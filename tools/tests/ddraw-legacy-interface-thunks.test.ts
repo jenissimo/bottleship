@@ -277,6 +277,40 @@ describe("legacy writable surface locks", () => {
     });
 });
 
+describe("Lock/Unlock dirty regions accumulate until uploaded", () => {
+    function lockableTexture(h: ReturnType<typeof harness>) {
+        Object.assign(h.surfaceState, {
+            surfaceType: "render_surface", caps: DDSCAPS_TEXTURE, width: 8, height: 8, pitch: 32, surfacePtr: SURFACE_BITS,
+            format: { size: 32, flags: 0x40, fourCC: 0, bpp: 32, rMask: 0x00ff0000, gMask: 0x0000ff00, bMask: 0x000000ff, aMask: 0xff000000 },
+            mode: "CPU", version: 1, gpuDirty: false, everLocked: true, lastUploadVersion: 1, writeGeneration: 0,
+        });
+        h.view.setUint32(OUT, 108, true);
+    }
+    const lockWriteUnlock = (h: ReturnType<typeof harness>, write: () => void) => {
+        expect(h.call(h.surf, "IDirectDrawSurface_Lock", SURFACE_PTR, 0, OUT, 1, 0)).toBe(DD_OK);
+        write();
+        expect(h.call(h.surf, "IDirectDrawSurface_Unlock", SURFACE_PTR, SURFACE_BITS)).toBe(DD_OK);
+    };
+
+    test("a second Lock's writes add to the region the first one left pending", () => {
+        const h = harness();
+        lockableTexture(h);
+        lockWriteUnlock(h, () => h.view.setUint32(SURFACE_BITS + 1 * 4, 0x00ff0000, true));
+        expect(h.surfaceState.dirtyRegion).toEqual({ left: 1, top: 0, right: 2, bottom: 1 });
+        lockWriteUnlock(h, () => h.view.setUint32(SURFACE_BITS + 7 * 32 + 6 * 4, 0x0000ff00, true));
+        expect(h.surfaceState.dirtyRegion).toEqual({ left: 1, top: 0, right: 7, bottom: 8 });
+    });
+
+    test("a region that was uploaded meanwhile is not resurrected", () => {
+        const h = harness();
+        lockableTexture(h);
+        lockWriteUnlock(h, () => h.view.setUint32(SURFACE_BITS + 1 * 4, 0x00ff0000, true));
+        h.surfaceState.dirtyRegion = undefined;
+        lockWriteUnlock(h, () => h.view.setUint32(SURFACE_BITS + 7 * 32 + 6 * 4, 0x0000ff00, true));
+        expect(h.surfaceState.dirtyRegion).toEqual({ left: 6, top: 7, right: 7, bottom: 8 });
+    });
+});
+
 describe("IDirectDrawSurface::GetPalette hands back an interface or fails", () => {
     test("no palette attached: out-pointer NULLed, DDERR_NOPALETTEATTACHED", () => {
         const h = harness();
