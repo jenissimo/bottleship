@@ -12,8 +12,10 @@ import { readFileSync } from 'node:fs';
 import {
     activeDialogs,
     createPumpScheduler,
+    hasWaitingModalPump,
     resetDialogPumps,
 } from '../../src/worker/modules/user32/modal-dialog-state';
+import { registerRemovedTimerHook } from '../../src/worker/modules/user32/shared-state';
 import { createDialogExports } from '../../src/worker/modules/user32/dialog';
 import { System } from '../../src/worker/core/system';
 
@@ -82,6 +84,20 @@ describe('modal dialog pump lifetime', () => {
         expect(pump.isLive()).toBe(false);
     });
 
+    test('an armed step reads as a waiter blocked on messages; a running one does not', async () => {
+        const pump = createPumpScheduler();
+        let waitingDuringStep: boolean | undefined;
+        pump.schedule(() => { waitingDuringStep = hasWaitingModalPump(); }, 0);
+        expect(hasWaitingModalPump()).toBe(true);
+        await tick();
+        expect(waitingDuringStep).toBe(false);
+        expect(hasWaitingModalPump()).toBe(false);
+
+        pump.schedule(() => {}, 8);
+        resetDialogPumps();
+        expect(hasWaitingModalPump()).toBe(false);
+    });
+
     test('teardown clears the active-dialog registry', () => {
         activeDialogs.set(0x1234, { hwnd: 0x1234, dlgProc: 0x401000, result: 0, closed: false });
         resetDialogPumps();
@@ -103,6 +119,11 @@ describe('modal dialog pump wiring', () => {
         const head = dialogSrc.slice(idx, idx + 400);
         expect(head).toContain('system.isExiting');
         expect(head).toContain('pumpScheduler.abandon()');
+    });
+
+    test('an idle modal pump keeps virtual time moving like a GetMessage waiter', () => {
+        const systemSrc = read('../../src/worker/core/system.ts');
+        expect(systemSrc).toMatch(/onHasMessageWaiters = \(\) => [^;]*hasWaitingModalPump\(\)/);
     });
 
     test('a user32 reset makes every armed pump inert', () => {
@@ -170,6 +191,15 @@ function runDialog(dispatchAnswers: () => number, pendingMessages = 64) {
 const pumpDispatches = (inv: Invocation[]): Invocation[] =>
     inv.filter((i) => i.args[1] !== WM_INITDIALOG);
 
+/** Let each guest dispatch return, as the x86 side would, until `message` is dispatched. */
+async function completeUntil(inv: Invocation[], message: number): Promise<void> {
+    let completed = 1; // WM_INITDIALOG
+    for (let i = 0; i < 50 && !inv.some(x => x.args[1] === message); i++) {
+        await tick(10);
+        while (completed < inv.length) inv[completed++]!.complete?.(0);
+    }
+}
+
 describe('a modal pump that cannot dispatch', () => {
     beforeEach(() => {
         resetDialogPumps();
@@ -188,6 +218,30 @@ describe('a modal pump that cannot dispatch', () => {
 
         expect(pumpDispatches(invocations).length).toBeGreaterThan(3);
         expect(activeDialogs.has(dialogHwnd)).toBe(true);   // still a live dialog
+    });
+
+    test('every message the pump removes is reported, so an expired USER timer re-arms', async () => {
+        const removed: number[] = [];
+        registerRemovedTimerHook(msg => { removed.push(msg.message); });
+        const { invocations, dialogHwnd } = runDialog(() => 0x2000, 0);
+        System.getInstance().windowManager.postMessage(dialogHwnd, 0x0113, 10, 0);
+
+        await completeUntil(invocations, 0x0113);
+
+        expect(removed).toContain(0x0113);
+    });
+
+    test('a WM_TIMER carrying a TIMERPROC calls the TIMERPROC, not the dialog procedure', async () => {
+        const timerProc = 0x403000;
+        const { invocations, dialogHwnd } = runDialog(() => 0x2000, 0);
+        System.getInstance().windowManager.postMessage(dialogHwnd, 0x0113, 7, timerProc);
+
+        await completeUntil(invocations, 0x0113);
+
+        const timer = pumpDispatches(invocations).find(i => i.args[1] === 0x0113);
+        expect(timer?.wndProc).toBe(timerProc);
+        expect(timer?.args.slice(0, 3)).toEqual([dialogHwnd, 0x0113, 7]);
+        expect(timer?.args[3]).not.toBe(timerProc); // dwTime, not the TIMERPROC
     });
 
     test('a permanently refused dispatch ends the dialog and completes the frame', async () => {

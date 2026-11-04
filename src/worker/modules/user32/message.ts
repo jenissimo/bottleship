@@ -21,7 +21,7 @@ import { tryRichEditStreamMessage } from './rich-edit-stream';
 import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleAnimateMessage } from './animate-control';
 import { handleMciWndMessage } from '../msvfw32-mciwnd';
-import { windows, buttonCheckStates, registerWindowTimerKiller, finalizeWindowDestroy, getAbsoluteWindowPosition, getWindowByHandle, isEffectivelyVisible } from './shared-state';
+import { windows, buttonCheckStates, registerWindowTimerKiller, registerRemovedTimerHook, finalizeWindowDestroy, getAbsoluteWindowPosition, getWindowByHandle, isEffectivelyVisible } from './shared-state';
 import { validateWindow } from './paint-region';
 import { repaintChildControls, isButtonSystemControl, hitTestSystemControlAtClient } from './controls';
 import { isOwnerDrawButton } from './owner-draw';
@@ -381,6 +381,11 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         }
     }
     registerWindowTimerKiller(killTimersForWindow);
+    registerRemovedTimerHook(msg => {
+        if (msg.message !== WM_TIMER) return;
+        timerDiag.delivered++;
+        restartRemovedTimer(msg);
+    });
 
     // Last owner-draw child we forwarded a WM_MOUSEMOVE to, so we only re-post on ENTER
     // (the child's own hover timer then polls the cursor) instead of on every move.

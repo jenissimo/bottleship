@@ -12,7 +12,7 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { registerDialogItemExports } from './dialog-items';
 import { registerMessageBoxExports } from './dialog-messagebox';
 import { System } from '../../core/system';
-import { WindowInfo, windows, controlImageHandles, getAbsoluteWindowPosition, getGroupSiblingRange, getVirtualScreenRect, killWindowTimers, finalizeWindowDestroy, buttonCheckStates, findChildByControlId, isEffectivelyVisible } from './shared-state';
+import { WindowInfo, windows, controlImageHandles, getAbsoluteWindowPosition, getGroupSiblingRange, getVirtualScreenRect, killWindowTimers, noteTimerMessageRemoved, finalizeWindowDestroy, buttonCheckStates, findChildByControlId, isEffectivelyVisible } from './shared-state';
 import { validateWindow } from './paint-region';
 import { WH_CBT, HCBT_CREATEWND, getHooksOfType } from './hooks';
 import { parseDlgTemplate, dluToPixelX, dluToPixelY, getDialogBaseUnits, logDlgTemplateDump, ParsedDlgTemplate } from './dialog-template';
@@ -573,11 +573,14 @@ export function createDialogChildren(
  * Modal behavior comes from disabling the owner, not from message filtering.
  * WM_NULL (hwnd=0, message=0) idle messages are skipped automatically.
  */
-function dequeueNextDialogMessage(system: System): { hwnd: number; message: number; wParam: number; lParam: number } | undefined {
+function dequeueNextDialogMessage(system: System): { hwnd: number; message: number; wParam: number; lParam: number; time: number } | undefined {
     for (let i = 0; i < 32; i++) {
         const msg = system.windowManager.getMessage();
         if (!msg) return undefined;
         if (msg.hwnd === 0 && msg.message === 0) continue; // WM_NULL idle
+        // Removing an expired timer's WM_TIMER is what re-arms it; without this every
+        // SetTimer made inside a modal dialog fires exactly once.
+        noteTimerMessageRemoved(msg);
         return msg;
     }
     return undefined;
@@ -629,6 +632,7 @@ function hitTestSystemControlRecursive(
 }
 
 const WM_PAINT = 0x000F;
+const WM_TIMER = 0x0113;
 
 /** DefDlgProc epilogue messages (Wine defdlg.c) — see answersWithDlgProcResult. */
 const WM_CTLCOLOR16 = 0x0019;
@@ -1063,7 +1067,7 @@ function runModalDialog(
             return;
         }
 
-        const { hwnd, message, wParam, lParam } = msg;
+        const { hwnd, message, wParam, lParam, time } = msg;
         const targetInfo = windows.get(hwnd);
 
         Logger.log(
@@ -1165,7 +1169,12 @@ function runModalDialog(
         // --- Dispatch to x86 wndProc ---
         // Determine which wndProc to call for this message
         let targetWndProc = 0;
-        if (hwnd === dialogHwnd) {
+        let dispatchArgs = [hwnd, message, wParam, lParam];
+        if (message === WM_TIMER && lParam !== 0) {
+            // DispatchMessage calls a timer's TIMERPROC instead of the window procedure.
+            targetWndProc = lParam >>> 0;
+            dispatchArgs = [hwnd, message, wParam, time >>> 0];
+        } else if (hwnd === dialogHwnd) {
             // Message to the dialog itself -> call lpDialogFunc
             targetWndProc = lpDialogFunc;
         } else if (targetInfo?.wndProc && !isSentinelWndProc(targetInfo.wndProc)) {
@@ -1179,7 +1188,7 @@ function runModalDialog(
             try {
                 const result = callbackManager.invokeCallback(
                     targetWndProc,
-                    [hwnd, message, wParam, lParam],
+                    dispatchArgs,
                     0,
                     pumpCompleteThunk,
                     false,
