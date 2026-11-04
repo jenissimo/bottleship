@@ -1,0 +1,50 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebKit wasm tail-call / memory.grow repro</title>
+<style>
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 16px; }
+  pre { background: #111; color: #ddd; padding: 8px; white-space: pre-wrap; word-break: break-all; }
+  a { margin-right: 8px; }
+</style>
+<h3>WebKit: cross-instance return_call_indirect + memory.grow + table-slot reuse</h3>
+<p>Arms (open one, wait ~30 s). A WebContent crash reloads or blanks the tab; the last status
+of the previous run is shown below as "previous run".</p>
+<p>
+  <a href="?tail=1">tail (default)</a>
+  <a href="?tail=0">control: call_indirect+return</a>
+  <a href="?tail=1&growEvery=0">tail, no grow after start</a>
+  <a href="?tail=1&initialMB=64&growEvery=0">tail, small memory, no grow</a>
+  <a href="?tail=1&growInChain=0">tail, grow from JS tick</a>
+  <a href="?tail=1&recycle=0">tail, no slot reuse</a>
+  <a href="?tail=1&sync=1">tail, sync compile</a>
+  <a href="?tail=1&copyBytes=1">tail, copied bytes</a>
+  <a href="?tail=1&clearEvery=200">tail + cache clears</a>
+</p>
+<pre id="prev"></pre>
+<pre id="out">starting…</pre>
+<script type="module">
+  const KEY = "webkit-ios27-repro-last";
+  const prev = localStorage.getItem(KEY);
+  document.getElementById("prev").textContent = "previous run: " + (prev ?? "(none)");
+  const q = new URLSearchParams(location.search);
+  const opts = {};
+  for (const [k, v] of q) if (k !== "beacon") opts[k] = Number(v);
+  const beacon = q.get("beacon"); // optional URL that receives the status JSON (survives a crash)
+  const out = document.getElementById("out");
+  const lines = [];
+  const w = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+  w.onerror = (e) => { lines.push("worker error: " + e.message); out.textContent = lines.join("\n"); };
+  w.onmessage = (ev) => {
+    const m = ev.data;
+    const text = m.kind === "status"
+      ? `[${m.sec}s] ticks=${m.st.ticks} chains=${m.st.chains} compiled=${m.st.compiled} live=${m.live} recycled=${m.st.recycled} grows=${m.st.grows} mem=${m.memMB}MB failed=${m.st.failed}`
+      : `${m.kind}: ${m.text ?? JSON.stringify(m.st)}`;
+    if (m.kind === "status") lines[0] = text; else lines.push(text);
+    out.textContent = `ua: ${navigator.userAgent}\nurl: ${location.search || "(defaults)"}\n` + lines.join("\n");
+    const record = JSON.stringify({ at: new Date().toISOString(), search: location.search, text });
+    localStorage.setItem(KEY, record);
+    if (beacon) fetch(beacon, { method: "POST", body: record, keepalive: true, mode: "no-cors" }).catch(() => {});
+  };
+  w.postMessage({ type: "start", opts });
+</script>
