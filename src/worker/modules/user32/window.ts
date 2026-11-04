@@ -19,6 +19,7 @@ import {
     validateWindow,
     hasPendingUpdate,
     getWindowUpdateBounds,
+    getWindowUpdateQuads,
     consumeNeedsErase,
     clearWindowUpdate,
     removeWindowUpdate,
@@ -32,6 +33,8 @@ import { registerWindowGeometryExports, removeWindowPlacement, clientSizeFromWin
 import { registerWindowQueryExports } from './window-query';
 import { registerWindowPropExports } from './window-props';
 import { GDIContext } from '../gdi32/context';
+import { makeClipRegion, normalizeClipRegion, clipRegionType } from '../gdi32/dc-clip';
+import { setRegionContents } from '../gdi32/painting-dc-state';
 import { ensureAnimateControlClasses, clearAnimateState, onAnimateShowWindow, isAnimateControlWindow } from './animate-control';
 import { clearMciWndState } from '../msvfw32-mciwnd';
 import { getBuiltinSystemClass, getDefDlgProcAddress, getDefWindowProcAddress } from './system-classes';
@@ -2876,10 +2879,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const hWnd = args[0] >>> 0;
         const lpRect = args[1] >>> 0;
         const bErase = args[2] >>> 0;
-        Logger.verbose(
-            LogCategory.USER32,
-            `GetUpdateRect(0x${hWnd.toString(16)}, 0x${lpRect.toString(16)}, ${bErase})`
-        );
+        Logger.verboseLazy(LogCategory.USER32, () =>
+            `GetUpdateRect(0x${hWnd.toString(16)}, 0x${lpRect.toString(16)}, ${bErase})`);
 
         const bounds = getWindowUpdateBounds(hWnd);
         if (!bounds) return 0; // FALSE
@@ -2887,14 +2888,40 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (lpRect) {
             writeClientRectToMem(mem, lpRect, bounds);
         }
-        // Win32: bErase=TRUE erases the background within the update region.
-        if (bErase) {
-            const win = windows.get(hWnd);
-            if (win && isDialogLikeWindow(win)) {
-                repaintDialogOverlayIfVisible(hWnd);
-            }
-        }
+        if (bErase) eraseUpdateBackground(hWnd);
         return 1; // TRUE
+    };
+
+    // Win32: bErase=TRUE erases the background within the update region.
+    const eraseUpdateBackground = (hWnd: number): void => {
+        const win = windows.get(hWnd);
+        if (win && isDialogLikeWindow(win)) {
+            repaintDialogOverlayIfVisible(hWnd);
+        }
+    };
+
+    // int GetUpdateRgn(HWND, HRGN, BOOL bErase): copies the update region, in client
+    // coordinates, into the caller's region and returns its type. RollerCoaster Tycoon's
+    // WM_PAINT handler picks what to redraw from the type: its paint rect on SIMPLEREGION,
+    // each GetRegionData rect on COMPLEXREGION, nothing on NULLREGION/ERROR.
+    exports['GetUpdateRgn'] = (ctx, mem, args) => {
+        const hWnd = args[0] >>> 0;
+        const hRgn = args[1] >>> 0;
+        const bErase = args[2] >>> 0;
+        if (!windows.has(hWnd)) return 0; // ERROR
+
+        // Validation can leave pieces that tile one rectangle; coalesce them so the
+        // type is SIMPLEREGION whenever the region is a single rectangle. One rect or
+        // none is already canonical.
+        const raw = makeClipRegion(getWindowUpdateQuads(hWnd));
+        const region = raw.rects.length > 4 ? normalizeClipRegion(raw) : raw;
+        if (!setRegionContents(hRgn, region)) return 0; // ERROR
+        if (bErase && region.rects.length > 0) eraseUpdateBackground(hWnd);
+
+        const type = clipRegionType(region);
+        Logger.verboseLazy(LogCategory.USER32, () =>
+            `GetUpdateRgn(0x${hWnd.toString(16)}, 0x${hRgn.toString(16)}, ${bErase}) -> ${type}`);
+        return type;
     };
 
     exports['ShowOwnedPopups'] = (ctx, mem, args) => {

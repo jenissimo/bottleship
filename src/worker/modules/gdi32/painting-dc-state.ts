@@ -42,6 +42,14 @@ function _rgnAlloc(region: DcClipRegion): number {
     return h;
 }
 
+/** Overwrite the shape an HRGN holds — also for USER calls that fill a caller's region.
+ *  False when the handle is not a live region. */
+export function setRegionContents(hRgn: number, region: DcClipRegion): boolean {
+    if (!_regionStore.has(hRgn)) return false;
+    _regionStore.set(hRgn, region);
+    return true;
+}
+
 const ERROR_REGION = 0;
 
 /** RECT is 16 bytes; a guest pointer is validated over that whole extent before use. */
@@ -614,9 +622,7 @@ export function registerPaintingDcStateExports(exports: Record<string, ThunkImpl
             `SetRectRgn(hRgn=0x${hRgn.toString(16)}, ${left},${top},${right},${bottom})`,
         );
         // Update the stored region if we own this handle, otherwise accept silently.
-        if (_regionStore.has(hRgn)) {
-            _regionStore.set(hRgn, clipRegionFromRect(left, top, right, bottom));
-        }
+        setRegionContents(hRgn, clipRegionFromRect(left, top, right, bottom));
         return 1;
     };
 
@@ -787,6 +793,32 @@ export function registerPaintingDcStateExports(exports: Record<string, ThunkImpl
         Logger.verbose(LogCategory.GDI32,
             `GetRgnBox(0x${hRgn.toString(16)}) -> ${result} [${r.x1},${r.y1},${r.x2},${r.y2}]`);
         return result;
+    };
+
+    // DWORD GetRegionData(HRGN, DWORD nCount, LPRGNDATA): an RGNDATAHEADER (dwSize, iType =
+    // RDH_RECTANGLES, nCount, nRgnSize, rcBound) followed by the region's RECTs. With no
+    // buffer it answers the size needed; a buffer too small for that is a failure (0).
+    // Success returns the bytes written, as Wine's NtGdiGetRegionData does.
+    exports['GetRegionData'] = (ctx, mem, args): number => {
+        const hRgn = args[0];
+        const count = args[1] >>> 0;
+        const lpRgnData = args[2];
+        const r = _regionStore.get(hRgn);
+        if (!r) return 0;
+
+        const RGNDATAHEADER_SIZE = 32;
+        const RDH_RECTANGLES = 1;
+        const nRects = r.rects.length / 4;
+        const size = RGNDATAHEADER_SIZE + nRects * RECT_SIZE;
+        if (!lpRgnData) return size;
+        if (count < size || !isValidAddress(mem, lpRgnData, size, "rw")) return 0;
+
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const header = [RGNDATAHEADER_SIZE, RDH_RECTANGLES, nRects, nRects * RECT_SIZE, r.x1, r.y1, r.x2, r.y2];
+        header.forEach((v, i) => view.setInt32(lpRgnData + i * 4, v, true));
+        r.rects.forEach((v, i) => view.setInt32(lpRgnData + RGNDATAHEADER_SIZE + i * 4, v, true));
+        Logger.verbose(LogCategory.GDI32, `GetRegionData(0x${hRgn.toString(16)}) -> ${nRects} rect(s)`);
+        return size;
     };
 
     exports['SetColorAdjustment'] = (ctx, mem, args): number => {

@@ -151,6 +151,13 @@ export function getWindowUpdateRects(hwnd: number): ClientRect[] {
     return state ? [...state.rects] : [];
 }
 
+/** The update region as flat left,top,right,bottom quads — the input a GDI region is built from. */
+export function getWindowUpdateQuads(hwnd: number): number[] {
+    const quads: number[] = [];
+    for (const r of updates.get(hwnd)?.rects ?? []) quads.push(r.left, r.top, r.right, r.bottom);
+    return quads;
+}
+
 /** Win32 BeginPaint: fErase reflects whether background should be erased. */
 export function consumeNeedsErase(hwnd: number): boolean {
     const state = updates.get(hwnd);
