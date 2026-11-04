@@ -86,7 +86,7 @@ export interface MSSContext {
     /** Pointers allocated by readFileToBuffer when destBuffer is NULL; freed by _AIL_mem_free_lock */
     memAllocatedByMss: Set<number>;
     /** Queue of pending timer callbacks - processed during _AIL_serve to avoid corrupting CPU state */
-    pendingTimerCallbacks: Array<{ callback: number; user: number }>;
+    pendingTimerCallbacks: Array<{ callback: number; user: number; handle?: number }>;
     /** Queue of pending EOS callbacks - processed during _AIL_serve to avoid corrupting CPU state */
     pendingEOSCallbacks: Array<{ callback: number; handle: number; user: number }>;
     /** Stream callbacks (AIL_register_stream_callback) an incremental stream hit the end
