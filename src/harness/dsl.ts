@@ -218,6 +218,10 @@ export class HarnessChain {
     /** Relative motion through the browser stack — under Pointer Lock the page reads
      *  movementX/Y, which only a dispatched move produces. */
     hostMove(dx: number, dy: number, steps?: number): this { return this.push("hostMove", [dx, dy, steps]); }
+    /** A key held through the BROWSER's input stack (CDP-side, DOM `code`: 'ArrowUp',
+     *  'KeyW', 'Space'): KeyboardEvent → App.tsx → virtual device → SAB — the physical
+     *  keyboard baseline an on-screen control is compared against. `keyHold` skips all of it. */
+    hostKey(code: string, holdMs?: number): this { return this.pushTimed("hostKey", [code, holdMs], (holdMs ?? 300) + 15_000); }
     /** Record the pointer/keyboard WM_* the input layer posts — the ring expectMessages asserts over. */
     wmTrace(action: "start" | "stop" | "read" | "clear" = "read"): this { return this.push("wmTrace", [action]); }
     /** THE instrument for a BLANK control / an unpainted dialog: records every link of the
@@ -240,6 +244,17 @@ export class HarnessChain {
     twoFingerTap(x: number, y: number, spread?: number): this { return this.push("twoFingerTap", [x, y, spread]); }
     /** Two contacts straddling (x,y) moving symmetrically to `scale`× their span (<1 in, >1 out). */
     pinch(x: number, y: number, scale: number, ms?: number): this { return this.push("pinch", [x, y, scale, ms]); }
+    /** Several fingers on one clock, in VIEWPORT CSS px (on-screen controls sit outside the
+     *  guest picture): each `{x, y, x1?, y1?, downMs?, upMs}` lives downMs..upMs and moves
+     *  linearly to (x1,y1). The multi-touch case — hold the stick, tap Fire. A negative
+     *  upMs leaves that finger down (screenshot mid-gesture); `touchTimeline([])` lifts all. */
+    touchTimeline(fingers: Array<{ x: number; y: number; x1?: number; y1?: number; downMs?: number; upMs: number }>): this {
+        const end = Math.max(0, ...fingers.map((f) => Math.abs(f.upMs)));
+        return this.pushTimed("touchTimeline", [fingers], end + 15_000);
+    }
+    /** Screenshot the whole emulated VIEWPORT (shell chrome + on-screen controls + canvas),
+     *  which `shot` — a capture of the guest screen — deliberately excludes. */
+    pageShot(file?: string): this { return this.push("pageShot", [file]); }
 
     // ── observe ──
     state(sections?: string[]): this { return this.push("state", [sections]); }

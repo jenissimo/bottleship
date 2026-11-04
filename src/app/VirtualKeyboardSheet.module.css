@@ -39,6 +39,18 @@
   overflow-y: auto;
 }
 
+/* A keypad is used by touch-typing position, so it keeps a real keypad's proportions
+   (and a thumb-sized pitch) instead of stretching to the screen width. */
+.osk__sheet--num {
+  align-self: center;
+  width: min(100%, 320px);
+}
+
+.osk__sheet--num .key {
+  min-height: 52px;
+  font-size: 18px;
+}
+
 .key {
   flex: 1 1 0;
   /* Finger floor, same rationale as the control layer's hit rects. */

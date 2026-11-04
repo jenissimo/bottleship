@@ -71,6 +71,13 @@ export type ControlWidget =
         sensitivity?: number;
         /** Re-centre on the touchdown point rather than the widget centre. */
         recenter?: boolean;
+        /**
+         * Floating stick: the HIT zone is the whole letterbox bar on the widget's side
+         * (its half of a top/bottom bar), and the drawn base moves under the thumb.
+         * Inert where no bar exists — a stick over the picture must not claim the half
+         * of the screen the player is aiming at. Implies `recenter`.
+         */
+        float?: boolean;
     }
     | { kind: "trackpad"; id: string; rect: Anchored; taps?: boolean }
     | { kind: "wheelStrip"; id: string; rect: Anchored; step?: number };
@@ -181,6 +188,7 @@ function parseWidget(x: unknown): ControlWidget | null {
             const sensitivity = num(r["sensitivity"], 0.05, 20);
             if (sensitivity !== null) w.sensitivity = sensitivity;
             if (r["recenter"] === true) w.recenter = true;
+            if (r["float"] === true) { w.float = true; w.recenter = true; }
             return w;
         }
         case "trackpad":
@@ -254,6 +262,11 @@ export interface ResolveOptions {
     reserved?: readonly PanelRect[];
     /** Filled with 1 where a widget sits over the picture rather than in a bar. */
     overCanvas?: Uint8Array;
+    /**
+     * Resolve a floating stick to its whole hit ZONE (see the widget's `float`). The hit
+     * pass wants it; the drawing pass wants the authored size and leaves this off.
+     */
+    floatZones?: boolean;
 }
 
 /** A bar narrower than a fingertip is not a place to put controls. */
@@ -315,6 +328,23 @@ export function resolveRects(
         }
         if (cfg.overCanvas && i < cfg.overCanvas.length) cfg.overCanvas[i] = inBar || !cv ? 0 : 1;
 
+        const w = layout.widgets[i];
+        if (cfg.floatZones && inBar && w.kind === "stick" && w.float) {
+            // A side bar is the zone outright; a top/bottom bar is shared with the
+            // cluster on the other side, so the stick takes its own half of it.
+            let zx = bx, zw = bw;
+            if (bw === W && r.anchor !== "c") {
+                zw = W / 2;
+                zx = r.anchor[1] === "l" ? 0 : W / 2;
+            }
+            const o = i * 4;
+            rects[o] = panel.left + zx;
+            rects[o + 1] = panel.top + by;
+            rects[o + 2] = zw;
+            rects[o + 3] = bh;
+            continue;
+        }
+
         // Vertical placement first: it never depends on the horizontal inset, and
         // knowing the widget's band is what decides whether a reserved rect is even
         // in its way.
@@ -340,6 +370,12 @@ export function resolveRects(
                 const ry = res.top - panel.top;
                 if (y >= ry + res.height || y + hh <= ry) continue;
                 if (rx >= bx + bw || rx + res.width <= bx) continue;
+                // Only an affordance on the widget's OWN side of the box moves its edge:
+                // the HUD handle in the far right corner says nothing about where a
+                // left-anchored Esc may sit, and insetting from it pushed that Esc all
+                // the way across the bar and under the handle.
+                const mid = bx + bw / 2;
+                if (right ? rx + res.width <= mid : rx >= mid) continue;
                 if (right) {
                     // Only the space LEFT of the affordance is addressable from the
                     // right edge — including the sliver beyond it, which is too narrow

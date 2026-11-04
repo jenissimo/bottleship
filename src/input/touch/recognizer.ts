@@ -542,6 +542,14 @@ function onUp(s: RecognizerState, ev: TouchEvent2, now: number, out: TouchIntent
                 break;
             }
             s.longPressAt = Infinity;
+            // A plain tap clicks UNDER THE FINGER. The fingertip offset exists so a cursor
+            // being aimed is not hidden by the thumb, and a contact that never moved was
+            // never aimed: with the offset applied a tap on a 29-px Win32 button (Max
+            // Payne's launcher on a phone) clicked 28 CSS px above it and hit nothing.
+            // A refine slide WAS aimed, and resolves at the aimed cursor as before.
+            if (s.phase === Phase.pending && s.cfg.mode === "direct" && s.cfg.cursorAid) {
+                publishCursor(s, ev.x, ev.y, out);
+            }
             resolveTap(s, 0, now, out);
             break;
 

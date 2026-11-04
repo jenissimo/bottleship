@@ -60,6 +60,21 @@ const QWERTY_ROWS: Key[][] = [
     [k(0x20, "Space", 6), k(0x25, "←"), k(0x26, "↑"), k(0x28, "↓"), k(0x27, "→")],
 ];
 
+/**
+ * The numeric keypad, as its own sheet: the arrows on the bar are a DIFFERENT physical
+ * key to the guest (E0-prefixed, extended bit set), and a title that walks on Numpad
+ * 8/2/4/6 — Hitman: Codename 47, most flight sims — never reacts to them. VK_NUMPADn
+ * reaches the guest as the bare 48/50/4B/4D scan codes with NumLock on.
+ */
+const NUMPAD_ROWS: Key[][] = [
+    [k(0x67, "7"), k(0x68, "8"), k(0x69, "9"), k(0x6d, "−")],
+    [k(0x64, "4"), k(0x65, "5"), k(0x66, "6"), k(0x6b, "+")],
+    [k(0x61, "1"), k(0x62, "2"), k(0x63, "3"), k(0x6a, "×")],
+    [k(0x60, "0", 2), k(0x6e, "."), k(0x6f, "÷")],
+];
+
+type SheetPage = "none" | "all" | "num";
+
 export interface VirtualKeyboardSheetProps {
     open: boolean;
     onClose: () => void;
@@ -74,7 +89,7 @@ const Sheet: React.FC<{ onClose: () => void }> = ({ onClose }) => {
     // and must survive every re-render as the same instance.
     const [presser] = useState(() => new BindingPresser("osk"));
 
-    const [full, setFull] = useState(false);
+    const [page, setPage] = useState<SheetPage>("none");
     const [latched, setLatched] = useState<readonly number[]>([]);
 
     useEffect(() => () => presser.releaseAll(), [presser]);
@@ -157,10 +172,19 @@ const Sheet: React.FC<{ onClose: () => void }> = ({ onClose }) => {
                 ))}
                 <button
                     type="button"
-                    className={cx(s, "key", "key--util", full && "key--latched")}
-                    onPointerDown={(e) => { stop(e); setFull((v) => !v); }}
+                    className={cx(s, "key", "key--util", page === "num" && "key--latched")}
+                    aria-pressed={page === "num"}
+                    onPointerDown={(e) => { stop(e); setPage((v) => (v === "num" ? "none" : "num")); }}
                 >
-                    {full ? "Less" : "More"}
+                    Num
+                </button>
+                <button
+                    type="button"
+                    className={cx(s, "key", "key--util", page === "all" && "key--latched")}
+                    aria-pressed={page === "all"}
+                    onPointerDown={(e) => { stop(e); setPage((v) => (v === "all" ? "none" : "all")); }}
+                >
+                    {page === "all" ? "Less" : "More"}
                 </button>
                 <button
                     type="button"
@@ -172,7 +196,15 @@ const Sheet: React.FC<{ onClose: () => void }> = ({ onClose }) => {
                 </button>
             </div>
 
-            {full && (
+            {page === "num" && (
+                <div className={cx(s, "osk__sheet", "osk__sheet--num")}>
+                    {NUMPAD_ROWS.map((row, i) => (
+                        <div key={i} className={s["osk__row"]}>{row.map(renderKey)}</div>
+                    ))}
+                </div>
+            )}
+
+            {page === "all" && (
                 <div className={s["osk__sheet"]}>
                     <div className={s["osk__row"]}>{FUNCTION_ROW.map(renderKey)}</div>
                     {QWERTY_ROWS.map((row, i) => (

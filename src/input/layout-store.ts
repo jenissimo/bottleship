@@ -13,11 +13,23 @@ const GLOBAL_KEY = "default";
 
 export type TouchModePref = "auto" | "direct" | "trackpad";
 
+/** Which cluster the movement control presses (see controls/move-keys.ts). */
+export type MoveKeysPref = "wasd" | "arrows" | "numpad";
+
+export type Orientation = "landscape" | "portrait";
+
+const isMoveKeysPref = (x: unknown): x is MoveKeysPref => x === "wasd" || x === "arrows" || x === "numpad";
+
 /** One stored/resolved tier: a named preset, an authored layout, or both. */
 export interface StoredLayout<L = unknown> {
     presetId?: string;
     layout?: L;
     mode?: TouchModePref;
+    /**
+     * The movement cluster. A property of the GAME's key table, so it is stored once per
+     * game and shared by both orientations, unlike the layout itself.
+     */
+    moveKeys?: MoveKeysPref;
     /**
      * Set when the user picked or edited a layout for this game. Auto-select stops for
      * that gameId — a runtime signal must never overwrite an explicit choice.
@@ -35,9 +47,14 @@ function storage(): Storage | null {
     }
 }
 
-function storageKey(gameId: string | null | undefined): string {
+/**
+ * One record per game, plus one per game AND orientation: a portrait layout lives under
+ * the picture and a landscape one beside it, so a thumb cluster the player moved in one
+ * says nothing about the other.
+ */
+function storageKey(gameId: string | null | undefined, orientation?: Orientation): string {
     const id = (gameId ?? "").trim();
-    return KEY_PREFIX + (id.length > 0 ? id : GLOBAL_KEY);
+    return KEY_PREFIX + (id.length > 0 ? id : GLOBAL_KEY) + (orientation ? `@${orientation}` : "");
 }
 
 function parseStored<L>(raw: string | null, validate?: LayoutValidator<L>): StoredLayout<L> | null {
@@ -54,11 +71,13 @@ function parseStored<L>(raw: string | null, validate?: LayoutValidator<L>): Stor
     if (typeof o.presetId === "string" && o.presetId.length > 0) out.presetId = o.presetId;
     if (o.mode === "auto" || o.mode === "direct" || o.mode === "trackpad") out.mode = o.mode;
     if (o.pinned === true) out.pinned = true;
+    if (isMoveKeysPref(o.moveKeys)) out.moveKeys = o.moveKeys;
     if (o.layout !== undefined && o.layout !== null) {
         const layout = validate ? validate(o.layout) : (o.layout as L);
         if (layout !== null) out.layout = layout;
     }
-    if (out.presetId === undefined && out.layout === undefined && out.mode === undefined) return null;
+    if (out.presetId === undefined && out.layout === undefined && out.mode === undefined
+        && out.moveKeys === undefined) return null;
     return out;
 }
 
@@ -66,14 +85,37 @@ function parseStored<L>(raw: string | null, validate?: LayoutValidator<L>): Stor
 export function loadLayout<L = unknown>(
     gameId: string | null | undefined,
     validate?: LayoutValidator<L>,
+    orientation?: Orientation,
 ): StoredLayout<L> | null {
     const s = storage();
     if (!s) return null;
     try {
-        return parseStored<L>(s.getItem(storageKey(gameId)), validate);
+        return parseStored<L>(s.getItem(storageKey(gameId, orientation)), validate);
     } catch {
         return null;
     }
+}
+
+/**
+ * What the player chose for this game in this orientation: the orientation record's
+ * layout/preset/mode over the game-wide record, whose `moveKeys` (and a layout saved by
+ * a build that knew no orientations) still applies underneath.
+ */
+export function loadUserLayout<L = unknown>(
+    gameId: string | null | undefined,
+    orientation: Orientation,
+    validate?: LayoutValidator<L>,
+): StoredLayout<L> | null {
+    const base = loadLayout<L>(gameId, validate);
+    const own = loadLayout<L>(gameId, validate, orientation);
+    if (!base) return own;
+    if (!own) return base;
+    const merged: StoredLayout<L> = { ...base, ...own };
+    // A preset chosen for this orientation replaces the game-wide layout, not just its id.
+    if (own.presetId !== undefined && own.layout === undefined) delete merged.layout;
+    if (own.moveKeys === undefined && base.moveKeys !== undefined) merged.moveKeys = base.moveKeys;
+    if (own.pinned || base.pinned) merged.pinned = true;
+    return merged;
 }
 
 export function loadGlobalDefault<L = unknown>(validate?: LayoutValidator<L>): StoredLayout<L> | null {
@@ -84,14 +126,18 @@ export function loadGlobalDefault<L = unknown>(validate?: LayoutValidator<L>): S
  * Write a per-game record. `pinned` defaults to true for a real gameId: reaching this
  * function means the user made a choice, which is what stops auto-select for that game.
  */
-export function saveLayout<L>(gameId: string | null | undefined, value: StoredLayout<L>): void {
+export function saveLayout<L>(
+    gameId: string | null | undefined,
+    value: StoredLayout<L>,
+    orientation?: Orientation,
+): void {
     const s = storage();
     if (!s) return;
     const id = (gameId ?? "").trim();
     const record: StoredLayout<L> = { ...value };
     if (id.length > 0 && record.pinned === undefined) record.pinned = true;
     try {
-        s.setItem(storageKey(gameId), JSON.stringify(record));
+        s.setItem(storageKey(gameId, orientation), JSON.stringify(record));
     } catch {
         // quota / private mode — a lost layout is recoverable, a thrown UI is not
     }
@@ -106,16 +152,21 @@ export function clearLayout(gameId: string | null | undefined): void {
     if (!s) return;
     try {
         s.removeItem(storageKey(gameId));
+        s.removeItem(storageKey(gameId, "landscape"));
+        s.removeItem(storageKey(gameId, "portrait"));
     } catch {
         // ignore
     }
 }
 
 /** True once the user picked/edited a layout for this game — auto-select must stop. */
-export function isPinned(gameId: string | null | undefined): boolean {
+export function isPinned(gameId: string | null | undefined, orientation?: Orientation): boolean {
     const id = (gameId ?? "").trim();
     if (id.length === 0) return false;
-    return loadLayout(id)?.pinned === true;
+    // Only a chosen LAYOUT pins: picking the movement keys says nothing about which
+    // preset fits, and must not freeze auto-select on the boot-time fallback.
+    const pins = (r: StoredLayout | null) => r?.pinned === true && (r.presetId !== undefined || r.layout !== undefined);
+    return pins(loadLayout(id)) || (orientation !== undefined && pins(loadLayout(id, undefined, orientation)));
 }
 
 export type LayoutTier = "session" | "user" | "global" | "manifest" | "auto" | "fallback";
@@ -137,6 +188,8 @@ export interface ResolvedLayout<L> {
     presetId: string;
     layout: L | null;
     mode: TouchModePref;
+    /** null = whatever cluster the layout was authored with. */
+    moveKeys: MoveKeysPref | null;
     /** Which tier supplied the layout/preset (mode may come from a lower one). */
     tier: LayoutTier;
 }
@@ -189,5 +242,16 @@ export function resolveActiveLayout<L>(tiers: LayoutTiers<L>): ResolvedLayout<L>
         }
     }
 
-    return { presetId, layout, mode, tier };
+    // Independent too: a bundle that declares `moveKeys: "numpad"` keeps it under a
+    // layout the player reshaped, and a player's choice beats the bundle's.
+    let moveKeys: MoveKeysPref | null = null;
+    for (const t of TIER_ORDER) {
+        const v = byTier[t];
+        if (v?.moveKeys !== undefined) {
+            moveKeys = v.moveKeys;
+            break;
+        }
+    }
+
+    return { presetId, layout, mode, moveKeys, tier };
 }

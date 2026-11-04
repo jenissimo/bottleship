@@ -51,6 +51,8 @@ export interface TouchDriverOptions {
 
 const isTouchLike = (type: string): boolean => type === "touch" || type === "pen";
 
+const preventGesture = (e: Event): void => { e.preventDefault(); };
+
 /** Shell affordances (touch HUD, on-screen keyboard, first-run hint) mark the pixels
  *  they own with this attribute; the same one the control layer avoids placing over. */
 const RESERVED_SELECTOR = "[data-touch-reserved]";
@@ -83,6 +85,15 @@ export class TouchDriver {
         panel.addEventListener("pointerup", this.onUp);
         panel.addEventListener("pointercancel", this.onCancel);
         panel.addEventListener("lostpointercapture", this.onCancel);
+        // iOS Safari ignores `user-scalable=no` and `touch-action` for its own pinch
+        // gesture: a two-thumb chord (stick + Fire) that drifts apart zooms the whole page
+        // and every hit rect is then wrong. Its proprietary gesture events are the only
+        // handle on that, and cancelling them is harmless everywhere else (no other engine
+        // fires them).
+        if (typeof document !== "undefined") {
+            document.addEventListener("gesturestart", preventGesture, { passive: false });
+            document.addEventListener("gesturechange", preventGesture, { passive: false });
+        }
         return () => this.detach();
     }
 
@@ -94,6 +105,10 @@ export class TouchDriver {
         panel.removeEventListener("pointerup", this.onUp);
         panel.removeEventListener("pointercancel", this.onCancel);
         panel.removeEventListener("lostpointercapture", this.onCancel);
+        if (typeof document !== "undefined") {
+            document.removeEventListener("gesturestart", preventGesture);
+            document.removeEventListener("gesturechange", preventGesture);
+        }
         this.panel = null;
         this.opts = null;
         this.stopPump();

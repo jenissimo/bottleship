@@ -353,22 +353,25 @@ describe("presets", () => {
         }
     });
 
-    test("portrait thumb clusters stay in the top/bottom letterbox bars", () => {
-        // 390x844: a 4:3 guest is 390x292.5, leaving ~276 px above and below.
-        const panel = { left: 0, top: 0, width: 390, height: 844 };
-        const guestTop = (844 - 390 * 3 / 4) / 2;
-        const guestBottom = 844 - guestTop;
-        for (const id of PRESET_IDS) {
-            const l = getPreset(id, "portrait");
-            const r = resolveRects(l, panel);
-            for (let i = 0; i < l.widgets.length; i++) {
-                const w = l.widgets[i];
-                if (w.kind === "touchArea" || w.kind === "trackpad") continue;
-                const tag = `${id}/${w.id}`;
-                if (w.rect.anchor === "tl" || w.rect.anchor === "tr") {
-                    expect(`${tag}:${r[i * 4 + 1] + r[i * 4 + 3] <= guestTop + 1}`).toBe(`${tag}:true`);
-                } else if (w.rect.anchor === "bl" || w.rect.anchor === "br") {
+    test("portrait: every widget sits in the deck below a top-pinned picture", () => {
+        // The shell pins the picture to the top in portrait (App.module.css, app--touch),
+        // so there is ONE bar, below it, and the portrait presets are bottom-anchored.
+        // Checked on the tallest and the shortest phone panel we target: 390x716 (an
+        // iPhone 15 Pro inside the shell) and 375x604 (an iPhone SE).
+        for (const [pw, ph] of [[390, 716], [375, 604]] as const) {
+            const panel = { left: 0, top: 0, width: pw, height: ph };
+            const guestBottom = pw * 3 / 4;
+            const canvas = { left: 0, top: 0, width: pw, height: guestBottom };
+            for (const id of PRESET_IDS) {
+                const l = getPreset(id, "portrait");
+                const r = resolveRects(l, panel, { canvas, floatZones: true });
+                for (let i = 0; i < l.widgets.length; i++) {
+                    const w = l.widgets[i];
+                    if (w.kind === "touchArea" || w.kind === "trackpad") continue;
+                    const tag = `${pw}x${ph} ${id}/${w.id}`;
+                    expect(`${tag}:${w.rect.anchor[0]}`).toBe(`${tag}:b`);
                     expect(`${tag}:${r[i * 4 + 1] >= guestBottom - 1}`).toBe(`${tag}:true`);
+                    expect(`${tag}:${r[i * 4 + 1] + r[i * 4 + 3] <= ph + 0.5}`).toBe(`${tag}:true`);
                 }
             }
         }
