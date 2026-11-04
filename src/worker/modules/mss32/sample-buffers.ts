@@ -2,7 +2,8 @@ import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { MemoryGuard } from "../../core/memory/mem-guard";
 import { MSSContext, SMP_PLAYING } from "./context";
-import { defaultStreamBufferSize, setSampleStatus } from "./helpers";
+import { defaultStreamBufferSize, setSampleStatus, refreshSampleLenDone } from "./helpers";
+import { decodeRawSampleData } from "./sample";
 import { convertToFloat } from "./audio-decode";
 import { playSample, appendDecodedChunk } from "./playback-engine";
 
@@ -108,6 +109,10 @@ export function createSampleBufferExports(ctx: MSSContext): Record<string, Thunk
         MemoryGuard.writeUint32(mem, view, sample + 0x30, 0, "MSS32:set_sample_type:flags");
         MemoryGuard.writeUint32(mem, view, sample + 0x34, sampleObj.sampleRate >>> 0, "MSS32:set_sample_type:rate");
         MemoryGuard.writeUint32(mem, view, sample + 0x38, sampleObj.volume >>> 0, "MSS32:set_sample_type:vol");
+        if (sampleObj.fileFormat === "raw" && sampleObj.fileData) {
+            decodeRawSampleData(sampleObj);
+            refreshSampleLenDone(ctx, sampleObj);
+        }
         return 0;
     };
 
