@@ -1,7 +1,7 @@
 /**
  * Real Worker UDP receive-queue regressions against the saved Windows x86 capture.
- * Native source/certificate and the original actor RED are retained under
- * logs/lan-conformance/stage43 through stage45. Keep query/order assertions before
+ * The native fixture source, its Windows capture and the original actor RED are kept
+ * locally (not committed). Keep query/order assertions before
  * the separate ioctlsocket LastError contract. Empty recv is a secondary control.
  */
 import {expect, test} from "bun:test";

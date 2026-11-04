@@ -151,7 +151,7 @@ function data(actual:ReturnType<F["receive"]>,sender:Endpoint,payload:number[],p
 }
 async function run(name:string,body:(f:F)=>Promise<void>){
  const f=await createFixture();let first:unknown;
- try{await body(f);}catch(error){first=error;console.error(JSON.stringify({kind:"SOURCE_MECHANISM_NOT_NATIVE",name,transcript:f.transcript,error:String(error)}));}
+ try{await body(f);}catch(error){first=error;console.error(JSON.stringify({kind:"ENGINE_MECHANISM_NOT_NATIVE",name,transcript:f.transcript,error:String(error)}));}
  finally{try{await f.dispose();}catch(error){if(first===undefined)first=error;}}
  if(first!==undefined)throw first;
 }
@@ -178,7 +178,7 @@ test("dual UDP: actual AF4/AF6 arrivals share one AF23 FIFO, mapped reply and cl
  const errorPeek=f.receive(receiver,2),errorPlain=f.receive(receiver),later=f.receive(receiver);
  for(const error of[errorPeek,errorPlain]){expect(error.value).toBe(-1);expect(error.error).toBe(WSA.ECONNRESET);from(error,closed,23);}
  data(later,a,[0x44,0x45,0x46],23);
- // This closed-tuple part is SOURCE/mechanism projection, not a new native mapped-ICMP certificate.
+ // This closed-tuple part is an engine/mechanism projection, not a new native mapped-ICMP certificate.
 }),15000);
 
 test("dual TCP: AF4 client to AF23 listener and AF23 mapped client to AF4 listener",async()=>run("tcp",async f=>{
@@ -224,7 +224,7 @@ test("shared coverage: measured cross-family pair binds and physical alias retir
   f.note({measuredPairBind:{type,firstFamily,on,firstLocal,secondLocal}});
   f.close(first);f.close(second);await f.namespace.barrier();
  }
- // SOURCE/mechanism lifetime control: the native bind-only batch did not measure
+ // Engine/mechanism lifetime control: the native bind-only batch did not measure
  // surviving-owner delivery. No packet is sent while both cross-family owners live.
  const fourOwner=f.socket(2,2);f.bind(fourOwner,2,[0,0,0,0],local.port);
  const survivor=f.socket(23,2,0);f.bind(survivor,23,any6,local.port);

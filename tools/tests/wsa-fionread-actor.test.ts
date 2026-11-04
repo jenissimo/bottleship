@@ -2,7 +2,7 @@
  * UDP FIONREAD reports total queued payload bytes on AF_INET/AF_INET6.
  * Microsoft WinSock IOCTLs, FIONREAD section:
  * https://learn.microsoft.com/windows/win32/winsock/winsock-ioctls
- * NT5 AFD receive.c:1501-1513 snapshots aggregate bytes without consuming.
+ * Native record: tools/lan-conformance/cases/udp/fionread.native.log.
  *
  * Real namespace + dedicated Worker actor + public ioctlsocket/WSAIoctl ABI.
  * Single-datagram controls and actual receives establish payload/source delivery.

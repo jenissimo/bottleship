@@ -1013,7 +1013,8 @@ export function makeSocketExports(
 ): Record<string, ThunkImplementation> {
     const sockets = makeNetworkSocketExports(table, setLastError, counter, validateSocketTriple, process);
     if (legacyIpOptions) {
-        // wsock32's pre-Winsock2 IP option namespace, NT5 wsock32/sockopt.c.
+        // wsock32's pre-Winsock2 IP option namespace: the Winsock 1.1 winsock.h values
+        // (IP_MULTICAST_IF=2 ... IP_DONTFRAGMENT=9) differ from ws2ipdef.h; wsock32 maps them.
         const translated: Record<number, number> = { 2: 9, 3: 10, 4: 11, 5: 12, 6: 13, 7: 4, 8: 3 };
         for (const name of ["setsockopt", "getsockopt"]) {
             const implementation = sockets[name]!;
