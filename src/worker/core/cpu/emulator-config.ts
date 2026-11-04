@@ -2,7 +2,10 @@
 // HEAP_HIGH (see MEM_HEAP_HIGH_BASE), which is what lets a 32-bit title with a real
 // 400MB+ working set live inside a 512MB HEAP bucket. WASM memory is committed, not
 // resident, so the surplus costs commit charge and not RSS until the guest touches it.
-export const EMU_MEMORY_SIZE = 1536 * 1024 * 1024; // 1.5 GB
+// DEV-only experiment knob (VITE_BS_RAM_MB): resize guest RAM without repacking a bundle,
+// e.g. to bisect a mobile WebContent memory kill. Production builds ignore it.
+const DEV_RAM_MB = import.meta.env?.DEV ? Number(import.meta.env?.VITE_BS_RAM_MB ?? 0) : 0;
+export const EMU_MEMORY_SIZE = (DEV_RAM_MB > 0 ? DEV_RAM_MB : 1536) * 1024 * 1024; // 1.5 GB default
 export const EMU_VGA_MEMORY_SIZE = 8 * 1024 * 1024;
 // Largest single allocation the guest heap will accept. Purely a corrupted/garbage-size
 // guard — the real ceiling is the bucket's free space (an oversize request fails there →
