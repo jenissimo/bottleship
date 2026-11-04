@@ -774,7 +774,31 @@ export async function extractInstallShield(
         done++;
         opts.onProgress?.(done, live.length, outPath);
     }
+    for (const dir of emptyInstallDirs(info, live)) result.set(`${dir}/`, new Uint8Array(0));
     return result;
+}
+
+/**
+ * Directories the install creates with nothing in them. The authoring tool records an
+ * empty source folder as a zero-length FILE_INVALID entry in that folder, so the folder
+ * exists after setup even though no file lands in it (a save directory the game opens
+ * files in without creating it). Keyed `dir` without the trailing slash.
+ */
+function emptyInstallDirs(info: InstallShieldInfo, live: InstallShieldFile[]): string[] {
+    const parent = (p: string) => p.slice(0, Math.max(0, p.lastIndexOf("/")));
+    const occupied = new Set<string>();
+    for (const f of live) {
+        const path = resolveInstallPath(f, info);
+        for (let d = path ? parent(path) : ""; d; d = parent(d)) occupied.add(d.toLowerCase());
+    }
+    const out = new Set<string>();
+    for (const f of info.files) {
+        if (!(f.flags & FILE_INVALID) || f.expanded !== 0 || !f.dir) continue;
+        const path = resolveInstallPath({ ...f, name: "x" }, info);
+        const dir = path === null ? "" : parent(path);
+        if (dir && !occupied.has(dir.toLowerCase())) out.add(dir);
+    }
+    return [...out].sort();
 }
 
 /**
