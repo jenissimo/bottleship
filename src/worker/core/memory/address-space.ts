@@ -151,9 +151,11 @@ export class AddressSpace {
         this.noteRegionAdded(newEntry);
         if (entry.owner === "Layout") {
             this.layoutBucketMap.set(entry.kind, newEntry);
-        } else {
-            // A registered region (PE image, ROM file, VirtualAlloc block, HLE image) is
-            // about to be written by its owner: its pages no longer count as known-zero.
+        } else if (entry.owner !== "PELoader") {
+            // A registered region (ROM file, VirtualAlloc block, HLE image) is about to be
+            // written by its owner: its pages no longer count as known-zero. The PE loader
+            // marks its images itself, after zeroing them, so a never-touched .bss is not
+            // written just because the image was mapped (PELoader.clearImageRegion).
             markGuestPagesDirty(newEntry.base, newEntry.size);
         }
         // Seed bit0 for writable-RAM regions (HEAP/SURFACE/THUNK_DATA);

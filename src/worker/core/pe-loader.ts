@@ -28,6 +28,7 @@ import { writeMbwcStubs, resetMbwcInlineStubs, type MbwcInlineStubs } from '../m
 import { serializeMbwcStubTable, writeMbwcStubDestLimit } from '../modules/kernel32/codepage-lut';
 import { loadDiagnostics } from './diagnostics/load-diagnostics';
 import { writeGuestCode, invalidateGuestCode } from './memory/guest-code';
+import { markGuestPagesDirty, zeroGuestRange } from './memory/guest-page-dirty';
 import { resolveImportBinding, isD3dx9VersionedDll } from './pe-import-binding';
 import { dllSearchDirectories } from './dll-search-order';
 
@@ -396,7 +397,12 @@ export class PELoader {
     }
 
     /** Zero `[base, base+length)`, clipped to guest RAM. Returns the bytes actually cleared,
-     *  so the caller's JIT invalidation covers exactly what it touched. */
+     *  so the caller's JIT invalidation covers exactly what it touched.
+     *
+     *  Lazily: pages already known zero are not written (guest-page-dirty.ts), so the part
+     *  of a .bss nobody touches never becomes resident. The image is NOT dirty yet — the
+     *  section copies mark what they write, the .bss fill relies on that, and the caller
+     *  marks the whole image once it is mapped ({@link markImageMapped}). */
     private clearImageRegion(base: number, length: number, label: string): number {
         const mem = this.memory;
         const start = base >>> 0;
@@ -410,8 +416,13 @@ export class PELoader {
                 `[PE] ${label}: image at 0x${start.toString(16)} needs 0x${length.toString(16)} bytes but only ` +
                 `0x${cleared.toString(16)} of guest RAM remain — the load will be truncated`);
         }
-        mem.fill(0, start, start + cleared);
+        zeroGuestRange(mem, start, cleared);
         return cleared;
+    }
+
+    /** The image is mapped: from here on the guest owns its pages (.bss included). */
+    private markImageMapped(base: number, length: number): void {
+        markGuestPagesDirty(base >>> 0, length);
     }
 
     async loadExecutable(peData: Uint8Array): Promise<LoadedModule> {
@@ -478,6 +489,7 @@ export class PELoader {
         // the load TOUCHED, not just the image — the clear runs 64KB past SizeOfImage, and
         // a previous tenant's compiled blocks in that tail would otherwise survive the zeroing.
         invalidateGuestCode(baseAddress, clearedBytes);
+        this.markImageMapped(baseAddress, clearedBytes);
 
         // Registered BEFORE its imports are resolved, the order Windows uses. An import whose
         // preferred ImageBase is the EXE's own (cw3220, like every Watcom runtime, prefers
@@ -624,7 +636,9 @@ export class PELoader {
             const fillStart = targetAddr + copySize;
             const fillEnd = Math.min(targetAddr + Math.max(mappedSize, copySize), this.memory.length);
             if (fillEnd > fillStart) {
-                this.memory.fill(0, fillStart, fillEnd);
+                // Only the pages a section copy (or a previous tenant) dirtied are written;
+                // clearImageRegion already left the rest of the extent zero.
+                zeroGuestRange(this.memory, fillStart, fillEnd - fillStart);
                 Logger.log(LogCategory.SYSTEM,
                     `[PE] Section ${sectionName}: zero-filled ${fillEnd - fillStart} bytes at 0x${fillStart.toString(16)}`);
             }
@@ -799,6 +813,7 @@ export class PELoader {
             // Apply base relocations (MUST be done after sections are loaded, before imports)
             this.applyRelocations(peData, baseAddress);
             invalidateGuestCode(baseAddress, clearedBytes);
+            this.markImageMapped(baseAddress, clearedBytes);
 
             // Process TLS directory (implicit __declspec(thread) variables)
             // Must be after sections+relocations so guest memory has correct VAs.
