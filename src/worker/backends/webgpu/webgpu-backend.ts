@@ -11,6 +11,7 @@ import { setD3D9VolumeCapabilityContract } from "./shared/volume-policy";
 import { setD3D9MsaaCapabilityContract } from "./d3d9/multisample";
 import { setD3D9WebGpuCapabilityLimits } from "./shared/webgpu-capability-limits";
 import { coversTarget, overlayDestRect, publishComputedPresentRect } from "./shared/present-geometry";
+import { instrumentGpuDeviceCensus } from "./shared/gpu-memory-census";
 
 /** Backoff between requestDevice attempts while recovering, in ms. The list also fixes how
  *  many attempts there are: a GPU that has not come back by ~4s is gone, and retrying past
@@ -133,6 +134,8 @@ export class WebGPUBackend implements RenderBackend {
 
     /** Take ownership of a device: capabilities, queue, and the two error channels. */
     private async adoptDevice(device: GPUDevice): Promise<void> {
+        // Byte census for harness `footprint` (estimates; see gpu-memory-census.ts).
+        instrumentGpuDeviceCensus(device);
         this.device = device;
         this.bcSupported = device.features.has("texture-compression-bc");
         this.queue = device.queue;

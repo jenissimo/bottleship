@@ -33,6 +33,7 @@ import { diskBundleUrl } from "../utils/bundle-url";
 import { INPUT_INDEX, KEY_BITFIELD_BASE, KEY_BITFIELD_COUNT } from "../input/sab-layout";
 import { relativeIntent } from "../input/relative-intent";
 import { storageReport } from "./storage-report";
+import { sharedBufferCensus } from "../utils/shared-buffer-census";
 
 /** Verbs handled page-side (browser-only) rather than forwarded to the worker. */
 const BROWSER_ONLY = new Set([
@@ -687,6 +688,14 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         setHostModal,
         hostModals: () => ({ modals: hostModalCensus() }),
         report: (...args: unknown[]) => reportWithHost(args),
+        /** Worker `footprint` plus the page's own SAB census and JS heap (see docs/harness.md). */
+        footprint: async (...args: unknown[]) => {
+            const worker = await rpc("footprint", args) as Record<string, unknown>;
+            const sab = sharedBufferCensus();
+            const heap = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory;
+            return { ...worker, page: { sabCount: sab.count, sabMB: Math.round(sab.bytes / 1048576 * 10) / 10,
+                sabByLabel: sab.byLabel, jsHeapUsedMB: heap ? Math.round(heap.usedJSHeapSize / 1048576 * 10) / 10 : null } };
+        },
     };
 
     // Proxy so any worker command is callable as harness.<cmd>(...args) (like the
