@@ -551,7 +551,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                     context.gdiSurfaceVisible = false;
                     Logger.verbose(LogCategory.DDRAW,
                         `Flip: calling present dst=0x${dstState.surfacePtr.toString(16)} gpuDirty=${(dstState as any).gpuDirty} gpuTexView=${!!dstState.gpuTextureView}`);
-                    void context.presenter.present(dstState, mem, { throttle: true, frameAlreadyMarked: true });
+                    void context.presenter.present(dstState, mem, { throttle: true, frameAlreadyMarked: true, flip: true });
                 } else {
                     Logger.warn(LogCategory.DDRAW, `Flip: suppressPresent=true, skipping present!`);
                 }
