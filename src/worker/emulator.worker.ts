@@ -1,6 +1,7 @@
 import { parseIoProfile, profileChunkOrder, type WgbIoPolicy } from "@bottleship/formats/wgb/io-profile";
 import { V86 } from "v86";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
+import { adoptFreshGuestMemory } from "./core/memory/guest-page-dirty";
 import { Process } from "./core/process";
 import { System, type GuestImagePatch } from "./core/system";
 import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, setChildRegistrySink, forwardRegistryToChildren, type ChildBoot, type ChildProcessPreparation } from "./core/child-process";
@@ -2484,6 +2485,14 @@ const initV86 = async (canvas: OffscreenCanvas) => {
 
     v86.add_listener("emulator-ready", async () => {
       bootMark("v86-emulator-ready");
+      // Fresh wasm memory reads zero. Say so before anything writes guest RAM, so zeroing
+      // sites (Process.reset, VirtualAlloc commit, slab arenas) skip pages that are already
+      // zero instead of making them resident — see guest-page-dirty.ts. v86 has already
+      // loaded its BIOS images below 1 MB; that range stays dirty.
+      {
+        const freshMem = v86.mem8 || (v86.v86 && v86.v86.cpu.mem8);
+        if (freshMem) adoptFreshGuestMemory(freshMem, 0x00100000);
+      }
       const apiRegistry = APIRegistry.getInstance();
 
       // Create the Process environment

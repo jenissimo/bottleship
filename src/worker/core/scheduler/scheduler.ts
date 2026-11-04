@@ -2042,7 +2042,11 @@ export class Scheduler {
         }
 
         const stackTop = stackBase + size;
-        memory.fill(0, stackBase, stackTop);
+        // A fresh stack comes from MemoryManager.alloc, which hands out zeroed memory (and
+        // writes only pages something dirtied — guest-page-dirty.ts). Re-zeroing it would
+        // make the whole reserve resident on creation, where Windows commits a stack lazily
+        // behind its guard page. A pooled stack still carries its previous tenant's frames.
+        if (reusedStack) memory.fill(0, stackBase, stackTop);
         // Guests run code on their own stacks (the SEH trampoline this dispatcher writes
         // into the dead zone below ESP is ours), so a recycled stack can still carry v86
         // blocks compiled from its previous tenant. The zero-fill above is a JS write and
