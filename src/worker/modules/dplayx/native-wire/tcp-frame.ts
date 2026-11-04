@@ -1,7 +1,9 @@
 /**
- * Isolated normal TOKEN framing of legacy DirectPlay system messages.
- * NT5 wsock/dpsp.h:94-128,293-305, wsock/dpsp.c:484-493,
- * 1119-1169,1299-1336,3535-3557 and dplay/dpmess.h:162-190.
+ * DPSP_MSG_HEADER framing of DirectPlay 4 system messages over TCP
+ * ([MC-DPL4CS] 2.1 Transport, 2.2.6 DPSP_MSG_HEADER): a DWORD whose low 20
+ * bits are the total message size and high 12 bits the token (0xFAB, "received
+ * from a remote DirectPlay machine"), a 16-byte SOCKADDR_IN (2.2.1), then the
+ * 'play' signature, Version and Command Value.
  * This is an inner codec, not a socket, routing, or native interop claim.
  */
 export interface DirectPlay4SystemTcpFrame {
@@ -19,7 +21,7 @@ function limit(value: number): void {
         throw new RangeError("frame limit must be between 28 and 1048575");
 }
 
-/** Build the normal 20-byte provider header around an existing system message. */
+/** Build the 20-byte size/token + SockAddr prefix of DPSP_MSG_HEADER around a system message. */
 export function encodeDirectPlay4SystemTcpFrame(
     providerSockaddr: Uint8Array, message: Uint8Array, maxBytes: number,
 ): Uint8Array {
@@ -44,10 +46,10 @@ export function encodeDirectPlay4SystemTcpFrame(
  * Decode one already-buffered normal system frame, or null if incomplete.
  * consumed permits a caller to process concatenated frames. All returned
  * bytes are independently owned, including when input is a Node Buffer.
- * Bounds, minimum size, and unsupported-token rejection are local safety
- * policy; zero-size controls, non-system messages, server/helper/reuse tokens,
+ * Bounds, minimum size, and rejection of tokens other than 0xFAB are local
+ * safety policy; the 0xCAB/0xBAB server tokens, DPSP_MSG_PACKET/PACKET2
  * packetization, receive-side address rewriting and native malformed-input
- * semantics are outside this slice.
+ * semantics are outside this slice and are rejected as unsupported.
  */
 export function decodeDirectPlay4SystemTcpFrame(
     input: Uint8Array, maxBytes: number,

@@ -1,5 +1,5 @@
 /**
- * Listbox caret state, pinned to the NT5/Wine class-proc contract and the UE1
+ * Listbox caret state, pinned to the LB_* documentation, Wine listbox.c and the UE1
  * WListBox call pattern used by Harry Potter COS.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
@@ -57,7 +57,7 @@ describe("ListBox LB_*CARETINDEX", () => {
         expect(send(LB_GETCARETINDEX)).toBe(2);
     });
 
-    test("single-select LB_SETCARETINDEX follows NT5 rejection rules", () => {
+    test("single-select LB_SETCARETINDEX follows Wine's rejection rules", () => {
         expect(send(LB_SETCARETINDEX, 2)).toBe(0);
         expect(send(LB_GETCARETINDEX)).toBe(2);
 

@@ -26,13 +26,10 @@ The own-process WSASendTo IAT hook records getsockname and original WSABUF bytes
 
 The isolated Host currently supports exactly Host + one admitted Peer, flags zero, C1/C2/C3/C5/C6/C9/CA and direct data. It is not installed in guest COM Host. This oracle does not establish native Host discovery, multiple peers, host migration, security, IPv6, group mutation or remote COMPLETEONPROCESS semantics.
 
-Ground truth navigation (reference behavior; no implementation source copied):
-- G:\\sources\\nt5src\\Source\\XPSP1\\NT\\multimedia\\directx\\dplay\\dnet\\core\\common.cpp:2720 Host, 3050-3095 listener success before local CREATE.
-- core/coreconnect.cpp:148/314 admission, 410-466 C2 copy/send and RETURN_BUFFER, 588 C3/C6, 702 validation, 882 reservation, 904 INDICATE, 950-1011 C5 failure.
-- core/user.cpp:125-196 INDICATE_CONNECT fields and callback outputs.
-- core/appdesc.h:249-256 DPNID XOR mask from the first instance GUID DWORD.
-- core/nametable.h:82-95 20-bit slot / 12-bit version handles; core/nametable.cpp:705-720 native FindEntry validation.
-- sp/wsock/endpoint.cpp:4687 unknown source to listener child; protocol/receive.cpp:139 and protocol/connect.cpp:647/840 native transport handshake.
-- G:\\sources\\wine\\include\\dplay8.h defines the ABI. Wine's Host stub is not wire evidence.
+Public references:
+- [MC-DPL8CS] 2.2.1 connect messages (C1 PLAYER_CONNECT_INFO, C2 SEND_CONNECT_INFO, C3 ACK_CONNECT_INFO, C5 CONNECT_FAILED, C6 INSTRUCT_CONNECT), 2.2.6 (C9 NAMETABLE_VERSION / CA RESYNC_VERSION), 2.2.7 (DPNID: 20-bit index, table version, XOR with the first instance GUID DWORD) and 3.1.5.2 (peer-to-peer connect sequence).
+- [MC-DPL8R] for the transport connect handshake.
+- DirectX 9 SDK documentation: IDirectPlay8Peer::Host, DPN_MSGID_INDICATE_CONNECT and DPN_MSGID_CREATE_PLAYER.
+- Wine include/dplay8.h for the ABI. Wine's Host stub is not wire evidence.
 
-The initial same-PE reference and actual Bun interop were recorded separately under logs/lan-conformance/stage28-native-host. Native results and source references have distinct roles: a source description alone does not prove modern Windows behavior.
+The same-PE reference run and the Bun interop run are kept locally and are not committed. Native results decide behavior; documentation alone does not prove modern Windows behavior.

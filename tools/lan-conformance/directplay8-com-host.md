@@ -22,7 +22,7 @@ callback-header.bin has7 DWORDs: magic0x42534843,version1,nonce,role,rejectMode,
 
 The callback legally reuses its application-owned reply array after RETURN_BUFFER; the Peer independently checks the original eight bytes. CREATE captures input context before assigning a role context. Incoming data is retained with DPNSUCCESS_PENDING, checked and released through ReturnBuffer twice to measure the exact second-call HRESULT.
 
-Ground truth: G:\sources\wine\include\dplay8.h (ABI) and NT5 dnet core/user.cpp125-230 (INDICATE/ABORTED), core/coreconnect.cpp (reservation, reply/C2/C5/C3), common.cpp (Host/listen before local CREATE). The previous raw-wire oracle separately measures socket and packet behavior. This API-only trace alone does not prove physical Host ingress or discovery/migration/security parity.
+Ground truth: Wine include/dplay8.h (ABI), the DirectX 9 SDK documentation for DPN_MSGID_INDICATE_CONNECT / DPN_MSGID_INDICATED_CONNECT_ABORTED and IDirectPlay8Peer::Host, and [MC-DPL8CS] 2.2.1 / 3.1.5 for the C2/C5/C3 connect replies. The previous raw-wire oracle separately measures socket and packet behavior. This API-only trace alone does not prove physical Host ingress or discovery/migration/security parity.
 
 The maintained browser controller uses the existing immutable baseline:
 

@@ -102,8 +102,9 @@ export function writeHeapSlabStubs(
     w8(0x0F); w8(0xB6); w8(0x88); w32(lutAddr);
 
     // Large bins (>= 6 = 1024/2048/4096) use a FIFO free list maintained by the WASM
-    // hypercall (a freed large block is not re-handed immediately — matches NT5's
-    // non-lookaside back-end; see hypercall.rs SLAB_LARGE_BIN_MIN). The inline pop is
+    // hypercall (a freed large block is not re-handed immediately, so use-after-free
+    // in titles does not see its own block recycled at once; the Windows heap docs
+    // describe lookaside lists only for small blocks; see hypercall.rs SLAB_LARGE_BIN_MIN). The inline pop is
     // strict LIFO and has no tail pointer, so route large allocs to the OUT-trap.
     // CMP ECX, 6          ; 83 F9 06
     w8(0x83); w8(0xF9); w8(0x06);

@@ -117,7 +117,7 @@ describe("durable Winsock socket actor",()=>{
         const h=fixture(),source=h.socket(),sender=h.socket(h.sibling);h.call(h.root,"bind",[source,h.address]);const target=h.call(h.root,"duplicate",[source,h.child.pid]);
         h.call(h.child,"set",[target,{broadcast:true,receiveLimit:2}]);expect(h.call(h.child,"get",[target]).broadcast).toBe(true);expect(h.call(h.root,"get",[source]).broadcast).toBe(false);
         expect(h.call(h.root,"get",[source]).receiveLimit).toBeGreaterThan(2);
-        // The native first-packet probe admits a whole packet beyond a tiny window; NT5 drops later arrivals while full.
+        // The native first-packet probe admits a whole packet beyond a tiny window; later arrivals are dropped while full (SO_RCVBUF docs).
         h.call(h.sibling,"send",[sender,Uint8Array.of(1,2,3),h.address]);expect(h.call(h.root,"readable",[source])).toBe(true);
         h.call(h.sibling,"send",[sender,Uint8Array.of(7,8,9),h.address]);
         expect(h.call(h.root,"receive",[source,8,2]).data).toEqual(Uint8Array.of(1,2,3));

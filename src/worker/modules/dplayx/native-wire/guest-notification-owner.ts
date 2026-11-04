@@ -28,9 +28,10 @@ export class DirectPlay4GuestNotificationOwner {
     applyRosterChanges(recipients:readonly number[],change:DirectPlay4NativeRosterChange):boolean {
         const requested=Array.from(recipients),selected=new Set(requested);
         if(selected.size!==requested.length)throw new RangeError("invalid guest recipient");
-        // NT5 inserts ordinary players immediately after system players, then
-        // distributes system messages by walking that list (newest first).
-        const ids=[...this.session.entities.keys()].filter(id=>selected.has(id)).reverse();
+        // The order in which several local players receive the same system message is
+        // not specified ([MC-DPL4CS] and the IDirectPlay4::Receive docs are silent); the
+        // engine delivers in local player creation order.
+        const ids=[...this.session.entities.keys()].filter(id=>selected.has(id));
         if(ids.length!==requested.length)throw new RangeError("invalid guest recipient");
         return this.submitMany(ids,()=>{
             if(ids.includes(change?.playerId))throw new RangeError("invalid guest recipient");

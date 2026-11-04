@@ -625,9 +625,10 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
 
       const isStreaming = (flags & FLAG_STREAMING) !== 0;
       // The write-cursor hold below is for one-shot streams (video audio) that must END at
-      // the last written byte. A LOOPING buffer never holds: NT5's Grace mixer computes the
-      // play position from the primary's DAC position and mixes the ring unconditionally —
-      // an under-written lap replays its last content. Holding a looping stream would let
+      // the last written byte. A LOOPING buffer never holds: per the DirectSound streaming
+      // buffer docs (IDirectSoundBuffer::Play with DSBPLAY_LOOPING) the play cursor keeps
+      // wrapping whether or not the app refilled the ring — an under-written lap replays
+      // its last content (also what real Windows does audibly when a pump stalls). Holding a looping stream would let
       // the app's own pump decide whether the play cursor advances, and a pump that sizes
       // each Lock from the cursor delta then deadlocks the moment it goes quiet.
       const streamingHold = isStreaming && loopMode !== -1;
@@ -661,10 +662,9 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       const writeCursorFrame = isStreaming ? Math.floor(writeCursorBytes / blockAlign) : 0;
 
       // A looping dsound buffer whose guest stopped refilling it keeps mixing the stale
-      // ring — that is what the real software mixer does. Its position math derives
-      // entirely from the primary buffer's cursor and it records nothing about how far
-      // the app has written (nt5 dsound CGrace::GetBytePosition), so there is no
-      // drained-queue silence to imitate and no legitimate pump cadence to misjudge.
+      // ring — that is the documented looping behavior: DirectSound tracks only the play
+      // and write cursors and has no notion of how far the app has written, so there is
+      // no drained-queue silence to imitate and no legitimate pump cadence to misjudge.
 
       for (let i = 0; i < frames; i++) {
         while (loopEnd < totalFrames && pos >= loopEnd

@@ -26,7 +26,7 @@ export interface ForegroundQueue {
     threadId: number;
 }
 
-/** `null` on either side means no foreground at all (NT gpqForeground == NULL). */
+/** `null` on either side means no foreground at all (no foreground queue). */
 export type ForegroundQueueObserver = (next: ForegroundQueue | null, prev: ForegroundQueue | null) => void;
 
 export interface WindowObject {
@@ -91,7 +91,7 @@ export class WindowManager {
     private activeHwnd = 0;     // Active top-level window (GetActiveWindow)
     private focusHwnd = 0;      // Focus window — may be a child (GetFocus)
     private foregroundHwnd = 0; // Foreground top-level window (GetForegroundWindow)
-    private foregroundThreadId = 0; // Queue behind foregroundHwnd (NT gpqForeground)
+    private foregroundThreadId = 0; // Queue (thread) behind foregroundHwnd
     private captureHwnd = 0;    // Mouse capture owner (GetCapture / SetCapture)
 
     /**
@@ -151,12 +151,11 @@ export class WindowManager {
     }
 
     /**
-     * Notified when the FOREGROUND INPUT QUEUE changes — NT xxxSetForegroundWindow2 guards
-     * its global-mode teardown with `gpqForeground != gpqForegroundPrev` (focusact.c), and
-     * a queue is a thread's, so moving the foreground between two windows of ONE thread is
-     * not a switch and must leave those modes alone. The cursor clip is the mode we drop
-     * here ("it is a global mode that gets removed when switching"); LockWindowUpdate and
-     * mouse tracking are the others NT drops at the same point.
+     * Notified when the FOREGROUND INPUT QUEUE changes. A queue is a thread's (see the
+     * Win32 "About Messages and Message Queues" docs), so moving the foreground between
+     * two windows of ONE thread is not a switch and must leave global input modes alone;
+     * wineserver set_foreground_input makes the same distinction. The cursor clip is the
+     * mode we drop here.
      *
      * Observers are deduped by identity so a re-`initialize()` on a game switch cannot
      * grow a second copy of the same one.

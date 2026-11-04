@@ -2,10 +2,10 @@
  * IMM32 input contexts: the INPUTCONTEXT block ImmLockIMC hands out, its lock count, the
  * IMCC components, and window association (ImmAssociateContext[Ex]).
  *
- * Ground truth: imm.h / immdev.h for the layout; NT5 imm32 context.c CreateInputContext
- * for the initial contents; ntimm.c AssociateInputContextEx for the association rules.
- * The local-memory fake follows kernel32's moveable-handle contract, since every IMM block
- * is an LHND local handle.
+ * Ground truth: imm.h / immdev.h for the layout; the ImmLockIMC / ImmCreateIMCC docs and
+ * Wine imm32 for the initial contents; the ImmAssociateContextEx docs for the association
+ * rules. The local-memory fake follows kernel32's moveable-handle contract, since the
+ * engine models every IMM block as an LHND local handle.
  */
 
 import { beforeEach, describe, expect, test } from "bun:test";

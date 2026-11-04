@@ -7,7 +7,7 @@ server round-trip. It loads a game's PE executable directly and reimplements Win
 itself (Win32, COM, DirectDraw / Direct3D 3–9, DirectSound) on top of WebGPU, WebAudio
 and OPFS.
 
-[Play online](https://bottleship.pages.dev) · [Release 0.7](https://github.com/jenissimo/bottleship/releases/tag/v0.7.0) · [Compatibility](docs/compatibility.md) · [Documentation](#documentation) · [Contributing](CONTRIBUTING.md)
+[Play online](https://bottleship.happydog.games) · [Release 0.7](https://github.com/jenissimo/bottleship/releases/tag/v0.7.0) · [Compatibility](docs/compatibility.md) · [Documentation](#documentation) · [Contributing](CONTRIBUTING.md)
 
 <!-- TODO: hero.gif — a short montage (Max Payne / NFS Underground / StarCraft / Unreal) -->
 
@@ -32,7 +32,7 @@ Tomb Raider II…) — you can drop the offline installer straight in. Because o
 freeware** are legally redistributable, the online library lets you play those instantly;
 everything else, you bring your own legally-owned copy.
 
-[Open the game library →](https://bottleship.pages.dev)
+[Open the game library →](https://bottleship.happydog.games)
 
 ## Why
 

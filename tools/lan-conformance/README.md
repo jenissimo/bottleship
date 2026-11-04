@@ -5,9 +5,10 @@ Windows and in BottleShip. DirectPlay wire capture uses paired native host and
 guest builds, whose separate hashes are recorded. Each comparison proves its
 recorded observations, not complete API coverage or
 compatibility with every game. The current native reference machine runs Windows
-11 build 26300 (x64); the fixtures themselves run as x86 processes. NT5 and Wine
-sources under the owner's reference directory help explain ABI and state
-transitions. They are not substituted for native observations.
+11 build 26300 (x64); the fixtures themselves run as x86 processes. The Microsoft Open
+Specifications ([MC-DPL4CS], [MC-DPL8CS], [MC-DPLHP]), the public SDK headers and
+Wine help explain ABI and state transitions. They are not substituted for native
+observations. Leaked or proprietary source is never used.
 
 ## Build and compare
 

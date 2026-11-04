@@ -15,7 +15,7 @@ export function decodeNativeInfoRequest(bytes:Uint8Array):NativeInfoRequest|null
   return{id,handle:view.getUint32(4,true),mask,name,data};
  }catch{return null;}
 }
-/** DB authority update, packed in the same name-then-data CPackedBuffer order as native. */
+/** DB authority update ([MC-DPL8CS] 2.2.5.2), tail-packed name-then-data as in the native D6/DB capture. */
 export function encodeNativeInfoUpdate(info:NativeInfoRequest&{version:number;requesting:number}):Uint8Array{
  const name=info.mask&1?nativeCoreWide(info.name):new Uint8Array(),data=info.mask&2?info.data:new Uint8Array();
  if(info.mask&~3||name.length>2050||data.length>60000||!info.id||!info.version)throw RangeError("Invalid native info update");

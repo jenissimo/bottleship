@@ -1,7 +1,7 @@
 import {expect,test} from "bun:test";
 import {encodeDirectPlay4PlayerTcpFrame,decodeDirectPlay4PlayerTcpFrame,DirectPlay4PlayerTcpStream} from "../../src/worker/modules/dplayx/native-wire/player-tcp";
 const hex=(s:string)=>Uint8Array.from(Buffer.from(s.replace(/\s/g,""),"hex"));
-// Real exchange: logs/lan-conformance/dp4-data-native-websocket-20261028-second/result.json.
+// Real exchange with a Windows host (directplay4-com-data.ts over WebSocket; result kept locally).
 // Host Receive and Send succeeded. Provider padding is preserved as raw bytes.
 const outbound=hex("2d00b0fa 0200e1cbc0a838010000000000000000 05d97907 07d97907 636c69656e742d33323434353636373335");
 const inbound=hex("2b00b0fa 020012c95e13de3510000000faaddbba 07d97907 05d97907 686f73742d33323434353636373335");

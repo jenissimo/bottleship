@@ -3,9 +3,9 @@ import { encodeDirectPlay4EnumSessionsRequest, encodeDirectPlay4EnumSessionsRepl
 
 const bytes = (hex: string) => Uint8Array.from(Buffer.from(hex.replace(/\s/g, ""), "hex"));
 
-// Independent NT5 dpmess.h/enum.c and wsock dpsp.h/dpsp.c/winsock.c layout.
-// Source-derived literal profile; it is not a captured packet or interop proof.
-// AF_INET, return address 192.0.2.1:2300, raw GUID 00..0f, no password, flags 0.
+// Literal built by hand from [MC-DPL4CS] 2.2.6 + 2.2.29 (compare the 4.1 example);
+// it is not a captured packet. AF_INET, return address 192.0.2.1:2300,
+// raw GUID 00..0f, no password, flags 0, version DX8VERSION (13).
 const literal = bytes(
     "3400b0fa 020008fc c0000201 0000000000000000 " +
     "706c6179 02000d00 000102030405060708090a0b0c0d0e0f 00000000 00000000",
@@ -42,7 +42,7 @@ test("encoder rejects invalid input extents, address family and DWORD flags", ()
 });
 
 test("normal nonsecure internal enum reply matches independent x86 literal", () => {
-    // Source-derived layout; version 11 is an explicit input, not a DoReply claim.
+    // [MC-DPL4CS] 2.2.30 + 2.2.5 layout; version 11 is an explicit input.
     const instance = bytes("000102030405060708090a0b0c0d0e0f");
     const application = bytes("101112131415161718191a1b1c1d1e1f");
     const result = encodeDirectPlay4EnumSessionsReply({

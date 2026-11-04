@@ -23,8 +23,8 @@ export const imagehlpModule: ModuleDescriptor = {
         makeFunc("UnMapAndLoad", 1),
         makeFunc("ImageRvaToVa", 4),
 
-        // imagehlp.dll exports the dbghelp symbol/stack-walk surface too — NT builds the
-        // two from one source and re-exports it here (imagehlp.src, XPSP1). GetProcAddress
+        // imagehlp.dll exports the dbghelp symbol/stack-walk surface too (visible in the
+        // export table of the shipped imagehlp.dll and in the SDK's imagehlp.h). GetProcAddress
         // is scoped by HMODULE, so these must be DECLARED under imagehlp as well or a
         // caller holding imagehlp's handle resolves nothing. Arities match dbghelp's: a
         // DWORD64 argument occupies two stack dwords, which is what makes the *64 forms

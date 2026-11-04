@@ -1,5 +1,5 @@
 /**
- * SOURCE mechanism only: real child Worker/public WSADuplicateSocketW→WSASocketW.
+ * Engine mechanism only: real child Worker/public WSADuplicateSocketW→WSASocketW.
  * Native8dc9 measured SAME-process immediate imports, not delayed cross-process
  * cache timing. No physical mutation occurs between this export and its import.
  */
@@ -43,7 +43,7 @@ function checkData(r:any,source:ReturnType<ReturnType<typeof publicContext>["loc
  expect(r.length).toBe(source.length);expect(r.name.slice(0,r.length)).toEqual(source.raw.slice(0,source.length));
  expect(r.name.slice(r.length)).toEqual(Array(32-r.length).fill(0xa5));
 }
-for(const family of[2,23] as const)test("SOURCE child reservation survives creator finish, cache seed and shared FIFO AF"+family,async()=>{
+for(const family of[2,23] as const)test("ENGINE child reservation survives creator finish, cache seed and shared FIFO AF"+family,async()=>{
  const pid=51400+family,network=new LanNetwork(),ns=new RootNetworkNamespace(network,16,pid);
  let f:ReturnType<typeof publicContext>|undefined,child:ReturnType<typeof childProcess>|undefined,first:unknown;
  const observed:unknown[]=[];
@@ -84,7 +84,7 @@ for(const family of[2,23] as const)test("SOURCE child reservation survives creat
   expect([offeredEmpty,offeredData]).toEqual([0,payload.length]);
   checkData(peek,source,[]);checkData(empty,source,[]);checkData(data,source,payload);
   expect(rebound.port).toBe(endpoint.port);
- }catch(error){first=error;console.error(JSON.stringify({kind:"SOURCE_CROSS_PROCESS_NOT_NATIVE_CERTIFICATE",family,observed,trace:f?.trace,error:String(error)}));}
+ }catch(error){first=error;console.error(JSON.stringify({kind:"ENGINE_CROSS_PROCESS_NOT_NATIVE_CERTIFICATE",family,observed,trace:f?.trace,error:String(error)}));}
  finally{
   try{await child?.close();}catch(error){if(first===undefined)first=error;}
   try{f?.dispose();}catch(error){if(first===undefined)first=error;}

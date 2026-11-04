@@ -2,8 +2,9 @@ import {decodeDirectPlay4SystemTcpFrame,type DirectPlay4SystemTcpFrame} from "./
 import {decodeDirectPlay4PlayerTcpFrame,type DirectPlay4PlayerTcpFrame} from "./player-tcp";
 import {decodeDirectPlay4PlayerWrapper} from "./player-wrapper";
 
-/** Normal provider TOKEN and nonsecure player IDs, including PLAYERWRAPPER.
- * Secure messages, NOMESSAGEID and control tokens need their own handlers.
+/** TCP stream of 0xFAB-token messages ([MC-DPL4CS] 2.2.6): system messages ('play'
+ * signature at +20), 2.2.45 player messages with idFrom/idTo, and 2.2.47 PLAYERWRAPPER.
+ * Secure messages, NM-flag sessions (no IDs) and the other tokens are unsupported.
  * Bounds are local safety policy. */
 export type DirectPlay4MixedTcpFrame =
     | {kind:"system";frame:DirectPlay4SystemTcpFrame}

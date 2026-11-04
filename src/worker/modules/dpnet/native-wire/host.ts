@@ -79,7 +79,7 @@ export class NativeDirectPlayHost {
     private connections = new Map<string, Connection>();
     private generation = 0;
     private version = 2;
-    // NT5 initializes NameTable.LatestVersion to0; normal C9/CA never advances it.
+    /** Oldest version last announced with DN_RESYNC_VERSION ([MC-DPL8CS] 2.2.6, 2.2.2.5). */
     private latestVersion = 0;
     private reservations = 0;
     private decisions = new Set<Connection>();
@@ -138,9 +138,9 @@ export class NativeDirectPlayHost {
         } catch { this.close(); return DPN.INVALIDDEVICEADDRESS; }
     }
     private newId(version: number): number {
-        // NT5 NameTable handles contain a 20-bit slot and 12-bit entry version,
-        // XORed with the first DWORD of the instance GUID (wire byte order).
-        // FindEntry validates both parts; an arbitrary identifier is not a handle.
+        // [MC-DPL8CS] 2.2.7 DN_DPNID: name-table index in the low 20 bits, the table
+        // version above it, XORed with the first DWORD of the instance GUID (wire byte
+        // order). The host locates entries by DPNID, so both parts are validated.
         if (version > 0xfff) throw Error("NameTable version exhausted");
         const prefix = this.options!.application.instance.slice(0, 8);
         const mask = parseInt(prefix.match(/../g)!.reverse().join(""), 16) >>> 0;
@@ -234,7 +234,9 @@ export class NativeDirectPlayHost {
         }
         return true;
     }
-    /** Normal Host report assignment and aggregate resync; no Host-local history prune. */
+    /** [MC-DPL8CS] 2.2.6: track each peer's DN_NAMETABLE_VERSION (C9) report and, when the
+     * oldest reported version advances, send DN_RESYNC_VERSION (CA) to all participants.
+     * Reports are assignments, not max(). No Host-local history prune. */
     private receiveVersion(connection: Connection, version: number): void {
         connection.reportedVersion = version;
         let oldest = version;
@@ -242,6 +244,7 @@ export class NativeDirectPlayHost {
             !(other.entry.flags & 0x10) && other.id !== this.localId)
             oldest = Math.min(oldest, other.reportedVersion);
         if (oldest <= this.latestVersion) return;
+        this.latestVersion = oldest;
         const packet = nativeCoreWords(0xca, oldest, 0);
         // Operation version0/excludedID0 fans out independently of Available-min membership.
         this.publish(this.reserveCommitted(this.recipients(0).map(connection => ({ connection, data: packet }))));
@@ -303,7 +306,8 @@ export class NativeDirectPlayHost {
             try {
                 this.memberships.created(id);
                 if (this.role === "peer") {
-                    // NT5 packs CURRENT entry info after the handler, retaining its creation version.
+                    // The DN_CREATE_GROUP sent to peers carries the entry as it stands after the
+                    // local handler returns, with its creation version (engine ordering).
                     const packet = encodeNativeGroupAdded(requesting, handle, entry);
                     const publication = this.reserveCommitted(this.recipients(entry.version).map(connection => ({ connection, data: packet })));
                     this.publish(publication);
@@ -407,7 +411,8 @@ export class NativeDirectPlayHost {
         if (settled) return settled;
         return new Promise<Reply>(done => { resolve = done; });
     }
-    /** NT5 worker recipient selector: older entries with a real, live connection. */
+    /** Recipients of a name-table operation: live connected peers whose entry predates it
+     * ([MC-DPL8CS] 3.1.5.2: newer peers get the change in their DN_SEND_CONNECT_INFO table). */
     private recipients(version: number, exclude?: Connection): Connection[] {
         return [...this.connections.values()].filter(c => c !== exclude && this.live(c) && !c.retirement && !!c.entry &&
             (c.phase === "table" || c.phase === "connected") && (!version || c.entry.version < version));
@@ -427,8 +432,8 @@ export class NativeDirectPlayHost {
         const publication: Publication = { generation: this.generation, held: [] };
         for (const { connection, data } of packets) {
             const reservation = this.live(connection) ? connection.channel!.link.reserveReliable(data) : DPN.NOCONNECTION;
-            // NT5 worker: a non-PENDING child send does not undo the operation or
-            // imply carrier loss; release that target and continue the others.
+            // Engine policy: a send that cannot be queued for one peer neither undoes the
+            // operation nor implies carrier loss; skip that target and continue the others.
             if (typeof reservation === "number") continue;
             publication.held.push({ connection, reservation, started: false });
         }
@@ -694,7 +699,7 @@ export class NativeDirectPlayHost {
         if (this.connections.get(key(c.address)) !== c) return;
         if (c.destroyChannel && !this.closing) reason = 4;
         if (c.callbackActive && !this.closing) {
-            // NT5 waits for active connection callbacks before disconnect cleanup.
+            // Engine policy: wait for active connection callbacks before disconnect cleanup.
             // Keep the committed entry and held FIFO slots until RETURN_BUFFER or
             // the synchronous publication observer returns. Whole Close bypasses
             // the wait and cancels the old generation without publishing it.
@@ -724,8 +729,9 @@ export class NativeDirectPlayHost {
             c.controller.abort();
             if (generation !== this.generation) return;
             if (removed) {
-                // NT5 DeletePlayer implicitly removes owned AUTO groups. Only the
-                // owner D1 advances the table version; no additional D8 is sent.
+                // DPNGROUP_AUTODESTRUCT (CreateGroup docs): the departing owner's groups go with
+                // it. Only the owner's D1 advances the table version; every participant
+                // removes the groups locally, so no additional D8 is sent.
                 for (const [id, group] of this.groups) if ((group.flags & 0x40) && group.owner === c.id) {
                     this.groups.delete(id); this.entities.delete(id); this.memberships.retireGroup(id);
                 }
@@ -875,7 +881,7 @@ export class NativeDirectPlayHost {
             if (result) channel.close(result);
             else if (channel.link.state === "connected") void channel.link.shutdown();
         });
-        // DNSendMessage precedes DNHostDisconnect. Starting can synchronously
+        // [MC-DPL8CS] 3.2.5.2: DN_TERMINATE_SESSION goes out before the host disconnects. Starting can synchronously
         // reenter the carrier, close the original channel, or replace the Host.
         reservation.start();
         if (generation === this.generation && !this.closing && c.destroyChannel === channel && this.live(c))
@@ -893,7 +899,7 @@ export class NativeDirectPlayHost {
         if (flags & 4) {
             if (!(flags & 8)) return DPN.INVALIDFLAGS;
             if (!Number.isInteger(completionHandle) || completionHandle! < 1 || completionHandle! > 0xffffffff) return DPN.INVALIDPARAM;
-            // NT5 DN_MSG_INTERNAL_REQ_PROCESS_COMPLETION: DWORD handle, then user bytes.
+            // [MC-DPL8CS] 2.2.3.2 DN_REQ_PROCESS_COMPLETION (0xE0): dwPacketContext, then payload.
             const packet = new Uint8Array(8 + data.length);
             packet.set(nativeCoreWords(0xe0, completionHandle!)); packet.set(data, 8);
             return c.channel.link.sendReliable(packet);

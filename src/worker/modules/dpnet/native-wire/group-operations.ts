@@ -41,7 +41,8 @@ export function encodeNativeGroupAdded(requesting: number, handle: number, entry
     if (size + 4 > NATIVE_CORE_MAX_MESSAGE) throw RangeError("Group entry exceeds core bound");
     const out = new Uint8Array(size + 4), view = new DataView(out.buffer);
     out.set(nativeCoreWords(0xd7, ...fields, 0, 0, 0, 0, 0, 0));
-    // CPackedBuffer adds the name before data, so data precedes the name in the tail.
+    // Tail packing as in native captures: fields are added from the end, name first,
+    // so data precedes the name in the tail.
     let tail = size;
     for (const [field, bytes] of [[32, name], [40, data]] as const) if (bytes.length) {
         tail -= bytes.length; out.set(bytes, 4 + tail);

@@ -86,9 +86,9 @@ for(const family of[2,23] as const){
   closedAddressOnly(valid,p.a);untouched(empty,WSA.EWOULDBLOCK);
   untouched(noOutputs,WSA.ECONNRESET);untouched(afterNull,WSA.EWOULDBLOCK);
  },30000);
- // XP source contract: afdsys/misc.c484-498 signals readable with STATUS_SUCCESS.
- // This is not a measured modern-Windows WSAEnumNetworkEvents native profile.
- test("UDP NT5-source FD_READ AF"+family+": notification status0 leaves SO_ERROR0 and receive54 address available",async()=>{
+ // WSAEnumNetworkEvents docs: FD_READ is reported with iErrorCode 0; the receive itself
+ // returns the queued error. This is not a measured modern-Windows native profile.
+ test("UDP model FD_READ AF"+family+": notification status0 leaves SO_ERROR0 and receive54 address available",async()=>{
   const x=f!,p=await x.closedCase(family,false,true),notified=x.networkEvents(p.client.socket);
   // Reconfigure while the same physical error is pending, exercising refresh
   // without consuming recvfrom or synthesizing a second error notification.

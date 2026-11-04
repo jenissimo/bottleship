@@ -957,10 +957,10 @@ export class InputManager {
      * SetCursorPos semantics: confine the target to the clip rect, take the position
      * away from the host publication, and generate the mouse event the SYSTEM generates.
      *
-     * The move is UNCONDITIONAL — NT5 zzzInternalSetCursorPos is BoundCursor +
-     * GreMovePointer + zzzSetFMouseMoved with no comparison against the old position,
-     * and the queue read path (xxxGetNextSysMsg → PostMove) then posts a real
-     * WM_MOUSEMOVE at the current cursor, so a same-position warp still produces one.
+     * The move is UNCONDITIONAL — Windows posts a WM_MOUSEMOVE after SetCursorPos even when
+     * the position did not change (the well-known "spurious WM_MOUSEMOVE", described in
+     * The Old New Thing and observed on real Windows), so a same-position warp still
+     * produces one.
      * Whether the pointer MOVED is a different question, and that is what the return
      * value answers: false = displaced nothing (the caller must not re-publish the
      * position to the host, nor read it as evidence of anything).

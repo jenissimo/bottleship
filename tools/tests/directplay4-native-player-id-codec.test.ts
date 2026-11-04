@@ -4,7 +4,7 @@ import { encodeDirectPlay4SystemTcpFrame } from "../../src/worker/modules/dplayx
 
 const bytes = (hex: string) => Uint8Array.from(Buffer.from(hex.replace(/\s/g, ""), "hex"));
 
-// Independent literal derived from NT5's x86 MSG_REQUESTPLAYERID, not a packet capture.
+// Independent literal from [MC-DPL4CS] 2.2.49 DPSP_MSG_REQUESTPLAYERID, not a packet capture.
 test("REQUESTPLAYERID has command 5, current version and raw little-endian flags", () => {
     expect(encodeDirectPlay4RequestPlayerId(0xfedcba98)).toEqual(bytes("706c6179 05000d00 98badcfe"));
     for (const value of [-1, 0x100000000, 1.5, NaN, Infinity])
@@ -12,7 +12,7 @@ test("REQUESTPLAYERID has command 5, current version and raw little-endian flags
 });
 
 test("captured native REQUESTPLAYERID supplies version 14 explicitly", () => {
-    // Oracle logs/lan-conformance/dp4-join-wire-20261028-sixth/result.json.
+    // Bytes from a Windows DP4 join wire capture (directplay4-join-wire-capture.ts; kept locally).
     // Sockaddr is copied verbatim; its padding is not asserted to have a policy.
     const sockaddr = bytes("020012c95e13de350000700063000000");
     const result = encodeDirectPlay4SystemTcpFrame(sockaddr, encodeDirectPlay4RequestPlayerId(9, 14), 1024);

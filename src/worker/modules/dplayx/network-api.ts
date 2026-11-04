@@ -357,11 +357,12 @@ export class DirectPlayNetworkApi {
     }
     install(exports: Record<string, ThunkImplementation>): void {
         const methods: Record<string, (s: GuestState, a: number[], legacy: boolean, ctx: Frame, wide?: boolean) => ReturnType<ThunkImplementation>> = {};
-        // NT5 iplay.c DP_Initialize is obsolete and always answers ALREADYINITIALIZED.
+        // IDirectPlay4::Initialize docs: provided for COM compliance; always DPERR_ALREADYINITIALIZED.
         methods.Initialize = () => DP.ALREADYINITIALIZED;
         methods.InitializeConnection = (s, a) => {
-            // NT5 connect.c:291-333 checks initialized object and the readable
-            // minimal/declared address before validating flags.
+            // Observed on Windows (tools/lan-conformance/directplay4-address-oracle.c:
+            // already/null/size/flags cases): an initialized object, then the readable
+            // minimal/declared address, are checked before the flags.
             if (s.session.initialized) return DP.ALREADYINITIALIZED;
             if (!this.valid(a[1], 24)) return DP.INVALIDPARAMS;
             const start = a[1], firstType = hex(Mem.readBytes(start, 16)!);
@@ -370,10 +371,11 @@ export class DirectPlayNetworkApi {
             const total = Mem.readUint32(start + 20)!;
             if (total < 24 || total > 65536 || !this.valid(start, total)) return DP.INVALIDPARAMS;
             if (a[2]) return DP.INVALIDFLAGS;
-            // NT5 connect.c:345-397 enumerates LobbyProvider first, then
-            // ServiceProvider; each callback stops at the first match, even if
-            // a later chunk is malformed. wsock/dpsp.c:4956-4964 ignores the
-            // provider's EnumAddress failure. Native oracle: tail-byte succeeds.
+            // A DPAID_LobbyProvider chunk is looked for before DPAID_ServiceProvider
+            // (both are DirectPlay Address data types, dplobby.h); the first match of
+            // each wins even if a later chunk is malformed. This precedence is the
+            // engine's choice. Observed on Windows (address oracle, tail-byte case):
+            // trailing bytes after the last chunk do not fail the call.
             // Copy the whole declared blob; short GUID chunks and the traversal
             // cap remain local safety rules rather than native policy.
             const bytes = Mem.readBytes(start, total)!.slice();
@@ -575,7 +577,7 @@ export class DirectPlayNetworkApi {
             const text = this.text(ptr, 1024, wide); if (text === null) return DP.INVALIDPARAMS;
             return s.session.sendChat(a[1], a[2], a[3], text);
         };
-        // NT5 iplay1.c: DP_1_SaveSession is unimplemented even for an open session.
+        // IDirectPlay::SaveSession is documented as not implemented.
         methods.SaveSession = () => DP.UNSUPPORTED;
         methods.GetPlayerAccount = (s, a) => {
             if (a[2]) return DP.INVALIDFLAGS;
@@ -584,7 +586,8 @@ export class DirectPlayNetworkApi {
             if (!s.session.isHost) return DP.ACCESSDENIED;
             return DP.INVALIDPLAYER;
         };
-        // A TCP/IP/IPX service provider is not a lobby service provider (NT5 group.c).
+        // Group connection settings need a lobby service provider (IDirectPlay4::
+        // GetGroupConnectionSettings docs); TCP/IP/IPX providers are not one.
         methods.GetGroupConnectionSettings = () => DP.UNSUPPORTED;
         methods.SetGroupConnectionSettings = () => DP.UNSUPPORTED;
         methods.StartSession = () => DP.UNSUPPORTED;
@@ -764,8 +767,8 @@ export class DirectPlayNetworkApi {
                     .filter(d => !!d.native === nativeMode)
                     .filter(d => (nativeMode && (a[5] & 2) !== 0) || desc.application === ZERO_GUID || d.desc.application === desc.application)
                     .filter(d => {
-                        // NT5 enum.c CheckSessionDesc: ALL takes precedence;
-                        // flags=0 defaults to AVAILABLE in DP_EnumSessions.
+                        // [MC-DPL4CS] 3.2.5.3 AV/AL filtering, with ALL taking precedence;
+                        // EnumSessions docs: dwFlags 0 means DPENUMSESSIONS_AVAILABLE.
                         if (nativeMode) {
                             const available = !(a[5] & 2) && (!a[5] || !!(a[5] & 1));
                             return !available || ((!d.desc.maxPlayers || d.currentPlayers < d.desc.maxPlayers) &&
@@ -847,8 +850,8 @@ export class DirectPlayNetworkApi {
             if (a[1] && !this.valid(a[1], 16)) return DP.INVALIDPARAMS;
             if (a[4] & ~3) return DP.INVALIDFLAGS;
             const flags = a[4] || 1;
-            // NT5 connect.c:105-114 and dplaypr.h:229-237: ADDRESSHEADER
-            // includes a zeroed third DPADDRESS and is 80 bytes on x86.
+            // Observed on Windows (address oracle, "enum" case): each connection blob is
+            // 80 bytes — DPAID_TotalSize, DPAID_ServiceProvider and a zero-filled tail.
             const providers = flags & 1 ? PROVIDERS : [];
             return this.enumerate(ctx, a[2], 20, providers.map(provider => ({
                 pack: (base: number) => {

@@ -370,7 +370,7 @@ test("a held retired group query cannot leak into a replacement Host or erase it
 });
 
 const coreWords=(data:Uint8Array)=>{const view=new DataView(data.buffer,data.byteOffset,data.byteLength);return Array.from({length:data.length/4},(_,i)=>view.getUint32(i*4,true));};
-test("D5 and D8 use literal source-derived DWORD layouts and reject a nonexact request extent",()=>{
+test("D5 and D8 use the [MC-DPL8CS] 2.2.4.7/2.2.4.8 DWORD layouts and reject a nonexact request extent",()=>{
  const request=Uint8Array.of(0xd5,0,0,0,0x40,0x30,0x20,0x10,0x44,0x33,0x22,0x11);
  const padded=Uint8Array.from([0xee,...request,0xef]);
  expect(decodeNativeGroupDestroyRequest(padded.subarray(1,13))).toEqual({handle:0x10203040,id:0x11223344});
@@ -776,13 +776,15 @@ function historyReportScene(){
  };
  return{nets,session,peers,wire,events,start,join,report};
 }
-test("Host aggregates both authenticated nonHost C9 reports and fans out a positive minimum without inventing a global watermark",async()=>{
+test("Host aggregates both authenticated nonHost C9 reports and sends CA only when the oldest version advances",async()=>{
  const s=historyReportScene();expect(await s.start()).toBe(0);expect(await s.join(0)).toBe(0);expect(await s.join(1)).toBe(0);await turns();
  expect(s.session.engine.currentPlayers).toBe(3);expect(s.peers.map(peer=>peer.currentPlayers)).toEqual([3,3]);
  const hostVersion=(s.session.engine as any).host.version;expect(hostVersion).toBeGreaterThanOrEqual(2);
- // Source permits report assignment0. Set both actual authenticated entries to a
+ // Report assignment 0 is accepted. Set both actual authenticated entries to a
  // known baseline after any normal join reports, without changing adopted tables.
  expect(await s.report(0,0)).toBe(0);expect(await s.report(1,0)).toBe(0);await turns();s.wire.length=0;
+ // Join-time reports may already have announced a CA; restart the announced watermark too.
+ (s.session.engine as any).host.latestVersion=0;
  const versions=s.peers.map(peer=>(peer as any).version),tables=s.peers.map(peer=>structuredClone([...peer.entities])),eventCount=s.events.length;
  const fanout=()=>s.wire.filter(row=>row.from===0&&coreWords(row.data)[0]===0xca)
   .map(row=>({to:row.to,words:coreWords(row.data)})).sort((a,b)=>a.to-b.to);
@@ -791,12 +793,13 @@ test("Host aggregates both authenticated nonHost C9 reports and fans out a posit
  // First RED must be the unwanted one-peer echo while the other reporter is0.
  expect(observed[0]).toEqual([]);s.wire.length=0;
  expect(await s.report(1,2)).toBe(0);observed.push(fanout());expect(observed[1]).toEqual(expected);s.wire.length=0;
- // Source globalLatest starts0 and is not advanced by sending CA: equal positive
- // minima may fan out again. Per-entry reports are assignment, not max().
- expect(await s.report(1,2)).toBe(0);observed.push(fanout());expect(observed[2]).toEqual(expected);s.wire.length=0;
+ // [MC-DPL8CS] 2.2.6: CA is sent when the oldest version ADVANCES past the last one
+ // announced, so an equal minimum is not re-announced. Reports are assignment, not max().
+ expect(await s.report(1,2)).toBe(0);observed.push(fanout());expect(observed[2]).toEqual([]);s.wire.length=0;
  expect(await s.report(0,0)).toBe(0);observed.push(fanout());expect(observed[3]).toEqual([]);s.wire.length=0;
- expect(await s.report(0,1)).toBe(0);observed.push(fanout());expect(observed[4]).toEqual(expected);
- expect(s.wire.filter(row=>row.from===1&&row.to===0&&coreWords(row.data)[0]===0xc9).map(row=>coreWords(row.data))).toEqual([[0xc9,1,0]]);
+ expect(await s.report(0,1)).toBe(0);observed.push(fanout());expect(observed[4]).toEqual([]);s.wire.length=0;
+ expect(await s.report(0,3)).toBe(0);observed.push(fanout());expect(observed[5]).toEqual([{to:1,words:[0xca,2,0]},{to:2,words:[0xca,2,0]}]);
+ expect(s.wire.filter(row=>row.from===1&&row.to===0&&coreWords(row.data)[0]===0xc9).map(row=>coreWords(row.data))).toEqual([[0xc9,3,0]]);
  expect(s.peers.map(peer=>(peer as any).version)).toEqual(versions);expect((s.session.engine as any).host.version).toBe(hostVersion);
  expect(s.peers.map(peer=>[...peer.entities])).toEqual(tables);expect(s.events).toHaveLength(eventCount);
  expect(s.peers.map(peer=>peer.openError)).toEqual([0,0]);expect(s.session.engine.currentPlayers).toBe(3);

@@ -2,12 +2,15 @@
  * IMM32 input contexts: the HIMC table, window association, and the client-side
  * INPUTCONTEXT block that ImmLockIMC hands out.
  *
- * Modelled on NT5 imm32 (context.c / misc.c) and win32k ntimm.c:
- *  - every thread has a default HIMC, and a window is associated with its creator
- *    thread's default until ImmAssociateContext[Ex] says otherwise (NULL included);
- *  - the INPUTCONTEXT is created on the first ImmLockIMC, as a moveable LHND local block,
- *    and its five IMCC components are LHND blocks too — so ImmLockIMCC/ImmUnlockIMCC ARE
- *    LocalLock/LocalUnlock, and the lock counts the guest observes are the kernel32 ones.
+ * Modelled on the Input Method Manager documentation (imm.h / immdev.h, ImmGetContext,
+ * ImmAssociateContext[Ex], ImmLockIMC, ImmCreateIMCC) and Wine's imm32:
+ *  - every thread has a default HIMC (ImmGetDefaultIMEWnd / ImmGetContext docs), and a
+ *    window uses its thread's default until ImmAssociateContext[Ex] says otherwise
+ *    (NULL included);
+ *  - IMCC components are movable memory blocks (ImmCreateIMCC / ImmLockIMCC docs), modelled
+ *    as LHND local blocks, so ImmLockIMCC/ImmUnlockIMCC behave as LocalLock/LocalUnlock and
+ *    the lock counts the guest observes are the kernel32 ones; the INPUTCONTEXT itself is
+ *    created lazily on the first ImmLockIMC.
  *
  * No IME is installed, so no ImeSelect runs and hPrivate carries the no-IME sizeof(UINT).
  */
@@ -150,7 +153,7 @@ export class ImmContextTable {
         return prev;
     }
 
-    /** ImmAssociateContextEx, following ntimm.c AssociateInputContextEx. */
+    /** ImmAssociateContextEx (IACE_CHILDREN / IACE_DEFAULT / IACE_IGNORENOCONTEXT per its docs). */
     associateEx(hwnd: number, himc: number, flags: number): boolean {
         const windowThread = this.host.windowThread(hwnd);
         if (windowThread === undefined) return false;

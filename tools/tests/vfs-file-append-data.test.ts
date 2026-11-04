@@ -1,8 +1,9 @@
 /**
  * FILE_APPEND_DATA regression from the immutable native COM oracle:
- * reopening an append-only handle must preserve existing bytes. NT5 iomgr/write.c
- * 352–367 substitutes EOF per write only when WRITE_DATA is absent; IopFileMapping
- * maps GENERIC_WRITE/GENERIC_ALL to WRITE_DATA. These tests use public VFS methods
+ * reopening an append-only handle must preserve existing bytes (observed on Windows by
+ * that oracle). Per the File Access Rights docs, each write goes to EOF only when
+ * FILE_WRITE_DATA is absent, and the generic mapping (FILE_GENERIC_WRITE) of
+ * GENERIC_WRITE/GENERIC_ALL includes FILE_WRITE_DATA. These tests use public VFS methods
  * and the real overlay, with only the unavailable browser OPFS storage replaced.
  */
 import {afterAll, describe, expect, test} from "bun:test";

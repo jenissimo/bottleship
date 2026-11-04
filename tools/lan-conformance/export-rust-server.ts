@@ -1,8 +1,8 @@
 /**
- * Source-only export of the Rust LAN server into a new/empty directory.
+ * Source-only export of the Rust LAN server (`bottleship-lan`) into a new/empty directory.
  * No install, compilation, Git, service startup or publication is performed.
  * Usage from the BottleShip worktree:
- *   bun tools/lan-conformance/export-rust-server.ts --out ../bottleship-multiplayer-server
+ *   bun tools/lan-conformance/export-rust-server.ts --out ../bottleship-lan
  */
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readdir, readFile, realpath, writeFile } from "node:fs/promises";
@@ -93,7 +93,7 @@ function adapted(path: string, bytes: Uint8Array): { bytes: Uint8Array; transfor
 
 const standalone = `# Standalone source export
 
-This directory contains the Rust server, core/native/gateway/transport crates, vendored transport patches, Cargo locks, licenses, notices and source tests. It contains no compiled server/helper binaries or dependency caches. EXPORT-MANIFEST.json records source and exported hashes separately; documentation adaptations are identified there. Export verifies the selected original source inventory and bytes again after copying. A failed/partial export is retained for inspection and is never silently overwritten.
+This directory contains the bottleship-lan Rust server, core/native/gateway/transport crates, vendored transport patches, Cargo locks, licenses, notices and source tests. It contains no compiled server/helper binaries or dependency caches. EXPORT-MANIFEST.json records source and exported hashes separately; documentation adaptations are identified there. Export verifies the selected original source inventory and bytes again after copying. A failed/partial export is retained for inspection and is never silently overwritten.
 
 Rust1.94+ is required. From this directory use cargo build --release --locked and cargo test --locked. Crate tests use cargo test --locked --manifest-path core/Cargo.toml (and native/gateway/transport). Cargo obtains pinned registry dependencies separately; the exporter never installs dependencies.
 

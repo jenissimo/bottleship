@@ -13,10 +13,10 @@ The maintained C and schema files are byte-exact archival copies. Their original
 
 ## Retained baselines
 
-Resolve these paths relative to the original worktree's `logs/lan-conformance`, not to a new worktree's junctions:
+The native baseline captures are kept locally (not committed); their artifact hashes are:
 
-- `stage30-udp-connreset/portable-preparation/native-first` — job `j302e80`, compiler/native exit 0, 54 exclusive port rebinds.
-- `stage30-udp-connreset/iocp-apc-effect-preparation/native-first` — job `je849e5`, compiler/native exit 0, 24 exclusive port rebinds.
+- portable baseline — compiler/native exit 0, 54 exclusive port rebinds.
+- effect baseline — compiler/native exit 0, 24 exclusive port rebinds.
 
 | Artifact | portable6168 SHA-256 | effect976 SHA-256 |
 | --- | --- | --- |
@@ -40,12 +40,12 @@ No compiler or native executable is invoked by the preparer. By default it pins 
 From the intended worktree, use a **fresh** output directory:
 
 ```powershell
-$udpBun = './logs/tools/bun-portable/package/bin/bun.exe'
-$udpCapture = 'C:/Projects/bottleship-oss/.wt/lan-network/logs/lan-conformance/stage30-udp-connreset/portable-preparation/native-first'
+$udpBun = 'bun'
+$udpCapture = '<path to the portable native capture>'
 & $udpBun tools/lan-conformance/prepare-udp-connreset.ts --fixture winsock-udp-connreset --capture $udpCapture --validate-only
 & $udpBun tools/lan-conformance/prepare-udp-connreset.ts --fixture winsock-udp-connreset --capture $udpCapture --output logs/lan-conformance/winsock-udp-connreset/same-pe-first --guest-os winxp
 
-$udpEffect = 'C:/Projects/bottleship-oss/.wt/lan-network/logs/lan-conformance/stage30-udp-connreset/iocp-apc-effect-preparation/native-first'
+$udpEffect = '<path to the effect native capture>'
 & $udpBun tools/lan-conformance/prepare-udp-connreset.ts --fixture winsock-udp-connreset-iocp-apc-effect --capture $udpEffect --validate-only
 & $udpBun tools/lan-conformance/prepare-udp-connreset.ts --fixture winsock-udp-connreset-iocp-apc-effect --capture $udpEffect --output logs/lan-conformance/winsock-udp-connreset-iocp-apc-effect/same-pe-first --guest-os winxp
 ```
@@ -59,11 +59,11 @@ After a browser grant, point the existing compare harness at the new `build.json
 A fresh native capture is separate evidence. It does **not** replace the retained SAME-PE baseline. The runner imports only tracked code, refuses existing attempts before starting processes, records compiler/native PIDs and exits, retains source/schema/runner/helper and raw checkpoints, and verifies exclusive rebind of all audited endpoints.
 
 ```powershell
-& ./logs/tools/bun-portable/package/bin/bun.exe tools/lan-conformance/run-udp-connreset-native.ts --fixture winsock-udp-connreset --attempt native-NEW
-& ./logs/tools/bun-portable/package/bin/bun.exe tools/lan-conformance/run-udp-connreset-native.ts --fixture winsock-udp-connreset-iocp-apc-effect --attempt native-NEW
+& bun tools/lan-conformance/run-udp-connreset-native.ts --fixture winsock-udp-connreset --attempt native-NEW
+& bun tools/lan-conformance/run-udp-connreset-native.ts --fixture winsock-udp-connreset-iocp-apc-effect --attempt native-NEW
 ```
 
-Replace `NEW` with a lowercase fresh label. The optional `--output-root` and `--compiler` are explicit paths. No credentials or environment snapshot is recorded. Default compiler: `C:/msys64/mingw32/bin/gcc.exe`; flags are the original no-CRT x86 flags.
+Replace `NEW` with a lowercase fresh label. The optional `--output-root` and `--compiler` are explicit paths. No credentials or environment snapshot is recorded. Default compiler: the 32-bit MinGW `gcc` (`BS_MINGW_CC`); flags are the original no-CRT x86 flags.
 
 The portable PE has a 45s internal watchdog and 60s native-host guard; the effect PE has 20s/30s guards. Both have a separate 30s compiler guard. Retirement audit has a 5s aggregate bound. The general 15s `build-native.ts` cap is deliberately not substituted. A killed process that does not retire within another 5s is an unknown-result failure with its exact PID retained. No automatic rerun or forced-success word exists.
 
@@ -72,5 +72,5 @@ Future captures have a new nonce/PE/ref. To package one, supply all three review
 Pure parser/identity checks (no compiler/native/network/browser):
 
 ```powershell
-& ./logs/tools/bun-portable/package/bin/bun.exe test tools/tests/udp-connreset-artifacts.test.ts
+& bun test tools/tests/udp-connreset-artifacts.test.ts
 ```

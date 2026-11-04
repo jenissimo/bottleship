@@ -3,7 +3,9 @@
  *
  * The A/W pairs share one core each, so these pin the parts that differ between
  * the variants and are easy to regress: the cchSize<1 / truncation contract of
- * GetKeyNameText (nt5 xlate.c `_GetKeyNameText` + client/ntcftxt.h), and which
+ * GetKeyNameText (GetKeyNameText docs for bits 24/25 and truncation; the ANSI-only
+ * NUL for cchSize < 1 is the engine's current model and is not yet confirmed by a
+ * Windows capture), and which
  * code-unit width each %s/%c argument is read at (WPRINTF_ParseFormat{A,W}).
  */
 import { describe, expect, test } from "bun:test";

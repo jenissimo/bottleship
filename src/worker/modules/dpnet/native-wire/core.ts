@@ -262,8 +262,9 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
                 message: (id, message) => generation !== this.generation || this.receivePeer(id, message),
                 lost: id => {
                     if (generation !== this.generation || this.closing || !this.entities.has(id)) return;
-                    // Captured E2 and NT5 DNPlayerDisconnectNew: retire availability,
-                    // retain the versioned entry until the host's D1, request integrity.
+                    // [MC-DPL8CS] 3.2.5.3 integrity check (and the captured E2): retire availability,
+                    // keep the versioned entry until the host's DN_DESTROY_PLAYER (D1), and send
+                    // DN_REQ_INTEGRITY_CHECK (E2) to the host.
                     void this.request(0xe2, [id]);
                     this.entities.delete(id);
                     for (const entity of this.entities.values()) entity.members = entity.members.filter(member => member !== id);
@@ -390,7 +391,8 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
         const candidate = op.requesting === local.id && op.handle ? this.requests.get(op.handle) : undefined;
         const request = candidate?.command === 0xd6 && candidate.entityId === op.id && candidate.target === this.hostId ? candidate : undefined;
         if (request) clearTimeout(request.timer);
-        // Own-client DB is only an ACK. NT5 deliberately does not reapply its payload to the local shortcut.
+        // Our own DN_UPDATE_INFO (DB) echo is only an ACK: the local entry already holds the
+        // info set by SetPeerInfo, so the engine does not reapply the payload.
         if (op.id === host.id) {
             const next: NativeNameTableEntry = { ...host, ...(op.mask! & 1 ? { name: op.name ?? null } : {}),
                 ...(op.mask! & 2 ? { data: new Uint8Array(op.data!) } : {}) };
@@ -416,7 +418,8 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
                 return;
             }
             try {
-                // DNProcessUpdateInfo adopts the exact incoming version AFTER the actual notification returns.
+                // Engine ordering: the operation's version is adopted after the local PEER_INFO
+                // notification returns ([MC-DPL8CS] 3.5.5.1 only requires that it be applied).
                 this.adoptOperation(op);
                 if (request && op.handle && this.requests.get(op.handle) === request) this.complete(op.handle, { hr: DPN.OK }, this.hostId);
             } finally { if (tail && generation === this.generation && !this.closing) resume(); }
@@ -586,7 +589,8 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
     }
     private applyGroupDestroyed(op: NativeCoreOperation, resume: () => void): boolean | "held" {
         const entry = this.entries.get(op.id), entity = this.entities.get(op.id);
-        // NT5 adopts an unusable D8 version, but does not complete its requester successfully.
+        // A DN_DESTROY_GROUP (D8) that cannot be applied still advances our version, but does
+        // not complete the local requester successfully (engine policy).
         if (!entry || !(entry.flags & 0x10) || !entity?.group) return true;
         const candidate = op.requesting === this.localId && op.handle ? this.requests.get(op.handle) : undefined;
         const request = candidate?.command === 0xd5 && candidate.target === this.hostId && candidate.groupId === op.id ? candidate : undefined;
@@ -643,7 +647,8 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
         }
         else if (op.command === 0xd1) {
             const entry = this.entries.get(op.id), generation = this.generation;
-            // NT5 presets the reason on the existing entry before disconnect can reenter.
+            // Record DN_DESTROY_PLAYER's destroy reason (2.2.2.2) on the entry before the
+            // disconnect handling below can reenter.
             if (entry && this.entities.has(op.id) && op.reason) this.onPlayerDestroyReason?.(op.id, op.reason);
             if (generation !== this.generation || this.closing || this.entries.get(op.id) !== entry) return true;
             this.memberships.retirePlayer(op.id);

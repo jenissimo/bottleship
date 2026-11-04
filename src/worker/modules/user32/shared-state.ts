@@ -23,9 +23,8 @@ export interface WindowInfo {
      * paint order (getChildrenInPaintOrder), hit-test order AND the order the dialog
      * manager walks for tab stops and WS_GROUP ranges.
      *
-     * So a new CHILD is APPENDED, whoever creates it: NT puts a child at the bottom of its
-     * parent's list (createw.c, overriding even the CBT hook's hwndInsertAfter), pinned by
-     * Wine's test_children_zorder — creation order == list order, which is what makes a
+     * So a new CHILD is APPENDED, whoever creates it: Windows puts a child at the bottom of
+     * its parent's list, pinned by Wine's test_children_zorder (which runs against Windows) — creation order == list order, which is what makes a
      * template's control order the tab/group order. Inserting a child at the front instead
      * reverses the group/tab walks for that one creator's windows while leaving every other
      * creator's correct. SetWindowPos Z-order changes go through reorderChildInParent.
@@ -668,13 +667,12 @@ export function getCursorClipRect(): CursorClipRect | null {
 }
 
 /**
- * The foreground input queue switched, so the clip goes — NT xxxSetForegroundWindow2:
- * "Remove the clip cursor rectangle - it is a global mode that gets removed when
- * switching" (focusact.c, guarded by gpqForeground != gpqForegroundPrev; wineserver
- * set_foreground_input does the same with SET_CURSOR_NOCLIP). The clip is ONE global
- * rect, so the process that set it is not consulted and does not keep it; afterwards
- * GetClipCursor answers with the whole virtual screen, since zzzClipCursor(NULL) stores
- * grcCursorClip = rcScreen rather than a "no clip" flag.
+ * The foreground input queue switched, so the clip goes. ClipCursor's docs call the
+ * cursor a shared resource, and Windows drops the clip when the foreground moves to
+ * another thread's queue (wineserver set_foreground_input does the same with
+ * SET_CURSOR_NOCLIP). The clip is ONE global rect, so the process that set it is not
+ * consulted and does not keep it; afterwards GetClipCursor answers with the screen
+ * rectangle, as its documentation says it does when the cursor is not confined.
  */
 export function releaseCursorClipOnForegroundSwitch(): void {
     if (cursorClipRect === null) return;
@@ -688,7 +686,7 @@ export function isCursorClipped(): boolean {
 
 /**
  * Confine a screen point to the clip rect. Right/bottom are exclusive, so the
- * pointer bounds to right-1/bottom-1 (NT5 BoundCursor; wineserver
+ * pointer bounds to right-1/bottom-1 (RECT semantics per the Win32 docs; wineserver
  * update_desktop_cursor_pos does the same max/min).
  */
 export function clampToCursorClip(x: number, y: number): { x: number; y: number } {
@@ -957,8 +955,8 @@ export function warpGuestCursorTo(x: number, y: number): void {
 
 /**
  * ShowCursor's counter is a plain running total, and the value it returns is the
- * app's own bookkeeping (NT zzzShowCursor: `pq->iCursorLevel` incremented or
- * decremented, no floor; hidden is simply `< 0`). Clamping it makes a matched
+ * app's own bookkeeping (ShowCursor docs: an internal display counter incremented or
+ * decremented, returned as-is; the cursor shows only while it is >= 0). Clamping it makes a matched
  * ShowCursor(FALSE)/ShowCursor(TRUE) pair from a doubly-nested caller re-show a
  * pointer the outer level still wants hidden, and hands the guest a level it
  * never reached.

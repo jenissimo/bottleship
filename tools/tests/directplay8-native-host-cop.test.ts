@@ -1,7 +1,7 @@
 /**
  * Host COMPLETEONPROCESS binary-lane regressions.
  * Real NativeReliableLink C1/C2/C3 and E0/E1 binary lanes; no mocked encoder/reserve.
- * NT5-derived component controls, NOT a new Windows/public-COM or buffer-lifetime certificate.
+ * [MC-DPL8CS] 2.2.3.2/2.2.3.3 component controls, NOT a new Windows/public-COM or buffer-lifetime certificate.
  */
 import {afterEach,expect,test} from "bun:test";
 import {LanNetwork} from "../../src/worker/net/lan-network";

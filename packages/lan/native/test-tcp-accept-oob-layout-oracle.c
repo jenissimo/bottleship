@@ -79,64 +79,6 @@ static void overlapped_probe(sock_t s,const char *layout,const char *phase) {
         layout,phase,rc,mark,(unsigned long)returned,error);
     WSACloseEvent(ov.hEvent);
 }
-static void afd_handles_probe(sock_t s,const char *layout,const char *phase) {
-    ULONG request=2;struct {HANDLE address;HANDLE connection;} info={NULL,NULL};
-    OVERLAPPED ov;memset(&ov,0,sizeof(ov));ov.hEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
-    if(!ov.hEvent)ExitProcess(4);
-    DWORD n=0,error=0;BOOL ok=DeviceIoControl((HANDLE)s,0x12037,&request,sizeof(request),&info,sizeof(info),&n,&ov);
-    if(!ok) {
-        error=GetLastError();
-        if(error==ERROR_IO_PENDING) {
-            DWORD wait=WaitForSingleObject(ov.hEvent,2000);if(wait!=WAIT_OBJECT_0)ExitProcess(4);
-            ok=GetOverlappedResult((HANDLE)s,&ov,&n,FALSE);error=ok?0:GetLastError();
-        }
-    }
-    printf("layout=%s phase=%s afd_handles_ok=%d has_connection=%d n=%lu error=%lu\n",
-        layout,phase,(int)ok,info.connection!=NULL,(unsigned long)n,(unsigned long)error);
-    if(ok&&info.connection) {
-        DWORD handle_flags=0;BOOL valid=GetHandleInformation(info.connection,&handle_flags);
-        DWORD handle_error=valid?0:GetLastError();
-        printf("layout=%s phase=%s tdi_handle_valid=%d error=%lu\n",layout,phase,(int)valid,(unsigned long)handle_error);
-        /* NT5 TCP_SOCKET_ATMARK through the duplicated TDI connection. */
-        struct {ULONG entity,instance,info_class,info_type,id;unsigned char context[16];} request_info={0x400,0,0x200,0x300,5,{0}};
-        struct {ULONG size;LONG offset;} mark={0,0};
-        OVERLAPPED q;memset(&q,0,sizeof(q));q.hEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
-        if(!q.hEvent)ExitProcess(4);
-        DWORD out=0,query_error=0;
-        BOOL query_ok=DeviceIoControl(info.connection,0x120003,&request_info,sizeof(request_info),&mark,sizeof(mark),&out,&q);
-        if(!query_ok) {
-            query_error=GetLastError();
-            if(query_error==ERROR_IO_PENDING) {
-                DWORD wait=WaitForSingleObject(q.hEvent,2000);if(wait!=WAIT_OBJECT_0)ExitProcess(4);
-                query_ok=GetOverlappedResult(info.connection,&q,&out,FALSE);query_error=query_ok?0:GetLastError();
-            }
-        }
-        printf("layout=%s phase=%s tdi_atmark_ok=%d size=%lu offset=%ld n=%lu error=%lu\n",
-            layout,phase,(int)query_ok,(unsigned long)mark.size,(long)mark.offset,(unsigned long)out,(unsigned long)query_error);
-        CloseHandle(q.hEvent);
-    }
-    if(ok&&info.address)CloseHandle(info.address);
-    if(ok&&info.connection)CloseHandle(info.connection);
-    CloseHandle(ov.hEvent);
-}
-static void afd_probe(sock_t s,const char *layout,const char *phase) {
-    /* NT5 AFD_QUERY_RECEIVE_INFO, METHOD_NEITHER, only on this owned socket.
-     * Undocumented and observational: modern Windows may reject it. */
-    struct {ULONG normal;ULONG expedited;} info={0,0};
-    OVERLAPPED ov;memset(&ov,0,sizeof(ov));ov.hEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
-    if(!ov.hEvent)ExitProcess(4);
-    DWORD n=0,error=0;BOOL ok=DeviceIoControl((HANDLE)s,0x12033,NULL,0,&info,sizeof(info),&n,&ov);
-    if(!ok) {
-        error=GetLastError();
-        if(error==ERROR_IO_PENDING) {
-            DWORD wait=WaitForSingleObject(ov.hEvent,2000);if(wait!=WAIT_OBJECT_0)ExitProcess(4);
-            ok=GetOverlappedResult((HANDLE)s,&ov,&n,FALSE);error=ok?0:GetLastError();
-        }
-    }
-    printf("layout=%s phase=%s afd_query_ok=%d normal=%lu expedited=%lu n=%lu error=%lu\n",
-        layout,phase,(int)ok,(unsigned long)info.normal,(unsigned long)info.expedited,(unsigned long)n,(unsigned long)error);
-    CloseHandle(ov.hEvent);
-}
 static void winsock_probe(sock_t s,const char *layout,const char *phase) {
     char bytes[32]={0};WSABUF b;DWORD received=0,flags=MSG_PEEK,returned=0;
     u_long mark=99;
@@ -149,8 +91,6 @@ static void winsock_probe(sock_t s,const char *layout,const char *phase) {
     printf("layout=%s phase=%s wsaioc_atmark_result=%d mark=%lu returned=%lu error=%d\n",
         layout,phase,result,mark,(unsigned long)returned,error);
     overlapped_probe(s,layout,phase);
-    afd_probe(s,layout,phase);
-    afd_handles_probe(s,layout,phase);
 }
 #endif
 static int run_case(int layout) {
@@ -274,9 +214,6 @@ static int arrival_during_inline(void) {
     s=accept(l,NULL,NULL);if(s==BAD)goto done;
     if(send(p,"AB",2,0)!=2||send(p,"!",1,MSG_OOB)!=1||!wait_for(s,1))goto done;
     char before=0;if(recv(s,&before,1,MSG_OOB|MSG_PEEK)!=1)goto done;
-#ifdef _WIN32
-    afd_probe(s,"window","before_toggle");
-#endif
     if(setsockopt(s,SOL_SOCKET,SO_OOBINLINE,(const char*)&one,sizeof(one)))goto done;
     if(send(p,"#",1,MSG_OOB)!=1||send(p,"CD",2,0)!=2||shutdown(p,SHUT_SEND))goto done;
     unsigned long available=0;
@@ -290,15 +227,9 @@ static int arrival_during_inline(void) {
 #endif
     }
     if(available<4)goto done;
-#ifdef _WIN32
-    afd_probe(s,"window","before_restore");
-#endif
     char inline_peek[16]={0};int n=recv(s,inline_peek,sizeof(inline_peek),MSG_PEEK);if(n<0)goto done;
     if(setsockopt(s,SOL_SOCKET,SO_OOBINLINE,(const char*)&zero,sizeof(zero)))goto done;
     char after=0;int r=recv(s,&after,1,MSG_OOB|MSG_PEEK),error=r<0?ERR():0;
-#ifdef _WIN32
-    afd_probe(s,"window","after_restore");
-#endif
     printf("arrival_during_inline before=%c available=%lu inline_peek=%.*s restored_oob=%d byte=%d error=%d\n",
         before,available,n,inline_peek,r,(int)(unsigned char)after,error);
     if(r==1){char consumed=0;if(recv(s,&consumed,1,MSG_OOB)!=1)goto done;}
@@ -332,7 +263,6 @@ static int arrival_without_inline(void) {
     unsigned long available=0;
     for(int i=0;i<2000;i++){if(IOCTL(s,FIONREAD,&available))goto done;if(available>=4)break;Sleep(1);}
     if(available<4)goto done;
-    afd_probe(s,"control","after_second");
     u_long nonblocking=1;if(ioctlsocket(s,FIONBIO,&nonblocking))goto done;
     char first=0,second=0;
     int n1=recv(s,&first,1,MSG_OOB),error1=n1<0?ERR():0;

@@ -1,7 +1,7 @@
 /**
- * DirectPlay 8 TCP/IP enumeration datagrams. Binary layout is documented by
- * NT5 dnet/sp/wsock/messagestructures.h and core/{enumhosts,message}.h.
- * Native Windows captures live under logs/lan-conformance/directplay8-wire.
+ * DirectPlay 8 TCP/IP enumeration datagrams: [MC-DPLHP] 2.2.1 EnumQuery and
+ * 2.2.2 EnumResponse. Native Windows captures are produced by
+ * tools/lan-conformance/capture-directplay8.ts (not committed; see its README).
  * No guest pointers or RAM views cross this boundary.
  */
 export const NATIVE_DP8_MAX_DATAGRAM = 65507;
@@ -73,8 +73,8 @@ export function decodeNativeEnumResponse(bytes: Uint8Array): NativeEnumResponse 
     if (!data || !nameBytes || !passwordBytes || !reserved || !applicationData) return null;
     const name = nameBytes.length ? text(nameBytes) : null, password = passwordBytes.length ? text(passwordBytes) : null;
     if ((nameBytes.length && name === null) || (passwordBytes.length && password === null)) return null;
-    // dwSize at core offset 8 is informational. NT5 receivers decode this fixed
-    // wire structure without trusting it as a buffer size.
+    // ApplicationDescSize at offset 8 MUST be 0x50 ([MC-DPLHP] 2.2.2); the layout is
+    // fixed, so the decoder does not use it as a buffer size.
     return { token: view.getUint16(2, true), flags: bodyView.getUint32(12, true),
         maxPlayers: bodyView.getUint32(16, true), players: bodyView.getUint32(20, true),
         instance: hex(body.subarray(56, 72)), application: hex(body.subarray(72, 88)),

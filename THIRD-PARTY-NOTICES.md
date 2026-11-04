@@ -66,9 +66,32 @@ upstream projects referenced here.
 | `react`, `react-dom` | MIT |
 | `pako` | MIT AND Zlib |
 | `lucide-react` | ISC |
+| `@phosphor-icons/react` | MIT |
+| `socket.io-client` (with `engine.io-client`, `engine.io-parser`, `socket.io-parser`, `@socket.io/component-emitter`, `debug`, `ms`) | MIT |
 
 Development-only dependencies (Vite, TypeScript, Tailwind, ESLint, …) are not
 redistributed and are therefore not listed here.
+
+## Multiplayer relay (`packages/lan`, `packages/lan-rust`)
+
+### cszackrison/bottleship
+- The virtual LAN adapter design and binary datagram layout used by the relay
+  protocol (`packages/lan/src/protocol.ts`, `bottleship-lan-core`) derive from
+  `src/worker/net/lan-network.ts` and `src/worker/net/netplay-wire.ts` of
+  <https://github.com/cszackrison/bottleship>, modified for Socket.IO, isolated
+  rooms, reconnect lifecycle, bounded queues and additional channels.
+- **License:** Apache-2.0. Attribution is kept in the `NOTICE` files of
+  `packages/lan`, `packages/lan-rust`, `packages/lan-rust/core` and
+  `packages/lan-rust/gateway`.
+
+### engineioxide (`packages/lan-rust/transport/vendor/engineioxide`)
+- Engine.IO server crate from <https://github.com/totodore/socketioxide>,
+  version 0.17.7, vendored **with modifications** (delivery guards, forced close,
+  retirement observation, numeric error codes). Provenance, hashes and the list of
+  changes are in `packages/lan-rust/transport/vendor/UPSTREAM.md`.
+- **License:** MIT (see `packages/lan-rust/transport/vendor/engineioxide/LICENSE`).
+- Other Rust crates of the server are ordinary Cargo dependencies pinned in the
+  `Cargo.lock` files; their licenses are recorded in their crates.io metadata.
 
 ## Reference material (consulted, **not** redistributed)
 
@@ -94,3 +117,6 @@ implementation shares.
 - **Wine (LGPL-2.1) and DXVK (Zlib)** — used as behavioral references to validate
   our independent implementations of documented DirectX semantics. No Wine or DXVK
   source is incorporated.
+- **Microsoft Open Specifications** ([MC-DPL4CS], [MC-DPL8CS], [MC-DPL8R],
+  [MC-DPLHP]) — the public DirectPlay protocol documents that the native DirectPlay
+  wire implementations follow. No leaked or proprietary source code is used.

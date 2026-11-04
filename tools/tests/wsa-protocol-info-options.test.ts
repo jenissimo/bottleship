@@ -120,7 +120,7 @@ for(const family of [2,23])test("primary Stage47 SO_PROTOCOL_INFOA real actor AF
  });
 },10000);
 
-for(const family of [2,23])test("NT5 ANSI short/null and invalid-socket precedence AF"+family,async()=>{
+for(const family of [2,23])test("ANSI short/null and invalid-socket precedence AF"+family,async()=>{
  await withActor(f=>{
   const s=f.socket({family,type:2,protocol:17});
   for(const capacity of [0,1,371]){
@@ -143,7 +143,7 @@ for(const family of [2,23])test("NT5 ANSI short/null and invalid-socket preceden
  });
 },10000);
 
-for(const family of [2,23])test("NT5 ANSI success retains supplied optlen and writes only A372 AF"+family,async()=>{
+for(const family of [2,23])test("ANSI success retains supplied optlen and writes only A372 AF"+family,async()=>{
  await withActor(f=>{
   const triple={family,type:2,protocol:17},s=f.socket(triple);
   for(const capacity of [372,404,628]){
@@ -175,7 +175,7 @@ test("virtual product A/W identity relationships including RAW (not a native RAW
 },10000);
 
 // RAW actual-protocol preservation below is an explicit virtual catalog/product relation.
-// The accessible NT5 provider implementation and modern native RAW query are still unmeasured.
+// The modern native RAW query is still unmeasured.
 for(const wide of [false,true])test("virtual protocol-info preserves public duplicate reservation and live alias "+(wide?"W":"A"),async()=>{
  await withActor(f=>{
   const triple={family:23,type:3,protocol:58},source=f.socket(triple),size=wide?628:372;

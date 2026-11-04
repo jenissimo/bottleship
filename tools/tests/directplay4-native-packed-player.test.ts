@@ -4,8 +4,8 @@ import {encodeDirectPlay4AddForward} from "../../src/worker/modules/dplayx/nativ
 import {encodeDirectPlay4SystemTcpFrame} from "../../src/worker/modules/dplayx/native-wire/tcp-frame";
 
 const bytes=(s:string)=>Uint8Array.from(Buffer.from(s.replace(/\s/g,""),"hex"));
-// Source-derived x86 literals, not captured packets; provider sockaddr padding is raw.
-test("SPPLAYERDATA stores stream followed by datagram and owns Buffer views",()=>{
+// Literals follow [MC-DPL4CS] 2.2.2 DPLAYI_PACKEDPLAYER; provider sockaddr padding is raw.
+test("ServiceProviderData stores stream followed by datagram and owns Buffer views",()=>{
     const stream=Buffer.from("ff020008fc000000001122334455667788ff","hex").subarray(1,17);
     const datagram=Buffer.from("ff020008fd0000000099aabbccddeeff00ff","hex").subarray(1,17);
     const data=encodeDirectPlay4TcpIpPlayerData(stream,datagram);
@@ -15,7 +15,7 @@ test("SPPLAYERDATA stores stream followed by datagram and owns Buffer views",()=
     expect(()=>encodeDirectPlay4TcpIpPlayerData(new Uint8Array(15),new Uint8Array(16))).toThrow(RangeError);
 });
 
-test("PackPlayer filters nonprop flags and encodes null versus empty UTF-16",()=>{
+test("packed player sends only the flags 2.2.2 defines and encodes null versus empty UTF-16",()=>{
     const sp=bytes("020008fc000000001122334455667788 020008fd0000000099aabbccddeeff00");
     const data=bytes("aabbcc");
     const packed=encodeDirectPlay4PackedPlayer({
@@ -40,7 +40,7 @@ test("PackPlayer filters nonprop flags and encodes null versus empty UTF-16",()=
 });
 
 test("packed player and forwarded frame reproduce native cmd19 capture",()=>{
-    // logs/lan-conformance/dp4-join-wire-20261028-seventh/result.json:
+    // Bytes captured from a Windows DirectPlay 4 join (directplay4-join-wire-capture.ts);
     // raw addresses include captured padding; no assumption about their contents.
     const provider=bytes("020012c95e13de351200000063000000 0200c0c85e13de3510000000faaddbba");
     const player=encodeDirectPlay4PackedPlayer({
