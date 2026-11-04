@@ -423,8 +423,11 @@ tests regardless.
 When a case cannot be expressed with the probe (true multi-machine timing, NAT),
 write a dedicated fixture, but treat that as the exception.
 
-Investigations use NT5 sources (read-only, local reference tree) to understand
-mechanisms and validation order; the native log decides behaviour.
+Investigations use only public material: the Microsoft Open Specifications
+([MC-DPL4CS], [MC-DPL8CS], [MC-DPLHP], [MC-DPLNAT], [MC-DPLVP]), the Win32 and
+DirectX SDK documentation, Wine as an open-source reference, and the native log
+from real Windows. Leaked or proprietary source code is never used, quoted or
+cited. The native log decides behaviour.
 
 ## Running things
 

@@ -82,6 +82,10 @@ template):
   in the issue or PR and commit reusable harness scenarios under `tools/harness/`.
 - **Never commit game files**, box art you can't redistribute, decompiled binaries, or
   leaked source. Reports and fixes about commercial games are welcome; their bytes are not.
+- **No leaked or proprietary source as input or reference.** Do not feed an agent leaked
+  or proprietary code (Windows/NT source leaks such as "nt5src", "research" leaks), and do
+  not cite it in code, comments, tests or docs. Ground behavior in public documentation,
+  the Microsoft Open Specifications, and behavior observed on real Windows.
 - **Use real cover art or the existing fallback.** If a catalog entry has no cover, omit
   `coverUrl` so the library shows its gradient and initial. Do not make synthetic cover
   files; the `subtitle` badge already identifies a demo. Preview covers and missing-image

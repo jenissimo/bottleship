@@ -254,10 +254,6 @@ WebSocket and forced polling. It requires exclusive access to the `lan-oracle`
 harness tab. Without `--guest`, the provider/gateway exchange runs without a browser.
 Each fixture proves only the observations it compares.
 
-`bun tools/network-export-audit.ts [NT5-source-root]` compares public x86 exports
-with descriptors and writes `logs/lan-conformance/export-audit.json`. This audits
-declarations and ordinals; it does not prove behavioral parity.
-
 Set `BS_MINGW_CC` to select a compiler. The oracle records API observations from
 Windows and compares them with the same executable under BottleShip; its build
 nonce prevents old guest output from satisfying a new run. Generated binaries and

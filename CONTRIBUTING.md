@@ -12,6 +12,11 @@ conventions we hold to, and how to get a change merged.
 - **Cite behavior, don't copy code.** Referencing what Windows (or Wine, as observed
   behavior — its conformance tests especially) does is encouraged; copying implementation
   code from differently-licensed projects (e.g. Wine, LGPL) is not.
+- **No leaked or proprietary source, ever.** Leaked or otherwise proprietary source code
+  (including Windows/NT source leaks such as "nt5src" and "research" leaks) must not be used
+  as input to your work, quoted, or cited in code, comments, tests, or docs. Base behavior on
+  public documentation (Win32/DirectX SDK docs, Microsoft Open Specifications such as
+  [MC-DPL4CS]/[MC-DPL8CS]) and on behavior observed on real Windows.
 - **Faithful, generic recreations — no per-game hacks.** Implement WinAPI/COM/graphics as a
   faithful recreation of the real documented behavior (ABI, struct layouts, error codes, edge
   cases). Never branch on a game's name/exe/hash or hardcode a magic offset for one title. If
