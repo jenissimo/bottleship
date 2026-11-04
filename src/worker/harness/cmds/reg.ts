@@ -20,11 +20,12 @@ export function registerRegistryCommands(svc: HarnessService): void {
     svc.register("regGet", (args) => {
         const root = String(args[0] ?? "");
         const key = String(args[1] ?? "");
-        const value = args[2] as string | undefined;
+        // The RPC is JSON, so an omitted value arrives as null, not undefined.
+        const value = args[2] as string | null | undefined;
         const r = reg();
         const kh = r.open(root, key);
         if (!kh) throw new HarnessError(`registry key not found: ${root}\\${key}`, HarnessErrorCode.NOT_FOUND);
-        if (value !== undefined) return { key: kh, value: r.getValue(kh, value) };
+        if (value != null) return { key: kh, value: r.getValue(kh, value) };
         return { key: kh, values: r.enumValues(kh) };
     });
 

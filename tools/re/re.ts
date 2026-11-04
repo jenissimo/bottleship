@@ -88,7 +88,7 @@ function localDoctor(): Record<string, unknown> {
         repoLocalGhidraDir: existsSync(join(repo, ".ghidra")),
         repoLocalJdkOrVenvDir: existsSync(join(repo, ".ghidra-home")),
         peDisasFallback: existsSync(join(repo, "tools", "pe-disas.py")),
-        projectRoot: join(repo, "tmp", "ghidra_project"),
+        projectRoot: process.env.BS_RE_PROJECT_ROOT || join(repo, "tmp", "ghidra_project"),
         serviceLog: join(repo, ".ghidra-home", "re-service.log"),
         hint: "run `bun tools/re/re.ts start <binary>`; it bootstraps Ghidra + JDK 21 + pyghidra if missing",
     };
