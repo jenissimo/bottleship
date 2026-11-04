@@ -14,6 +14,7 @@ import {
     MEM_ROM_BASE,
     MEM_ROM_SIZE,
 } from "../cpu/emulator-config";
+import { markGuestPagesDirty, zeroGuestRange } from "./guest-page-dirty";
 
 export type RegionKind =
     | "LOW_MEM"
@@ -150,6 +151,12 @@ export class AddressSpace {
         this.noteRegionAdded(newEntry);
         if (entry.owner === "Layout") {
             this.layoutBucketMap.set(entry.kind, newEntry);
+        } else if (entry.owner !== "PELoader") {
+            // A registered region (ROM file, VirtualAlloc block, HLE image) is about to be
+            // written by its owner: its pages no longer count as known-zero. The PE loader
+            // marks its images itself, after zeroing them, so a never-touched .bss is not
+            // written just because the image was mapped (PELoader.clearImageRegion).
+            markGuestPagesDirty(newEntry.base, newEntry.size);
         }
         // Seed bit0 for writable-RAM regions (HEAP/SURFACE/THUNK_DATA);
         // clear for everything else so a re-registered VA can't inherit a stale fast bit.
@@ -727,13 +734,19 @@ export class AddressSpace {
         if (!this.validateRange(address, data.length, "w")) return 0;
         const mem = this.getMemory();
         mem.set(data, address);
+        markGuestPagesDirty(address, data.length);
         return data.length;
     }
 
     fill(address: number, size: number, value: number = 0): boolean {
         if (!this.validateRange(address, size, "w")) return false;
         const mem = this.getMemory();
-        mem.fill(value, address, address + size);
+        if (value === 0) {
+            zeroGuestRange(mem, address, size);
+        } else {
+            mem.fill(value, address, address + size);
+            markGuestPagesDirty(address, size);
+        }
         return true;
     }
 

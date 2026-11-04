@@ -2,6 +2,7 @@ import { childProcessIdentity, type ProcessIdentityBoot } from './process-identi
 import { createChildProcessIpc, getProcessIpc } from './process-ipc';
 import { CHILD_IO_BYTES, createChildVfsServer, settleWithin } from './child-vfs';
 import { Logger, LogCategory } from './logger';
+import { noteSharedBuffer } from '../../utils/shared-buffer-census';
 import { createChildNetworkNamespace, type NetworkNamespaceBoot } from './process-network';
 import type { VirtualFileSystem } from '../runtime/filesystem/vfs';
 import type { RegistryMutation, RegistryStore } from '../runtime/filesystem/registry';
@@ -300,7 +301,7 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
             bytes.set(chunk, offset);
             offset += chunk.length;
         }
-        const io = new SharedArrayBuffer(CHILD_IO_BYTES);
+        const io = noteSharedBuffer('child-io', new SharedArrayBuffer(CHILD_IO_BYTES));
         const serve = createChildVfsServer(vfs, io, path => {
             context.record.fileMutations = (context.record.fileMutations ?? 0) + 1;
             const paths = context.record.mutationPaths ??= [];

@@ -30,9 +30,22 @@ export class RingBufferManager {
     private device: GPUDevice;
     private queue: GPUQueue;
 
-    // Ring buffer configuration
+    // Ring buffer configuration. Vertex/index rings start at their initial size and grow in
+    // place (see growGeometryRing) up to maxRingBufferSize; sizes are per ring.
     private readonly ringBufferSize: number;
+    private readonly indexRingInitialSize: number;
+    private readonly maxRingBufferSize: number;
     private readonly ringBufferCount: number;
+    private vertexRingSizes: number[] = [];
+    private indexRingSizes: number[] = [];
+    /** Size every ring adopts when next entered, once any ring had to grow. */
+    private vertexTargetSize = 0;
+    private indexTargetSize = 0;
+    /** Replaced ring buffers: still referenced by recorded or in-flight work, destroyed after
+     *  `frames` more frame rotations (every encoder that could name them is submitted by then). */
+    private retiredBuffers: Array<{ buffer: GPUBuffer; frames: number }> = [];
+    /** Growth census (harness footprint / tests). */
+    public ringGrowths = { vertex: 0, index: 0 };
     private readonly uniformBufferSize: number;
     private readonly storageBufferSize: number;
     private readonly storageSlotSize: number;
@@ -126,6 +139,11 @@ export class RingBufferManager {
         this.device = device;
         this.queue = queue;
         this.ringBufferSize = ringConfig.bufferSize;
+        this.indexRingInitialSize = ringConfig.indexBufferSize ?? ringConfig.bufferSize;
+        this.maxRingBufferSize = Math.max(ringConfig.maxBufferSize ?? ringConfig.bufferSize,
+            this.ringBufferSize, this.indexRingInitialSize);
+        this.vertexTargetSize = this.ringBufferSize;
+        this.indexTargetSize = this.indexRingInitialSize;
         this.ringBufferCount = ringConfig.bufferCount;
         this.uniformBufferSize = uniformConfig.bufferSize;
         this.storageBufferSize = storageConfig.bufferSize;
@@ -180,20 +198,12 @@ export class RingBufferManager {
     private initializeBuffers(): void {
         for (let i = 0; i < this.ringBufferCount; i++) {
             // Vertex ring buffer
-            this.vertexRingBuffers.push(
-                this.device.createBuffer({
-                    size: this.ringBufferSize,
-                    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-                })
-            );
+            this.vertexRingBuffers.push(this.createGeometryBuffer("vertex", this.ringBufferSize));
+            this.vertexRingSizes.push(this.ringBufferSize);
 
             // Index ring buffer
-            this.indexRingBuffers.push(
-                this.device.createBuffer({
-                    size: this.ringBufferSize,
-                    usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-                })
-            );
+            this.indexRingBuffers.push(this.createGeometryBuffer("index", this.indexRingInitialSize));
+            this.indexRingSizes.push(this.indexRingInitialSize);
             this.vertexUploadWindows.push(new GeometryUploadWindow());
             this.indexUploadWindows.push(new GeometryUploadWindow());
 
@@ -233,6 +243,82 @@ export class RingBufferManager {
             this.indexRingOffsets.push(0);
             this.uniformRingOffsets.push(0);
         }
+    }
+
+    private createGeometryBuffer(kind: "vertex" | "index", size: number): GPUBuffer {
+        return this.device.createBuffer({
+            label: kind === "vertex" ? "ddraw-vertex-ring" : "ddraw-index-ring",
+            size,
+            usage: (kind === "vertex" ? GPUBufferUsage.VERTEX : GPUBufferUsage.INDEX) | GPUBufferUsage.COPY_DST,
+        });
+    }
+
+    /** Size for a ring that must take `need` bytes from offset 0: double, at least `need`. */
+    private grownSize(current: number, need: number): number {
+        let size = Math.max(current * 2, 16);
+        while (size < need) size *= 2;
+        return Math.min(size, this.maxRingBufferSize);
+    }
+
+    /**
+     * Give the CURRENT vertex or index ring a bigger buffer so an allocation of `need` bytes
+     * fits, without a flush or a ring switch. Draws already recorded this frame keep their
+     * (buffer, offset) pairs — the old buffer stays alive until it is retired — and new
+     * allocations start at offset 0 of the new one. Bytes staged for the old buffer are
+     * published to it first, so nothing recorded loses its data. A batch keyed on the vertex
+     * buffer simply starts a new batch. Returns false when even the ceiling cannot hold `need`.
+     */
+    private growGeometryRing(kind: "vertex" | "index", need: number): boolean {
+        if (need > this.maxRingBufferSize) return false;
+        const fi = this.currentFrameIndex;
+        const isVertex = kind === "vertex";
+        const buffers = isVertex ? this.vertexRingBuffers : this.indexRingBuffers;
+        const sizes = isVertex ? this.vertexRingSizes : this.indexRingSizes;
+        const offsets = isVertex ? this.vertexRingOffsets : this.indexRingOffsets;
+        const window = (isVertex ? this.vertexUploadWindows : this.indexUploadWindows)[fi];
+        const size = this.grownSize(sizes[fi], need);
+        if (size < need) return false;
+        window.flush(this.queue, buffers[fi], offsets[fi]);
+        this.retiredBuffers.push({ buffer: buffers[fi], frames: this.ringBufferCount + 1 });
+        buffers[fi] = this.createGeometryBuffer(kind, size);
+        sizes[fi] = size;
+        offsets[fi] = 0;
+        window.reset();
+        if (isVertex) { this.vertexTargetSize = Math.max(this.vertexTargetSize, size); this.ringGrowths.vertex++; }
+        else { this.indexTargetSize = Math.max(this.indexTargetSize, size); this.ringGrowths.index++; }
+        Logger.log(LogCategory.SYSTEM,
+            `RingBufferManager: ${kind} ring ${fi} grown to ${(size / 1048576).toFixed(0)} MB (need ${need} B)`);
+        return true;
+    }
+
+    /** On entering a ring at a frame boundary: adopt the size another ring had to grow to. */
+    private adoptTargetSizes(fi: number): void {
+        if (this.vertexRingSizes[fi] < this.vertexTargetSize) {
+            this.retiredBuffers.push({ buffer: this.vertexRingBuffers[fi], frames: this.ringBufferCount + 1 });
+            this.vertexRingBuffers[fi] = this.createGeometryBuffer("vertex", this.vertexTargetSize);
+            this.vertexRingSizes[fi] = this.vertexTargetSize;
+        }
+        if (this.indexRingSizes[fi] < this.indexTargetSize) {
+            this.retiredBuffers.push({ buffer: this.indexRingBuffers[fi], frames: this.ringBufferCount + 1 });
+            this.indexRingBuffers[fi] = this.createGeometryBuffer("index", this.indexTargetSize);
+            this.indexRingSizes[fi] = this.indexTargetSize;
+        }
+    }
+
+    private ageRetiredBuffers(): void {
+        if (this.retiredBuffers.length === 0) return;
+        for (let i = this.retiredBuffers.length - 1; i >= 0; i--) {
+            const r = this.retiredBuffers[i];
+            if (--r.frames > 0) continue;
+            r.buffer.destroy();
+            this.retiredBuffers.splice(i, 1);
+        }
+    }
+
+    /** Current vertex/index ring sizes and growth census. */
+    getGeometryRingStats(): { vertexSizes: number[]; indexSizes: number[]; growths: { vertex: number; index: number }; retired: number } {
+        return { vertexSizes: [...this.vertexRingSizes], indexSizes: [...this.indexRingSizes],
+            growths: { ...this.ringGrowths }, retired: this.retiredBuffers.length };
     }
 
     /**
@@ -685,18 +771,28 @@ export class RingBufferManager {
         const uOffset = this.uniformRingOffsets[this.currentFrameIndex];
         const sOffset = this.storageRingOffsets[this.currentFrameIndex];
 
-        const vOverflow = vOffset + alignedV > this.ringBufferSize;
-        const iOverflow = bytesI > 0 && iOffset + alignedI > this.ringBufferSize;
+        // Vertex/index: grow the current ring in place (no flush, no switch). Only a request
+        // larger than the growth ceiling falls through to the flush-and-switch path, which is
+        // what every overflow did when the rings were fixed-size.
+        const fi = this.currentFrameIndex;
+        let vOverflow = vOffset + alignedV > this.vertexRingSizes[fi];
+        if (vOverflow && this.growGeometryRing("vertex", alignedV)) vOverflow = false;
+        let iOverflow = bytesI > 0 && iOffset + alignedI > this.indexRingSizes[fi];
+        if (iOverflow && this.growGeometryRing("index", alignedI)) iOverflow = false;
         const uOverflow = uOffset + alignedU > this.uniformBufferSize;
-        const sOverflow = bytesS > 0 && sOffset + alignedS > this.storageBufferSize;
+        // Storage and light-set slots are taken by prepareDraw for any draw, whether or not
+        // the caller declared them, and their own overflow paths degrade (slot 0 / last slot
+        // reused). Reserve one slot of each here so they switch rings instead.
+        const sOverflow = sOffset + Math.max(alignedS, this.storageSlotSize) > this.storageBufferSize;
+        const lOverflow = this.lightsRingOffsets[fi] + this.lightsAlignment > this.uniformBufferSize;
 
-        if (vOverflow || iOverflow || uOverflow || sOverflow) {
+        if (vOverflow || iOverflow || uOverflow || sOverflow || lOverflow) {
             Logger.warn(
                 LogCategory.SYSTEM,
                 `⚠️ RingBufferManager: Ring buffer overflow detected! ` +
-                    `(v=${vOverflow} i=${iOverflow} u=${uOverflow} s=${sOverflow}) ` +
-                    `vOffset=${vOffset}/${this.ringBufferSize} ` +
-                    `iOffset=${iOffset}/${this.ringBufferSize} ` +
+                    `(v=${vOverflow} i=${iOverflow} u=${uOverflow} s=${sOverflow} l=${lOverflow}) ` +
+                    `vOffset=${vOffset}/${this.vertexRingSizes[fi]} ` +
+                    `iOffset=${iOffset}/${this.indexRingSizes[fi]} ` +
                     `uOffset=${uOffset}/${this.uniformBufferSize} ` +
                     `sOffset=${sOffset}/${this.storageBufferSize} ` +
                     `→ Flushing and switching buffer (this causes frame stall!)`
@@ -706,6 +802,7 @@ export class RingBufferManager {
 
             // Switch to next buffer in ring
             this.currentFrameIndex = (this.currentFrameIndex + 1) % this.ringBufferCount;
+            this.adoptTargetSizes(this.currentFrameIndex);
             this.vertexRingOffsets[this.currentFrameIndex] = 0;
             this.indexRingOffsets[this.currentFrameIndex] = 0;
             this.vertexUploadWindows[this.currentFrameIndex].reset();
@@ -732,10 +829,16 @@ export class RingBufferManager {
      */
     allocateVertexData(data: Uint8Array): AllocationResult {
         const alignedSize = (data.byteLength + 3) & ~3;
+        // A caller that did not reserve through ensureSpaceForDraw (a GPU-conversion fallback)
+        // still gets space: grow in place rather than drop the draw.
+        if (this.vertexRingOffsets[this.currentFrameIndex] + alignedSize > this.vertexRingSizes[this.currentFrameIndex]) {
+            this.growGeometryRing("vertex", alignedSize);
+        }
         const buffer = this.vertexRingBuffers[this.currentFrameIndex];
         const offset = this.vertexRingOffsets[this.currentFrameIndex];
+        const ringSize = this.vertexRingSizes[this.currentFrameIndex];
 
-        const usagePercent = (offset / this.ringBufferSize) * 100;
+        const usagePercent = (offset / this.maxRingBufferSize) * 100;
         const usageBucket = Math.floor(usagePercent / 10);
         if (usagePercent > 80 && usageBucket > this.lastVertexWarnBucket) {
             this.lastVertexWarnBucket = usageBucket;
@@ -745,11 +848,11 @@ export class RingBufferManager {
             );
         }
 
-        if (offset + alignedSize > this.ringBufferSize) {
+        if (offset + alignedSize > ringSize) {
             Logger.error(
                 LogCategory.SYSTEM,
                 `RingBufferManager: Vertex buffer overflow in allocateVertexData! ` +
-                    `offset=${offset} required=${alignedSize} size=${this.ringBufferSize}`
+                    `offset=${offset} required=${alignedSize} size=${ringSize}`
             );
             return { buffer, offset: 0, overflow: true };
         }
@@ -780,10 +883,14 @@ export class RingBufferManager {
         size: number
     ): AllocationResult {
         const alignedSize = (size + 3) & ~3;
+        if (this.vertexRingOffsets[this.currentFrameIndex] + alignedSize > this.vertexRingSizes[this.currentFrameIndex]) {
+            this.growGeometryRing("vertex", alignedSize);
+        }
         const buffer = this.vertexRingBuffers[this.currentFrameIndex];
         const dstOffset = this.vertexRingOffsets[this.currentFrameIndex];
+        const ringSize = this.vertexRingSizes[this.currentFrameIndex];
 
-        const usagePercent = (dstOffset / this.ringBufferSize) * 100;
+        const usagePercent = (dstOffset / this.maxRingBufferSize) * 100;
         const usageBucket = Math.floor(usagePercent / 10);
         if (usagePercent > 80 && usageBucket > this.lastVertexWarnBucket) {
             this.lastVertexWarnBucket = usageBucket;
@@ -793,11 +900,11 @@ export class RingBufferManager {
             );
         }
 
-        if (dstOffset + alignedSize > this.ringBufferSize) {
+        if (dstOffset + alignedSize > ringSize) {
             Logger.error(
                 LogCategory.SYSTEM,
                 `RingBufferManager: Vertex buffer overflow in allocateVertexDataFromGpuBuffer! ` +
-                    `offset=${dstOffset} required=${alignedSize} size=${this.ringBufferSize}`
+                    `offset=${dstOffset} required=${alignedSize} size=${ringSize}`
             );
             return { buffer, offset: 0, overflow: true };
         }
@@ -818,10 +925,14 @@ export class RingBufferManager {
      */
     allocateIndexData(data: Uint8Array): AllocationResult {
         const alignedSize = (data.byteLength + 3) & ~3;
+        if (this.indexRingOffsets[this.currentFrameIndex] + alignedSize > this.indexRingSizes[this.currentFrameIndex]) {
+            this.growGeometryRing("index", alignedSize);
+        }
         const buffer = this.indexRingBuffers[this.currentFrameIndex];
         const offset = this.indexRingOffsets[this.currentFrameIndex];
+        const ringSize = this.indexRingSizes[this.currentFrameIndex];
 
-        const usagePercent = (offset / this.ringBufferSize) * 100;
+        const usagePercent = (offset / this.maxRingBufferSize) * 100;
         const usageBucket = Math.floor(usagePercent / 10);
         if (usagePercent > 80 && usageBucket > this.lastIndexWarnBucket) {
             this.lastIndexWarnBucket = usageBucket;
@@ -831,11 +942,11 @@ export class RingBufferManager {
             );
         }
 
-        if (offset + alignedSize > this.ringBufferSize) {
+        if (offset + alignedSize > ringSize) {
             Logger.error(
                 LogCategory.SYSTEM,
                 `RingBufferManager: Index buffer overflow in allocateIndexData! ` +
-                    `offset=${offset} required=${alignedSize} size=${this.ringBufferSize}`
+                    `offset=${offset} required=${alignedSize} size=${ringSize}`
             );
             return { buffer, offset: 0, overflow: true };
         }
@@ -1135,8 +1246,10 @@ export class RingBufferManager {
      * Get per-frame vertex ring buffer usage (call before nextFrame to get current frame stats)
      */
     getFrameVertexUsage(): { bytes: number; percent: number } {
+        // Percent of the growth CEILING: the warning it feeds is about running out of room
+        // altogether, and a ring at 90% of its current size simply grows.
         const offset = this.vertexRingOffsets[this.currentFrameIndex];
-        return { bytes: offset, percent: (offset / this.ringBufferSize) * 100 };
+        return { bytes: offset, percent: (offset / this.maxRingBufferSize) * 100 };
     }
 
     /** Current-frame high-water offsets across all rings (call BEFORE nextFrame).
@@ -1153,7 +1266,7 @@ export class RingBufferManager {
             u: this.uniformRingOffsets[fi],
             l: this.lightsRingOffsets[fi],
             s: this.storageRingOffsets[fi],
-            vSize: this.ringBufferSize,
+            vSize: this.vertexRingSizes[fi],
             uSize: this.uniformBufferSize,
             sSize: this.storageBufferSize,
             lightsOverflow: this.lightsOverflowCount,
@@ -1166,7 +1279,9 @@ export class RingBufferManager {
         this.lastIndexWarnBucket = 0;
         this.lightsOverflowWarnedThisFrame = false;
 
+        this.ageRetiredBuffers();
         this.currentFrameIndex = (this.currentFrameIndex + 1) % this.ringBufferCount;
+        this.adoptTargetSizes(this.currentFrameIndex);
         this.vertexRingOffsets[this.currentFrameIndex] = 0;
         this.indexRingOffsets[this.currentFrameIndex] = 0;
         this.vertexUploadWindows[this.currentFrameIndex].reset();
@@ -1209,6 +1324,8 @@ export class RingBufferManager {
         for (const buffer of this.storageRingBuffers) {
             buffer.destroy();
         }
+        for (const r of this.retiredBuffers) r.buffer.destroy();
+        this.retiredBuffers = [];
         this.vertexRingBuffers = [];
         this.indexRingBuffers = [];
         this.uniformRingBuffers = [];

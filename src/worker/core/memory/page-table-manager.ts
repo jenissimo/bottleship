@@ -22,6 +22,7 @@
 import { Logger, LogCategory } from '../logger';
 import { setWriteMapBase } from './address-space';
 import { invalidateGuestCode } from './guest-code';
+import { markGuestPagesDirty, zeroGuestRange } from './guest-page-dirty';
 import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE, MEM_PAGETABLE_BASE, MEM_PAGETABLE_SIZE, MEM_GUARD_BASE, MEM_GUARD_SIZE } from '../cpu/emulator-config';
 
 // Page table constants
@@ -84,6 +85,8 @@ export class PageTableManager {
 
         // Zero page directory (4KB)
         mem.fill(0, PAGE_DIR_ADDR, PAGE_DIR_ADDR + PAGE_SIZE);
+        // PD + every PT is written below and by the CPU's walker (A/D bits).
+        markGuestPagesDirty(PAGE_DIR_ADDR, PAGE_SIZE + FULL_PD_ENTRIES * PAGE_SIZE);
 
         // Write all 1024 PDEs — each points to a page table
         for (let i = 0; i < FULL_PD_ENTRIES; i++) {
@@ -271,8 +274,14 @@ export class PageTableManager {
      * For a range being allocated fresh — VirtualAlloc(MEM_RESERVE|MEM_COMMIT) and
      * paging-enable. A commit over pages that may ALREADY be committed must go through
      * `ensurePagesCommitted`, which leaves present pages (and their protection) alone.
+     *
+     * Zeroing is lazy, like Windows' demand-zero commit: only pages that may hold bytes
+     * (guest-page-dirty.ts) are written. `contentsZero` is the caller's guarantee that
+     * the whole span already reads zero — a block MemoryManager has just handed out — so
+     * not even dirty-marked pages need writing. Either way the span is dirty afterwards:
+     * it is committed, and the guest may write it.
      */
-    commitPages(baseAddr: number, sizeBytes: number): void {
+    commitPages(baseAddr: number, sizeBytes: number, contentsZero = false): void {
         this.rejectExternalCommit(baseAddr, sizeBytes);
         const startPage = (baseAddr >>> 12);
         const endPage = ((baseAddr + sizeBytes + PAGE_SIZE - 1) >>> 12);
@@ -322,7 +331,8 @@ export class PageTableManager {
         // held guest code before it was decommitted, and full_clear_tlb does not drop
         // compiled blocks, so this JS write needs the §3.1 invalidation like any other.
         invalidateGuestCode(baseAddr, sizeBytes);
-        mem.fill(0, baseAddr, baseAddr + sizeBytes);
+        if (!contentsZero) zeroGuestRange(mem, baseAddr, sizeBytes);
+        markGuestPagesDirty(baseAddr, sizeBytes);
 
         Logger.verbose(LogCategory.SYSTEM,
             `[PageTableManager] Committed ${endPage - startPage} pages at 0x${baseAddr.toString(16)}`);
@@ -348,10 +358,10 @@ export class PageTableManager {
 
             const physAddr = page * PAGE_SIZE;
             view.setUint32(pteOffset, physAddr | PTE_DEFAULT, true);
-            const pageStart = physAddr;
-            const pageEnd = Math.min(pageStart + PAGE_SIZE, mem.length);
-            if (pageStart < mem.length) {
-                mem.fill(0, pageStart, pageEnd);
+            // Windows: a recommitted page reads zero. Written only if it may not already.
+            if (physAddr < mem.length) {
+                zeroGuestRange(mem, physAddr, PAGE_SIZE);
+                markGuestPagesDirty(physAddr, PAGE_SIZE);
             }
             // Track 2b Phase W: only the pages actually (re)committed here become RW —
             // present pages (possibly RO) are skipped, so mark bit0 per recommitted page.
@@ -442,6 +452,21 @@ export class PageTableManager {
 
     isPagingEnabled(): boolean {
         return this.pagingEnabled;
+    }
+
+    /** Harness `footprint`: PTE census over guest RAM (present RW / present RO / not present). */
+    pageCensus(): { pagingEnabled: boolean; ramPages: number; presentRw: number; presentRo: number; notPresent: number } {
+        const mem = this.getMemory();
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const ramPages = Math.floor(Math.min(this.totalMemoryBytes || mem.length, mem.length) / PAGE_SIZE);
+        let presentRw = 0, presentRo = 0, notPresent = 0;
+        for (let page = 0; page < ramPages; page++) {
+            const pte = view.getUint32(this._getPteOffset(page), true);
+            if ((pte & PTE_PRESENT) === 0) notPresent++;
+            else if ((pte & PTE_RW) !== 0) presentRw++;
+            else presentRo++;
+        }
+        return { pagingEnabled: this.pagingEnabled, ramPages, presentRw, presentRo, notPresent };
     }
 
     /**

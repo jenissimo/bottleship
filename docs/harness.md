@@ -146,6 +146,43 @@ far too much log output to grep. So the harness gives you structured views inste
   snapshots; `during` is sampled from inside the invalidation fan-out, which is the only
   instant at which "did we tell the guest?" is answerable.
 
+## Memory footprint
+
+`footprint()` (CLI: `bun tools/harness.ts footprint`; console: `await window.__BS__.harness.footprint()`)
+adds up what the emulator itself holds. It exists for devices where no OS counter is readable
+from the page — iOS kills the WebContent process at a per-process footprint limit (about 2 GB
+on current iPhones) that counts written (dirty) and compressed pages, not reserved ones.
+
+- `wasm`: size of the v86 linear memory and of the guest RAM window inside it. Reserved and
+  committed by the engine, not necessarily touched.
+- `guestDirty`: guest pages that may hold non-zero bytes (`dirtyMB`), from the page map the
+  lazy zeroing uses (`src/worker/core/memory/guest-page-dirty.ts`), plus how many bytes zeroing
+  sites asked for and actually wrote. `dirtyMB` approximates the guest RAM we and the guest have
+  made resident. `footprint({verify:true})` reads every page marked clean and reports any that
+  hold bytes (`violations`, `samples`). Any violation is a bug: a writer the map does not see.
+  Verify reads all of guest RAM, so run it on desktop only.
+- `pageTable`: PTE census over guest RAM (present RW / RO / not present).
+- `allocator`: MemoryManager live and peak bytes, and per bucket the span handed out, the
+  slab arena and the free lists.
+- `sab`: SharedArrayBuffers created at the noted sites (bundle I/O, child-process I/O, audio
+  rings). The page facade adds the page realm's own census under `page`.
+- `gpu`: estimated bytes of live GPUBuffers and GPUTextures on this worker's devices, with the
+  largest buffers listed. Sizes come from the descriptors, so driver padding is not included.
+  `ddrawRings` shows the legacy D3D/DDraw geometry rings, which start small and double on
+  demand: current sizes per ring and how often they grew. On an iPhone 15 Pro this GPU memory
+  counted against the tab's limit (889 MB of fixed rings got Hitman killed, the same build with
+  small rings survived), so an unexpectedly large `bufferMB` is worth chasing.
+- `jsCaches` (bundle block cache), `jsHeap` (where the realm exposes it), `jit`: live JIT
+  module slots, modules and wasm bytes emitted so far, and `liveWasmEstimateMB` (mean module
+  size times live slots; wasm bytes, the compiled machine code is larger).
+
+`estimateMB` sums guest dirty pages, SABs and JS caches. Use it to compare runs, not as an OS
+number. On desktop the ground truth is the renderer's private working set:
+`bun tools/harness/diagnostics/footprint-measure.ts <wgb> [label] [5,15,30] [--fp]` starts
+a fresh renderer, opens the bundle and samples it over CDP `SystemInfo.getProcessInfo` at the
+given delays after the guest starts (Windows). Private bytes (commit) include the whole wasm
+reservation and say nothing about touched pages.
+
 ## Checked-in scripts & the regression batch
 
 Durable `*.harness.ts` scripts live under `tools/harness/`: `templates/` (copy-and-adapt

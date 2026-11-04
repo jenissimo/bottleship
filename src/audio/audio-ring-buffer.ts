@@ -8,6 +8,8 @@
  * so it MUST NOT import any DOM/Node/worker-specific APIs.
  */
 
+import { noteSharedBuffer } from "../utils/shared-buffer-census";
+
 // ─── Control block field indices (Int32Array element offsets) ─────────────────
 
 /** Byte offset of current playback position (worklet writes) */
@@ -303,7 +305,7 @@ export function createAudioRingBuffer(
     format: AudioRingFormat,
     circular: boolean,
 ): SharedArrayBuffer {
-    const sab = new SharedArrayBuffer(CTRL_BLOCK_BYTES + bufferBytes);
+    const sab = noteSharedBuffer("audio-ring", new SharedArrayBuffer(CTRL_BLOCK_BYTES + bufferBytes));
     const ctrl = new Int32Array(sab, 0, CTRL_SLOTS);
     const blockAlign = format.channels * (format.bitsPerSample >> 3);
 
