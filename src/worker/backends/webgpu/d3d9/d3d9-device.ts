@@ -5695,7 +5695,8 @@ export class D3D9Device {
             this.guestFree(tex.guestPtr);
         }
         if (tex.gpuTexture) {
-            tex.gpuTexture.destroy();
+            // Recorded draws may still reference this view after COM Release.
+            this.commandRecorder.registerTemporaryTexture(tex.gpuTexture);
         }
     }
 
