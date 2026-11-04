@@ -1,6 +1,7 @@
 import { RegistryPersistence, RegistryAccessLogEntry, PersistedRegistryState } from "./registry-persistence";
 import { Logger, LogCategory } from "../../core/logger";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
+import { redirectsForImage, validateRedirects, type ExeRegistryRedirect, type RegistryRedirect } from "@bottleship/formats/sdb";
 
 export type RegistryValueType = "REG_SZ" | "REG_DWORD" | "REG_BINARY" | "REG_MULTI_SZ";
 
@@ -25,6 +26,31 @@ const ROOT_ALIASES: Record<string, string> = {
 function canonicalRoot(root: string): string {
     const upper = root.toUpperCase();
     return ROOT_ALIASES[upper] ?? upper;
+}
+
+function trimSeparators(path: string): string {
+    return path.replace(/\//g, "\\").replace(/^\\+/, "").replace(/\\+$/, "");
+}
+
+/**
+ * The form a key is stored under: short root, backslashes, no edge separators, lowercase.
+ * `root` is a predefined root or a key handle (itself a stored key); a whole root is just
+ * the root ("hklm"), never "hklm\".
+ */
+function keyOf(root: string, path: string): string {
+    const cleanPath = path ? trimSeparators(path) : "";
+    // A handle is already a clean stored key; anything else is trimmed first.
+    const cleanBase = root.includes("/") || root.startsWith("\\") || root.endsWith("\\") ? trimSeparators(root) : root;
+    const sep = cleanBase.indexOf("\\");
+    const base = sep < 0 ? canonicalRoot(cleanBase) : canonicalRoot(cleanBase.slice(0, sep)) + cleanBase.slice(sep);
+    return (cleanPath ? `${base}\\${cleanPath}` : base).toLowerCase();
+}
+
+/** "HKEY_LOCAL_MACHINE\Software\X" → ["HKEY_LOCAL_MACHINE", "Software\X"]. */
+function splitKey(spec: string): [string, string] {
+    const clean = spec.replace(/\//g, "\\").replace(/^\\+/, "");
+    const sep = clean.indexOf("\\");
+    return sep < 0 ? [clean, ""] : [clean.slice(0, sep), clean.slice(sep + 1)];
 }
 
 function validateRegType(type: string): RegistryValueType {
@@ -156,9 +182,15 @@ export class RegistryStore {
     private downstreamSink: ((mutation: RegistryMutation, exceptChildId?: number) => void) | null = null;
     private replayOrigin: RegistryOrigin | null = null;
     private readonly MAX_LOG_BUFFER_SIZE = 1000;
+    /**
+     * This process's VirtualRegistry redirects in stored-key form, longest source first.
+     * Validated so that no target overlaps any source: see setRedirects.
+     */
+    private redirects: Array<{ from: string; under: string; to: string }> = [];
 
     reset(): void {
         this.keys.clear();
+        this.redirects = [];
         this.systemDefaults = null;
         this.accessLogBuffer = [];
         this.gameId = "";
@@ -176,7 +208,8 @@ export class RegistryStore {
         for (const seed of buildSystemDefaults(EmulatorConfig.getInstance().osVersion)) {
             const values = new Map<string, RegistryValue>();
             for (const value of seed.values) values.set(value.name.toLowerCase(), value);
-            map.set(this.normalizeKey(seed.root, seed.path), values);
+            // The system's own keys are where the system keeps them, whichever process asks.
+            map.set(keyOf(seed.root, seed.path), values);
         }
         this.systemDefaults = map;
         return map;
@@ -203,8 +236,10 @@ export class RegistryStore {
             return;
         }
         // Support single RegistrySeed object
+        // A seed is the hive's own contents — what an installer left in the real registry — so
+        // it lands where it names; a process's redirects only change what that process sees.
         if (seed.root && seed.path && Array.isArray(seed.values)) {
-            const key = this.normalizeKey(seed.root, seed.path);
+            const key = keyOf(seed.root, seed.path);
             Logger.log(LogCategory.SYSTEM, `Registry seed: ${key} (${seed.values.length} values)`);
             let existing = this.keys.get(key);
             if (!existing) {
@@ -237,7 +272,7 @@ export class RegistryStore {
             } else {
                 // It's a value for the current key
                 if (currentRoot) {
-                    const keyHandle = this.normalizeKey(currentRoot, currentPath);
+                    const keyHandle = keyOf(currentRoot, currentPath);
                     let values = this.keys.get(keyHandle);
                     if (!values) {
                         values = new Map();
@@ -256,7 +291,7 @@ export class RegistryStore {
     }
 
     open(root: string, path: string): string | null {
-        const key = this.normalizeKey(root, path);
+        const key = this.guestKey(root, path);
         if (this.keys.has(key)) return key;
         if (IMPLICIT_EMPTY_KEYS.has(key)) return key;
         if (this.defaults().has(key)) return key;
@@ -314,7 +349,12 @@ export class RegistryStore {
     }
 
     createKey(root: string, path: string): { key: string; isNew: boolean } {
-        const key = this.normalizeKey(root, path);
+        return this.createStoredKey(this.guestKey(root, path));
+    }
+
+    /** `key` is final (already redirected); what other processes replay is this key, not the
+     *  name this process was given — their own redirects are theirs, not ours. */
+    private createStoredKey(key: string): { key: string; isNew: boolean } {
         const isNew = !this.keys.has(key);
         if (isNew) {
             this.keys.set(key, new Map());
@@ -328,6 +368,7 @@ export class RegistryStore {
                 result: "success",
             });
 
+            const [root, path] = splitKey(key);
             this.emit({ op: "createKey", root, path });
             // Notify change
             this.notifyChange();
@@ -366,7 +407,7 @@ export class RegistryStore {
             result: "success",
         });
 
-        this.emit({ op: "deleteKey", key: baseKey, subKey });
+        this.emit({ op: "deleteKey", key: fullKey });
         this.notifyChange();
         return true;
     }
@@ -453,10 +494,52 @@ export class RegistryStore {
         return list;
     }
 
-    private normalizeKey(root: string, path: string): string {
-        const cleanRoot = canonicalRoot(root);
-        const cleanPath = path.replace(/\//g, "\\").replace(/^\\+/, "").replace(/\\+$/, "");
-        return `${cleanRoot}\\${cleanPath}`.toLowerCase();
+    /**
+     * Windows' VirtualRegistry ADDREDIRECT for THIS process: a key the guest names under `from`
+     * is the key at the same place under `to`, for opens, creates and writes alike.
+     *
+     * A redirect is applied exactly once, to the full name the guest gives (a predefined root
+     * or a handle, plus a subkey path). A handle holds the final key, so a key opened through a
+     * redirected handle already lies under a target; validation guarantees no target overlaps
+     * any source, so nothing produced by a redirect is ever moved again — not by a relative
+     * open, not by restore() (which never redirects), not by a replayed mutation (which carries
+     * the final key). A handle opened ABOVE a source ("HKLM\Software") is the guest's own name,
+     * and joining a subkey to it names the source, so that join is redirected, as on Windows.
+     *
+     * Invalid rules (see validateRedirects) are rejected with a log line. Returns the accepted
+     * ones.
+     */
+    setRedirects(rules: ReadonlyArray<RegistryRedirect> | undefined): RegistryRedirect[] {
+        const { accepted, rejected } = validateRedirects(rules ?? []);
+        for (const { rule, reason } of rejected) {
+            Logger.warn(LogCategory.SYSTEM, `Registry redirect ${rule?.from} -> ${rule?.to} rejected: ${reason}`);
+        }
+        this.redirects = accepted.map(({ from, to }) => ({ from, under: `${from}\\`, to }));
+        return accepted.map(({ rule }) => ({ from: rule.from, to: rule.to }));
+    }
+
+    /**
+     * Select the rules of the database entry that matches this process's image and apply them.
+     * Matching is by the image's file name only (MATCHING_FILE attributes are not checked); an
+     * image no entry names gets no redirects at all.
+     */
+    setRedirectsForImage(rules: ReadonlyArray<ExeRegistryRedirect> | undefined, imagePath: string): RegistryRedirect[] {
+        const accepted = this.setRedirects(redirectsForImage(rules ?? [], imagePath));
+        if (accepted.length > 0) {
+            Logger.log(LogCategory.SYSTEM,
+                `Registry redirects for ${imagePath}: ${accepted.map((r) => `${r.from} -> ${r.to}`).join(", ")}`);
+        }
+        return accepted;
+    }
+
+    /** The stored key a name the guest gives resolves to in this process. */
+    private guestKey(root: string, path: string): string {
+        const key = keyOf(root, path);
+        if (this.redirects.length === 0) return key;
+        for (const { from, under, to } of this.redirects) {
+            if (key === from || key.startsWith(under)) return to + key.slice(from.length);
+        }
+        return key;
     }
 
     private resolveKey(baseKey: string, subKey?: string): string {
@@ -464,10 +547,7 @@ export class RegistryStore {
         if (!subKey) return cleanBase;
         const cleanSub = subKey.replace(/\//g, "\\").replace(/^\\+/, "").replace(/\\+$/, "");
         if (!cleanSub) return cleanBase;
-        if (cleanBase.includes("\\")) {
-            return `${cleanBase}\\${cleanSub}`.toLowerCase();
-        }
-        return this.normalizeKey(cleanBase, cleanSub);
+        return this.guestKey(cleanBase, cleanSub);
     }
 
     /**
@@ -522,7 +602,8 @@ export class RegistryStore {
                     this.setValue(mutation.key, mutation.name, mutation.value);
                     break;
                 case "createKey":
-                    this.createKey(mutation.root, mutation.path);
+                    // The sender resolved the name with ITS redirects; replay the key it got.
+                    this.createStoredKey(keyOf(mutation.root, mutation.path));
                     break;
                 case "deleteKey":
                     this.deleteKey(mutation.key, mutation.subKey);
@@ -594,8 +675,8 @@ export class RegistryStore {
                     data: valueData.data,
                 });
             }
-            const sep = keyPath.indexOf("\\");
-            const key = sep < 0 ? keyPath : this.normalizeKey(keyPath.slice(0, sep), keyPath.slice(sep + 1));
+            // Persisted keys are final: a redirect already happened when the guest named them.
+            const key = keyPath.includes("\\") ? keyOf(keyPath, "") : keyPath;
             const existing = this.keys.get(key);
             if (existing) for (const [n, v] of values) existing.set(n, v);
             else this.keys.set(key, values);
