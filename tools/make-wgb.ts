@@ -81,6 +81,12 @@
  *                        The worker recreates them at boot (mkdir -p) so the game's own
  *                        fopen("wb") into e.g. user\rosters succeeds. Backslash or forward
  *                        slash both work. Example: --create-dirs "user\rosters,user\save\photos"
+ *   --copy <src=dst>     Also store game-dir file <src> under <dst> (both relative to
+ *                        game-dir, `/` or `\`), repeatable. For a file the installer's
+ *                        SCRIPT creates by copying one it shipped, which therefore is in
+ *                        no cabinet: InstallScript picking a language pack, a default
+ *                        config cloned from a template. The copy must not already exist.
+ *                        Example: --copy "Setup\Locale\language-English.zip=Setup\Locale.zip"
  *   --touch-layout <v>   On-screen touch controls for this title: either a preset id
  *                        (pointer | pointer-rmb | wasd-look | dpad-buttons | pad) or a
  *                        path to a .json ControlLayout exported from the layout editor.
@@ -257,6 +263,35 @@ const explicitCreateDirs = (get('--create-dirs') ?? '')
     .filter((d) => d.length > 0);
 
 const createDirs = [...new Set([...explicitCreateDirs, ...emptyDirs])].sort();
+
+// Files an installer SCRIPT makes by copying one it shipped (a selected language pack, a
+// config cloned from a template). They are in no cabinet, so an extraction never has them,
+// and the game that reads the copy finds nothing. Stored as their own entries — on disk
+// after a real install they are independent files the game may later rewrite.
+const romKeyByLower = new Map([...romFiles.keys()].map((k) => [k.toLowerCase(), k]));
+const toRomName = (p: string) => `rom/${p.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')}`;
+for (const pair of getAll('--copy')) {
+    const eq = pair.indexOf('=');
+    const src = eq > 0 ? toRomName(pair.slice(0, eq)) : '';
+    const dst = eq > 0 ? toRomName(pair.slice(eq + 1)) : '';
+    if (!src || dst === 'rom/' || src.split('/').includes('..') || dst.split('/').includes('..')) {
+        console.error(`Error: --copy expects SRC=DST relative to the game directory, got "${pair}"`);
+        process.exit(1);
+    }
+    const srcKey = romKeyByLower.get(src.toLowerCase());
+    if (!srcKey) {
+        console.error(`Error: --copy ${pair}: source ${src.slice(4)} is not a file in the game directory`);
+        process.exit(1);
+    }
+    // Guest paths are case-insensitive: a second entry differing only in case would shadow one.
+    if (romKeyByLower.has(dst.toLowerCase())) {
+        console.error(`Error: --copy ${pair}: ${dst.slice(4)} already exists in the bundle`);
+        process.exit(1);
+    }
+    romFiles.set(dst, romFiles.get(srcKey)!);
+    romKeyByLower.set(dst.toLowerCase(), dst);
+    console.log(`  copy:       ${srcKey.slice(4)} -> ${dst.slice(4)}`);
+}
 
 // Where the CD-ROM drive (D:\) points. A retail install still expects its disc — GTA III
 // hunts for a DRIVE_CDROM whose AUDIO\HEAD.WAV opens — so a bundle packed from an install
