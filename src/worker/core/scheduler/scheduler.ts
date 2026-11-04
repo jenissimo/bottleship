@@ -2075,6 +2075,7 @@ export class Scheduler {
         const thread: Thread = {
             id: threadId, handle,
             state: isSuspended ? ThreadState.SUSPENDED : ThreadState.READY,
+            kernelObject: this.resourceProvider.getKernelObject(handle) as KernelThreadObject,
             context,
             stackBase, stackSize: size, stackTop,
             startAddress, parameter,
@@ -2198,10 +2199,11 @@ export class Scheduler {
 
         // Persist exit metadata into the kernel object so GetExitCodeThread /
         // WaitForSingleObject can still work after the Thread record is reaped.
-        const kobj = this.resourceProvider.getKernelObject(thread.handle) as KernelThreadObject | null;
+        const kobj = thread.kernelObject ?? this.resourceProvider.getKernelObject(thread.handle) as KernelThreadObject | null;
         if (kobj && kobj.kind === 'thread') {
             kobj.terminated = true;
             kobj.exitCode = safeExitCode;
+            kobj.basicInformation = { tebAddress: thread.tebAddress, relativePriority: thread.priority };
         }
 
         // Release owned mutexes
@@ -3495,6 +3497,25 @@ export class Scheduler {
         const kobj = this.resourceProvider.getKernelObject(resolved) as KernelThreadObject | null;
         if (kobj && kobj.kind === 'thread' && kobj.terminated) {
             return { state: ThreadState.TERMINATED, exitCode: kobj.exitCode ?? 0 };
+        }
+        return null;
+    }
+
+    /** Native query snapshot; aliases resolve by kernel-object identity, closed handles fail. */
+    getThreadBasicInformation(handle: number): { id: number; tebAddress: number; exitStatus: number; relativePriority: number } | null {
+        const h = handle >>> 0;
+        if (h === 0xfffffffe) {
+            const thread = this.getCurrentThread();
+            return thread ? { id: thread.id, tebAddress: thread.tebAddress,
+                exitStatus: thread.exitCode ?? 259, relativePriority: thread.priority } : null;
+        }
+        const object = this.resourceProvider.getKernelObject(h) as KernelThreadObject | null;
+        if (!object || object.kind !== 'thread') return null;
+        const thread = this.threads.get(object.threadId);
+        if (thread) return { id: thread.id, tebAddress: thread.tebAddress,
+            exitStatus: thread.exitCode ?? 259, relativePriority: thread.priority };
+        if (object.terminated && object.basicInformation && object.exitCode !== undefined) {
+            return { id: object.threadId, ...object.basicInformation, exitStatus: object.exitCode };
         }
         return null;
     }
@@ -5273,6 +5294,7 @@ export class Scheduler {
         const thread: Thread = {
             id: threadId, handle,
             state: ThreadState.RUNNING,
+            kernelObject: this.resourceProvider.getKernelObject(handle) as KernelThreadObject,
             context: null,
             stackBase, stackSize, stackTop,
             startAddress: readEip(cpu),

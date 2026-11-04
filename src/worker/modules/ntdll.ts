@@ -1,3 +1,4 @@
+import { queryThreadBasicInformation } from "./ntdll/thread-information";
 import { currentProcessId } from '../core/process-identity';
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
@@ -17,6 +18,8 @@ export class Ntdll implements IModule {
 
     initialize(process: Process): void {
         const system = System.getInstance();
+        this.exports["NtQueryInformationThread"] = queryThreadBasicInformation;
+        this.exports["ZwQueryInformationThread"] = queryThreadBasicInformation;
 
         // Critical section stubs - single-threaded for now
         // NTSTATUS RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION)
