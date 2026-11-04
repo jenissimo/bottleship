@@ -401,6 +401,10 @@ export class D3D9CommandRecorder {
         this.frame.registerTemporaryBuffer(buffer);
     }
 
+    registerTemporaryTexture(texture: GPUTexture): void {
+        this.frame.registerTemporaryTexture(texture);
+    }
+
     registerPooledBuffer(buffer: GPUBuffer): void {
         this.frame.registerPooledBuffer(buffer);
     }

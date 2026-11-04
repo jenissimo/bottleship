@@ -353,7 +353,10 @@ export function computeDepthKey(getRS: GetRenderState): string {
 
 /** True when the requested raster state needs a stencil attachment we do not own. */
 export function hasUnsupportedStencilState(getRS: GetRenderState, format?: GPUTextureFormat): boolean {
-    const enabled = getRS(D3DRS_STENCILENABLE) !== 0 || getRS(D3DRS_TWOSIDEDSTENCILMODE) !== 0;
+    // TWOSIDEDSTENCILMODE selects front/back operations; it does not enable the
+    // stencil test. A retained two-sided setting must not reject depth-only passes
+    // after STENCILENABLE is turned off (D3DRENDERSTATETYPE contract).
+    const enabled = getRS(D3DRS_STENCILENABLE) !== 0;
     if (!enabled) return false;
     // Callers without format information retain the historical conservative answer.  Device
     // callers pass the active attachment format and can use D24S8/depth24plus-stencil8.
