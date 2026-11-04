@@ -14,7 +14,7 @@ export function registerFileIoAttributeExports(exports: Record<string, ThunkImpl
         if (!output || !isValidAddress(mem, output, 36, 'rw')) return fail(998); // ERROR_NOACCESS
         const vfs = system.fileSystem;
         const path = vfs.resolvePath(name);
-        const entry = vfs.statEntry(path);
+        const entry = vfs.statEntry(path) ?? vfs.statVirtualSystemFile(path);
         if (!entry) {
             const cut = path.lastIndexOf('\\');
             const parent = cut > 2 ? path.slice(0, cut) : path.slice(0, 3);

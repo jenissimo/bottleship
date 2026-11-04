@@ -5,7 +5,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { harnessBus } from "../../harness/event-bus";
 import { getContainerDir } from "./container-store";
 import { PathPolicy, DEFAULT_PATH_POLICY } from "./path-policy";
-import { isVirtualHleSystemFile } from "../../core/hle-system-catalog";
+import { isVirtualHleSystemFile, VIRTUAL_HLE_DLL_SIZE } from "../../core/hle-system-catalog";
 import { expandFileLookupPaths } from "./guest-path-resolver";
 import { asArrayBuffer } from "../../../dom-buffer";
 
@@ -522,6 +522,18 @@ export class VirtualFileSystem {
         if (this.directoryExists(full)) return false;
         if (this.resolveStoredFile(full)) return true;
         return isVirtualHleSystemFile(full);
+    }
+
+    /**
+     * The directory entry a real install has for an HLE system DLL (ddraw.dll in the system
+     * directory) that no stored file backs — the stat-shaped counterpart of fileExists. Kept
+     * apart from statEntry, which names STORED files the loader may map.
+     */
+    statVirtualSystemFile(path: string): VfsEntry | null {
+        const full = normalizePath(this.resolvePath(path));
+        if (this.directoryExists(full) || this.resolveStoredFile(full) || !isVirtualHleSystemFile(full)) return null;
+        const name = full.slice(full.lastIndexOf("\\") + 1).toLowerCase();
+        return { path: full, name, kind: "file", size: VIRTUAL_HLE_DLL_SIZE, source: "rom" };
     }
 
     /** Resolve a stored file (ROM/overlay), trying Win9x/NT system-directory aliases. */

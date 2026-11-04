@@ -39,7 +39,7 @@ import { UnpackDecoder, Md5 } from "@bottleship/formats/unpack";
 import { extractInstallShield, detectInstallShieldStem, parseInstallShieldHeader, resolveInstallPath, FILE_INVALID } from "@bottleship/formats/installshield";
 import { findCabinet, parseCabHeader, extractCabToMap, type CabInflateBlock } from "@bottleship/formats/cab";
 import { detectFreeArc, extractFreeArcToMap, FreeArcUnsupportedError } from "@bottleship/formats/freearc";
-import { unzipToMap } from "@bottleship/formats/zip";
+import { BufferSource as ZipBufferSource, ZipArchive, unzipToMap } from "@bottleship/formats/zip";
 import { isGogJunk } from "./gog-filter";
 import { extractMsiPayload } from './msi-extract';
 import { isWise, extractWise } from '@bottleship/formats/wise';
@@ -49,7 +49,7 @@ import { findRar4, extractRar4 } from '@bottleship/formats/rar';
 import { IsoImage, extractIsoToMap } from '@bottleship/formats/iso';
 import { isInstallShieldLauncher, extractInstallShieldLauncher } from '@bottleship/formats/installshield-launcher';
 
-export type InstallerVia = "ea-winzip" | "installshield" | "installshield3" | "wise" | "vise" | "rar4" | "iso" | "inno" | "freearc" | "pftw" | "cab-sfx" | "msi" | "installshield-launcher" | "none";
+export type InstallerVia = "ea-winzip" | "installshield" | "installshield3" | "wise" | "vise" | "rar4" | "iso" | "inno" | "freearc" | "pftw" | "cab-sfx" | "zip-sfx" | "msi" | "installshield-launcher" | "none";
 
 export interface ContainerExtractOptions {
     /** Shared unpack-streaming WASM bytes for Inno/FreeArc LZMA and RAR PPMd. */
@@ -512,6 +512,34 @@ const cabSfxFormat: InstallerFormat<{ exe: Uint8Array }> = {
     },
 };
 
+/**
+ * ZIP self-extractor: a Win32 stub with a ZIP appended, its central directory at the end of
+ * the exe (GTA's Rockstar Classics installer: an "MPU" stub unpacking an InstallShield 5
+ * disk set to C:\Temp and running its SETUP.EXE). The reader anchors on the EOCD, so the
+ * stub in front costs nothing; the unwrapped tree recurses like any other container.
+ */
+async function findZipSelfExtractor(files: Map<string, Uint8Array>): Promise<{ exe: Uint8Array } | null> {
+    for (const [rel, data] of files) {
+        if (!rel.toLowerCase().endsWith('.exe') || data.length < 64 || data[0] !== 0x4d || data[1] !== 0x5a) continue;
+        try {
+            const archive = new ZipArchive(new ZipBufferSource(data));
+            await archive.init();
+            if (archive.listEntries().some(e => !e.isDirectory)) return { exe: data };
+        } catch { /* no appended ZIP */ }
+    }
+    return null;
+}
+
+const zipSfxFormat: InstallerFormat<{ exe: Uint8Array }> = {
+    id: 'zip-sfx',
+    label: 'ZIP self-extractor',
+    detect: files => findZipSelfExtractor(files),
+    async extract(_files, match, ctx) {
+        const inner = await extractInstallerFromFiles(await unzipToMap(match.exe), ctx);
+        return { gameFiles: inner.gameFiles, fileTimes: inner.fileTimes, note: `ZIP self-extractor → ${inner.note}` };
+    },
+};
+
 const msiFormat: InstallerFormat<{ name: string; bytes: Uint8Array }> = {
     id: 'msi',
     label: 'MSI cabinet payload',
@@ -612,7 +640,7 @@ const INSTALLER_FORMATS: InstallerFormat<any>[] = [
     singlePayload('installshield3', 'InstallShield 3 Z archive', isInstallShield3, extractInstallShield3),
     singlePayload('wise', 'Wise DEFLATE installer', isWise, extractWise),
     singlePayload('vise', 'VISE object-table installer', isVise, extractVise),
-    rar4Format, isoFormat, freeArcFormat, pftwFormat, cabSfxFormat, innoFormat,
+    rar4Format, isoFormat, freeArcFormat, pftwFormat, cabSfxFormat, zipSfxFormat, innoFormat,
 ];
 
 // --- the recursion ------------------------------------------------------------------

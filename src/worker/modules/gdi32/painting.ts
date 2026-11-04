@@ -1730,12 +1730,22 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         return bestIndex;
     };
 
-    // GetSystemPaletteUse - gets system palette usage
+    // System palette usage is one system-wide setting: SYSPAL_STATIC (1) until an app takes
+    // the static entries with SYSPAL_NOSTATIC (2) / SYSPAL_NOSTATIC256 (3).
+    let systemPaletteUse = 1;
     exports['GetSystemPaletteUse'] = (ctx, mem, args): number => {
-        const hdc = args[0];
-        Logger.verbose(LogCategory.GDI32, `GetSystemPaletteUse(hdc=0x${hdc.toString(16)})`);
-        // SYSPAL_STATIC = 1 (static colors used)
-        return 1;
+        Logger.verbose(LogCategory.GDI32, `GetSystemPaletteUse(hdc=0x${args[0].toString(16)}) -> ${systemPaletteUse}`);
+        return systemPaletteUse;
+    };
+    // UINT SetSystemPaletteUse(HDC, UINT uUsage): the previous usage, or SYSPAL_ERROR (0)
+    // for a value that is not one of the three.
+    exports['SetSystemPaletteUse'] = (ctx, mem, args): number => {
+        const use = args[1] >>> 0;
+        if (use < 1 || use > 3) return 0;
+        const previous = systemPaletteUse;
+        systemPaletteUse = use;
+        Logger.verbose(LogCategory.GDI32, `SetSystemPaletteUse(hdc=0x${args[0].toString(16)}, ${use}) -> ${previous}`);
+        return previous;
     };
 
     // GetSystemPaletteEntries - retrieves system palette entries

@@ -132,7 +132,7 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
         // enumeration. Stat it directly (O(1)) instead of scanning the whole ROM index.
         const exactPath = pattern.replace(/\//g, '\\');
         if (exactPath.includes('\\') && !/[*?]/.test(exactPath)) {
-            const entry = vfs.statEntry(exactPath);
+            const entry = vfs.statEntry(exactPath) ?? vfs.statVirtualSystemFile(exactPath);
             if (!entry) {
                 System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
                 return INVALID_HANDLE_VALUE;
@@ -189,7 +189,7 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
         // Fast path: explicit path, no wildcard → direct stat (see FindFirstFileA).
         const exactPath = pattern.replace(/\//g, '\\');
         if (exactPath.includes('\\') && !/[*?]/.test(exactPath)) {
-            const entry = vfs.statEntry(exactPath);
+            const entry = vfs.statEntry(exactPath) ?? vfs.statVirtualSystemFile(exactPath);
             if (!entry) {
                 System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
                 return INVALID_HANDLE_VALUE;
