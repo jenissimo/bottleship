@@ -7,6 +7,7 @@ import { Logger, LogCategory } from "../core/logger";
 import { registerBuiltinClass } from "./user32/class";
 import { ensureAnimateControlClasses } from "./user32/animate-control";
 import { getSystemCursorHandle, IDC_IBEAM } from "./user32/system-cursors";
+import { onHleModuleAttach } from "../core/hle-module-images";
 
 /** sizeof(INITCOMMONCONTROLSEX) - dwSize + dwICC */
 export const INITCOMMONCONTROLSEX_SIZE = 8;
@@ -152,6 +153,10 @@ export function initCommonControlsEx(dwICC: number): boolean {
     Logger.log(LogCategory.SYSTEM, `InitCommonControlsEx: dwICC=0x${flags.toString(16)} registered`);
     return true;
 }
+
+// comctl32's DllMain registers every class it implements at process attach (Wine
+// comctl32/commctrl.c DllMain); InitCommonControls only guarantees the DLL is linked.
+onHleModuleAttach("comctl32", () => { initCommonControlsEx(ICC_ALL_VALID); });
 
 /** Legacy InitCommonControls - equivalent to InitCommonControlsEx(ICC_WIN95_CLASSES). */
 export function initCommonControls(): boolean {
