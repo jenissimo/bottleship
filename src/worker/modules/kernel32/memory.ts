@@ -16,6 +16,7 @@ import { ensureGuestPagesCommitted, registerGuestCommitNotifier, registerGuestMe
     registerGuestCommittedProbe } from '../../core/memory/guest-page-commit';
 import { isValidUserAddress } from '../../core/memory/address-guard';
 import { invalidateGuestCode } from '../../core/memory/guest-code';
+import { isGuestMemoryTracked, markGuestPagesClean, markGuestPagesDirty, zeroGuestRange } from '../../core/memory/guest-page-dirty';
 import { profiler } from '../../core/profiler';
 import { GUEST_PROCESSOR_TYPE, GUEST_PROCESSOR_LEVEL, GUEST_PROCESSOR_REVISION } from '../../core/guest-cpu-identity';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
@@ -343,8 +344,9 @@ function installNewSlab(size: number): boolean {
     const end = addr + size;
     slabRanges.push({ base: addr, end });
     totalSlabBytes += size;
-    const mem = process.getCurrentMemory();
-    mem.fill(0, addr, end);
+    // No fill here: allocSlabArena hands out zeroed memory (allocFromHigh's fresh-commit
+    // contract), writing only pages a previous tenant dirtied. Filling the whole arena
+    // made every slab generation resident up front — up to the full arena size.
     hypercallDataManager.initializeHeapSlab(addr, end);
     Logger.log(LogCategory.KERNEL32,
         `Heap slab gen${slabRanges.length}: 0x${addr.toString(16)}-0x${end.toString(16)} ` +
@@ -932,7 +934,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             if (ptm?.isPagingEnabled()) ptm.commitPages(from, to - from);
             else {
                 invalidateGuestCode(from, to - from);
-                proc.getCurrentMemory().fill(0, from, to);
+                const m = proc.getCurrentMemory();
+                zeroGuestRange(m, from, to - from);
+                markGuestPagesDirty(from, to - from);
             }
         }
     }
@@ -2382,7 +2386,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 registerVirtualAllocation(process, reuse, alignedSize, 'rw', PAGE_READWRITE);
                 virtualAllocRegions.set(reuse, alignedSize);
                 invalidateGuestCode(reuse, alignedSize);
-                mem.fill(0, reuse, reuse + alignedSize);
+                // A parked block held its previous tenant's bytes: its pages are dirty.
+                zeroGuestRange(mem, reuse, alignedSize);
+                markGuestPagesDirty(reuse, alignedSize);
                 if (vaCacheKey > alignedSize) {
                     freeVirtualPages.addRange(reuse + alignedSize, vaCacheKey - alignedSize);
                     if (process.pageTableManager?.isPagingEnabled()) {
@@ -2439,17 +2445,34 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             }
         }
 
+        // A block from MemoryManager's own placement (anonymous / top-down) reads zero on
+        // return — its fresh-commit contract, kept with the dirty-page map so a never-used
+        // range is not written at all. A FIXED-address allocAt keeps whatever was there, so
+        // only that path still needs the commit to zero (lazily, dirty pages only).
+        // Untracked memory (no dirty-page map) keeps the unconditional zero.
+        const handedOutZero = effectiveAddress === 0 && isGuestMemoryTracked(mem);
         if (flAllocationType & MEM_COMMIT) {
             const ptm = process.pageTableManager;
             if (ptm?.isPagingEnabled()) {
-                ptm.commitPages(address, alignedSize);
+                ptm.commitPages(address, alignedSize, handedOutZero);
                 if (perms !== 'rw') ptm.setProtection(address, alignedSize, permsToProtect(perms));
             } else {
                 invalidateGuestCode(address, alignedSize);
-                mem.fill(0, address, address + alignedSize);
+                if (!handedOutZero) zeroGuestRange(mem, address, alignedSize);
+                markGuestPagesDirty(address, alignedSize);
             }
         } else {
             markDecommitted(address, alignedSize);
+            // Reserved, not committed: zero (handedOutZero) and unreachable by the guest
+            // until a MEM_COMMIT, which zeroes only dirty pages — so a big reserve that is
+            // committed piecemeal never writes pages nobody touched.
+            if (handedOutZero && process.pageTableManager?.isPagingEnabled()) {
+                markGuestPagesClean(mem, address, alignedSize);
+            }
+        }
+        // The capacity tail past alignedSize was zeroed with the block and is decommitted.
+        if (handedOutZero && capacity > alignedSize && process.pageTableManager?.isPagingEnabled()) {
+            markGuestPagesClean(mem, address + alignedSize, capacity - alignedSize);
         }
 
         Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc -> 0x${address.toString(16)} (size=${alignedSize})`);

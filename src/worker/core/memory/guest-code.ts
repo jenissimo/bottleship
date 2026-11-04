@@ -21,6 +21,7 @@
  */
 
 import { preemptionManager } from "../cpu/preemption-manager";
+import { markGuestPagesDirty } from "./guest-page-dirty";
 
 /** Ranges seen before a wasm instance existed, replayed on the first successful resolve. */
 const pending: number[] = [];
@@ -153,6 +154,7 @@ export function writeGuestCode(mem: Uint8Array, bytes: Uint8Array, address: numb
     if (bytes.length === 0) return true;
     if (start + bytes.length > mem.length) return false;
     mem.set(bytes, start);
+    markGuestPagesDirty(start, bytes.length);
     invalidateGuestCode(start, bytes.length);
     return true;
 }

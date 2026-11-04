@@ -149,10 +149,14 @@ export const DEFAULT_DEBUG_FLAGS: DebugFlags = {
  * Ring buffer configuration
  */
 export interface RingBufferConfig {
-    /** Size of each ring buffer in bytes */
+    /** Initial size of each VERTEX ring buffer in bytes (grows on demand, see maxBufferSize) */
     bufferSize: number;
     /** Number of buffers in the ring (for GPU/CPU overlap) */
     bufferCount: number;
+    /** Initial size of each INDEX ring buffer in bytes. Defaults to bufferSize. */
+    indexBufferSize?: number;
+    /** Ceiling a vertex/index ring may grow to. Defaults to bufferSize (no growth). */
+    maxBufferSize?: number;
 }
 
 /**
@@ -162,7 +166,20 @@ export interface RingBufferConfig {
  * when DrawIndexedPrimitiveVB passed the full VB capacity as vCount.
  */
 export const DEFAULT_RING_BUFFER_CONFIG: RingBufferConfig = {
-    bufferSize: 128 * 1024 * 1024, // 128MB — prevents overflow/flush stalls in high-draw-count games
+    // Rings start small and double IN PLACE when a frame outgrows them (RingBufferManager:
+    // the current ring gets a bigger buffer, already-recorded draws keep the old one until
+    // it is retired) — no flush, no stall, no dropped draw. Starting at the old 128 MB
+    // ceiling cost 768 MB of GPU memory from the first frame of every title, which on iOS
+    // is counted against the page's memory limit.
+    //
+    // Measured per-frame high-water marks (ddraw executor fstats, 1024 frames):
+    // Re-Volt race 22.7 MB vertex / 28 KB index, Max Payne tutorial 5.4 MB / 50 KB,
+    // Hitman and Red Faction menus 2.2 MB / 7 KB. 16 MB vertex covers every menu and most
+    // scenes outright; a heavy scene pays one buffer creation per ring and settles at
+    // 32 MB. Index traffic is two orders of magnitude smaller, so 4 MB.
+    bufferSize: 16 * 1024 * 1024,
+    indexBufferSize: 4 * 1024 * 1024,
+    maxBufferSize: 128 * 1024 * 1024, // the previous fixed size: worst case is unchanged
     bufferCount: 3, // Triple-buffering for better GPU/CPU overlap
 };
 
@@ -184,7 +201,12 @@ export interface UniformBufferConfig {
  */
 export const DEFAULT_UNIFORM_BUFFER_CONFIG: UniformBufferConfig = {
     slotSize: 768,
-    bufferSize: 16 * 1024 * 1024, // 16MB — ~21K unique uniform slots per frame at 768-byte stride
+    // 4MB — ~5.4K unique uniform slots (and ~4K light-set slots, which share this size) per
+    // frame per ring. Measured high-water: 33 KB uniforms / 98 KB light sets (Max Payne
+    // tutorial), 0 on MegaBatch-heavy Re-Volt. A frame that does outgrow it takes the
+    // existing flush-and-switch path (ensureSpaceForDraw), which checks both rings. 16MB
+    // per ring × (uniform + lights) × 3 was 96 MB of GPU memory up front.
+    bufferSize: 4 * 1024 * 1024,
 };
 
 /**
@@ -723,7 +745,9 @@ export interface StorageBufferConfig {
 /** Default storage buffer configuration for per-draw uniforms. */
 export const DEFAULT_STORAGE_BUFFER_CONFIG: StorageBufferConfig = {
     slotSize: 512,
-    bufferSize: 8 * 1024 * 1024, // 8MB — ~16K draw slots per frame
+    // 4MB — ~8K MegaBatch draw slots per frame per ring (measured high-water 32 KB; Re-Volt
+    // peaks at ~2.8K draws/frame in total). Overflow flushes and switches rings.
+    bufferSize: 4 * 1024 * 1024,
 };
 
 /**

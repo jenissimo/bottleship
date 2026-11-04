@@ -24,6 +24,7 @@ import {
 import type { IoWorkerStats } from "./sab-io-protocol";
 import type { ReadHint } from "@bottleship/formats/zip";
 import { currentIoReadPolicy } from "./io-read-policy";
+import { noteSharedBuffer } from "../../../utils/shared-buffer-census";
 
 /**
  * Upper edges (ms) of the block-time histogram. Log-ish, because the two answers
@@ -185,7 +186,7 @@ export class SabIoSource implements ZipSource {
         if (typeof SharedArrayBuffer === "undefined" || !(globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated) {
             throw new Error("SAB I/O unavailable: not cross-origin isolated");
         }
-        const sab = new SharedArrayBuffer(SAB_TOTAL_BYTES);
+        const sab = noteSharedBuffer("wgb-io", new SharedArrayBuffer(SAB_TOTAL_BYTES));
         const worker = new Worker(new URL("./io-worker.ts", import.meta.url), { type: "module" });
 
         let ready: Ready;
