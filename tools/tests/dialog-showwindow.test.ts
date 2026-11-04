@@ -139,6 +139,23 @@ test('a modal dialog is shown after init even without WS_VISIBLE in the template
     expect(windows.get(hwnd)!.visible).toBe(true);
 });
 
+// A top-level modal dialog is a titled top-level window on screen: the report is what
+// hands the display to a child process whose first window is that dialog (GTA2's
+// network setup started from its launcher). Without it the child ran headless.
+test('showing a top-level modal dialog reports a visible top-level window to the host', () => {
+    const titles: { title: string; visible: boolean }[] = [];
+    const system = System.getInstance();
+    system.setHostWindowTitleCallback((title, visible) => titles.push({ title, visible }));
+    try {
+        runDialog('DialogBoxIndirectParamA', WS_POPUP);
+        expect(titles).toHaveLength(0); // still hidden during WM_INITDIALOG
+        invoked.find((c) => c.args[1] === WM_INITDIALOG)!.complete(1);
+        expect(titles).toEqual([{ title: '', visible: true }]);
+    } finally {
+        system.setHostWindowTitleCallback(() => {});
+    }
+});
+
 // The message belongs to the transition: a second show announces nothing, and a
 // spurious WM_SHOWWINDOW re-runs the app's show-time work.
 test('showing an already-visible window posts no second WM_SHOWWINDOW', () => {

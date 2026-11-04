@@ -1,5 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { hleImageBase, isHleModuleLoaded, loadedHleModules, markHleModuleLoaded, materializeHleModuleImages, resetHleModuleImages } from "../../src/worker/core/hle-module-images";
+import { hleImageBase, isHleModuleLoaded, loadedHleModules, markHleModuleLoaded, materializeHleModuleImages, onHleModuleAttach, resetHleModuleImages } from "../../src/worker/core/hle-module-images";
+import { shell32Module } from "../../src/worker/api/shell32.api";
+import { comctl32Module } from "../../src/worker/api/comctl32.api";
+import { getWindowClassByName } from "../../src/worker/modules/user32/class";
+import "../../src/worker/modules/comctl32-init";
 import { ThunkGenerator } from "../../src/worker/core/thunking/thunk-generator";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { preemptionManager } from "../../src/worker/core/cpu/preemption-manager";
@@ -53,6 +57,8 @@ function fast(name: string): number | null {
 }
 beforeAll(() => {
     APIRegistry.getInstance().registerModule(kernel32Module);
+    APIRegistry.getInstance().registerModule(shell32Module);
+    APIRegistry.getInstance().registerModule(comctl32Module);
     mem = new Uint8Array(MEM_HLE_IMAGE_BASE + MEM_HLE_IMAGE_SIZE);
     memoryDescriptors = Object.getOwnPropertyDescriptors(Mem);
     Mem.bind(() => mem);
@@ -187,4 +193,23 @@ describe("GetModuleHandle observes loaded HLE images without loading them", () =
             expect(view.getUint32(OUT, true)).toBe(EXE);
         });
     }
+});
+
+// A DLL's static imports load with it, and each one's DllMain runs once per load: an
+// app that links shell32 has comctl32 and its classes without calling InitCommonControls
+// (GTA2's lobby creates a SysListView32 and a trackbar that way).
+describe("loading an HLE module attaches its static imports", () => {
+    test("shell32 loads comctl32, whose attach registers the common-control classes", () => {
+        let attaches = 0;
+        onHleModuleAttach("comctl32", () => { attaches++; });
+        expect(isHleModuleLoaded("comctl32")).toBe(false);
+        markHleModuleLoaded("shell32.dll");
+        expect(isHleModuleLoaded("comctl32")).toBe(true);
+        expect(attaches).toBe(1);
+        expect(getWindowClassByName("SysListView32")?.controlClass).toBe("SysListView32");
+        expect(getWindowClassByName("msctls_trackbar32")?.controlClass).toBe("msctls_trackbar32");
+        markHleModuleLoaded("shell32.dll");
+        markHleModuleLoaded("comctl32.dll");
+        expect(attaches).toBe(1);
+    });
 });
