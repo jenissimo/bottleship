@@ -341,9 +341,10 @@ describe("D3D9ScreenLayer — the emulator side of the boundary", () => {
     });
 });
 
-function fakeCanvasFactory(opts: { noContext?: boolean } = {}) {
+function fakeCanvasFactory(opts: { noContext?: boolean; unconfigureOnTransfer?: boolean; failure?: Error } = {}) {
     const log = { configures: [] as Any[], transfers: 0, created: 0, copies: [] as Any[] };
     let current: Any = { id: 0 };
+    let configured = false;
     const factory = (w: number, h: number): OffscreenCanvas => {
         log.created++;
         const canvas: Any = {
@@ -351,12 +352,20 @@ function fakeCanvasFactory(opts: { noContext?: boolean } = {}) {
             getContext: () => (opts.noContext ? null : context),
             transferToImageBitmap: () => {
                 log.transfers++;
+                if (opts.unconfigureOnTransfer) configured = false;
                 const b = bitmap(canvas.width, canvas.height);
                 current = { id: current.id + 1 };
                 return b;
             },
         };
-        const context: Any = { configure: (c: Any) => log.configures.push(c), getCurrentTexture: () => current };
+        const context: Any = {
+            configure: (c: Any) => { configured = true; log.configures.push(c); },
+            getCurrentTexture: () => {
+                if (opts.failure) throw opts.failure;
+                if (!configured) throw new DOMException("Canvas not configured", "InvalidStateError");
+                return current;
+            },
+        };
         return canvas as OffscreenCanvas;
     };
     const encoder = {
@@ -397,6 +406,27 @@ describe("D3D9FrameVehicle — the render side of the boundary", () => {
         v.encode(deviceB, "bgra8unorm", c.encoder, { width: 1280, height: 960 } as GPUTexture);
         expect(c.log.configures).toHaveLength(3);
         expect(c.log.created).toBe(1);
+    });
+
+    test("a context left unconfigured by the transfer is configured again before the next copy", () => {
+        const c = fakeCanvasFactory({ unconfigureOnTransfer: true });
+        const v = new D3D9FrameVehicle(c.factory);
+        const source = { width: 640, height: 480 } as GPUTexture;
+        expect(v.encode(deviceA, "bgra8unorm", c.encoder, source)).toBe(true);
+        expect(v.transfer()).toMatchObject({ width: 640, height: 480 });
+        expect(v.encode(deviceA, "bgra8unorm", c.encoder, source)).toBe(true);
+        expect(c.log.configures).toHaveLength(2);
+        expect(c.log.configures[1]).toMatchObject({ device: deviceA, format: "bgra8unorm", alphaMode: "opaque" });
+        expect(c.log.copies).toHaveLength(2);
+        expect(c.log.copies[1].dst).toEqual({ texture: { id: 1 } });
+        expect(v.transfer()).toMatchObject({ width: 640, height: 480 });
+    });
+
+    test("other getCurrentTexture failures are not swallowed", () => {
+        const c = fakeCanvasFactory({ failure: new TypeError("device lost") });
+        const v = new D3D9FrameVehicle(c.factory);
+        expect(() => v.encode(deviceA, "bgra8unorm", c.encoder, { width: 640, height: 480 } as GPUTexture)).toThrow("device lost");
+        expect(c.log.copies).toHaveLength(0);
     });
 
     test("no WebGPU context: nothing is copied and nothing transfers", () => {
