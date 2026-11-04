@@ -182,4 +182,6 @@ export interface MSSTimer {
     timerId?: number;
     /** A tick is queued or running on the timer-pump thread; further ticks coalesce. */
     inFlight?: boolean;
+    /** onReturn of the current start's pump ticks; identifies them in the pump queue. */
+    pumpOnReturn?: () => void;
 }

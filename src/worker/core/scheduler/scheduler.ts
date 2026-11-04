@@ -77,7 +77,7 @@ import {
 } from './scheduler-diagnostics';
 import { PF_HALT_TARGET } from '../bootloader';
 import { grantSrwOnWake, ensureSrwWaitEvent } from '../../modules/kernel32/srw-lock';
-import type { WinMM } from '../../modules/winmm';
+import type { WinMM, PendingTimerCallback as PostedTimerCallback } from '../../modules/winmm';
 
 // Max virtual-time advance per idle pollTimeouts() pump. Bounds the jump when the
 // idle anchor is stale after a pause / background-throttle gap. See pollTimeouts().
@@ -3133,6 +3133,18 @@ export class Scheduler {
         if (!callbackAddr) return false;
         const winmm = this.process?.getModule('winmm') as WinMM | undefined;
         return winmm?.postGuestCallback(callbackAddr, args, onReturn) ?? false;
+    }
+
+    /** Drop posted timer callbacks that have not started yet; returns how many were removed. */
+    cancelTimerCallbacks(match: (cb: PostedTimerCallback) => boolean): number {
+        const winmm = this.process?.getModule('winmm') as WinMM | undefined;
+        return winmm?.cancelPostedGuestCallbacks(match).length ?? 0;
+    }
+
+    /** True while a posted timer callback is still queued or running on a live pump thread. */
+    isTimerCallbackPending(match: (cb: PostedTimerCallback) => boolean): boolean {
+        const winmm = this.process?.getModule('winmm') as WinMM | undefined;
+        return winmm?.hasPostedGuestCallback(match) ?? false;
     }
 
     /** @deprecated Use setEvent on the CS LockSemaphore handle instead */
