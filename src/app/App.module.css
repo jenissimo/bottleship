@@ -527,6 +527,36 @@
   }
 }
 
+/* On-screen controls are up. The "F11 · Fullscreen" strip is a keyboard hint and
+   costs a phone 40px of control deck, so it goes. */
+.app--touch .emu-info-strip {
+  display: none;
+}
+
+/* Portrait with on-screen controls: the picture is pinned to the TOP of the panel and
+   the whole bar below it becomes the control deck (presets.ts authors every portrait
+   widget bottom-anchored). Centring would split the free space into two bars, and the
+   top one is useless — nothing can be anchored to it without covering the picture's
+   neighbour, the top bar. */
+@media (orientation: portrait) {
+  .app--touch {
+    /* Standalone/fullscreen web app: the shell itself starts below the Dynamic Island
+       (Safari with toolbars reports 0 here). */
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .app--touch .app__panel {
+    align-items: flex-start;
+    container-type: size;
+  }
+
+  .app--touch .app__canvas {
+    height: auto;
+    min-height: 0;
+  }
+}
+
 /* A fixed, full-screen background repaints on every scroll/resize on mobile and
    steals compositor budget from the frame loop. */
 @media (pointer: coarse) {

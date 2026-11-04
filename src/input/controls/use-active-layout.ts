@@ -5,7 +5,7 @@
 // observed as pressed. All three are properties visible at our own API boundary, so a
 // title nobody has ever run gets a sane layout on its first boot.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
     GUEST_POLLED_KEYS_BASE,
     GUEST_POLLED_KEYS_COUNT,
@@ -24,18 +24,24 @@ import {
 import {
     isPinned,
     loadGlobalDefault,
-    loadLayout,
+    loadUserLayout,
     resolveActiveLayout,
+    saveLayout,
+    loadLayout,
+    type Orientation,
     type StoredLayout,
     type TouchModePref,
 } from "../layout-store";
 import { getPreset } from "./presets";
 import { validateLayout, type ControlLayout } from "./types";
+import { isMoveKeys, layoutMoveKeys, withMoveKeys, type MoveKeys } from "./move-keys";
 
 /** `emulator.touch` as delivered by bundle_meta. */
 export interface ManifestTouch {
     layout?: string | Record<string, unknown>;
     mode?: TouchModePref;
+    /** The movement cluster the title steers with: "wasd" | "arrows" | "numpad". */
+    moveKeys?: MoveKeys;
 }
 
 export interface ActiveLayout {
@@ -43,6 +49,15 @@ export interface ActiveLayout {
     mode: TouchModePref;
     /** Which tier decided, for the settings UI and diagnostics. */
     tier: string;
+    /** The preset the live layout came from ("" for an authored one). */
+    presetId: string;
+    /** The cluster the movement control presses, or null when the layout has none. */
+    moveKeys: MoveKeys | null;
+    orientation: Orientation;
+    /** The player's pick from the HUD: saved for this game AND this orientation. */
+    choosePreset(presetId: string): void;
+    /** Saved for this game in both orientations. */
+    chooseMoveKeys(keys: MoveKeys): void;
 }
 
 /** Signals are cheap to read but pointless to poll faster than a person can notice. */
@@ -57,7 +72,8 @@ function manifestTier(touch: ManifestTouch | null): StoredLayout<ControlLayout> 
         if (parsed) out.layout = parsed;
     }
     if (touch.mode) out.mode = touch.mode;
-    return out.presetId || out.layout || out.mode ? out : null;
+    if (isMoveKeys(touch.moveKeys)) out.moveKeys = touch.moveKeys;
+    return out.presetId || out.layout || out.mode || out.moveKeys ? out : null;
 }
 
 export function useActiveLayout(
@@ -103,7 +119,14 @@ export function useActiveLayout(
     const orientationRef = useRef(orientation);
     orientationRef.current = orientation;
 
+    // Bumped by the choose* callbacks: the stored tiers are read in the memo below, and
+    // nothing else would tell it that localStorage changed.
+    const [revision, setRevision] = useState(0);
+
     useEffect(() => {
+        // Only a GAME-WIDE pin stops the picker. A layout the player chose for one
+        // orientation already outranks the auto tier there, and must not leave the
+        // other orientation with nothing but the pointer fallback.
         if (!enabled || isPinned(gameId)) return;
         // Sticky per game: presets are supersets (wasd-look still taps fine in a menu),
         // so one visible transition is the budget — re-picking on every signal change
@@ -141,17 +164,41 @@ export function useActiveLayout(
         return () => window.clearInterval(timer);
     }, [enabled, gameId]);
 
+    const choosePreset = useCallback((presetId: string) => {
+        const own = loadLayout<ControlLayout>(gameId, validateLayout, orientationRef.current) ?? {};
+        const next: StoredLayout<ControlLayout> = { ...own, presetId };
+        delete next.layout;
+        saveLayout(gameId, next, orientationRef.current);
+        setRevision((r) => r + 1);
+    }, [gameId]);
+
+    const chooseMoveKeys = useCallback((keys: MoveKeys) => {
+        const base = loadLayout<ControlLayout>(gameId, validateLayout) ?? {};
+        // Not a layout choice: leave `pinned` as it was so auto-select keeps working.
+        saveLayout(gameId, { ...base, moveKeys: keys, pinned: base.pinned ?? false });
+        setRevision((r) => r + 1);
+    }, [gameId]);
+
     return useMemo(() => {
         const resolved = resolveActiveLayout<ControlLayout>({
-            userOverride: loadLayout<ControlLayout>(gameId, validateLayout),
+            userOverride: loadUserLayout<ControlLayout>(gameId, orientation, validateLayout),
             globalDefault: loadGlobalDefault<ControlLayout>(validateLayout),
             manifest: manifestTier(manifestTouch),
             autoPick,
         });
+        const base = resolved.layout ?? getPreset(resolved.presetId, orientation);
+        const layout = base ? withMoveKeys(base, resolved.moveKeys) : base;
         return {
-            layout: resolved.layout ?? getPreset(resolved.presetId, orientation),
+            layout,
             mode: resolved.mode,
             tier: resolved.tier,
+            presetId: resolved.layout ? "" : resolved.presetId,
+            moveKeys: layoutMoveKeys(layout),
+            orientation,
+            choosePreset,
+            chooseMoveKeys,
         };
-    }, [gameId, manifestTouch, autoPick, orientation]);
+        // `revision` is the storage version; the memo has to re-read on every bump.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [gameId, manifestTouch, autoPick, orientation, revision, choosePreset, chooseMoveKeys]);
 }

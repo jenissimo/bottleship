@@ -3199,7 +3199,7 @@ export default function App() {
 
   return (
     <div
-      className={cx(s, "app", uiSettings.lockFullscreenAspect ? "app--fullscreen-aspect-lock" : "app--fullscreen-aspect-free", uiSettings.integerScaling && "app--fullscreen-integer", immersive && "app--immersive")}
+      className={cx(s, "app", uiSettings.lockFullscreenAspect ? "app--fullscreen-aspect-lock" : "app--fullscreen-aspect-free", uiSettings.integerScaling && "app--fullscreen-integer", immersive && "app--immersive", workerStatus === "ready" && showTouchControls && "app--touch")}
       style={
         {
           ["--fullscreen-aspect-w" as string]: String(fullscreenAspect.w),
@@ -3309,7 +3309,16 @@ export default function App() {
       )}
 
       {/* Canvas */}
-      <section className={s["app__panel"]} ref={panelRef}>
+      <section
+        className={s["app__panel"]}
+        ref={panelRef}
+        // The guest aspect, for CSS that has to know where the picture ends without a
+        // measurement (the portrait HUD sits just under it).
+        style={{
+          ["--guest-aw" as string]: String(guestResolution.width),
+          ["--guest-ah" as string]: String(guestResolution.height),
+        }}
+      >
         {workerStatus !== "ready" && !loadingProgress && displayGame!.coverUrl && (
           <div className={s["emu-cover-placeholder"]} style={{ backgroundImage: `url(${displayGame!.coverUrl})` }} />
         )}
@@ -3328,12 +3337,20 @@ export default function App() {
             getPointerScale={guestPerCss}
             sensitivity={uiSettings.touchSensitivity}
             idleFade={uiSettings.touchIdleFade}
+            edgeToEdge={immersive}
             onHostAction={handleHostAction}
           />
         )}
         {workerStatus === "ready" && <InputStatusOverlay status={inputStatus} />}
         {workerStatus === "ready" && showTouchHud && (
-          <TouchHud onHostAction={handleHostAction} />
+          <TouchHud
+            onHostAction={handleHostAction}
+            scheme={activeLayout.presetId}
+            onScheme={activeLayout.choosePreset}
+            moveKeys={activeLayout.moveKeys}
+            onMoveKeys={activeLayout.chooseMoveKeys}
+            edgeToEdge={immersive}
+          />
         )}
         {workerStatus === "ready" && (
           <TouchFirstRunHint

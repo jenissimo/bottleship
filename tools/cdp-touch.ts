@@ -25,6 +25,10 @@ export interface DeviceProfile {
     mobile: boolean;
     /** navigator.maxTouchPoints the page should report; 0 disables touch emulation. */
     maxTouchPoints: number;
+    /** env(safe-area-inset-*) in CSS px — notch / Dynamic Island / home indicator. */
+    safeArea?: { top: number; right: number; bottom: number; left: number };
+    /** Which way a landscape phone is turned: the cutout sits on the left for 90, right for 270. */
+    angle?: number;
 }
 
 /** Plain data. `desktop` is the null profile: it CLEARS the override. */
@@ -34,6 +38,20 @@ export const DEVICE_PROFILES: Record<string, DeviceProfile | null> = {
     "phone-portrait": { width: 390, height: 844, deviceScaleFactor: 3, mobile: true, maxTouchPoints: 5 },
     "tablet-landscape": { width: 1180, height: 820, deviceScaleFactor: 2, mobile: true, maxTouchPoints: 5 },
     "tablet-portrait": { width: 820, height: 1180, deviceScaleFactor: 2, mobile: true, maxTouchPoints: 5 },
+    // iPhone 15 Pro, Safari, standalone-like (no toolbars): 393x852 pt, Dynamic Island on
+    // top in portrait and on the LEFT (angle 90) or RIGHT (angle 270) in landscape.
+    "iphone-15-pro-portrait": {
+        width: 393, height: 852, deviceScaleFactor: 3, mobile: true, maxTouchPoints: 5,
+        safeArea: { top: 59, right: 0, bottom: 34, left: 0 },
+    },
+    "iphone-15-pro-landscape": {
+        width: 852, height: 393, deviceScaleFactor: 3, mobile: true, maxTouchPoints: 5,
+        safeArea: { top: 0, right: 59, bottom: 21, left: 59 }, angle: 90,
+    },
+    "iphone-15-pro-landscape-right": {
+        width: 852, height: 393, deviceScaleFactor: 3, mobile: true, maxTouchPoints: 5,
+        safeArea: { top: 0, right: 59, bottom: 21, left: 59 }, angle: 270,
+    },
 };
 
 /** Aliases so plan/acceptance chains can name a device instead of a form factor. */
@@ -44,6 +62,7 @@ const PROFILE_ALIASES: Record<string, string> = {
     tablet: "tablet-landscape",
     "iphone-14-landscape": "phone-landscape",
     "ipad-landscape": "tablet-landscape",
+    "iphone-15-pro": "iphone-15-pro-portrait",
 };
 
 export function resolveProfileName(name: string): string {
@@ -74,6 +93,7 @@ export async function applyDevice(session: CdpSession, name: string): Promise<De
     if (!metrics) {
         await session.send("Emulation.clearDeviceMetricsOverride");
         await session.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+        await setSafeArea(session, null);
     } else {
         await session.send("Emulation.setDeviceMetricsOverride", {
             width: metrics.width,
@@ -81,9 +101,10 @@ export async function applyDevice(session: CdpSession, name: string): Promise<De
             deviceScaleFactor: metrics.deviceScaleFactor,
             mobile: metrics.mobile,
             screenOrientation: metrics.width >= metrics.height
-                ? { type: "landscapePrimary", angle: 90 }
+                ? { type: metrics.angle === 270 ? "landscapeSecondary" : "landscapePrimary", angle: metrics.angle ?? 90 }
                 : { type: "portraitPrimary", angle: 0 },
         });
+        await setSafeArea(session, metrics.safeArea ?? null);
         await session.send("Emulation.setTouchEmulationEnabled", {
             enabled: true,
             maxTouchPoints: metrics.maxTouchPoints,
@@ -98,6 +119,15 @@ export async function applyDevice(session: CdpSession, name: string): Promise<De
         { timeoutMs: 10_000 },
     )) as { mtp: number; w: number; h: number };
     return { profile, metrics, maxTouchPoints: probe?.mtp ?? 0, innerWidth: probe?.w ?? 0, innerHeight: probe?.h ?? 0 };
+}
+
+/** Emulation.setSafeAreaInsetsOverride is experimental (Chrome 137+). An older browser
+ *  simply reports zero insets, which the result's `safeArea` makes visible. */
+async function setSafeArea(
+    session: CdpSession,
+    insets: { top: number; right: number; bottom: number; left: number } | null,
+): Promise<void> {
+    await session.send("Emulation.setSafeAreaInsetsOverride", { insets: insets ?? {} }).catch(() => { /* unsupported */ });
 }
 
 /* ─────────────────────────── touch event primitives ─────────────────────────── */
@@ -241,4 +271,92 @@ export async function pinch(
     }
     await dispatch(session, "touchEnd", []);
     return { guest: { x, y }, client: a0, scale, span, endSpan: span * scale, moves: n, ms: Date.now() - t0 };
+}
+
+/* ─────────────────────────── multi-finger timelines ─────────────────────────── */
+
+/** One finger of a timeline, in viewport CSS px (on-screen controls live in the letterbox
+ *  bars, OUTSIDE the guest picture, so guest coordinates cannot address them). */
+export interface TimelineFinger {
+    x: number;
+    y: number;
+    /** Optional end point: the finger moves linearly from (x,y) to it over its life. */
+    x1?: number;
+    y1?: number;
+    /** Contact lifetime, ms from the timeline start. A NEGATIVE upMs keeps the finger on
+     *  the glass after the timeline returns (for a screenshot mid-gesture); the next
+     *  `touchTimeline([])` lifts it. Such a finger moves over `-upMs` ms. */
+    downMs?: number;
+    upMs: number;
+}
+
+/**
+ * Several fingers with independent lifetimes on one clock — "hold the stick, tap Fire
+ * twice, let go of the stick". Every touch event carries the FULL set of live contacts,
+ * which is what a real touchscreen reports and what exposes a control that confuses one
+ * contact's lift for another's.
+ */
+export async function touchTimeline(session: CdpSession, fingers: TimelineFinger[]): Promise<TouchResult> {
+    const t0 = Date.now();
+    await focusTarget(session);
+    if (fingers.length === 0) {
+        await dispatch(session, "touchEnd", []);
+        return { guest: { x: 0, y: 0 }, client: { x: 0, y: 0 }, fingers: 0, ms: Date.now() - t0 };
+    }
+    const held = (f: TimelineFinger) => f.upMs < 0;
+    const span = (f: TimelineFinger) => (held(f) ? -f.upMs : f.upMs);
+    const end = Math.max(...fingers.map(span));
+    const pos = (f: TimelineFinger, t: number): Contact & { live: boolean } => {
+        const a = f.downMs ?? 0;
+        const u = span(f);
+        const k = u > a ? Math.min(1, Math.max(0, (t - a) / (u - a))) : 1;
+        return {
+            id: fingers.indexOf(f) + 1,
+            x: f.x + ((f.x1 ?? f.x) - f.x) * k,
+            y: f.y + ((f.y1 ?? f.y) - f.y) * k,
+            live: t >= a && (held(f) || t < u),
+        };
+    };
+    let prevLive = new Set<number>();
+    const stepMs = 16;
+    for (let t = 0; t <= end + stepMs; t += stepMs) {
+        await paceTo(t0 + t);
+        const now = fingers.map((f) => pos(f, t));
+        const live = now.filter((c) => c.live);
+        const liveIds = new Set(live.map((c) => c.id));
+        const started = live.some((c) => !prevLive.has(c.id));
+        const ended = [...prevLive].some((id) => !liveIds.has(id));
+        // Chrome diffs each event against the contacts it already holds: one missing from
+        // a touchStart/touchMove list is released, one new to it is pressed. touchEnd must
+        // carry no points at all and lifts everything.
+        if (ended) {
+            const kept = live.filter((c) => prevLive.has(c.id));
+            if (kept.length === 0) await dispatch(session, "touchEnd", []);
+            else await dispatch(session, "touchMove", kept);
+        }
+        if (started) await dispatch(session, "touchStart", live);
+        else if (live.length > 0) await dispatch(session, "touchMove", live);
+        prevLive = liveIds;
+    }
+    if (prevLive.size > 0 && !fingers.some(held)) await dispatch(session, "touchEnd", []);
+    return { guest: { x: 0, y: 0 }, client: { x: fingers[0]?.x ?? 0, y: fingers[0]?.y ?? 0 }, fingers: fingers.length, ms: Date.now() - t0 };
+}
+
+/** The whole emulated viewport as the user sees it — page chrome, overlays and canvas. */
+export async function pageShot(session: CdpSession, file?: string): Promise<{ file?: string; bytes: number; base64?: string }> {
+    await focusTarget(session);
+    // An explicit viewport clip and no beyond-viewport capture: without them, a capture
+    // under device emulation re-lays the page out and Chrome re-targets a finger that is
+    // still down, so a mid-gesture shot shows (and causes) a jump the user never made.
+    const vp = (await pageEval(session, "({w: innerWidth, h: innerHeight})", { timeoutMs: 10_000 })) as { w: number; h: number };
+    const shot = await session.send("Page.captureScreenshot", {
+        format: "png", captureBeyondViewport: false, fromSurface: true,
+        clip: { x: 0, y: 0, width: vp.w, height: vp.h, scale: 1 },
+    });
+    const data: string = shot.result?.data ?? "";
+    if (file) {
+        await Bun.write(file, Buffer.from(data, "base64"));
+        return { file, bytes: data.length };
+    }
+    return { bytes: data.length, base64: data };
 }

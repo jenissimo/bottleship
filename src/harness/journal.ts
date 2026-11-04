@@ -15,7 +15,7 @@ const NAMED_VERBS = new Set([
     "tickFrames", "watchFrames", "sleep", "click", "inputSab", "clickAt", "clickHold", "key", "keyHold",
     "type", "move", "moveRelative", "clickHere", "drag", "wheel", "padPlug",
     "wmTrace", "inputTrace",
-    "device", "tap", "touchDrag", "longPress", "twoFingerTap", "pinch",
+    "device", "tap", "touchDrag", "longPress", "twoFingerTap", "pinch", "touchTimeline", "pageShot", "hostKey", "hostClick", "hostMove",
     "state", "shot", "captureFrame", "textures", "dumpTexture", "dumpSurface", "time",
     "perfProfile", "perfSpikes", "perfStats", "perfThunks", "profilerStats", "readbackStats", "readLockDivergence", "eipProfile",
     "frameReport", "guestBlocks", "hotBlocksMark",

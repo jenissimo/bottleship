@@ -43,19 +43,30 @@
 }
 
 /* --- button --- */
+/* A control reads as pressable by its edge, not its fill: a 1.5px light rim plus a
+   soft drop shadow lifts it off both the black bars and a bright game picture. */
 .widget--button {
   border-radius: var(--r-pill, 999px);
-  border: 1px solid rgba(220, 235, 240, 0.28);
-  background: rgba(10, 19, 24, 0.42);
+  border: 1.5px solid rgba(220, 235, 240, 0.42);
+  background: rgba(10, 19, 24, 0.5);
   backdrop-filter: blur(3px);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
   color: var(--fg-1, #e9f4f4);
 }
 
 .widget--button.is-pressed,
 .widget--button.is-on {
-  background: rgba(70, 200, 216, 0.3);
+  background: rgba(70, 200, 216, 0.38);
   border-color: var(--cyan, #46c8d8);
+  box-shadow: 0 0 0 4px rgba(70, 200, 216, 0.22), 0 1px 2px rgba(0, 0, 0, 0.4);
   color: #fff;
+}
+
+/* Pressed state must be visible under the thumb that covers the middle of it, so the
+   feedback lives on the rim (above) and as a brightness pop on the whole control. */
+.widget.is-pressed,
+.widget.is-active {
+  opacity: 1;
 }
 
 .widget--button.is-on {
@@ -64,9 +75,12 @@
 
 .widget__label {
   font-family: var(--font-mono, monospace);
-  font-size: clamp(10px, 2.2vmin, 15px);
-  letter-spacing: 0.04em;
+  /* Caps + semibold + a little tracking: the floor for small labels is 12px. */
+  font-size: clamp(12px, 3.2vmin, 16px);
+  font-weight: 600;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
   pointer-events: none;
 }
 
@@ -138,27 +152,94 @@
 /* --- stick --- */
 .widget--stick {
   border-radius: 50%;
-  border: 1px solid rgba(220, 235, 240, 0.24);
-  background: radial-gradient(circle at 50% 50%, rgba(18, 32, 41, 0.5), rgba(7, 13, 17, 0.35));
+  border: 1.5px solid rgba(220, 235, 240, 0.34);
+  background: radial-gradient(circle at 50% 50%, rgba(18, 32, 41, 0.55), rgba(7, 13, 17, 0.4));
   backdrop-filter: blur(3px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
 }
 
 .widget--stick.is-active {
-  border-color: rgba(70, 200, 216, 0.6);
+  border-color: rgba(70, 200, 216, 0.7);
+}
+
+/* The base follows the thumb; no transition, or it lags the finger that placed it. */
+.is-floating {
+  transition: opacity var(--t-fast, 0.15s) ease;
 }
 
 .stick__knob {
+  position: relative;
   width: 42%;
   height: 42%;
   border-radius: 50%;
-  background: rgba(220, 235, 240, 0.32);
-  border: 1px solid rgba(220, 235, 240, 0.4);
+  background: rgba(220, 235, 240, 0.36);
+  border: 1.5px solid rgba(220, 235, 240, 0.5);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
   will-change: transform;
   pointer-events: none;
 }
 
 .widget--stick.is-active .stick__knob {
-  background: rgba(70, 200, 216, 0.45);
+  background: rgba(70, 200, 216, 0.55);
+  border-color: var(--cyan, #46c8d8);
+}
+
+/* Deadzone ring: inside it the stick sends nothing. --dz is the authored fraction. */
+.stick__dead {
+  position: absolute;
+  width: calc(var(--dz, 0.25) * 100%);
+  height: calc(var(--dz, 0.25) * 100%);
+  border-radius: 50%;
+  border: 1px dashed rgba(220, 235, 240, 0.4);
+  pointer-events: none;
+  /* Only while steering: at rest the knob sits on it and it reads as a stray ring. */
+  opacity: 0;
+}
+
+.widget--stick.is-active .stick__dead {
+  opacity: 1;
+}
+
+/* Four chevrons on the rim; the live direction lights up (8-way: two at once). */
+.stick__dir {
+  position: absolute;
+  width: 0;
+  height: 0;
+  border: 7px solid transparent;
+  opacity: 0.38;
+  pointer-events: none;
+  transition: opacity 0.06s linear;
+}
+
+.stick__dir--up { top: 6%; border-bottom-color: rgba(220, 235, 240, 0.9); border-top-width: 0; }
+.stick__dir--down { bottom: 6%; border-top-color: rgba(220, 235, 240, 0.9); border-bottom-width: 0; }
+.stick__dir--left { left: 6%; border-right-color: rgba(220, 235, 240, 0.9); border-left-width: 0; }
+.stick__dir--right { right: 6%; border-left-color: rgba(220, 235, 240, 0.9); border-right-width: 0; }
+
+.widget--stick.is-up .stick__dir--up { opacity: 1; border-bottom-color: var(--cyan, #46c8d8); }
+.widget--stick.is-down .stick__dir--down { opacity: 1; border-top-color: var(--cyan, #46c8d8); }
+.widget--stick.is-left .stick__dir--left { opacity: 1; border-right-color: var(--cyan, #46c8d8); }
+.widget--stick.is-right .stick__dir--right { opacity: 1; border-left-color: var(--cyan, #46c8d8); }
+
+/* Which keys the stick presses — under the base, so the thumb never covers it. */
+.stick__caption {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--fg-2, #8eabb4);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+  pointer-events: none;
+}
+
+.is-floating .stick__caption {
+  opacity: 0;
 }
 
 /* --- wheel strip --- */
@@ -181,6 +262,16 @@
   );
 }
 
+/* Portrait, inside the shell: the app shell's own padding keeps the panel clear of the
+   Dynamic Island and the home indicator, so insetting again would throw away the top
+   59px of the control deck. Edge-to-edge (immersive) the panel IS the screen. */
+@media (orientation: portrait) {
+  .touch-controls:not([data-edge]) {
+    top: 0;
+    bottom: 0;
+  }
+}
+
 /* A coarse pointer is the only one these are for; a mouse user gets the desktop
    path and should not have thumb chrome over the game. */
 @media (pointer: fine) and (hover: hover) {
@@ -195,11 +286,12 @@
   opacity: 0.45;
 }
 
-/* Nothing touched for a while: recede, but stay legible enough to aim at. */
+/* Nothing touched for a while: recede, but stay legible enough to aim at. In a black
+   bar the controls cost no picture, so they keep more presence than over the game. */
 .layer--idle .widget {
-  opacity: 0.28;
+  opacity: 0.42;
 }
 
 .layer--idle .widget--over {
-  opacity: 0.16;
+  opacity: 0.2;
 }
