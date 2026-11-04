@@ -10,6 +10,9 @@ export interface MSSSample {
     userData?: number[];
     totalBytes?: number;
     fileFormat?: "wav" | "mp3" | "ogg" | "raw" | "unknown";
+    /** Last AIL_set_sample_type (format, flags); undefined until the app declares one. */
+    sampleTypeFormat?: number;
+    sampleTypeFlags?: number;
     sampleRate: number;
     channels: number;
     bitsPerSample: number;
