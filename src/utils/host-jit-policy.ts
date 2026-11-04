@@ -2,7 +2,10 @@
 //
 // iOS/iPadOS WebKit 27 kills the WebContent process (EXC_ARM_PAC_FAIL inside JSC's in-place
 // interpreter tail-call path) a few seconds into a boot with the JIT on; macOS Safari 27 and
-// iOS 26 run the same build. Every iOS browser is WebKit, so the gate is the platform, not
+// iOS 26 run the same build. The trigger is the cross-module return_call_indirect of RET
+// chaining: with only that off (`notail`) an iPhone on iOS 27.2 ran the Hitman demo for
+// minutes at ~69 MIPS, against ~37 MIPS with no compilation at all, so `notail` is the
+// iOS 27 default. Every iOS browser is WebKit, so the gate is the platform, not
 // the browser. The decision needs navigator.maxTouchPoints (iPadOS reports a Mac UA), which
 // WorkerNavigator does not expose, so the page resolves it and hands the mode to the worker.
 //
@@ -64,9 +67,9 @@ export function resolveHostJitPolicy(signals: HostJitSignals): HostJitPolicy {
 
     if (isAppleMobileWebKit(signals.userAgent, signals.maxTouchPoints)) {
         const major = appleMobileMajor(signals.userAgent);
-        // Unknown means a frozen token on iOS 26 or later: a slow game beats a dead tab.
+        // Unknown means a frozen token on iOS 26 or later; notail is safe on 26 as well.
         if (major === null || major >= IOS_WEBKIT_JIT_BROKEN_MAJOR) {
-            return { mode: "off", reason: "ios-webkit-27" };
+            return { mode: "notail", reason: "ios-webkit-27" };
         }
     }
     return { mode: "on", reason: "default" };

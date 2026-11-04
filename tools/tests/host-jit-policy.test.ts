@@ -17,12 +17,12 @@ const policy = (userAgent: string, maxTouchPoints = 5, search = "") =>
     resolveHostJitPolicy({ userAgent, maxTouchPoints, search });
 
 describe("host JIT policy", () => {
-    test("iPhone Safari 27 boots with the JIT off", () => {
-        expect(policy(IPHONE_27)).toEqual({ mode: "off", reason: "ios-webkit-27" });
+    test("iPhone Safari 27 boots with the JIT but without tail calls", () => {
+        expect(policy(IPHONE_27)).toEqual({ mode: "notail", reason: "ios-webkit-27" });
     });
 
     test("iPadOS 27 reporting a Mac UA is caught by its touch points", () => {
-        expect(policy(MAC_SAFARI_27, 5).mode).toBe("off");
+        expect(policy(MAC_SAFARI_27, 5).mode).toBe("notail");
     });
 
     test("macOS Safari 27 keeps the JIT", () => {
@@ -36,7 +36,7 @@ describe("host JIT policy", () => {
     });
 
     test("a frozen OS token with no Version token is treated as affected", () => {
-        expect(policy(IPHONE_CHROME_FROZEN).mode).toBe("off");
+        expect(policy(IPHONE_CHROME_FROZEN).mode).toBe("notail");
     });
 
     test("desktop Chromium is untouched, touchscreen or not", () => {
@@ -48,7 +48,8 @@ describe("host JIT policy", () => {
         expect(policy(IPHONE_27, 5, "?game=dev&jit=1")).toEqual({ mode: "on", reason: "query" });
         expect(policy(IPHONE_27, 5, "?jit=notail").mode).toBe("notail");
         expect(policy(WINDOWS_CHROME, 0, "?jit=0")).toEqual({ mode: "off", reason: "query" });
-        expect(policy(IPHONE_27, 5, "?jit=bogus").mode).toBe("off");
+        expect(policy(IPHONE_27, 5, "?jit=bogus").mode).toBe("notail");
+        expect(policy(IPHONE_27, 5, "?jit=0")).toEqual({ mode: "off", reason: "query" });
     });
 });
 
