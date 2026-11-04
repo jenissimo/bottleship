@@ -19,6 +19,7 @@ import { getProcAddressRegistry, type GetProcResolution } from '../../../core/di
 import { moduleHandleMissRegistry } from '../../../core/diagnostics/module-handle-miss-registry';
 import { isSuspectSilentStub } from '../../../core/diagnostics/api-census';
 import { resolveHleExportAddress } from '../../../core/thunking/export-resolver';
+import { shippedExportNames } from '../../../core/pe-export-names';
 
 export const exports: Record<string, ThunkImplementation> = {};
 
@@ -1414,8 +1415,11 @@ function initModuleFunctions(): void {
                         // function by name with an `ordinal:` tag carry no literal `ord_N`
                         // entry, so the placeholder resolves nothing — ask the registry for
                         // the canonical name first, exactly as the PE import walk does.
+                        const shippedName = isOrdinal ? shippedExportNames.nameOf(dllName, ordinal) : undefined;
                         const exportName = isOrdinal
-                            ? apiRegistry.getFunctionNameByOrdinal(dllName, ordinal) ?? procName
+                            ? (shippedName !== undefined && apiRegistry.hasExportedFunction(dllName, shippedName)
+                                ? shippedName
+                                : apiRegistry.getFunctionNameByOrdinal(dllName, ordinal) ?? procName)
                             : procName;
                         address = resolveThunkedExportAddress(dispatcher, dllName, exportName, verbose);
                     }

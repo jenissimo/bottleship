@@ -30,6 +30,8 @@ import { loadDiagnostics } from './diagnostics/load-diagnostics';
 import { writeGuestCode, invalidateGuestCode } from './memory/guest-code';
 import { markGuestPagesDirty, zeroGuestRange } from './memory/guest-page-dirty';
 import { resolveImportBinding, isD3dx9VersionedDll } from './pe-import-binding';
+import { nameOrdinalImports, readExportNameDirectory, shippedExportNames } from './pe-export-names';
+import { resolveThunkedDllAlias } from './dll-aliases';
 import { dllSearchDirectories } from './dll-search-order';
 
 export interface LoadedModule {
@@ -1356,6 +1358,37 @@ export class PELoader {
         return entry?.kind === 'file' ? entry.path : null;
     }
 
+    /**
+     * Ordinal-only imports of a thunked module take the export name of the DLL the bundle
+     * ships: ordinals differ between builds of the same DLL, so only that build's export
+     * directory says which function an ordinal is. Without a shipped DLL nothing changes.
+     */
+    private async nameOrdinalImportsFromShippedDll(dllNameRaw: string,
+        functions: Array<{ name?: string; ordinal?: number }>, searchDirectories: readonly string[]): Promise<void> {
+        if (!this.vfs || !functions.some(f => f.name === undefined && f.ordinal !== undefined)) return;
+        const moduleName = resolveThunkedDllAlias(dllNameRaw);
+        if (!this.apiRegistry.hasModule(moduleName)) return;
+        let directory = shippedExportNames.get(moduleName);
+        if (!directory) {
+            const path = this.findDllPath(dllNameRaw.toLowerCase(), 0, searchDirectories);
+            if (!path) return;
+            const handle = await this.vfs.open(path, 0x80000000, 3);
+            if (!handle) return;
+            const image = await this.vfs.read(handle, this.vfs.getFileSize(path));
+            const parsed = readExportNameDirectory(image);
+            if (!parsed) return;
+            directory = parsed;
+            shippedExportNames.set(moduleName, directory);
+            Logger.log(LogCategory.SYSTEM, `[PE] ${path}: ${directory.names.size} named exports ` +
+                `(timestamp 0x${directory.timeDateStamp.toString(16)}) resolve ordinal imports of ${moduleName}`);
+        }
+        const named = nameOrdinalImports(functions, directory,
+            (name) => this.apiRegistry.hasExportedFunction(moduleName, name));
+        for (const { ordinal, name } of named) {
+            Logger.log(LogCategory.SYSTEM, `[PE] ${dllNameRaw} ordinal ${ordinal} -> ${name} (shipped export directory)`);
+        }
+    }
+
     private async processImports(baseAddress: number, importDirRVA: number,
         searchDirectories: readonly string[] = this.getDllSearchDirectories()): Promise<void> {
         let descriptorAddr = baseAddress + importDirRVA;
@@ -1379,6 +1412,7 @@ export class PELoader {
             const iatRVA = this.view.getUint32(descriptorAddr + 16, true); // Import Address Table
 
             const functions = this.parseImportTable(baseAddress, iltRVA || iatRVA);
+            await this.nameOrdinalImportsFromShippedDll(dllNameRaw, functions, searchDirectories);
 
             const { dllName, aliasTarget, isThunked } = resolveImportBinding(dllNameRaw, functions, {
                 hasThunkedModule: (n) => this.apiRegistry.hasModule(n),
