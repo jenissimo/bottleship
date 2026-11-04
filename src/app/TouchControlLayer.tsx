@@ -17,7 +17,8 @@ import React, {
 } from "react";
 import { cx } from "../ui/cx";
 import s from "./TouchControlLayer.module.css";
-import { describeBinding, type HostAction } from "../input/bindings";
+import { describeBinding, type Binding, type HostAction } from "../input/bindings";
+import { MOVE_KEYS_LABEL, moveKeysOf } from "../input/controls/move-keys";
 import {
     pickRect, resolveRects, type ControlLayout, type ControlWidget,
 } from "../input/controls/types";
@@ -46,6 +47,8 @@ export interface TouchControlLayerProps {
     opacity?: number;
     /** Dim the chrome while nothing is being touched. */
     idleFade?: boolean;
+    /** The panel covers the whole screen (immersive), so it owns every safe-area inset. */
+    edgeToEdge?: boolean;
     onHostAction?: (action: HostAction) => void;
 }
 
@@ -79,7 +82,7 @@ export const TouchControlLayer = forwardRef<TouchControlsHandle, TouchControlLay
     function TouchControlLayer(props, ref) {
         const {
             layout, getPointerScale, sensitivity = 1, opacity = 0.8,
-            idleFade = true, onHostAction,
+            idleFade = true, edgeToEdge = false, onHostAction,
         } = props;
 
         const rootRef = useRef<HTMLDivElement | null>(null);
@@ -87,6 +90,10 @@ export const TouchControlLayer = forwardRef<TouchControlsHandle, TouchControlLay
         const knobsRef = useRef<(HTMLElement | null)[]>([]);
         const hitRef = useRef<Float32Array>(new Float32Array(0));
         const visualRef = useRef<Float32Array>(new Float32Array(0));
+        /** Each widget's resting transform — a floating stick returns here on release. */
+        const restRef = useRef<string[]>([]);
+        /** The layer root's client origin at the last measure. */
+        const originRef = useRef({ left: 0, top: 0 });
         /** 1 where a widget had to sit over the picture — no bar was wide enough. */
         const overRef = useRef<Uint8Array>(new Uint8Array(0));
         const fadeRef = useRef(idleFade);
@@ -151,15 +158,19 @@ export const TouchControlLayer = forwardRef<TouchControlsHandle, TouchControlLay
 
             if (overRef.current.length < list.length) overRef.current = new Uint8Array(list.length);
             const opts = { canvas, reserved, overCanvas: overRef.current };
-            hitRef.current = resolveRects(l, panel, opts, hitRef.current);
+            hitRef.current = resolveRects(l, panel, { ...opts, floatZones: true }, hitRef.current);
             const vis = resolveRects(l, panel, { ...opts, minHitPx: 0 }, visualRef.current);
             visualRef.current = vis;
+            originRef.current = { left: panel.left, top: panel.top };
             for (let i = 0; i < list.length; i++) {
                 const el = elsRef.current[i];
                 if (!el) continue;
                 const o = i * 4;
                 // Position relative to the layer root, which is the panel's safe area.
-                el.style.transform = `translate3d(${vis[o] - panel.left}px, ${vis[o + 1] - panel.top}px, 0)`;
+                const rest = `translate3d(${vis[o] - panel.left}px, ${vis[o + 1] - panel.top}px, 0)`;
+                restRef.current[i] = rest;
+                // A floating stick under a live thumb stays where the thumb put it.
+                if (!el.classList.contains(s["is-floating"]!)) el.style.transform = rest;
                 el.style.width = `${vis[o + 2]}px`;
                 el.style.height = `${vis[o + 3]}px`;
                 // Over the picture: the chrome dims so it costs the player less.
@@ -248,18 +259,56 @@ export const TouchControlLayer = forwardRef<TouchControlsHandle, TouchControlLay
             setClass(index, "is-right", right);
         }, [presser]);
 
-        /** Deflection of a contact inside a widget, normalized to [-1, 1] per axis. */
+        /**
+         * Deflection of a contact inside a widget, normalized to [-1, 1] per axis.
+         * Throw is the DRAWN radius, not the hit rect's: a floating stick's hit zone is a
+         * whole bar, and the hit floor grows small widgets — neither is how far the knob
+         * can travel.
+         */
         const deflection = (index: number, c: Contact, recenter: boolean): { nx: number; ny: number } => {
             const o = index * 4;
             const r = hitRef.current;
-            const halfW = Math.max(1, r[o + 2] / 2);
-            const halfH = Math.max(1, r[o + 3] / 2);
-            const cx = recenter ? c.originX : r[o] + halfW;
-            const cy = recenter ? c.originY : r[o + 1] + halfH;
+            const v = visualRef.current;
+            const halfW = Math.max(1, (v[o + 2] || r[o + 2]) / 2);
+            const halfH = Math.max(1, (v[o + 3] || r[o + 3]) / 2);
+            const cx = recenter ? c.originX : r[o] + r[o + 2] / 2;
+            const cy = recenter ? c.originY : r[o + 1] + r[o + 3] / 2;
             return {
                 nx: clamp((c.lastX - cx) / halfW, -1, 1),
                 ny: clamp((c.lastY - cy) / halfH, -1, 1),
             };
+        };
+
+        /** Floating stick: draw the base centred under the thumb (clamped to the layer). */
+        const floatTo = (index: number, clientX: number, clientY: number): void => {
+            const el = elsRef.current[index];
+            const root = rootRef.current;
+            if (!el || !root) return;
+            const o = index * 4;
+            const vw = visualRef.current[o + 2], vh = visualRef.current[o + 3];
+            const { left, top } = originRef.current;
+            const x = clamp(clientX - left - vw / 2, 0, Math.max(0, root.clientWidth - vw));
+            const y = clamp(clientY - top - vh / 2, 0, Math.max(0, root.clientHeight - vh));
+            el.classList.add(s["is-floating"]!);
+            el.style.transform = `translate3d(${x}px, ${y}px, 0)`;
+        };
+
+        const unfloat = (index: number): void => {
+            const el = elsRef.current[index];
+            if (!el || !el.classList.contains(s["is-floating"]!)) return;
+            el.classList.remove(s["is-floating"]!);
+            el.style.transform = restRef.current[index] ?? el.style.transform;
+        };
+
+        /** Lit chevrons on a stick: which way the guest is being steered right now. */
+        const showDirection = (index: number, nx: number, ny: number, deadzone: number): void => {
+            const mag = Math.hypot(nx, ny);
+            const live = mag >= deadzone;
+            const ax = Math.abs(nx), ay = Math.abs(ny);
+            setClass(index, "is-up", live && ny < 0 && ay > mag * 0.383);
+            setClass(index, "is-down", live && ny > 0 && ay > mag * 0.383);
+            setClass(index, "is-left", live && nx < 0 && ax > mag * 0.383);
+            setClass(index, "is-right", live && nx > 0 && ax > mag * 0.383);
         };
 
         const scale = (): { x: number; y: number } => propsRef.current.getPointerScale?.() ?? { x: 1, y: 1 };
@@ -313,8 +362,10 @@ export const TouchControlLayer = forwardRef<TouchControlsHandle, TouchControlLay
                         inputDevice.applyBinding({ t: "axis", axis: a as 0 | 2, value: 0 }, false, "widget");
                         inputDevice.applyBinding({ t: "axis", axis: (a + 1) as 1 | 3, value: 0 }, false, "widget");
                     }
+                    showDirection(index, 0, 0, 1);
                     setKnob(index, 0, 0);
                     setClass(index, "is-active", false);
+                    unfloat(index);
                     break;
                 case "trackpad":
                 case "wheelStrip":
@@ -348,6 +399,7 @@ export const TouchControlLayer = forwardRef<TouchControlsHandle, TouchControlLay
                 }
                 case "stick": {
                     setClass(index, "is-active", true);
+                    if (w.float) floatTo(index, c.startX, c.startY);
                     if (w.out === "mouse") startPump();
                     break;
                 }
@@ -378,10 +430,12 @@ export const TouchControlLayer = forwardRef<TouchControlsHandle, TouchControlLay
                 case "stick": {
                     const { nx, ny } = deflection(index, c, w.recenter === true);
                     const o = index * 4;
-                    setKnob(index, nx * hitRef.current[o + 2] * 0.3, ny * hitRef.current[o + 3] * 0.3);
+                    const vis = visualRef.current;
+                    setKnob(index, nx * (vis[o + 2] || hitRef.current[o + 2]) * 0.3, ny * (vis[o + 3] || hitRef.current[o + 3]) * 0.3);
                     if (w.out === "keys") {
                         applyDirections(w, index, nx, ny, w.deadzone ?? DEFAULT_DEADZONE, true);
                     } else if (w.out === "pad") {
+                        showDirection(index, nx, ny, w.deadzone ?? DEFAULT_DEADZONE);
                         const dz = w.deadzone ?? DEFAULT_DEADZONE;
                         const a = w.axis ?? 0;
                         const shape = (v: number): number => (Math.abs(v) < dz ? 0 : v);
@@ -483,6 +537,12 @@ export const TouchControlLayer = forwardRef<TouchControlsHandle, TouchControlLay
             },
         }), [hitTest, measure, presser]);
 
+        // Every widget is re-homed on a layout change; a stale float class would pin a
+        // stick of the NEXT layout where this one's thumb left it.
+        useEffect(() => {
+            for (const el of elsRef.current) el?.classList.remove(s["is-floating"]!);
+        }, [widgets]);
+
         if (!layout || widgets.length === 0) return null;
 
         return (
@@ -490,6 +550,7 @@ export const TouchControlLayer = forwardRef<TouchControlsHandle, TouchControlLay
                 ref={rootRef}
                 className={s["touch-controls"]}
                 style={{ ["--tc-opacity" as string]: String(clamp(opacity, 0.1, 1)) }}
+                data-edge={edgeToEdge ? "" : undefined}
                 aria-hidden
             >
                 {widgets.map((w, i) => (
@@ -510,6 +571,12 @@ export const TouchControlLayer = forwardRef<TouchControlsHandle, TouchControlLay
     },
 );
 
+/** Which keys the stick presses, under it: a player who switched to Numpad sees it took. */
+function stickCaption(binds: { up: Binding }): string {
+    const keys = moveKeysOf(binds as Parameters<typeof moveKeysOf>[0]);
+    return keys ? MOVE_KEYS_LABEL[keys] : describeBinding(binds.up);
+}
+
 const WidgetChrome: React.FC<{ widget: ControlWidget }> = ({ widget }) => {
     switch (widget.kind) {
         case "button":
@@ -523,7 +590,23 @@ const WidgetChrome: React.FC<{ widget: ControlWidget }> = ({ widget }) => {
                 </>
             );
         case "stick":
-            return <span className={s["stick__knob"]} data-knob />;
+            return (
+                <>
+                    {/* The deadzone, drawn: inside this ring the stick sends nothing. */}
+                    <span
+                        className={s["stick__dead"]}
+                        style={{ ["--dz" as string]: String(widget.deadzone ?? DEFAULT_DEADZONE) }}
+                    />
+                    <span className={cx(s, "stick__dir", "stick__dir--up")} />
+                    <span className={cx(s, "stick__dir", "stick__dir--down")} />
+                    <span className={cx(s, "stick__dir", "stick__dir--left")} />
+                    <span className={cx(s, "stick__dir", "stick__dir--right")} />
+                    <span className={s["stick__knob"]} data-knob />
+                    {widget.out === "keys" && widget.binds && (
+                        <span className={s["stick__caption"]}>{stickCaption(widget.binds)}</span>
+                    )}
+                </>
+            );
         case "wheelStrip":
             return <span className={s["wheel__ridges"]} />;
         case "trackpad":

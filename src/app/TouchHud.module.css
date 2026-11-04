@@ -17,6 +17,20 @@
 .hud--bl { bottom: calc(8px + env(safe-area-inset-bottom, 0px)); left: calc(8px + env(safe-area-inset-left, 0px)); align-items: flex-start; flex-direction: column-reverse; }
 .hud--br { bottom: calc(8px + env(safe-area-inset-bottom, 0px)); right: calc(8px + env(safe-area-inset-right, 0px)); flex-direction: column-reverse; }
 
+/* Portrait inside the shell: the picture is pinned to the top of the panel (App.module.css),
+   so the handle moves down to the top-right of the control deck instead of covering the
+   picture's corner. The picture's height is the panel width times the guest aspect,
+   capped by the panel — container units, because the panel is the size container. */
+@media (orientation: portrait) {
+  .hud--tr:not([data-edge]) {
+    top: calc(min(100cqw * var(--guest-ah, 3) / var(--guest-aw, 4), 100cqh - 52px) + 8px);
+  }
+
+  .hud--tr:not([data-edge]) .hud__menu {
+    max-height: calc(100cqh - min(100cqw * var(--guest-ah, 3) / var(--guest-aw, 4), 100cqh - 52px) - 68px);
+  }
+}
+
 .hud__handle {
   width: 44px;
   height: 44px;
@@ -50,7 +64,7 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
-  min-width: 180px;
+  min-width: 232px;
   max-height: calc(100dvh - 96px);
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -96,21 +110,59 @@
 
 .hud__segments {
   display: flex;
-  gap: 2px;
+  gap: 4px;
+}
+
+.hud__segments--wrap {
+  flex-wrap: wrap;
+}
+
+.hud__segments--wrap .hud__segment {
+  flex-basis: calc(50% - 2px);
 }
 
 .hud__segment {
   flex: 1 1 0;
-  min-height: 38px;
+  /* Same 44px finger floor as every other target in the HUD. */
+  min-height: 44px;
+  padding: 0 8px;
+  font-weight: 600;
   border-radius: var(--r-sm, 6px);
   border: 1px solid var(--line-1, #182a33);
   background: rgba(18, 32, 41, 0.7);
-  color: var(--fg-2, #8eabb4);
-  font-size: var(--fs-2xs, 0.68rem);
+  color: var(--fg-1, #e9f4f4);
+  font-size: var(--fs-xs, 0.75rem);
 }
 
 .hud__segment.is-on {
   background: rgba(70, 200, 216, 0.24);
   border-color: var(--cyan, #46c8d8);
   color: #fff;
+}
+
+/* A landscape phone is ~330px tall inside the shell: a single column of 44px rows plus
+   the two choice groups does not fit, and a menu that scrolls hides exactly the
+   choices a player opened it for. Three action columns and one-row groups do fit.
+   A portrait phone is the same problem in the ~360px of deck under the handle.
+   Last in the file on purpose: it overrides the base segment rules above. */
+@media (max-height: 500px) and (orientation: landscape), (max-width: 500px) and (orientation: portrait) {
+  .hud__menu {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    column-gap: 4px;
+    min-width: 0;
+    width: min(420px, calc(100vw - 16px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)));
+  }
+
+  .hud__group {
+    grid-column: 1 / -1;
+  }
+
+  .hud__segments--wrap {
+    flex-wrap: nowrap;
+  }
+
+  .hud__segments--wrap .hud__segment {
+    flex-basis: 0;
+  }
 }

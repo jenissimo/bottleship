@@ -278,6 +278,10 @@ export interface WgbManifest {
         touch?: {
             layout?: string | Record<string, unknown>;
             mode?: "auto" | "direct" | "trackpad";
+            /** The keys the movement control presses (src/input/controls/move-keys.ts) —
+             *  for a title whose key table nothing at the API boundary reveals, e.g. one
+             *  that walks on Numpad 8/2/4/6. */
+            moveKeys?: "wasd" | "arrows" | "numpad";
         };
     };
 }
