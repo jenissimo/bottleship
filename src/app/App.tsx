@@ -1604,9 +1604,8 @@ export default function App() {
         const id = Number(event.data?.payload?.id ?? 0);
         const sab = event.data?.payload?.sab as SharedArrayBuffer | undefined;
         if (id && sab) {
-          // Resume AudioContext immediately — video may start before a user gesture,
-          // but the user likely already clicked (load game) so the gesture is in the past.
-          void audioEngine?.resume();
+          // Unlock if permitted; a late registration must not cancel an intentional pause.
+          void audioEngine?.resumeIfNotPaused();
           audioEngine?.registerBuffer(id, sab);
         }
       }
@@ -2029,7 +2028,7 @@ export default function App() {
       }
 
       if (!isPausedRef.current && state === 1) {
-        void audioEngine?.resume();
+        void audioEngine?.resumeIfNotPaused();
       }
 
       const vk = event.keyCode & 0xff;
@@ -2066,7 +2065,7 @@ export default function App() {
         // rely on WndProc mouse messages for click handling.
       }
       if (!isPausedRef.current) {
-        void audioEngine?.resume();
+        void audioEngine?.resumeIfNotPaused();
       }
       writePointer(event);
     };
@@ -2209,7 +2208,7 @@ export default function App() {
     document.addEventListener("pointerlockchange", handlePointerLockChange);
     const unlockAudio = () => {
       if (!isPausedRef.current) {
-        void audioEngine?.resume();
+        void audioEngine?.resumeIfNotPaused();
       }
     };
     window.addEventListener("pointerdown", unlockAudio, { passive: true });
