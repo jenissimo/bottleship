@@ -2,7 +2,8 @@
 /**
  * Compile Wine's locale database into the worker's locale DB.
  *
- *   bun tools/gen-locale-db.ts [path/to/wine/nls/locale.nls]   (default G:/sources/wine/nls/locale.nls)
+ *   bun tools/gen-locale-db.ts <path/to/wine/nls/locale.nls>
+ *   BS_WINE_SRC=<wine checkout> bun tools/gen-locale-db.ts      (uses $BS_WINE_SRC/nls/locale.nls)
  *
  * Input: nls/locale.nls from the Wine tree — CLDR-derived locale DATA that Wine's
  * tools/make_unicode compiles into the layout kernelbase/locale.c reads (NLS_LOCALE_HEADER,
@@ -20,7 +21,11 @@ import {
     ARRAY_ABSENT, FIELD_COUNT, HEADER_WORDS, HeaderWord, LOCALE_DB_MAGIC, LOCALE_DB_VERSION, LocaleField as F,
 } from '../src/worker/modules/kernel32/locale-db-schema';
 
-const SRC = process.argv[2] ?? 'G:/sources/wine/nls/locale.nls';
+const SRC = process.argv[2] ?? (process.env.BS_WINE_SRC ? path.join(process.env.BS_WINE_SRC, 'nls', 'locale.nls') : '');
+if (!SRC) {
+    console.error('usage: bun tools/gen-locale-db.ts <path/to/wine/nls/locale.nls> (or set BS_WINE_SRC to a Wine source checkout)');
+    process.exit(1);
+}
 const OUT = path.join(import.meta.dir, '../src/worker/modules/kernel32/locale-db.generated.ts');
 
 const file = readFileSync(SRC);

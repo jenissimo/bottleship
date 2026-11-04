@@ -22,6 +22,6 @@ To prepare a release:
 
 The first numbered release, 0.7, covers changes merged into `main` from October 5
 through October 8, 2026. GitHub provides source archives for its tagged snapshot;
-the live browser application remains at [bottleship.pages.dev](https://bottleship.pages.dev/).
+the live browser application remains at [bottleship.happydog.games](https://bottleship.happydog.games/).
 
 - [0.7 release notes](0.7.md)

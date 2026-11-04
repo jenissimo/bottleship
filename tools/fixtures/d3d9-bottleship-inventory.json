@@ -3985,7 +3985,7 @@
         "owner": "FP5/FP17",
         "evidence": [
           "src/worker/backends/webgpu/d3d9/d3d9-sampler.ts:mip-filter",
-          "G:/sources/dxvk/src/d3d9/d3d9_util.h:175-176",
+          "dxvk/src/d3d9/d3d9_util.h:175-176",
           "tools/tests/d3d9-sampler.test.ts"
         ],
         "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
@@ -4034,7 +4034,7 @@
           "src/worker/backends/webgpu/d3d9/copy-policy.ts:offscreen-readback",
           "src/worker/backends/webgpu/d3d9/d3d9-device.ts:stretchRect",
           "tools/tests/d3d9-copy-policy.test.ts",
-          "G:/sources/dxvk/src/d3d9/d3d9_device.cpp:1360-1364"
+          "dxvk/src/d3d9/d3d9_device.cpp:1360-1364"
         ],
         "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
         "gap": "The single-sample local seam now performs GPU readback plus CPU scale/encode for DEFAULT offscreen-plain destinations; MSAA/depth/compressed and native/DXVK byte-level differentials still require created-resource captures.",
@@ -4070,7 +4070,7 @@
           "src/worker/modules/d3d9/ex.ts:SetConvolutionMonoKernel-invalidcall",
           "tools/tests/d3d9-ex-lifecycle.test.ts",
           "tools/d3d9-parity/native-probe/Program.cs:Ex-probes",
-          "G:/sources/dxvk/src/d3d9/d3d9_device.cpp:4114-4121"
+          "dxvk/src/d3d9/d3d9_device.cpp:4114-4121"
         ],
         "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
         "gap": "The unsupported Ex operation has an explicit INVALIDCALL contract; capture the native/DXVK HRESULT before changing it.",
@@ -4106,7 +4106,7 @@
           "src/worker/modules/d3d9/ex.ts:ComposeRects-compat-stub",
           "tools/tests/d3d9-ex-lifecycle.test.ts",
           "tools/d3d9-parity/native-probe/Program.cs:Ex-probes",
-          "G:/sources/dxvk/src/d3d9/d3d9_device.cpp:4124-4139"
+          "dxvk/src/d3d9/d3d9_device.cpp:4124-4139"
         ],
         "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
         "gap": "ComposeRects is a compatibility stub returning success; the oracle must not mislabel this as E_NOTIMPL.",
@@ -4136,7 +4136,7 @@
           "src/worker/modules/d3d9/ex.ts:CheckResourceResidency-stub",
           "tools/tests/d3d9-ex-lifecycle.test.ts",
           "tools/d3d9-parity/native-probe/Program.cs:Ex-probes",
-          "G:/sources/dxvk/src/d3d9/d3d9_device.cpp:4175-4181"
+          "dxvk/src/d3d9/d3d9_device.cpp:4175-4181"
         ],
         "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
         "gap": "The local Ex stub returns D3D_OK for a null resource array with count zero; the executable probe records the native invalid-input HRESULT instead of treating the stub as differential parity.",
@@ -4165,7 +4165,7 @@
           "src/worker/modules/d3d9/ex.ts:CheckDeviceState-stub",
           "tools/tests/d3d9-ex-lifecycle.test.ts",
           "tools/d3d9-parity/native-probe/Program.cs:Ex-probes",
-          "G:/sources/dxvk/src/d3d9/d3d9_device.cpp:4217-4223"
+          "dxvk/src/d3d9/d3d9_device.cpp:4217-4223"
         ],
         "captureCommand": "bun tools/d3d9-parity/compare-capture.ts <capture.json> (native: dotnet run --project tools/d3d9-parity/native-probe/NativeD3D9Probe.csproj -- > <capture.json>)",
         "gap": "The local Ex stub returns D3D_OK for a valid device; the native/DXVK runner needs a created device and window-state vector, so no unavailable result is fabricated here.",
