@@ -1,4 +1,4 @@
-import type { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import type { FastPathRegistrar, ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
 import { getCurrentProcessPriorityClass } from '../kernel32/process/process';
@@ -59,3 +59,22 @@ export const queryThreadBasicInformation: ThunkImplementation = (_ctx, mem, args
     if (returnLength && !Mem.writeUint32(returnLength, SIZE)) return STATUS_ACCESS_VIOLATION;
     return 0;
 };
+
+const THREAD_BASIC_INFORMATION_CLASS = 0;
+const fastArgs = [0, 0, 0, 0, 0];
+
+/**
+ * FastPath tier for Nt/ZwQueryInformationThread(ThreadBasicInformation): the same body as the
+ * slow path, without the generic dispatch overhead. Mono/Unity runtimes query it on every
+ * thread-state check. Other information classes defer to the slow path.
+ */
+export function registerFastPathThreadInformation(dispatcher: FastPathRegistrar): void {
+    const fastPath = (esp: number, view: DataView, mem8: Uint8Array): number | null => {
+        if (esp + 24 > mem8.length) return null;
+        if (view.getUint32(esp + 8, true) !== THREAD_BASIC_INFORMATION_CLASS) return null;
+        for (let i = 0; i < 5; i++) fastArgs[i] = view.getUint32(esp + 4 + (i << 2), true);
+        return queryThreadBasicInformation(undefined as never, mem8, fastArgs) as number;
+    };
+    dispatcher.registerFastPath('ntdll', 'NtQueryInformationThread', fastPath);
+    dispatcher.registerFastPath('ntdll', 'ZwQueryInformationThread', fastPath);
+}

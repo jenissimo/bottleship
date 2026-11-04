@@ -192,6 +192,7 @@ import { registerFastPathHeapFunctions, registerFastPathVirtualQuery, allocateHe
 import { registerFastPathMsvcrtFunctions } from "./modules/msvcrt";
 import { registerFastPathPointerFunctions } from "./modules/kernel32/exception";
 import { registerFastPathProcessFunctions } from "./modules/kernel32/process/process";
+import { registerFastPathThreadInformation } from "./modules/ntdll/thread-information";
 import { prePopulateGetProcAddressCache, registerFastPathModuleFunctions, ensureGetProcAddressDynamicExports } from "./modules/kernel32/module/module";
 import { loadedHleModules, materializedHleModules, materializeHleModuleImages } from "./core/hle-module-images";
 import { KERNEL32_VISTA_WARMUP_EXPORTS } from "./api/kernel32-vista-supplement";
@@ -3016,6 +3017,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       registerFastPathMsvcrtFunctions(process.dispatcher);
       registerFastPathPointerFunctions(process.dispatcher);
       registerFastPathProcessFunctions(process.dispatcher);
+      registerFastPathThreadInformation(process.dispatcher);
       registerFastPathModuleFunctions(process.dispatcher);
 
       // Tick hooks for time data sync + onTickHook compensation

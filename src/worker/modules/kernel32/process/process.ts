@@ -2541,6 +2541,19 @@ export const exports: Record<string, ThunkImplementation> = {
 export function registerFastPathProcessFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
+    // HANDLE GetCurrentThread(void) — stdcall, RET 0. The constant pseudo-handle.
+    dispatcher.registerFastPath('kernel32', 'GetCurrentThread', (): number | null =>
+        System.getInstance().scheduler?.getCurrentThreadHandle() ?? null);
+
+    // BOOL TlsSetValue(DWORD dwTlsIndex, LPVOID lpTlsValue) — stdcall, RET 8. A refused
+    // index defers to the slow path, which owns the failure result.
+    dispatcher.registerFastPath('kernel32', 'TlsSetValue', (esp: number, view: DataView, mem8: Uint8Array): number | null => {
+        if (esp + 12 > mem8.length) return null;
+        const sched = System.getInstance().scheduler;
+        if (!sched) return null;
+        return sched.tlsSetValue(view.getUint32(esp + 4, true), view.getUint32(esp + 8, true)) ? 1 : null;
+    });
+
     // DWORD SuspendThread(HANDLE hThread) — stdcall, RET 4. Returns prev suspend count.
     dispatcher.registerFastPath('kernel32', 'SuspendThread', (esp: number, _view: DataView, mem8: Uint8Array): number | null => {
         if (esp + 8 > mem8.length) return null;
