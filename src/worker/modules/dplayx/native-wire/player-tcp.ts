@@ -1,16 +1,19 @@
 /**
- * Isolated normal-token TCP framing for nonsecure player messages with IDs.
- * NT5 dplay/dpmess.h:309-313, sysmess.c:1573-1611,1713-1766 and
- * wsock/dpsp.h:94-128. Does not implement NOMESSAGEID, PLAYERWRAPPER,
- * other provider tokens, peer authorization, routing, or a live session.
- * Limits and rejecting the ambiguous 'play' ID are local safety policy.
+ * [MC-DPL4CS] 2.2.45 DPSP_MSG_PLAYERMESSAGE over TCP: size/token (0xFAB) and
+ * SockAddr, then idFrom/idTo and the payload. A player message is told apart
+ * from a system message by the absence of the 'play' signature, so an idFrom equal
+ * to it is rejected. Sessions with the NM flag (no IDs, 2.2.5), PLAYERWRAPPER,
+ * other tokens, peer authorization, routing and a live session are not handled here.
+ * Limits are local safety policy.
  */
+import {DPSP_SIGNATURE} from "./spec";
+
 export interface DirectPlay4PlayerTcpFrame {
     consumed:number; providerSockaddr:Uint8Array; from:number; to:number; data:Uint8Array;
 }
 const validLimit=(n:number)=>Number.isInteger(n)&&n>=28&&n<=0xfffff;
 const uint=(n:number)=>Number.isInteger(n)&&n>=0&&n<=0xffffffff;
-const magic=0x79616c70;
+const magic=DPSP_SIGNATURE;
 export function encodeDirectPlay4PlayerTcpFrame(provider:Uint8Array,from:number,to:number,data:Uint8Array,maxBytes:number):Uint8Array {
     if(!validLimit(maxBytes))throw new RangeError("invalid frame limit");
     if(!(provider instanceof Uint8Array)||provider.length!==16||!(data instanceof Uint8Array)||

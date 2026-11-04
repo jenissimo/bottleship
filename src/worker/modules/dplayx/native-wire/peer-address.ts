@@ -2,8 +2,9 @@ import type {LanNetwork} from "../../../net/lan-network";
 import {isExternalIpv4Node, validPort} from "../../../net/netplay-wire";
 import type {WsaAddress} from "../../wsa-network";
 
-/** NT5 wsock/dpsp.c:1136-1169 and winsock.c:882-896:
- * retain advertised port; replace only a zero IP with the accepted TCP peer.
+/** [MC-DPL4CS] 2.2.6 SockAddr: a sender on the same network advertises 0.0.0.0, so
+ * keep the advertised port and replace only a zero IP with the accepted TCP peer's.
+ * (2.2.2 says the same for PL-flagged ServiceProviderData addresses.)
  * Routing checks here are local safety policy, not gateway authorization or native receiver behavior. */
 export function nativeDiscoveryOwner(
     wire: Uint8Array, peer: WsaAddress, version: number, network: LanNetwork,

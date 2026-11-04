@@ -4,10 +4,10 @@ import type {DirectPlay4NameTable,DirectPlay4PackedEntry} from "./name-table";
  * Staged native name-table data, without a virtual Session mutation.
  * Input must be the plain data returned by decodeDirectPlay4NameTable, not
  * arbitrary objects with accessors or proxies; this is not a JS object sandbox.
- * NT5 superpac.c:319-323, 341-378, 390-419, 446-495:
- * players, groups, then subgroup shortcuts; a local system player may
- * already exist. Native continues after some failed links. Duplicate/dangling
- * rejection below is our local fail-closed policy, not a native oracle.
+ * [MC-DPL4CS] 2.2.53: entries arrive as players, groups, then shortcuts; the
+ * joining client already holds its own system player (3.1.4.2), so that one record
+ * is merged rather than recreated (3.1.5.7). Duplicate/dangling rejection below is
+ * our local fail-closed policy, not a native oracle.
  * Byte budget measures source bytes, not JS heap: frozen number arrays have
  * per-element overhead. A 1 MiB hard cap and 4096 entries bound amplification.
  */
@@ -71,7 +71,7 @@ export class DirectPlay4JoinNameTableOwner {
             if(!v||![v.id,v.flags,v.fixedSize,v.versionOrSystemId,v.version,v.parentId].every(uint)||wire.has(v.id))
                 throw new RangeError("duplicate or invalid identity");
             // Existing IDs are explicitly local system players. Only a system
-            // player record can refer to one (dplaysp.h:134, flag 0x1).
+            // player record (2.2.3 SP flag, 0x1) can refer to one.
             const preexisting=!group&&existing.has(v.id);
             if((all.has(v.id)&&!preexisting)||(preexisting&&!(v.flags&1)))throw new RangeError("identity collision");
             wire.add(v.id);

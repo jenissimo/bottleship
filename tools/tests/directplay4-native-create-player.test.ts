@@ -12,7 +12,7 @@ function setup(timeoutMs=1000){
  const reply=(id=0x07756d22)=>{const b=new Uint8Array(48),v=new DataView(b.buffer);v.setUint32(0,0x79616c70,true);v.setUint16(4,7,true);v.setUint16(6,14,true);v.setUint32(8,id,true);return decodeDirectPlay4SystemTcpFrame(encodeDirectPlay4SystemTcpFrame(tcp,b,1024),1024)!;};
  return {abort,sent,uncertain,owner,op,reply,retire:()=>{live=false;}};
 }
-test("cmd5 then cmd8 matches real native-host accepted source-derived fixture",async()=>{
+test("cmd5 then cmd8 matches the [MC-DPL4CS] fixture a real native host accepted",async()=>{
  const f=setup();const run=f.op.create({shortName:"owned-client",longName:null,data:new Uint8Array()});
  await tick();expect(f.sent).toHaveLength(1);expect(f.sent[0]).toEqual(hex("2000b0fa0200f9d5c0a838010000000000000000706c617905000e0008000000"));
  expect(f.op.receive(f.reply())).toBe(true);expect(await run).toEqual({playerId:0x07756d22,submission:"submitted"});

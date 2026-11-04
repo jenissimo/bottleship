@@ -4,7 +4,7 @@ import { encodeDirectPlay4SystemTcpFrame } from "../../src/worker/modules/dplayx
 
 const bytes = (hex: string) => Uint8Array.from(Buffer.from(hex.replace(/\s/g, ""), "hex"));
 
-// Independent literal derived from NT5's x86 MSG_REQUESTPLAYERID, not a packet capture.
+// Independent literal from [MC-DPL4CS] 2.2.49 DPSP_MSG_REQUESTPLAYERID, not a packet capture.
 test("REQUESTPLAYERID has command 5, current version and raw little-endian flags", () => {
     expect(encodeDirectPlay4RequestPlayerId(0xfedcba98)).toEqual(bytes("706c6179 05000d00 98badcfe"));
     for (const value of [-1, 0x100000000, 1.5, NaN, Infinity])

@@ -2,7 +2,7 @@ import {expect,test} from "bun:test";
 import {encodeDirectPlay4SystemTcpFrame,decodeDirectPlay4SystemTcpFrame} from "../../src/worker/modules/dplayx/native-wire/tcp-frame";
 
 const bytes=(s:string)=>Uint8Array.from(Buffer.from(s.replace(/\s/g,""),"hex"));
-// Source-derived little endian literal, not a captured native packet.
+// Little-endian literal from [MC-DPL4CS] 2.2.6, not a captured native packet.
 const request=bytes("2000b0fa 020008fc c0000201 0000000000000000 706c6179 05000d00 78563412");
 
 test("normal TCP provider framing matches independent request literal",()=>{

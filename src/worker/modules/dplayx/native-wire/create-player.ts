@@ -1,10 +1,12 @@
 import {encodeDirectPlay4RequestPlayerId,decodeDirectPlay4PlayerIdReply} from "./player-id";
 import {encodeDirectPlay4PackedPlayer,encodeDirectPlay4TcpIpPlayerData} from "./packed-player";
 import {encodeDirectPlay4SystemTcpFrame,type DirectPlay4SystemTcpFrame} from "./tcp-frame";
+import {DPLAYI_PLAYER,DPSP_MSG,DPSP_SIGNATURE} from "./spec";
 
-/** Isolated application-player operation. The owning session must exclusively
- * dispatch its cmd7 replies here and retire itself when onUncertain fires:
- * cmd7 has no operation ID, so a late reply cannot safely be reused. */
+/** Application-player creation ([MC-DPL4CS] 3.1.4.4 Create Player): REQUESTPLAYERID,
+ * wait for REQUESTPLAYERREPLY, then CREATEPLAYER. The owning session must exclusively
+ * dispatch its REQUESTPLAYERREPLY (0x07) frames here and retire itself when onUncertain
+ * fires: the reply has no operation ID, so a late reply cannot safely be reused. */
 export interface DirectPlay4CreatePlayerOwner {
     signal:AbortSignal; current():boolean; send(frame:Uint8Array):Promise<void>;
     onUncertain(error:Error):void;
@@ -15,13 +17,13 @@ export interface DirectPlay4CreatePlayerRequest {
 }
 export interface DirectPlay4CreatePlayerResult {
     playerId:number;
-    /** WSA accepted cmd8 bytes; host acceptance and game-visible delivery are not acknowledged. */
+    /** WSA accepted the CREATEPLAYER bytes; host acceptance and game-visible delivery are not acknowledged. */
     submission:"submitted";
 }
 const uint=(n:number)=>Number.isInteger(n)&&n>=0&&n<=0xffffffff;
-/** NT5 sysmess.c:1223-1285, 1358-1365; dpmess.h:221-235.
- * This form is the observed normal version-14 application-player message;
- * trailing six zero bytes reproduce the source allocation and native capture.
+/** [MC-DPL4CS] 2.2.21 DPSP_MSG_CREATEPLAYER inner message: IDTo 0, PlayerID, GroupID 0,
+ * CreateOffset 28, PasswordOffset 0, the 2.2.2 packed player, then Reserved1 (2 bytes)
+ * and Reserved2 (4 bytes) as zero — the same six trailing bytes a Windows join capture shows.
  */
 export function encodeDirectPlay4CreatePlayer(playerId:number,packed:Uint8Array,version:number,maxBytes:number):Uint8Array {
     if(!uint(playerId)||!playerId||!Number.isInteger(version)||version<0||version>0xffff ||
@@ -31,7 +33,7 @@ export function encodeDirectPlay4CreatePlayer(playerId:number,packed:Uint8Array,
     if(p.getUint32(0,true)!==packed.length||p.getUint32(8,true)!==playerId||28+packed.length+6>maxBytes)
         throw new RangeError("invalid packed player");
     const b=new Uint8Array(28+packed.length+6),v=new DataView(b.buffer);
-    v.setUint32(0,0x79616c70,true);v.setUint16(4,8,true);v.setUint16(6,version,true);
+    v.setUint32(0,DPSP_SIGNATURE,true);v.setUint16(4,DPSP_MSG.CREATEPLAYER,true);v.setUint16(6,version,true);
     v.setUint32(12,playerId,true);v.setUint32(20,28,true);b.set(packed,28);return b;
 }
 export class DirectPlay4CreatePlayer {
@@ -56,7 +58,7 @@ export class DirectPlay4CreatePlayer {
     /** Returns false for frames belonging to the owning session's other handlers. */
     receive(frame:DirectPlay4SystemTcpFrame):boolean {
         const pending=this.pending;
-        if(frame.command!==7||!pending)return false;
+        if(frame.command!==DPSP_MSG.REQUESTPLAYERREPLY||!pending)return false;
         const current=this.current();
         // current() may synchronously deliver the reply or retire the owner.
         if(this.pending!==pending)return true;
@@ -78,7 +80,7 @@ export class DirectPlay4CreatePlayer {
             if(request.data.length>this.maxBytes)throw new RangeError("player data exceeds budget");
             shortName=request.shortName;longName=request.longName;data=Uint8Array.from(request.data);
             sp=encodeDirectPlay4TcpIpPlayerData(this.tcp,this.udp);
-            encodeDirectPlay4PackedPlayer({flags:8,id:1,systemPlayerId:this.owner.systemPlayerId,version:this.owner.version,
+            encodeDirectPlay4PackedPlayer({flags:DPLAYI_PLAYER.PLAYERLOCAL,id:1,systemPlayerId:this.owner.systemPlayerId,version:this.owner.version,
                 parentId:0,shortName,longName,spData:sp,playerData:data},this.maxBytes-54);
         } catch(error) {this.busy=false;throw error;}
         let timer:ReturnType<typeof setTimeout>|undefined,started=false;
@@ -88,7 +90,7 @@ export class DirectPlay4CreatePlayer {
         this.owner.signal.addEventListener("abort",aborted,{once:true});
         try {
             if(!this.current())throw new Error("player owner retired");
-            const frame=encodeDirectPlay4SystemTcpFrame(this.tcp,encodeDirectPlay4RequestPlayerId(8,this.owner.version),this.maxBytes);
+            const frame=encodeDirectPlay4SystemTcpFrame(this.tcp,encodeDirectPlay4RequestPlayerId(DPLAYI_PLAYER.PLAYERLOCAL,this.owner.version),this.maxBytes);
             const reply=new Promise<DirectPlay4SystemTcpFrame>((resolve,reject)=>{rejectWait=reject;this.pending={resolve,reject};});
             timer=setTimeout(()=>rejectWait?.(new Error("player operation timeout")),this.timeoutMs);
             started=true;
@@ -99,7 +101,7 @@ export class DirectPlay4CreatePlayer {
             if(id.version!==this.owner.version||id.result!==0||!id.playerId||id.securityDescription.some(x=>x!==0)||
                 id.sspiProviderOffset!==0||id.capiProviderOffset!==0||id.trailingBytes.length)
                 throw new Error("player ID rejected");
-            const packed=encodeDirectPlay4PackedPlayer({flags:8,id:id.playerId,systemPlayerId:this.owner.systemPlayerId,
+            const packed=encodeDirectPlay4PackedPlayer({flags:DPLAYI_PLAYER.PLAYERLOCAL,id:id.playerId,systemPlayerId:this.owner.systemPlayerId,
                 version:this.owner.version,parentId:0,shortName,longName,spData:sp,playerData:data},this.maxBytes-54);
             const inner=encodeDirectPlay4CreatePlayer(id.playerId,packed,this.owner.version,this.maxBytes-20);
             if(!this.current())throw new Error("player owner retired");

@@ -89,9 +89,10 @@ export function discoverNativeSessions(table: WsaSocketTable, request: NativeDis
                     if (!live() || signal?.aborted) throw new Error("native listener retired during send");
                     sent = true;
                 }
-                // NT5 dpsp.c:2083-2113 adds a background TCP request after
-                // successful UDP unicast; its failure does not fail UDP search.
-                // The peer replies to the advertised listener, not this socket.
+                // [MC-DPL4CS] 2.1: unicast messages travel over TCP, so after the UDP
+                // datagram we also send the request over TCP to the host's enumeration
+                // port; its failure does not fail the UDP search. Per 3.2.5.3 the host
+                // replies to the advertised listener, not this socket.
                 if (tcpPort && !streamDone) {
                     try {
                         if (!streamStarted) {

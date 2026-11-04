@@ -3,7 +3,8 @@ import {decodeDirectPlay4NameTable,encodeDirectPlay4AddForward} from "../../src/
 
 const bytes=(hex:string)=>Uint8Array.from(Buffer.from(hex.replace(/\s/g,""),"hex"));
 const desc="50000000"+"00".repeat(76);
-// Literals derive from NT5 x86 layouts; they are not captured native packets.
+// Literals are built by hand from [MC-DPL4CS] 2.2.2, 2.2.3, 2.2.11, 2.2.28 and 2.2.53;
+// they are not captured native packets.
 const packedPlayer=bytes(
     "30000000 01000000 78563412 00000000 00000000 00000000 " +
     "00000000 00000000 78563412 30000000 0d000000 00000000",
@@ -37,8 +38,10 @@ const superReply=bytes(
     "706c6179 29000d00 01000000 01000000 74000000 01000000 24000000 00000000 00000000 "+
     desc+
     "10000000 01000000 01000000 19000000 0d000000 41000000 01aa 0300 010203 "+
-    "10000000 00000000 02000000 40010000 01000000 63000000 02 01000000 03000000 "+
-    "10000000 00000000 02000000 00020000 01 04000000",
+    // Group: PC (1 byte) + PI; 2.2.3 order is PlayerCount, PlayerIDs, then ParentID.
+    "10000000 00000000 02000000 40010000 01000000 02 01000000 03000000 63000000 "+
+    // Shortcut entry: a superpacked group with VersionOrSystemPlayerID and SC (1 byte).
+    "10000000 00000000 02000000 00020000 01000000 01 04000000",
 );
 test("super name table handles unaligned names, mixed data widths, members, parent and shortcuts",()=>{
     const buffer=Buffer.alloc(superReply.length+1); Buffer.from(superReply).copy(buffer,1);
@@ -54,19 +57,19 @@ test("super name table handles unaligned names, mixed data widths, members, pare
     expect(result.sessionDescription[0]).toBe(80);
     expect(result.players[0].shortName).toEqual(bytes("41000000"));
 });
-test("shortcut ignores unrelated mask bits but uses bits 9 and 10 as count width",()=>{
-    for (const mask of ["01020000", "01020080"]) {
+test("shortcut ignores undefined mask bits (2.2.3 X) but uses SC bits 9 and 10 as count width",()=>{
+    for (const mask of ["00020000", "00020080"]) {
         const reply=bytes(
             "706c6179 29000d00 00000000 00000000 74000000 01000000 24000000 00000000 00000000 "+
             desc+
-            "10000000 00000000 02000000 "+mask+" 01 04000000",
+            "10000000 00000000 02000000 "+mask+" 01000000 01 04000000",
         );
         expect(decodeDirectPlay4NameTable(reply,1024,10).shortcuts[0]).toEqual({flags:0,id:2,groupIds:[4]});
     }
-    // Width bits are not ignored: 0x601 specifies a DWORD count, which is truncated.
+    // Width bits are not ignored: 0x600 specifies a DWORD count, which is truncated.
     const wrongWidth=bytes(
         "706c6179 29000d00 00000000 00000000 74000000 01000000 24000000 00000000 00000000 "+
-        desc+"10000000 00000000 02000000 01060080 01",
+        desc+"10000000 00000000 02000000 00060080 01000000 01",
     );
     expect(()=>decodeDirectPlay4NameTable(wrongWidth,1024,10)).toThrow(RangeError);
 });
