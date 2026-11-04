@@ -1,46 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { parseSdb, SdbError, virtualRegistryRedirects } from "@bottleship/formats/sdb";
-
-// A database laid out the way sdbinst-era tools write one: an index list first, then the
-// DATABASE, then the string table every STRINGREF points into.
-function buildSdb(exes: Array<{ name: string; shims: Array<{ name: string; cmd?: string }> }>, opts: { inlineNames?: boolean } = {}): Uint8Array {
-    const items: number[][] = [];
-    const tableOffsets = new Map<string, number>();
-    let tableCursor = 6; // past the STRINGTABLE tag + size
-    const ref = (s: string): number => {
-        let off = tableOffsets.get(s);
-        if (off === undefined) {
-            off = tableCursor;
-            tableOffsets.set(s, off);
-            const item = [...word(0x8801), ...dword((s.length + 1) * 2), ...utf16z(s)];
-            items.push(item);
-            tableCursor += item.length;
-        }
-        return off;
-    };
-    const word = (v: number) => [v & 0xff, (v >> 8) & 0xff];
-    const dword = (v: number) => [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >>> 24) & 0xff];
-    const utf16z = (s: string) => [...s].flatMap((c) => word(c.charCodeAt(0))).concat([0, 0]);
-    const list = (tag: number, body: number[]) => [...word(tag), ...dword(body.length), ...body];
-    const strField = (tag: number, s: string) => opts.inlineNames
-        ? [...word((tag & 0x0fff) | 0x8000), ...dword((s.length + 1) * 2), ...utf16z(s)]
-        : [...word(tag), ...dword(ref(s))];
-
-    const exeLists = exes.flatMap((exe) => list(0x7007, [
-        ...strField(0x6001, exe.name),
-        ...list(0x7008, [...strField(0x6001, "*")]),
-        ...exe.shims.flatMap((shim) => list(0x7009, [
-            ...strField(0x6001, shim.name),
-            ...(shim.cmd !== undefined ? strField(0x6008, shim.cmd) : []),
-        ])),
-    ]));
-    const database = list(0x7001, [...word(0x4023), ...dword(4), ...strField(0x6001, "Test Compatibility Database"), ...exeLists]);
-    const indexes = list(0x7802, list(0x7803, [...word(0x3802), ...word(0x7007), ...list(0x9801, [])]));
-    const table = list(0x7801, items.flat());
-    return new Uint8Array([...dword(2), ...dword(3), ..."sdbf"].map((c) => typeof c === "string" ? c.charCodeAt(0) : c).concat(indexes, database, table));
-}
+import { parseSdb, redirectsForImage, SdbError, validateRedirects, virtualRegistryRedirects } from "@bottleship/formats/sdb";
+import { buildSdb } from "./fixtures/sdb-builder";
 
 const MAFIA_SHIM = "ADDREDIRECT(HKLM\\SOFTWARE\\Illusion%20Softworks\\Mafia^HKCU\\Software\\Illusion%20Softworks\\Mafia)";
+const MAFIA = { from: "HKLM\\SOFTWARE\\Illusion Softworks\\Mafia", to: "HKCU\\Software\\Illusion Softworks\\Mafia" };
 
 describe("sdb parser", () => {
     test("reads exe entries and their shim references through the string table", () => {
@@ -65,18 +28,24 @@ describe("sdb parser", () => {
         const bytes = buildSdb([{ name: "Game.exe", shims: [] }]);
         expect(() => parseSdb(bytes.subarray(0, bytes.length - 8))).toThrow(SdbError);
     });
+
+    test("a STRINGREF that lands on a tag other than STRINGTABLE_ITEM is a parse error", () => {
+        const bytes = buildSdb([{ name: "Game.exe", shims: [] }], { strayRefFor: "Game.exe" });
+        expect(() => parseSdb(bytes)).toThrow(SdbError);
+        expect(() => parseSdb(bytes)).toThrow(/STRINGTABLE_ITEM/);
+    });
 });
 
 describe("VirtualRegistry redirects", () => {
-    test("one ADDREDIRECT shared by two exes becomes one rule with spaces unescaped", () => {
+    test("each exe keeps its own rule, with spaces unescaped", () => {
         const exes = parseSdb(buildSdb([
             { name: "Game.exe", shims: [{ name: "VirtualRegistry", cmd: MAFIA_SHIM }] },
-            { name: "Setup.exe", shims: [{ name: "VirtualRegistry", cmd: MAFIA_SHIM }] },
+            { name: "Setup.exe", shims: [{ name: "VirtualRegistry", cmd: `${MAFIA_SHIM} ${MAFIA_SHIM}` }] },
         ]));
-        expect(virtualRegistryRedirects(exes)).toEqual([{
-            from: "HKLM\\SOFTWARE\\Illusion Softworks\\Mafia",
-            to: "HKCU\\Software\\Illusion Softworks\\Mafia",
-        }]);
+        expect(virtualRegistryRedirects(exes)).toEqual([
+            { exe: "Game.exe", ...MAFIA },
+            { exe: "Setup.exe", ...MAFIA },
+        ]);
     });
 
     test("other shims and other VirtualRegistry commands are reported, not applied", () => {
@@ -94,5 +63,86 @@ describe("VirtualRegistry redirects", () => {
             "Game.exe: shim ForceDisplayMode is not supported",
             "Game.exe: VirtualRegistry command ADDKEYS(HKLM\\Software\\X) is not supported",
         ]);
+    });
+
+    test("an entry only MATCHING_FILE could identify (NAME \"*\") is skipped and reported", () => {
+        const skipped: string[] = [];
+        const exes = parseSdb(buildSdb([{ name: "*", shims: [{ name: "VirtualRegistry", cmd: MAFIA_SHIM }] }]));
+        expect(virtualRegistryRedirects(exes, (r) => skipped.push(r))).toEqual([]);
+        expect(skipped).toHaveLength(1);
+        expect(skipped[0]).toContain("MATCHING_FILE");
+    });
+
+    test("parentheses inside a key are part of the key", () => {
+        const cmd = "ADDREDIRECT(HKLM\\Software\\Vendor%20(x86)\\Game^HKCU\\Software\\Vendor%20(x86)\\Game%20(Steam))";
+        const exes = parseSdb(buildSdb([{ name: "Game.exe", shims: [{ name: "VirtualRegistry", cmd }] }]));
+        expect(virtualRegistryRedirects(exes)).toEqual([{
+            exe: "Game.exe",
+            from: "HKLM\\Software\\Vendor (x86)\\Game",
+            to: "HKCU\\Software\\Vendor (x86)\\Game (Steam)",
+        }]);
+    });
+
+    test("an ADDREDIRECT without exactly one ^ is reported, not guessed at", () => {
+        const skipped: string[] = [];
+        const exes = parseSdb(buildSdb([{ name: "Game.exe", shims: [{ name: "VirtualRegistry", cmd: "ADDREDIRECT(HKLM\\A^HKCU\\B^HKCU\\C) ADDREDIRECT(HKLM\\A)" }] }]));
+        expect(virtualRegistryRedirects(exes, (r) => skipped.push(r))).toEqual([]);
+        expect(skipped).toHaveLength(2);
+    });
+
+    test("a process gets only the rules of the entry naming its image", () => {
+        const rules = [{ exe: "Game.exe", ...MAFIA }, { exe: "Other.exe", from: "HKLM\\Software\\O", to: "HKCU\\Software\\O" }];
+        expect(redirectsForImage(rules, "C:\\Mafia\\GAME.EXE")).toEqual([MAFIA]);
+        expect(redirectsForImage(rules, "C:\\Mafia\\Setup.exe")).toEqual([]);
+    });
+});
+
+describe("redirect validation", () => {
+    test("a plain rule is accepted in stored-key form", () => {
+        const { accepted, rejected } = validateRedirects([MAFIA]);
+        expect(rejected).toEqual([]);
+        expect(accepted.map(({ from, to }) => ({ from, to }))).toEqual([{
+            from: "hklm\\software\\illusion softworks\\mafia", to: "hkcu\\software\\illusion softworks\\mafia",
+        }]);
+    });
+
+    test("whole root keys, unknown roots and empty keys are rejected", () => {
+        const { accepted, rejected } = validateRedirects([
+            { from: "HKLM", to: "HKCU\\Software\\X" },
+            { from: "HKLM\\Software\\X", to: "HKCU" },
+            { from: "HKLM\\Software\\X", to: "HKCU\\" },
+            { from: "MACHINE\\Software\\X", to: "HKCU\\Software\\X" },
+            { from: "", to: "HKCU\\Software\\X" },
+            { from: "HKLM\\Software\\\\X", to: "HKCU\\Software\\X" },
+        ]);
+        expect(accepted).toEqual([]);
+        expect(rejected).toHaveLength(6);
+    });
+
+    test("a target inside its own source is rejected", () => {
+        const { accepted, rejected } = validateRedirects([{ from: "HKLM\\Software\\X", to: "HKLM\\Software\\X\\Y" }]);
+        expect(accepted).toEqual([]);
+        expect(rejected).toHaveLength(1);
+    });
+
+    test("A->B with B->A is a cycle: both are rejected", () => {
+        const { accepted, rejected } = validateRedirects([
+            { from: "HKLM\\Software\\A", to: "HKCU\\Software\\B" },
+            { from: "HKCU\\Software\\B", to: "HKLM\\Software\\A" },
+        ]);
+        expect(accepted).toEqual([]);
+        expect(rejected.map((r) => r.reason).every((r) => r.includes("cycle"))).toBe(true);
+    });
+
+    test("a chain A->B, B\\C->D is rejected", () => {
+        expect(validateRedirects([
+            { from: "HKLM\\Software\\A", to: "HKCU\\Software\\B" },
+            { from: "HKCU\\Software\\B\\C", to: "HKCU\\Software\\D" },
+        ]).accepted).toEqual([]);
+    });
+
+    test("one source with two targets is rejected; exact duplicates fold", () => {
+        expect(validateRedirects([MAFIA, MAFIA]).accepted).toHaveLength(1);
+        expect(validateRedirects([MAFIA, { from: MAFIA.from, to: "HKCU\\Software\\Elsewhere" }]).accepted).toEqual([]);
     });
 });
