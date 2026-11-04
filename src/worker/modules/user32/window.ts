@@ -63,7 +63,7 @@ import {
 } from './control-interaction';
 import { ddrawOwnsScreen } from '../ddraw/gdi-visibility';
 import { paintTraceEnabled, logBeginEndPaint } from './paint-trace';
-import { repaintChildControls } from './controls';
+import { repaintChildControls, applyComboBoxClosedHeight } from './controls';
 import { restampOwnedPopups } from './paint-hooks';
 import {
     tryEndPaintOwnerDrawChain,
@@ -1137,6 +1137,9 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             if (!windowInfo.wndProc) {
                 windowInfo.wndProc = getDefWindowProcAddress();
             }
+            // The combobox's create-time sizing: cy is the height WITH the dropped list,
+            // the window itself is the closed box (same rule as a dialog template's).
+            applyComboBoxClosedHeight(windowInfo);
         }
 
         windows.set(windowInfo.handle, windowInfo);
