@@ -180,4 +180,6 @@ export interface MSSTimer {
     period: number;
     active: boolean;
     timerId?: number;
+    /** A tick is queued or running on the timer-pump thread; further ticks coalesce. */
+    inFlight?: boolean;
 }

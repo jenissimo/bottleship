@@ -59,12 +59,24 @@ export function createTimerExports(ctx: MSSContext): Record<string, ThunkImpleme
             // virtual-time timer wheel, NOT host setInterval — a busy-spinning guest thread starves
             // host macrotasks, so the mixer would never be serviced → audio stall + audio-gated game
             // logic stall (Re-Volt mac). The wheel is polled in-band with guest execution.
+            // Miles runs timer callbacks on its own background thread, independent of whether
+            // the app ever calls AIL_serve, so ticks go to the shared timer-pump thread; the
+            // AIL_serve queue is only the fallback when no pump thread can be created.
+            scheduler.ensureTimerPumpThread();
+            const cbArgs = [0];
+            const onReturn = () => { timer.inFlight = false; };
             timer.timerId = scheduler.timerWheel.add(
                 periodMs, true, TimerKind.MSS_TIMER,
                 () => {
                     if (!timer.active || !cb) return;
                     if (!system.process || system.isExiting) return;
-                    ctx.pendingTimerCallbacks.push({ callback: cb, user: timer.user });
+                    if (timer.inFlight) return;
+                    timer.inFlight = true;
+                    cbArgs[0] = timer.user;
+                    if (!scheduler.postTimerCallback(cb, cbArgs, onReturn)) {
+                        timer.inFlight = false;
+                        ctx.pendingTimerCallbacks.push({ callback: cb, user: timer.user });
+                    }
                 },
                 TimeService.getInstance().nowMs(),
             );
