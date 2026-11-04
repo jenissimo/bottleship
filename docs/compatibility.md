@@ -166,7 +166,7 @@ full playability.
 | Quake II 3.14 (classic Win32) | Entered a playable level, movement and rendered HUD; OpenGL | ✓ |
 | American McGee's Alice | Main menu, OpenGL; bundled 1280 × 1024, 32-bit color/textures and high texture detail | ✓ |
 | XIII UK demo | Rendered menu, D3D8 | ✓ |
-| Hitman: Codename 47 revision 2 | Mission briefing, Direct3D; original OpenGL setup fails pixel-format selection | ✓ |
+| Hitman: Codename 47 revision 2 | Mission briefing and the first level's HUD, Direct3D; original OpenGL setup fails pixel-format selection. WGB includes `Setup\Locale.zip`, which the installer script copies from the English language pack; without it the briefing and HUD show resource keys | ✓ |
 | Serious Sam: The First Encounter | English single-player menu, OpenGL; dismiss the normal first-run information dialog | ✓ |
 | Worms Armageddon | Clean startup splashes, working single-player menu and quick match against the CPU; DirectDraw | ✓ |
 | System Shock 2 (original demo) | Main menu, DirectDraw | ✓ |
