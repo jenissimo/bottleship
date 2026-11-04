@@ -71,6 +71,21 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     const ddeInstances = new Set<number>();
     const ddeLastError = new Map<number, number>();
     const ddeStrings = new Map<number, string>();
+    const ddeServices = new Map<string, Set<number>>();
+    const ddeConversations = new Set<number>();
+    const ddeShellServices = new Set(['progman', 'folders', 'appproperties']);
+    const DNS_REGISTER = 0x0001;
+    const DNS_UNREGISTER = 0x0002;
+    const ddeServiceKey = (hsz: number): string | null => {
+        const name = ddeStrings.get(hsz);
+        return name === undefined ? null : name.toLowerCase();
+    };
+    const ddeDropInstanceServices = (idInst: number): void => {
+        for (const [key, owners] of ddeServices) {
+            owners.delete(idInst);
+            if (owners.size === 0) ddeServices.delete(key);
+        }
+    };
     function resolvePropertyKey(mem: Uint8Array, lpString: number, wide: boolean): string | null {
         if (lpString === 0) {
             return null;
@@ -505,7 +520,44 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         }
         ddeInstances.delete(idInst);
         ddeLastError.delete(idInst);
+        ddeDropInstanceServices(idInst);
         return 1;
+    };
+
+    // HDDEDATA DdeNameService(DWORD idInst, HSZ hsz1, HSZ hsz2, UINT afCmd)
+    exports['DdeNameService'] = (ctx, mem, args) => {
+        const idInst = args[0] >>> 0;
+        const hsz1 = args[1] >>> 0;
+        const afCmd = args[3] >>> 0;
+        if (!ddeInstances.has(idInst)) {
+            return 0;
+        }
+        if (afCmd & DNS_UNREGISTER) {
+            if (hsz1 === 0) {
+                ddeDropInstanceServices(idInst);
+            } else {
+                const key = ddeServiceKey(hsz1);
+                const owners = key === null ? undefined : ddeServices.get(key);
+                owners?.delete(idInst);
+                if (key !== null && owners && owners.size === 0) ddeServices.delete(key);
+            }
+        } else if (afCmd & DNS_REGISTER) {
+            const key = ddeServiceKey(hsz1);
+            if (key === null) {
+                ddeLastError.set(idInst, DMLERR_INVALIDPARAMETER);
+                return 0;
+            }
+            let owners = ddeServices.get(key);
+            if (!owners) ddeServices.set(key, owners = new Set());
+            owners.add(idInst);
+        }
+        ddeLastError.set(idInst, DMLERR_NO_ERROR);
+        return 1;
+    };
+
+    // BOOL DdeDisconnect(HCONV hConv)
+    exports['DdeDisconnect'] = (ctx, mem, args) => {
+        return ddeConversations.delete(args[0] >>> 0) ? 1 : 0;
     };
 
     // UINT DdeGetLastError(DWORD idInst)
@@ -573,8 +625,15 @@ export function createInputExports(): Record<string, ThunkImplementation> {
             }
             return 0;
         }
+        const key = ddeServiceKey(hszService);
+        if (key === null || (!ddeServices.has(key) && !ddeShellServices.has(key))) {
+            ddeLastError.set(idInst, DMLERR_NO_CONV_ESTABLISHED);
+            return 0;
+        }
         ddeLastError.set(idInst, DMLERR_NO_ERROR);
-        return (0xD0000000 | (nextDdeConv++ & 0x0FFFFFFF)) >>> 0;
+        const hConv = (0xD0000000 | (nextDdeConv++ & 0x0FFFFFFF)) >>> 0;
+        ddeConversations.add(hConv);
+        return hConv;
     };
 
     // HDDEDATA DdeClientTransaction(...)
