@@ -238,6 +238,10 @@ export class GDIContext {
     private overlayDirty: boolean = false;
     private overlayHasContent: boolean = false; // True if overlay has any content to composite
     private overlayClearRepairFn: ((x: number, y: number, w: number, h: number, excludeHwnd: number) => void) | null = null;
+
+    /** System palette usage, one system-wide setting: SYSPAL_STATIC (1) until an app takes
+     *  the static entries with SYSPAL_NOSTATIC (2) / SYSPAL_NOSTATIC256 (3). */
+    systemPaletteUse = 1;
     private overlayDirtyNotifyFn: (() => void) | null = null;
 
     /** After clearOverlayRect, repaint windows whose overlay pixels were cleared. */
@@ -2385,6 +2389,7 @@ export class GDIContext {
         this.windowClientBacking.clear();
         this.nextHdc = 0x20000;
         this.nextHgdiobj = 0x30000;
+        this.systemPaletteUse = 1;
         this.clearOverlay();
         this.overlayDirty = false;
         this.overlayHasContent = false;

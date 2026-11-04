@@ -35,7 +35,7 @@ import { resetSehDispatchState } from "./seh-dispatch";
 import { namedObjects } from "../modules/kernel32/named-objects";
 import { hasWaitingModalPump } from "../modules/user32/modal-dialog-state";
 import { hypercallDataManager } from "./cpu/hypercall-data";
-import { sessionState } from "./session-state";
+import { sessionState, type SessionResetFailure } from "./session-state";
 import type { PointerClipRect } from "./pointer-policy";
 
 /**
@@ -450,9 +450,15 @@ export class System {
         add('frame-profiler', 'subsystems', () => frameProfiler.reset());
     }
 
-    private resetSessionPhase(phase: 'game-switch' | 'subsystems'): void {
-        for (const { id, error } of sessionState.resetPhase(phase)) {
-            Logger.warn(LogCategory.SYSTEM, `Failed to reset session state "${id}": ${error}`);
+    /**
+     * A failed per-session reset is the cross-game leak the registry exists to prevent, so it
+     * is logged as an error and collected for the caller of reset(); the remaining entries
+     * still run, as the module reset() loop does.
+     */
+    private resetSessionPhase(phase: 'game-switch' | 'subsystems', failures: SessionResetFailure[]): void {
+        for (const failure of sessionState.resetPhase(phase)) {
+            Logger.error(LogCategory.SYSTEM, `Failed to reset session state "${failure.id}": ${failure.error}`);
+            failures.push(failure);
         }
     }
 
@@ -986,9 +992,11 @@ export class System {
     }
 
     /**
-     * Reset all system state - clear all subsystems
+     * Reset all system state - clear all subsystems. Resolves to the per-session stores whose
+     * reset threw (empty when the switch is clean); see resetSessionPhase().
      */
-    async reset(): Promise<void> {
+    async reset(): Promise<SessionResetFailure[]> {
+        const sessionResetFailures: SessionResetFailure[] = [];
         this.brokerExit = null;
         finishProcessIpcLifetime();
         await stopChildProcesses();
@@ -1017,7 +1025,7 @@ export class System {
         this.registry.reset();
         await this.cleanupProcessFiles();
         this.fileSystem.reset();
-        this.resetSessionPhase('game-switch');
+        this.resetSessionPhase('game-switch', sessionResetFailures);
 
         // Stop and restart v86 if running to fully reset CPU/MMU/JIT state
         if (this.process?.v86) {
@@ -1075,7 +1083,7 @@ export class System {
         this.exitNotified = false;
         this.isReExecPending = false;
 
-        this.resetSessionPhase('subsystems');
+        this.resetSessionPhase('subsystems', sessionResetFailures);
 
         // Reset process if exists
         if (this.process) {
@@ -1120,6 +1128,7 @@ export class System {
         }
 
         Logger.log(LogCategory.SYSTEM, 'System reset complete');
+        return sessionResetFailures;
     }
 
     /**
