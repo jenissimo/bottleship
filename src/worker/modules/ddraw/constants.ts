@@ -322,6 +322,9 @@ export const MIN_SURFACE_SIZE = 0x1000; // 4KB minimum allocation
 export const STACK_CLEANUP_DIRECTDRAWENUMERATEA = 8; // 2 args * 4 bytes
 export const STACK_CLEANUP_DIRECTDRAWENUMERATEEXA = 12; // 3 args * 4 bytes
 export const STACK_CLEANUP_ENUMDISPLAYMODES = 20; // 5 args * 4 bytes
+export const STACK_CLEANUP_SETDISPLAYMODE_V1 = 16; // this + 3 args
+export const STACK_CLEANUP_SETDISPLAYMODE = 24; // this + 5 args (v2/v4/v7)
+export const STACK_CLEANUP_RESTOREDISPLAYMODE = 4; // this
 export const STACK_CLEANUP_ENUMSURFACES = 20; // 5 args * 4 bytes
 
 // DDENUMSURFACES flags

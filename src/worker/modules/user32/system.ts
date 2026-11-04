@@ -4,7 +4,7 @@
  * Atomic implementation for system information
  */
 
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { ThunkImplementation, type ThunkResult, type X86Context } from '../../core/thunking/thunk-dispatcher';
 import { parseBMPHeader, parseBMPPixels } from '../gdi32/gdi-raster';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
@@ -44,7 +44,7 @@ import {
 import * as Classic from './classic-theme';
 import { getSystemCursorHandle } from './system-cursors';
 import { registerDeviceNotification, unregisterDeviceNotification } from './device-notify';
-import { invokeWindowMessageSync } from './message';
+import { invokeWindowMessageSync, sendDisplayChange } from './message';
 import { PRIMARY_HMONITOR, monitorFromRect, monitorFallback } from './monitor';
 import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 
@@ -2529,21 +2529,21 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return { value: 1, stackCleanup: 12 }; // TRUE
     };
 
-    exports['ChangeDisplaySettingsA'] = (_ctx, mem, args) => {
+    exports['ChangeDisplaySettingsA'] = (ctx, mem, args) => {
         const lpDevMode = args[0] >>> 0;
         const dwFlags = args[1] >>> 0;
         Logger.log(LogCategory.USER32, `ChangeDisplaySettingsA(0x${lpDevMode.toString(16)}, 0x${dwFlags.toString(16)})`);
-        return applyChangeDisplaySettings(mem, lpDevMode, dwFlags, DEVMODEA_OFFSETS, "ChangeDisplaySettingsA");
+        return applyChangeDisplaySettings(ctx, mem, 8, lpDevMode, dwFlags, DEVMODEA_OFFSETS, "ChangeDisplaySettingsA");
     };
 
-    exports['ChangeDisplaySettingsW'] = (_ctx, mem, args) => {
+    exports['ChangeDisplaySettingsW'] = (ctx, mem, args) => {
         const lpDevMode = args[0] >>> 0;
         const dwFlags = args[1] >>> 0;
         Logger.log(LogCategory.USER32, `ChangeDisplaySettingsW(0x${lpDevMode.toString(16)}, 0x${dwFlags.toString(16)})`);
-        return applyChangeDisplaySettings(mem, lpDevMode, dwFlags, DEVMODEW_OFFSETS, "ChangeDisplaySettingsW");
+        return applyChangeDisplaySettings(ctx, mem, 8, lpDevMode, dwFlags, DEVMODEW_OFFSETS, "ChangeDisplaySettingsW");
     };
 
-    exports['ChangeDisplaySettingsExA'] = (_ctx, mem, args) => {
+    exports['ChangeDisplaySettingsExA'] = (ctx, mem, args) => {
         const lpszDeviceName = args[0] >>> 0;
         const lpDevMode = args[1] >>> 0;
         const hwnd = args[2] >>> 0;
@@ -2551,10 +2551,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const lParam = args[4] >>> 0;
         void hwnd; void lParam;
         Logger.verbose(LogCategory.USER32, `ChangeDisplaySettingsExA(dev=0x${lpszDeviceName.toString(16)}, dm=0x${lpDevMode.toString(16)}, flags=0x${dwFlags.toString(16)})`);
-        return applyChangeDisplaySettings(mem, lpDevMode, dwFlags, DEVMODEA_OFFSETS, "ChangeDisplaySettingsExA");
+        return applyChangeDisplaySettings(ctx, mem, 20, lpDevMode, dwFlags, DEVMODEA_OFFSETS, "ChangeDisplaySettingsExA");
     };
 
-    exports['ChangeDisplaySettingsExW'] = (_ctx, mem, args) => {
+    exports['ChangeDisplaySettingsExW'] = (ctx, mem, args) => {
         const lpszDeviceName = args[0] >>> 0;
         const lpDevMode = args[1] >>> 0;
         const hwnd = args[2] >>> 0;
@@ -2562,7 +2562,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const lParam = args[4] >>> 0;
         void hwnd; void lParam;
         Logger.verbose(LogCategory.USER32, `ChangeDisplaySettingsExW(dev=0x${lpszDeviceName.toString(16)}, dm=0x${lpDevMode.toString(16)}, flags=0x${dwFlags.toString(16)})`);
-        return applyChangeDisplaySettings(mem, lpDevMode, dwFlags, DEVMODEW_OFFSETS, "ChangeDisplaySettingsExW");
+        return applyChangeDisplaySettings(ctx, mem, 20, lpDevMode, dwFlags, DEVMODEW_OFFSETS, "ChangeDisplaySettingsExW");
     };
 
     const DEVMODEA_OFFSETS = {
@@ -2680,20 +2680,22 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
      *  - lpDevMode == NULL  → restore to the desktop (registry) mode.
      *  - CDS_TEST           → validate against supported modes, return BADMODE/SUCCESSFUL,
      *                         WITHOUT applying.
-     *  - otherwise apply: update the DDraw display mode, resize the host, and broadcast
+     *  - otherwise apply: update the DDraw display mode, resize the host, and send
      *    WM_DISPLAYCHANGE (so EnumDisplaySettings(ENUM_CURRENT_SETTINGS)/SM_CXSCREEN reflect it).
      */
     const applyChangeDisplaySettings = (
+        ctx: X86Context,
         mem: Uint8Array,
+        stackCleanup: number,
         lpDevMode: number,
         dwFlags: number,
         offsets: DevModeOffsets,
         apiName: string
-    ): number => {
+    ): ThunkResult | number => {
         const system = System.getInstance();
         const ddraw = system.ddrawContext;
 
-        const applyMode = (width: number, height: number, bpp: number, refresh: number, isRestore: boolean): void => {
+        const applyMode = (width: number, height: number, bpp: number, refresh: number, isRestore: boolean): ThunkResult | number => {
             if (ddraw) {
                 if (width > 0 && height > 0) {
                     ddraw.display.width = width;
@@ -2712,8 +2714,8 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             system.requestHostResize(w, h, {
                 modeSet: true, bpp: b, refreshRate: ddraw?.display.refresh,
             });
-            system.windowManager.postDisplayChange(w, h, b);
             Logger.log(LogCategory.USER32, `${apiName}: applied ${w}x${h}x${b} (restore=${isRestore})`);
+            return sendDisplayChange(ctx, mem, { width: w, height: h, bpp: b }, stackCleanup, apiName, DISP_CHANGE_SUCCESSFUL);
         };
 
         // lpDevMode == NULL → restore to the desktop mode.
@@ -2722,8 +2724,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
                 ? { width: ddraw.desktopMode.width, height: ddraw.desktopMode.height, bpp: ddraw.desktopMode.bpp, refreshRate: ddraw.desktopMode.refresh }
                 : getCurrentScreenMode();
             if ((dwFlags & CDS_TEST) !== 0) return DISP_CHANGE_SUCCESSFUL;
-            applyMode(desktop.width, desktop.height, desktop.bpp, normalizeRefreshRate(desktop.refreshRate), true);
-            return DISP_CHANGE_SUCCESSFUL;
+            return applyMode(desktop.width, desktop.height, desktop.bpp, normalizeRefreshRate(desktop.refreshRate), true);
         }
 
         if (lpDevMode + offsets.minSize > mem.length) return DISP_CHANGE_BADMODE;
@@ -2753,8 +2754,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             return DISP_CHANGE_SUCCESSFUL;
         }
 
-        applyMode(effWidth, effHeight, effBpp, normalizeRefreshRate(reqHz || cur.refreshRate), false);
-        return DISP_CHANGE_SUCCESSFUL;
+        return applyMode(effWidth, effHeight, effBpp, normalizeRefreshRate(reqHz || cur.refreshRate), false);
     };
 
     exports['EnumDisplaySettingsA'] = (_ctx, mem, args) => {

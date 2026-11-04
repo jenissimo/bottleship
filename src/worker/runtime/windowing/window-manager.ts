@@ -104,7 +104,7 @@ const WM_KILLFOCUS = 0x0008;
 const WM_ACTIVATEAPP = 0x001c;
 const WM_NCACTIVATE = 0x0086;
 const WM_CAPTURECHANGED = 0x0215;
-const WM_DISPLAYCHANGE = 0x007e;
+export const WM_DISPLAYCHANGE = 0x007e;
 const WA_INACTIVE = 0;
 const WA_ACTIVE = 1;
 
@@ -817,36 +817,29 @@ export class WindowManager {
     }
 
     /**
-     * Post WM_DISPLAYCHANGE to every top-level window (faithful Win32: on a display-mode
-     * change the system broadcasts WM_DISPLAYCHANGE to all top-level windows with
-     * wParam = new bpp, lParam = MAKELPARAM(width, height)). The guest WinDrv / windowed
-     * vs fullscreen reconciliation keys off this. Children are not notified (Windows only
-     * broadcasts to top-level windows). Enumerates the Z-order list plus any tracked
-     * top-level windows not yet in the Z-order, so newly-created hidden windows still hear it.
+     * Post a message to every top-level window (the HWND_BROADCAST target set) and
+     * return how many got it.
      */
-    postDisplayChange(width: number, height: number, bpp: number): void {
-        const lParam = (((height & 0xFFFF) << 16) | (width & 0xFFFF)) >>> 0;
-        const count = this.broadcastToTopLevel(WM_DISPLAYCHANGE, bpp >>> 0, lParam);
-        Logger.log(LogCategory.SYSTEM,
-            `WindowManager: WM_DISPLAYCHANGE broadcast ${width}x${height}x${bpp} to ${count} top-level window(s)`);
+    broadcastToTopLevel(msg: number, wParam: number, lParam: number): number {
+        return this.forEachTopLevel((win) => this.postMessage(win.hwnd, msg, wParam, lParam));
     }
 
     /**
-     * Post a message to every top-level window (the HWND_BROADCAST target set) and
-     * return how many got it. Enumerates the Z-order list plus any tracked top-level
-     * window not yet in it, so a newly-created hidden window still hears the broadcast.
+     * Visit every top-level window once and return how many there were. Enumerates the
+     * Z-order list plus any tracked top-level window not yet in it, so a newly-created
+     * hidden window still hears a broadcast. Children are never visited.
      */
-    broadcastToTopLevel(msg: number, wParam: number, lParam: number): number {
+    forEachTopLevel(visit: (win: WindowObject) => void): number {
         const seen = new Set<number>();
-        const broadcast = (hwnd: number): void => {
+        const each = (hwnd: number): void => {
             if (seen.has(hwnd)) return;
             const win = this.windows.get(hwnd);
             if (!win || (win.style & WS_CHILD) !== 0) return;
             seen.add(hwnd);
-            this.postMessage(hwnd, msg, wParam, lParam);
+            visit(win);
         };
-        for (const hwnd of this.zOrder) broadcast(hwnd);
-        for (const win of this.windows.values()) broadcast(win.hwnd);
+        for (const hwnd of this.zOrder) each(hwnd);
+        for (const win of this.windows.values()) each(win.hwnd);
         return seen.size;
     }
 
