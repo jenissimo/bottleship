@@ -153,6 +153,16 @@ export class DirectPlaySession implements LanEndpoint {
     private nativeMode = false;
     private nativeBackend?: DirectPlay4NativeSession;
     get isNative(): boolean { return this.nativeMode; }
+    /** Harness view: the roster and queue as THIS process sees them. */
+    describe() {
+        return {
+            open: !!this.desc, host: this.hostMode, native: this.nativeMode, ownKey: this.ownKey,
+            session: this.desc ? { name: this.desc.name, instance: this.desc.instance, maxPlayers: this.desc.maxPlayers } : null,
+            peers: this.peers.size, queued: this.queue.length,
+            entities: [...this.entities.values()].map(e => ({ id: e.id, group: e.group, owner: e.owner,
+                local: e.owner === this.ownKey, name: e.name.short, members: [...e.members], parent: e.parent })),
+        };
+    }
     private lastHostSeen = 0;
     private stopState: () => void;
     private stopPeer: () => void;

@@ -155,16 +155,24 @@ interface GuestState {
 }
 type Frame = { esp: number; returnAddr?: number };
 type EnumerationEntry = { args: (base: number) => number[]; pack: (base: number) => Uint8Array };
+/** The process's API instance, for the `dplayState` harness verb. */
+let currentDirectPlayApi: DirectPlayNetworkApi | null = null;
+export function describeDirectPlay(): ReturnType<DirectPlayNetworkApi["describe"]> { return currentDirectPlayApi?.describe() ?? []; }
+
 /** Guest COM/ABI boundary. Session state is keyed by the COM object, never by the process. */
 export class DirectPlayNetworkApi {
     private states = new Map<number, GuestState>();
+    /** One entry per DirectPlay object: what its session holds right now. */
+    describe() {
+        return [...this.states].map(([handle, s]) => ({ handle, ...s.session.describe() }));
+    }
     private lobbyInterfaces = new Map<number, Map<string, number>>();
     private generation = 0;
     private lobbyEndpoint?: DirectPlayLobbyEndpoint;
     private lobbyEvents = new Map<number, Map<number, number>>();
     private lobbyOwnedEvents = new Set<number>();
     constructor(private process: Process, private tables: () => Record<string, VTableInfo>, private network: LanNetwork = lanNetwork,
-        private nativeSockets: () => WsaSocketTable = () => getWsaProcessState(process).table) {}
+        private nativeSockets: () => WsaSocketTable = () => getWsaProcessState(process).table) { currentDirectPlayApi = this; }
     private valid(ptr: number, size: number, perms: "r" | "rw" | "rx" = "r"): boolean {
         return Number.isSafeInteger(ptr) && ptr >= 0x1000 && Number.isSafeInteger(size) && size >= 0
             && ptr + size <= this.process.getCurrentMemory().length && (this.process.addressSpace?.validateRange(ptr, size, perms) ?? true);
