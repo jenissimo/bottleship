@@ -52,6 +52,8 @@ const ringBuffers = new Map<number, {
     registered: boolean;
     streaming?: boolean;
     writeBytes?: number;
+    /** Decoded image last copied into the data region; a replay of it skips the copy. */
+    copied?: Float32Array;
 }>();
 const RING_CURSOR_STALE_MS = 250;
 
@@ -449,8 +451,12 @@ export function playSample(ctx: MSSContext, sample: MSSSample): void {
     const sab = ensureRingBuffer(sample.id, sample.channels, sample.sampleRate, 32 /* Float32 */, dataBytes);
 
     // Copy decoded Float32 data into SAB data region
-    const dst = new Uint8Array(sab, CTRL_BLOCK_BYTES, dataBytes);
-    dst.set(new Uint8Array(sample.decodedData.buffer, sample.decodedData.byteOffset, dataBytes));
+    const ring = ringBuffers.get(sample.id);
+    if (ring?.copied !== sample.decodedData) {
+        const dst = new Uint8Array(sab, CTRL_BLOCK_BYTES, dataBytes);
+        dst.set(new Uint8Array(sample.decodedData.buffer, sample.decodedData.byteOffset, dataBytes));
+        if (ring) ring.copied = sample.decodedData;
+    }
 
     // Set control fields
     setCtrl(sab, CTRL_DATA_LENGTH, dataBytes);
