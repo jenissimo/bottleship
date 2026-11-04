@@ -24,12 +24,13 @@ import { EmulatorConfig } from "../core/emulator-config-manager";
 import { videoEngine } from "../../video/video-engine";
 import { CTRL_PLAY_CURSOR, CTRL_BUFFER_BYTES, CTRL_BLOCK_ALIGN, CTRL_SAMPLE_RATE, CTRL_STATE, STATE_PLAYING } from "../../audio/audio-ring-buffer";
 import { DirectDrawSurfaceObject, DirectDrawSurfaceState, isRenderSurface, type BitmapTextureSurface } from "./ddraw/com-objects";
-import { setAuthorityCpu } from "./ddraw/surface-sync";
+import { setAuthorityCpu, surfaceHasActiveWriteLease, unionSurfaceDirtyRegion } from "./ddraw/surface-sync";
+import { BB, BINKBUFFER_ALLOC_BYTES, binkSurfaceForPixelFormat, blitBinkRects, type BinkRect } from "./bink-buffer";
 import { resolveD3D8TextureSurface } from "./d3d8/shared-state";
 import { resolveD3D9LockedTextureTarget, d3d9TextureUploadSeq } from "./d3d9/shared-state";
 import { readAnsiFromGuest } from "./codepage-utils";
 import { Mem } from "../core/memory/mem-accessor";
-import { overlapsThunkCode } from "../core/memory/address-guard";
+import { isValidAddress, overlapsThunkCode } from "../core/memory/address-guard";
 import { Glide2x } from "./glide2x";
 import { VideoFrameViews } from "../video/video-routing-types";
 import { readPeVersionString, readPeFixedFileVersion } from "../core/pe-version";
@@ -216,6 +217,16 @@ function detectDestBpp(pitch: number, destRowPixels: number): number {
         if (bpp === 1 || bpp === 2 || bpp === 3 || bpp === 4) return bpp;
     }
     return 4;
+}
+
+/**
+ * Destination row width in pixels for BinkCopyToBuffer. A BINKSURFACE declared in `flags`
+ * fixes the bytes per pixel, so the row is pitch / bpp; the pitch heuristic would read a
+ * 16-bit row's pitch as a 32-bit row half as wide and copy only its left half.
+ */
+export function binkDestRowPixels(pitch: number, flags: number, storedBpp: number, surface: BitmapTextureSurface | null): number {
+    const declared = binkSurfaceFromFlags(flags);
+    return inferDestRowPixels(pitch, declared !== -1 ? binkSurfaceBpp(declared) : storedBpp, surface);
 }
 
 function inferDestRowPixels(pitch: number, storedBpp: number, surface: BitmapTextureSurface | null): number {
@@ -439,6 +450,7 @@ interface BinkFramePlanes {
 }
 
 interface BinkBufferSession {
+    /** Guest BINKBUFFER the app holds (bink-buffer.ts). */
     handle: number;
     hwnd: number;
     width: number;
@@ -446,6 +458,13 @@ interface BinkBufferSession {
     flags: number;
     locked: boolean;
     lastBlitAtMs: number;
+    /** Guest pixels BinkCopyToBuffer fills through buf->Buffer. */
+    pixels: number;
+    pitch: number;
+    bytesPerPixel: number;
+    /** BinkBufferSetOffset: where in the window's client area the blit lands. */
+    destX: number;
+    destY: number;
 }
 
 export class BinkW32 implements IModule {
@@ -466,8 +485,9 @@ export class BinkW32 implements IModule {
      *  flag set at entry would let a BinkOpen arriving during the file read see
      *  "resolved" and use the PREVIOUS game's layout. */
     private buildResolution: Promise<void> | null = null;
-    private nextBufferHandle = 0x7800;
     private binkBuffers = new Map<number, BinkBufferSession>();
+    /** IDirectDrawSurface BinkBufferSetDDPrimary named: where BinkBufferBlit draws. */
+    private ddPrimary = 0;
 
     /**
      * Global IO buffer size hint set by BinkSetIOSize(iosize) before BinkOpen.
@@ -582,7 +602,7 @@ export class BinkW32 implements IModule {
     ): { surf: BinkSurface; destBpp: number; copyWidth: number; rows: number; destSurface: BitmapTextureSurface | null } {
         const destSurface = this.resolveBitmapTextureTarget(destPtr);
         const declared = binkSurfaceFromFlags(flags);
-        const destRowPixels = inferDestRowPixels(pitch, storedBpp, destSurface);
+        const destRowPixels = binkDestRowPixels(pitch, flags, storedBpp, destSurface);
         const surf = declared !== -1
             ? declared
             : binkSurfaceFromBpp(storedBpp || detectDestBpp(pitch, destRowPixels || s.width));
@@ -596,7 +616,28 @@ export class BinkW32 implements IModule {
         return { surf, destBpp, copyWidth, rows, destSurface };
     }
 
+    /** The BinkBuffer whose pixels `ptr` points into — Bink, not the app, presents those. */
+    private binkBufferAt(ptr: number): BinkBufferSession | null {
+        if (!ptr) return null;
+        for (const b of this.binkBuffers.values()) {
+            if (ptr >= b.pixels && ptr < b.pixels + b.pitch * b.height) return b;
+        }
+        return null;
+    }
+
+    /** The DirectDraw primary BinkBufferBlit writes into, when it can (same pixel size). */
+    private binkBufferPrimary(b: BinkBufferSession): DirectDrawSurfaceState | null {
+        if (!this.ddPrimary) return null;
+        const obj = System.getInstance().resourceProvider.getComObjectByAddressFast(this.ddPrimary);
+        const state = obj instanceof DirectDrawSurfaceObject ? obj.getState() : null;
+        return state?.surfacePtr && (state.format.bpp >> 3) === b.bytesPerPixel ? state : null;
+    }
+
     private hasAppManagedSink(s: BinkSession): boolean {
+        // A BinkBuffer is presented by BinkBufferBlit; without a DirectDraw primary to draw
+        // into, the video plane stands in for the window blit.
+        const bb = this.binkBufferAt(s.destPtr);
+        if (bb) return !!this.binkBufferPrimary(bb);
         if (s.explicitDdrawSurface || s.explicitGlideSurfacePtr) return true;
         if (!s.destPtr && !s.hasBufferApiHint) return false;
         // Morrowind-style D3D8: BinkCopyToBuffer → raw malloc buffer, then custom GPU upload.
@@ -608,6 +649,10 @@ export class BinkW32 implements IModule {
     }
 
     private getRoutingTargetHint(s: BinkSession): { kind: "none" | "ddraw_surface" | "glide_lfb" | "app_buffer"; valid: boolean; surfacePtr?: number; pitch?: number; width?: number; height?: number; note?: string } {
+        const bb = this.binkBufferAt(s.destPtr);
+        if (bb && !this.binkBufferPrimary(bb)) {
+            return { kind: "none", valid: false, note: "BinkBuffer without a DirectDraw primary" };
+        }
         if (s.explicitDdrawSurface?.surfacePtr) {
             return {
                 kind: "ddraw_surface",
@@ -751,6 +796,49 @@ export class BinkW32 implements IModule {
             pal8Indices: pal8?.indices ?? null,
             paletteBgra: pal8?.palette ?? null,
         };
+    }
+
+    /**
+     * BinkBufferBlit: copy the buffer's dirty rects into the DirectDraw primary at the
+     * SetOffset position and present it, as Bink's own DirectDraw blitter does. With no
+     * primary the sessions drawing into this buffer stay on the video plane.
+     */
+    private blitBinkBuffer(buf: BinkBufferSession, rectsPtr: number, count: number): void {
+        const state = this.binkBufferPrimary(buf);
+        if (!state || surfaceHasActiveWriteLease(state)) return;
+        const mem = Mem.getView();
+        if (!mem) return;
+        const rects: BinkRect[] = [];
+        if (rectsPtr && count > 0 && isValidAddress(mem, rectsPtr, count * 16, "r")) {
+            for (let i = 0; i < count; i++) {
+                const p = rectsPtr + i * 16;
+                rects.push({ left: this.readU32(mem, p) | 0, top: this.readU32(mem, p + 4) | 0,
+                    width: this.readU32(mem, p + 8) | 0, height: this.readU32(mem, p + 12) | 0 });
+            }
+        } else {
+            rects.push({ left: 0, top: 0, width: buf.width, height: buf.height });
+        }
+        const srcBytes = buf.pitch * buf.height;
+        const dstBytes = state.pitch * state.height;
+        if (!isValidAddress(mem, buf.pixels, srcBytes, "r") || !isValidAddress(mem, state.surfacePtr, dstBytes, "rw")) return;
+        const dirty = blitBinkRects(
+            mem.subarray(buf.pixels, buf.pixels + srcBytes), buf.pitch, buf.width, buf.height,
+            mem.subarray(state.surfacePtr, state.surfacePtr + dstBytes), state.pitch, state.width, state.height,
+            buf.bytesPerPixel, rects, buf.destX, buf.destY);
+        if (!dirty) return;
+        state.surfaceEverWritten = true;
+        state.writeGeneration++;
+        if (isRenderSurface(state)) {
+            setAuthorityCpu(state);
+            state.rgbaScratch = undefined;
+            state.rgbaScratchVersion = undefined;
+            unionSurfaceDirtyRegion(state, dirty);
+        }
+        for (const s of this.sessions.values()) {
+            if (this.binkBufferAt(s.destPtr) === buf) s.explicitDdrawSurface = state;
+        }
+        const presenter = System.getInstance().ddrawContext?.presenter;
+        if (presenter) void presenter.present(state, this.getMemory(), { throttle: false });
     }
 
     private submitExplicitDdrawSink(s: BinkSession): boolean {
@@ -1901,29 +1989,94 @@ export class BinkW32 implements IModule {
         };
 
         // в”Ђв”Ђ Buffer API (minimal compatibility + routing hints) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+        // HBINKBUFFER BinkBufferOpen(HWND, U32 width, U32 height, U32 bufferflags): a real
+        // BINKBUFFER the app reads Buffer/BufferPitch/SurfaceType/Height out of, over an
+        // off-screen buffer in the primary's pixel format (or the display's).
         this.exports["_BinkBufferOpen@16"]   = (_ctx, _mem, args) => {
-            const handle = this.nextBufferHandle++;
-            const session: BinkBufferSession = {
-                handle,
-                hwnd: args[0],
-                width: args[1],
-                height: args[2],
-                flags: args[3],
-                locked: false,
-                lastBlitAtMs: 0,
-            };
-            this.binkBuffers.set(handle, session);
-            Logger.log(
-                LogCategory.SYSTEM,
-                `BinkBufferOpen(hwnd=0x${args[0].toString(16)}, w=${args[1]}, h=${args[2]}, flags=0x${args[3].toString(16)}) -> 0x${handle.toString(16)}`
-            );
+            const [hwnd, width, height, flags] = [args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, args[3] >>> 0];
+            if (!width || !height || width > 8192 || height > 8192) return 0;
+            const display = System.getInstance().ddrawContext?.display;
+            const primaryObj = this.ddPrimary
+                ? System.getInstance().resourceProvider.getComObjectByAddressFast(this.ddPrimary) : null;
+            const primary = primaryObj instanceof DirectDrawSurfaceObject ? primaryObj.getState() : null;
+            const bpp = primary?.format.bpp ?? display?.bpp ?? 32;
+            let surfaceType = binkSurfaceForPixelFormat(bpp, primary?.format.rMask ?? 0, primary?.format.gMask ?? 0);
+            if (surfaceType < 0) surfaceType = BinkSurface.BGRA32;
+            const bytesPerPixel = binkSurfaceBpp(surfaceType as BinkSurface);
+            const pitch = (width * bytesPerPixel + 3) & ~3;
+            const handle = this.process.memory.alloc(BINKBUFFER_ALLOC_BYTES);
+            const pixels = handle ? this.process.memory.alloc(pitch * height) : 0;
+            if (!handle || !pixels) {
+                if (handle) this.process.memory.free(handle);
+                Logger.warn(LogCategory.SYSTEM, `[BINK] BinkBufferOpen: cannot allocate ${width}x${height}`);
+                return 0;
+            }
+            const m = this.getMemory();
+            m.fill(0, handle, handle + BINKBUFFER_ALLOC_BYTES);
+            m.fill(0, pixels, pixels + pitch * height);
+            const head: [number, number][] = [
+                [BB.width, width], [BB.height, height], [BB.windowWidth, width], [BB.windowHeight, height],
+                [BB.surfaceType, surfaceType], [BB.buffer, pixels], [BB.bufferPitch, pitch],
+                [BB.screenWidth, display?.width ?? width], [BB.screenHeight, display?.height ?? height],
+                [BB.screenDepth, bpp], [BB.stretchWidth, width], [BB.stretchHeight, height],
+            ];
+            for (const [off, v] of head) this.writeU32(m, handle + off, v);
+            this.binkBuffers.set(handle, {
+                handle, hwnd, width, height, flags, locked: false, lastBlitAtMs: 0,
+                pixels, pitch, bytesPerPixel, destX: 0, destY: 0,
+            });
+            Logger.log(LogCategory.SYSTEM,
+                `BinkBufferOpen(hwnd=0x${hwnd.toString(16)}, ${width}x${height}, flags=0x${flags.toString(16)}) -> ` +
+                `0x${handle.toString(16)} surface=${surfaceType} pitch=${pitch} primary=${primary ? "yes" : "no"}`);
             return handle;
         };
         this.exports["_BinkBufferClose@4"]   = (_ctx, _mem, args) => {
-            const handle = args[0];
-            this.binkBuffers.delete(handle);
+            const handle = args[0] >>> 0;
+            const buf = this.binkBuffers.get(handle);
+            if (buf) {
+                for (const s of this.sessions.values()) {
+                    if (this.binkBufferAt(s.destPtr) === buf) { s.destPtr = 0; s.explicitDdrawSurface = null; }
+                }
+                this.binkBuffers.delete(handle);
+                this.process.memory.free(buf.pixels);
+                this.process.memory.free(handle);
+            }
             Logger.verbose(LogCategory.SYSTEM, `BinkBufferClose(0x${handle.toString(16)})`);
+            return 0;
+        };
+        // S32 BinkBufferSetDDPrimary(LPDIRECTDRAWSURFACE): the surface every later
+        // BinkBufferBlit draws into. Nonzero = accepted.
+        this.exports["_BinkBufferSetDDPrimary@4"] = (_ctx, _mem, args) => {
+            this.ddPrimary = args[0] >>> 0;
+            Logger.log(LogCategory.SYSTEM, `BinkBufferSetDDPrimary(0x${this.ddPrimary.toString(16)})`);
             return 1;
+        };
+        // S32 BinkBufferSetOffset(HBINKBUFFER, S32 destx, S32 desty)
+        this.exports["_BinkBufferSetOffset@12"] = (_ctx, _mem, args) => {
+            const buf = this.binkBuffers.get(args[0] >>> 0);
+            if (!buf) return 0;
+            buf.destX = args[1] | 0;
+            buf.destY = args[2] | 0;
+            return 1;
+        };
+        // void BinkBufferCheckWinPos(HBINKBUFFER, S32* NewWindowX, S32* NewWindowY): Bink may
+        // nudge a window position to a blit-friendly alignment. Every position is one here.
+        this.exports["_BinkBufferCheckWinPos@12"] = () => 0;
+        // S32 BinkBufferSetHWND(HBINKBUFFER, HWND)
+        this.exports["_BinkBufferSetHWND@8"] = (_ctx, _mem, args) => {
+            const buf = this.binkBuffers.get(args[0] >>> 0);
+            if (!buf) return 0;
+            buf.hwnd = args[1] >>> 0;
+            return 1;
+        };
+        // void BinkBufferBlit(HBINKBUFFER, BINKRECT* rects, U32 numrects): put the dirty
+        // rects on screen — into the DirectDraw primary when one was named.
+        this.exports["_BinkBufferBlit@12"] = (_ctx, _mem, args) => {
+            const buf = this.binkBuffers.get(args[0] >>> 0);
+            if (!buf) return 0;
+            buf.lastBlitAtMs = performance.now();
+            this.blitBinkBuffer(buf, args[1] >>> 0, Math.min(args[2] >>> 0, 64));
+            return 0;
         };
         this.exports["_BinkBufferBlit@16"]   = (_ctx, _mem, args) => {
             const handle = args[0];
@@ -2010,11 +2163,11 @@ export class BinkW32 implements IModule {
         // Engines already closed by System.reset → videoEngine.closeAll().
         this.sessions.clear();
         this.binkBuffers.clear();
+        this.ddPrimary = 0;
         this.apiCallLog.clear();
         this.lastSurfaceBpp = 0;
         this.layout = BINK_LAYOUT_DEFAULT;
         this.buildResolution = null;
-        this.nextBufferHandle = 0x7800;
         this.pendingIoSize = 0;
     }
 }
