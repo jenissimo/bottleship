@@ -593,6 +593,35 @@ test("enumeration callback false stops and releases frame storage, player filter
     expect(a).not.toBe(b);
 });
 
+function ansi(ptr: number): string {
+    let text = ""; while (mem[ptr]) text += String.fromCharCode(mem[ptr++]!);
+    return text;
+}
+test("DirectPlayEnumerateA hands each provider a NUL-terminated name, with nothing left over from the previous one", () => {
+    const result = exports["directplayenumeratea"]!({ esp: 0x9000 } as X86Context, mem, [0x7000, 0x8765]) as ThunkResult;
+    expect(result.suspendedForCallback).toBe(true);
+    const names: string[] = [];
+    for (let i = 0; i < 8 && callbacks[i]; i++) {
+        const { args } = callbacks[i]!;
+        expect(args[0]).toBe(args[1]! - 16); // lpguidSP, then lpSPName
+        expect(args.slice(2)).toEqual([6, 0, 0x8765]);
+        names.push(ansi(args[1]!));
+        if (callbacks[i]!.done?.(1) !== null) break;
+        (callbacks[i] as unknown as { enumerationState?: { continueEnumeration(): void } }).enumerationState?.continueEnumeration();
+    }
+    expect(names).toEqual(["Internet TCP/IP Connection For DirectPlay", "IPX Connection For DirectPlay"]);
+});
+test("legacy IDirectPlay EnumPlayers points at the friendly and formal names it packed", async () => {
+    open();
+    mem.set(new TextEncoder().encode("Travis\0"), 0x5000); mem.set(new TextEncoder().encode("Travis Formal\0"), 0x5100);
+    expect(await call("CreatePlayer", [0x4000, 0x5000, 0x5100, 0], "IDirectPlay")).toBe(DP.OK);
+    const result = call("EnumPlayers", [0, 0x7000, 0x8765, 0], "IDirectPlay") as ThunkResult;
+    expect(result.suspendedForCallback).toBe(true);
+    const [id, friendly, formal, , context] = callbacks[0]!.args;
+    expect(id).toBe(read(0x4000)); expect(context).toBe(0x8765);
+    expect(ansi(friendly!)).toBe("Travis"); expect(ansi(formal!)).toBe("Travis Formal");
+    callbacks[0]!.done?.(0);
+});
 test("remote session enumeration keeps player properties available only during callbacks", async () => {
     initialize();
     const client = ((api as any).state(primary).session) as DirectPlaySession;
