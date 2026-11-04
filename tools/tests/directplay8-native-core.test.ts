@@ -17,7 +17,7 @@ test("native C2 application metadata and name-table identities use offsets relat
     expect(parsed.localId).toBe(1347791109); expect(parsed.entries.map(e => e.id)).toEqual([1346742532, 1347791109]);
     expect(parsed.entries[0].flags & 2).toBeTruthy(); expect(parsed.entries[1].id).toBe(parsed.localId); expect(parsed.members).toEqual([]);
 });
-test("NT5 version 2 C1 omits modern fields while preserving Unicode, binary connection data and absent address", () => {
+test("dwDNETVersion 2 C1 ([MC-DPL8CS] 2.2.1.1, not _EX) omits modern fields while preserving Unicode, binary connection data and absent address", () => {
     const parsed = decodeNativePlayerConnect(player)!;
     const value = { ...parsed, version: 2, name: "Клиент", url: null, data: Uint8Array.of(1, 0), connectData: Uint8Array.of(3, 5, 7) };
     const encoded = encodeNativePlayerConnect(value); expect(decodeNativePlayerConnect(encoded)).toEqual(value);

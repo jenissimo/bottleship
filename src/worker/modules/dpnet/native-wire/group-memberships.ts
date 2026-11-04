@@ -16,8 +16,10 @@ const key = (group: number, player: number) => group + ":" + player;
 const u32 = (n: number) => Number.isInteger(n) && n >= 0 && n <= 0xffffffff;
 
 /**
- * NT5 normal Created-pair linkage and notification ownership. Caller owns public
- * table/version/wire. NeedToAdd/initial-CREATE races remain an explicit open slice.
+ * Group membership pairs ([MC-DPL8CS] 2.2.1.6 DN_NAMETABLE_MEMBERSHIP_INFO, 2.2.4.4/2.2.4.6,
+ * 3.4.5.2) and ownership of their notifications. Caller owns public
+ * table/version/wire. Races between a membership add and the group's initial CREATE
+ * remain an explicit open (unsupported) slice.
  * These finite entry/pair/pending bounds are local resource policy, not native quotas.
  */
 export class NativeGroupMemberships {
@@ -77,7 +79,7 @@ export class NativeGroupMemberships {
     beginRemove(group: number, player: number, version: number | null): Pair | number {
         const pair = this.linked.get(key(group, player));
         if (!pair || !pair.linked || pair.pendingRemove) return DPN.PLAYERNOTINGROUP;
-        // The historical NeedToAdd/NeedToRemove race is not repaired or claimed here.
+        // A membership add/remove racing the group's creation is not handled (unsupported).
         if (pair.pendingAdd || !pair.available) return DPN.UNSUPPORTED;
         if (version !== null && !u32(version)) return DPN.INVALIDPARAM;
         if (this.pending.size >= 512) return DPN.TABLEFULL;
@@ -130,7 +132,8 @@ export class NativeGroupMemberships {
         pair.linked = false; pair.available = false; pair.pendingAdd = false; pair.pendingRemove = false;
         pair.referencesOwned = false; this.records.delete(pair);
         const group = this.entries.get(pair.group); if (group) group.entity.members = this.members(pair.group);
-        // NT5 releases group then player refs, including any synchronous deferred destruction.
+        // Engine ordering: release the group reference, then the player's, including any
+        // destruction that the release completes synchronously.
         this.release(pair.group, result => { if (result) done(result); else this.release(pair.player, done); });
     }
     private release(id: number, done: (result: number) => void): void {

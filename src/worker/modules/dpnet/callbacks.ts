@@ -190,8 +190,9 @@ export class DirectPlay8Callbacks {
                 const buffer = this.buffers.get(handle);
                 if (!buffer) return;
                 buffer.active = false;
-                // NT5 acknowledges COMPLETEONPROCESS after the handler returns,
-                // including PENDING; ReturnBuffer controls storage lifetime separately.
+                // DPNSEND_COMPLETEONPROCESS (IDirectPlay8Peer::SendTo docs): the sender's completion
+                // waits for the receiver's message handler to return, also when it returns
+                // DPNSUCCESS_PENDING; ReturnBuffer controls storage lifetime separately.
                 processed();
                 if (hr === DPN.PENDING && !buffer.returned && !this.closed) return true;
                 this.buffers.delete(handle); release();

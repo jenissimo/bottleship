@@ -143,7 +143,7 @@ static HRESULT address(IDirectPlay8Address **out,const WCHAR *host,DWORD port){
     hr=IDirectPlay8Address_SetSP(*out,&CLSID_DP8SP_TCPIP);if(FAILED(hr))return hr;
     if(host){while(host[size])size++;hr=IDirectPlay8Address_AddComponent(*out,L"hostname",host,(size+1)*2,DPNA_DATATYPE_STRING);if(FAILED(hr))return hr;}
     else{
-        /* NT5 ipaddress.h encodes a device sockaddr using the IP SP GUID mask. */
+        /* Device GUID built from the loopback sockaddr over the IP SP GUID; Windows accepts it in the native mesh runs. */
         hr=IDirectPlay8Address_AddComponent(*out,DPNA_KEY_DEVICE,&loopback,sizeof(loopback),DPNA_DATATYPE_GUID);if(FAILED(hr))return hr;
     }
     hr=IDirectPlay8Address_AddComponent(*out,DPNA_KEY_TRAVERSALMODE,&traversal,4,DPNA_DATATYPE_DWORD);if(FAILED(hr))return hr;

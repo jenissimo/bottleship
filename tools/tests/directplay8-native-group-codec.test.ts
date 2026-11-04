@@ -4,7 +4,7 @@ import { decodeNativeCoreOperation } from "../../src/worker/modules/dpnet/native
 import type { NativeNameTableEntry } from "../../src/worker/modules/dpnet/native-wire/core-connect-codec";
 
 const bytes = (hex: string) => Uint8Array.from(Buffer.from(hex.replace(/\s/g, ""), "hex"));
-// Independent literal NT5 request.cpp/message.h/ntentry.cpp layouts. SOURCE profile,
+// Independent literals for the [MC-DPL8CS] 2.2.4 group messages, built by hand,
 // not a packet captured from a modern provider and not produced by our encoder.
 // Body-relative D2: data at24, UTF-16 "AЖ" at28. Command/token are outside that body.
 const d2Hex = "d2000000 12345678 01000000 03000000 1c000000 06000000 18000000 04000000 31007fff 410016040000";
@@ -70,7 +70,7 @@ test("D7 encoder refuses invalid DWORD ownership, absent GROUP identity and a fa
         expect(() => encodeNativeGroupAdded(7, 0x78563412, bad)).toThrow(RangeError);
 });
 
-// Independent message.h membership DWORD order: internal token is opaque and
+// [MC-DPL8CS] 2.2.4.3 / 2.2.4.5 membership DWORD order: the request token is opaque and
 // neither a guest callback context nor a public async-operation handle.
 test("literal D3 and D4 requests use exact 16-byte framing with opaque zero or nonzero tokens",()=>{
  const d3=bytes("d3000000 12345678 40302010 88776655");

@@ -63,7 +63,9 @@ function wide(value: string | null): Uint8Array {
     const bytes = new Uint8Array((value.length + 1) * 2), view = new DataView(bytes.buffer);
     for (let i = 0; i < value.length; i++) view.setUint16(i * 2, value.charCodeAt(i), true); return bytes;
 }
-/** NT5 core version 2 is negotiated separately from DNET protocol version 1.2. */
+/** [MC-DPL8CS] 2.2.1.1 DN_INTERNAL_MESSAGE_PLAYER_CONNECT_INFO (0xC1). dwDNETVersion 2 is
+ * "DirectX 8.1"; it is independent of the transport protocol version that the
+ * [MC-DPL8R] connect handshake negotiates. */
 export function encodeNativePlayerConnect(info: NativePlayerConnectInfo): Uint8Array {
     if (!guid.test(info.instance) || !guid.test(info.application) || !Number.isInteger(info.flags) || info.flags < 0 || info.flags > 0xffffffff ||
         !Number.isInteger(info.version) || info.version < 0 || info.version > 0xffffffff) throw new RangeError("Invalid core connect fields");

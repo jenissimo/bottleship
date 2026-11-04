@@ -1825,7 +1825,7 @@ test("Peer TerminateSession defers a member's DESTROY until its held REMOVE call
         callbacks((message,ptr)=>{collect(message,ptr);return 0;});
         expect(destroyed.filter(event=>event.id===player)).toEqual([{id:player,context:0xc620,reason:3}]);
         expect(destroyedGroups.filter(event=>event.id===group)).toEqual([{id:group,context:0xc631,reason:3}]);
-        // NT5 Remove releases the group notification reference before the player.
+        // Engine ordering: the group notification reference is released before the player's.
         expect(cleanupOrder.findIndex(event=>event.type===8&&event.id===group)).toBeLessThan(
             cleanupOrder.findIndex(event=>event.type===9&&event.id===player));
         expect(destroyed.filter(event=>event.id===hostId)).toHaveLength(1);
@@ -1872,7 +1872,7 @@ test("Peer DestroyPeer retains deleted player context across actual CREATE and D
         expect(create.args[1]).toBe(0xffff0007);
         expect([read(createPtr+4),read(createPtr+8)]).toEqual([id,0xa701]);
 
-        // FindEntry sees an available but not-yet-Created player.
+        // The lookup sees an available but not-yet-Created player (DPNERR_NOTREADY).
         query(id,DPN.NOTREADY);
         expect(call("DestroyPeer",[id,0,0,0])).toBe(DPN.OK);
         // FindDeletedEntry sees unavailable and not-yet-Created.
@@ -1900,7 +1900,8 @@ test("Peer DestroyPeer retains deleted player context across actual CREATE and D
 
 test("Peer GetPlayerContext validates ID, output and flags before initialized state", () => {
     write(0x3600,0xeeeeeeee);
-    // NT5 DN_ValidateGetPlayerContext: ALL_PLAYERS, writable output, flags.
+    // GetPlayerContext docs' errors, checked in this order: DPNID_ALL_PLAYERS_GROUP
+    // (DPNERR_INVALIDPLAYER), output pointer (DPNERR_INVALIDPOINTER), flags.
     expect(call("GetPlayerContext",[0,0xfffffff0,1])).toBe(DPN.INVALIDPLAYER);
     expect(call("GetPlayerContext",[1,0xfffffff0,1])).toBe(DPN.INVALIDPOINTER);
     expect(call("GetPlayerContext",[1,0,1])).toBe(DPN.INVALIDPOINTER);

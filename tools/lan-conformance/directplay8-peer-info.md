@@ -2,7 +2,7 @@
 
 This fixture measures a native Host and one Peer through public x86 COM APIs. It covers connected `SetPeerInfo` NAME/DATA masks, SYNC and ASYNC, opaque contexts, source copying, GetPeerInfo during INFO, NULL versus empty storage, and graceful Close. It does not establish groups, migration, security, larger Host sessions, or performance.
 
-`directplay8-peer-info.c` is byte-identical to the successful 988-observation native source (SHA256 `1ea01926588983162ddc31232f5a5db586949b53f7bdc63225be8964e1839c58`). The native record is `logs/lan-conformance/stage29-host-peer-info/empty-runs/1792760288734/verified.json`, SHA256 `15e2de040cde6cc4da8f5fb6ad48820362331f7fba524a49d0875f368bc9ab28`. Both processes exited 0 and both ports were rebound. The earlier 768-observation API baseline, separate D6/DB packet capture, and initial malformed-fixture RED are retained independently.
+`directplay8-peer-info.c` is byte-identical to the successful 988-observation native source (SHA256 `1ea01926588983162ddc31232f5a5db586949b53f7bdc63225be8964e1839c58`). The native record (`verified.json` from a Windows run, kept locally and not committed) has SHA256 `15e2de040cde6cc4da8f5fb6ad48820362331f7fba524a49d0875f368bc9ab28`. Both processes exited 0 and both ports were rebound. The earlier 768-observation API baseline, separate D6/DB packet capture, and initial malformed-fixture RED are retained independently.
 
 ## Commands
 
@@ -43,4 +43,4 @@ The controller configures one explicit numeric IPv4 Host listener using the immu
 
 The detailed field/tag layout is in `directplay8-peer-info.schema.json`. INFO is 12 bytes; ASYNC_COMPLETE is 16; PLAYER_INFO is 24. Masked-out NAME pointers fail INVALIDSTRING; masked-out DATA pointers fail INVALIDPARAM; unknown mask bits fail INVALIDFLAGS; SYNC with an async handle pointer fails without modifying it. A SYNC async context is ignored. A NULL name has no storage, while a non-NULL empty UTF16 name consumes two bytes and has a non-NULL returned pointer. Non-NULL DATA with size zero is stored as empty/NULL, and still produces INFO even after DATA was previously cleared.
 
-The NT5 behavioral reference is `G:/sources/nt5src/Source/XPSP1/NT/multimedia/directx/dplay/dnet/core/`: `peer.cpp` DN_SetPeerInfo, `paramval.cpp` ValidPlayerInfo, `request.cpp` DNHostUpdateInfo/DNProcessUpdateInfo, `message.h` D6/DB layouts, and `user.cpp` INFO construction. Actual native D6 and DB messages were captured through an ordinary loopback UDP proxy in `wire-runs/1792759342852`; those messages seed bounded binary decoder/encoder tests. Source inspection complements native observations.
+Public references: the IDirectPlay8Peer::SetPeerInfo / GetPeerInfo and DPN_PLAYER_INFO documentation (DirectX 9 SDK), and [MC-DPL8CS] 2.2.5.1 DN_REQ_UPDATE_INFO (D6), 2.2.5.2 DN_UPDATE_INFO (DB) and 3.5.5.1. Actual native D6 and DB messages were captured through an ordinary loopback UDP proxy; those messages seed bounded binary decoder/encoder tests.

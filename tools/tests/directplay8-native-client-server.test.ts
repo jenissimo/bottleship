@@ -1,4 +1,4 @@
-// Source-derived native Client/Server primary, promoted after peer-history gate7003.
+// Native Client/Server primary ([MC-DPL8CS] 1.3.2.1, 3.1.5.1), promoted after the peer-history gate.
 // This uses the real binary carrier and public Session backend seam, not a native
 // Windows capture or an executed COM-ABI proof. The first measured failure is
 // recorded separately; completing this test alone cannot establish full parity.
@@ -87,8 +87,8 @@ test("a public native Server hosts CLIENT_SERVER before a real binary Client con
     }
 });
 
-// NT5 source profile controls: real Server authority and two independent native
-// Client carriers. These are HLE component proofs, not native COM observations.
+// Component controls: real Server authority and two independent native Client
+// carriers. These are HLE component proofs, not native COM observations.
 // callback-return fences are explicit; connect() alone must not release Client
 // user receives. Full DestroyClient/Terminate and held general player destruction
 // remain separate contracts.
@@ -704,9 +704,10 @@ test("Server group SetInfo publishes exact DB to both Clients without acquiring 
         const db = s.wire.filter(row => row.from === 0 && coreCommand(row) === 0xdb);
         const versions = s.clients.map(client => (client as unknown as { version: number }).version);
 
-        // Independent literal vector: message.h198-209 is ten DWORDs, followed
-        // by CPackedBuffer name-then-data tail packing (request2838-2877).
-        // Offsets exclude the command DWORD: data40/3, UTF16 name43/6.
+        // DN_UPDATE_INFO (DB): ten DWORDs after the command in the order the native
+        // D6/DB capture shows (dpnid, version, versionNotUsed, infoFlags, name/data
+        // offset+size, requesting, opaque zero), then data and name packed at the
+        // tail. Offsets exclude the command DWORD ([MC-DPL8CS] 2.2.5.2): data40/3, name43/6.
         const expected = new Uint8Array(53), view = new DataView(expected.buffer);
         [0xdb, group, before + 2, 0, 3, 43, 6, 40, 3, s.server.localId, 0]
             .forEach((word, index) => view.setUint32(index * 4, word, true));
@@ -721,8 +722,8 @@ test("Server group SetInfo publishes exact DB to both Clients without acquiring 
         expect(a.entities.has(group)).toBe(false); expect(b.entities.has(group)).toBe(false);
         expect([...a.entities.keys()].sort((x, y) => x - y)).toEqual([s.server.localId, a.localId].sort((x, y) => x - y));
         expect([...b.entities.keys()].sort((x, y) => x - y)).toEqual([s.server.localId, b.localId].sort((x, y) => x - y));
-        // DNProcessUpdateInfo3853-3858 rejects the unknown group before3892:
-        // independently observed original C2 versions must remain unchanged.
+        // A client drops a DB for a group it does not know without adopting its version:
+        // the original C2 versions must remain unchanged (engine policy).
         expect(versions).toEqual(clientVersions);
         expect(s.events.filter(event => event.type === 0xc)).toEqual([]);
         expect(s.server.groupEntity(group)!.name.short).toBe("SG");
