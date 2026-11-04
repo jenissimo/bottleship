@@ -607,6 +607,26 @@ function getVol(volumes: Map<number, Uint8Array>, vol: number): Uint8Array {
     return b;
 }
 
+/**
+ * A v5 descriptor carries no volume number: which `.cab` holds a file is recorded only in
+ * each volume's header, as the range of file indices it carries (a file split across a
+ * boundary is the LAST of one volume and the FIRST of the next, and starts in the former).
+ */
+function assignV5Volumes(files: InstallShieldFile[], volumes: Map<number, Uint8Array>, major: number): void {
+    if (volumes.size < 2) return;
+    const ranges: { vol: number; first: number; last: number }[] = [];
+    for (const vol of [...volumes.keys()].sort((a, b) => a - b)) {
+        const b = volumes.get(vol)!;
+        if (b.length < COMMON_HEADER_SIZE + VOLUME_HEADER_SIZE_V5) continue;
+        const vh = readVolumeHeader(b, major);
+        if (vh.lastFileIndex >= vh.firstFileIndex) ranges.push({ vol, first: vh.firstFileIndex, last: vh.lastFileIndex });
+    }
+    for (const fd of files) {
+        const hit = ranges.find(r => fd.index >= r.first && fd.index <= r.last);
+        if (hit) fd.volume = hit.vol;
+    }
+}
+
 /** Extract a single file's bytes (following LINK_PREV for v6+). */
 async function extractFile(
     fd: InstallShieldFile,
@@ -725,6 +745,7 @@ export async function extractInstallShield(
     const verifyMd5 = opts.verifyMd5 ?? true;
     const inflate = opts.inflateRaw ?? inflateRawPlatform;
     const info = parseInstallShieldHeader(headerBytes);
+    if (info.major <= 5) assignV5Volumes(info.files, volumes, info.major);
 
     const result = new Map<string, Uint8Array>();
     // An install file is a candidate whether its bytes live in the cabinet

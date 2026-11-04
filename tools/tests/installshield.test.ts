@@ -289,6 +289,31 @@ describe("InstallShield 5 extraction", () => {
         expect(out.get("player/")!.length).toBe(0);
     });
 
+    test("a v5 file is read from the volume whose header range holds its index", async () => {
+        const first = new TextEncoder().encode("track one");
+        const second = new Uint8Array(300).map((_, i) => (i * 7) & 0xff);
+        const { header, cab } = buildIs5([""], [
+            { name: "a.wav", dirIndex: 0, data: first, compress: true },
+            { name: "b.dat", dirIndex: 0, data: second, compress: true },
+        ]);
+        // Two volumes at the same layout: data1 carries file 0, data2 carries file 1. The
+        // copy of file 1's bytes left in data1 is garbage, so only data2 can yield it.
+        const cab1 = cab.slice(), cab2 = cab.slice();
+        const setRange = (b: Uint8Array, firstIndex: number, lastIndex: number) => {
+            const dv = new DataView(b.buffer);
+            dv.setUint32(COMMON_HEADER_SIZE + 8, firstIndex, true);
+            dv.setUint32(COMMON_HEADER_SIZE + 12, lastIndex, true);
+        };
+        setRange(cab1, 0, 0);
+        setRange(cab2, 1, 1);
+        const info = parseInstallShieldHeader(header);
+        const b = info.files[1]!;
+        cab1.fill(0xee, b.dataOffset, b.dataOffset + b.compressed);
+        const out = await extractInstallShield(header, new Map([[1, cab1], [2, cab2]]), { inflateRaw: nodeInflate });
+        expect(out.get("a.wav")).toEqual(first);
+        expect(out.get("b.dat")).toEqual(second);
+    });
+
     test("throws on a corrupted compressed descriptor (size mismatch)", async () => {
         const big = new Uint8Array(500).fill(0x5a);
         const { header, cab } = buildIs5(
