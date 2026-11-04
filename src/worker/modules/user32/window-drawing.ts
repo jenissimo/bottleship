@@ -98,7 +98,8 @@ function composeIconFromBitmaps(
     hbmColor: number,
     hbmMask: number,
 ): { width: number; height: number; pixels: Uint8Array } | null {
-    // XP+ per-pixel-alpha cursor (nt5src curseng.cxx): a 32bpp color DIBSection
+    // XP+ per-pixel-alpha cursor (CreateIconIndirect / "About Cursors" docs: XP
+    // supports 32bpp alpha cursors and icons): a 32bpp color DIBSection
     // whose guest bits carry any nonzero alpha is drawn alpha-blended, mask
     // ignored (apps write the alpha into the bits directly over GDI-blitted RGB).
     if (hbmColor) {
@@ -117,7 +118,7 @@ function composeIconFromBitmaps(
 
     if (color) {
         const pixels = new Uint8Array(color.data);
-        // AND-mask semantics (nt5src sprite.cxx): screen = (screen AND mask) XOR
+        // AND-mask semantics (ICONINFO docs; MSDN "Icons in Win32"): screen = (screen AND mask) XOR
         // color — mask 1 (white) keeps the screen (transparent), 0 shows the
         // color pixel. A double-height mask stacks AND on TOP, XOR below
         // (ICONINFO layout); a same-size mask is the AND plane alone.

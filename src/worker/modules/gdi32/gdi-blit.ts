@@ -60,7 +60,7 @@ function cssToRgb(css: string | undefined, fallback: string): [number, number, n
 }
 
 /**
- * Real GDI color→mono (nt5src ylateobj.cxx): a source pixel equal to the
+ * Real GDI color→mono (BitBlt docs, Remarks on color conversion): a source pixel equal to the
  * SOURCE DC's background color maps to 1 (white); all others map to 0 (black).
  * Our 1bpp bitmaps are RGBA canvases, so the conversion is emulated in RGB.
  */
@@ -89,7 +89,7 @@ function blitColorToMono(
 }
 
 /**
- * Real GDI mono→color (nt5src ylateobj.cxx, the icon/mask path): a source 0 bit
+ * Real GDI mono→color (BitBlt docs, Remarks on color conversion; the icon/mask path): a source 0 bit
  * (black) becomes the DESTINATION DC's text color and a 1 bit (white) its background
  * color. Copying the mono canvas through verbatim renders every masked sprite as hard
  * black/white whatever SetTextColor/SetBkColor said.

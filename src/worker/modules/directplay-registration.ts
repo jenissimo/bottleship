@@ -43,7 +43,7 @@ function unregisterClass(registry: RegistryStore, clsid: string): boolean {
     }
     return true;
 }
-/** NT5 DirectPlay DLL registration changes the guest registry only. */
+/** DllRegisterServer/DllUnregisterServer (COM self-registration docs) change the guest registry only. */
 export function installDirectPlayRegistration(exports: Record<string, ThunkImplementation>, module: 'dplayx' | 'dpnet' | 'dpnlobby'): void {
     const profiles = module === 'dpnlobby' ? lobbyProfiles : networkProfiles;
     const providerPath = providerRoot + (module === 'dpnlobby' ? '\\Applications' : '\\Service Providers');

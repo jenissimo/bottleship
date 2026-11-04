@@ -1,8 +1,8 @@
 /**
  * ShowCursor's display count belongs to the GUEST.
  *
- * NT zzzShowCursor (ntuser/kernel/cursor.c) is a plain counter — `pq->iCursorLevel`
- * incremented on TRUE, decremented on FALSE, no floor — and the value it returns is what
+ * Per the ShowCursor documentation it is a plain display counter — incremented on TRUE,
+ * decremented on FALSE, no floor, cursor shown while >= 0 — and the value it returns is what
  * the app reads back to decide whether it still owes a matching call. Windows changes it
  * for nobody else: it does not re-show the pointer because a dialog appeared, and it does
  * not clamp a nested hide.

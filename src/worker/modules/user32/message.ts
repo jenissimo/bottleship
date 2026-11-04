@@ -575,7 +575,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
      * ignored and the message cannot be discarded — but the hook receives a POINTER
      * to the MSG (lParam) and may rewrite its fields in place (MFC, shells, macro
      * recorders, accessibility tools use it for exactly this). Contract (per
-     * USER32 xxxCallHook / input.c): nCode = HC_ACTION when removing (PM_REMOVE) or
+     * the GetMsgProc callback docs; Wine user32/input.c): nCode = HC_ACTION when removing (PM_REMOVE) or
      * HC_NOREMOVE on a PM_NOREMOVE peek; wParam = the remove flag; lParam = &MSG.
      *
      * The caller must have already written `m` to guest `lpMsg` (so the hook sees

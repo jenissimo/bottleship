@@ -71,7 +71,7 @@ export class HostPointerTrack {
         return this.clamp(target);
     }
 
-    /** wineserver update_desktop_cursor_pos / NT5 BoundCursor: right/bottom exclusive. */
+    /** wineserver update_desktop_cursor_pos / ClipCursor RECT semantics: right/bottom exclusive. */
     private clamp(p: HostPoint): HostPoint {
         const c = this.confine;
         if (!c) return p;

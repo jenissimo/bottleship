@@ -191,16 +191,15 @@ function defaultDs3dState(): Ds3dState {
     };
 }
 
-// Software-mixer premix depth. On a LOCSOFTWARE buffer the reported write cursor leads
-// play by exactly the premixed region — GetCurrentPosition derives the secondary's write
-// cursor from the distance between the primary's write cursor and the mixer's next-mix
-// position (nt5 dsound CGrace::GetBytePosition, "the region from the write cursor to the
-// mix cursor is the premixed region"). So these bounds ARE the write-cursor lead.
-//
-// The mixer thread (nt5 dsound CNaGrace::MixThread) ramps that depth on a timer:
-// MIXER_MINPREMIX after a remix, then `premix += step; step += 2` per refresh up to
-// MIXER_MAXPREMIX — 45, 47, 51, 57, 65, 75, 87, 101, 117, 135, 155, 177, 200. Sleep
-// between refreshes is min(premixed/2, nextNotify) clamped to [MIN/2, MAX/2].
+// Software-mixer premix depth: BottleShip's model of the write-cursor lead on a
+// LOCSOFTWARE buffer. The DirectSound docs (IDirectSoundBuffer::GetCurrentPosition) say
+// only that data between the play and write cursors is already committed and must not be
+// changed; how far the write cursor leads is not documented. We model the lead as a
+// premixed region that restarts short after a remix and grows on every refresh toward a
+// ceiling (45 ms rising to 200 ms with an increment that grows by 2 ms per step), with
+// refreshes spaced at half the premixed region, bounded by the next notification.
+// These parameters are a model, not a published Windows constant; re-validate them
+// against a cursor capture on real Windows before relying on exact values.
 const PREMIX_MIN_MS = 45;
 const PREMIX_MAX_MS = 200;
 /** Ramp increment growth per refresh: step starts here and grows by the same amount. */
@@ -2068,8 +2067,8 @@ export class DSound implements IModule {
             if (!(buffer.flags & DSBCAPS_CTRLVOLUME)) return DSERR_CONTROLUNAVAIL;
             const vol = args[1] | 0;
             if (vol > DSBVOLUME_MAX || vol < DSBVOLUME_MIN) return DSERR_INVALIDPARAM;
-            // A set to the value already in effect changes nothing in the mixer and
-            // raises no remix (nt5 dsound early-outs on it). Without that, a title
+            // A set to the value already in effect changes nothing audible, so the model
+            // raises no remix for it. Without that, a title
             // re-asserting its volume every frame pins the premix ramp at its minimum.
             const volumeChanged = buffer.volumeDb !== Math.max(-10000, Math.min(0, vol));
             buffer.volumeDb = Math.max(-10000, Math.min(0, vol));
@@ -2767,11 +2766,10 @@ export class DSound implements IModule {
     }
 
     /**
-     * A remix rewinds the mixer's next-mix position back to the write cursor and rebuilds
-     * the premixed region from PREMIX_MIN_MS (nt5 dsound CGrace::Refresh with fRemix, plus
-     * the MixThread branch that resets dtimePremix). The reported write cursor therefore
-     * dips back toward play and re-ramps. Raised by the same things the real one is:
-     * volume/pan/frequency changed on a PLAYING, unmuted buffer.
+     * A remix (model, see PREMIX_MIN_MS) rewinds the next-mix position back to the write
+     * cursor and rebuilds the premixed region from PREMIX_MIN_MS, so the reported write
+     * cursor dips back toward play and re-ramps. Raised when a parameter that changes the
+     * mixed output (volume/pan/frequency) changes on a PLAYING, unmuted buffer.
      */
     private signalRemix(buffer: SoundBuffer): void {
         if (!buffer.isPlaying) return;
