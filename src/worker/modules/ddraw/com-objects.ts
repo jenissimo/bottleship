@@ -373,6 +373,8 @@ export interface RenderSurface extends BaseSurfaceState {
     lastUploadVersion: number;
     /** Bounding box of dirty region (for partial upload optimization - Phase 2). */
     dirtyRegion?: Rect;
+    /** Region still awaiting upload when the current Lock began; the Unlock adds its writes to it. */
+    leasePriorDirtyRegion?: Rect;
 
     /** Ephemeral RGBA cache (can invalidate/recreate). */
     rgbaScratch?: Uint8Array;
