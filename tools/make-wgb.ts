@@ -55,9 +55,14 @@
  *                         ships a wrapper/proxy DLL — an ASI loader, a Glide or ddraw
  *                         shim — which otherwise never executes. Example:
  *                         --app-dir-dlls "ddraw"
- *                         Shim databases (*.sdb) in the game directory are read without a
- *                         flag: their VirtualRegistry ADDREDIRECT rules for exes the game
- *                         ships become manifest registryRedirects (Steam's Mafia needs one).
+ *   --sdb <relpath>       Shim database (.sdb) in the game directory that the game's
+ *                         installer registers with sdbinst, repeatable. Its VirtualRegistry
+ *                         ADDREDIRECT rules become manifest registryRedirects, each bound to
+ *                         the exe whose entry declares it (Steam's Mafia needs one:
+ *                         --sdb mafia.sdb). A .sdb in the folder does nothing on Windows until
+ *                         it is installed, so without the flag make-wgb only reports it.
+ *                         Entries are matched by exe name; wildcard (MATCHING_FILE-only)
+ *                         entries, other shims and other commands are reported and skipped.
  *   --working-dir <path>  Guest cwd at boot when it is NOT the entrypoint's folder —
  *                         an engine module a launcher starts inherits the LAUNCHER's
  *                         directory and resolves its data paths against it. Example:
@@ -100,7 +105,7 @@ import { orderFilesByProfile, parseIoProfile } from "@bottleship/formats/wgb/io-
 import { ZipStoreWriter } from './internal/zip-store-writer';
 import { isValidGameId, deriveGameId, KNOWN_GAME_ID_SCHEMES } from '@bottleship/formats/wgb/container-id';
 import { parseRegFile, mergeRegSeeds, type RegSeed } from '@bottleship/formats/reg';
-import { parseSdb, virtualRegistryRedirects, type RegistryRedirect } from '@bottleship/formats/sdb';
+import { parseSdb, validateRedirects, virtualRegistryRedirects, type ExeRegistryRedirect } from '@bottleship/formats/sdb';
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -267,22 +272,52 @@ const appDirDlls = (get('--app-dir-dlls') ?? '')
     .map((d) => d.trim())
     .filter((d) => d.length > 0);
 
-// A re-release can ship a compatibility database (registered by sdbinst at install) instead of
-// patching the binary; Windows applies its shims silently, so they have to travel with the bundle.
+// A re-release can ship a compatibility database instead of patching the binary. On Windows it
+// takes effect only once installed (sdbinst, run by the installer); a .sdb lying in the game
+// folder does nothing. So only the databases named with --sdb are applied; any other is reported.
+const sdbArgs = getAll('--sdb');
+const sdbEntries = [...romFiles.keys()].filter((p) => /\.sdb$/i.test(p));
+const selectedSdb = new Map<string, string>();
+for (const rel of sdbArgs) {
+    const wanted = `rom/${rel.replace(/\\/g, '/').replace(/^\/+/, '')}`.toLowerCase();
+    const zipName = [...romFiles.keys()].find((p) => p.toLowerCase() === wanted);
+    if (!zipName) {
+        console.error(`Error: --sdb ${rel}: no such file in the game directory`);
+        process.exit(1);
+    }
+    selectedSdb.set(zipName, romFiles.get(zipName)!);
+}
+for (const zipName of sdbEntries) {
+    if (selectedSdb.has(zipName)) continue;
+    console.log(`  shim db:    ${zipName} found, not applied (Windows applies a game's own shim database only ` +
+        `once its installer registers it with sdbinst). If it does, pass --sdb "${zipName.slice('rom/'.length)}"`);
+}
 const shippedExes = new Set([...romFiles.keys()].filter((p) => /\.exe$/i.test(p)).map((p) => basename(p).toLowerCase()));
-const registryRedirects: RegistryRedirect[] = [];
-for (const [zipName, full] of romFiles) {
-    if (!/\.sdb$/i.test(zipName)) continue;
+const sdbRules: ExeRegistryRedirect[] = [];
+for (const [zipName, full] of selectedSdb) {
     let exes;
     try {
-        exes = parseSdb(readFileSync(full)).filter((e) => shippedExes.has(e.name.toLowerCase()));
+        exes = parseSdb(readFileSync(full));
     } catch (err) {
-        console.warn(`Warning: ${zipName} is not a readable shim database (${err}); its shims are not applied.`);
-        continue;
+        console.error(`Error: --sdb ${zipName.slice('rom/'.length)} is not a readable shim database (${err})`);
+        process.exit(1);
     }
-    for (const rule of virtualRegistryRedirects(exes, (reason) => console.warn(`Warning: ${zipName}: ${reason}`))) {
+    for (const exe of exes) {
+        if (!/[*?]/.test(exe.name) && !shippedExes.has(exe.name.toLowerCase())) {
+            console.warn(`Warning: ${zipName}: entry ${exe.name} names an exe the game does not ship; skipped`);
+        }
+    }
+    const named = exes.filter((e) => /[*?]/.test(e.name) || shippedExes.has(e.name.toLowerCase()));
+    sdbRules.push(...virtualRegistryRedirects(named, (reason) => console.warn(`Warning: ${zipName}: ${reason}`)));
+}
+// Each process applies its own exe's rules, so they must hold together per exe.
+const registryRedirects: ExeRegistryRedirect[] = [];
+for (const exe of new Set(sdbRules.map((r) => r.exe.toLowerCase()))) {
+    const { accepted, rejected } = validateRedirects(sdbRules.filter((r) => r.exe.toLowerCase() === exe));
+    for (const { rule, reason } of rejected) console.warn(`Warning: ${rule.exe}: registry ${rule.from} -> ${rule.to} rejected: ${reason}`);
+    for (const { rule } of accepted) {
         registryRedirects.push(rule);
-        console.log(`  shim:       ${zipName}: registry ${rule.from} -> ${rule.to}`);
+        console.log(`  shim:       ${rule.exe}: registry ${rule.from} -> ${rule.to}`);
     }
 }
 if (emptyDirs.size > 0) {
