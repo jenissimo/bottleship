@@ -5,6 +5,7 @@ import {
     DDPF_PALETTEINDEXED8,
     DDPF_RGB,
     DDPF_ZBUFFER,
+    DDSD_BACKBUFFERCOUNT,
     DDSD_CAPS,
     DDSD_HEIGHT,
     DDSD_LPSURFACE,
@@ -248,7 +249,9 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
     const height = hasField(DDSURFACEDESC2_OFFSETS.height) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.height, true) : 0;
     const width = hasField(DDSURFACEDESC2_OFFSETS.width) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.width, true) : 0;
     const pitch = hasField(DDSURFACEDESC2_OFFSETS.pitch) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.pitch, true) : 0;
-    const backBufferCount = hasField(DDSURFACEDESC2_OFFSETS.backBufferCount) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.backBufferCount, true) : 0;
+    // Like every member, dwBackBufferCount is only valid under its DDSD_ flag; callers that
+    // set just DDSD_CAPS often leave stack garbage there.
+    const backBufferCount = (flags & DDSD_BACKBUFFERCOUNT) && hasField(DDSURFACEDESC2_OFFSETS.backBufferCount) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.backBufferCount, true) : 0;
     // Only read lpSurface if DDSD_LPSURFACE flag is set AND field exists
     // Otherwise garbage value may point to thunk/callback/spin regions and corrupt system memory
     const surfacePtr = (flags & DDSD_LPSURFACE) && hasField(DDSURFACEDESC2_OFFSETS.lpSurface)
@@ -470,7 +473,7 @@ export const readSurfaceDescV1 = (mem: Uint8Array, address: number): SurfaceDesc
     const height = hasField(DDSURFACEDESC_OFFSETS.height) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.height, true) : 0;
     const width = hasField(DDSURFACEDESC_OFFSETS.width) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.width, true) : 0;
     const pitch = hasField(DDSURFACEDESC_OFFSETS.pitch) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.pitch, true) : 0;
-    const backBufferCount = hasField(DDSURFACEDESC_OFFSETS.backBufferCount) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.backBufferCount, true) : 0;
+    const backBufferCount = (flags & DDSD_BACKBUFFERCOUNT) && hasField(DDSURFACEDESC_OFFSETS.backBufferCount) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.backBufferCount, true) : 0;
     // Only read lpSurface if DDSD_LPSURFACE flag is set AND field exists
     const surfacePtr = (flags & DDSD_LPSURFACE) && hasField(DDSURFACEDESC_OFFSETS.lpSurface)
         ? view.getUint32(address + DDSURFACEDESC_OFFSETS.lpSurface, true)
