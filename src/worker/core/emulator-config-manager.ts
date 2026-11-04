@@ -10,7 +10,7 @@ import {
 import { QualityConfig, DEFAULT_QUALITY, mergeQuality } from "./quality-config";
 import { asBufferSource } from "../../dom-buffer";
 import { normalizeNetworkConfig, type NetworkConfig } from "../../network-config";
-import type { RegistryRedirect } from "@bottleship/formats/sdb";
+import type { ExeRegistryRedirect } from "@bottleship/formats/sdb";
 
 // OS Version constants
 export const VER_PLATFORM_WIN32_WINDOWS = 0x1;
@@ -359,9 +359,11 @@ export class EmulatorConfig {
     // disabledDlls. Opt-in per bundle while the default order is still HLE-first.
     public appDirDlls: string[] = [];
 
-    // The game's own VirtualRegistry shims. The owner hands them to its hive at load; a child
-    // process inherits them here and applies them to its copy (RegistryStore.setRedirects).
-    public registryRedirects: RegistryRedirect[] = [];
+    // The game's own VirtualRegistry shims, each bound to the exe its database entry names.
+    // Every process selects its own set by image name when it starts (the owner for the boot
+    // image, a child for its own image, which it inherits this list to choose from):
+    // RegistryStore.setRedirectsForImage.
+    public registryRedirects: ExeRegistryRedirect[] = [];
 
     // VFS paths to delete from CoW overlay on every boot
     public deleteOnBoot: string[] = [];
@@ -641,10 +643,18 @@ export class EmulatorConfig {
         }
 
         if (config.registryRedirects && config.registryRedirects.length > 0) {
-            this.registryRedirects = config.registryRedirects;
+            const rules = config.registryRedirects;
+            this.registryRedirects = rules.filter((r) =>
+                typeof r?.exe === "string" && r.exe.length > 0 && typeof r.from === "string" && typeof r.to === "string");
+            if (this.registryRedirects.length < rules.length) {
+                Logger.warn(
+                    LogCategory.SYSTEM,
+                    `EmulatorConfig: ${rules.length - this.registryRedirects.length} registryRedirects entr(y/ies) without exe/from/to ignored`
+                );
+            }
             Logger.log(
                 LogCategory.SYSTEM,
-                `EmulatorConfig: registryRedirects loaded: ${this.registryRedirects.map((r) => `${r.from} -> ${r.to}`).join(", ")}`
+                `EmulatorConfig: registryRedirects loaded: ${this.registryRedirects.map((r) => `${r.exe}: ${r.from} -> ${r.to}`).join(", ")}`
             );
         }
 

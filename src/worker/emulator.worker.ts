@@ -2042,9 +2042,6 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       system.registry.seed({ root: "HKDD", path: k, values: [] });
     }
 
-    // Before seeding: the game's own registry redirects decide where its seeds land.
-    system.registry.setRedirects(bundle.manifest.emulator?.registryRedirects);
-
     // Apply the manifest registry seed (bundle DEFAULTS) BEFORE restoring persisted
     // state. seed() overwrites and restore() overwrites — "last write wins" — so the
     // persisted (game-written) values like screen resolution must be restored LAST,
@@ -2174,6 +2171,10 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     system.onReExecRequest = requestSelfReExec;
     system.executableName = exeName;
     system.executablePath = executablePath;
+    // The shim engine matches a process to its database entry when it starts: this boot's
+    // image selects its own VirtualRegistry redirects (seeds and persisted keys above are the
+    // hive's real contents and were never redirected).
+    system.registry.setRedirectsForImage(emulatorConfig.registryRedirects, executablePath);
     // A self re-exec supplies the command line the LAUNCHER chose; it outranks the
     // manifest's boot args for exactly one boot, then the manifest applies again.
     system.executableArgs = pendingReExecArgs ?? bootArgsOverride ?? bundle.manifest.args ?? "";
@@ -3244,7 +3245,9 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         // image before restoring inherited objects; otherwise that stale TEB survives
         // while the new bootloader resets FS, and CRT startup faults at fs:[0].
         await prepareFullGameSwitch();
-        system.registry.setRedirects(EmulatorConfig.getInstance().registryRedirects);
+        // A child is matched on its own image, not on its parent's: it inherits the bundle's
+        // whole rule list in its EmulatorConfig and picks the entry that names it.
+        system.registry.setRedirectsForImage(EmulatorConfig.getInstance().registryRedirects, boot.imagePath);
         if (boot.registry) system.registry.restore(boot.registry);
         // The hive is the parent's; this worker only holds a copy of it. postToParent, not
         // the overridden self.postMessage: a child that owns the screen talks to the PAGE,
