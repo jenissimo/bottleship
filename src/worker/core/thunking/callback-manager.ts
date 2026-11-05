@@ -147,11 +147,6 @@ export class CallbackManager {
     private getMemory: () => Uint8Array;
 
     private pendingCallbacks: Map<number, CallbackInvocation> = new Map();
-
-    /** Guest callbacks invoked from JS whose completion has not run yet. */
-    pendingCallbackCount(): number {
-        return this.pendingCallbacks.size;
-    }
     private pendingSlotByCallbackId = new Map<number, number>();
     private pendingSlotActive = new Uint8Array(MAX_PENDING_CALLBACK_SLOTS);
     private pendingSlotCallbackId = new Uint32Array(MAX_PENDING_CALLBACK_SLOTS);
@@ -856,6 +851,26 @@ export class CallbackManager {
     /** True when `threadId` has a terminal frame completion waiting for it to become current. */
     hasDeferredCompletionForThread(threadId: number): boolean {
         return this.deferredCompletions.has(threadId >>> 0);
+    }
+
+    /** Guest callbacks invoked from JS whose completion has not run yet. */
+    pendingCallbackCount(): number {
+        return this.pendingCallbacks.size;
+    }
+
+    /** Live suspended-thunk frames (a JS-driven pump such as DialogBoxParamA owns the thread)
+     *  and terminal completions still waiting for their owner, by thread and frame source. */
+    suspendedFrames(): Array<{ threadId: number; source: string }> {
+        const out: Array<{ threadId: number; source: string }> = [];
+        for (let i = 0; i < this.frameStackDepth; i++) {
+            const slot = this.frameStack[i];
+            if (slot < 0 || slot >= SUSPENDED_FRAME_RING_SIZE || this.frameActive[slot] !== 1) continue;
+            out.push({ threadId: this.frameThreadId[slot] >>> 0, source: this.frameSource[slot] || `frame ${this.frameIdRing[slot] >>> 0}` });
+        }
+        for (const [threadId, completion] of this.deferredCompletions) {
+            out.push({ threadId, source: `${completion.source || `frame ${completion.frameId}`} (completion deferred)` });
+        }
+        return out;
     }
 
     /** Diagnostics: completions waiting on their owner thread (harness `asyncParked`).

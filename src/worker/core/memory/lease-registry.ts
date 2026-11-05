@@ -23,11 +23,11 @@ export interface Lease {
 
 export class LeaseRegistry {
     private leases: Map<number, Lease> = new Map();
+    private nextLeaseId = 1;
 
     activeLeaseCount(): number {
         return this.leases.size;
     }
-    private nextLeaseId = 1;
 
     createLease(
         base: number,

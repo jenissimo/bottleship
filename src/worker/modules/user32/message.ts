@@ -1,4 +1,3 @@
-import { markRestartable } from '../../core/thunking/restartable';
 /**
  * User32 Message functions
  *
@@ -7,6 +6,7 @@ import { markRestartable } from '../../core/thunking/restartable';
 
 import { type HleDispatcher, ThunkImplementation, FastPathImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
+import { markRestartable } from '../../core/thunking/restartable';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
@@ -859,6 +859,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         // Async slow path: no message available, must block.
         Logger.verbose(LogCategory.USER32, `GetMessageW(0x${lpMsg.toString(16)}, 0x${hWnd.toString(16)}, ${wMsgFilterMin}, ${wMsgFilterMax}) - waiting...`);
 
+        let holdsMessage = false;
         const asyncBody = async () => {
             // Loop until we get a REAL message. waitForMessage returns WM_NULL as
             // an idle timeout signal (4ms), but real Windows GetMessage blocks until
@@ -867,6 +868,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             let waitMsg: { hwnd: number; message: number; wParam: number; lParam: number; time: number; ptX?: number; ptY?: number; extraInfo?: number };
             for (;;) {
                 waitMsg = await system.windowManager.waitForMessage(currentThreadId, wMsgFilterMin, wMsgFilterMax);
+                holdsMessage = !(waitMsg.message === WM_NULL && waitMsg.hwnd === 0);
 
                 // If paused, block return to v86 until unpaused.
                 while (system.isPaused) {
@@ -950,8 +952,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             return { value: retVal, stackCleanup: 16 };
         };
 
-        // Nothing guest-visible happens before the first await: a savestate may rewind it.
-        return markRestartable(asyncBody());
+        return markRestartable(asyncBody(), () => !holdsMessage);
     };
 
     exports['GetMessageA'] = exports['GetMessageW'];

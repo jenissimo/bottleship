@@ -1,5 +1,5 @@
 import { ThunkGenerator, ThunkStub } from './thunk-generator';
-import { isRestartable } from './restartable';
+import { restartableCheck } from './restartable';
 import { CallbackManager } from './callback-manager';
 import { Logger, LogCategory } from '../logger';
 import { System } from '../system';
@@ -261,8 +261,8 @@ interface ActiveAsyncThunk {
     originalSpinBytes?: [number, number];
     /** Caller's module base at call time (for offset->linear patch on async return) */
     callerModuleBase?: number;
-    /** The call can be re-issued instead of awaited (see restartable.ts). */
-    restartable?: boolean;
+    /** Whether the call can still be re-issued instead of awaited (see restartable.ts). */
+    restartable?: () => boolean;
 }
 
 interface PendingAsyncRestore {
@@ -1705,10 +1705,10 @@ export class ThunkDispatcher {
     }
 
     /** Threads parked on host Promises, for savestate readiness. */
-    asyncParks(): Array<{ name: string; threadId: number; restartable: boolean }> {
-        const out: Array<{ name: string; threadId: number; restartable: boolean }> = [];
+    asyncParks(): Array<{ name: string; threadId: number | null; restartable: boolean }> {
+        const out: Array<{ name: string; threadId: number | null; restartable: boolean }> = [];
         for (const info of this.activeAsyncThunks.values()) {
-            out.push({ name: info.functionName ?? `#${info.functionId}`, threadId: info.threadId ?? 0, restartable: info.restartable === true });
+            out.push({ name: info.functionName ?? `#${info.functionId}`, threadId: info.threadId ?? null, restartable: info.restartable?.() === true });
         }
         return out;
     }
@@ -3490,7 +3490,7 @@ export class ThunkDispatcher {
             spinAddr,
             originalSpinBytes: originalBytes,
             callerModuleBase: this.lastCallerModuleBase,
-            restartable: isRestartable(promise),
+            restartable: restartableCheck(promise),
         };
 
         // Set boundary state for scheduler: CPU is now at spin loop.

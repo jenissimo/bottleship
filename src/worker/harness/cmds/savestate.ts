@@ -8,6 +8,7 @@ import { leaseRegistry } from "../../core/memory/lease-registry";
 import { sehDispatchInFlight } from "../../core/seh-dispatch";
 import { liveChildProcessCount } from "../../core/child-process";
 import { pendingMessageBoxes } from "../../runtime/dialog-bridge";
+import { hasWaitingModalPump } from "../../modules/user32/modal-dialog-state";
 import { videoEngine } from "../../../video/video-engine";
 import { assessReadiness } from "../../savestate/readiness";
 
@@ -19,6 +20,8 @@ export function registerSavestateCommands(svc: HarnessService): void {
             asyncParks: () => dispatcher?.asyncParks() ?? [],
             pendingAsyncRestores: () => dispatcher?.pendingAsyncRestoreCount() ?? 0,
             pendingCallbacks: () => dispatcher?.callbackManager?.pendingCallbackCount() ?? 0,
+            suspendedFrames: () => dispatcher?.callbackManager?.suspendedFrames() ?? [],
+            modalPumpArmed: hasWaitingModalPump,
             pendingModals: () => pendingMessageBoxes().length,
             writeBufferPendingBytes: () => dispatcher?.writeBufferPendingBytes() ?? 0,
             sehDispatchInFlight,

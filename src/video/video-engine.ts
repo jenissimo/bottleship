@@ -218,11 +218,6 @@ export class VideoEngine {
 
     /** Map from JS-side unique handle → session state */
     private sessions: Map<number, DecoderSession> = new Map();
-
-    /** Decoder sessions currently open (video playback in progress). */
-    activeSessionCount(): number {
-        return this.sessions.size + this.wcSessions.size;
-    }
     /** WebCodecs-backed sessions. Disjoint from `sessions` — one handle space, two backends. */
     private wcSessions: Map<number, WebCodecsEntry> = new Map();
     private nextJsHandle = 1;
@@ -233,6 +228,11 @@ export class VideoEngine {
      * Inject the quality source. Read per frame rather than pushed, so a manifest layer
      * applied at load or a set_quality mid-movie both land without a second wiring point.
      */
+    /** Decoder sessions currently open (video playback in progress). */
+    activeSessionCount(): number {
+        return this.sessions.size + this.wcSessions.size;
+    }
+
     setQualitySource(fn: (() => Pick<QualityConfig, "videoChroma" | "videoDither" | "videoDeinterlace">) | null): void {
         this.qualitySource = fn;
     }
