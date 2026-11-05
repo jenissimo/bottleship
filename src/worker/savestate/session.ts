@@ -1,5 +1,5 @@
-import { savestateParticipants, uncoveredModules, type CaptureContext, type CpuOverride } from './participant';
-import { restoreRam, snapshotRam, writeRamChunks, type RamCaptureStats, type RamPatch } from './ram';
+import { savestateParticipants, uncoveredModules, type CaptureContext, type CpuOverride, type ParticipantRegistry } from './participant';
+import { restoreRam, snapshotRam, type RamCaptureStats, type RamManifest, type RamPatch } from './ram';
 import type { ChunkStore } from './chunk-store';
 import {
     decodeSavestate, encodeSavestate, incompatibilities, type CompatibilityKey, type Savestate,
@@ -39,33 +39,45 @@ export function newCaptureRun(): CaptureRun {
     };
 }
 
-export interface CaptureResult { bytes: Uint8Array; ram: RamCaptureStats; sections: Record<string, number> }
+export interface CaptureResult {
+    bytes: Uint8Array;
+    manifest: RamManifest;
+    pending: Map<string, Uint8Array>;
+    ram: RamCaptureStats;
+    sections: Record<string, number>;
+}
 
-export async function captureSession(target: SavestateTarget, store: ChunkStore): Promise<CaptureResult> {
-    const missing = uncoveredModules(target.touchedModules(), savestateParticipants.coveredModules());
-    if (missing.length > 0) throw new CaptureRefusal(`savestate: no participant captures ${missing.join(', ')}`);
+export function coverageRefusal(target: Pick<SavestateTarget, 'touchedModules'>, participants: ParticipantRegistry = savestateParticipants): string | null {
+    const missing = uncoveredModules(target.touchedModules(), participants.coveredModules());
+    return missing.length > 0 ? `savestate: no participant captures ${missing.join(', ')}` : null;
+}
+
+export async function captureSession(
+    target: SavestateTarget, known: ReadonlySet<string>, stillReady: () => void = () => undefined,
+    participants: ParticipantRegistry = savestateParticipants,
+): Promise<CaptureResult> {
+    const refusal = coverageRefusal(target, participants);
+    if (refusal) throw new CaptureRefusal(refusal);
     const sections = new Map<string, SaveValue>();
     const sizes: Record<string, number> = {};
     const run = newCaptureRun();
-    for (const p of savestateParticipants.all()) {
+    for (const p of participants.all()) {
         const value = p.capture(run);
         sections.set(p.id, value);
         const enc = encodeValue(value);
         sizes[p.id] = enc.json.length + enc.blobs.reduce((n, b) => n + b.length, 0);
     }
     sections.set(OBJECTS, run.objects as unknown as SaveValue);
-    const snap = await snapshotRam(target.guestMemory(), new Set(await store.list()), run.ramPatches);
-    await writeRamChunks(snap.pending, store);
-    const { manifest, stats } = snap;
+    const snap = await snapshotRam(target.guestMemory(), known, run.ramPatches);
+    stillReady();
     const state: Savestate = {
         header: {
             key: target.compatibilityKey(), overlay: target.overlayState(),
-            createdAt: Date.now(), gameId: target.gameId(), ram: manifest,
+            createdAt: Date.now(), gameId: target.gameId(), ram: snap.manifest,
         },
         sections,
     };
-    const bytes = encodeSavestate(state);
-    return { bytes, ram: stats, sections: sizes };
+    return { bytes: encodeSavestate(state), manifest: snap.manifest, pending: snap.pending, ram: snap.stats, sections: sizes };
 }
 
 export interface LoadCheck { ok: boolean; reasons: string[]; overlayChanged: boolean; state: Savestate }
@@ -77,10 +89,36 @@ export function checkSavestate(target: SavestateTarget, bytes: Uint8Array): Load
     return { ok: reasons.length === 0, reasons, overlayChanged: state.header.overlay !== target.overlayState(), state };
 }
 
-export async function restoreSession(target: SavestateTarget, state: Savestate, store: ChunkStore): Promise<void> {
+export class RestoreFailed extends Error {}
+
+export async function missingChunks(manifest: RamManifest, store: ChunkStore): Promise<string[]> {
+    const out: string[] = [];
+    for (const [, hash] of manifest.chunks) {
+        if (!(await store.has(hash)) || (await store.size(hash)) <= 1) out.push(hash);
+    }
+    return out;
+}
+
+/**
+ * Nothing is written until every chunk the manifest names is present. After the first write,
+ * any failure is a RestoreFailed: the guest is half restored and must not run.
+ */
+export async function restoreSession(
+    target: SavestateTarget, state: Savestate, store: ChunkStore, participants: ParticipantRegistry = savestateParticipants,
+): Promise<void> {
+    const missing = await missingChunks(state.header.ram, store);
+    if (missing.length > 0) throw new Error(`savestate: ${missing.length} RAM chunk(s) are missing, e.g. ${missing[0]}`);
+    try {
+        await restoreWritten(target, state, store, participants);
+    } catch (e) {
+        throw new RestoreFailed(e instanceof Error ? e.message : String(e));
+    }
+}
+
+async function restoreWritten(target: SavestateTarget, state: Savestate, store: ChunkStore, participants: ParticipantRegistry): Promise<void> {
     await restoreRam(target.guestMemory(), state.header.ram, store);
     const ctx = restoreObjectGraph((state.sections.get(OBJECTS) ?? []) as unknown as Array<[string, SaveValue]>);
-    for (const p of savestateParticipants.all()) {
+    for (const p of participants.all()) {
         const value = state.sections.get(p.id);
         if (value === undefined) throw new Error(`savestate: no section for participant ${p.id}`);
         await p.restore(value, ctx);

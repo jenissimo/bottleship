@@ -75,6 +75,8 @@ export interface ZipEntry {
     compression: number;
     localHeaderOffset: number;
     isDirectory: boolean;
+    /** CRC-32 from the central directory; absent on entries built in memory. */
+    crc32?: number;
     /** Last-modified time from the DOS stamp, as wall-clock seconds (zip/dos-time.ts); absent when the entry has none. */
     modified?: number;
 }
@@ -365,6 +367,7 @@ export class ZipArchive {
 
             const flags = view.getUint16(offset + 8, true);
             const compression = view.getUint16(offset + 10, true);
+            const crc32 = view.getUint32(offset + 16, true);
             let compressedSize = view.getUint32(offset + 20, true);
             let uncompressedSize = view.getUint32(offset + 24, true);
             const nameLen = view.getUint16(offset + 28, true);
@@ -404,6 +407,7 @@ export class ZipArchive {
                 compression,
                 localHeaderOffset,
                 isDirectory,
+                crc32,
                 ...(modified !== undefined ? { modified } : {}),
             });
 
