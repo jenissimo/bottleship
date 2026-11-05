@@ -355,6 +355,11 @@ export class VirtualFileSystem {
     /** The disc's volume label, as GetVolumeInformation reports it for D:\. See manifest emulator.cdLabel. */
     private cdVolumeLabel: string | null = null;
 
+    /** Overlay (game save tree) writes not yet durable in OPFS. */
+    pendingOverlayWrites(): number {
+        return this.overlay?.pendingWriteCount() ?? 0;
+    }
+
     /**
      * Open the writable overlay for a game's container (bottleship/games/<containerDir>/overlay/).
      * On a game switch (different gameId) the previous overlay is closed and re-rooted, so game B
@@ -2494,6 +2499,11 @@ class OpfsOverlay {
      */
     private policy: PathPolicy = DEFAULT_PATH_POLICY;
     private ephemeralFiles = new Map<string, Uint8Array>();
+
+    /** Overlay paths with writes buffered or still being committed to OPFS. */
+    pendingWriteCount(): number {
+        return new Set([...this.writerCache.keys(), ...this.pendingFlushes.keys()]).size;
+    }
 
     setPolicy(policy: PathPolicy): void { this.policy = policy; }
 
