@@ -17,7 +17,7 @@ import { readbackSourceRect, resolveReadback } from "./opengl-readback";
 import { scissorRect, viewportRect } from "./opengl-render-space";
 import { registerGpuDeviceObserver } from "../../../core/gpu/gpu-device-lifecycle";
 import {
-    GLCommandStream, GLDrawCommandType, GLTextureObject, VERT_FLOATS,
+    GLCommandStream, GLDrawCommandType, GLTextureObject, VERT_FLOATS, VERT_FOG_DIST,
     CMD_I32, CMD_F32, CI_TYPE,
     CI_MODE, CI_VERT_OFFSET, CI_VERT_COUNT, CI_FLAGS, CI_DEPTH_FUNC, CI_BLEND_SRC, CI_BLEND_DST,
     CI_ALPHA_FUNC, CI_CULL_FACE, CI_FRONT_FACE, CI_TEX_ID0, CI_TEX_ID1, CI_TEXENV0, CI_TEXENV1,
@@ -127,7 +127,7 @@ interface SelectedVertices {
     topology: OpenGLTopology;
 }
 
-const VERTEX_FLOAT_STRIDE = 12; // pos.xyz + color.rgba + uv0.xy + uv1.xy + pad
+const VERTEX_FLOAT_STRIDE = 13; // clip.xyzw + color.rgba + uv0.xy + uv1.xy + eye-space fog distance
 const VERTEX_BYTE_STRIDE = VERTEX_FLOAT_STRIDE * 4;
 const UNIFORM_BLOCK_SIZE = 144;
 
@@ -953,6 +953,7 @@ export class OpenGLBackendExecutor {
             out[idx++] = src[si+12];    // t0
             out[idx++] = src[si+13];    // s1
             out[idx++] = src[si+14];    // t1
+            out[idx++] = src[si + VERT_FOG_DIST];
             si += VERT_FLOATS;
         }
 
@@ -1261,6 +1262,7 @@ export class OpenGLBackendExecutor {
                         { shaderLocation: 1, offset: 16, format: "float32x4" },
                         { shaderLocation: 2, offset: 32, format: "float32x2" },
                         { shaderLocation: 3, offset: 40, format: "float32x2" },
+                        { shaderLocation: 4, offset: 48, format: "float32" },
                     ],
                 }],
             },
@@ -1594,6 +1596,7 @@ struct VertexIn {
     @location(1) color: vec4f,
     @location(2) uv0: vec2f,
     @location(3) uv1: vec2f,
+    @location(4) fogDist: f32,
 };
 
 struct VertexOut {
@@ -1738,7 +1741,8 @@ fn computeFogFactor(mode: u32, density: f32, start: f32, end: f32, coord: f32) -
         return clamp(exp(-(d * d)), 0.0, 1.0);
     }
     if (mode == ${GL_LINEAR}u) {
-        let range = max(end - start, 1e-6);
+        let range = end - start;
+        if (range == 0.0) { return select(0.0, 1.0, coord <= start); }
         return clamp((end - coord) / range, 0.0, 1.0);
     }
     return 1.0;
@@ -1756,9 +1760,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
     out.color = input.color;
     out.uv0 = input.uv0;
     out.uv1 = input.uv1;
-    // Approximate fog from clip-space depth (NDC z mapped to [0,1])
-    let w = max(abs(input.pos.w), 0.0001);
-    out.fogCoord = clamp(input.pos.z / w * 0.5 + 0.5, 0.0, 1.0);
+    out.fogCoord = input.fogDist;
     return out;
 }
 
