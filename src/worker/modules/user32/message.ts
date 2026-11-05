@@ -1037,6 +1037,13 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         if (system.windowManager.hasMessages(0, 0, currentThreadId)) {
             return 1; // TRUE — queue already has a message
         }
+        // PostQuitMessage marks the queue as holding a posted message (Wine: post_quit_message
+        // sets QS_POSTMESSAGE | QS_ALLPOSTMESSAGE), so a wait issued after it returns at once
+        // and the pump's next PeekMessage/GetMessage retrieves WM_QUIT. Blocking here would
+        // sleep until some unrelated message happened to arrive.
+        if (system.scheduler.hasPendingQuit(currentThreadId)) {
+            return 1;
+        }
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const returnAddr = view.getUint32(ctx.esp >>> 0, true) >>> 0;

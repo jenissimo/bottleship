@@ -1772,15 +1772,31 @@ export class HypercallDataManager {
         this.view.setInt32(this.hpBase + OFF_HC_WINDOW_Y, y, true);
     }
 
+    /** Whether any thread has a PostQuitMessage that GetMessage/PeekMessage has not consumed. */
+    private quitPendingProbe: (() => boolean) | null = null;
+
+    /** The scheduler owns the per-thread quit flags; it registers how to ask about them. */
+    setQuitPendingProbe(probe: (() => boolean) | null): void {
+        this.quitPendingProbe = probe;
+    }
+
     /**
      * Update the message queue flag in shared page.
      * WASM PeekMessage handler reads this to short-circuit when queue is empty.
+     *
+     * A pending quit keeps the flag up even with an empty queue: WM_QUIT is synthesized by
+     * the JS PeekMessage paths from the per-thread flag, so a WASM short-circuit would hide
+     * it. (Win32 marks the queue QS_POSTMESSAGE on PostQuitMessage for the same reason.)
+     * Every caller passes "is the queue non-empty", so the quit leg lives here, once —
+     * a BeginPaint that drained the last WM_PAINT used to clear the flag under a pending
+     * quit and leave a Delphi pump (PeekMessage -> WaitMessage) asleep forever.
      */
     updateMessageQueueFlag(hasMessages: boolean): void {
         if (!this.initialized || !this.view) return;
         this.refreshViews();
         if (!this.view) return;
-        this.view.setUint32(this.hpBase + OFF_HC_MSG_QUEUE_FLAG, hasMessages ? 1 : 0, true);
+        const flag = hasMessages || (this.quitPendingProbe?.() ?? false);
+        this.view.setUint32(this.hpBase + OFF_HC_MSG_QUEUE_FLAG, flag ? 1 : 0, true);
     }
 
     /**

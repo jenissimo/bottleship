@@ -704,6 +704,7 @@ export class Scheduler {
     constructor(config: Partial<SchedulerConfig> = {}) {
         this.config = { ...DEFAULT_SCHEDULER_CONFIG, ...config };
         this.timerWheel.bind(TimerKind.SLEEP_TIMEOUT, (tid) => this.onWaitTimeout(tid));
+        hypercallDataManager.setQuitPendingProbe(() => this.hasPendingQuit());
     }
 
     private readonly onYieldTask = (): void => {
@@ -2607,6 +2608,15 @@ export class Scheduler {
         const thread = this.threads.get(threadId);
         if (!thread) return null;
         return { posted: thread.quitPosted, exitCode: thread.quitExitCode };
+    }
+
+    /** True when `threadId` (or, with no id, any live thread) has an unconsumed PostQuitMessage. */
+    hasPendingQuit(threadId?: number): boolean {
+        if (threadId !== undefined) return this.threads.get(threadId)?.quitPosted === true;
+        for (const thread of this.threads.values()) {
+            if (thread.quitPosted && thread.state !== ThreadState.TERMINATED) return true;
+        }
+        return false;
     }
 
     /** Clear the quit flag after WM_QUIT has been consumed by GetMessage/PeekMessage. */
