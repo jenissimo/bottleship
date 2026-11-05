@@ -76,7 +76,9 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     const ddeClientOnly = new Set<number>();
     // Wine's shell32 DDE server registers Progman, Shell and Folders, and also accepts
     // AppProperties as a service; it answers the Progman and Shell topics.
+    // @transient(constant name table)
     const ddeShellServices = new Set(['progman', 'shell', 'folders', 'appproperties']);
+    // @transient(constant name table)
     const ddeShellTopics = new Set(['progman', 'shell']);
     const DNS_REGISTER = 0x0001;
     const DNS_UNREGISTER = 0x0002;
