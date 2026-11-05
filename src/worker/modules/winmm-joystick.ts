@@ -155,13 +155,13 @@ function stopCapture(joyId: number): void {
     captures[joyId] = null;
 }
 
+setTimerHandler(TimerKind.JOYSTICK_CAPTURE, (joyId) => pollCapture(joyId));
+
 /**
  * Capture poll: diff the stick against the last posted sample and emit the
  * MM_JOY* messages Windows would. Axis moves collapse into one MM_JOY*MOVE;
  * each button edge gets its own DOWN/UP with the JOY_BUTTONnCHG bit set.
  */
-setTimerHandler(TimerKind.JOYSTICK_CAPTURE, (joyId) => pollCapture(joyId));
-
 function pollCapture(joyId: number): void {
     const cap = captures[joyId];
     if (!cap) return;

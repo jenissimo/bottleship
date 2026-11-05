@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { System } from "../../src/worker/core/system";
 import { createMessageExports } from "../../src/worker/modules/user32/message";
-import { getTimerHandler } from "../../src/worker/core/scheduler/timer-wheel";
+import { clearTimerHandler, getTimerHandler } from "../../src/worker/core/scheduler/timer-wheel";
+import { TimerKind } from "../../src/worker/core/scheduler/types";
 
 describe("USER timer cancellation", () => {
     test("KillTimer removes an unobserved expiration but preserves an observed one", () => {
+        clearTimerHandler(TimerKind.USER32_TIMER);
         const system = System.getInstance(), api = createMessageExports();
         const wheel = system.scheduler.timerWheel;
         const add = wheel.add, cancel = wheel.cancel;

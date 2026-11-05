@@ -8,6 +8,8 @@ import { WsaStartupCount, makeSocketExports, type WsaProcessState } from "../../
 import { WsaSocketTable, WSA, ipv4Address } from "../../src/worker/modules/wsa-network";
 import type { ThunkImplementation } from "../../src/worker/core/thunking/thunk-dispatcher";
 import type { WsaErrorSetter } from "../../src/worker/modules/wsa-network-api";
+import { clearTimerHandler, getTimerHandler } from "../../src/worker/core/scheduler/timer-wheel";
+import { TimerKind } from "../../src/worker/core/scheduler/types";
 import { createMessageExports } from "../../src/worker/modules/user32/message";
 import { killWindowTimers } from "../../src/worker/modules/user32/shared-state";
 const cleanup:Array<()=>void>=[];
@@ -84,10 +86,11 @@ describe("Winsock 1.1 blocking hook contracts",()=>{
         h.state.counter.cleanup();expect(h.state.counter.version).toBe(0x202);
     });
     test("the default hook pumps through the session's user32 exports and keeps window timers owned by DestroyWindow",()=>{
+        clearTimerHandler(TimerKind.USER32_TIMER);
         const user32=createMessageExports(),h=fixture(0x101,user32);
         const wheel=System.getInstance().scheduler.timerWheel,add=wheel.add,cancel=wheel.cancel,cancelled:number[]=[];
         let fire:(()=>void)|undefined;
-        wheel.add=(_delay,_periodic,_kind,callback)=>{fire=callback;return 12345;};
+        wheel.add=(_delay,_periodic,kind,owner,_now,arg=0)=>{fire=()=>getTimerHandler(kind)!(owner,arg,12345);return 12345;};
         wheel.cancel=(id:number)=>{cancelled.push(id);return true;};
         cleanup.push(()=>{wheel.add=add;wheel.cancel=cancel;});
         const mem=new Uint8Array(0x1000),hwnd=0x7abc0084,id=0x84;

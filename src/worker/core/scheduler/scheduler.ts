@@ -4377,7 +4377,8 @@ export class Scheduler {
         }
 
         const now = this.timeService.nowMs();
-        // Telemetry: count WINMM timers fired by a wall-paced idle pump.
+        // Telemetry: count timeSetEvent timers (TimerKind.WINMM_TIMER only; joystick and waveOut
+        // polls have their own kinds) fired by a wall-paced idle pump.
         const winmmFiredBefore = this.timerWheel.firedByKind[TimerKind.WINMM_TIMER];
         this.timerWheel.poll(now);
         if (pumpedIdle) {
@@ -4757,9 +4758,6 @@ export class Scheduler {
         }
     }
 
-    /** A woken thread whose SRW lock is contended stays WAITING, re-registered
-     *  on the lock's wait event; the eventual ReleaseSRWLock* wake retries the
-     *  grant. `pendingEax` preserves a CV BOOL result across the second wait. */
     private onWaitTimeout(tid: number): void {
         const t = this.threads.get(tid);
         if (t && t.state === ThreadState.WAITING) {
@@ -4768,6 +4766,9 @@ export class Scheduler {
         }
     }
 
+    /** A woken thread whose SRW lock is contended stays WAITING, re-registered
+     *  on the lock's wait event; the eventual ReleaseSRWLock* wake retries the
+     *  grant. `pendingEax` preserves a CV BOOL result across the second wait. */
     private requeueSrwWait(thread: Thread, lockPtr: number, exclusive: boolean, pendingEax?: number): void {
         this.waitEngine.unregisterWait(thread);
         const waitEvent = ensureSrwWaitEvent(lockPtr, this);

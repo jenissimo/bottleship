@@ -406,32 +406,6 @@ export class WinMM implements IModule {
     private timers: Map<number, WinMMTimer> = new Map();
     private timersByWheel: Map<number, WinMMTimer> = new Map();
     private nextTimerId = 1;
-
-    constructor() {
-        setTimerHandler(TimerKind.WINMM_TIMER, (_owner, _arg, wheelId) => {
-            const timer = this.timersByWheel.get(wheelId);
-            if (!timer) return;
-            if (!timer.isPeriodic && !timer.collapsedSelfRearm) this.timersByWheel.delete(wheelId);
-            this.onTimerFire(timer);
-        });
-        setTimerHandler(TimerKind.WAVEOUT_COMPLETION, (hwo, _arg, wheelId) => {
-            const device = this.waveOutDevices.get(hwo);
-            if (!device || device.completionPollerId !== wheelId) return;
-            this.syncGuestToSab(device);
-            this.checkCompletions(device);
-        });
-    }
-
-    private armTimerWheel(timer: WinMMTimer, delayMs: number, periodic: boolean, now: number): void {
-        this.timersByWheel.delete(timer.wheelId);
-        timer.wheelId = System.getInstance().scheduler.timerWheel.add(delayMs, periodic, TimerKind.WINMM_TIMER, 0, now);
-        this.timersByWheel.set(timer.wheelId, timer);
-    }
-
-    private cancelTimerWheel(timer: WinMMTimer): void {
-        System.getInstance().scheduler?.timerWheel.cancel(timer.wheelId);
-        this.timersByWheel.delete(timer.wheelId);
-    }
     private mmioHandles: Map<number, MMIOHandle> = new Map();
     /** Diagnostic: snapshot of the last MMIOINFO our direct-I/O path wrote, so a
      *  harness can verify mmioGetInfo/mmioAdvance produce valid non-null buffer
@@ -494,6 +468,32 @@ export class WinMM implements IModule {
         drainBatches: 0, drainCallbacks: 0, multiCallbackDrains: 0, maxDrainBatch: 0,
     };
     private timerCallbackDrainCount = 0;
+
+    constructor() {
+        setTimerHandler(TimerKind.WINMM_TIMER, (_owner, _arg, wheelId) => {
+            const timer = this.timersByWheel.get(wheelId);
+            if (!timer) return;
+            if (!timer.isPeriodic && !timer.collapsedSelfRearm) this.timersByWheel.delete(wheelId);
+            this.onTimerFire(timer);
+        });
+        setTimerHandler(TimerKind.WAVEOUT_COMPLETION, (hwo, _arg, wheelId) => {
+            const device = this.waveOutDevices.get(hwo);
+            if (!device || device.completionPollerId !== wheelId) return;
+            this.syncGuestToSab(device);
+            this.checkCompletions(device);
+        });
+    }
+
+    private armTimerWheel(timer: WinMMTimer, delayMs: number, periodic: boolean, now: number): void {
+        this.timersByWheel.delete(timer.wheelId);
+        timer.wheelId = System.getInstance().scheduler.timerWheel.add(delayMs, periodic, TimerKind.WINMM_TIMER, 0, now);
+        this.timersByWheel.set(timer.wheelId, timer);
+    }
+
+    private cancelTimerWheel(timer: WinMMTimer): void {
+        System.getInstance().scheduler?.timerWheel.cancel(timer.wheelId);
+        this.timersByWheel.delete(timer.wheelId);
+    }
 
     /** Snapshot of timer subsystem state for dbg.timers(). */
     getTimerDebugState(): any {

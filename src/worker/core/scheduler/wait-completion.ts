@@ -1,4 +1,5 @@
 import type { WaitAnswer, WaitCompletion, WaitCompletionKind } from './types';
+import { Logger, LogCategory } from '../logger';
 
 export type WaitCompletionHandler = (completion: WaitCompletion, waitResult: number) => WaitAnswer;
 
@@ -6,6 +7,15 @@ export type WaitCompletionHandler = (completion: WaitCompletion, waitResult: num
 const handlers: (WaitCompletionHandler | undefined)[] = [];
 
 export function setWaitCompletionHandler(kind: WaitCompletionKind, handler: WaitCompletionHandler): void {
+    const current = handlers[kind];
+    if (current && current !== handler) {
+        Logger.error(LogCategory.THREAD, `wait completion kind ${kind} already has a handler; the new one is ignored`);
+        return;
+    }
+    handlers[kind] = handler;
+}
+
+export function replaceWaitCompletionHandler(kind: WaitCompletionKind, handler: WaitCompletionHandler): void {
     handlers[kind] = handler;
 }
 

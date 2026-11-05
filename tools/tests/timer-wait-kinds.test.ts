@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { Scheduler } from "../../src/worker/core/scheduler/scheduler";
-import { TimerWheel } from "../../src/worker/core/scheduler/timer-wheel";
+import { clearTimerHandler, getTimerHandler, replaceTimerHandler, setTimerHandler, TimerWheel } from "../../src/worker/core/scheduler/timer-wheel";
 import { completeWait } from "../../src/worker/core/scheduler/wait-completion";
 import {
     ThreadState, TimerKind, WAIT_OBJECT_0, WAIT_TIMEOUT, WaitCompletionKind, type Thread,
@@ -65,6 +65,24 @@ describe("timer wheel entries are kinds plus data", () => {
         const id = wheel.add(5, false, TimerKind.USER32_TIMER, 0x77, 0, 9);
         wheel.poll(5);
         expect(seen).toEqual([[0x77, 9, id]]);
+    });
+
+    test("a second, different handler for a kind is refused; replace and clear are explicit", () => {
+        const kind = TimerKind.THREADPOOL_WAIT;
+        const saved = getTimerHandler(kind);
+        try {
+            const first = () => {};
+            const second = () => {};
+            clearTimerHandler(kind);
+            setTimerHandler(kind, first);
+            setTimerHandler(kind, first);
+            setTimerHandler(kind, second);
+            expect(getTimerHandler(kind)).toBe(first);
+            replaceTimerHandler(kind, second);
+            expect(getTimerHandler(kind)).toBe(second);
+        } finally {
+            if (saved) replaceTimerHandler(kind, saved); else clearTimerHandler(kind);
+        }
     });
 
     test("entries armed through the APIs hold no behaviour and survive structured cloning", () => {

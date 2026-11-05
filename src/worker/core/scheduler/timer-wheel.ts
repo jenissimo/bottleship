@@ -36,8 +36,28 @@ export type TimerHandler = (owner: number, arg: number, timerId: number) => void
 /** @transient(behaviour, not data: each kind's owner module installs its handler when it is created) */
 const timerHandlers: (TimerHandler | undefined)[] = [];
 
+/**
+ * Install the one handler for `kind`. A kind has a single owner, so a second, different
+ * handler is a bug (a factory that ran twice would silently strand the first one's
+ * timers): it is logged and the first handler stays. Owners that are rebuilt on purpose
+ * use replaceTimerHandler.
+ */
 export function setTimerHandler(kind: TimerKind, handler: TimerHandler): void {
+    const current = timerHandlers[kind];
+    if (current && current !== handler) {
+        Logger.error(LogCategory.THREAD, `TimerWheel: kind ${kind} already has a handler; the new one is ignored`);
+        return;
+    }
     timerHandlers[kind] = handler;
+}
+
+export function replaceTimerHandler(kind: TimerKind, handler: TimerHandler): void {
+    timerHandlers[kind] = handler;
+}
+
+/** Drop the handler of `kind` so a deliberately rebuilt owner (a test fixture) can install its own. */
+export function clearTimerHandler(kind: TimerKind): void {
+    timerHandlers[kind] = undefined;
 }
 
 export function getTimerHandler(kind: TimerKind): TimerHandler | undefined {
