@@ -15,6 +15,9 @@ const SW_SHOWNORMAL = 1;
 const WS_OVERLAPPEDWINDOW = 0x00CF0000;
 const WS_VISIBLE = 0x10000000;
 const WS_MAXIMIZE = 0x01000000;
+const WS_POPUP = 0x80000000;
+const WS_CHILD = 0x40000000;
+const SW_SHOWMINIMIZED = 2;
 
 const WNDPROC = 0x00401000;
 const WNDCLASS = 0x11000;
@@ -73,9 +76,9 @@ afterEach(() => {
     for (const h of created.splice(0)) windows.delete(h);
 });
 
-function create(style: number): number {
+function create(style: number, parent = 0): number {
     const r = createWindowExports()['CreateWindowExA']!({ esp: ESP } as never, mem,
-        [0, CLASS_NAME, 0, style, 10, 20, 400, 300, 0, 0, 0x400000, 0] as never) as { value: number } | number;
+        [0, CLASS_NAME, 0, style >>> 0, 10, 20, 400, 300, parent, 0, 0x400000, 0] as never) as { value: number } | number;
     const hwnd = typeof r === 'number' ? r : r.value;
     created.push(hwnd);
     drain();
@@ -136,4 +139,38 @@ test('resizing the hidden window first does not use up the first show\'s WM_SIZE
     createWindowExports()['SetWindowPos']!({ esp: ESP } as never, mem, [hwnd, 0, 0, 0, 500, 350, 0x0002 | 0x0004 | 0x0010] as never);
     drain();
     expect(show(hwnd, SW_SHOWNORMAL)).toEqual([WM_SHOWWINDOW, WM_SIZE, WM_MOVE]);
+});
+
+test('a hidden minimized show reports SIZE_MINIMIZED with lParam 0', () => {
+    const hwnd = create(WS_OVERLAPPEDWINDOW);
+    show(hwnd, SW_SHOWMINIMIZED);
+    const size = invoked.find((c) => c.args[1] === WM_SIZE)!;
+    expect(size.args[2]).toBe(1);
+    expect(size.args[3]).toBe(0);
+});
+
+test('hidden popup and child windows do not defer their size to the first show', () => {
+    const popup = create(WS_POPUP);
+    expect(show(popup, SW_SHOWNORMAL)).toEqual([WM_SHOWWINDOW]);
+    const parent = create(WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+    const child = create(WS_CHILD, parent);
+    expect(show(child, SW_SHOWNORMAL)).toEqual([WM_SHOWWINDOW]);
+});
+
+test('a window SetWindowPos already showed gets no late WM_SIZE from a later ShowWindow', () => {
+    const hwnd = create(WS_OVERLAPPEDWINDOW);
+    createWindowExports()['SetWindowPos']!({ esp: ESP } as never, mem, [hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0040] as never);
+    drain();
+    expect(show(hwnd, SW_SHOWNORMAL)).not.toContain(WM_SIZE);
+});
+
+test('WM_SIZE and WM_MOVE follow a WM_SHOWWINDOW that suspended into the guest, each on its completion', () => {
+    const hwnd = create(WS_OVERLAPPEDWINDOW);
+    const before = invoked.length;
+    createWindowExports()['ShowWindow']!({ esp: ESP } as never, mem, [hwnd, SW_SHOWNORMAL] as never);
+    expect(invoked.slice(before).map((c) => c.args[1])).toEqual([WM_SHOWWINDOW]);
+    invoked[before]!.complete?.(0);
+    expect(invoked.slice(before).map((c) => c.args[1])).toEqual([WM_SHOWWINDOW, WM_SIZE]);
+    invoked[before + 1]!.complete?.(0);
+    expect(invoked.slice(before).map((c) => c.args[1])).toEqual([WM_SHOWWINDOW, WM_SIZE, WM_MOVE]);
 });

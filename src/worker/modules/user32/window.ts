@@ -1194,7 +1194,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         // WM_CREATE into it is a guest round-trip for a no-op (dialog children skip it
         // the same way). CBT hooks still fire below when present.
         const hasGuestCreateProc = !!windowInfo.wndProc && !windowInfo.isSystemControl;
-        if (!windowInfo.visible) windowInfo.sizeMovePending = true;
+        if (!windowInfo.visible && (windowInfo.style & (0x40000000 | 0x80000000)) === 0) windowInfo.sizeMovePending = true;
 
         if (!callbackManager || (!hasGuestCreateProc && totalCbtHooks === 0)) {
             postInitialVisibleWindowMessages(windowInfo);
@@ -1928,11 +1928,14 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         let chainFrameId = existingFrameId;
         let chainDirect: { returnAddr: number; postEsp: number } | undefined;
         let pendingSizeMoveSuspension: { callbackId: number; reusedFrame: boolean } | null = null;
+        const minMaxBefore = window.style & (WS_MINIMIZE | WS_MAXIMIZE);
         const sendPendingSizeMove = (): number | null => {
             const live = windows.get(hWnd);
             if (!live || !show || !live.sizeMovePending) return resultValue;
+            if (!visibilityChanged && (live.style & (WS_MINIMIZE | WS_MAXIMIZE)) === minMaxBefore) return resultValue;
             live.sizeMovePending = false;
             const sizeType = (live.style & WS_MAXIMIZE) !== 0 ? 2 : ((live.style & WS_MINIMIZE) !== 0 ? 1 : 0);
+            const sizeLParam = sizeType === 1 ? 0 : makeGeometryLParam(live.width, live.height);
             const sendMove = (): number | null => {
                 const move = trySuspendForSyncWindowMessage(
                     ctx, hWnd, WM_MOVE_GEO, 0, makeGeometryLParam(live.x, live.y),
@@ -1941,7 +1944,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 return move.suspended ? null : resultValue;
             };
             const size = trySuspendForSyncWindowMessage(
-                ctx, hWnd, WM_SIZE_GEO, sizeType, makeGeometryLParam(live.width, live.height),
+                ctx, hWnd, WM_SIZE_GEO, sizeType, sizeLParam,
                 'ShowWindow', stackCleanup, sendMove, chainFrameId || undefined, chainDirect,
             );
             if (!size.suspended) return resultValue;
