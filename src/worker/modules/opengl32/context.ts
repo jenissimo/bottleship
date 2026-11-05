@@ -21,6 +21,8 @@ import { GL_MODELVIEW, GL_LESS, GL_ONE, GL_ZERO, GL_ALWAYS, GL_BACK, GL_CCW, GL_
 /** Floats per vertex in the flat buffer: [x,y,z,w, r,g,b,a, nx,ny,nz, s0,t0,s1,t1] */
 export const VERT_FLOATS = 15;
 
+export const VERT_FOG_DIST = 8;
+
 // ---- Pre-baked display list types ----
 
 export type GLPrebakedItem =
