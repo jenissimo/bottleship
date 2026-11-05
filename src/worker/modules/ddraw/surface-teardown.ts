@@ -8,6 +8,7 @@
  */
 import type { DirectDrawSurfaceState } from "./com-objects";
 
+// @transient(wiring registered at module init)
 const hooks: ((state: DirectDrawSurfaceState) => void)[] = [];
 
 export function registerSurfaceTeardownHook(hook: (state: DirectDrawSurfaceState) => void): void {

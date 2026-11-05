@@ -59,6 +59,8 @@ export async function captureSession(
 ): Promise<CaptureResult> {
     const refusal = coverageRefusal(target, participants);
     if (refusal) throw new CaptureRefusal(refusal);
+    for (const p of participants.all()) await p.prepare?.();
+    stillReady();
     const sections = new Map<string, SaveValue>();
     const sizes: Record<string, number> = {};
     const run = newCaptureRun();

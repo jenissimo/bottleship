@@ -63,8 +63,11 @@ const TOPOLOGY_MAP: Record<number, string> = {
     6: "trianglefan",
 };
 
+// @transient(cache derived from the viewport size)
 let cachedDefaultMvpWidth = -1;
+// @transient(cache derived from the viewport size)
 let cachedDefaultMvpHeight = -1;
+// @transient(cache derived from the viewport size)
 const cachedDefaultMvp = new Float32Array(16);
 
 /**

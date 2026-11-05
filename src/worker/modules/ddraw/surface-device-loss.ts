@@ -44,6 +44,7 @@ export interface SurfaceLossTally {
 export type SurfaceEntry = { state: DirectDrawSurfaceState };
 export type SurfaceSource = () => Iterable<SurfaceEntry>;
 
+// @transient(wiring registered at module init)
 const sources = new Map<string, SurfaceSource>();
 
 /**
@@ -179,6 +180,7 @@ export function restoreAllLostSurfaces(): number {
 // path defers to JS for as long as it is non-zero, so a leak here is a permanent slow path.
 registerSurfaceTeardownHook((state) => forgetLossTrackedSurface(state));
 
+// @transient(diagnostics)
 let lastTally: SurfaceLossTally | null = null;
 
 /** The most recent loss's tally — what came back and what did not. */
