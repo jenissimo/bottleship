@@ -37,6 +37,7 @@ const ERROR_INVALID_PARAMETER = 87;
 const ERROR_FILE_NOT_FOUND = 2;
 const ERROR_PATH_NOT_FOUND = 3;
 const ERROR_BAD_FORMAT = 11;
+const ERROR_BAD_EXE_FORMAT = 193;
 const ERROR_CALL_NOT_IMPLEMENTED = 120;
 const ERROR_PARTIAL_COPY = 299;
 const ERROR_NO_MORE_FILES = 18;
@@ -823,7 +824,7 @@ export function resolveCommandLineImage(system: System, commandLine: string): Co
     }
     return {
         imagePath: "", reExecArgs: "",
-        error: pathNotFound ? ERROR_PATH_NOT_FOUND : badFormat ? 193 : ERROR_FILE_NOT_FOUND,
+        error: pathNotFound ? ERROR_PATH_NOT_FOUND : badFormat ? ERROR_BAD_EXE_FORMAT : ERROR_FILE_NOT_FOUND,
     };
 }
 
@@ -887,7 +888,7 @@ const finishVirtualProcess = (
         // duck-typed `code` would also match DOMException's legacy numeric codes
         // (NotFoundError = 8, DataCloneError = 25), turning a VFS or postMessage failure
         // during start into an errno Win32 never produced.
-        setError(win32ErrorOf(error) ?? 193);
+        setError(win32ErrorOf(error) ?? ERROR_BAD_EXE_FORMAT);
         Logger.warn(LogCategory.SYSTEM, 'Child image preparation failed: ' + String(error));
         return { value: 0, stackCleanup: 40 };
     });
@@ -954,7 +955,7 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
         );
     }
     return failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide,
-        imagePath && system.fileSystem.fileExists(imagePath) ? 193 : lookupError, errOut); // BAD_EXE_FORMAT / FILE_NOT_FOUND / PATH_NOT_FOUND
+        imagePath && system.fileSystem.fileExists(imagePath) ? ERROR_BAD_EXE_FORMAT : lookupError, errOut); // BAD_EXE_FORMAT / FILE_NOT_FOUND / PATH_NOT_FOUND
 };
 
 /**
@@ -1272,16 +1273,14 @@ export const exports: Record<string, ThunkImplementation> = {
         };
         const errOut = { code: 0 };
         const result = createVirtualProcess(mem, [0, lpCmdLine, 0, 0, 0, 0, 0, 0, 0, processInfo], false, errOut);
-        // WinExec has an answer for exactly these failures: file not found, path not
-        // found, and a file that is not a valid image (CreateProcess records 193
-        // BAD_EXE_FORMAT for a child that could not load or prepare its image, which
-        // WinExec reports as its own ERROR_BAD_FORMAT). Anything else is 0, "failed",
-        // rather than a made-up reason: a start that failed with, say, access denied
-        // must not read as a missing file.
+        // WinExec's return value doubles as its error code: anything under 32 is the
+        // GetLastError of the failed CreateProcess, anything else means failure.
+        // Wine (dlls/kernel32/process.c) therefore hands back the recorded code as it
+        // is when it is below 32 - access denied (5) stays 5 - and falls back to its
+        // own ERROR_BAD_FORMAT for the rest, which is where 193 BAD_EXE_FORMAT from a
+        // child that could not load its image ends up.
         const toFailure = (code: number): number =>
-            code === ERROR_FILE_NOT_FOUND || code === ERROR_PATH_NOT_FOUND ? code
-                : code === ERROR_BAD_FORMAT || code === 193 ? ERROR_BAD_FORMAT
-                : 0;
+            code > 0 && code < 32 ? code : ERROR_BAD_FORMAT;
         if (result instanceof Promise) {
             return result.then(
                 // A child whose start fails resolves with value 0 and its code

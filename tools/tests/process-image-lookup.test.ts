@@ -213,6 +213,35 @@ describe('CreateProcess image lookup for a bare command line', () => {
         expect(worker.terminated).toBe(true);
     });
 
+    test('a failure code below 32 is WinExec’s answer as it is', async () => {
+        system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
+        autoReady = false;
+        const pending = Promise.resolve(processApi.WinExec!(undefined as never, memory, [text('C:\\System\\helper.exe'), 1]));
+        const worker = await booted();
+        // Access denied is a failure WinExec passes through unchanged: the docs read any
+        // value under 32 as the GetLastError of the failed CreateProcess, so reporting
+        // 0 ("out of memory or resources") would name a cause that never happened.
+        worker.onmessage?.({ data: { type: 'error', message: 'child loader failed', win32Error: 5 } });
+        const result = await pending;
+        expect(typeof result === 'number' ? result : result.value).toBe(5); // ERROR_ACCESS_DENIED
+        expect(lastError).toBe(5);
+        await stopChildProcesses();
+    });
+
+    test('a failure code of 32 or more is not a WinExec answer and becomes ERROR_BAD_FORMAT', async () => {
+        system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
+        autoReady = false;
+        const pending = Promise.resolve(processApi.WinExec!(undefined as never, memory, [text('C:\\System\\helper.exe'), 1]));
+        const worker = await booted();
+        // A code of 32 or more would read as success, so WinExec substitutes its own
+        // ERROR_BAD_FORMAT for it, as Wine's WinExec does.
+        worker.onmessage?.({ data: { type: 'error', message: 'child loader failed', win32Error: 87 } });
+        const result = await pending;
+        expect(typeof result === 'number' ? result : result.value).toBe(11);
+        expect(lastError).toBe(87);
+        await stopChildProcesses();
+    });
+
     test('a failure code that is not a reported Win32 error is not adopted as one', async () => {
         system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
         autoReady = false;
@@ -261,9 +290,10 @@ describe('CreateProcess image lookup for a bare command line', () => {
                 compression: 0, localHeaderOffset: 0, isDirectory: false } as ZipEntry],
         ]));
         const result = await processApi.WinExec!(undefined as never, memory, [text('C:\\System\\empty.exe'), 1]);
-        // WinExec's answer for a file that is not an image; the child is never created.
+        // CreateProcess records 193 for a file that is not a Win32 image; WinExec's own
+        // answer for it is ERROR_BAD_FORMAT, and the thread sees the 193 it recorded.
         expect(typeof result === 'number' ? result : result.value).toBe(11);
-        expect(lastError).toBe(11);
+        expect(lastError).toBe(193);
         expect(workers).toHaveLength(0);
     });
 });

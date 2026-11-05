@@ -472,7 +472,7 @@ describe('child image loader error codes', () => {
     });
 
     test('an empty image is ERROR_BAD_EXE_FORMAT', async () => {
-        expect(win32ErrorOf(await load(filesystem(new Uint8Array(0)), 'C:\\helper.exe'))).toBe(11);
+        expect(win32ErrorOf(await load(filesystem(new Uint8Array(0)), 'C:\\helper.exe'))).toBe(193);
     });
 
     test('a read failure is not a Win32 condition and claims no code', async () => {

@@ -19,7 +19,9 @@ export interface ChildProcessPreparation { imagePatches?: GuestImagePatch[]; }
  */
 const ERROR_FILE_NOT_FOUND = 2;
 const ERROR_PATH_NOT_FOUND = 3;
-const ERROR_BAD_EXE_FORMAT = 11;
+// 193 is what CreateProcess reports for a file that is not a Win32 image. 11 is a
+// different code, ERROR_BAD_FORMAT, which only WinExec hands back as its own answer.
+const ERROR_BAD_EXE_FORMAT = 193;
 
 /** A child start that failed for a condition Windows itself names. */
 class ChildStartFailure extends Error {
