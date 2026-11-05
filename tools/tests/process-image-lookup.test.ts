@@ -253,4 +253,17 @@ describe('CreateProcess image lookup for a bare command line', () => {
         const worker = await booted();
         expect(worker.boot!.imagePath.toLowerCase()).toBe('c:\\system\\my.app\\helper.exe');
     });
+
+    test('an image that exists but holds nothing fails the launch instead of waiting', async () => {
+        system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
+        mountRom(new Map<string, ZipEntry>([
+            ['system/empty.exe', { name: 'system/empty.exe', uncompressedSize: 0, compressedSize: 0,
+                compression: 0, localHeaderOffset: 0, isDirectory: false } as ZipEntry],
+        ]));
+        const result = await processApi.WinExec!(undefined as never, memory, [text('C:\\System\\empty.exe'), 1]);
+        // WinExec's answer for a file that is not an image; the child is never created.
+        expect(typeof result === 'number' ? result : result.value).toBe(11);
+        expect(lastError).toBe(11);
+        expect(workers).toHaveLength(0);
+    });
 });

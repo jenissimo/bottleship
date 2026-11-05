@@ -3,7 +3,7 @@
 
 import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
 import {
-    promoteChildSession, hasChildSession, pendingChildHandoff,
+    promoteChildSession, hasChildSession, pendingChildHandoff, win32ErrorOf,
     type ChildProcessRequest, type ChildProcessRecord,
 } from '../../../core/child-process';
 import { Logger, LogCategory } from '../../../core/logger';
@@ -881,15 +881,13 @@ const finishVirtualProcess = (
         system.resourceProvider.unregisterKernelObject(proc.threadHandle);
         system.resourceProvider.unregisterKernelObject(proc.processHandle);
         writeProcessInformationZeroed(lpProcessInformation);
-        // A child that could not load or prepare its image reads as 193
-        // BAD_EXE_FORMAT; a child loader that knows which Win32 error it hit reports
-        // it through win32Error. The field is one only child-process.ts sets, and
-        // reading a duck-typed `code` instead would also match DOMException's legacy
-        // numeric codes (NotFoundError = 8, DataCloneError = 25), turning a VFS or
-        // postMessage failure during start into an errno Win32 never produced. A
-        // reported 0 is not a report either: it would fail the call with GetLastError 0.
-        const reported = (error as { win32Error?: number } | null)?.win32Error;
-        setError(typeof reported === 'number' && reported > 0 ? reported : 193);
+        // A child that could not load or prepare its image reads as 193 BAD_EXE_FORMAT;
+        // a start that failed for a condition Windows names reports it through
+        // win32Error instead (child-process.ts is the only producer). Reading a
+        // duck-typed `code` would also match DOMException's legacy numeric codes
+        // (NotFoundError = 8, DataCloneError = 25), turning a VFS or postMessage failure
+        // during start into an errno Win32 never produced.
+        setError(win32ErrorOf(error) ?? 193);
         Logger.warn(LogCategory.SYSTEM, 'Child image preparation failed: ' + String(error));
         return { value: 0, stackCleanup: 40 };
     });
@@ -1274,12 +1272,16 @@ export const exports: Record<string, ThunkImplementation> = {
         };
         const errOut = { code: 0 };
         const result = createVirtualProcess(mem, [0, lpCmdLine, 0, 0, 0, 0, 0, 0, 0, processInfo], false, errOut);
-        // WinExec's failure value is the CreateProcess error, minus BAD_EXE_FORMAT which
-        // reads as ERROR_BAD_FORMAT (the historical WinExec code for a non-executable).
+        // WinExec has an answer for exactly these failures: file not found, path not
+        // found, and a file that is not a valid image (CreateProcess records 193
+        // BAD_EXE_FORMAT for a child that could not load or prepare its image, which
+        // WinExec reports as its own ERROR_BAD_FORMAT). Anything else is 0, "failed",
+        // rather than a made-up reason: a start that failed with, say, access denied
+        // must not read as a missing file.
         const toFailure = (code: number): number =>
-            code === 193 ? ERROR_BAD_FORMAT
-                : code === ERROR_PATH_NOT_FOUND ? ERROR_PATH_NOT_FOUND
-                : ERROR_FILE_NOT_FOUND;
+            code === ERROR_FILE_NOT_FOUND || code === ERROR_PATH_NOT_FOUND ? code
+                : code === ERROR_BAD_FORMAT || code === 193 ? ERROR_BAD_FORMAT
+                : 0;
         if (result instanceof Promise) {
             return result.then(
                 // A child whose start fails resolves with value 0 and its code
