@@ -61,13 +61,15 @@ function processOf(handle: number): { pid: number; imagePath: string } | null {
     const p = getVirtualProcessManager().describeProcessHandle(handle);
     if (!p) return null;
     if (p.pid === VIRTUAL_CURRENT_PROCESS_ID) return { pid: p.pid, imagePath: system.executablePath };
-    return { pid: p.pid, imagePath: childImagePath(p.commandLine, p.imageName, p.currentDirectory) };
+    // The lookup already settled on a file; a record without one is the only case
+    // where the command line has to be read again.
+    return { pid: p.pid, imagePath: p.imagePath ?? childImagePath(p.commandLine, p.imageName, p.currentDirectory) };
 }
 
 /** A child's image as its command line names it, made absolute against its directory. */
 function childImagePath(commandLine: string, imageName: string, currentDirectory: string): string {
     const line = commandLine.trim();
-    let token = line.startsWith('"') ? line.slice(1, Math.max(1, line.indexOf('"', 1))) : line.split(' ')[0];
+    let token = line.startsWith('"') ? line.slice(1, Math.max(1, line.indexOf('"', 1))) : line.search(/\s/) < 0 ? line : line.slice(0, line.search(/\s/));
     if (!token) token = imageName;
     token = token.replace(/\//g, '\\');
     if (/^[A-Za-z]:\\/.test(token)) return token;

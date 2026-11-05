@@ -76,6 +76,8 @@ interface VirtualProcessRecord {
     pid: number;
     parentPid: number;
     imageName: string;
+    /** The executable the lookup settled on, when it settled on one. */
+    imagePath?: string;
     commandLine: string;
     currentDirectory: string;
     terminated: boolean;
@@ -295,6 +297,7 @@ export class VirtualProcessManager {
             pid,
             parentPid: VIRTUAL_CURRENT_PROCESS_ID,
             imageName,
+            imagePath: params.imagePath,
             commandLine: params.commandLine,
             currentDirectory: params.currentDirectory,
             terminated: false,
@@ -367,11 +370,14 @@ export class VirtualProcessManager {
 
     /** What a process handle names, for the APIs that report on the process itself. */
     describeProcessHandle(handle: number): {
-        pid: number; imageName: string; commandLine: string; currentDirectory: string;
+        pid: number; imageName: string; imagePath?: string; commandLine: string; currentDirectory: string;
     } | null {
         this.pruneStaleHandles();
         const p = this.processesByHandle.get(handle >>> 0);
-        return p ? { pid: p.pid, imageName: p.imageName, commandLine: p.commandLine, currentDirectory: p.currentDirectory } : null;
+        return p ? {
+            pid: p.pid, imageName: p.imageName, imagePath: p.imagePath,
+            commandLine: p.commandLine, currentDirectory: p.currentDirectory,
+        } : null;
     }
 
     hasProcessHandle(handle: number): boolean {
