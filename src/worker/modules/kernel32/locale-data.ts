@@ -334,17 +334,22 @@ export function fastPathLcids(): number[] {
 }
 
 /** GetLocaleInfoW's bytes (UTF-16LE, NUL included) for the process locale, by cleanType. */
+// @transient(cache derived from the locale tables)
 export let _localeWCache: Map<number, Uint8Array> | null = null;
 /** GetLocaleInfoA's bytes (NUL included) for the same types in the process ANSI page.
  *  FONTSIGNATURE and SSHORTTIME are absent: A answers the first by count and refuses the
  *  second. */
+// @transient(cache derived from the locale tables)
 export let _localeACache: Map<number, Uint8Array> | null = null;
 /** RETURN_NUMBER values by cleanType. Uint32, not Uint16: the out-param is a DWORD and a
  *  page number (10000) or a GEOID must survive the store. */
+// @transient(cache derived from the locale tables)
 export let _localeWNumCache: Uint32Array | null = null;
 /** 1 where the type is numeric; RETURN_NUMBER on any other type is ERROR_INVALID_FLAGS. */
+// @transient(cache derived from the locale tables)
 export let _localeIsNumber: Uint8Array | null = null;
 /** fastPathLcids(), frozen with the answer cache it gates. */
+// @transient(cache derived from the locale tables)
 export let _localeFastLcids: Set<number> | null = null;
 export const LOCALE_CACHE_SIZE = 0x1100;
 
@@ -435,6 +440,7 @@ export function writeLocaleStubDestLimit(mem: Uint8Array, tableAddr: number, mem
 }
 
 /** Guest address of the installed stub table, or 0 when no stub was emitted. */
+// @transient(written while the image loads; the fresh worker writes the same table, which the boot-layout key pins)
 let installedLocaleStubTable = 0;
 export function localeStubTableAddr(): number { return installedLocaleStubTable; }
 

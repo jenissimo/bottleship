@@ -39,6 +39,7 @@ export interface LocaleInlineStubs {
  *  inside guest code, so it is invisible to slowPathThunks / apiCensus / breakOnApi —
  *  "the count went to zero" and "the stub was never installed" look identical from every
  *  instrument we own. These counters are the only thing that tells them apart. */
+// @transient(written while the image loads; the fresh worker writes the same stubs, which the boot-layout key pins)
 let installed: LocaleInlineStubs | null = null;
 
 export function getLocaleInlineStubs(): LocaleInlineStubs | null {

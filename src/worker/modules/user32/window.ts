@@ -150,7 +150,7 @@ export function clientSizeFromCreateWindow(
 const makeGeometryLParam = (lo: number, hi: number): number =>
     (((lo & 0xFFFF) | ((hi & 0xFFFF) << 16)) >>> 0);
 
-interface DeferredWindowPosEntry {
+export interface DeferredWindowPosEntry {
     hWnd: number;
     hWndInsertAfter: number;
     x: number;
@@ -160,7 +160,9 @@ interface DeferredWindowPosEntry {
     uFlags: number;
 }
 
+// @participant(user32)
 const deferWindowPosBatches = new Map<number, DeferredWindowPosEntry[]>();
+// @participant(user32)
 let nextDeferWindowPosHandle = 1;
 
 interface ApplyWindowPosOptions {
@@ -515,6 +517,7 @@ const WM_ERASEBKGND_PAINT = 0x0014;
  * Win32 hands the erase a DC clipped to the update region; the class-brush fill must
  * respect that or an InvalidateRect of one control's rect repaints the whole client.
  */
+// @refuse(a WM_ERASEBKGND is in flight)
 const pendingEraseRects = new Map<number, ClientRect>();
 
 /**
@@ -796,6 +799,7 @@ export function runDefaultWindowPaint(
  */
 type SyncWndProcImpl = (ctx: X86Context, mem: Uint8Array, args: number[]) => number | ThunkResult;
 
+// @transient(wiring set at module init)
 let defWindowProcImpl: SyncWndProcImpl | null = null;
 
 export function defaultWindowProc(
@@ -835,6 +839,7 @@ const SIZE_BORDER_CURSORS = [
 ];
 
 /** Windows whose parent WM_SETCURSOR offer is out with the guest. */
+// @refuse(a WM_SETCURSOR forward to a parent window is in flight)
 const setCursorForwardInFlight = new Set<number>();
 
 /** Bundle-switch reset: hwnds are recycled, so an unfinished offer must not outlive them. */
@@ -3179,4 +3184,20 @@ export function registerFastPathWindowFunctions(dispatcher: HleDispatcher): void
     dispatcher.registerFastPath('user32', 'GetForegroundWindow', getForeground, { trivial: true });
     dispatcher.registerFastPath('user32', 'ShowCursor', showCursor, { trivial: true });
     dispatcher.registerFastPath('user32', 'ShowWindow', showWindowNoop, { trivial: true });
+}
+
+export interface WindowPosState { deferBatches: Array<[number, DeferredWindowPosEntry[]]>; nextDeferHandle: number }
+
+export function captureWindowPosState(): WindowPosState {
+    if (setCursorForwardInFlight.size > 0) throw new Error('user32: a WM_SETCURSOR forward to a parent window is in flight');
+    if (pendingEraseRects.size > 0) throw new Error('user32: a WM_ERASEBKGND is in flight');
+    return { deferBatches: [...deferWindowPosBatches].map(([h, b]) => [h, b.map(e => ({ ...e }))]), nextDeferHandle: nextDeferWindowPosHandle };
+}
+
+export function restoreWindowPosState(s: WindowPosState): void {
+    deferWindowPosBatches.clear();
+    for (const [h, b] of s.deferBatches) deferWindowPosBatches.set(h, b.map(e => ({ ...e })));
+    nextDeferWindowPosHandle = s.nextDeferHandle;
+    setCursorForwardInFlight.clear();
+    pendingEraseRects.clear();
 }

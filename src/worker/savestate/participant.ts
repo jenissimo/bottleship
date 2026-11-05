@@ -1,5 +1,6 @@
 import { encodeValue, type SaveValue } from './value-codec';
 import type { ParticipantSchema } from './container';
+import type { ParticipantId } from './participant-ids';
 
 export interface CpuOverride {
     eip: number; esp: number;
@@ -21,7 +22,7 @@ export interface RestoreContext {
 export type FieldPolicy = 'save' | 'derive' | 'host' | 'transient';
 
 export interface Participant {
-    readonly id: string;
+    readonly id: ParticipantId;
     readonly version: number;
     readonly order?: number;
     readonly covers?: readonly string[];
@@ -40,6 +41,20 @@ export function pickSaved<T, P extends Record<keyof T, FieldPolicy>>(
         if (policy[key] === 'save') (out as Record<keyof T, unknown>)[key] = record[key];
     }
     return out;
+}
+
+export function pickDefined<T, P extends Record<keyof T, FieldPolicy>>(
+    record: T, policy: P,
+): Pick<T, SavedKeys<T, P>> {
+    const out = {} as Pick<T, SavedKeys<T, P>>;
+    for (const key of Object.keys(policy) as (keyof T)[]) {
+        if (policy[key] === 'save' && record[key] !== undefined) (out as Record<keyof T, unknown>)[key] = record[key];
+    }
+    return out;
+}
+
+export function savestatesEnabled(): boolean {
+    return (globalThis as { __savestates?: unknown }).__savestates === true;
 }
 
 export function normalizeModuleName(name: string): string {

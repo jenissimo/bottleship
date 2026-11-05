@@ -15,6 +15,15 @@
  * reviewable line in the pin diff (`bun tools/validate-session-state.ts --update`);
  * swapping one binding for another in the same file cannot pass unnoticed.
  *
+ * SAVESTATE COVERAGE. A module that a savestate participant `covers` (the DLL names in
+ * `covers: [...]`, matched to src/worker/modules/<dll>/, <dll>.ts and <dll>-*.ts) must
+ * classify every binding in its files, pinned or not, with one of
+ *   - `@participant(<id>)`: a participant captures it; the id must be listed in
+ *     savestate/participant-ids.ts;
+ *   - `@refuse(<reason>)`: capture refuses while it holds anything;
+ *   - `@transient(<reason>)`: not per-session state.
+ * A classified binding leaves the pin like a `@transient` one does.
+ *
  * WHAT IT MATCHES, on code with comments, strings and regex literals blanked and braces
  * counted (so indentation does not matter):
  *   - module scope: `let` / `var`, and `const X = new Ctor(…)` / `const X = []`, with or
@@ -66,6 +75,10 @@ const STATIC_FIELD = new RegExp(
 );
 const CLASS_DECL = /\bclass\s+([\w$]+)/;
 const TRANSIENT = /@transient\(([^)]*)\)/;
+const ANNOTATION = /@(transient|participant|refuse)\(([^)]*)\)/;
+const COVERS = /\bcovers\s*:\s*\[([^\]]*)\]/g;
+const QUOTED = /['"]([^'"]+)['"]/g;
+const PARTICIPANT_IDS = join("savestate", "participant-ids.ts");
 
 /** Keywords after which a `/` starts a regex literal rather than a division. */
 const REGEX_AFTER_WORD = /(?:^|[^\w$])(?:return|typeof|case|in|of|delete|void|throw|new|else|yield|await|do)$/;
@@ -169,8 +182,10 @@ function startsRegex(code: string | string[], at: number): boolean {
 export interface Census {
     /** Unannotated binding names, in source order: `name`, `factory.name` or `static Class.field`. */
     names: string[];
-    /** 1-based lines carrying `@transient()` with an empty reason. */
+    /** 1-based lines carrying `@transient()`, `@participant()` or `@refuse()` with an empty argument. */
     emptyReasons: number[];
+    /** `@participant(<id>)` annotations, by 1-based line. */
+    participants: { line: number; id: string }[];
 }
 
 export function censusOf(source: string): Census {
@@ -178,14 +193,19 @@ export function censusOf(source: string): Census {
     const code = stripNonCode(source).split(/\r?\n/);
     const names: string[] = [];
     const emptyReasons: number[] = [];
+    const participants: { line: number; id: string }[] = [];
     const classes: { name: string; depth: number }[] = [];
     let depth = 0;
     let factory: { name: string; entered: boolean } | null = null;
 
     const annotation = (i: number): "ok" | "empty" | "none" => {
         for (const line of [raw[i]!, i > 0 ? raw[i - 1]! : ""]) {
-            const m = TRANSIENT.exec(line);
-            if (m) return m[1]!.trim() ? "ok" : "empty";
+            const m = ANNOTATION.exec(line);
+            if (!m) continue;
+            const arg = m[2]!.trim();
+            if (!arg) return "empty";
+            if (m[1] === "participant") participants.push({ line: i + 1, id: arg });
+            return "ok";
         }
         return "none";
     };
@@ -238,7 +258,28 @@ export function censusOf(source: string): Census {
             else if (depth === 0) factory = null;
         }
     }
-    return { names, emptyReasons };
+    return { names, emptyReasons, participants };
+}
+
+/** The DLL a file under src/worker implements, by the modules/<dll>… layout; null outside it. */
+export function moduleOfFile(relToRoot: string): string | null {
+    const m = /^modules\/([^/]+?)(?:\/|\.ts$|-[^/]*\.ts$)/.exec(relToRoot);
+    return m ? m[1]!.toLowerCase() : null;
+}
+
+/** DLL names some participant lists in `covers: [...]` anywhere in the scanned tree. */
+export function coveredModulesOf(sources: Iterable<string>): Set<string> {
+    const out = new Set<string>();
+    for (const src of sources) {
+        const code = src.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
+        for (const m of code.matchAll(COVERS)) {
+            for (const q of m[1]!.matchAll(QUOTED)) {
+                const name = q[1]!.toLowerCase().replace(/\.(dll|drv|exe)$/, "");
+                if (name !== "*") out.add(name);
+            }
+        }
+    }
+    return out;
 }
 
 function walk(dir: string, out: string[]): void {
@@ -262,18 +303,45 @@ export interface CensusOptions {
 
 export interface CensusResult { ok: boolean; lines: string[] }
 
+interface FileCensus { rel: string; module: string | null; census: Census; source: string }
+
+function checkCoverage(root: string, scanned: FileCensus[]): string[] {
+    const problems: string[] = [];
+    const covered = coveredModulesOf(scanned.map(f => f.source));
+    const ids = new Set<string>();
+    try {
+        const text = readFileSync(join(root, PARTICIPANT_IDS), "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
+        for (const q of text.matchAll(QUOTED)) ids.add(q[1]!);
+    } catch {
+        ids.clear();
+    }
+    for (const { rel, module, census } of scanned) {
+        for (const p of census.participants) {
+            if (!ids.has(p.id)) problems.push(`  UNKNOWN PARTICIPANT: ${rel}:${p.line} — ${p.id} is not listed in ${PARTICIPANT_IDS.split(sep).join("/")}`);
+        }
+        if (module && covered.has(module) && census.names.length) {
+            problems.push(`  UNCLASSIFIED: ${rel} — ${census.names.join(", ")} (${module} is covered by a savestate participant)`);
+        }
+    }
+    return problems;
+}
+
 /** Compare the tree against the pin (or rewrite it). Never exits; main() does. */
 export function runCensus(opts: CensusOptions): CensusResult {
     const files: string[] = [];
     walk(opts.root, files);
     const current: Record<string, string[]> = {};
     const problems: string[] = [];
+    const scanned: FileCensus[] = [];
     for (const f of files.sort()) {
         const rel = relative(opts.base, f).split(sep).join("/");
-        const { names, emptyReasons } = censusOf(readFileSync(f, "utf8"));
-        for (const line of emptyReasons) problems.push(`  EMPTY REASON: ${rel}:${line} — @transient() needs a reason`);
-        if (names.length) current[rel] = [...names].sort();
+        const source = readFileSync(f, "utf8");
+        const census = censusOf(source);
+        scanned.push({ rel, module: moduleOfFile(relative(opts.root, f).split(sep).join("/")), census, source });
+        for (const line of census.emptyReasons) problems.push(`  EMPTY REASON: ${rel}:${line} — the annotation needs a reason or a participant id`);
+        if (census.names.length) current[rel] = [...census.names].sort();
     }
+    problems.push(...checkCoverage(opts.root, scanned));
     const total = (m: Record<string, string[]>) => Object.values(m).reduce((a, b) => a + b.length, 0);
 
     if (opts.update) {
@@ -308,7 +376,9 @@ export function runCensus(opts: CensusOptions): CensusResult {
                 "Per-session mutable state census CHANGED.\n\n" +
                 "A NEW binding outlives the guest session: move it into a store that System.reset()\n" +
                 "walks (core/session-state.ts), or annotate it `@transient(reason)`. A DRIFT or\n" +
-                "STALE PIN means a pinned binding is gone: re-pin with --update so the pin stays exact.\n",
+                "STALE PIN means a pinned binding is gone: re-pin with --update so the pin stays exact.\n" +
+                "UNCLASSIFIED bindings sit in a module a savestate participant covers: annotate each with\n" +
+                "`@participant(<id>)`, `@refuse(reason)` or `@transient(reason)`.\n",
                 ...problems,
             ],
         };

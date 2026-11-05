@@ -72,6 +72,7 @@ const IMAGE_FILE_DLL = 0x2000;
 const PE_SNIFF_BYTES = 0x1000;
 const IMAGE_SUBSYSTEM_WINDOWS_CUI = 3;
 
+// @participant(kernel32)
 let currentPriorityClass = NORMAL_PRIORITY_CLASS;
 
 /** Shared with native thread-information queries; no duplicate priority-class state. */
@@ -91,6 +92,7 @@ function isValidThreadPriority(priority: number): boolean {
 
 // Tracks the last ES_CONTINUOUS SetThreadExecutionState value.
 // Initial state: ES_CONTINUOUS only (no active power-management request).
+// @participant(kernel32)
 let threadExecutionState = 0x80000000; // ES_CONTINUOUS
 
 // ==================== Toolhelp32 Snapshot internals ====================
@@ -107,6 +109,7 @@ interface ToolhelpSnapshot {
 }
 
 /** Active snapshots keyed by handle. Cleaned up on access if handle was closed. */
+// @refuse(open toolhelp snapshots are not part of a v1 savestate)
 const toolhelpSnapshots = new Map<number, ToolhelpSnapshot>();
 
 export function resetProcessApiState(): void {
@@ -120,7 +123,7 @@ export function resetProcessApiState(): void {
 
 export function captureProcessApiState(): { priorityClass: number; executionState: number } {
     if (toolhelpSnapshots.size > 0) throw new Error('kernel32: open toolhelp snapshots are not part of a v1 savestate');
-    if (childImageByPid.size > 0 || virtualProcessMemoryByPid.size > 0) throw new Error('kernel32: child process images are not part of a v1 savestate');
+    if (childImageByPid.size > 0 || childImagePathsByPid.size > 0 || virtualProcessMemoryByPid.size > 0) throw new Error('kernel32: child process images are not part of a v1 savestate');
     return { priorityClass: currentPriorityClass, executionState: threadExecutionState };
 }
 
@@ -549,6 +552,7 @@ const isKnownProcessHandle = (handle: number): boolean => {
     return getVirtualProcessManager().hasProcessHandle(handle >>> 0);
 };
 
+// @refuse(child process images are not part of a v1 savestate)
 const virtualProcessMemoryByPid = new Map<number, Map<number, number>>();
 
 const getVirtualProcessPid = (handle: number): number | null => {
@@ -587,6 +591,7 @@ interface ChildImageMap {
     /** RVA -> file offset for the section containing it, or -1 when it maps to no raw bytes. */
     sections: Array<{ va: number; vsize: number; raw: number; rawSize: number }>;
 }
+// @refuse(child process images are not part of a v1 savestate)
 const childImageByPid = new Map<number, ChildImageMap | null>();
 
 const loadChildImage = (path: string): ChildImageMap | null => {
@@ -926,6 +931,7 @@ export function resolveCommandLineImage(system: System, commandLine: string): Co
 const CREATE_SUSPENDED = 0x00000004;
 
 // Image lookup remains process-local while a real child Worker owns execution.
+// @refuse(child process images are not part of a v1 savestate)
 const childImagePathsByPid = new Map<number, string>();
 
 const finishVirtualProcess = (
@@ -1195,9 +1201,13 @@ function fillVersionExW(mem: Uint8Array, lpVersionInfo: number, apiName: string)
     return 1;
 }
 
+// @transient(diagnostics)
 let rpmCalls = 0;
+// @transient(diagnostics)
 let lastRpmLog = 0;
+// @transient(diagnostics)
 let rpmPartial = 0;
+// @transient(diagnostics)
 let lastRpmPartialLog = 0;
 
 export const exports: Record<string, ThunkImplementation> = {

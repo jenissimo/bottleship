@@ -35,6 +35,14 @@ import { getVirtualProcessManager } from "../../src/worker/modules/kernel32/proc
 import { resetProcessStartupInfo } from "../../src/worker/core/process-startup-info";
 import { setFileApisAnsi } from "../../src/worker/modules/kernel32/file-io-strings";
 import { TimeService } from "../../src/worker/runtime/time";
+import { PARTICIPANT_IDS } from "../../src/worker/savestate/participant-ids";
+import { createMessageExports } from "../../src/worker/modules/user32/message";
+import { createInputExports } from "../../src/worker/modules/user32/input";
+import { createSystemExports } from "../../src/worker/modules/user32/system";
+import { createPaintingExports } from "../../src/worker/modules/gdi32/painting";
+import { clearTimerHandler } from "../../src/worker/core/scheduler/timer-wheel";
+import { exports as vistaRuntimeExports } from "../../src/worker/modules/kernel32/vista-runtime";
+import { exports as processExports } from "../../src/worker/modules/kernel32/process/process";
 
 const bytes = (v: unknown) => {
     const e = encodeValue(v as SaveValue);
@@ -226,6 +234,49 @@ describe("capture → restore → capture is byte-identical", () => {
     });
 });
 
+function registerAllParticipants(): void {
+    const flag = globalThis as { __savestates?: unknown };
+    flag.__savestates = true;
+    try {
+        clearTimerHandler(TimerKind.USER32_TIMER);
+        createMessageExports();
+        createInputExports();
+        createSystemExports();
+        createPaintingExports();
+        registerCoreParticipants();
+    } finally {
+        delete flag.__savestates;
+    }
+}
+
+describe("participant ids", () => {
+    test("the static id list the census reads is exactly what registers", () => {
+        registerAllParticipants();
+        expect(savestateParticipants.all().map(p => p.id).sort()).toEqual([...PARTICIPANT_IDS].sort());
+    });
+});
+
+describe("kernel32 refusals", () => {
+    test("thread-pool objects make the capture refuse", () => {
+        resetVistaRuntimeState();
+        expect(() => captureKernel32State()).not.toThrow();
+        const handle = vistaRuntimeExports.CreateThreadpoolWork!({} as never, new Uint8Array(0), [0x401000, 0, 0]);
+        expect(handle).toBeGreaterThan(0);
+        expect(() => captureKernel32State()).toThrow("thread-pool objects");
+        resetVistaRuntimeState();
+    });
+
+    test("an open toolhelp snapshot makes the capture refuse", () => {
+        resetProcessApiState();
+        const handle = processExports.CreateToolhelp32Snapshot!({} as never, new Uint8Array(0x1000), [2, 0]);
+        expect(handle).toBeGreaterThan(0);
+        expect(handle).not.toBe(0xffffffff);
+        expect(() => captureKernel32State()).toThrow("toolhelp snapshots");
+        resetProcessApiState();
+        expect(() => captureKernel32State()).not.toThrow();
+    });
+});
+
 describe("kernel records", () => {
     test("a kernel object keeps exactly its policy fields through the object graph", () => {
         registerCoreParticipants();
@@ -262,9 +313,9 @@ describe("participant schemas", () => {
 
 describe("schema pin and mutation", () => {
     test("participant versions and schema hashes are pinned; a change here needs a version bump", () => {
-        registerCoreParticipants();
+        registerAllParticipants();
         expect(savestateParticipants.schemas()).toEqual({
-            "kernel32": { version: 1, schemaHash: "17264d450fb069e1" },
+            "kernel32": { version: 2, schemaHash: "6bbba5ed115386df" },
             "time": { version: 1, schemaHash: "728d1b2522148901" },
             "address-space": { version: 1, schemaHash: "a1c4ce059654c36f" },
             "memory-manager": { version: 1, schemaHash: "4a5dbc8ebbd40e94" },
@@ -276,6 +327,14 @@ describe("schema pin and mutation", () => {
             "timer-wheel": { version: 1, schemaHash: "3e2f3b81b4d37775" },
             "dispatcher": { version: 1, schemaHash: "88687a30dd0036f2" },
             "cpu": { version: 1, schemaHash: "4aad346ee75f6054" },
+            "window-manager": { version: 1, schemaHash: "0a7d493b700e7f53" },
+            "message-queue": { version: 1, schemaHash: "58fb335bdd9764ed" },
+            "user32": { version: 1, schemaHash: "fcf936cc5ffc9b88" },
+            "user32-timers": { version: 1, schemaHash: "e6c18e508aea7e24" },
+            "user32-input": { version: 1, schemaHash: "60f3b0b9b4e027fb" },
+            "user32-system": { version: 1, schemaHash: "b93e806912786ec3" },
+            "gdi32": { version: 1, schemaHash: "f5495edbe7c4ae9d" },
+            "gdi32-palettes": { version: 1, schemaHash: "fdca280b054649f9" },
         });
     });
 
@@ -331,20 +390,24 @@ describe("module coverage", () => {
             .toEqual(["ddraw", "user32"]);
     });
 
-    test("core participants cover kernel32, and touched modules come from the thunk table", () => {
+    test("core participants cover kernel32, user32 and gdi32, and touched modules come from the thunk table", () => {
         registerCoreParticipants();
         const covered = savestateParticipants.coveredModules();
         expect(covered.has("kernel32")).toBe(true);
-        expect(covered.has("user32")).toBe(false);
+        expect(covered.has("user32")).toBe(true);
+        expect(covered.has("gdi32")).toBe(true);
+        expect(covered.has("ddraw")).toBe(false);
         const system = System.getInstance();
         const previous = system.process;
         const gen = new ThunkGenerator();
         gen.setBaseAddress(0x21046000);
         gen.generateStubDll("KERNEL32.dll", [{ name: "GetTickCount", argCount: 0 }]);
         gen.generateStubDll("USER32.dll", [{ name: "GetMessageA", argCount: 4 }]);
+        gen.generateStubDll("GDI32.dll", [{ name: "GetStockObject", argCount: 1 }]);
+        gen.generateStubDll("DDRAW.dll", [{ name: "DirectDrawCreate", argCount: 3 }]);
         system.process = { thunkGenerator: gen } as never;
         try {
-            expect(uncoveredModules(touchedModules(), covered)).toEqual(["user32"]);
+            expect(uncoveredModules(touchedModules(), covered)).toEqual(["ddraw"]);
         } finally {
             system.process = previous;
         }

@@ -4,6 +4,7 @@ import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { getActiveDeviceCursor, getActiveDeviceCursorKind } from "../../core/device-cursor";
 import { resetPointerPolicy, setPointerClipped, setPointerVisibilityFacts, setPointerWarping } from "../../core/pointer-policy";
 import { IDC_ARROW, getSystemCursorHandle } from "./system-cursors";
+import { pickDefined, type FieldPolicy } from "../../savestate/participant";
 
 // Window storage
 export interface WindowInfo {
@@ -116,6 +117,7 @@ export function markWindowPaintCycleRan(hwnd: number): void {
 // timer, destroyed by EndDialog) leaves an orphan timer posting WM_TIMER to
 // the dead hwnd → MFC FromHandlePermanent returns its freed CWnd → garbage vtable
 // call → crash.
+// @transient(wiring set at module init)
 let windowTimerKiller: ((hwnd: number) => void) | null = null;
 export function registerWindowTimerKiller(fn: (hwnd: number) => void): void {
     windowTimerKiller = fn;
@@ -141,11 +143,13 @@ export function noteTimerMessageRemoved(msg: RemovedTimerMessage): void {
 // user32 + WindowManager maps); message.ts DispatchMessageW calls it once WM_NCDESTROY
 // has been delivered to the window's wndProc. Cross-module hook (same pattern as the
 // timer killer). See window.ts DestroyWindow.
+// @transient(wiring set at module init)
 let windowDestroyFinalizer: ((hwnd: number) => void) | null = null;
 export function registerWindowDestroyFinalizer(fn: (hwnd: number) => void): void {
     windowDestroyFinalizer = fn;
 }
 /** Extra per-HWND state stores (edit-control, ...) registered to avoid import cycles. */
+// @transient(wiring set at module init)
 const extraControlStatePurgers: Array<(hwnd: number) => void> = [];
 export function registerControlStatePurger(fn: (hwnd: number) => void): void {
     extraControlStatePurgers.push(fn);
@@ -164,6 +168,7 @@ export function purgeControlState(hwnd: number): void {
 /** Modules holding per-HWND state of their own (ole32 drag-drop, ...). Same cross-module
  *  hook pattern as the purgers above — handles are pool-reused, so a registration left
  *  behind would be inherited by whatever window later gets this handle. */
+// @transient(wiring set at module init)
 const windowDestroyObservers: Array<(hwnd: number) => void> = [];
 export function registerWindowDestroyObserver(fn: (hwnd: number) => void): void {
     windowDestroyObservers.push(fn);
@@ -178,6 +183,7 @@ export function finalizeWindowDestroy(hwnd: number): void {
     windowDestroyFinalizer?.(hwnd >>> 0);
 }
 
+// @participant(user32)
 export const windows: Map<number, WindowInfo> = new Map();
 
 export function getWindowByHandle(handle: number): WindowInfo | undefined {
@@ -368,6 +374,7 @@ export function getChildZOrder(parentHwnd: number): number[] | undefined {
 }
 
 /** LockWindowUpdate: suppress overlay repaint while a subtree is locked. */
+// @participant(user32)
 let lockWindowUpdateHwnd = 0;
 
 export function setLockWindowUpdate(hwnd: number): number {
@@ -638,6 +645,7 @@ export function isEffectivelyVisible(win: WindowInfo | undefined): boolean {
     return true;
 }
 
+// @participant(user32)
 export let cursorDisplayCount = 0;
 
 /** Screen-space cursor bounds; right/bottom are EXCLUSIVE (Win32 RECT). */
@@ -651,6 +659,7 @@ export interface CursorClipRect {
 // Cursor confinement (ClipCursor). null = unconfined. The rect is the whole of the
 // state: the pointer is genuinely clamped to it (see clampToCursorClip), so
 // confinement needs nothing from the host transport.
+// @participant(user32)
 let cursorClipRect: CursorClipRect | null = null;
 
 /** Bounds the clip rect itself is confined to (wineserver set_clip_rectangle clamps
@@ -730,6 +739,7 @@ export function releaseCapture(): number {
 // Clipboard storage
 // Stores HGLOBAL-like handles by clipboard format (CF_* constants).
 // Button check states for CheckDlgButton / IsDlgButtonChecked
+// @participant(user32)
 export const buttonCheckStates: Map<number, number> = new Map();
 
 // Combobox / Listbox item storage per control HWND
@@ -753,6 +763,7 @@ export interface ListControlState {
     /** CB_SETITEMHEIGHT / LB_SETITEMHEIGHT override; unset = font-derived. */
     itemHeight?: number;
 }
+// @participant(user32)
 export const listControlStates: Map<number, ListControlState> = new Map();
 
 export function getOrCreateListState(hwnd: number): ListControlState {
@@ -773,6 +784,7 @@ export interface TrackbarState {
     pageSize: number;
     ticFreq: number;
 }
+// @participant(user32)
 export const trackbarStates: Map<number, TrackbarState> = new Map();
 
 export function getOrCreateTrackbarState(hwnd: number): TrackbarState {
@@ -785,9 +797,12 @@ export function getOrCreateTrackbarState(hwnd: number): TrackbarState {
 }
 
 // Static control bitmap associations (hwnd → hBitmap handle for SS_BITMAP / STM_SETIMAGE)
+// @participant(user32)
 export const controlImageHandles: Map<number, number> = new Map();
 
+// @participant(user32)
 export const clipboardDataByFormat: Map<number, number> = new Map();
+// @participant(user32)
 export let clipboardOpenOwner: number | null = null;
 
 export function getCursorDisplayCount(): number {
@@ -802,6 +817,7 @@ export function getCursorDisplayCount(): number {
 // placeholder handle would resolve to no user object, and the host would be asked
 // to show a cursor it has no image for.
 const DEFAULT_CURSOR = -1;
+// @participant(user32)
 let currentCursorHandle = DEFAULT_CURSOR;
 
 function resolveCursorHandle(handle: number): number {
@@ -836,6 +852,7 @@ export function isGuestCursorVisible(): boolean {
 // Last cursor user object forwarded to the host — identity dedup (handles are
 // pool-reused, so dedup by handle value would go stale; see the ddraw
 // GetAttachedSurface cache for the same failure mode).
+// @transient(identity of the cursor image last sent to the host; cleared on restore)
 let lastForwardedCursorImageObj: unknown = null;
 
 /**
@@ -906,9 +923,13 @@ const RECENTRE_TOLERANCE_PX = 4;
 // A recentring app pauses whenever it is not steering (menu, cutscene, loading) and
 // resumes in the same mode, so the claim outlives a long gap.
 const RECENTRE_RELEASE_MS = 10000;
+// @transient(host pointer-warp heuristic)
 let recentreTimes: number[] = [];
+// @transient(host pointer-warp heuristic)
 let lastWarpTarget: { x: number; y: number } | null = null;
+// @transient(host pointer-warp heuristic)
 let warpModeActive = false;
+// @transient(host pointer-warp heuristic)
 let warpReleaseTimer: ReturnType<typeof setTimeout> | null = null;
 
 function nearTarget(ax: number, ay: number, bx: number, by: number): boolean {
@@ -1000,6 +1021,7 @@ export function closeClipboard(): boolean {
 }
 
 /** GetClipboardSequenceNumber: bumped by every content change, whoever makes it. */
+// @participant(user32)
 let clipboardSequence = 1;
 
 export function getClipboardSequenceNumber(): number {
@@ -1020,6 +1042,7 @@ export function setClipboardFormatData(format: number, hData: number): void {
  *  GetDoubleClickTime answers and the WM_*BUTTONDBLCLK synthesizer applies. */
 const DEFAULT_DOUBLE_CLICK_MS = 500;
 const MAX_DOUBLE_CLICK_MS = 5000;
+// @participant(user32)
 let doubleClickTimeMs = DEFAULT_DOUBLE_CLICK_MS;
 
 export function getDoubleClickTimeMs(): number {
@@ -1058,4 +1081,97 @@ export function getWindowHitTestState(hwnd: number): { visible: boolean; disable
     const win = windows.get(hwnd);
     if (!win) return undefined;
     return { visible: !!win.visible, disabled: (win.style & 0x08000000 /* WS_DISABLED */) !== 0 };
+}
+
+export const WINDOW_INFO_FIELDS = {
+    handle: 'save', classId: 'save', title: 'save', style: 'save', exStyle: 'save', x: 'save', y: 'save',
+    width: 'save', height: 'save', parent: 'save', children: 'save', visible: 'save', wndProc: 'save',
+    userData: 'save', createParam: 'save', cbWndExtra: 'save', extraBytes: 'save', hMenu: 'save', controlId: 'save',
+    isSystemControl: 'save', systemControlClass: 'save', externalPaintManaged: 'save', lastActivePopupHwnd: 'save',
+    nativeClassName: 'save', fontHandle: 'save', touchWindowFlags: 'save', dialogDefaultId: 'save',
+    dialogBaseUnitX: 'save', dialogBaseUnitY: 'save', guestCustomPaint: 'save', paintCycleRan: 'save',
+    wndProcSubclassed: 'save', createSyncVisibleDelivered: 'save', createSyncActivationDelivered: 'save',
+    activationDelivered: 'save', dialogInitInProgress: 'transient', createInProgress: 'transient',
+    pendingDestroy: 'save', overlayOnFlipScreen: 'save', lastOverlayFillBounds: 'host',
+} as const satisfies Record<keyof WindowInfo, FieldPolicy>;
+
+export const LIST_CONTROL_FIELDS = {
+    items: 'save', selectedIndex: 'save', caretIndex: 'save', topIndex: 'save', dropdownOpen: 'save', itemHeight: 'save',
+} as const satisfies Record<keyof ListControlState, FieldPolicy>;
+
+export const TRACKBAR_FIELDS = {
+    min: 'save', max: 'save', pos: 'save', lineSize: 'save', pageSize: 'save', ticFreq: 'save',
+} as const satisfies Record<keyof TrackbarState, FieldPolicy>;
+
+export type SavedWindowInfo = ReturnType<typeof savedWindow>;
+
+export interface User32WindowState {
+    windows: SavedWindowInfo[];
+    buttonCheckStates: Array<[number, number]>;
+    listControlStates: Array<[number, ListControlState]>;
+    trackbarStates: Array<[number, TrackbarState]>;
+    controlImageHandles: Array<[number, number]>;
+    clipboard: Array<[number, number]>;
+    clipboardOpenOwner: number | null;
+    clipboardSequence: number;
+    cursorDisplayCount: number;
+    cursorClipRect: CursorClipRect | null;
+    currentCursorHandle: number;
+    lockWindowUpdateHwnd: number;
+    doubleClickTimeMs: number;
+}
+
+function savedWindow(w: WindowInfo) {
+    const saved = pickDefined(w, WINDOW_INFO_FIELDS);
+    return { ...saved, children: [...w.children], ...(w.extraBytes ? { extraBytes: w.extraBytes.slice() } : {}) };
+}
+
+function savedList(l: ListControlState): ListControlState {
+    return { ...pickDefined(l, LIST_CONTROL_FIELDS), items: l.items.map(i => ({ text: i.text, data: i.data })) };
+}
+
+export function captureUser32Windows(): User32WindowState {
+    for (const w of windows.values()) {
+        if (w.createInProgress) throw new Error(`user32: window 0x${w.handle.toString(16)} is still being created`);
+        if (w.dialogInitInProgress) throw new Error(`user32: dialog 0x${w.handle.toString(16)} is still in WM_INITDIALOG`);
+    }
+    return {
+        windows: [...windows.values()].map(savedWindow),
+        buttonCheckStates: [...buttonCheckStates],
+        listControlStates: [...listControlStates].map(([h, l]) => [h, savedList(l)]),
+        trackbarStates: [...trackbarStates].map(([h, t]) => [h, pickDefined(t, TRACKBAR_FIELDS)]),
+        controlImageHandles: [...controlImageHandles],
+        clipboard: [...clipboardDataByFormat],
+        clipboardOpenOwner,
+        clipboardSequence,
+        cursorDisplayCount,
+        cursorClipRect: cursorClipRect ? { ...cursorClipRect } : null,
+        currentCursorHandle,
+        lockWindowUpdateHwnd,
+        doubleClickTimeMs,
+    };
+}
+
+export function restoreUser32Windows(s: User32WindowState): void {
+    windows.clear();
+    for (const w of s.windows) windows.set(w.handle, { ...w, children: [...w.children], ...(w.extraBytes ? { extraBytes: w.extraBytes.slice() } : {}) });
+    const refill = <K, V>(m: Map<K, V>, rows: Array<[K, V]>, copy: (v: V) => V) => {
+        m.clear();
+        for (const [k, v] of rows) m.set(k, copy(v));
+    };
+    refill(buttonCheckStates, s.buttonCheckStates, v => v);
+    refill(listControlStates, s.listControlStates, savedList);
+    refill(trackbarStates, s.trackbarStates, t => ({ ...t }));
+    refill(controlImageHandles, s.controlImageHandles, v => v);
+    refill(clipboardDataByFormat, s.clipboard, v => v);
+    clipboardOpenOwner = s.clipboardOpenOwner;
+    clipboardSequence = s.clipboardSequence;
+    cursorDisplayCount = s.cursorDisplayCount;
+    currentCursorHandle = s.currentCursorHandle;
+    lockWindowUpdateHwnd = s.lockWindowUpdateHwnd;
+    doubleClickTimeMs = s.doubleClickTimeMs;
+    lastForwardedCursorImageObj = null;
+    setCursorClipRect(s.cursorClipRect ? { ...s.cursorClipRect } : null);
+    if (currentCursorHandle === DEFAULT_CURSOR) setPointerVisibilityFacts(isGuestCursorVisible(), getActiveDeviceCursorKind());
+    else syncHostCursorToGuestState();
 }

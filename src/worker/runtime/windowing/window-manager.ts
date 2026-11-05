@@ -2,7 +2,8 @@
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { MessageQueue } from './message-queue';
-import type { Message } from './message-queue';
+import type { Message, MessageQueueState } from './message-queue';
+import { pickSaved, type FieldPolicy } from '../../savestate/participant';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 
 // Pseudo-handle returned by GetDesktopWindow() when no top-level window is active.
@@ -53,6 +54,31 @@ export interface WindowObject {
 }
 
 export type { Message } from './message-queue';
+
+export const WINDOW_CLASS_FIELDS = {
+    name: 'save', wndProc: 'save', hInstance: 'save', style: 'save', hbrBackground: 'save',
+} as const satisfies Record<keyof WindowClass, FieldPolicy>;
+
+export const WINDOW_OBJECT_FIELDS = {
+    hwnd: 'save', wndClass: 'save', parent: 'save', rect: 'save', style: 'save', exStyle: 'save', userData: 'save',
+    wndProc: 'save', visible: 'save', title: 'save', clientOffsetX: 'save', clientOffsetY: 'save', creatorThreadId: 'save',
+} as const satisfies Record<keyof WindowObject, FieldPolicy>;
+
+export interface SavedWindowObject extends Omit<WindowObject, 'wndClass'> {
+    wndClass: { name: string } | { own: WindowClass };
+}
+
+export interface WindowManagerState {
+    classes: Array<[string, WindowClass]>;
+    windows: SavedWindowObject[];
+    nextHwnd: number;
+    activeHwnd: number;
+    focusHwnd: number;
+    foregroundHwnd: number;
+    foregroundThreadId: number;
+    captureHwnd: number;
+    zOrder: number[];
+}
 
 // Window styles for frame detection
 const WS_POPUP = 0x80000000;
@@ -120,6 +146,53 @@ export class WindowManager {
     private foregroundQueueObservers: ForegroundQueueObserver[] = [];
 
     constructor() { }
+
+    captureState(): WindowManagerState {
+        const named = new Map<WindowClass, string>();
+        for (const [key, c] of this.classes) named.set(c, key);
+        return {
+            classes: [...this.classes].map(([key, c]) => [key, pickSaved(c, WINDOW_CLASS_FIELDS)]),
+            windows: [...this.windows.values()].map(w => {
+                const key = named.get(w.wndClass);
+                return {
+                    ...pickSaved(w, WINDOW_OBJECT_FIELDS), rect: { ...w.rect },
+                    wndClass: key !== undefined ? { name: key } : { own: pickSaved(w.wndClass, WINDOW_CLASS_FIELDS) },
+                };
+            }),
+            nextHwnd: this.nextHwnd,
+            activeHwnd: this.activeHwnd,
+            focusHwnd: this.focusHwnd,
+            foregroundHwnd: this.foregroundHwnd,
+            foregroundThreadId: this.foregroundThreadId,
+            captureHwnd: this.captureHwnd,
+            zOrder: [...this.zOrder],
+        };
+    }
+
+    restoreState(s: WindowManagerState): void {
+        this.classes = new Map(s.classes.map(([key, c]) => [key, { ...c }]));
+        this.windows = new Map();
+        for (const w of s.windows) {
+            const wndClass = 'name' in w.wndClass ? this.classes.get(w.wndClass.name) : { ...w.wndClass.own };
+            if (!wndClass) throw new Error(`window manager: window 0x${w.hwnd.toString(16)} names a missing class`);
+            this.windows.set(w.hwnd, { ...w, rect: { ...w.rect }, wndClass });
+        }
+        this.nextHwnd = s.nextHwnd;
+        this.activeHwnd = s.activeHwnd;
+        this.focusHwnd = s.focusHwnd;
+        this.foregroundHwnd = s.foregroundHwnd;
+        this.foregroundThreadId = s.foregroundThreadId;
+        this.captureHwnd = s.captureHwnd;
+        this.zOrder = [...s.zOrder];
+    }
+
+    captureQueueState(): MessageQueueState {
+        return this.messageQueue.captureState();
+    }
+
+    restoreQueueState(s: MessageQueueState): void {
+        this.messageQueue.restoreState(s);
+    }
 
     registerMouseTargetResolver(resolver: (screenX: number, screenY: number) => number): void {
         this.mouseTargetResolver = resolver;

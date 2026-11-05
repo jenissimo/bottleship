@@ -14,6 +14,9 @@ import {
     getWindowByHandle,
 } from './shared-state';
 import { GUEST_INPUT_FLAG } from '../../../input/sab-layout';
+import { savestateParticipants, savestatesEnabled, stateKeys } from '../../savestate/participant';
+import { CaptureRefusal } from '../../savestate/object-codecs';
+import type { SaveValue } from '../../savestate/value-codec';
 
 // The three polled key readers are the hottest thunks any title issues (a per-frame
 // input poll, millions of calls over a session), so each has a fast path. The bodies
@@ -42,6 +45,7 @@ function readKeyState(nVirtKey: number): number {
 
 // Reused across calls: the packed table is host-side scratch handed straight to
 // Mem.writeBytes, never retained by anyone.
+// @transient(host scratch refilled by every GetKeyboardState)
 const packedKeyboardState = new Uint8Array(256);
 
 /** GetKeyboardState: 256 packed VK bytes into a guest buffer. Returns BOOL. */
@@ -57,6 +61,17 @@ function readKeyboardState(lpKeyState: number): number {
     return written === packedKeyboardState.length ? 1 : 0;
 }
 
+export interface User32InputState {
+    windowProperties: Array<[number, Array<[string, number]>]>;
+    nextDdeInstance: number;
+    nextDdeStringHandle: number;
+    nextDdeConv: number;
+    ddeStrings: Array<[number, string]>;
+    ddeServices: Array<[string, number[]]>;
+    ddeLastError: Array<[number, number]>;
+    ddeClientOnly: number[];
+}
+
 export function createInputExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
     const ERROR_INVALID_WINDOW_HANDLE = 1400;
@@ -64,16 +79,63 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     const DMLERR_INVALIDPARAMETER = 0x4006;
     const DMLERR_NO_CONV_ESTABLISHED = 0x400a;
 
+    // @participant(user32-input)
     const windowProperties: Map<number, Map<string, number>> = new Map();
+    // @participant(user32-input)
     let nextDdeInstance = 1;
+    // @participant(user32-input)
     let nextDdeStringHandle = 1;
+    // @participant(user32-input)
     let nextDdeConv = 1;
+    // @refuse(DDE conversations are not part of a v1 savestate)
     const ddeInstances = new Set<number>();
+    // @participant(user32-input)
     const ddeLastError = new Map<number, number>();
+    // @participant(user32-input)
     const ddeStrings = new Map<number, string>();
+    // @participant(user32-input)
     const ddeServices = new Map<string, Set<number>>();
+    // @refuse(DDE conversations are not part of a v1 savestate)
     const ddeConversations = new Set<number>();
+    // @participant(user32-input)
     const ddeClientOnly = new Set<number>();
+    if (savestatesEnabled()) savestateParticipants.add({
+        id: 'user32-input', version: 1, order: 42,
+        schema: stateKeys<User32InputState>({
+            windowProperties: true, nextDdeInstance: true, nextDdeStringHandle: true, nextDdeConv: true,
+            ddeStrings: true, ddeServices: true, ddeLastError: true, ddeClientOnly: true,
+        }),
+        capture: () => {
+            if (ddeInstances.size > 0 || ddeConversations.size > 0) throw new CaptureRefusal('user32: DDE conversations are not part of a v1 savestate');
+            const state: User32InputState = {
+                windowProperties: [...windowProperties].map(([h, props]) => [h, [...props]]),
+                nextDdeInstance, nextDdeStringHandle, nextDdeConv,
+                ddeStrings: [...ddeStrings],
+                ddeServices: [...ddeServices].map(([name, insts]) => [name, [...insts]]),
+                ddeLastError: [...ddeLastError],
+                ddeClientOnly: [...ddeClientOnly],
+            };
+            return state as unknown as SaveValue;
+        },
+        restore: (saved) => {
+            const s = saved as unknown as User32InputState;
+            windowProperties.clear();
+            for (const [h, props] of s.windowProperties) windowProperties.set(h, new Map(props));
+            nextDdeInstance = s.nextDdeInstance;
+            nextDdeStringHandle = s.nextDdeStringHandle;
+            nextDdeConv = s.nextDdeConv;
+            ddeInstances.clear();
+            ddeConversations.clear();
+            ddeClientOnly.clear();
+            for (const inst of s.ddeClientOnly) ddeClientOnly.add(inst);
+            ddeLastError.clear();
+            for (const [inst, err] of s.ddeLastError) ddeLastError.set(inst, err);
+            ddeStrings.clear();
+            for (const [h, text] of s.ddeStrings) ddeStrings.set(h, text);
+            ddeServices.clear();
+            for (const [name, insts] of s.ddeServices) ddeServices.set(name, new Set(insts));
+        },
+    });
     // Wine's shell32 DDE server registers Progman, Shell and Folders, and also accepts
     // AppProperties as a service; it answers the Progman and Shell topics.
     // @transient(constant name table)

@@ -6,7 +6,7 @@ import { captureSession, checkSavestate, coverageRefusal, restoreSession, Restor
 import { CaptureRefusal } from './object-codecs';
 import type { ChunkStore } from './chunk-store';
 import type { SafePoint } from './halt';
-import { savestateParticipants, type ParticipantRegistry } from './participant';
+import { savestateParticipants, savestatesEnabled, type ParticipantRegistry } from './participant';
 import { touchedModules } from './core-participants';
 import { incompatibilities, type CompatibilityKey } from './container';
 import { OpfsDir, SlotStore, type Dir, type SlotInfo } from './slots';
@@ -61,9 +61,7 @@ export async function noteBootIdentity(input: {
     return boot;
 }
 
-export function savestatesEnabled(): boolean {
-    return (globalThis as { __savestates?: unknown }).__savestates === true;
-}
+export { savestatesEnabled };
 
 function requireEnabled(): void {
     if (!savestatesEnabled()) throw new Error('savestate: disabled (set the worker flag __savestates before loading the game)');

@@ -75,6 +75,7 @@ const IBEAM_SHAPE: SystemCursorShape = {
     hotspotY: 7,
 };
 
+// @transient(constant table)
 const SYSTEM_CURSOR_SHAPES: ReadonlyMap<number, SystemCursorShape> = new Map([
     [IDC_ARROW, ARROW_SHAPE],
     [IDC_IBEAM, IBEAM_SHAPE],
@@ -102,6 +103,7 @@ function rasterizeShape(map: readonly string[]): { width: number; height: number
 
 // IDC id → registered user-object handle. System cursors are shared singletons
 // (real Windows: LoadCursor(NULL, IDC_*) returns the same handle every call).
+// @participant(user32)
 const systemCursorHandles = new Map<number, number>();
 
 /** Cursor user object for an IDC_* id; unknown ids share the arrow shape. */
@@ -130,4 +132,13 @@ export function getSystemCursorHandle(idcId: number): number {
 
 export function resetSystemCursorHandles(): void {
     systemCursorHandles.clear();
+}
+
+export function captureSystemCursorHandles(): Array<[number, number]> {
+    return [...systemCursorHandles];
+}
+
+export function restoreSystemCursorHandles(rows: ReadonlyArray<[number, number]>): void {
+    systemCursorHandles.clear();
+    for (const [id, h] of rows) systemCursorHandles.set(id, h);
 }

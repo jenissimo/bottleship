@@ -6,6 +6,7 @@
  */
 
 import { TimeService } from "../time";
+import type { FieldPolicy } from "../../savestate/participant";
 
 export interface Message {
     hwnd: number;
@@ -35,7 +36,7 @@ let coalesceMouseMoveEnabled = true;
 const QUEUE_SIZE = 256;
 const KEY_STATE_BYTES = 256;
 
-type PendingMessage = {
+export type PendingMessage = {
     wParam: number;
     lParam: number;
     time: number;
@@ -46,6 +47,39 @@ type PendingMessage = {
     extraInfo?: number;
     timerEpoch?: number;
 };
+
+export const PENDING_MESSAGE_FIELDS = {
+    wParam: 'save', lParam: 'save', time: 'save', ptX: 'save', ptY: 'save', targetThreadId: 'save',
+    keyStatePacked: 'save', extraInfo: 'save', timerEpoch: 'save',
+} as const satisfies Record<keyof PendingMessage, FieldPolicy>;
+
+export type QueuedMessageRow = [
+    hwnd: number, message: number, wParam: number, lParam: number, time: number,
+    ptX: number, ptY: number, targetThreadId: number, extraInfo: number, keyState: Uint8Array | null,
+];
+
+export interface TimerPendingState { key: string; hwnd: number; pending: PendingMessage; materialized: boolean }
+
+export interface MessageQueueState {
+    posted: QueuedMessageRow[];
+    input: QueuedMessageRow[];
+    paintPending: Array<[number, PendingMessage]>;
+    timerPending: TimerPendingState[];
+    nextTimerMessage: number;
+    lastMouseMove: Array<[number, PendingMessage]>;
+    moveSetCursor: Array<[number, PendingMessage]>;
+    lastDequeued: [ptX: number, ptY: number, time: number];
+}
+
+function copyPending(p: PendingMessage): PendingMessage {
+    const out = {} as Record<string, unknown>;
+    for (const key of Object.keys(PENDING_MESSAGE_FIELDS) as (keyof PendingMessage)[]) {
+        const v = p[key];
+        if (v === undefined) continue;
+        out[key] = v instanceof Uint8Array ? v.slice() : v;
+    }
+    return out as PendingMessage;
+}
 
 (globalThis as Record<string, any>).h3QueueSetMouseMoveCoalescing = (enabled: boolean): boolean => {
     coalesceMouseMoveEnabled = !!enabled;
@@ -143,6 +177,30 @@ class RingBuffer {
         this.extraInfos[idx] = extraInfo >>> 0;
         this.tail = (this.tail + 1) & this.mask;
         this.count++;
+    }
+
+    captureRows(): QueuedMessageRow[] {
+        const out: QueuedMessageRow[] = [];
+        for (let i = 0; i < this.count; i++) {
+            const idx = (this.head + i) & this.mask;
+            out.push([
+                this.hwnds[idx], this.messages[idx], this.wParams[idx], this.lParams[idx], this.times[idx],
+                this.ptXs[idx], this.ptYs[idx], this.targetThreadIds[idx], this.extraInfos[idx],
+                this.getKeyStateSnapshot(idx) ?? null,
+            ]);
+        }
+        return out;
+    }
+
+    restoreRows(rows: readonly QueuedMessageRow[]): void {
+        if (rows.length > this.capacity) throw new Error(`message queue: ${rows.length} saved entries exceed the capacity ${this.capacity}`);
+        this.head = 0;
+        this.tail = 0;
+        this.count = 0;
+        this.keyStatePresent.fill(0);
+        for (const [hwnd, message, wParam, lParam, time, ptX, ptY, target, extra, keyState] of rows) {
+            this.enqueue(hwnd, message, wParam, lParam, time, ptX, ptY, target, keyState ?? undefined, extra);
+        }
     }
 
     /** Every entry in arrival order, with the thread filter that gates it. Diagnostic only. */
@@ -378,6 +436,34 @@ export class MessageQueue {
     // Keeping ticks as ordinary posts can permanently starve a modal loop's idle path.
     private timerPending: Map<string, { hwnd: number; pending: PendingMessage; materialized: boolean }> = new Map();
     private nextTimerMessage = 1;
+
+    captureState(): MessageQueueState {
+        const rows = (m: Map<number, PendingMessage>): Array<[number, PendingMessage]> => [...m].map(([h, p]) => [h, copyPending(p)]);
+        return {
+            posted: this.postedQueue.captureRows(),
+            input: this.inputQueue.captureRows(),
+            paintPending: rows(this.paintPending),
+            timerPending: [...this.timerPending].map(([key, e]) => ({ key, hwnd: e.hwnd, pending: copyPending(e.pending), materialized: e.materialized })),
+            nextTimerMessage: this.nextTimerMessage,
+            lastMouseMove: rows(this.lastMouseMove),
+            moveSetCursor: rows(this.moveSetCursor),
+            lastDequeued: [this.lastDequeuedPtX, this.lastDequeuedPtY, this.lastDequeuedTime],
+        };
+    }
+
+    restoreState(s: MessageQueueState): void {
+        const map = (rows: Array<[number, PendingMessage]>) => new Map(rows.map(([h, p]) => [h, copyPending(p)]));
+        this.postedQueue.restoreRows(s.posted);
+        this.inputQueue.restoreRows(s.input);
+        this.paintPending = map(s.paintPending);
+        this.timerPending = new Map(s.timerPending.map(e => [e.key, { hwnd: e.hwnd, pending: copyPending(e.pending), materialized: e.materialized }]));
+        this.nextTimerMessage = s.nextTimerMessage;
+        this.lastMouseMove = map(s.lastMouseMove);
+        this.moveSetCursor = map(s.moveSetCursor);
+        [this.lastDequeuedPtX, this.lastDequeuedPtY, this.lastDequeuedTime] = s.lastDequeued;
+        for (const w of this.waiters) w.settled = true;
+        this.waiters = [];
+    }
 
     /** A due timer is generated lazily; a WM_TIMER already returned by PM_NOREMOVE survives cancellation. */
     cancelTimer(hwnd: number, id: number): void {

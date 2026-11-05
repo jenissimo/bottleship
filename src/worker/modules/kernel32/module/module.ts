@@ -32,20 +32,30 @@ function getMainExeHandle(): number {
 // The HLE module images (their bases ARE the HMODULEs) live in hle-module-images.ts;
 // FORCE_NATIVE_PACKAGE_LOAD and the VFS presence rules in hle-system-catalog.ts.
 
+// @participant(kernel32)
 const loadLibraryHandleCache = new Map<string, number>();
+// @participant(kernel32)
 const handleToPathCache = new Map<number, string>();
+// @transient(cache of lookups answered again from the restored thunk table)
 const getProcAddressCache = new Map<string, number>();
+// @transient(cache of lookups answered again from the restored thunk table)
 const getProcAddressPointerCache = new Map<string, number>();
+// @transient(diagnostics)
 const loggedUnknownModuleHandles = new Set<number>();
 // FreeLibrary refcounting. Modules that appear in the registry WITHOUT a dynamic
 // LoadLibrary ref (the EXE + its static import closure, and static-import
 // dependencies auto-loaded while mapping a dynamic DLL) are PINNED — a static
 // import holds a permanent reference on real Windows, so FreeLibrary never unloads
 // them. Only explicitly LoadLibrary'd modules unload at refcount 0.
+// @participant(kernel32)
 const pinnedModuleBases = new Set<number>();
+// @participant(kernel32)
 const dynamicLoadRefs = new Map<number, number>();
+// @participant(kernel32)
 const hleLibraryReferences = new Map<number, Map<string, HleModuleLoadReference>>();
+// @transient(identity of the owning process object)
 let cacheOwnerProcess: any = null;
+// @transient(identity of the owning process object)
 let cacheOwnerResetGeneration = -1;
 
 function ensureProcessLocalCaches(): void {
@@ -190,6 +200,7 @@ const EXE_GETPROC_FORWARD_MAP: Record<string, Array<{ dll: string; name: string 
  * by name and still gets the handler. _assert/_wassert are deliberately absent — the
  * release CRT exports both.
  */
+// @transient(constant table)
 const DEBUG_CRT_ONLY_EXPORTS = new Set([
     "_malloc_dbg", "_calloc_dbg", "_realloc_dbg", "_free_dbg", "_expand_dbg",
     "_strdup_dbg", "_wcsdup_dbg", "_msize_dbg", "_recalloc_dbg", "_aligned_malloc_dbg",
@@ -208,6 +219,7 @@ const RELEASE_CRT_MODULE_RE = /^(crtdll|msvcrt|msvcr\d+|msvcp\d+)$/;
  * The same probe aimed at the EXE's own base. An exe never exports these, so the two
  * the release CRT does export (_assert/_wassert) belong here as well.
  */
+// @transient(constant table)
 const EXE_DEBUG_CRT_PROBE_NAMES = new Set([...DEBUG_CRT_ONLY_EXPORTS, "_assert", "_wassert"]);
 
 /**

@@ -39,6 +39,7 @@ export const DEV_BROADCAST_DEVICEINTERFACE_OFFSETS = {
 export const DEV_BROADCAST_DEVICEINTERFACE_SIZE = 32;
 
 /** GUID_DEVINTERFACE_HID {4D1E55B2-F16F-11CF-88CB-001111000030} in GUID memory order. */
+// @transient(constant GUID bytes)
 export const GUID_DEVINTERFACE_HID = new Uint8Array([
     0xb2, 0x55, 0x1e, 0x4d, // Data1, LE DWORD
     0x6f, 0xf1,             // Data2, LE WORD

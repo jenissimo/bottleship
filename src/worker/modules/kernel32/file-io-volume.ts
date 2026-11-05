@@ -113,9 +113,13 @@ const FALLBACK_FREE_BYTES = 32 * 1024 * 1024 * 1024;
 // there to 2GB so that pre-OSR2 callers' `clusters * sectors * bytes` arithmetic cannot overflow.
 const LEGACY_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 
+// @transient(host disk estimate, asked again on demand)
 let volumeTotalBytes = FALLBACK_TOTAL_BYTES;
+// @transient(host disk estimate, asked again on demand)
 let volumeFreeBytes = FALLBACK_FREE_BYTES;
+// @transient(host disk estimate, asked again on demand)
 let volumeEstimateInFlight = false;
+// @transient(host disk estimate, asked again on demand)
 let volumeEstimateAt = 0;
 const VOLUME_ESTIMATE_TTL_MS = 5000;
 

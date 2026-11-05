@@ -613,6 +613,7 @@ export class VirtualProcessManager {
     }
 }
 
+// @refuse(child process handles are not part of a v1 savestate)
 const virtualProcessManager = new VirtualProcessManager();
 
 export const getVirtualProcessManager = (): VirtualProcessManager => virtualProcessManager;
