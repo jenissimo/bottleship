@@ -1,6 +1,7 @@
 # Game bundles (`.wgb`)
 
-BottleShip runs a game from a **`.wgb`** bundle — a *store-only* (uncompressed) ZIP that
+BottleShip runs a game from a **`.wgb`** bundle — a *store-only* (uncompressed) ZIP, optionally
+block-compressed (see below), that
 packages a game together with the metadata the engine needs to boot it. This document covers
 the format and the tools for creating and inspecting bundles, plus how to bring your own games.
 
@@ -68,6 +69,41 @@ MATCHING_FILE could identify (NAME `*`) are skipped and reported, as are other s
 VirtualRegistry commands. Per exe, a rule whose target overlaps a source (its own or another
 rule's: a target inside the source, chains, cycles) and a rule on a whole root key (`HKLM`) are
 rejected with a warning, both here and again when the bundle loads.
+
+## Block compression: `wgb-compress`
+
+Block compression is an opt-in step for published bundles; `make-wgb` keeps writing
+store-only bundles, and dev disk bundles have no reason to change.
+
+```bash
+bun tools/wgb-compress.ts game.wgb game.packed.wgb --block-kib 64
+```
+
+- Each member that shrinks by at least 5 % (and 4 KiB) becomes an ordinary ZIP method-8
+  member whose DEFLATE stream is cut with a full flush every 64 KiB of file data
+  (`--block-kib`, a power of two from 4 to 16384). A full flush byte-aligns the stream and
+  clears the history window, so every block decodes on its own. `manifest.json`,
+  `registry.json` and already-compressed payloads (ogg, mp3, bik, smk, jpg, png, cab, …;
+  `--compress-all` disables the extension list) stay STORED.
+- `wgb-blocks.idx` (STORED) starts with a header: magic `WGBK`, format version, row count
+  and a CRC-32 of the rows; a damaged index is rejected as a whole. Each row names a
+  member by name and local header offset and records its sizes, CRC-32, block shift and
+  the compressed length of every block. A row that no longer matches its member is
+  ignored, and such a member is rejected at mount like any other compressed member.
+- `manifest.json` references the index: `"blockIndex": { "member": "wgb-blocks.idx",
+  "version": 1 }`. An engine that reads another version, or finds the index missing or
+  damaged, refuses the bundle with that reason.
+- The archive stays a standard ZIP that any unzip tool extracts. Decompressed bytes are
+  identical to the input; the tool verifies every member, whole and block by block,
+  before it renames the output into place. Packing uses the pinned pako of
+  `@bottleship/formats`, so the same input gives the same bytes.
+- At run time a range read fetches only the compressed blocks it overlaps, as one range
+  request, and decodes them synchronously through `inflateRawBlock(src, dst)`; decoded
+  blocks are kept in a small LRU (16 MiB by default). Everything below `ZipArchive` (the
+  streaming transport, the sparse OPFS copy, which stays compressed, the strong-ETag check
+  and I/O profiles) keeps working on archive offsets, i.e. on the compressed bytes.
+
+`wgb.ts` edits store-only bundles; edit the store-only source and compress again.
 
 ## Inspecting & patching: `wgb.ts`
 

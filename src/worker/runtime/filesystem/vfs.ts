@@ -1,5 +1,5 @@
 import { enterIoReadPolicy, restoreIoReadPolicy, type IoReadPolicy } from "./io-read-policy";
-import { ZipArchive, ZipEntry } from "@bottleship/formats/zip";
+import { isRangeReadableEntry, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
 import { LruCache } from "../../core/collections/lru-cache";
 import { Logger, LogCategory } from "../../core/logger";
 import { harnessBus } from "../../harness/event-bus";
@@ -426,7 +426,7 @@ export class VirtualFileSystem {
                 dir = slash === -1 ? "" : dir.slice(0, slash);
             }
             this.indexRomChildren(lowerKey, entry);
-            if (!entry.isDirectory && entry.compression !== 0) {
+            if (!entry.isDirectory && !isRangeReadableEntry(entry)) {
                 compressedEntries++;
                 if (firstCompressedName === null) {
                     firstCompressedName = entry.name;
@@ -440,9 +440,9 @@ export class VirtualFileSystem {
                 `Invalid WGB archive: found ${compressedEntries} compressed ZIP entr` +
                 `${compressedEntries === 1 ? "y" : "ies"} ` +
                 `(first="${firstCompressedName ?? "n/a"}", method=${firstCompressedMethod ?? -1}). ` +
-                `BottleShip expects WGB as ZIP STORED-only (method=0). ` +
-                `Compressed entries force full decompression and break deterministic range reads. ` +
-                `Repack archive with STORE-only entries and retry.`;
+                `BottleShip expects WGB entries STORED (method=0) or block-indexed DEFLATE (see docs/bundles.md). ` +
+                `Compressed entries without a block index force full decompression and break deterministic range reads. ` +
+                `Repack archive with STORE-only entries, or block-compress it with tools/wgb-compress.ts, and retry.`;
             Logger.error(LogCategory.SYSTEM, `VFS: ${message}`);
             throw new Error(message);
         }
@@ -1011,7 +1011,7 @@ export class VirtualFileSystem {
 
         // Large uncached STORED ROM entries: sync range read (BufferSource WGB cache).
         const entry = this.romIndex.get(rel);
-        if (!entry || !this.romArchive || entry.compression !== 0) return null;
+        if (!entry || !this.romArchive || !isRangeReadableEntry(entry)) return null;
 
         // A run of small sequential reads (a pak read record-by-record) would otherwise
         // re-cross VFS → ZipArchive → source once per read. Widen to the readahead chunk
@@ -2039,7 +2039,7 @@ export class VirtualFileSystem {
         if (!data) {
             // For uncompressed (STORED) large entries we read only requested range.
             // This avoids loading huge assets (e.g. videos) fully into memory.
-            if (entry.compression === 0 && entry.uncompressedSize > this.MAX_CACHE_ENTRY_SIZE) {
+            if (isRangeReadableEntry(entry) && entry.uncompressedSize > this.MAX_CACHE_ENTRY_SIZE) {
                 return this.romArchive.readEntryRange(entry, offset, length);
             }
 

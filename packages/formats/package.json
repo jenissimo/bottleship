@@ -12,6 +12,6 @@
     "./wgb/*": "./src/wgb/*.ts"
   },
   "dependencies": {
-    "pako": "^2.1.0"
+    "pako": "2.1.0"
   }
 }
