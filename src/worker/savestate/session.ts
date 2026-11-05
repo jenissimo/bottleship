@@ -45,6 +45,7 @@ export interface CaptureResult {
     pending: Map<string, Uint8Array>;
     ram: RamCaptureStats;
     sections: Record<string, number>;
+    captureMs: Record<string, number>;
     ramHashMs: number;
 }
 
@@ -63,9 +64,12 @@ export async function captureSession(
     stillReady();
     const sections = new Map<string, SaveValue>();
     const sizes: Record<string, number> = {};
+    const captureMs: Record<string, number> = {};
     const run = newCaptureRun();
     for (const p of participants.all()) {
+        const started = performance.now();
         const value = p.capture(run);
+        captureMs[p.id] = Math.round((performance.now() - started) * 10) / 10;
         sections.set(p.id, value);
         const enc = encodeValue(value);
         sizes[p.id] = enc.json.length + enc.blobs.reduce((n, b) => n + b.length, 0);
@@ -82,7 +86,7 @@ export async function captureSession(
         },
         sections,
     };
-    return { bytes: encodeSavestate(state), manifest: snap.manifest, pending: snap.pending, ram: snap.stats, sections: sizes, ramHashMs };
+    return { bytes: encodeSavestate(state), manifest: snap.manifest, pending: snap.pending, ram: snap.stats, sections: sizes, captureMs, ramHashMs };
 }
 
 export interface LoadCheck { ok: boolean; reasons: string[]; overlayChanged: boolean; state: Savestate }

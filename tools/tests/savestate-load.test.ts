@@ -80,6 +80,7 @@ describe("prepare runs before any capture", () => {
         const result = await captureSession(target(mem), new Set(), () => { log.push("ready"); }, reg);
         expect(log).toEqual(["prepare time", "ready", "capture time", "capture cpu", "ready"]);
         expect([...result.pending.values()].some(b => b[0] === 9)).toBe(true);
+        expect(Object.keys(result.captureMs).sort()).toEqual(["cpu", "time"]);
     });
 });
 

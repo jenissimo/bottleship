@@ -239,7 +239,7 @@ export async function deleteSlot(slot: string): Promise<{ removedChunks: number 
 
 export interface SaveReport {
     name: string; bytes: number; chunkBytes: number; chunkWrites: number;
-    ms: { paused: number; ramHash: number; store: number }; sections: Record<string, number>; ram: unknown;
+    ms: { paused: number; ramHash: number; store: number }; sections: Record<string, number>; captureMs: Record<string, number>; ram: unknown;
 }
 
 export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, permanentBlockers: () => string[] = () => []): Promise<SaveReport> {
@@ -267,7 +267,7 @@ export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, p
         const t2 = performance.now();
         return {
             name, bytes: result.bytes.length, chunkBytes, chunkWrites: result.ram.written,
-            ms: { paused: Math.round(t1 - t0), ramHash: Math.round(result.ramHashMs), store: Math.round(t2 - t1) }, sections: result.sections, ram: result.ram,
+            ms: { paused: Math.round(t1 - t0), ramHash: Math.round(result.ramHashMs), store: Math.round(t2 - t1) }, sections: result.sections, captureMs: result.captureMs, ram: result.ram,
         };
     });
 }
