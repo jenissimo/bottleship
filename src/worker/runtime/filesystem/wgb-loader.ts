@@ -1,4 +1,5 @@
-import { BlobSource, BufferSource, SyncHttpRangeSource, WGB_BLOCK_INDEX_ENTRY, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
+import { BlobSource, BufferSource, SyncHttpRangeSource, WGB_BLOCK_INDEX_ENTRY, WGB_BLOCK_INDEX_VERSION, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
+import type { WgbBlockIndexRef } from "@bottleship/formats/zip";
 import type { ZipSource } from "@bottleship/formats/zip";
 import type { ExeRegistryRedirect } from "@bottleship/formats/sdb";
 import { CachedSource, computeAdaptiveMaxBytes } from "./cached-source";
@@ -110,6 +111,7 @@ export interface WgbManifest {
     /** Presentation baseline; enriched by editorial catalog / user overrides keyed by gameId. */
     meta?: WgbMeta;
     entrypoint: string;
+    blockIndex?: WgbBlockIndexRef;
     args?: string;
     rom?: string;
     registry?: string;
@@ -416,6 +418,7 @@ export class WgbLoader {
             );
         }
 
+        checkBlockIndex(manifest, archive);
         onStage?.(`Loading ${manifest.entrypoint.split(/[\\/]/).pop() ?? "game"}`);
         const entrypointBytes = await readEntrypointBytes(archive, manifest.entrypoint);
 
@@ -462,6 +465,21 @@ export async function readEntrypointBytes(archive: ZipArchive, entrypoint: strin
         throw new Error(`entrypoint missing: ${entrypointPath}. entries: ${available}`);
     }
     return archive.readEntry(entry);
+}
+
+export function checkBlockIndex(manifest: Pick<WgbManifest, "blockIndex">, archive: ZipArchive): void {
+    const ref = manifest.blockIndex;
+    if (!ref) return;
+    if (ref.version !== WGB_BLOCK_INDEX_VERSION) {
+        throw new Error(`This bundle needs block-index v${ref.version}; this engine reads v${WGB_BLOCK_INDEX_VERSION}.`);
+    }
+    if (ref.member !== WGB_BLOCK_INDEX_ENTRY) {
+        throw new Error(`This bundle names block-index member "${ref.member}"; this engine reads "${WGB_BLOCK_INDEX_ENTRY}".`);
+    }
+    if (archive.blockIndexState !== "loaded") {
+        const why = archive.blockIndexState === "rejected" ? `damaged (${archive.blockIndexError})` : "missing";
+        throw new Error(`This bundle needs block-index v${ref.version}, but ${ref.member} is ${why}.`);
+    }
 }
 
 export function buildRomIndex(archive: ZipArchive, romRoot: string): Map<string, ZipEntry> {

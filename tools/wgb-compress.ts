@@ -1,14 +1,13 @@
 #!/usr/bin/env bun
 import { closeSync, existsSync, fstatSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from "fs";
-import { constants, deflateRawSync } from "zlib";
 import {
-    encodeBlockIndex, unixToDosDateTime, WGB_BLOCK_INDEX_ENTRY, ZipArchive,
+    BLOCK_STREAM_END, deflateRawBlock, encodeBlockIndex, unixToDosDateTime, WGB_BLOCK_INDEX_ENTRY, WGB_BLOCK_INDEX_VERSION, ZipArchive,
     type BlockIndexRow, type ZipSource,
 } from "@bottleship/formats/zip";
 import { crc32, crc32Final, crc32Update, ZipStoreWriter } from "./internal/zip-store-writer";
 
-const FINAL_EMPTY_BLOCK = new Uint8Array([0x03, 0x00]);
 const ALWAYS_STORED = ["manifest.json", "registry.json"];
+const PRECOMPRESSED = new Set(["ogg", "mp3", "wma", "bik", "smk", "jpg", "jpeg", "png", "gif", "cab", "zip", "7z", "rar", "gz", "mp4", "webm"]);
 
 export interface CompressOptions {
     blockKiB?: number;
@@ -16,6 +15,7 @@ export interface CompressOptions {
     minSavingPct?: number;
     store?: readonly string[];
     verify?: boolean;
+    compressAll?: boolean;
 }
 
 export interface CompressReport {
@@ -51,15 +51,21 @@ class FdSource implements ZipSource {
     }
 }
 
+export function withBlockIndexRef(manifest: Uint8Array): Uint8Array {
+    const m = JSON.parse(new TextDecoder().decode(manifest)) as Record<string, unknown>;
+    m.blockIndex = { member: WGB_BLOCK_INDEX_ENTRY, version: WGB_BLOCK_INDEX_VERSION };
+    return new TextEncoder().encode(JSON.stringify(m, null, 2));
+}
+
 export function deflateBlocks(data: Uint8Array, blockSize: number, level: number): { parts: Uint8Array[]; lengths: number[] } {
     const parts: Uint8Array[] = [];
     const lengths: number[] = [];
     for (let off = 0; off < data.byteLength; off += blockSize) {
-        const block = deflateRawSync(data.subarray(off, Math.min(data.byteLength, off + blockSize)), { level, finishFlush: constants.Z_FULL_FLUSH });
+        const block = deflateRawBlock(data.subarray(off, Math.min(data.byteLength, off + blockSize)), level);
         parts.push(block);
         lengths.push(block.byteLength);
     }
-    parts.push(FINAL_EMPTY_BLOCK);
+    parts.push(BLOCK_STREAM_END);
     return { parts, lengths };
 }
 
@@ -72,6 +78,7 @@ export async function compressWgb(input: string, output: string, options: Compre
     const level = options.level ?? 9;
     const minSaving = (options.minSavingPct ?? 5) / 100;
     const keep = new Set([...ALWAYS_STORED, ...(options.store ?? [])].map(n => n.toLowerCase()));
+    const skipExt = options.compressAll ? new Set<string>() : PRECOMPRESSED;
 
     const fd = openSync(input, "r");
     const tmp = `${output}.tmp-${process.pid}`;
@@ -88,11 +95,13 @@ export async function compressWgb(input: string, output: string, options: Compre
         let deflated = 0, stored = 0, blocks = 0;
         for (const entry of entries) {
             const stamp = entry.modified === undefined ? 0 : unixToDosDateTime(entry.modified);
-            const data = entry.isDirectory ? new Uint8Array(0) : await archive.readEntry(entry);
-            if (entry.crc32 !== undefined && !entry.isDirectory && crc32(data) !== entry.crc32) {
+            let data = entry.isDirectory ? new Uint8Array(0) : await archive.readEntry(entry);
+            if (entry.crc32 !== undefined && !entry.isDirectory && entry.name.toLowerCase() !== "manifest.json" && crc32(data) !== entry.crc32) {
                 throw new Error(`${entry.name}: CRC mismatch in input`);
             }
-            if (entry.isDirectory || data.byteLength === 0 || keep.has(entry.name.toLowerCase())) {
+            if (entry.name.toLowerCase() === "manifest.json") data = withBlockIndexRef(data);
+            const ext = entry.name.slice(entry.name.lastIndexOf(".") + 1).toLowerCase();
+            if (entry.isDirectory || data.byteLength === 0 || keep.has(entry.name.toLowerCase()) || skipExt.has(ext)) {
                 writer.addStored(entry.name, data, stamp);
                 stored++;
                 continue;
@@ -106,12 +115,12 @@ export async function compressWgb(input: string, output: string, options: Compre
                 continue;
             }
             const crc = crc32Final(crc32Update(data));
-            writer.addDeflated(entry.name, parts, data.byteLength, crc, stamp);
-            rows.push({ name: entry.name, uncompressedSize: data.byteLength, compressedSize, crc32: crc, shift, blockLengths: lengths });
+            const localHeaderOffset = writer.addDeflated(entry.name, parts, data.byteLength, crc, stamp);
+            rows.push({ name: entry.name, localHeaderOffset, uncompressedSize: data.byteLength, compressedSize, crc32: crc, shift, blockLengths: lengths });
             deflated++;
             blocks += lengths.length;
         }
-        if (rows.length > 0) writer.addStored(WGB_BLOCK_INDEX_ENTRY, encodeBlockIndex(rows));
+        writer.addStored(WGB_BLOCK_INDEX_ENTRY, encodeBlockIndex(rows));
         const { bytes } = writer.finish();
         report = { inputBytes: source.size, outputBytes: bytes, entries: entries.length, deflated, stored, blockKiB, level, blocks, seconds: 0 };
         if (options.verify !== false) await verifyWgb(input, tmp);
@@ -133,13 +142,14 @@ export async function verifyWgb(original: string, packed: string): Promise<void>
         const b = new ZipArchive(new FdSource(fb), { blockCacheBytes: 0 });
         await a.init();
         await b.init();
+        if (b.blockIndexState !== "loaded") throw new Error(`verify: block index ${b.blockIndexState} (${b.blockIndexError ?? ""})`);
         for (const ea of a.listEntries()) {
             if (ea.name === WGB_BLOCK_INDEX_ENTRY) continue;
             const eb = b.getEntry(ea.name);
             if (!eb) throw new Error(`verify: ${ea.name} missing`);
             if (ea.isDirectory) continue;
             if (eb.compression === 8 && !eb.blocks) throw new Error(`verify: ${ea.name} is deflated without a block index`);
-            const want = await a.readEntry(ea);
+            const want = ea.name.toLowerCase() === "manifest.json" ? withBlockIndexRef(await a.readEntry(ea)) : await a.readEntry(ea);
             const whole = await b.readEntry(eb);
             if (Buffer.compare(Buffer.from(want), Buffer.from(whole)) !== 0) throw new Error(`verify: ${ea.name} differs (whole)`);
             if (!eb.blocks) continue;
@@ -164,11 +174,12 @@ function parseArgs(argv: string[]): { input: string; output: string; options: Co
         else if (a === "--min-saving-pct") options.minSavingPct = Number(argv[++i]);
         else if (a === "--store") store.push(argv[++i]);
         else if (a === "--no-verify") options.verify = false;
+        else if (a === "--compress-all") options.compressAll = true;
         else if (a === "--json") json = argv[++i];
         else pos.push(a);
     }
     if (pos.length !== 2) {
-        console.error("usage: bun tools/wgb-compress.ts <in.wgb> <out.wgb> [--block-kib 64] [--level 9] [--min-saving-pct 5] [--store <entry>]... [--no-verify] [--json <report.json>]");
+        console.error("usage: bun tools/wgb-compress.ts <in.wgb> <out.wgb> [--block-kib 64] [--level 9] [--min-saving-pct 5] [--store <entry>]... [--compress-all] [--no-verify] [--json <report.json>]");
         process.exit(2);
     }
     options.store = store;

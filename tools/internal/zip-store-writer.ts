@@ -129,7 +129,7 @@ export class ZipStoreWriter {
         this.cd.push({ nameBuf, size: data.length, crc, offset: entryOffset });
     }
 
-    addDeflated(name: string, parts: readonly Uint8Array[], size: number, crc: number, dosStamp = 0): void {
+    addDeflated(name: string, parts: readonly Uint8Array[], size: number, crc: number, dosStamp = 0): number {
         const nameBuf = Buffer.from(name, "utf8");
         const entryOffset = this.offset;
         let compressedSize = 0;
@@ -140,6 +140,7 @@ export class ZipStoreWriter {
             this.offset += part.byteLength;
         }
         this.cd.push({ nameBuf, size, crc, offset: entryOffset, dosStamp, method: 8, compressedSize });
+        return entryOffset;
     }
 
     addStored(name: string, data: Uint8Array, dosStamp = 0): void {

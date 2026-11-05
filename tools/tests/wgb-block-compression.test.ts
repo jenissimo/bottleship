@@ -8,7 +8,7 @@ import {
 } from "@bottleship/formats/zip";
 import { ZipStoreWriter } from "../internal/zip-store-writer";
 import { compressWgb } from "../wgb-compress";
-import { buildRomIndex } from "../../src/worker/runtime/filesystem/wgb-loader";
+import { buildRomIndex, checkBlockIndex, WgbLoader } from "../../src/worker/runtime/filesystem/wgb-loader";
 import { VirtualFileSystem } from "../../src/worker/runtime/filesystem/vfs";
 import { installFakeOpfs } from "./fixtures/fake-opfs";
 
@@ -60,6 +60,7 @@ const FILES: Record<string, Uint8Array> = {
     "rom/one.txt": textLike(12_000, 4),
     "rom/noise.bin": noise(BLOCK * 3 + 5, 5),
     "rom/empty.dat": new Uint8Array(0),
+    "rom/theme.ogg": textLike(BLOCK * 2, 6),
 };
 
 function writeStored(path: string): void {
@@ -103,6 +104,8 @@ describe("wgb-compress output", () => {
         expect(a.getEntry("manifest.json")!.compression).toBe(0);
         expect(a.getEntry("rom/noise.bin")!.compression).toBe(0);
         expect(a.getEntry("rom/empty.dat")!.compression).toBe(0);
+        expect(a.getEntry("rom/theme.ogg")!.compression).toBe(0);
+        expect(a.blockIndexState).toBe("loaded");
         for (const n of ["rom/game.exe", "rom/data.mix", "rom/exact.bin", "rom/one.txt"]) {
             const e = a.getEntry(n)!;
             expect(e.compression).toBe(8);
@@ -117,6 +120,7 @@ describe("wgb-compress output", () => {
     test("every member is still a standard ZIP member: one raw-DEFLATE pass returns the file", async () => {
         const a = await open(packed);
         for (const [name, want] of Object.entries(FILES)) {
+            if (name === "manifest.json") continue;
             const e = a.getEntry(name)!;
             expect(Buffer.from(await a.readEntry(e)).equals(Buffer.from(want))).toBe(true);
             if (e.compression !== 8) continue;
@@ -141,14 +145,18 @@ describe("wgb-compress output", () => {
     });
 
     test("the index round-trips", () => {
-        const rows = [{ name: "a/b.bin", uncompressedSize: 2 ** 33 + 5, compressedSize: 2 ** 32 + 9, crc32: 0xdeadbeef, shift: 16, blockLengths: [1, 65536, 70000] }];
+        const rows = [{ name: "a/b.bin", localHeaderOffset: 2 ** 34 + 1, uncompressedSize: 2 ** 33 + 5, compressedSize: 2 ** 32 + 9, crc32: 0xdeadbeef, shift: 16, blockLengths: [1, 65536, 70000] }];
         const back = decodeBlockIndex(encodeBlockIndex(rows));
         expect(back[0].name).toBe("a/b.bin");
         expect(back[0].uncompressedSize).toBe(2 ** 33 + 5);
         expect(back[0].compressedSize).toBe(2 ** 32 + 9);
         expect(back[0].crc32).toBe(0xdeadbeef);
+        expect(back[0].localHeaderOffset).toBe(2 ** 34 + 1);
         expect(Array.from(back[0].blockLengths)).toEqual([1, 65536, 70000]);
-        expect(() => decodeBlockIndex(encodeBlockIndex(rows).subarray(0, 30))).toThrow(/truncated/);
+        expect(() => decodeBlockIndex(encodeBlockIndex(rows).subarray(0, 30))).toThrow(/CRC|truncated/);
+        const flipped = encodeBlockIndex(rows);
+        flipped[flipped.length - 1] ^= 1;
+        expect(() => decodeBlockIndex(flipped)).toThrow(/CRC mismatch/);
     });
 });
 
@@ -277,6 +285,12 @@ describe("index validation and the VFS", () => {
         expect(b.getEntry("rom/game.exe")!.blocks).toBeDefined();
     });
 
+    test("a row whose local header offset points elsewhere is ignored", async () => {
+        const b = await withIndex(rows => { rows.find(r => r.name === "rom/game.exe")!.localHeaderOffset += 1; });
+        expect(b.getEntry("rom/game.exe")!.blocks).toBeUndefined();
+        expect(b.getEntry("rom/data.mix")!.blocks).toBeDefined();
+    });
+
     test("a row whose block count disagrees with the size is ignored", async () => {
         const b = await withIndex(rows => {
             const r = rows.find(x => x.name === "rom/exact.bin")!;
@@ -308,6 +322,28 @@ describe("index validation and the VFS", () => {
         expect(Buffer.from(got).equals(Buffer.from(FILES["rom/data.mix"]))).toBe(true);
     });
 
+    test("seeks, async reads, size queries and pinning all see the original bytes", async () => {
+        installFakeOpfs();
+        const a = await open(packed, BLOCK * 2);
+        const vfs = new VirtualFileSystem();
+        vfs.mountRom(a, "rom", buildRomIndex(a, "rom"));
+        await vfs.initOverlay("test:wgb-block-compression-paths");
+        const want = FILES["rom/data.mix"];
+        expect(vfs.getFileSize("C:\\data.mix")).toBe(want.length);
+        const h = vfs.openSync("C:\\data.mix", 0x80000000, 3)!;
+        const r = rng(9);
+        for (let i = 0; i < 60; i++) {
+            const off = Math.floor(r() * want.length);
+            const len = 1 + Math.floor(r() * BLOCK * 2);
+            vfs.setPosition(h, off, 0);
+            const got = i % 2 ? await vfs.read(h, len) : vfs.readSync(h, len)!;
+            expect(Buffer.from(got).equals(Buffer.from(want.subarray(off, Math.min(want.length, off + len))))).toBe(true);
+        }
+        expect(await vfs.pinRomFiles(["one.txt", "game.exe"])).toBeGreaterThanOrEqual(0);
+        const one = vfs.openSync("C:\\one.txt", 0x80000000, 3)!;
+        expect(Buffer.from(vfs.readSync(one, 1 << 20)!).equals(Buffer.from(FILES["rom/one.txt"]))).toBe(true);
+    });
+
     test("the VFS still rejects DEFLATE members without a valid index", async () => {
         installFakeOpfs();
         const b = await withIndex(rows => { rows.find(r => r.name === "rom/data.mix")!.compressedSize += 1; });
@@ -316,6 +352,17 @@ describe("index validation and the VFS", () => {
     });
 });
 
+
+test("the manifest names the index, and the loader checks the version it needs", async () => {
+    const bundle = await WgbLoader.fromSource(new BufferSource(packed));
+    expect(bundle.manifest.blockIndex).toEqual({ member: WGB_BLOCK_INDEX_ENTRY, version: 1 });
+    expect(Buffer.from(bundle.entrypointBytes).equals(Buffer.from(FILES["rom/game.exe"]))).toBe(true);
+    expect(() => checkBlockIndex({ blockIndex: { member: WGB_BLOCK_INDEX_ENTRY, version: 2 } }, bundle.archive)).toThrow(/needs block-index v2; this engine reads v1/);
+    const stored = new ZipArchive(new BufferSource(new Uint8Array(readFileSync(storedPath))));
+    await stored.init();
+    expect(() => checkBlockIndex({ blockIndex: { member: WGB_BLOCK_INDEX_ENTRY, version: 1 } }, stored)).toThrow(/is missing/);
+    expect(() => checkBlockIndex({}, stored)).not.toThrow();
+});
 
 test("an unreadable index leaves the members unindexed instead of failing the archive", async () => {
     const a = await open(packed);
@@ -328,5 +375,8 @@ test("an unreadable index leaves the members unindexed instead of failing the ar
     const b = new ZipArchive(new BufferSource(copy));
     await b.init();
     expect(b.getEntry("rom/data.mix")!.blocks).toBeUndefined();
+    expect(b.blockIndexState).toBe("rejected");
+    expect(b.blockIndexError).toMatch(/magic/);
+    expect(() => checkBlockIndex({ blockIndex: { member: WGB_BLOCK_INDEX_ENTRY, version: 1 } }, b)).toThrow(/needs block-index v1, but wgb-blocks.idx is damaged/);
     expect(Buffer.from(await b.readEntry(b.getEntry("rom/data.mix")!)).equals(Buffer.from(FILES["rom/data.mix"]))).toBe(true);
 });

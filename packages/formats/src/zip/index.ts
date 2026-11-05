@@ -1,10 +1,12 @@
 import { asBlobPart } from "../dom-buffer";
 import { inflateRawSync as inflateRawInto } from './inflate';
 import { dosDateTimeToUnix } from './dos-time';
-import { applyBlockIndex, decodeBlockIndex, inflateBlock, WGB_BLOCK_INDEX_ENTRY } from './block-index';
+import { applyBlockIndex, decodeBlockIndex, WGB_BLOCK_INDEX_ENTRY } from './block-index';
 import type { BlockIndexRow, ZipBlockMap } from './block-index';
-export { WGB_BLOCK_INDEX_ENTRY, encodeBlockIndex, decodeBlockIndex, inflateBlock } from './block-index';
-export type { ZipBlockMap, BlockIndexRow } from './block-index';
+import { inflateRawBlock } from './block-codec';
+export { WGB_BLOCK_INDEX_ENTRY, WGB_BLOCK_INDEX_VERSION, encodeBlockIndex, decodeBlockIndex } from './block-index';
+export type { ZipBlockMap, BlockIndexRow, WgbBlockIndexRef } from './block-index';
+export { inflateRawBlock, deflateRawBlock, BLOCK_STREAM_END } from './block-codec';
 export { dosDateTimeToUnix, unixToDosDateTime, wallClockToInstant, instantToWallClock } from './dos-time';
 
 // Synchronous inflate — usable where DecompressionStream is not (guest traps).
@@ -298,6 +300,8 @@ export class ZipArchive {
     private readonly blockCache = new Map<number, Uint8Array>();
     private blockCacheBytes = 0;
     private readonly blockCacheBudget: number;
+    blockIndexState: "absent" | "loaded" | "rejected" = "absent";
+    blockIndexError: string | null = null;
 
     constructor(source: ZipSource, options: ZipArchiveOptions = {}) {
         this.source = source;
@@ -377,15 +381,16 @@ export class ZipArchive {
     private async loadBlockIndex(): Promise<void> {
         const entry = this.entries.get(WGB_BLOCK_INDEX_ENTRY);
         if (!entry || entry.isDirectory || entry.compression !== 0) return;
-        const hasDeflate = Array.from(this.entries.values()).some(e => e.compression === 8);
-        if (!hasDeflate) return;
         let rows: BlockIndexRow[];
         try {
             rows = decodeBlockIndex(await this.readEntryRange(entry, 0, entry.uncompressedSize));
-        } catch {
+        } catch (e) {
+            this.blockIndexState = "rejected";
+            this.blockIndexError = e instanceof Error ? e.message : String(e);
             return;
         }
         applyBlockIndex(rows, name => this.entries.get(name));
+        this.blockIndexState = "loaded";
     }
 
     isRangeReadable(entry: ZipEntry): boolean {
@@ -608,7 +613,9 @@ export class ZipArchive {
             if (!span || !compressed || b < span.first || b > span.last) return null;
             const rel = dataStart + offsets[b] - span.start;
             const expected = Math.min(blockSize, entry.uncompressedSize - b * blockSize);
-            const block = inflateBlock(compressed.subarray(rel, rel + offsets[b + 1] - offsets[b]), expected);
+            const block = new Uint8Array(expected);
+            const written = inflateRawBlock(compressed.subarray(rel, rel + offsets[b + 1] - offsets[b]), block);
+            if (written !== expected) throw new Error(`block inflate: block ${b} of ${entry.name} gave ${written} bytes, expected ${expected}`);
             this.cacheBlock(dataStart + offsets[b], block);
             parts[b - plan.first] = block;
         }
