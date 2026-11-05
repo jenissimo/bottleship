@@ -546,7 +546,22 @@ export class MemoryManager {
             skipOverlapCheck: true,
         });
 
-        bucket.next = Math.max(bucket.next, addr + aligned);
+        // A fixed-address claim takes its range out of the address space the anonymous
+        // allocator may still hand out. VirtualAlloc(lpAddress) is how a guest heap grows in
+        // place: it VirtualQuery-walks to a MEM_FREE run next to its own pool — typically a
+        // range an earlier VirtualFree(MEM_RELEASE) put on the released lists — and reserves
+        // exactly there. Left on those lists, the next VirtualAlloc(NULL) is served the same
+        // base, "zeroes" it under the fresh-commit contract and wipes the live pool (Blade of
+        // Darkness: SmartHeap's page ring pointed into the zeroed range, next=0, endless walk).
+        this.claimFromFreeLists(bucketKind, addr, aligned);
+        // Only a claim inside the bump zone (below the high frontier) moves the bump frontier.
+        // One in the top-down zone — above slabTop, carved by allocFromHigh and since
+        // released — must not: pushing `next` past `slabTop` crosses the two frontiers, after
+        // which every bump and every high carve in this bucket reads as exhausted.
+        const ceiling = bucket.slabTop ?? bucket.limit;
+        if (addr < ceiling) {
+            bucket.next = Math.max(bucket.next, Math.min(addr + aligned, ceiling));
+        }
         this.recordAllocation(addr, aligned);
         this.allocs.setBucket(addr, bucketKind);
         this.logLargeEvent('alloc', addr, aligned);
@@ -557,6 +572,25 @@ export class MemoryManager {
         markGuestPagesDirty(addr, aligned);
         maybeInvalidateExecutableRange(finalKind, finalPerms, addr, aligned);
         return addr;
+    }
+
+    /** Remove [addr, addr+size) from both free pools of a bucket, keeping the remainders. */
+    private claimFromFreeLists(bucketKind: RegionKind, addr: number, size: number): void {
+        const end = addr + size;
+        for (const pools of [this.freeBlocks, this.largeFreeBlocks]) {
+            const list = pools.get(bucketKind);
+            if (!list || list.length === 0) continue;
+            let touched = false;
+            const kept: Array<{ addr: number; size: number }> = [];
+            for (const block of list) {
+                const blockEnd = block.addr + block.size;
+                if (blockEnd <= addr || block.addr >= end) { kept.push(block); continue; }
+                touched = true;
+                if (block.addr < addr) kept.push({ addr: block.addr, size: addr - block.addr });
+                if (blockEnd > end) kept.push({ addr: end, size: blockEnd - end });
+            }
+            if (touched) pools.set(bucketKind, kept);
+        }
     }
 
     free(ptr: number): void {
