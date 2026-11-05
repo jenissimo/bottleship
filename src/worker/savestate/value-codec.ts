@@ -8,6 +8,8 @@
  * - A shared, non-cyclic reference is written once per place it appears; a cycle is refused.
  * - `undefined` is dropped from objects and refused in arrays; holes in a sparse array come
  *   back as `null`.
+ * - Plain objects and null-prototype objects are accepted; both decode as plain objects.
+ *   Arrays must be plain arrays.
  */
 export type SaveValue =
     | null | boolean | number | string
@@ -20,6 +22,8 @@ const TYPED = {
     i16: Int16Array, i32: Int32Array, f32: Float32Array, f64: Float64Array,
 } as const;
 type TypedTag = keyof typeof TYPED;
+
+const MAX_DEPTH = 1000;
 
 const SPECIAL_NUMBERS: Readonly<Record<string, number>> = { '-0': -0, NaN: NaN, Infinity: Infinity, '-Infinity': -Infinity };
 
@@ -47,6 +51,7 @@ export function encodeValue(value: SaveValue): EncodedValue {
     const ancestors = new Set<object>();
     const walk = (v: unknown, path: string): unknown => {
         if (v === null || typeof v === 'boolean' || typeof v === 'string') return v;
+        if (ancestors.size >= MAX_DEPTH) throw new SaveValueError(path, `nested deeper than ${MAX_DEPTH}`);
         if (typeof v === 'number') {
             if (Number.isFinite(v) && !Object.is(v, -0)) return v;
             return { $num: Object.is(v, -0) ? '-0' : String(v) };
@@ -62,6 +67,7 @@ export function encodeValue(value: SaveValue): EncodedValue {
         ancestors.add(v);
         try {
             if (Array.isArray(v)) {
+                if (Object.getPrototypeOf(v) !== Array.prototype) throw new SaveValueError(path, `${v.constructor?.name ?? 'array'} is not a plain array`);
                 const arr: unknown[] = [];
                 for (let i = 0; i < v.length; i++) {
                     if (i in v && v[i] === undefined) throw new SaveValueError(`${path}[${i}]`, 'undefined in an array');
@@ -69,7 +75,8 @@ export function encodeValue(value: SaveValue): EncodedValue {
                 }
                 return arr;
             }
-            if (Object.getPrototypeOf(v) !== Object.prototype) {
+            const proto = Object.getPrototypeOf(v);
+            if (proto !== Object.prototype && proto !== null) {
                 throw new SaveValueError(path, `${(v as object).constructor?.name ?? 'object'} is not a plain object`);
             }
             const out: Record<string, unknown> = Object.create(null);
@@ -89,11 +96,16 @@ export function encodeValue(value: SaveValue): EncodedValue {
 }
 
 export function decodeValue(encoded: EncodedValue): SaveValue {
-    const walk = (v: unknown, path: string): SaveValue => {
+    const tagged = (o: Record<string, unknown>, path: string, keys: readonly string[]) => {
+        for (const k of Object.keys(o)) if (!keys.includes(k)) throw new SaveValueError(`${path}.${k}`, 'unexpected key on a tagged value');
+    };
+    const walk = (v: unknown, path: string, depth: number): SaveValue => {
         if (v === null || typeof v !== 'object') return v as SaveValue;
-        if (Array.isArray(v)) return v.map((x, i) => walk(x, `${path}[${i}]`));
+        if (depth >= MAX_DEPTH) throw new SaveValueError(path, `nested deeper than ${MAX_DEPTH}`);
+        if (Array.isArray(v)) return v.map((x, i) => walk(x, `${path}[${i}]`, depth + 1));
         const o = v as Record<string, unknown>;
         if (Object.prototype.hasOwnProperty.call(o, '$num')) {
+            tagged(o, path, ['$num']);
             const n = o.$num;
             if (typeof n !== 'string' || !Object.prototype.hasOwnProperty.call(SPECIAL_NUMBERS, n)) {
                 throw new SaveValueError(path, `bad number ${String(n)}`);
@@ -101,6 +113,7 @@ export function decodeValue(encoded: EncodedValue): SaveValue {
             return SPECIAL_NUMBERS[n]!;
         }
         if (Object.prototype.hasOwnProperty.call(o, '$typed')) {
+            tagged(o, path, ['$typed', 'blob']);
             const index = o.blob;
             if (!isTypedTag(o.$typed) || typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= encoded.blobs.length) {
                 throw new SaveValueError(path, `bad typed array ${String(o.$typed)}/${String(index)}`);
@@ -116,9 +129,9 @@ export function decodeValue(encoded: EncodedValue): SaveValue {
         const out: Record<string, SaveValue> = {};
         for (const k of Object.keys(o)) {
             if (k === '__proto__' || k.startsWith('$')) throw new SaveValueError(`${path}.${k}`, 'reserved key');
-            out[k] = walk(o[k], `${path}.${k}`);
+            out[k] = walk(o[k], `${path}.${k}`, depth + 1);
         }
         return out;
     };
-    return walk(JSON.parse(encoded.json), '');
+    return walk(JSON.parse(encoded.json), '', 0);
 }

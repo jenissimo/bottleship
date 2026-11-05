@@ -45,6 +45,18 @@ describe("savestate value codec", () => {
         expect(() => decodeValue({ json: '{"__proto__":{"x":1}}', blobs: [] })).toThrow(/reserved key/);
     });
 
+    test("accepts null-prototype objects, refuses array subclasses and runaway depth", () => {
+        const dict = Object.create(null);
+        dict.k = 1;
+        expect(decodeValue(encodeValue({ d: dict }))).toEqual({ d: { k: 1 } });
+        class List extends Array {}
+        expect(() => encodeValue({ l: List.from([1]) } as any)).toThrow(/not a plain array/);
+        let deep: any = 1;
+        for (let i = 0; i < 5000; i++) deep = [deep];
+        expect(() => encodeValue(deep)).toThrow(SaveValueError);
+        expect(() => decodeValue({ json: "[".repeat(5000) + "]".repeat(5000), blobs: [] })).toThrow(SaveValueError);
+    });
+
     test("encodes keys in sorted order whatever order they were built in", () => {
         expect(encodeValue({ b: 1, a: 2, 2: 3 }).json).toBe(encodeValue({ 2: 3, a: 2, b: 1 }).json);
         expect(encodeValue({ b: 1, a: 2 }).json).toBe('{"a":2,"b":1}');
@@ -56,6 +68,8 @@ describe("savestate value codec", () => {
         expect(() => decodeValue({ json: '{"$typed":"f64","blob":0.5}', blobs: [twelve] })).toThrow(/bad typed array/);
         expect(() => decodeValue({ json: '{"$typed":"toString","blob":0}', blobs: [twelve] })).toThrow(/bad typed array/);
         expect(() => decodeValue({ json: '{"$num":"12abc"}', blobs: [] })).toThrow(/bad number/);
+        expect(() => decodeValue({ json: '{"$num":"NaN","extra":1}', blobs: [] })).toThrow(/unexpected key/);
+        expect(() => decodeValue({ json: '{"$typed":"u8","blob":0,"x":1}', blobs: [new Uint8Array(1)] })).toThrow(/unexpected key/);
     });
 
     test("a typed array view is captured by its own bytes, not its whole buffer", () => {

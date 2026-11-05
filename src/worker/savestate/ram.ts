@@ -49,7 +49,7 @@ export function validateRamManifest(manifest: unknown, guestLength?: number): Ra
         if (!Array.isArray(entry) || entry.length !== 2) throw new RamManifestError('ram: bad chunk entry');
         const [index, hash] = entry as [unknown, unknown];
         if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= count) {
-            throw new RamManifestError(`ram: chunk index ${String(index)} is outside 0..${count - 1}`);
+            throw new RamManifestError(`ram: chunk index ${JSON.stringify(index)} is outside 0..${count - 1}`);
         }
         if (index <= previous) throw new RamManifestError(`ram: chunk index ${index} is not after ${previous}`);
         if (!isChunkHash(hash)) throw new RamManifestError(`ram: chunk ${index} has a bad hash`);
