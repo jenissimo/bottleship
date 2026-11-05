@@ -4,6 +4,7 @@ import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
 import { TimerKind } from "../../core/scheduler/types";
+import { setTimerHandler } from "../../core/scheduler/timer-wheel";
 import { TimeService } from "../../runtime/time";
 import { MSSContext, createMSSContext, SMP_DONE, SMP_PLAYING } from "./context";
 import { finishSamplePlayback, getBytesPerSecond, getPlaybackLengthBytes, setSampleStatus, setStreamStatus, writeSamplePosition, writeStreamPosition, startHeartbeat, stopHeartbeat } from "./helpers";
@@ -62,6 +63,8 @@ export class MSS32 implements IModule {
         // → MSS32 voice-pool saturation hang (mac). startHeartbeat re-arms it whenever a
         // digital driver is (re)opened; closing one stops it.
         this.ctx.heartbeatTick = () => { pumpVfsStreams(this.ctx); updateEmulatorState(this.ctx); };
+        const ctx = this.ctx;
+        setTimerHandler(TimerKind.MSS_HEARTBEAT, () => ctx.heartbeatTick?.());
         startHeartbeat(this.ctx);
 
         // Merge all domain exports

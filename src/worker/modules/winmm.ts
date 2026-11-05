@@ -11,6 +11,7 @@ import { System } from "../core/system";
 import { Mem } from "../core/memory/mem-accessor";
 import { Marshaler } from "../core/memory/marshaler";
 import { TimerKind } from "../core/scheduler/types";
+import { setTimerHandler } from "../core/scheduler/timer-wheel";
 import { findResourceInPE } from "./kernel32/resource";
 import { probeAudioAt } from "@bottleship/formats/audio";
 import {
@@ -403,7 +404,34 @@ export class WinMM implements IModule {
     name = "winmm";
     exports: Record<string, ThunkImplementation> = {};
     private timers: Map<number, WinMMTimer> = new Map();
+    private timersByWheel: Map<number, WinMMTimer> = new Map();
     private nextTimerId = 1;
+
+    constructor() {
+        setTimerHandler(TimerKind.WINMM_TIMER, (_owner, _arg, wheelId) => {
+            const timer = this.timersByWheel.get(wheelId);
+            if (!timer) return;
+            if (!timer.isPeriodic && !timer.collapsedSelfRearm) this.timersByWheel.delete(wheelId);
+            this.onTimerFire(timer);
+        });
+        setTimerHandler(TimerKind.WAVEOUT_COMPLETION, (hwo, _arg, wheelId) => {
+            const device = this.waveOutDevices.get(hwo);
+            if (!device || device.completionPollerId !== wheelId) return;
+            this.syncGuestToSab(device);
+            this.checkCompletions(device);
+        });
+    }
+
+    private armTimerWheel(timer: WinMMTimer, delayMs: number, periodic: boolean, now: number): void {
+        this.timersByWheel.delete(timer.wheelId);
+        timer.wheelId = System.getInstance().scheduler.timerWheel.add(delayMs, periodic, TimerKind.WINMM_TIMER, 0, now);
+        this.timersByWheel.set(timer.wheelId, timer);
+    }
+
+    private cancelTimerWheel(timer: WinMMTimer): void {
+        System.getInstance().scheduler?.timerWheel.cancel(timer.wheelId);
+        this.timersByWheel.delete(timer.wheelId);
+    }
     private mmioHandles: Map<number, MMIOHandle> = new Map();
     /** Diagnostic: snapshot of the last MMIOINFO our direct-I/O path wrote, so a
      *  harness can verify mmioGetInfo/mmioAdvance produce valid non-null buffer
@@ -672,26 +700,14 @@ export class WinMM implements IModule {
 
         if (timer.collapsedSelfRearm) {
             if (!scheduler.timerWheel.reschedule(timer.wheelId, delayMs, true, TimerKind.WINMM_TIMER, now)) {
-                timer.wheelId = scheduler.timerWheel.add(
-                    delayMs,
-                    true,
-                    TimerKind.WINMM_TIMER,
-                    () => this.onTimerFire(timer),
-                    now
-                );
+                this.armTimerWheel(timer, delayMs, true, now);
                 this.dbgTimerStats.selfRearmRecreated++;
             } else {
                 this.dbgTimerStats.selfRearmRefresh++;
             }
         } else {
             timer.collapsedSelfRearm = true;
-            timer.wheelId = scheduler.timerWheel.add(
-                delayMs,
-                true,
-                TimerKind.WINMM_TIMER,
-                () => this.onTimerFire(timer),
-                now
-            );
+            this.armTimerWheel(timer, delayMs, true, now);
             this.dbgTimerStats.selfRearmCollapsed++;
         }
 
@@ -878,8 +894,7 @@ export class WinMM implements IModule {
             return;
         }
         device.completionPollerId = scheduler.timerWheel.add(
-            5, true, TimerKind.WINMM_TIMER,
-            () => { this.syncGuestToSab(device); this.checkCompletions(device); },
+            5, true, TimerKind.WAVEOUT_COMPLETION, device.id,
             TimeService.getInstance().nowMs(),
         );
     }
@@ -1023,7 +1038,7 @@ export class WinMM implements IModule {
                     this.dbgTimerStats.selfRearmInFlightSkips++;
                     return;
                 }
-                System.getInstance().scheduler.timerWheel.cancel(timer.wheelId);
+                this.cancelTimerWheel(timer);
                 this.forgetTimerPublicId(timer);
                 this.dbgTimerStats.selfRearmExpired++;
                 this.timerDebug(`self-rearm timer expired target=0x${timer.callbackOrEvent.toString(16)}`);
@@ -1416,7 +1431,6 @@ export class WinMM implements IModule {
 
             // Register with timerWheel instead of host setTimeout/setInterval
             const now = TimeService.getInstance().nowMs();
-            const scheduler = System.getInstance().scheduler;
 
             if (mode === "function" && !isPeriodic && this.refreshSelfRearmTimer(timerId, callbackOrEvent, dwUser, delayMs, now)) {
                 this.timerDebug(`timeSetEvent self-rearm refresh: id=${timerId} delay=${delayMs} target=0x${callbackOrEvent.toString(16)}`);
@@ -1432,13 +1446,7 @@ export class WinMM implements IModule {
                 dwUser,
                 delayMs,
             };
-            timerState.wheelId = scheduler.timerWheel.add(
-                delayMs,
-                isPeriodic,
-                TimerKind.WINMM_TIMER,
-                () => this.onTimerFire(timerState),
-                now
-            );
+            this.armTimerWheel(timerState, delayMs, isPeriodic, now);
 
             this.timers.set(timerId, timerState);
             return timerId;
@@ -1448,8 +1456,7 @@ export class WinMM implements IModule {
             const uTimerId = args[0];
             const timer = this.timers.get(uTimerId);
             if (timer) {
-                // Cancel timerWheel entry
-                System.getInstance().scheduler.timerWheel.cancel(timer.wheelId);
+                this.cancelTimerWheel(timer);
                 // Remove any pending callbacks for this timer
                 this.compactPendingQueue();
                 this.pendingTimerCallbacks = this.pendingTimerCallbacks.filter(
@@ -2306,7 +2313,9 @@ export class WinMM implements IModule {
             for (const timer of this.timers.values()) {
                 scheduler.timerWheel.cancel(timer.wheelId);
             }
+            for (const wheelId of this.timersByWheel.keys()) scheduler.timerWheel.cancel(wheelId);
         }
+        this.timersByWheel.clear();
         // Stop any per-device waveOut completion pollers (wheel entries) so a reset
         // doesn't leak a poller bound to a stale device, then drop the devices —
         // handle tables recycle and a stale WaveOutDevice would alias the next open.

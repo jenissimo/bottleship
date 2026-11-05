@@ -547,7 +547,7 @@ export function startHeartbeat(ctx: MSSContext): void {
         return;
     }
     ctx.updateInterval = scheduler.timerWheel.add(
-        HEARTBEAT_MS, true, TimerKind.MSS_TIMER, ctx.heartbeatTick,
+        HEARTBEAT_MS, true, TimerKind.MSS_HEARTBEAT, 0,
         TimeService.getInstance().nowMs(),
     );
 }

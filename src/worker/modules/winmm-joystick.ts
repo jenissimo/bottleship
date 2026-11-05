@@ -15,6 +15,7 @@
 import { ThunkImplementation } from '../core/thunking/thunk-dispatcher';
 import { System } from '../core/system';
 import { TimerKind } from '../core/scheduler/types';
+import { setTimerHandler } from '../core/scheduler/timer-wheel';
 import { TimeService } from '../runtime/time';
 import { GAMEPAD_AXES, GAMEPAD_BUTTONS, POV_CENTERED, gamepadPovAngle } from './dinput/emulated-gamepad';
 
@@ -159,6 +160,8 @@ function stopCapture(joyId: number): void {
  * MM_JOY* messages Windows would. Axis moves collapse into one MM_JOY*MOVE;
  * each button edge gets its own DOWN/UP with the JOY_BUTTONnCHG bit set.
  */
+setTimerHandler(TimerKind.JOYSTICK_CAPTURE, (joyId) => pollCapture(joyId));
+
 function pollCapture(joyId: number): void {
     const cap = captures[joyId];
     if (!cap) return;
@@ -350,8 +353,8 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
             };
             captures[uJoyID] = cap;
             cap.timerId = scheduler.timerWheel.add(
-                uPeriod, true, TimerKind.WINMM_TIMER,
-                () => pollCapture(uJoyID),
+                uPeriod, true, TimerKind.JOYSTICK_CAPTURE,
+                uJoyID,
                 TimeService.getInstance().nowMs(),
             );
             return JOYERR_NOERROR;

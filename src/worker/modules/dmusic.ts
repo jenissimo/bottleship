@@ -37,6 +37,7 @@ import { IModule } from "../core/module";
 import { Process } from "../core/process";
 import { SystemResourceProvider } from "../core/resources/system-resource-provider";
 import { TimerKind } from "../core/scheduler/types";
+import { setTimerHandler } from "../core/scheduler/timer-wheel";
 import { System } from "../core/system";
 import { type GuestCall, type GuestRoutine, runGuestRoutine } from "../core/thunking/guest-routine";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
@@ -167,6 +168,10 @@ export class DMusic implements IModule {
     private readonly performances = new Set<PerformanceObject>();
     private readonly loading = new Set<LoadableObject>();
     private pumpTimer: number | null = null;
+
+    constructor() {
+        setTimerHandler(TimerKind.DMUSIC_SYNTH, () => this.pump());
+    }
     private mixLeft = new Float32Array(0);
     private mixRight = new Float32Array(0);
     /** Guest blocks AllocPMsg and GetNotificationPMsg handed out, with what FreePMsg owes each. */
@@ -1737,7 +1742,7 @@ export class DMusic implements IModule {
         if (!scheduler) return;
         // Scheduler time, not a host timer: a guest thread that spins must not starve the music.
         this.pumpTimer = scheduler.timerWheel.add(
-            SYNTH_PUMP_MS, true, TimerKind.DMUSIC_SYNTH, () => this.pump(), TimeService.getInstance().nowMs());
+            SYNTH_PUMP_MS, true, TimerKind.DMUSIC_SYNTH, 0, TimeService.getInstance().nowMs());
     }
 
     private stopPump(): void {

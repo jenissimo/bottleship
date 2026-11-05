@@ -11,6 +11,7 @@ import { allocateComObject } from "../../core/com/com-memory";
 import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
 import { TimerKind } from "../../core/scheduler/types";
+import { setTimerHandler } from "../../core/scheduler/timer-wheel";
 import { TimeService } from "../../runtime/time";
 import { videoEngine } from "../../../video/video-engine";
 import { VideoFrameViews } from "../../video/video-routing-types";
@@ -36,6 +37,11 @@ import {
 
 /** One entry of the graph's event queue (IMediaEvent::GetEvent out-params). */
 export type MediaEvent = { code: number; param1: number; param2: number };
+
+setTimerHandler(TimerKind.QUARTZ_VIDEO, (handle, _arg, wheelId) => {
+    const graph = SystemResourceProvider.getInstance().getComObject(handle);
+    if (graph instanceof FilterGraphObject) graph.onPlaybackTimer(wheelId);
+});
 
 export class FilterGraphObject extends BaseComObject {
     private static nextAudioId = 0x51000000;
@@ -95,6 +101,8 @@ export class FilterGraphObject extends BaseComObject {
 
     // Playback timer — TimerWheel id, 0 = none scheduled (TimerWheel ids start at 1).
     private playbackTimer: number = 0;
+    private frameInterval = 0;
+    private nextFrameDeadline = 0;
     private completionResolvers: Array<() => void> = [];
 
     constructor(vtableAddress: number) {
@@ -510,33 +518,36 @@ export class FilterGraphObject extends BaseComObject {
         // timer and the HP Galaxy audio livelock), so a raw setTimeout callback can be
         // delayed arbitrarily long behind guest CPU usage. The wheel is polled in-band
         // with guest execution at every thunk boundary, so it fires even under load.
-        const timeService = TimeService.getInstance();
-        let nextFrameDeadline = timeService.nowMs() + frameInterval;
+        this.frameInterval = frameInterval;
+        this.nextFrameDeadline = TimeService.getInstance().nowMs() + frameInterval;
+        this.decodeFrame();
+    }
 
-        const decodeLoop = () => {
-            if (this.state !== FilterState.RUNNING) return;
+    onPlaybackTimer(wheelId: number): void {
+        if (this.playbackTimer === wheelId) this.decodeFrame();
+    }
 
-            const ok = videoEngine.doFrame(this.engineHandle);
-            if (!ok) {
-                this.finishVideoPlayback();
-                return;
-            }
+    private decodeFrame(): void {
+        if (this.state !== FilterState.RUNNING) return;
 
-            this.frameDecodeCount++;
-            this.routeDecodedFrame();
-            this.notifyVideoPaint();
-            videoEngine.nextFrame(this.engineHandle);
+        const ok = videoEngine.doFrame(this.engineHandle);
+        if (!ok) {
+            this.finishVideoPlayback();
+            return;
+        }
 
-            nextFrameDeadline += frameInterval;
-            const now = timeService.nowMs();
-            const delay = Math.max(0, nextFrameDeadline - now);
-            const scheduler = System.getInstance().scheduler;
-            if (scheduler) {
-                this.playbackTimer = scheduler.timerWheel.add(delay, false, TimerKind.QUARTZ_VIDEO, decodeLoop, now);
-            }
-        };
+        this.frameDecodeCount++;
+        this.routeDecodedFrame();
+        this.notifyVideoPaint();
+        videoEngine.nextFrame(this.engineHandle);
 
-        decodeLoop();
+        this.nextFrameDeadline += this.frameInterval;
+        const now = TimeService.getInstance().nowMs();
+        const delay = Math.max(0, this.nextFrameDeadline - now);
+        const scheduler = System.getInstance().scheduler;
+        if (scheduler) {
+            this.playbackTimer = scheduler.timerWheel.add(delay, false, TimerKind.QUARTZ_VIDEO, this.handle, now);
+        }
     }
 
     /**

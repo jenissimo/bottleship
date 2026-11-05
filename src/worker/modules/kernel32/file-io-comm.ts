@@ -7,12 +7,14 @@ import { ThunkImplementation, ThunkResult, X86Context } from '../../core/thunkin
 import { isValidAddress } from '../../core/memory/address-guard';
 import {
     INFINITE, WAIT_BLOCKED_NO_SWITCH, WAIT_FAILED, WAIT_IO_COMPLETION, WAIT_OBJECT_0,
+    WaitCompletionKind, type WaitAnswer, type WaitCompletion,
 } from '../../core/scheduler/types';
 import { deliverPendingApcs } from './sync';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
-import { socketCompletionWait } from './socket-completion-wait';
+import { releaseSocketCompletionWait, socketCompletionWait } from './socket-completion-wait';
+import { completeWait, setWaitCompletionHandler } from '../../core/scheduler/wait-completion';
 
 const ERROR_INVALID_PARAMETER = 87;
 const ERROR_IO_INCOMPLETE = 996;
@@ -58,6 +60,22 @@ function ioStatusToWin32(status: number): number {
     }
 }
 
+function overlappedCompletion(lpOverlapped: number, lpBytes: number): WaitAnswer {
+    // Signalled yet still marked pending: the waited object said done, so it is.
+    let status = Mem.readUint32(lpOverlapped) ?? 0;
+    if (lpBytes) Mem.writeUint32(lpBytes, Mem.readUint32(lpOverlapped + 4) ?? 0);
+    if (status === STATUS_PENDING) status = 0;
+    // Current Windows reports ERROR_SUCCESS even when the IOSB was already complete.
+    return status === 0 ? { value: 1, lastError: 0 } : { value: 0, lastError: ioStatusToWin32(status) };
+}
+
+setWaitCompletionHandler(WaitCompletionKind.OVERLAPPED_RESULT, ({ a: lpOverlapped, b: lpBytes, c: socketWait }, waitResult) => {
+    if (socketWait) releaseSocketCompletionWait(socketWait);
+    if (waitResult === WAIT_OBJECT_0) return overlappedCompletion(lpOverlapped, lpBytes);
+    if (waitResult === WAIT_FAILED) return { value: 0, lastError: 6 }; // ERROR_INVALID_HANDLE
+    return { value: 0, lastError: waitResult };                      // WAIT_TIMEOUT / WAIT_IO_COMPLETION
+});
+
 /**
  * GetOverlappedResult[Ex]: the OVERLAPPED's Internal/InternalHigh are the operation's
  * status and byte count. A pending operation with a non-zero timeout waits on hEvent
@@ -74,27 +92,12 @@ function overlappedResult(
         return { value: 0, stackCleanup: cleanup };
     }
 
-    const complete = (): { value: number; lastError?: number } => {
-        // Signalled yet still marked pending: the waited object said done, so it is.
-        let status = Mem.readUint32(lpOverlapped) ?? 0;
-        if (lpBytes) Mem.writeUint32(lpBytes, Mem.readUint32(lpOverlapped + 4) ?? 0);
-        if (status === STATUS_PENDING) status = 0;
-        // Current Windows reports ERROR_SUCCESS even when the IOSB was already complete.
-        return status === 0 ? { value: 1, lastError: 0 } : { value: 0, lastError: ioStatusToWin32(status) };
-    };
-    let socketWait: ReturnType<typeof socketCompletionWait> = null;
-    const afterWait = (waitResult: number): { value: number; lastError?: number } => {
-        socketWait?.release();
-        if (waitResult === WAIT_OBJECT_0) return complete();
-        if (waitResult === WAIT_FAILED) return { value: 0, lastError: 6 }; // ERROR_INVALID_HANDLE
-        return { value: 0, lastError: waitResult };                      // WAIT_TIMEOUT / WAIT_IO_COMPLETION
-    };
     const answer = (r: { value: number; lastError?: number }): ThunkResult => {
         if (r.lastError !== undefined) sched.setLastError(r.lastError);
         return { value: r.value, stackCleanup: cleanup };
     };
 
-    if ((Mem.readUint32(lpOverlapped) ?? 0) !== STATUS_PENDING) return answer(complete());
+    if ((Mem.readUint32(lpOverlapped) ?? 0) !== STATUS_PENDING) return answer(overlappedCompletion(lpOverlapped, lpBytes));
     if (timeoutMs === 0) return answer({ value: 0, lastError: ERROR_IO_INCOMPLETE });
 
     if (alertable) {
@@ -106,8 +109,11 @@ function overlappedResult(
     }
 
     const hEvent = Mem.readUint32(lpOverlapped + 16) ?? 0;
-    if (!hEvent) socketWait = socketCompletionWait(hFile, lpOverlapped);
+    const socketWait = hEvent ? null : socketCompletionWait(hFile, lpOverlapped);
     const waitOn = socketWait ? socketWait.handle : (hEvent ? hEvent : hFile) & ~3;
+    const afterWait: WaitCompletion = {
+        kind: WaitCompletionKind.OVERLAPPED_RESULT, a: lpOverlapped, b: lpBytes, c: socketWait?.handle ?? 0,
+    };
     const returnAddr = Mem.readUint32(ctx.esp) ?? 0;
     const result = sched.waitForObjectsWithContext(
         [waitOn >>> 0], false, timeoutMs, returnAddr, ctx.esp + 4 + cleanup,
@@ -115,7 +121,7 @@ function overlappedResult(
         alertable, afterWait,
     );
     if (result === WAIT_BLOCKED_NO_SWITCH) return { value: 0, blockedNoSwitch: true, stackCleanup: cleanup };
-    return answer(afterWait(result));
+    return answer(completeWait(afterWait, result));
 }
 
 export function registerFileIoCommExports(exports: Record<string, ThunkImplementation>): void {
