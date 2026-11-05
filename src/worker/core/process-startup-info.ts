@@ -53,7 +53,7 @@ export const STARTUPINFO_OFFSETS = {
 interface StartupState {
     /** The parent's copy, or null for a process that was booted directly. */
     adopted: ProcessStartupInfo | null;
-    /** Whether a first SW_SHOWDEFAULT can still resolve to wShowWindow. */
+    /** Whether the first top-level ShowWindow can still resolve to wShowWindow. */
     showWindowPending: boolean;
     /** The child's own lpDesktop/lpTitle, placed in the current guest image. */
     strings: { key: string; desktop: number; title: number } | null;
@@ -79,16 +79,23 @@ export function getProcessStartupInfo(): ProcessStartupInfo | null {
 }
 
 /**
- * The wShowWindow a first ShowWindow(SW_SHOWDEFAULT) should use, once.
+ * The wShowWindow the first top-level ShowWindow resolves to, once.
  *
- * Windows documents STARTF_USESHOWWINDOW as the value SW_SHOWDEFAULT resolves to, so
- * this is spent on the first such call and not applied to later ones: an application
- * that hides its own window after starting still hides it.
+ * Wine's show_window spends STARTF_USESHOWWINDOW on the first ShowWindow of a window
+ * that is neither a child nor owned (a popup only when it also carries a caption),
+ * whatever command that call uses. The value replaces SW_SHOW, SW_SHOWNORMAL and
+ * SW_SHOWDEFAULT only; an explicit SW_HIDE or SW_SHOWMAXIMIZED still wins. Later calls
+ * are ordinary: an application that hides its own window after starting still hides it.
  */
 export function takeStartupShowWindow(): number | null {
     if (!state.adopted || !state.showWindowPending) return null;
     state.showWindowPending = false;
     return state.adopted.wShowWindow;
+}
+
+/** Whether a ShowWindow still has a wShowWindow waiting for it. */
+export function hasPendingStartupShowWindow(): boolean {
+    return !!state.adopted && state.showWindowPending;
 }
 
 /**

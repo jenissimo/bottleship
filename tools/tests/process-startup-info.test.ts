@@ -6,9 +6,11 @@ import { stopChildProcesses, type ChildBoot } from '../../src/worker/core/child-
 import { VirtualFileSystem } from '../../src/worker/runtime/filesystem/vfs';
 import { exports as processApi } from '../../src/worker/modules/kernel32/process/process';
 import {
-    adoptProcessStartupInfo, resetProcessStartupInfo,
+    adoptProcessStartupInfo, hasPendingStartupShowWindow, resetProcessStartupInfo,
     STARTF_USESHOWWINDOW, STARTUPINFO_OFFSETS, STARTUPINFO_SIZE,
 } from '../../src/worker/core/process-startup-info';
+import { windows, type WindowInfo } from '../../src/worker/modules/user32/shared-state';
+import { createWindowExports } from '../../src/worker/modules/user32/window';
 import type { ZipArchive, ZipEntry } from '@bottleship/formats/zip';
 
 // STARTUPINFO carries the parent's window state to the child. These cases drive the
@@ -168,5 +170,182 @@ describe('STARTUPINFO across a process start', () => {
         expect(Mem.readUint32(CHILD_INFO + STARTUPINFO_OFFSETS.dwFlags)).toBe(0);
         expect(Mem.readUint16(CHILD_INFO + STARTUPINFO_OFFSETS.wShowWindow)).toBe(0);
         expect(Mem.readUint32(CHILD_INFO + STARTUPINFO_OFFSETS.lpTitle)).toBe(0);
+    });
+});
+
+// The other half of STARTF_USESHOWWINDOW: which ShowWindow spends it. Wine's show_window
+// spends it on the first ShowWindow of a top-level window whatever command that call
+// uses, and replaces only SW_SHOW, SW_SHOWNORMAL and SW_SHOWDEFAULT. These cases pin the
+// window test, the single spend, and the commands that keep their own meaning.
+describe('the launcher state a ShowWindow spends', () => {
+    const system = System.getInstance();
+    const WS_OVERLAPPEDWINDOW = 0x00cf0000;  // WS_CAPTION | WS_THICKFRAME | ...
+    const WS_CHILD = 0x40000000;
+    const WS_VISIBLE = 0x10000000;
+    const WS_MINIMIZE = 0x20000000;
+    const WS_POPUP = 0x80000000;
+    const SW_HIDE = 0;
+    const SW_SHOWNORMAL = 1;
+    const SW_SHOW = 5;
+    const SW_SHOWMINNOACTIVE = 7;
+    const SW_SHOWDEFAULT = 10;
+    const ESP = 0x2000;
+    const HWND = 0x22000;
+    const CHILD_HWND = 0x22004;
+    let mem: Uint8Array;
+    let savedProcess: unknown;
+    let savedWindowManager: Record<string, unknown>;
+    const memProperties = new Map<string, PropertyDescriptor | undefined>();
+    /** WM_SHOWWINDOW resolutions waiting for the guest window procedure to return. */
+    const pendingReturns: Array<((ret: number) => unknown) | undefined> = [];
+
+    function place(handle: number, style: number, parent?: number): void {
+        windows.set(handle, {
+            handle, title: `w${handle}`, style, x: 0, y: 0, width: 320, height: 200,
+            children: [], wndProc: 0x00401000, userData: 0, visible: (style & WS_VISIBLE) !== 0,
+            parent,
+        } as WindowInfo);
+    }
+
+    function styleOf(handle: number): number {
+        return windows.get(handle)!.style;
+    }
+
+    function showWindow(handle: number, cmd: number): void {
+        createWindowExports()['ShowWindow']!({ esp: ESP } as never, mem, [handle, cmd] as never);
+        // The visibility change is applied when the guest's WM_SHOWWINDOW handler
+        // returns, the way the emulator resumes it. Drain that here.
+        for (const resume of pendingReturns.splice(0)) resume?.(0);
+    }
+
+    /** Adopt what a launcher that ran the child with SW_SHOWMINNOACTIVE would pass. */
+    function adoptMinimized(): void {
+        adoptProcessStartupInfo({
+            dwFlags: STARTF_USESHOWWINDOW, wShowWindow: SW_SHOWMINNOACTIVE,
+            dwX: 0, dwY: 0, dwXSize: 0, dwYSize: 0, desktop: '', title: '',
+        });
+    }
+
+    beforeEach(() => {
+        mem = new Uint8Array(0x10000);
+        new DataView(mem.buffer).setUint32(ESP, 0x00402000, true);
+        for (const key of ['memoryGetter', 'validateRange', 'getRegion']) memProperties.set(key, Object.getOwnPropertyDescriptor(Mem, key));
+        Mem.bind(() => mem);
+        savedProcess = system.process;
+        // ShowWindow resolves WM_SHOWWINDOW synchronously; the harness records the
+        // callback instead of entering a guest window procedure.
+        system.process = {
+            v86: { mem8: mem },
+            dispatcher: {
+                callbackManager: {
+                    saveSuspendedThunkContext: () => 1,
+                    getStubPoolRange: () => ({ base: 0xf0000000, end: 0xf0001000 }),
+                    invokeCallback: (_p: number, _args: number[], _f: number, complete?: (ret: number) => unknown) => {
+                        pendingReturns.push(complete);
+                        return { callbackId: 1 };
+                    },
+                },
+            },
+            memory: { alloc: () => 0x800, free: () => {} },
+            getModule: () => undefined,
+        } as never;
+        const wm = system.windowManager as unknown as Record<string, unknown>;
+        savedWindowManager = {
+            getWindow: wm.getWindow, postMessage: wm.postMessage,
+            setWindowZOrder: wm.setWindowZOrder, getActiveHwnd: wm.getActiveHwnd,
+        };
+        wm.getWindow = () => null;
+        wm.postMessage = () => {};
+        wm.setWindowZOrder = () => {};
+        wm.getActiveHwnd = () => HWND;
+        resetProcessStartupInfo();
+    });
+
+    afterEach(() => {
+        Object.assign(system.windowManager as unknown as Record<string, unknown>, savedWindowManager);
+        system.process = savedProcess as never;
+        for (const [key, descriptor] of memProperties) {
+            if (descriptor) Object.defineProperty(Mem, key, descriptor);
+            else Reflect.deleteProperty(Mem, key);
+        }
+        windows.delete(HWND);
+        windows.delete(CHILD_HWND);
+        resetProcessStartupInfo();
+    });
+
+    test('the first SW_SHOWDEFAULT on the main window resolves to the launcher state', () => {
+        adoptMinimized();
+        place(HWND, WS_OVERLAPPEDWINDOW);
+        showWindow(HWND, SW_SHOWDEFAULT);
+
+        expect(styleOf(HWND) & WS_VISIBLE).toBe(WS_VISIBLE);
+        expect(styleOf(HWND) & WS_MINIMIZE).toBe(WS_MINIMIZE);
+        expect(hasPendingStartupShowWindow()).toBe(false);
+    });
+
+    test('a later ShowWindow is an ordinary one, not a second resolution', () => {
+        adoptMinimized();
+        place(HWND, WS_OVERLAPPEDWINDOW);
+        showWindow(HWND, SW_SHOWDEFAULT);
+        showWindow(HWND, SW_SHOWNORMAL);
+
+        // SW_SHOWNORMAL clears the minimize state; had the value been applied again the
+        // window would still be minimized.
+        expect(styleOf(HWND) & WS_MINIMIZE).toBe(0);
+        expect(styleOf(HWND) & WS_VISIBLE).toBe(WS_VISIBLE);
+    });
+
+    test('SW_SHOW spends the launcher state too', () => {
+        adoptMinimized();
+        place(HWND, WS_OVERLAPPEDWINDOW);
+        showWindow(HWND, SW_SHOW);
+
+        // The launcher said "minimized", so the first show is minimized even though the
+        // call itself asked for a plain SW_SHOW.
+        expect(styleOf(HWND) & WS_MINIMIZE).toBe(WS_MINIMIZE);
+        expect(hasPendingStartupShowWindow()).toBe(false);
+    });
+
+    test('an explicit SW_HIDE still hides, and spends the state', () => {
+        adoptMinimized();
+        place(HWND, WS_OVERLAPPEDWINDOW);
+        showWindow(HWND, SW_HIDE);
+
+        expect(styleOf(HWND) & WS_VISIBLE).toBe(0);
+        // Spent: a later SW_SHOW is an ordinary show, not the launcher's minimize.
+        expect(hasPendingStartupShowWindow()).toBe(false);
+        showWindow(HWND, SW_SHOW);
+        expect(styleOf(HWND) & WS_VISIBLE).toBe(WS_VISIBLE);
+        expect(styleOf(HWND) & WS_MINIMIZE).toBe(0);
+    });
+
+    test('a child control does not spend it', () => {
+        adoptMinimized();
+        place(HWND, WS_OVERLAPPEDWINDOW);
+        place(CHILD_HWND, WS_CHILD, HWND);
+        showWindow(CHILD_HWND, SW_SHOWDEFAULT);
+
+        expect(styleOf(CHILD_HWND) & WS_MINIMIZE).toBe(0);
+        expect(hasPendingStartupShowWindow()).toBe(true);
+    });
+
+    test('an owned popup does not spend it, the main window still does', () => {
+        adoptMinimized();
+        place(HWND, WS_OVERLAPPEDWINDOW);
+        place(CHILD_HWND, WS_POPUP, HWND);
+        showWindow(CHILD_HWND, SW_SHOWDEFAULT);
+        expect(hasPendingStartupShowWindow()).toBe(true);
+
+        showWindow(HWND, SW_SHOWDEFAULT);
+        expect(styleOf(HWND) & WS_MINIMIZE).toBe(WS_MINIMIZE);
+    });
+
+    test('a process booted directly is untouched by the rule', () => {
+        resetProcessStartupInfo();
+        place(HWND, WS_OVERLAPPEDWINDOW);
+        showWindow(HWND, SW_SHOWDEFAULT);
+
+        expect(styleOf(HWND) & WS_VISIBLE).toBe(WS_VISIBLE);
+        expect(styleOf(HWND) & WS_MINIMIZE).toBe(0);
     });
 });

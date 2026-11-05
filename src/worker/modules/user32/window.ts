@@ -12,7 +12,7 @@ import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { getWindowClass, getWindowClassByName } from './class';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
-import { takeStartupShowWindow } from '../../core/process-startup-info';
+import { hasPendingStartupShowWindow, takeStartupShowWindow } from '../../core/process-startup-info';
 import { WindowInfo, windows, getWindowByHandle, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, markWindowPaintCycleRan, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, isWindowPosZOrderRequestValid, shouldSeedPaintFromParent, tryLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect } from './shared-state';
 import {
     invalidateWindow,
@@ -1811,20 +1811,33 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const window = windows.get(hWnd);
         if (!window || nCmdShow < 0 || nCmdShow > 11) return 0;
 
-        // SW_SHOWDEFAULT means "whatever STARTUPINFO says": when the parent set
-        // STARTF_USESHOWWINDOW, the documented answer is its wShowWindow, and only the
-        // first such call resolves to it. A later SW_SHOWDEFAULT is an ordinary show,
-        // which is why an application can still hide its own window after starting.
-        if (nCmdShow === 10) {
-            const fromStartup = takeStartupShowWindow();
-            if (fromStartup !== null && fromStartup >= 0 && fromStartup <= 11) nCmdShow = fromStartup;
-        }
-
         const WS_VISIBLE = 0x10000000;
         const WS_CHILD = 0x40000000;
         const WS_POPUP = 0x80000000;
+        const WS_CAPTION = 0x00c00000;
         const WS_MINIMIZE = 0x20000000;
         const WS_MAXIMIZE = 0x01000000;
+
+        // The launcher's wShowWindow is spent by the first ShowWindow of a top-level
+        // window — Wine's show_window uses the same test: no WS_CHILD, no owner, and a
+        // popup only when it also carries a caption. It is spent whatever command that
+        // call uses, because the whole point is that the launcher decided how the first
+        // window appears. Only the three "whatever the launcher said" commands take the
+        // value; an explicit SW_HIDE or SW_SHOWMAXIMIZED still wins, and later calls are
+        // ordinary shows, which is why an application can still hide its own window.
+        const spendsStartupShow = (window.style & WS_CHILD) === 0
+            && (window.parent ?? 0) === 0
+            && ((window.style & WS_POPUP) === 0
+                || (window.style & (WS_POPUP | WS_CAPTION)) === (WS_POPUP | WS_CAPTION));
+        if (spendsStartupShow) {
+            const fromStartup = takeStartupShowWindow();
+            if (fromStartup !== null && fromStartup >= 0 && fromStartup <= 11
+                && (nCmdShow === 1 /* SW_SHOWNORMAL */ || nCmdShow === 5 /* SW_SHOW */
+                    || nCmdShow === 10 /* SW_SHOWDEFAULT */)) {
+                nCmdShow = fromStartup;
+            }
+        }
+
         const wasVisible = (window.style & WS_VISIBLE) !== 0;
         const resultValue = forcedResult ?? (wasVisible ? 1 : 0);
         const show = nCmdShow !== 0;
@@ -3099,6 +3112,9 @@ export function registerFastPathWindowFunctions(dispatcher: HleDispatcher): void
         const cmd = view.getInt32(esp + 8, true);
         const win = windows.get(hwnd);
         if (!win) return null;
+        // A pending wShowWindow belongs to the first top-level ShowWindow and has to be
+        // spent there, so the call cannot be answered from the visible/flags state alone.
+        if (hasPendingStartupShowWindow()) return null;
         const visible = (win.style & 0x10000000) !== 0;
         if (cmd === 0 && !visible) return 0;
         if (cmd === 5 && visible) return 1;
