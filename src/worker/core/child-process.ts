@@ -56,6 +56,35 @@ function missingImageError(vfs: VirtualFileSystem, imagePath: string): ChildStar
     return new ChildStartFailure(`Cannot open child image: ${imagePath}`, code);
 }
 
+/**
+ * One handle a child inherits (CreateProcess with bInheritHandles = TRUE). It is installed
+ * at the SAME value in the child: the parent passes the number itself, on the command line
+ * or in the environment. Only object kinds that can be held across workers are described;
+ * the parent logs the ones it could not carry (see modules/kernel32/inherited-handles.ts).
+ */
+export type InheritedHandleSpec = {
+    handle: number;
+    access: number;
+} & ({
+    kind: 'process' | 'thread';
+    pid: number;
+    tid?: number;
+    ownerPid: number;
+    imageName: string;
+    imagePath?: string;
+    commandLine: string;
+    currentDirectory: string;
+    terminated: boolean;
+    exitCode: number;
+} | {
+    kind: 'event';
+    /** The process that created the event and relays its state to every holder. */
+    ownerPid: number;
+    id: number;
+    manualReset: boolean;
+    signaled: boolean;
+});
+
 export interface ChildProcessRequest {
     processId?: number;
     startSuspended?: boolean;
@@ -66,6 +95,8 @@ export interface ChildProcessRequest {
     environment?: [string, string][];
     /** The caller's lpStartupInfo, already copied out of its memory. */
     startupInfo?: ProcessStartupInfo;
+    /** The parent's inheritable handles, when it asked for them to be inherited. */
+    inheritedHandles?: InheritedHandleSpec[];
 }
 
 export interface ChildBoot extends ChildProcessRequest {
@@ -418,7 +449,7 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
                     });
                 }
                 else if (message.type === 'process_exit') {
-                    getProcessIpc().markProcessExited(identity.pid);
+                    getProcessIpc().markProcessExited(identity.pid, message.exitCode >>> 0);
                     context.record.fault = message.fault;
                     context.record.logs = message.logs;
                     // The child exited; its barrier did not drain. Not a crash, but the

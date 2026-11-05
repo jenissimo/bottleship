@@ -30,6 +30,7 @@ import { exports as vista_runtime, resetVistaRuntimeState } from './vista-runtim
 import { exports as vista_system, resetVistaSystemState } from './process/vista-system';
 import { resetActCtxState } from './process/actctx';
 import { getVirtualProcessManager } from './process/virtual-process-manager';
+import { resetInheritedHandleState } from './inherited-handles';
 import { resetAllSrwLocks } from './srw-lock';
 import { consoleScreenBuffers } from './console-screen-buffer';
 import { resetConsoleModeState } from './file-io-console';
@@ -96,6 +97,7 @@ export class Kernel32 implements IModule {
         resetSyncState();
         resetActCtxState();
         getVirtualProcessManager().reset();
+        resetInheritedHandleState();
         resetAllSrwLocks();
         resetVistaRuntimeState();
         resetVistaSystemState();

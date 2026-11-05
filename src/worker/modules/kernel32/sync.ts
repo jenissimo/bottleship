@@ -26,6 +26,7 @@ import {
     tryAcquireSrwShared,
 } from './srw-lock';
 import { namedObjects } from './named-objects';
+import { applyInheritFlag } from './inherited-handles';
 import { getWsaNativeSocketTable } from '../wsa-stub-shared';
 import type { WsaSocketTable } from '../wsa-network';
 
@@ -908,6 +909,7 @@ const syncModule = (() => {
         }
 
         const handle = sched.createEvent(bManualReset, bInitialState);
+        applyInheritFlag(handle, args[0] >>> 0);
         if (name) {
             namedObjects.register('event', name, handle, { manualReset: bManualReset, initialState: bInitialState });
         }
@@ -943,6 +945,7 @@ const syncModule = (() => {
         }
 
         const handle = sched.createEvent(bManualReset, bInitialState);
+        applyInheritFlag(handle, args[0] >>> 0);
         if (name) {
             namedObjects.register('event', name, handle, { manualReset: bManualReset, initialState: bInitialState });
         }
@@ -1219,6 +1222,7 @@ const syncModule = (() => {
         }
 
         const handle = sched.createMutex(bInitialOwner);
+        applyInheritFlag(handle, args[0] >>> 0);
         if (name) {
             namedObjects.register('mutex', name, handle);
         }
@@ -1241,6 +1245,7 @@ const syncModule = (() => {
         }
 
         const handle = sched.createMutex(bInitialOwner);
+        applyInheritFlag(handle, args[0] >>> 0);
         if (name) {
             namedObjects.register('mutex', name, handle);
         }
@@ -1304,6 +1309,7 @@ const syncModule = (() => {
         }
 
         const handle = sched.createSemaphore(lInitialCount, lMaximumCount);
+        applyInheritFlag(handle, args[0] >>> 0);
         if (name) {
             namedObjects.register('semaphore', name, handle, { initialCount: lInitialCount, maximumCount: lMaximumCount });
         }
@@ -1332,6 +1338,7 @@ const syncModule = (() => {
         }
 
         const handle = sched.createSemaphore(lInitialCount, lMaximumCount);
+        applyInheritFlag(handle, args[0] >>> 0);
         if (name) {
             namedObjects.register('semaphore', name, handle, { initialCount: lInitialCount, maximumCount: lMaximumCount });
         }
