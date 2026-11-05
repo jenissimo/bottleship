@@ -59,6 +59,7 @@ import { memoryWatch } from "./core/memory/memory-watch";
 import { memWriteTrap } from "./core/memory/mem-write-trap";
 import { Kernel32 } from "./modules/kernel32";
 import { adoptNamedObjects, namedObjects, type NamedObjectSpec } from "./modules/kernel32/named-objects";
+import { adoptInheritedHandles } from "./modules/kernel32/inherited-handles";
 import { User32 } from "./modules/user32";
 import { GDI32 } from "./modules/gdi32";
 import { installWindowsFonts } from "./modules/gdi32/installed-fonts";
@@ -3339,6 +3340,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         // image before restoring inherited objects; otherwise that stale TEB survives
         // while the new bootloader resets FS, and CRT startup faults at fs:[0].
         await prepareFullGameSwitch();
+        // Inherited handles first: they hold the PARENT's values, and every object this
+        // process creates from here on (the named-object adoption below included) must be
+        // allocated around them, as a Windows child's own handles are.
+        if (boot.inheritedHandles?.length) adoptInheritedHandles(boot.inheritedHandles);
         // A child is matched on its own image, not on its parent's: it inherits the bundle's
         // whole rule list in its EmulatorConfig and picks the entry that names it.
         system.registry.setRedirectsForImage(EmulatorConfig.getInstance().registryRedirects, boot.imagePath);

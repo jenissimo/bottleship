@@ -86,6 +86,27 @@ interface VirtualProcessRecord {
     primaryThreadId: number;
     isCurrentProcess: boolean;
     runtime?: ChildRuntime;
+    /**
+     * A process another worker runs, known here only through an inherited handle. Its
+     * handles signal when the process-IPC layer reports the pid dead; `ownerPid` is the
+     * process whose manager holds its runtime (the one TerminateProcess has to ask).
+     */
+    foreign?: { ownerPid: number };
+}
+
+/** What a process or thread handle needs to be re-created in a process that inherits it. */
+export interface ForeignHandleDescription {
+    kind: 'process' | 'thread';
+    pid: number;
+    tid?: number;
+    /** The process that can terminate `pid`: its creator, or `pid` itself when nobody here created it. */
+    ownerPid: number;
+    imageName: string;
+    imagePath?: string;
+    commandLine: string;
+    currentDirectory: string;
+    terminated: boolean;
+    exitCode: number;
 }
 
 interface CreateVirtualProcessParams {
@@ -542,6 +563,9 @@ export class VirtualProcessManager {
         if (!thread) return false;
 
         const process = this.processesByPid.get(thread.processPid);
+        // Another worker's thread: nothing here can stop it, and pretending would signal
+        // its handle while it keeps running.
+        if (process?.foreign) return false;
         if (process?.runtime && !process.terminated) {
             process.runtime.terminate(exitCode);
             return true;
@@ -593,6 +617,95 @@ export class VirtualProcessManager {
             });
         }
         return list;
+    }
+
+    /**
+     * Describe a process or thread handle for a child that inherits it, or null when the
+     * handle names neither. The child re-creates it with adoptForeign().
+     */
+    describeForInheritance(handle: number): ForeignHandleDescription | null {
+        this.pruneStaleHandles();
+        const self = VIRTUAL_CURRENT_PROCESS_ID;
+        const describe = (p: VirtualProcessRecord, kind: 'process' | 'thread', terminated: boolean, exitCode: number, tid?: number): ForeignHandleDescription => ({
+            kind, pid: p.pid, tid, terminated, exitCode,
+            ownerPid: p.foreign ? p.foreign.ownerPid : p.isCurrentProcess ? p.pid : self,
+            imageName: p.imageName, imagePath: p.imagePath, commandLine: p.commandLine, currentDirectory: p.currentDirectory,
+        });
+        const process = this.processesByHandle.get(handle >>> 0);
+        if (process) return describe(process, 'process', process.terminated, process.exitCode);
+        const thread = this.threadsByHandle.get(handle >>> 0);
+        const owner = thread ? this.processesByPid.get(thread.processPid) : undefined;
+        if (thread && owner) return describe(owner, 'thread', thread.terminated, thread.exitCode, thread.threadId);
+        return null;
+    }
+
+    /**
+     * Install an inherited process or thread handle at the value the parent used, naming a
+     * process that runs in another worker. Returns false when the value is already taken.
+     */
+    adoptForeign(handle: number, description: ForeignHandleDescription, access: number): boolean {
+        this.pruneStaleHandles();
+        const system = System.getInstance();
+        const event = { kind: 'event' as const, manualReset: true, signaled: description.terminated };
+        if (!system.scheduler.syncObjects.adoptEventAt(handle, event, { grantedAccess: access, flags: 0 })) return false;
+        let process = this.processesByPid.get(description.pid);
+        if (!process) {
+            process = {
+                handle: handle >>> 0, pid: description.pid, parentPid: 0,
+                imageName: description.imageName, imagePath: description.imagePath,
+                commandLine: description.commandLine, currentDirectory: description.currentDirectory,
+                terminated: description.terminated, exitCode: description.terminated ? description.exitCode >>> 0 : STILL_ACTIVE,
+                primaryThreadHandle: 0, primaryThreadId: description.kind === 'thread' ? description.tid ?? 0 : 0,
+                isCurrentProcess: false, foreign: { ownerPid: description.ownerPid },
+            };
+            this.processesByPid.set(process.pid, process);
+        }
+        if (description.kind === 'process') {
+            this.processesByHandle.set(handle >>> 0, process);
+            return true;
+        }
+        // Thread ids are per process here (another worker's scheduler counts from 1 too), so
+        // a foreign thread is never entered in threadsByTid, where OpenThread would find it
+        // in place of this process's own thread of the same number.
+        const tid = description.tid ?? 0;
+        let thread = [...this.threadsByHandle.values()].find(t => t.processPid === description.pid && t.threadId === tid);
+        if (!thread) {
+            thread = {
+                handle: handle >>> 0, threadId: tid, processPid: description.pid, suspendCount: 0,
+                started: true, terminated: description.terminated,
+                exitCode: description.terminated ? description.exitCode >>> 0 : STILL_ACTIVE,
+                autoExitTimerId: null, runtimeBacked: false, context: this.createDefaultThreadContext(),
+            };
+        }
+        this.threadsByHandle.set(handle >>> 0, thread);
+        return true;
+    }
+
+    /** A foreign process exited: signal every handle to it and to its threads. */
+    foreignProcessExited(pid: number, exitCode: number | undefined): void {
+        const process = this.processesByPid.get(pid >>> 0);
+        if (!process?.foreign || process.terminated) return;
+        this.pruneStaleHandles();
+        // A death notice without a code (a worker that vanished) reads as a crash, not success.
+        const code = (exitCode ?? 1) >>> 0;
+        for (const thread of new Set(this.threadsByHandle.values())) if (thread.processPid === process.pid) this.setThreadTerminated(thread, code);
+        this.setProcessTerminated(process, code);
+    }
+
+    /** The foreign process behind a handle, for the APIs that must ask its owner. */
+    foreignProcessOf(handle: number): { pid: number; ownerPid: number; terminated: boolean } | null {
+        this.pruneStaleHandles();
+        const process = this.processesByHandle.get(handle >>> 0);
+        return process?.foreign ? { pid: process.pid, ownerPid: process.foreign.ownerPid, terminated: process.terminated } : null;
+    }
+
+    /** TerminateProcess asked for by another process holding an inherited handle to our child. */
+    terminateChildByPid(pid: number, exitCode: number): boolean {
+        const process = this.processesByPid.get(pid >>> 0);
+        if (!process || process.isCurrentProcess || process.foreign || process.terminated) return false;
+        if (process.runtime) { process.runtime.terminate(exitCode); return true; }
+        this.completeProcess(process, exitCode);
+        return true;
     }
 
     /** Drop every virtual child process/thread on game switch. */

@@ -374,6 +374,9 @@ export class SystemResourceProvider {
      * Register a kernel object (file handles, etc.)
      */
     registerKernelObject(obj: any, attributes?: HandleAttributes): number {
+        // Values a process inherited at creation are already taken in its table (see
+        // registerKernelObjectAt); a fresh object gets the next value nobody holds.
+        while (this.kernelObjects.getByHandle(this.nextKernelHandle) !== null) this.nextKernelHandle += 4;
         const handle = this.nextKernelHandle;
         if (handle >= 0x40000) {
             Logger.error(LogCategory.RESOURCE, `Kernel handle range exhausted! handle=0x${handle.toString(16)}`);
@@ -389,6 +392,35 @@ export class SystemResourceProvider {
 
         Logger.verbose(LogCategory.RESOURCE, `Registered kernel object handle=0x${handle.toString(16)}`);
         return handle;
+    }
+
+    /**
+     * Register a kernel object at a handle value chosen by the caller.
+     *
+     * Inheritance is the one producer: an inherited handle has the SAME value in the child
+     * as in the parent (the value travels on the command line or in the environment), so the
+     * child's table must hold it there rather than at the next free slot. Refuses a value
+     * outside the kernel range or one already in use.
+     */
+    registerKernelObjectAt(handle: number, obj: any, attributes?: HandleAttributes): boolean {
+        handle >>>= 0;
+        if (handle < 0x30000 || handle >= 0x40000 || (handle & 3) !== 0) return false;
+        if (this.kernelObjects.getByHandle(handle) !== null) return false;
+        this.kernelObjects.create(handle, obj);
+        this.handleAttributes.set(handle, attributes ?? { grantedAccess: 0x001fffff, flags: 0 });
+        if (obj !== null && (typeof obj === 'object' || typeof obj === 'function')) {
+            this.kernelObjectReferences.set(obj, (this.kernelObjectReferences.get(obj) ?? 0) + 1);
+        }
+        return true;
+    }
+
+    /** Every kernel handle this process holds with HANDLE_FLAG_INHERIT set, lowest first. */
+    inheritableKernelHandles(): number[] {
+        const out: number[] = [];
+        for (const [handle, attributes] of this.handleAttributes) {
+            if ((attributes.flags & HANDLE_FLAG_INHERIT) && this.kernelObjects.getByHandle(handle) !== null) out.push(handle);
+        }
+        return out.sort((a, b) => a - b);
     }
 
     /**
