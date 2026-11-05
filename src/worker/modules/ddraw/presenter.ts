@@ -4,7 +4,7 @@ import { Process } from "../../core/process";
 import { System } from "../../core/system";
 import { profiler } from "../../core/profiler";
 import { recordGpuError } from "../../core/gpu-error-log";
-import { DirectDrawSurfaceState, isRenderSurface } from "./com-objects";
+import { DirectDrawSurfaceState, awaitsTextureAfterRestore, isRenderSurface, textureCreatedAfterRestore } from "./com-objects";
 import { WebGPUBackend } from "../../backends/webgpu/webgpu-backend";
 import { FrameInterpolator } from "../../backends/webgpu/frame-interpolator";
 import { Logger, LogCategory } from "../../core/logger";
@@ -22,6 +22,8 @@ import {
     getSurfaceFormatLayout,
 } from "../../backends/webgpu/shared/texture-formats";
 import { DDSCAPS_TEXTURE } from "./constants";
+import { ensureGpuTextureForBlt } from "./surface-blt-flip";
+import type { DDrawContext } from "./context";
 import { getOverlayCompositePlan } from "../user32/dialog-overlay";
 import { getVideoPlanePlan, notifyVideoPlaneComposited } from "../../video/video-plane-policy";
 import { markGpuSyncedFromCpu, surfaceSyncManager } from "./surface-sync";
@@ -509,6 +511,11 @@ export class DDrawPresenter implements RenderActive {
                             profiler.start("present:palette8Upload");
                             this.uploadPalette8SurfaceToGPU(surface, mem, device, queue);
                             profiler.end("present:palette8Upload");
+                        }
+                    } else if (isRenderSurface(surface) && !surface.gpuTexture && awaitsTextureAfterRestore(surface)) {
+                        const ddrawContext = (system.process?.getModule("ddraw") as { context?: DDrawContext } | undefined)?.context;
+                        if (ddrawContext && ensureGpuTextureForBlt(surface, ddrawContext, mem, webgpu.getFormat() ?? "bgra8unorm")) {
+                            textureCreatedAfterRestore(surface);
                         }
                     }
 

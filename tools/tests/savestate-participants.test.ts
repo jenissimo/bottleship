@@ -40,6 +40,7 @@ import { createMessageExports } from "../../src/worker/modules/user32/message";
 import { createInputExports } from "../../src/worker/modules/user32/input";
 import { createSystemExports } from "../../src/worker/modules/user32/system";
 import { createPaintingExports } from "../../src/worker/modules/gdi32/painting";
+import { registerDDrawParticipant } from "../../src/worker/modules/ddraw/savestate";
 import { clearTimerHandler } from "../../src/worker/core/scheduler/timer-wheel";
 import { exports as vistaRuntimeExports } from "../../src/worker/modules/kernel32/vista-runtime";
 import { exports as processExports } from "../../src/worker/modules/kernel32/process/process";
@@ -244,6 +245,7 @@ function registerAllParticipants(): void {
         createSystemExports();
         createPaintingExports();
         registerCoreParticipants();
+        registerDDrawParticipant({ context: () => { throw new Error("unused"); }, bitmapSurfaces: () => new Map(), surfaceStates: () => [] });
     } finally {
         delete flag.__savestates;
     }
@@ -335,6 +337,7 @@ describe("schema pin and mutation", () => {
             "user32-system": { version: 1, schemaHash: "b93e806912786ec3" },
             "gdi32": { version: 1, schemaHash: "f5495edbe7c4ae9d" },
             "gdi32-palettes": { version: 1, schemaHash: "fdca280b054649f9" },
+            "ddraw": { version: 1, schemaHash: "844462508bc4ae1e" },
         });
     });
 
@@ -396,7 +399,7 @@ describe("module coverage", () => {
         expect(covered.has("kernel32")).toBe(true);
         expect(covered.has("user32")).toBe(true);
         expect(covered.has("gdi32")).toBe(true);
-        expect(covered.has("ddraw")).toBe(false);
+        expect(covered.has("dsound")).toBe(false);
         const system = System.getInstance();
         const previous = system.process;
         const gen = new ThunkGenerator();
@@ -404,10 +407,10 @@ describe("module coverage", () => {
         gen.generateStubDll("KERNEL32.dll", [{ name: "GetTickCount", argCount: 0 }]);
         gen.generateStubDll("USER32.dll", [{ name: "GetMessageA", argCount: 4 }]);
         gen.generateStubDll("GDI32.dll", [{ name: "GetStockObject", argCount: 1 }]);
-        gen.generateStubDll("DDRAW.dll", [{ name: "DirectDrawCreate", argCount: 3 }]);
+        gen.generateStubDll("DSOUND.dll", [{ name: "DirectSoundCreate", argCount: 3 }]);
         system.process = { thunkGenerator: gen } as never;
         try {
-            expect(uncoveredModules(touchedModules(), covered)).toEqual(["ddraw"]);
+            expect(uncoveredModules(touchedModules(), covered)).toEqual(["dsound"]);
         } finally {
             system.process = previous;
         }

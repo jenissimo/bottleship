@@ -115,6 +115,7 @@ type DDEnumCallback = (lpGUID: number, lpDriverDescription: number, lpDriverName
  * distinguish "the title asked for RGB565" from "the title asked for DXT1 and we rewrote it".
  * dwSize is printed because an engine legitimately leaves it zero.
  */
+// @transient(diagnostics)
 const seenPixelFormatRequests = new Set<number>();
 function notePixelFormatRequest(view: DataView, pfAddr: number): void {
     const size = view.getUint32(pfAddr + DDPIXELFORMAT_OFFSETS.size, true);
@@ -275,9 +276,13 @@ export function restoreDisplayModeToDesktop(system: System, ddrawCtx: DDrawConte
 
 export const createDirectDrawExports = (context: DDrawContext): Record<string, ThunkImplementation> => {
     const exports: Record<string, ThunkImplementation> = {};
+    // @transient(diagnostics)
     let lastVblankLog = 0;
+    // @transient(diagnostics)
     let vblankWaitCount = 0;
+    // @transient(diagnostics)
     let vblankStatusCount = 0;
+    // @transient(diagnostics)
     let scanlineCount = 0;
 
     const getVTable = (name: string) => (context.vtables as any)[name]?.address;

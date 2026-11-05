@@ -27,6 +27,7 @@ export interface Participant {
     readonly order?: number;
     readonly covers?: readonly string[];
     readonly schema?: SaveValue;
+    prepare?(): Promise<void>;
     capture(ctx: CaptureContext): SaveValue;
     restore(state: SaveValue, ctx: RestoreContext): void | Promise<void>;
 }

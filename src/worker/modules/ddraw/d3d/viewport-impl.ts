@@ -62,8 +62,11 @@ const clipSpaceFromViewport1 = (scaleX: number, scaleY: number, width: number, h
 };
 
 const D3DRECT_SIZE = 16; // D3DRECT structure: 4 LONGs (x1, y1, x2, y2)
+// @transient(host scratch)
 const CLEAR2_Z_CAST_BUFFER = new ArrayBuffer(4);
+// @transient(host scratch)
 const CLEAR2_Z_CAST_U32 = new Uint32Array(CLEAR2_Z_CAST_BUFFER);
+// @transient(host scratch)
 const CLEAR2_Z_CAST_F32 = new Float32Array(CLEAR2_Z_CAST_BUFFER);
 
 /**

@@ -17,6 +17,7 @@ import {
 } from "../../backends/webgpu/shared/texture-formats";
 
 // Module-level rect pool to reduce allocations in hot paths
+// @transient(host allocation pool)
 const rectPool = new RectPool(8);
 
 /** A DDPF_FOURCC surface whose fourCC names a block-compressed layout (DXT*, BC4/5). */

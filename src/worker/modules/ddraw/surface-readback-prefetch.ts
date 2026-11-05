@@ -23,7 +23,9 @@ const DECAY_FRAMES = 8;
  * real frame boundary and takes over the tick as soon as one happens; a title that
  * presents by Blt never flips, and for it the endFrame pump remains the only clock.
  */
+// @transient(host readback prefetch)
 let epoch = 0;
+// @transient(host readback prefetch)
 let flipDrivesEpoch = false;
 
 interface InflightPrefetch {
@@ -76,9 +78,12 @@ export const prefetchCounters = {
     },
 };
 
+// @transient(host readback prefetch)
 const candidates = new Set<DirectDrawSurfaceState>();
 /** Epoch of the last read-Lock, per candidate. */
+// @transient(host readback prefetch)
 const lastReadLockEpoch = new WeakMap<DirectDrawSurfaceState, number>();
+// @transient(host readback prefetch)
 const inflight = new WeakMap<DirectDrawSurfaceState, InflightPrefetch>();
 
 registerSurfaceTeardownHook((state) => {

@@ -12,6 +12,7 @@ import { D3D_OK } from "./types";
 export function createDeviceStubsExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
     const stubCallCounts: Record<string, number> = {};
+    // @transient(constant name set)
     const stubLogMethods = new Set([
         "Begin",
         "BeginIndexed",
