@@ -20,8 +20,9 @@ export function inflateRawBlock(src: Uint8Array, dst: Uint8Array): number {
 
 export function deflateRawBlock(src: Uint8Array, level: number): Uint8Array {
     const d = new Deflate({ raw: true, level: level as 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 });
+    const chunks: Uint8Array[] = [];
+    d.onData = (chunk) => { chunks.push(chunk as Uint8Array); };
     if (!d.push(src, Z_FULL_FLUSH) || d.err) throw new Error(`block deflate failed: ${d.msg}`);
-    const chunks = (d as unknown as { chunks: Uint8Array[] }).chunks;
     if (chunks.length === 1) return chunks[0];
     let n = 0;
     for (const c of chunks) n += c.length;

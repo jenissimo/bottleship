@@ -83,7 +83,8 @@ bun tools/wgb-compress.ts game.wgb game.packed.wgb --block-kib 64
   member whose DEFLATE stream is cut with a full flush every 64 KiB of file data
   (`--block-kib`, a power of two from 4 to 16384). A full flush byte-aligns the stream and
   clears the history window, so every block decodes on its own. `manifest.json`,
-  `registry.json` and already-compressed payloads (ogg, mp3, bik, smk, jpg, png, cab, …;
+  `registry.json` and already-compressed payloads (ogg, mp3, flac, bik, bk2, smk, avi, wmv,
+  mpg, xmv, jpg, png, cab, …;
   `--compress-all` disables the extension list) stay STORED.
 - `wgb-blocks.idx` (STORED) starts with a header: magic `WGBK`, format version, row count
   and a CRC-32 of the rows; a damaged index is rejected as a whole. Each row names a
@@ -102,6 +103,18 @@ bun tools/wgb-compress.ts game.wgb game.packed.wgb --block-kib 64
   blocks are kept in a small LRU (16 MiB by default). Everything below `ZipArchive` (the
   streaming transport, the sparse OPFS copy, which stays compressed, the strong-ETag check
   and I/O profiles) keeps working on archive offsets, i.e. on the compressed bytes.
+
+- A synchronous guest read on a packed member is widened only to the end of the block it
+  touches (STORED members keep the 512 KiB window), so a sync read decodes the blocks it
+  needs and no more. A block that fails to decode makes the sync read answer "not
+  available"; the async path then reports the failure to the caller as an I/O error.
+- There is no per-block checksum: like a STORED member, a flipped literal can decode to
+  wrong bytes. Structural damage (a block that does not decode to its length) is caught.
+- Savestates are bound to the bundle's members including their compressed sizes, so a
+  savestate made with the store-only build of a game does not load into its packed build,
+  and vice versa.
+- The packer holds one member and its compressed blocks in RAM at a time; members of
+  2 GiB or more are not supported.
 
 `wgb.ts` edits store-only bundles; edit the store-only source and compress again.
 

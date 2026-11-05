@@ -7,6 +7,7 @@ const MAGIC = 0x4b424757;
 const HEADER_BYTES = 16;
 const ROW_FIXED_BYTES = 8 + 8 + 8 + 4 + 1 + 4;
 const MIN_SHIFT = 12;
+const BLOCK_STREAM_END_BYTES = 2;
 const MAX_SHIFT = 24;
 
 export interface ZipBlockMap {
@@ -114,7 +115,7 @@ export function applyBlockIndex(rows: readonly BlockIndexRow[], lookup: (name: s
             if (r.blockLengths[b] === 0) { ok = false; break; }
             offsets[b + 1] = offsets[b] + r.blockLengths[b];
         }
-        if (!ok || offsets[r.blockLengths.length] > r.compressedSize) continue;
+        if (!ok || offsets[r.blockLengths.length] + BLOCK_STREAM_END_BYTES !== r.compressedSize) continue;
         e.blocks = { shift: r.shift, offsets };
         applied++;
     }

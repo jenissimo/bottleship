@@ -143,10 +143,10 @@ export class ZipStoreWriter {
         return entryOffset;
     }
 
-    addStored(name: string, data: Uint8Array, dosStamp = 0): void {
+    addStored(name: string, data: Uint8Array, dosStamp = 0, knownCrc?: number): void {
         const nameBuf = Buffer.from(name, "utf8");
         const entryOffset = this.offset;
-        const crc = crc32(data);
+        const crc = knownCrc ?? crc32(data);
         this.raw(lfhFor(nameBuf, data.length, crc, dosStamp));
         writeSync(this.fd, data, 0, data.byteLength);
         this.offset += data.byteLength;
