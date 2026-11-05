@@ -10,25 +10,27 @@ import { liveChildProcessCount } from "../../core/child-process";
 import { pendingMessageBoxes } from "../../runtime/dialog-bridge";
 import { hasWaitingModalPump } from "../../modules/user32/modal-dialog-state";
 import { videoEngine } from "../../../video/video-engine";
-import { assessReadiness } from "../../savestate/readiness";
+import { assessReadiness, type ReadinessProbe } from "../../savestate/readiness";
+
+export function liveReadinessProbe(): ReadinessProbe {
+    const system = System.getInstance();
+    const dispatcher = system.process?.dispatcher;
+    return {
+        asyncParks: () => dispatcher?.asyncParks() ?? [],
+        pendingAsyncRestores: () => dispatcher?.pendingAsyncRestoreCount() ?? 0,
+        pendingCallbacks: () => dispatcher?.callbackManager?.pendingCallbackCount() ?? 0,
+        suspendedFrames: () => dispatcher?.callbackManager?.suspendedFrames() ?? [],
+        modalPumpArmed: hasWaitingModalPump,
+        pendingModals: () => pendingMessageBoxes().length,
+        writeBufferPendingBytes: () => dispatcher?.writeBufferPendingBytes() ?? 0,
+        sehDispatchInFlight,
+        activeLeases: () => leaseRegistry.activeLeaseCount(),
+        pendingOverlayWrites: () => system.fileSystem.pendingOverlayWrites(),
+        liveChildProcesses: liveChildProcessCount,
+        videoSessions: () => videoEngine.activeSessionCount(),
+    };
+}
 
 export function registerSavestateCommands(svc: HarnessService): void {
-    svc.register("savestateReadiness", () => {
-        const system = System.getInstance();
-        const dispatcher = system.process?.dispatcher;
-        return assessReadiness({
-            asyncParks: () => dispatcher?.asyncParks() ?? [],
-            pendingAsyncRestores: () => dispatcher?.pendingAsyncRestoreCount() ?? 0,
-            pendingCallbacks: () => dispatcher?.callbackManager?.pendingCallbackCount() ?? 0,
-            suspendedFrames: () => dispatcher?.callbackManager?.suspendedFrames() ?? [],
-            modalPumpArmed: hasWaitingModalPump,
-            pendingModals: () => pendingMessageBoxes().length,
-            writeBufferPendingBytes: () => dispatcher?.writeBufferPendingBytes() ?? 0,
-            sehDispatchInFlight,
-            activeLeases: () => leaseRegistry.activeLeaseCount(),
-            pendingOverlayWrites: () => system.fileSystem.pendingOverlayWrites(),
-            liveChildProcesses: liveChildProcessCount,
-            videoSessions: () => videoEngine.activeSessionCount(),
-        });
-    });
+    svc.register("savestateReadiness", () => assessReadiness(liveReadinessProbe()));
 }

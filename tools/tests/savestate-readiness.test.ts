@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { assessReadiness, type ReadinessProbe } from "../../src/worker/savestate/readiness";
 import { markRestartable, restartableCheck } from "../../src/worker/core/thunking/restartable";
-import { registerSavestateCommands } from "../../src/worker/harness/cmds/savestate";
+import { liveReadinessProbe, registerSavestateCommands } from "../../src/worker/harness/cmds/savestate";
 import { System } from "../../src/worker/core/system";
 import { createMessageExports } from "../../src/worker/modules/user32/message";
 
@@ -54,14 +54,25 @@ describe("savestate readiness", () => {
         ]);
     });
 
-    test("the registered verb reads every owner of a session without a process", () => {
+    test("the registered verb reads every owner; without a process the process-owned probes are empty", () => {
         const handlers = new Map<string, (args: unknown[]) => unknown>();
         registerSavestateCommands({ register: (name: string, h: (args: unknown[]) => unknown) => handlers.set(name, h) } as never);
         const system = System.getInstance();
         const previous = system.process;
         system.process = null as never;
         try {
-            expect(handlers.get("savestateReadiness")!([])).toEqual({ ready: true, blockers: [], restartableParks: 0 });
+            const probe = liveReadinessProbe();
+            expect(probe.asyncParks()).toEqual([]);
+            expect(probe.pendingAsyncRestores()).toBe(0);
+            expect(probe.pendingCallbacks()).toBe(0);
+            expect(probe.suspendedFrames()).toEqual([]);
+            expect(probe.writeBufferPendingBytes()).toBe(0);
+            expect(typeof probe.modalPumpArmed()).toBe("boolean");
+            for (const count of [probe.pendingModals, probe.sehDispatchInFlight, probe.activeLeases,
+                probe.pendingOverlayWrites, probe.liveChildProcesses, probe.videoSessions]) {
+                expect(Number.isInteger(count())).toBe(true);
+            }
+            expect(handlers.get("savestateReadiness")!([])).toEqual(assessReadiness(liveReadinessProbe()));
         } finally {
             system.process = previous;
         }
