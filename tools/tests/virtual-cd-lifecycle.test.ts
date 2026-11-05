@@ -15,11 +15,19 @@ let originalSelf: unknown;
 let posted: any[];
 let live: VirtualCdAudio[];
 
-function makeCd(read: () => Promise<Uint8Array | null>, tracks: CdTrack[] = [{ ...TRACK }]): VirtualCdAudio {
+function makeCd(
+    read: () => Promise<Uint8Array | null>,
+    tracks: CdTrack[] = [{ ...TRACK }],
+    probe?: (file: string) => number,
+): VirtualCdAudio {
     const cd = new VirtualCdAudio();
     const state = cd as any;
     state.scanned = true;
     state.trackTable = tracks;
+    // No live VFS behind these tracks: without a probe stub the TOC counts as already
+    // completed, so geometry queries never reach probeDuration.
+    if (probe) state.probeDuration = probe;
+    else state.tocCompleted = true;
     state.readTrackBytes = read;
     live.push(cd);
     return cd;
@@ -196,6 +204,94 @@ describe("VirtualCdAudio disc timeline", () => {
         };
         for (let i = 0; i < 8; i++) cd.getMode();
         expect(calls).toBe(3);
+    });
+
+    // What the budgeted scan leaves behind on a 43-track rip: the first tracks probed,
+    // the rest at the 300 s fallback.
+    const partlyProbed = (): CdTrack[] => [
+        { ...TRACK, number: 1, isAudio: false, file: "", mimeType: "", lengthMs: 0 },
+        { ...TRACK, number: 2, file: "C:\\MUSIC\\Track02.ogg", startMs: 0, lengthMs: 60_000 },
+        { ...TRACK, number: 3, file: "C:\\MUSIC\\Track03.ogg", startMs: 60_000, lengthMs: 300_000, lengthKnown: false },
+        { ...TRACK, number: 4, file: "C:\\MUSIC\\Track04.ogg", startMs: 360_000, lengthMs: 300_000, lengthKnown: false },
+    ];
+    const realLengths: Record<string, number> = {
+        "C:\\MUSIC\\Track03.ogg": 90_000,
+        "C:\\MUSIC\\Track04.ogg": 45_000,
+    };
+
+    test("mode and count queries do not complete the TOC", () => {
+        const probed: string[] = [];
+        const cd = makeCd(async () => null, partlyProbed(), (file) => { probed.push(file); return realLengths[file] ?? 0; });
+        (cd as any).refinePasses = 99;
+        expect(cd.getMode()).toBe("stopped");
+        expect(cd.numberOfTracks()).toBe(4);
+        expect(cd.hasMedia()).toBe(true);
+        expect(probed).toEqual([]);
+    });
+
+    // A guest reads a span once and plays it later. The span must already be the final
+    // one: a fallback start past the real end of the disc plays nothing.
+    test("the first geometry query reports final lengths, probing each unknown track once", () => {
+        const probed: string[] = [];
+        const cd = makeCd(async () => null, partlyProbed(), (file) => { probed.push(file); return realLengths[file] ?? 0; });
+        (cd as any).refinePasses = 99;
+
+        const t4 = cd.track(4)!;
+        expect(t4.startMs).toBe(150_000);
+        expect(t4.lengthMs).toBe(45_000);
+        expect(t4.lengthKnown).toBe(true);
+        expect(cd.track(3)!.startMs).toBe(60_000);
+        expect(cd.discLengthMs()).toBe(195_000);
+        expect(probed).toEqual(["C:\\MUSIC\\Track03.ogg", "C:\\MUSIC\\Track04.ogg"]);
+
+        cd.track(2); cd.trackAt(0); cd.audioTracks(); cd.discLengthMs();
+        expect(probed).toHaveLength(2);
+    });
+
+    test("a span read from the TOC plays that track from its start to its end", async () => {
+        const cd = makeCd(async () => new Uint8Array([1, 2, 3, 4]), partlyProbed(),
+            (file) => realLengths[file] ?? 0);
+        (cd as any).refinePasses = 99;
+
+        // AIL_redbook_track_info, then AIL_redbook_play with the same numbers.
+        const t4 = cd.track(4)!;
+        expect(cd.play(t4.startMs, t4.startMs + t4.lengthMs)).toBeGreaterThan(0);
+        expect(cd.currentTrackNumber()).toBe(4);
+        await drainPromises();
+        const play = posted.find((m) => m.type === "audio_play_encoded");
+        expect(play.payload.startOffsetMs).toBe(0);
+        expect(play.payload.endOffsetMs).toBe(45_000);
+    });
+
+    test("a track that cannot be probed keeps the fallback and is not re-probed per query", () => {
+        let probes = 0;
+        const cd = makeCd(async () => null, partlyProbed(), (file) => {
+            probes++;
+            return file.endsWith("Track03.ogg") ? 90_000 : 0;
+        });
+        (cd as any).refinePasses = 99;
+
+        expect(cd.track(4)!.lengthMs).toBe(300_000);
+        expect(cd.track(4)!.lengthKnown).toBe(false);
+        expect(cd.track(4)!.startMs).toBe(150_000);
+        cd.track(4); cd.discLengthMs();
+        expect(probes).toBe(2);
+    });
+
+    test("a new disc completes its TOC again", () => {
+        let probes = 0;
+        const cd = makeCd(async () => null, partlyProbed(), (file) => { probes++; return realLengths[file] ?? 0; });
+        (cd as any).refinePasses = 99;
+        cd.track(4);
+        expect(probes).toBe(2);
+
+        cd.invalidateDisc();
+        const state = cd as any;
+        state.scanned = true;
+        state.trackTable = partlyProbed();
+        state.refinePasses = 99;
+        expect(cd.track(4)!.startMs).toBe(150_000);
+        expect(probes).toBe(4);
     });
 
     test("a disc whose lengths are all known never re-probes", () => {
