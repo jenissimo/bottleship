@@ -12,6 +12,49 @@ import type { HostJitMode } from '../../utils/host-jit-policy';
 
 export interface ChildProcessPreparation { imagePatches?: GuestImagePatch[]; }
 
+/**
+ * The Win32 errors a child start can name. Spelled out here rather than imported from
+ * kernel32: core/ must not depend on the module layer, and the launch path (which maps
+ * them onto CreateProcess/WinExec) is the only consumer.
+ */
+const ERROR_FILE_NOT_FOUND = 2;
+const ERROR_PATH_NOT_FOUND = 3;
+// 193 is what CreateProcess reports for a file that is not a Win32 image. 11 is a
+// different code, ERROR_BAD_FORMAT, which only WinExec hands back as its own answer.
+const ERROR_BAD_EXE_FORMAT = 193;
+
+/** A child start that failed for a condition Windows itself names. */
+class ChildStartFailure extends Error {
+    constructor(message: string, readonly win32Error: number) {
+        super(message);
+        this.name = 'ChildStartFailure';
+    }
+}
+
+/**
+ * The Win32 code a start failure carries, if it carries one. Only a positive integer
+ * counts: a reported 0 would fail the launch with GetLastError 0, which is not an error
+ * code any caller can act on. A failure with no code keeps ERROR_BAD_EXE_FORMAT, the
+ * answer for a child that could not load or prepare its image at all.
+ */
+export function win32ErrorOf(error: unknown): number | undefined {
+    const reported = (error as { win32Error?: unknown } | null)?.win32Error;
+    return typeof reported === 'number' && Number.isInteger(reported) && reported > 0 ? reported : undefined;
+}
+
+/**
+ * Windows separates "nothing at that path" from "a directory on the way is missing".
+ * The caller resolved this path already, so reaching here means it went away in
+ * between; report what is true now rather than assuming.
+ */
+function missingImageError(vfs: VirtualFileSystem, imagePath: string): ChildStartFailure {
+    const cut = Math.max(imagePath.lastIndexOf('\\'), imagePath.lastIndexOf('/'));
+    let directory = cut > 0 ? imagePath.slice(0, cut) : '';
+    if (/^[a-z]:$/i.test(directory)) directory += '\\';
+    const code = directory && !vfs.directoryExists(directory) ? ERROR_PATH_NOT_FOUND : ERROR_FILE_NOT_FOUND;
+    return new ChildStartFailure(`Cannot open child image: ${imagePath}`, code);
+}
+
 export interface ChildProcessRequest {
     processId?: number;
     startSuspended?: boolean;
@@ -294,8 +337,11 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
         });
         const file = await vfs.open(request.imagePath, 0x80000000, 3);
         context.checkActive();
-        if (!file) throw new Error(`Cannot open child image: ${request.imagePath}`);
+        if (!file) throw missingImageError(vfs, request.imagePath);
         const bytes = new Uint8Array(vfs.getFileSize(file.path));
+        // Nothing to load: an empty file is not a Win32 image, and the child would wait
+        // for a readiness it can never signal.
+        if (!bytes.length) throw new ChildStartFailure(`Child image is empty: ${request.imagePath}`, ERROR_BAD_EXE_FORMAT);
         let offset = 0;
         while (offset < bytes.length) {
             const chunk = await vfs.read(file, bytes.length - offset);

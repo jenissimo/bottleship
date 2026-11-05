@@ -5,7 +5,7 @@ import { adoptFreshGuestMemory } from "./core/memory/guest-page-dirty";
 import { Process } from "./core/process";
 import { System, type GuestImagePatch } from "./core/system";
 import { applyHostJitMode, isHostJitMode, type HostJitMode } from "../utils/host-jit-policy";
-import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, setChildRegistrySink, forwardRegistryToChildren, type ChildBoot, type ChildProcessPreparation } from "./core/child-process";
+import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, setChildRegistrySink, forwardRegistryToChildren, win32ErrorOf, type ChildBoot, type ChildProcessPreparation } from "./core/child-process";
 import { ChildStartupGate } from "./core/child-startup";
 import { createChildVfsClient } from "./core/child-vfs";
 import { adoptProcessIdentity } from "./core/process-identity";
@@ -3425,7 +3425,13 @@ const handleWorkerMessage = (event: MessageEvent): void => {
     const boot = childBoot;
     childStartupGate = new ChildStartupGate<ChildProcessPreparation>(
       () => postToParent({ type: 'child_ready', bootId: boot.bootId, processId: boot.processIdentity?.pid ?? boot.processId }),
-      error => postToParent({ type: 'error', message: 'Child startup failed: ' + String(error) }),
+      error => postToParent({
+        type: 'error',
+        message: 'Child startup failed: ' + String(error),
+        // A start that failed for a condition Windows names carries the code the launch
+        // path has to map; anything else leaves it unset and reads as ERROR_BAD_EXE_FORMAT.
+        win32Error: win32ErrorOf(error),
+      }),
     );
     if (childBoot.processIdentity) {
       adoptProcessIdentity(childBoot.processIdentity);
