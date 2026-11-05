@@ -29,6 +29,11 @@ describe('STARTUPINFO across a process start', () => {
     let savedExecutablePath: string;
     let nextAlloc = 0;
     const workers: FakeWorker[] = [];
+    // The harness swaps the host worker boundary and binds Mem to its own image. Both
+    // are process-wide, so they have to go back exactly as they were or the next file
+    // to run sees a worker that cannot post and a memory that is not its own.
+    const hostGlobals = new Map<string, PropertyDescriptor | undefined>();
+    const memProperties = new Map<string, PropertyDescriptor | undefined>();
 
     class FakeWorker {
         onmessage: ((event: { data: unknown }) => void) | null = null;
@@ -90,6 +95,7 @@ describe('STARTUPINFO across a process start', () => {
         savedExecutablePath = system.executablePath;
         memory.fill(0); workers.length = 0; nextAlloc = 8000;
         resetProcessStartupInfo();
+        for (const key of ['Worker', 'self']) hostGlobals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
         const RealWorker = globalThis.Worker;
         class WorkerBoundary extends FakeWorker {
             constructor(url: string | URL, options?: WorkerOptions) {
@@ -99,6 +105,7 @@ describe('STARTUPINFO across a process start', () => {
         }
         Object.defineProperty(globalThis, 'Worker', { configurable: true, writable: true, value: WorkerBoundary });
         Object.defineProperty(globalThis, 'self', { configurable: true, writable: true, value: { location: { href: 'file:///guest-worker.js' } } });
+        for (const key of ['memoryGetter', 'validateRange', 'getRegion']) memProperties.set(key, Object.getOwnPropertyDescriptor(Mem, key));
         Mem.bind(() => memory);
         // Every allocation is a distinct address: WinExec allocates two structures and
         // must not have them land on top of each other.
@@ -108,9 +115,19 @@ describe('STARTUPINFO across a process start', () => {
     });
 
     afterEach(async () => {
+        // Put the host boundary back first: tearing the child processes down can create
+        // services, and those must not see the fake worker or the fake image.
+        for (const [key, descriptor] of hostGlobals) {
+            if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+            else Reflect.deleteProperty(globalThis, key);
+        }
         await stopChildProcesses();
         system.fileSystem = savedVfs; system.process = savedProcess;
         system.executablePath = savedExecutablePath;
+        for (const [key, descriptor] of memProperties) {
+            if (descriptor) Object.defineProperty(Mem, key, descriptor);
+            else Reflect.deleteProperty(Mem, key);
+        }
         resetProcessStartupInfo();
     });
 
