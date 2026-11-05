@@ -743,8 +743,11 @@ export function imageSearchDirectories(system: System): string[] {
 }
 
 /** A final path component with a period names the extension Windows takes literally. */
+// Windows accepts either separator in a module name, so the file name starts after
+// the last of them: with `C:/System/my.app/helper` only looking for a backslash
+// reads the dot in the directory as an extension and skips appending `.exe`.
 const hasFileExtension = (name: string): boolean =>
-    name.slice(name.lastIndexOf('\\') + 1).includes('.');
+    name.slice(Math.max(name.lastIndexOf('\\'), name.lastIndexOf('/')) + 1).includes('.');
 
 /**
  * Resolve the image a bare command line (lpApplicationName = NULL) names, the way
@@ -845,6 +848,11 @@ const finishVirtualProcess = (
     const setError = (code: number): void => {
         if (system.scheduler.getCurrentThreadId() === ownerThread) system.scheduler.setLastError(code);
         else system.scheduler.setLastErrorForThread(ownerThread, code);
+        // errOut travels with the result, because the thread that reads GetLastError
+        // when the promise settles need not be the one that recorded it. Every path
+        // that reports a code goes through here, so none of them can miss it; a
+        // successful publish leaves 0, which callers already read as "fall through".
+        if (errOut) errOut.code = code;
     };
     const publish = (): ThunkResult => {
         if (!ownerCurrent()) return { value: 0, stackCleanup: 40 };
@@ -873,15 +881,15 @@ const finishVirtualProcess = (
         system.resourceProvider.unregisterKernelObject(proc.threadHandle);
         system.resourceProvider.unregisterKernelObject(proc.processHandle);
         writeProcessInformationZeroed(lpProcessInformation);
-        // The child reports which Win32 error its own startup failed with when it
-        // can (a missing directory is not a bad image); 193 BAD_EXE_FORMAT is the
-        // answer for a child that could not load or prepare its image at all.
-        const code = typeof (error as { code?: number } | null)?.code === 'number'
-            ? (error as { code: number }).code : 193;
-        setError(code);
-        // Report the recorded code through errOut too: the calling thread at
-        // settlement time need not be the one that can read the scheduler.
-        if (errOut) errOut.code = code;
+        // A child that could not load or prepare its image reads as 193
+        // BAD_EXE_FORMAT; a child loader that knows which Win32 error it hit reports
+        // it through win32Error. The field is one only child-process.ts sets, and
+        // reading a duck-typed `code` instead would also match DOMException's legacy
+        // numeric codes (NotFoundError = 8, DataCloneError = 25), turning a VFS or
+        // postMessage failure during start into an errno Win32 never produced. A
+        // reported 0 is not a report either: it would fail the call with GetLastError 0.
+        const reported = (error as { win32Error?: number } | null)?.win32Error;
+        setError(typeof reported === 'number' && reported > 0 ? reported : 193);
         Logger.warn(LogCategory.SYSTEM, 'Child image preparation failed: ' + String(error));
         return { value: 0, stackCleanup: 40 };
     });
@@ -1281,9 +1289,10 @@ export const exports: Record<string, ThunkImplementation> = {
                 r => toWinExec(r, toFailure(errOut.code || system.scheduler.getLastError())),
                 (): ThunkResult => {
                     // A rejected child start must not surface as an unhandled rejection:
-                    // report the last error the failed start recorded.
+                    // report the last error the failed start recorded, from errOut when
+                    // the failure path got that far.
                     release();
-                    return { value: toFailure(system.scheduler.getLastError()), stackCleanup: 8 };
+                    return { value: toFailure(errOut.code || system.scheduler.getLastError()), stackCleanup: 8 };
                 },
             );
         }
