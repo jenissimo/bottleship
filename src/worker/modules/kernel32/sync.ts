@@ -26,6 +26,7 @@ import {
     tryAcquireSrwShared,
 } from './srw-lock';
 import { namedObjects } from './named-objects';
+import { applyInheritFlag } from './inherited-handles';
 import { getWsaNativeSocketTable } from '../wsa-stub-shared';
 import type { WsaSocketTable } from '../wsa-network';
 
@@ -33,12 +34,14 @@ import type { WsaSocketTable } from '../wsa-network';
 const FILETIME_UNIX_EPOCH_MS = 11644473600000;
 
 interface IoCompletionAssociation { portHandle: number; key: number; port: object; }
+// @refuse(I/O completion ports are not part of a v1 savestate)
 const ioCompletionAssociations = new Map<number, IoCompletionAssociation>();
 interface SocketCompletionScope {
     generation: number;
     bindings: Map<number, IoCompletionAssociation>;
     unsubscribe(): void;
 }
+// @refuse(I/O completion ports are not part of a v1 savestate)
 const socketCompletionScopes = new Map<WsaSocketTable, SocketCompletionScope>();
 
 function releaseEmptySocketScope(table: WsaSocketTable, scope: SocketCompletionScope): void {
@@ -142,6 +145,7 @@ interface IoCompletionPort {
 }
 
 /** Threads parked on one port object, shared by all of its HANDLE aliases. */
+// @refuse(I/O completion ports are not part of a v1 savestate)
 const ioCompletionWaiters = new Map<IoCompletionPort, Array<(wake: IoCompletionWake) => void>>();
 
 function getLivePortObject(handleOrObject: number | object): IoCompletionPort | null {
@@ -905,6 +909,7 @@ const syncModule = (() => {
         }
 
         const handle = sched.createEvent(bManualReset, bInitialState);
+        applyInheritFlag(handle, args[0] >>> 0);
         if (name) {
             namedObjects.register('event', name, handle, { manualReset: bManualReset, initialState: bInitialState });
         }
@@ -940,6 +945,7 @@ const syncModule = (() => {
         }
 
         const handle = sched.createEvent(bManualReset, bInitialState);
+        applyInheritFlag(handle, args[0] >>> 0);
         if (name) {
             namedObjects.register('event', name, handle, { manualReset: bManualReset, initialState: bInitialState });
         }
@@ -1216,6 +1222,7 @@ const syncModule = (() => {
         }
 
         const handle = sched.createMutex(bInitialOwner);
+        applyInheritFlag(handle, args[0] >>> 0);
         if (name) {
             namedObjects.register('mutex', name, handle);
         }
@@ -1238,6 +1245,7 @@ const syncModule = (() => {
         }
 
         const handle = sched.createMutex(bInitialOwner);
+        applyInheritFlag(handle, args[0] >>> 0);
         if (name) {
             namedObjects.register('mutex', name, handle);
         }
@@ -1301,6 +1309,7 @@ const syncModule = (() => {
         }
 
         const handle = sched.createSemaphore(lInitialCount, lMaximumCount);
+        applyInheritFlag(handle, args[0] >>> 0);
         if (name) {
             namedObjects.register('semaphore', name, handle, { initialCount: lInitialCount, maximumCount: lMaximumCount });
         }
@@ -1329,6 +1338,7 @@ const syncModule = (() => {
         }
 
         const handle = sched.createSemaphore(lInitialCount, lMaximumCount);
+        applyInheritFlag(handle, args[0] >>> 0);
         if (name) {
             namedObjects.register('semaphore', name, handle, { initialCount: lInitialCount, maximumCount: lMaximumCount });
         }

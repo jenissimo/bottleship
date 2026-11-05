@@ -66,6 +66,24 @@ export function createMidiDriverExports(ctx: MSSContext): Record<string, ThunkIm
         return 0;
     };
 
+    // S32 AIL_midiOutOpen(HMDIDRIVER* drvr, LPHMIDIOUT* lphMidiOut, S32 deviceId): Miles'
+    // MIDI driver sits on a winmm MIDI-out port and answers that open's MMRESULT. No
+    // port exists (midiOutGetNumDevs is 0), so it fails the way midiOutOpen does and
+    // hands back NULL handles rather than leaving the caller's slots uninitialized.
+    exports["_AIL_midiOutOpen@12"] = (ctxThunk, mem, args) => {
+        const MMSYSERR_BADDEVICEID = 2;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        for (const out of [args[0] >>> 0, args[1] >>> 0]) {
+            if (out && MemoryGuard.isValidRange(mem, out, 4)) view.setUint32(out, 0, true);
+        }
+        ctx.lastErrorStr = "No MIDI output device";
+        Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_midiOutOpen@12 device=${args[2] | 0} -> MMSYSERR_BADDEVICEID (no MIDI output)`);
+        return MMSYSERR_BADDEVICEID;
+    };
+
+    // void AIL_midiOutClose(HMDIDRIVER): no driver was ever opened.
+    exports["_AIL_midiOutClose@4"] = () => 0;
+
     // _AIL_XMIDI_master_volume@4
     exports["_AIL_XMIDI_master_volume@4"] = (ctxThunk, mem, args) => {
         return ctx.midiMasterVolume;

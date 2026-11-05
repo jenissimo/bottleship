@@ -297,6 +297,7 @@ export interface ScrollFeedback {
 }
 
 const NO_FEEDBACK: ScrollFeedback = { pressed: null, trackPos: null };
+// @transient(wiring set at module init)
 let feedbackProvider: ((hwnd: number, bar: number) => ScrollFeedback) | null = null;
 
 export function setScrollFeedbackProvider(fn: ((hwnd: number, bar: number) => ScrollFeedback) | null): void {

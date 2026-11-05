@@ -160,6 +160,7 @@ export const readLockDivergenceCounters = {
 
 /** Surfaces served stale, with the version they were served at. A later guest write bumps
  *  `version`, and a comparison across that would measure the guest's own writes. */
+// @transient(readback bookkeeping keyed by live surface objects; a restored surface starts CPU-authoritative)
 const pendingStaleServe = new WeakMap<object, number>();
 
 /** A Lock was answered without waiting; the readback it kicked owes us a comparison. */

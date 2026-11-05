@@ -27,6 +27,7 @@ import { isDifferentCommandLine } from '../../shell32';
 import { getVirtualProcessManager, VIRTUAL_CURRENT_PROCESS_ID } from './virtual-process-manager';
 import { hostToolsEnabled } from '../../../core/host-tool-bridge';
 import { startProcessRuntime } from './runtime-child';
+import { applyInheritFlag, collectInheritedHandles, terminateForeignProcess } from '../inherited-handles';
 import { createActCtxExports } from './actctx';
 import { versionVerifyExports } from './version-verify';
 import { GUEST_COMPUTER_NAME } from '../../../core/guest-identity';
@@ -36,6 +37,7 @@ import {
     STARTUPINFO_OFFSETS, STARTUPINFO_SIZE, type ProcessStartupInfo,
 } from '../../../core/process-startup-info';
 
+const ERROR_ACCESS_DENIED = 5;
 const ERROR_INVALID_HANDLE = 6;
 const ERROR_INVALID_PARAMETER = 87;
 const ERROR_FILE_NOT_FOUND = 2;
@@ -72,6 +74,7 @@ const IMAGE_FILE_DLL = 0x2000;
 const PE_SNIFF_BYTES = 0x1000;
 const IMAGE_SUBSYSTEM_WINDOWS_CUI = 3;
 
+// @participant(kernel32)
 let currentPriorityClass = NORMAL_PRIORITY_CLASS;
 
 /** Shared with native thread-information queries; no duplicate priority-class state. */
@@ -91,6 +94,7 @@ function isValidThreadPriority(priority: number): boolean {
 
 // Tracks the last ES_CONTINUOUS SetThreadExecutionState value.
 // Initial state: ES_CONTINUOUS only (no active power-management request).
+// @participant(kernel32)
 let threadExecutionState = 0x80000000; // ES_CONTINUOUS
 
 // ==================== Toolhelp32 Snapshot internals ====================
@@ -107,6 +111,7 @@ interface ToolhelpSnapshot {
 }
 
 /** Active snapshots keyed by handle. Cleaned up on access if handle was closed. */
+// @refuse(open toolhelp snapshots are not part of a v1 savestate)
 const toolhelpSnapshots = new Map<number, ToolhelpSnapshot>();
 
 export function resetProcessApiState(): void {
@@ -120,7 +125,7 @@ export function resetProcessApiState(): void {
 
 export function captureProcessApiState(): { priorityClass: number; executionState: number } {
     if (toolhelpSnapshots.size > 0) throw new Error('kernel32: open toolhelp snapshots are not part of a v1 savestate');
-    if (childImageByPid.size > 0 || virtualProcessMemoryByPid.size > 0) throw new Error('kernel32: child process images are not part of a v1 savestate');
+    if (childImageByPid.size > 0 || childImagePathsByPid.size > 0 || virtualProcessMemoryByPid.size > 0) throw new Error('kernel32: child process images are not part of a v1 savestate');
     return { priorityClass: currentPriorityClass, executionState: threadExecutionState };
 }
 
@@ -549,6 +554,7 @@ const isKnownProcessHandle = (handle: number): boolean => {
     return getVirtualProcessManager().hasProcessHandle(handle >>> 0);
 };
 
+// @refuse(child process images are not part of a v1 savestate)
 const virtualProcessMemoryByPid = new Map<number, Map<number, number>>();
 
 const getVirtualProcessPid = (handle: number): number | null => {
@@ -587,6 +593,7 @@ interface ChildImageMap {
     /** RVA -> file offset for the section containing it, or -1 when it maps to no raw bytes. */
     sections: Array<{ va: number; vsize: number; raw: number; rawSize: number }>;
 }
+// @refuse(child process images are not part of a v1 savestate)
 const childImageByPid = new Map<number, ChildImageMap | null>();
 
 const loadChildImage = (path: string): ChildImageMap | null => {
@@ -926,13 +933,17 @@ export function resolveCommandLineImage(system: System, commandLine: string): Co
 const CREATE_SUSPENDED = 0x00000004;
 
 // Image lookup remains process-local while a real child Worker owns execution.
+// @refuse(child process images are not part of a v1 savestate)
 const childImagePathsByPid = new Map<number, string>();
+
+/** CreateProcess's inheritance arguments: bInheritHandles and the two SECURITY_ATTRIBUTES. */
+interface ProcessInheritance { inheritHandles: boolean; lpProcessAttributes: number; lpThreadAttributes: number; }
 
 const finishVirtualProcess = (
     lpProcessInformation: number, applicationName: string, commandLine: string,
     currentDirectory: string, dwCreationFlags: number, isWide: boolean,
     childRequest?: ChildProcessRequest, childBackend: 'worker' | 'host' = 'worker',
-    errOut?: { code: number },
+    errOut?: { code: number }, inheritance?: ProcessInheritance,
 ): ThunkResult | Promise<ThunkResult> => {
     const system = System.getInstance(), manager = getVirtualProcessManager();
     const ownerThread = system.scheduler.getCurrentThreadId();
@@ -942,6 +953,17 @@ const finishVirtualProcess = (
         applicationName, commandLine, currentDirectory, creationFlags: dwCreationFlags,
         runtimeBacked: !!childRequest, imagePath: childRequest?.imagePath,
     });
+    if (inheritance) {
+        // The child's table is filled from the parent's BEFORE its own process/thread
+        // handles exist, so those two are never among what it inherits.
+        if (inheritance.inheritHandles && childRequest && childBackend === 'worker') {
+            childRequest.inheritedHandles = collectInheritedHandles(proc.processId, [proc.processHandle, proc.threadHandle]);
+        }
+        // lpProcessAttributes/lpThreadAttributes decide whether THESE handles can be
+        // inherited by the next child the caller starts.
+        applyInheritFlag(proc.processHandle, inheritance.lpProcessAttributes);
+        applyInheritFlag(proc.threadHandle, inheritance.lpThreadAttributes);
+    }
     const setError = (code: number): void => {
         if (system.scheduler.getCurrentThreadId() === ownerThread) system.scheduler.setLastError(code);
         else system.scheduler.setLastErrorForThread(ownerThread, code);
@@ -997,6 +1019,9 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
     errOut?: { code: number }, startupOverride?: ProcessStartupInfo): ThunkResult | Promise<ThunkResult> => {
     const lpApplicationName = args[0] >>> 0;
     const lpCommandLine = args[1] >>> 0;
+    const inheritance: ProcessInheritance = {
+        lpProcessAttributes: args[2] >>> 0, lpThreadAttributes: args[3] >>> 0, inheritHandles: (args[4] >>> 0) !== 0,
+    };
     const dwCreationFlags = args[5] >>> 0;
     const lpCurrentDirectory = args[7] >>> 0;
     const lpStartupInfo = args[8] >>> 0;
@@ -1052,7 +1077,7 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
                 startupInfo: startupOverride ?? readStartupInfo(memory, lpStartupInfo, isWide) ?? undefined,
             },
             !startSuspended && isConsoleTool && hostToolsEnabled() ? 'host' : 'worker',
-            errOut,
+            errOut, inheritance,
         );
     }
     return failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide,
@@ -1195,9 +1220,13 @@ function fillVersionExW(mem: Uint8Array, lpVersionInfo: number, apiName: string)
     return 1;
 }
 
+// @transient(diagnostics)
 let rpmCalls = 0;
+// @transient(diagnostics)
 let lastRpmLog = 0;
+// @transient(diagnostics)
 let rpmPartial = 0;
+// @transient(diagnostics)
 let lastRpmPartialLog = 0;
 
 export const exports: Record<string, ThunkImplementation> = {
@@ -1422,12 +1451,27 @@ export const exports: Record<string, ThunkImplementation> = {
         return { value: 0, terminated: true };
     },
 
-    'TerminateProcess': (ctx, mem, args): ThunkResult => {
+    'TerminateProcess': (ctx, mem, args): ThunkResult | Promise<ThunkResult> => {
         const hProcess = args[0] >>> 0;
         const exitCode = args[1] >>> 0;
 
         if (hProcess === CURRENT_PROCESS_PSEUDO_HANDLE) {
             return shutdownProcess(exitCode);
+        }
+
+        // An inherited handle to a process another worker runs: only the process holding
+        // that runtime can stop it. One that already exited cannot be terminated again
+        // (Wine: STATUS_PROCESS_IS_TERMINATING -> ERROR_ACCESS_DENIED).
+        const foreign = getVirtualProcessManager().foreignProcessOf(hProcess);
+        if (foreign) {
+            const system = System.getInstance(), caller = system.scheduler.getCurrentThreadId();
+            const denied = (): ThunkResult => {
+                system.scheduler.setLastErrorForThread(caller, ERROR_ACCESS_DENIED);
+                return { value: 0, stackCleanup: 8 };
+            };
+            if (foreign.terminated) return denied();
+            return terminateForeignProcess(foreign.pid, foreign.ownerPid, exitCode)
+                .then((ok): ThunkResult => ok ? { value: 1, stackCleanup: 8 } : denied());
         }
 
         const terminated = getVirtualProcessManager().terminateProcess(hProcess, exitCode);
@@ -1962,6 +2006,13 @@ export const exports: Record<string, ThunkImplementation> = {
             }
         }
 
+        // A handle this call created carries the caller's bInheritHandle — the usual way a
+        // launcher hands its OWN process handle to a child is DuplicateHandle(GetCurrentProcess(),
+        // GetCurrentProcess(), ..., bInheritHandle = TRUE) followed by an inheriting CreateProcess.
+        if (targetHandle !== hSourceHandle && targetHandle !== CURRENT_PROCESS && targetHandle !== CURRENT_THREAD) {
+            System.getInstance().resourceProvider.setHandleFlags(targetHandle >>> 0, 1, _bInheritHandle ? 1 : 0);
+        }
+
         // Write the target handle to the output parameter
         if (lpTargetHandle !== 0 && lpTargetHandle + 4 <= mem.length) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -2436,6 +2487,7 @@ export const exports: Record<string, ThunkImplementation> = {
             `OpenProcess(access=0x${dwDesiredAccess.toString(16)}, inherit=${bInheritHandle}, pid=${dwProcessId})`);
         const handle = manager.openProcessById(dwProcessId >>> 0);
         if (handle !== 0) {
+            if (bInheritHandle) System.getInstance().resourceProvider.setHandleFlags(handle >>> 0, 1, 1);
             Logger.log(
                 LogCategory.KERNEL32,
                 `OpenProcess(pid=${dwProcessId}) -> 0x${(handle >>> 0).toString(16)}`
@@ -2455,6 +2507,7 @@ export const exports: Record<string, ThunkImplementation> = {
             `OpenThread(access=0x${dwDesiredAccess.toString(16)}, inherit=${bInheritHandle}, tid=${dwThreadId})`);
         const handle = manager.openThreadById(dwThreadId >>> 0);
         if (handle !== 0) {
+            if (bInheritHandle) System.getInstance().resourceProvider.setHandleFlags(handle >>> 0, 1, 1);
             Logger.log(
                 LogCategory.KERNEL32,
                 `OpenThread(tid=${dwThreadId}) -> 0x${(handle >>> 0).toString(16)}`

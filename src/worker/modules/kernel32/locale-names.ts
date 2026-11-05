@@ -107,6 +107,7 @@ export function findLocaleByLcid(lcid: number): LocaleEntry | undefined {
     return i < 0 ? undefined : makeEntry(lcidEntryLcid(i), lcidEntryLocale(i), lcidEntryName(i));
 }
 
+// @transient(derived from the configuration, which the config key pins)
 let userDefault: { lcid: number; entry: LocaleEntry } | null = null;
 
 /**

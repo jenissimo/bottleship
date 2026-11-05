@@ -22,8 +22,11 @@ export interface HookRegistration {
     dwThreadId: number;
 }
 
+// @participant(user32)
 let nextHookHandle = 1;
+// @participant(user32)
 const hooksByHandle = new Map<number, HookRegistration>();
+// @participant(user32)
 const hookTypeCounts = new Map<number, number>();
 
 export function installHook(idHook: number, lpfn: number, hMod: number, dwThreadId: number): number {
@@ -77,6 +80,7 @@ export function getNextHookInChain(handle: number, threadId: number): HookRegist
 // per-thread internally rather than via the hhk argument; we mirror that here. Hook
 // chains run synchronously on a single pinned thread (the suspended-frame pin blocks
 // preemption), so one global stack is sufficient — no per-thread keying needed.
+// @refuse(a hook procedure is running)
 const activeHookStack: number[] = [];
 
 /** Mark `handle`'s proc as the innermost executing hook (call before invoking it). */
@@ -99,4 +103,22 @@ export function resetHooks(): void {
     hookTypeCounts.clear();
     activeHookStack.length = 0;
     nextHookHandle = 1;
+}
+
+export interface HookState { hooks: HookRegistration[]; nextHookHandle: number }
+
+export function captureHooks(): HookState {
+    if (activeHookStack.length > 0) throw new Error('user32: a hook procedure is running');
+    return { hooks: [...hooksByHandle.values()].map(h => ({ ...h })), nextHookHandle };
+}
+
+export function restoreHooks(s: HookState): void {
+    hooksByHandle.clear();
+    hookTypeCounts.clear();
+    for (const h of s.hooks) {
+        hooksByHandle.set(h.handle, { ...h });
+        hookTypeCounts.set(h.idHook, (hookTypeCounts.get(h.idHook) ?? 0) + 1);
+    }
+    nextHookHandle = s.nextHookHandle;
+    activeHookStack.length = 0;
 }

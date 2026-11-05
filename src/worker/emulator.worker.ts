@@ -59,6 +59,7 @@ import { memoryWatch } from "./core/memory/memory-watch";
 import { memWriteTrap } from "./core/memory/mem-write-trap";
 import { Kernel32 } from "./modules/kernel32";
 import { adoptNamedObjects, namedObjects, type NamedObjectSpec } from "./modules/kernel32/named-objects";
+import { adoptInheritedHandles } from "./modules/kernel32/inherited-handles";
 import { User32 } from "./modules/user32";
 import { GDI32 } from "./modules/gdi32";
 import { installWindowsFonts } from "./modules/gdi32/installed-fonts";
@@ -108,6 +109,7 @@ import { Wtsapi32 } from "./modules/wtsapi32";
 import { Msacm32 } from "./modules/msacm32";
 import { Imm32 } from "./modules/imm32";
 import { Msimg32 } from "./modules/msimg32";
+import { Wing32 } from "./modules/wing32";
 import { Uxtheme } from "./modules/uxtheme";
 import { Wintrust } from "./modules/wintrust";
 import { Crypt32 } from "./modules/crypt32";
@@ -178,7 +180,7 @@ import { EmulatorConfig } from "./core/emulator-config-manager";
 import { configureNetplay } from "./net/configure-netplay";
 import { lanNetwork } from "./net/lan-network";
 import type { NetworkStatus } from "../network-config";
-import { logQualityGapsOnce, activeQualityBackend, onQualityBackendChanged } from "./backends/webgpu/shared/quality-capabilities";
+import { logQualityGapsOnce, activeQualityBackend, onQualityBackendChanged, internalScaleSupport } from "./backends/webgpu/shared/quality-capabilities";
 import type { QualityConfig } from "./core/quality-config";
 import { videoEngine } from "../video/video-engine";
 import { preemptionManager } from "./core/cpu/preemption-manager";
@@ -2020,7 +2022,11 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         : payload.preload ? "preload-full" : policy.mode ?? "stream+fill";
       if (mode === "preload-full") {
         await liveIo.preloadFull();
-      } else if (policy.profileUrl) {
+      } else if (policy.profileUrl && mode !== "stream") {
+        // The profile only orders preload/fill; plain "stream" (always the case for a local
+        // disk route, whose ETag is a size/mtime stamp rather than the content hash a
+        // profile may have been recorded against) has no use for it, so it is neither
+        // fetched nor allowed to fail the boot.
         const response = await fetch(policy.profileUrl, { signal: AbortSignal.timeout(15_000), cache: "no-cache" });
         if (!response.ok) throw new Error(`WGB profile HTTP ${response.status}`);
         const profile = parseIoProfile(await response.json());
@@ -2031,8 +2037,8 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         if (mode === "preload-profile") {
           await liveIo.preloadChunks(profileChunkOrder(profile, liveIo.chunkBytes, policy.preloadPhases ?? ["loading", "first-level"]));
         }
-        if (mode !== "stream") liveIo.armFill(order);
-      } else {
+        liveIo.armFill(order);
+      } else if (mode !== "stream") {
         if (mode === "preload-profile") throw new Error("preload-profile requires io.profileUrl");
         if (mode === "stream+fill") liveIo.armFill();
       }
@@ -2743,6 +2749,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const msacm32 = new Msacm32();
       const imm32 = new Imm32();
       const msimg32 = new Msimg32();
+      const wing32 = new Wing32();
       const uxtheme = new Uxtheme();
       const wintrust = new Wintrust();
       const crypt32 = new Crypt32();
@@ -2826,6 +2833,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       msacm32.initialize(process);
       imm32.initialize(process);
       msimg32.initialize(process);
+      wing32.initialize(process);
       uxtheme.initialize(process);
       wintrust.initialize(process);
       crypt32.initialize(process);
@@ -2906,6 +2914,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(msacm32.name, msacm32);
       process.registerModule(imm32.name, imm32);
       process.registerModule(msimg32.name, msimg32);
+      process.registerModule(wing32.name, wing32);
       process.registerModule(uxtheme.name, uxtheme);
       process.registerModule(wintrust.name, wintrust);
       process.registerModule(crypt32.name, crypt32);
@@ -2988,6 +2997,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(msacm32.name, msacm32.exports);
       process.dispatcher.registerModule(imm32.name, imm32.exports);
       process.dispatcher.registerModule(msimg32.name, msimg32.exports);
+      process.dispatcher.registerModule(wing32.name, wing32.exports);
       process.dispatcher.registerModule(uxtheme.name, uxtheme.exports);
       process.dispatcher.registerModule(wintrust.name, wintrust.exports);
       process.dispatcher.registerModule(crypt32.name, crypt32.exports);
@@ -3334,6 +3344,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         // image before restoring inherited objects; otherwise that stale TEB survives
         // while the new bootloader resets FS, and CRT startup faults at fs:[0].
         await prepareFullGameSwitch();
+        // Inherited handles first: they hold the PARENT's values, and every object this
+        // process creates from here on (the named-object adoption below included) must be
+        // allocated around them, as a Windows child's own handles are.
+        if (boot.inheritedHandles?.length) adoptInheritedHandles(boot.inheritedHandles);
         // A child is matched on its own image, not on its parent's: it inherits the bundle's
         // whole rule list in its EmulatorConfig and picks the entry that names it.
         system.registry.setRedirectsForImage(EmulatorConfig.getInstance().registryRedirects, boot.imagePath);
@@ -3475,7 +3489,14 @@ function resumeEmulator(): void {
  */
 function postQualityState(q: QualityConfig): void {
     const gaps = logQualityGapsOnce(q);
-    self.postMessage({ type: "set_quality", ok: true, quality: q, unsupported: gaps, backend: activeQualityBackend() });
+    // `unsupported` answers "did the user ask this backend for something it cannot do".
+    // That is a different question from "can this backend apply internalScale at all", and
+    // only the second one lets the panel label the resolution honestly: an untouched Auto
+    // is never a gap, so a backend with no internal-resolution path looks supported.
+    self.postMessage({
+        type: "set_quality", ok: true, quality: q, unsupported: gaps,
+        backend: activeQualityBackend(), internalScale: internalScaleSupport(),
+    });
 }
 
 onQualityBackendChanged(() => postQualityState(EmulatorConfig.getInstance().quality));

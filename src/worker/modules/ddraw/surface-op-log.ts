@@ -59,10 +59,15 @@ export interface SurfaceOpRecord {
 // per record once full, and at 200k slots and thousands of ops per second that makes the
 // instrument dominate the frame it is supposed to be measuring — the timing it reports
 // would be its own.
+// @transient(diagnostics)
 let capacity = 0;
+// @transient(diagnostics)
 let ring: (SurfaceOpRecord | undefined)[] = [];
+// @transient(diagnostics)
 let head = 0;
+// @transient(diagnostics)
 let filled = 0;
+// @transient(diagnostics)
 let seq = 0;
 
 /** Zero-cost guard for the hot paths: a single boolean test when disarmed. */
@@ -71,6 +76,7 @@ export function surfaceOpsArmed(): boolean {
 }
 
 /** Whole-surface alpha census per op — O(w*h) per record, so opt-in and armed-only. */
+// @transient(diagnostics)
 let censusEnabled = false;
 
 export function armSurfaceOps(n: number, opts?: { alpha?: boolean }): { armed: number; alpha: boolean } {

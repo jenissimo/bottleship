@@ -6,6 +6,7 @@ import type { VfsFileHandle } from '../../runtime/filesystem/vfs';
 
 interface PendingRead { handle: number; thread: number; overlapped: number; cancel(): void; }
 interface ReadState { generation: number; pending: Set<PendingRead>; }
+// @refuse(an overlapped read is pending)
 const states = new WeakMap<Process, ReadState>();
 function state(process: Process): ReadState {
     let result = states.get(process);

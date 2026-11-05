@@ -36,6 +36,7 @@ export interface BuiltinSystemClass {
     classProc?: 'DefDlgProcA';
 }
 
+// @transient(constant table)
 const BUILTIN_SYSTEM_CLASSES: ReadonlyMap<string, BuiltinSystemClass> = new Map(
     ([
         { name: 'Button', style: CS_DBLCLKS | CS_VREDRAW | CS_HREDRAW | CS_PARENTDC, cbWndExtra: 12, idcCursor: IDC_ARROW, controlClass: 'Button' },
@@ -68,8 +69,11 @@ export function getBuiltinSystemClass(className: string): BuiltinSystemClass | u
  * GetWindowLong(GWL_WNDPROC), CallWindowProcA and a direct CALL all work.
  * When the thunk fires, the DefWindowProcA handler runs in JS.
  */
+// @transient(thunk address resolved again from the restored thunk table)
 let cachedDefWindowProcAddr = 0;
+// @transient(thunk address resolved again from the restored thunk table)
 let cachedDefWindowProcWAddr = 0;
+// @transient(thunk address resolved again from the restored thunk table)
 let cachedDefDlgProcAddr = 0;
 
 /** The thunk layout is rebuilt on bundle switch — the cached stub address dies with it. */

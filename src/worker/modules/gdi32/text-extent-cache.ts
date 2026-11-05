@@ -25,6 +25,7 @@ interface FontCache {
     cellHeight: number | undefined;
 }
 
+// @transient(text metrics measured again on demand)
 const caches = new Map<string, FontCache>();
 
 export function invalidateTextExtentCache(): void {

@@ -47,6 +47,7 @@ const TEAROFF_VTABLE: Record<string, string> = {
     [IID_IDirect3D7]: "IDirect3D7",
 };
 
+// @participant(ddraw)
 const tearOffsByObject = new WeakMap<BaseComObject, Map<string, number>>();
 
 const tearOffCache = (context: DDrawContext, obj: BaseComObject): Map<string, number> => {
@@ -113,3 +114,13 @@ export const resolveDDrawTearOff = (
     new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(ppvObject, addr, true);
     return DD_OK;
 };
+
+export function captureTearOffs(obj: BaseComObject): Array<[string, number]> | null {
+    const cache = tearOffsByObject.get(obj);
+    return cache ? [...cache] : null;
+}
+
+export function restoreTearOffs(obj: BaseComObject, rows: ReadonlyArray<[string, number]> | null): void {
+    if (rows) tearOffsByObject.set(obj, new Map(rows));
+    else tearOffsByObject.delete(obj);
+}

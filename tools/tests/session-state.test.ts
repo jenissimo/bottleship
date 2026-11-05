@@ -42,7 +42,7 @@ describe("session state registry", () => {
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { censusOf, runCensus, stripNonCode } from "../validate-session-state";
+import { censusOf, coveredModulesOf, moduleOfFile, runCensus, stripNonCode } from "../validate-session-state";
 
 describe("session-state census", () => {
     test("names module-scope and factory-scope mutable bindings, skips ones with a stated reason", () => {
@@ -100,6 +100,27 @@ describe("session-state census", () => {
         const c = censusOf(["let a = 0; // @transient()", "// @transient(   )", "let b = 0;"].join("\n"));
         expect(c.names).toEqual(["a", "b"]);
         expect(c.emptyReasons).toEqual([1, 3]);
+    });
+
+    test("@participant and @refuse classify a binding like @transient; empty arguments are reported", () => {
+        const c = censusOf([
+            "// @participant(user32)", "const windows = new Map();",
+            "let open = 0; // @refuse(a dialog is open)",
+            "// @participant()", "let x = 0;",
+            "// @refuse( )", "let y = 0;",
+        ].join("\n"));
+        expect(c.names).toEqual(["x", "y"]);
+        expect(c.emptyReasons).toEqual([5, 7]);
+        expect(c.participants).toEqual([{ line: 2, id: "user32" }]);
+    });
+
+    test("maps files to the DLL they implement and reads covered DLLs from covers lists", () => {
+        expect(moduleOfFile("modules/user32/window.ts")).toBe("user32");
+        expect(moduleOfFile("modules/kernelbase.ts")).toBe("kernelbase");
+        expect(moduleOfFile("modules/winmm-joystick.ts")).toBe("winmm");
+        expect(moduleOfFile("runtime/windowing/message-queue.ts")).toBeNull();
+        expect([...coveredModulesOf(["add({ id: 'k', covers: ['kernel32', 'NTDLL.dll'] })", "// covers: ['gdi32']"])].sort())
+            .toEqual(["kernel32", "ntdll"]);
     });
 
     test("stripping keeps every src/worker file brace-balanced", () => {
@@ -171,6 +192,34 @@ describe("session-state census gate", () => {
         const r = run({ "a.ts": "let x = 0; // @transient()\n" }, { "src/a.ts": ["x"] });
         expect(r.ok).toBe(false);
         expect(r.lines.join("\n")).toContain("EMPTY REASON: src/a.ts:1");
+    });
+
+    test("a module some participant covers must classify every binding", () => {
+        const files = {
+            "modules/user32/a.ts": "let pinned = 0;\n// @participant(user32)\nlet saved = 0;\n",
+            "modules/gdi32/b.ts": "let free = 0;\n",
+            "savestate/participant-ids.ts": "export const PARTICIPANT_IDS = ['user32'] as const;\n",
+            "savestate/user32.ts": "savestateParticipants.add({ id: 'user32', covers: ['user32'] });\n",
+        };
+        const t = setup({}, {});
+        try {
+            for (const [name, body] of Object.entries(files)) {
+                mkdirSync(join(t.root, name, ".."), { recursive: true });
+                writeFileSync(join(t.root, name), body);
+            }
+            writeFileSync(t.pin, JSON.stringify({ "src/modules/user32/a.ts": ["pinned"], "src/modules/gdi32/b.ts": ["free"] }));
+            const r = runCensus(t);
+            expect(r.ok).toBe(false);
+            expect(r.lines.join("\n")).toContain("UNCLASSIFIED: src/modules/user32/a.ts — pinned (user32 is covered");
+            expect(r.lines.join("\n")).not.toContain("UNCLASSIFIED: src/modules/gdi32");
+            writeFileSync(join(t.root, "modules/user32/a.ts"), "// @transient(diagnostics)\nlet pinned = 0;\n// @participant(usr32)\nlet saved = 0;\n");
+            writeFileSync(t.pin, JSON.stringify({ "src/modules/gdi32/b.ts": ["free"] }));
+            const r2 = runCensus(t);
+            expect(r2.ok).toBe(false);
+            expect(r2.lines.join("\n")).toContain("UNKNOWN PARTICIPANT: src/modules/user32/a.ts:4 — usr32");
+            writeFileSync(join(t.root, "modules/user32/a.ts"), "// @transient(diagnostics)\nlet pinned = 0;\n// @participant(user32)\nlet saved = 0;\n");
+            expect(runCensus(t).ok).toBe(true);
+        } finally { t.done(); }
     });
 
     test("--update writes a pin the check then accepts", () => {

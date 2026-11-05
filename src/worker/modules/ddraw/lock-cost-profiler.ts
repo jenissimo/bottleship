@@ -89,6 +89,7 @@ export type LockClass = typeof LC[keyof typeof LC];
 const LOCK_CLASS_NAMES = ["write", "read", "other"] as const;
 
 /** Phases whose time is already counted inside another phase — excluded from the total. */
+// @transient(constant set)
 const NESTED = new Set<number>([LP.convert, LP.snap, LP.udirty, LP.upresent]);
 
 const NPHASE = LOCK_COST_PHASES.length;
@@ -217,4 +218,5 @@ class LockCostProfiler {
     }
 }
 
+// @transient(diagnostics)
 export const lockCostProfiler = new LockCostProfiler();

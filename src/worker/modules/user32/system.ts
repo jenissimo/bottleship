@@ -16,6 +16,8 @@ import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { encodeAnsi, getAnsiCodePage, getCodePageDecoder, decodeAnsiString, readAnsiFromGuest, writeAnsiToGuest, encodeAnsiString } from '../codepage-utils';
 import { findResourceInPE } from '../kernel32/resource';
 import { loadBitmapFromPeResource } from '../kernel32/bitmap-extractor';
+import { savestateParticipants, savestatesEnabled, stateKeys } from '../../savestate/participant';
+import type { SaveValue } from '../../savestate/value-codec';
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
 import {
     clipboardDataByFormat,
@@ -48,11 +50,14 @@ import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 
 // wsprintf's output buffer: reused across calls (hot path, thousands per frame) and
 // sized to the API's own 1024 code-unit budget including the terminator.
+// @transient(host scratch)
 const wsprintfScratch = new Uint8Array(1024 * 2);
+// @transient(host scratch)
 const wsprintfScratchView = new DataView(wsprintfScratch.buffer);
 
 /** The DBCS ANSI code pages (Shift-JIS, GBK, Wansung, Big5) — the ones whose
  *  MaximumCharacterSize is 2 and which therefore make SM_DBCSENABLED true. */
+// @transient(constant table)
 const DBCS_CODE_PAGES = new Set([932, 936, 949, 950, 1361]);
 function isDbcsCodePage(cp: number): boolean {
     return DBCS_CODE_PAGES.has(cp);
@@ -68,6 +73,7 @@ function cssToColorRef(css: string): number {
 // JS control painters also use come FROM classic-theme, so GetSysColor(COLOR_BTNFACE) and
 // a painted button face cannot drift apart: a window erased with the class brush would
 // otherwise sit a shade off every control on it.
+// @participant(user32-system)
 const sysColors = new Map<number, number>([
     [0,  cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_SCROLLBAR
     [1,  0xC0DCC0],                                  // COLOR_BACKGROUND / COLOR_DESKTOP
@@ -109,6 +115,7 @@ export function getSystemColorRef(nIndex: number): number {
 // reaches every painter (WM_CTLCOLOR*, class hbrBackground, FillRect) as "unresolvable"
 // and silently degrades to no fill. Cached per index, as Win32's are process-wide and
 // must not be deleted; re-created when a reset drops the object.
+// @participant(user32-system)
 const sysColorBrushes = new Map<number, number>();
 
 export function getSystemColorBrush(nIndex: number): number {
@@ -311,6 +318,7 @@ const SPI_UI_EFFECT_SET_TO_GET: Array<[number, number]> =
     SPI_UI_EFFECT_GETS.map((get) => [get + 1, get]);
 
 /** SETs whose new value arrives in pvParam (cast to a value) rather than uiParam. */
+// @transient(constant table)
 const SPI_SET_VALUE_IN_PVPARAM = new Set<number>([
     SPI_SETMOUSESPEED, SPI_SETFOREGROUNDLOCKTIMEOUT, SPI_SETFOREGROUNDFLASHCOUNT,
     SPI_SETCARETWIDTH,
@@ -399,11 +407,65 @@ export const getDisplayModes = (): DisplayMode[] => {
     }));
 };
 
+export interface User32SystemState {
+    mouseButtonsSwapped: boolean;
+    registeredClipboardFormats: Array<[string, number]>;
+    nextRegisteredClipboardFormat: number;
+    nextInputDesktop: number;
+    openInputDesktops: number[];
+    nextIconHandle: number;
+    spiSettings: Array<[number, number]>;
+    sysColors: Array<[number, number]>;
+    sysColorBrushes: Array<[number, number]>;
+}
+
 export function createSystemExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
+    // @participant(user32-system)
     let mouseButtonsSwapped = false;
+    // @participant(user32-system)
     const registeredClipboardFormats = new Map<string, number>();
+    // @participant(user32-system)
     let nextRegisteredClipboardFormat = 0xC000;
+    if (savestatesEnabled()) savestateParticipants.add({
+        id: 'user32-system', version: 1, order: 43,
+        schema: stateKeys<User32SystemState>({
+            mouseButtonsSwapped: true, registeredClipboardFormats: true, nextRegisteredClipboardFormat: true,
+            nextInputDesktop: true, openInputDesktops: true, nextIconHandle: true, spiSettings: true,
+            sysColors: true, sysColorBrushes: true,
+        }),
+        capture: () => {
+            const state: User32SystemState = {
+                mouseButtonsSwapped,
+                registeredClipboardFormats: [...registeredClipboardFormats],
+                nextRegisteredClipboardFormat,
+                nextInputDesktop,
+                openInputDesktops: [...openInputDesktops],
+                nextIconHandle,
+                spiSettings: [...spiSettings],
+                sysColors: [...sysColors],
+                sysColorBrushes: [...sysColorBrushes],
+            };
+            return state as unknown as SaveValue;
+        },
+        restore: (saved) => {
+            const s = saved as unknown as User32SystemState;
+            mouseButtonsSwapped = s.mouseButtonsSwapped;
+            registeredClipboardFormats.clear();
+            for (const [name, id] of s.registeredClipboardFormats) registeredClipboardFormats.set(name, id);
+            nextRegisteredClipboardFormat = s.nextRegisteredClipboardFormat;
+            nextInputDesktop = s.nextInputDesktop;
+            openInputDesktops.clear();
+            for (const h of s.openInputDesktops) openInputDesktops.add(h);
+            nextIconHandle = s.nextIconHandle;
+            spiSettings.clear();
+            for (const [k, v] of s.spiSettings) spiSettings.set(k, v);
+            sysColors.clear();
+            for (const [k, v] of s.sysColors) sysColors.set(k, v);
+            sysColorBrushes.clear();
+            for (const [k, v] of s.sysColorBrushes) sysColorBrushes.set(k, v);
+        },
+    });
 
     // System metrics constants
     const SM_CXSCREEN = 0;       // Width of screen
@@ -656,6 +718,20 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
 
     exports['MessageBeep'] = () => 1;
 
+    // BOOL WinHelp(HWND, LPCSTR lpszHelp, UINT uCommand, ULONG_PTR dwData). There is no
+    // help engine (winhlp32) to start, so every request fails; HELP_QUIT with no help
+    // window open has nothing to close and succeeds, as Windows and Wine answer it.
+    const HELP_QUIT = 0x0002;
+    const winHelp = (wide: boolean): ThunkImplementation => (ctx, mem, args) => {
+        const command = args[2] >>> 0;
+        const ok = command === HELP_QUIT ? 1 : 0;
+        Logger.log(LogCategory.USER32,
+            `WinHelp${wide ? 'W' : 'A'}(hwnd=0x${(args[0] >>> 0).toString(16)}, cmd=0x${command.toString(16)}) -> ${ok ? 'TRUE' : 'FALSE (no help engine)'}`);
+        return ok;
+    };
+    exports['WinHelpA'] = winHelp(false);
+    exports['WinHelpW'] = winHelp(true);
+
     exports['GetKeyboardType'] = (ctx, mem, args) => {
         const typeFlag = args[0] | 0;
         // 0 = keyboard type, 1 = subtype, 2 = number of function keys
@@ -791,7 +867,9 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return 0;
     };
 
+    // @participant(user32-system)
     let nextInputDesktop = 0xd0000001;
+    // @participant(user32-system)
     const openInputDesktops = new Set<number>();
 
     exports['OpenInputDesktop'] = (ctx, mem, args) => {
@@ -989,6 +1067,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     exports['LoadCursorFromFileW'] = (_ctx, mem, args) => loadCursorFromFile(mem, args[0] >>> 0, true);
 
     const FIRST_LOADICON_HANDLE = 0x200;
+    // @participant(user32-system)
     let nextIconHandle = FIRST_LOADICON_HANDLE;
 
     const loadIconCommon = (mem: Uint8Array, hInstance: number, lpIconName: number, isWide: boolean): number => {
@@ -1715,6 +1794,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     // The scalar settings, with Windows' own defaults. A GET reads from here and a SET
     // writes to it, so a caller that sets a value and reads it back sees its own value —
     // the property games actually depend on (mouse speed, wheel lines, drag thresholds).
+    // @participant(user32-system)
     const spiSettings = new Map<number, number>([
         [SPI_GETBEEP, 1],
         [SPI_GETBORDER, 1],
@@ -1758,6 +1838,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     for (const action of SPI_UI_EFFECT_GETS) spiSettings.set(action, 0);
 
     /** GET action → the SET action that writes the same slot. */
+    // @transient(constant table)
     const spiSetToGet = new Map<number, number>([
         [SPI_SETBEEP, SPI_GETBEEP],
         [SPI_SETBORDER, SPI_GETBORDER],

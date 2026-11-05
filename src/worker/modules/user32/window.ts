@@ -150,7 +150,7 @@ export function clientSizeFromCreateWindow(
 const makeGeometryLParam = (lo: number, hi: number): number =>
     (((lo & 0xFFFF) | ((hi & 0xFFFF) << 16)) >>> 0);
 
-interface DeferredWindowPosEntry {
+export interface DeferredWindowPosEntry {
     hWnd: number;
     hWndInsertAfter: number;
     x: number;
@@ -160,7 +160,9 @@ interface DeferredWindowPosEntry {
     uFlags: number;
 }
 
+// @participant(user32)
 const deferWindowPosBatches = new Map<number, DeferredWindowPosEntry[]>();
+// @participant(user32)
 let nextDeferWindowPosHandle = 1;
 
 interface ApplyWindowPosOptions {
@@ -515,6 +517,7 @@ const WM_ERASEBKGND_PAINT = 0x0014;
  * Win32 hands the erase a DC clipped to the update region; the class-brush fill must
  * respect that or an InvalidateRect of one control's rect repaints the whole client.
  */
+// @refuse(a WM_ERASEBKGND is in flight)
 const pendingEraseRects = new Map<number, ClientRect>();
 
 /**
@@ -796,6 +799,7 @@ export function runDefaultWindowPaint(
  */
 type SyncWndProcImpl = (ctx: X86Context, mem: Uint8Array, args: number[]) => number | ThunkResult;
 
+// @transient(wiring set at module init)
 let defWindowProcImpl: SyncWndProcImpl | null = null;
 
 export function defaultWindowProc(
@@ -835,6 +839,7 @@ const SIZE_BORDER_CURSORS = [
 ];
 
 /** Windows whose parent WM_SETCURSOR offer is out with the guest. */
+// @refuse(a WM_SETCURSOR forward to a parent window is in flight)
 const setCursorForwardInFlight = new Set<number>();
 
 /** Bundle-switch reset: hwnds are recycled, so an unfinished offer must not outlive them. */
@@ -1194,6 +1199,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         // WM_CREATE into it is a guest round-trip for a no-op (dialog children skip it
         // the same way). CBT hooks still fire below when present.
         const hasGuestCreateProc = !!windowInfo.wndProc && !windowInfo.isSystemControl;
+        if (!windowInfo.visible && (windowInfo.style & (0x40000000 | 0x80000000)) === 0) windowInfo.sizeMovePending = true;
 
         if (!callbackManager || (!hasGuestCreateProc && totalCbtHooks === 0)) {
             postInitialVisibleWindowMessages(windowInfo);
@@ -1924,13 +1930,50 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             return resultValue;
         };
 
+        let chainFrameId = existingFrameId;
+        let chainDirect: { returnAddr: number; postEsp: number } | undefined;
+        let pendingSizeMoveSuspension: { callbackId: number; reusedFrame: boolean } | null = null;
+        const minMaxBefore = window.style & (WS_MINIMIZE | WS_MAXIMIZE);
+        const sendPendingSizeMove = (): number | null => {
+            const live = windows.get(hWnd);
+            if (!live || !show || !live.sizeMovePending) return resultValue;
+            if (!visibilityChanged && (live.style & (WS_MINIMIZE | WS_MAXIMIZE)) === minMaxBefore) return resultValue;
+            live.sizeMovePending = false;
+            const sizeType = (live.style & WS_MAXIMIZE) !== 0 ? 2 : ((live.style & WS_MINIMIZE) !== 0 ? 1 : 0);
+            const sizeLParam = sizeType === 1 ? 0 : makeGeometryLParam(live.width, live.height);
+            const sendMove = (): number | null => {
+                const move = trySuspendForSyncWindowMessage(
+                    ctx, hWnd, WM_MOVE_GEO, 0, makeGeometryLParam(live.x, live.y),
+                    'ShowWindow', stackCleanup, () => resultValue, chainFrameId || undefined, chainDirect,
+                );
+                return move.suspended ? null : resultValue;
+            };
+            const size = trySuspendForSyncWindowMessage(
+                ctx, hWnd, WM_SIZE_GEO, sizeType, sizeLParam,
+                'ShowWindow', stackCleanup, sendMove, chainFrameId || undefined, chainDirect,
+            );
+            if (!size.suspended) return resultValue;
+            pendingSizeMoveSuspension = size;
+            if (!chainFrameId && !chainDirect) {
+                chainFrameId = size.frameId;
+                chainDirect = size.directThunkReturn;
+            }
+            return null;
+        };
+        const showThenSizeMove = (): number | null => {
+            applyShowState();
+            return sendPendingSizeMove();
+        };
+
         // USER sends WM_SHOWWINDOW synchronously before SetWindowPos changes WS_VISIBLE.
         if (visibilityChanged || nCmdShow === 8 /* SW_SHOWNA */) {
             const sync = trySuspendForSyncWindowMessage(
                 ctx, hWnd, 0x0018 /* WM_SHOWWINDOW */, show ? 1 : 0, 0,
-                'ShowWindow', stackCleanup, applyShowState, existingFrameId || undefined,
+                'ShowWindow', stackCleanup, showThenSizeMove, existingFrameId || undefined,
             );
             if (sync.suspended) {
+                chainFrameId = sync.frameId || existingFrameId;
+                chainDirect = sync.directThunkReturn;
                 return {
                     value: resultValue,
                     suspendedForCallback: true,
@@ -1941,7 +1984,19 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 };
             }
         }
-        return applyShowState();
+        applyShowState();
+        if (sendPendingSizeMove() === null && pendingSizeMoveSuspension) {
+            const s: { callbackId: number; reusedFrame: boolean } = pendingSizeMoveSuspension;
+            return {
+                value: resultValue,
+                suspendedForCallback: true,
+                callbackId: s.callbackId,
+                stackCleanup,
+                skipStackCheck: true,
+                preserveCallbackReturnAddress: s.reusedFrame,
+            };
+        }
+        return resultValue;
     };
 
     exports['ShowWindow'] = (ctx, mem, args) =>
@@ -3129,4 +3184,20 @@ export function registerFastPathWindowFunctions(dispatcher: HleDispatcher): void
     dispatcher.registerFastPath('user32', 'GetForegroundWindow', getForeground, { trivial: true });
     dispatcher.registerFastPath('user32', 'ShowCursor', showCursor, { trivial: true });
     dispatcher.registerFastPath('user32', 'ShowWindow', showWindowNoop, { trivial: true });
+}
+
+export interface WindowPosState { deferBatches: Array<[number, DeferredWindowPosEntry[]]>; nextDeferHandle: number }
+
+export function captureWindowPosState(): WindowPosState {
+    if (setCursorForwardInFlight.size > 0) throw new Error('user32: a WM_SETCURSOR forward to a parent window is in flight');
+    if (pendingEraseRects.size > 0) throw new Error('user32: a WM_ERASEBKGND is in flight');
+    return { deferBatches: [...deferWindowPosBatches].map(([h, b]) => [h, b.map(e => ({ ...e }))]), nextDeferHandle: nextDeferWindowPosHandle };
+}
+
+export function restoreWindowPosState(s: WindowPosState): void {
+    deferWindowPosBatches.clear();
+    for (const [h, b] of s.deferBatches) deferWindowPosBatches.set(h, b.map(e => ({ ...e })));
+    nextDeferWindowPosHandle = s.nextDeferHandle;
+    setCursorForwardInFlight.clear();
+    pendingEraseRects.clear();
 }

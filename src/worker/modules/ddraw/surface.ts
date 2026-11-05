@@ -319,11 +319,15 @@ function resolveGetAttachedSurfaceTarget(
 export const createSurfaceExports = (context: DDrawContext): Record<string, ThunkImplementation> => {
     const exports: Record<string, ThunkImplementation> = {};
     // Diagnostic counters for texture interface creation (per surface)
+    // @transient(diagnostics)
     const textureQueryCounts: Map<number, number> = new Map();
+    // @transient(diagnostics)
     let texture2CreateCount = 0;
+    // @transient(diagnostics)
     let textureCreateCount = 0;
 
     // Performance: Cache memory regions to avoid repeated lookups in Lock/Unlock hot paths
+    // @transient(cache of memory regions)
     let cachedRegions: any = null;
     const getRegions = () => {
         if (!cachedRegions) {
@@ -2221,6 +2225,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
     };
 
     // Reserve a surface while its readback suspends the caller. Only publish a seeded DC.
+    // @transient(non-empty only while a GetDC readback suspends its caller, which the safe point excludes)
     const pendingSurfaceDCs = new WeakSet<DirectDrawSurfaceState>();
     exports["IDirectDrawSurface7_GetDC"] = (ctx, mem, args) => {
         const thisPtr = args[0];

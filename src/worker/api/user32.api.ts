@@ -182,6 +182,7 @@ export const user32Module: ModuleDescriptor = {
         makeFunc("CheckRadioButton", 4),
         makeFunc("IsDlgButtonChecked", 2),
         makeFunc("WinHelpA", 4),
+        makeFunc("WinHelpW", 4),
         makeFunc("DestroyMenu", 1),
         makeFunc("PostMessageA", 4),
         makeFunc("PostMessageW", 4),

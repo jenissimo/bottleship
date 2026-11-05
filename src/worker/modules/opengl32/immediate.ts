@@ -1,6 +1,6 @@
 import { ThunkImplementation, WriteBufHandler } from "../../core/thunking/thunk-dispatcher";
 import {
-    OpenGLContext, GLDrawCommandType, mat4Multiply, VERT_FLOATS,
+    OpenGLContext, GLDrawCommandType, mat4Multiply, VERT_FLOATS, VERT_FOG_DIST,
     CMD_I32, CMD_F32,
     CI_MODE, CI_VERT_OFFSET, CI_VERT_COUNT, CI_FLAGS, CI_DEPTH_FUNC, CI_BLEND_SRC, CI_BLEND_DST,
     CI_ALPHA_FUNC, CI_CULL_FACE, CI_FRONT_FACE, CI_TEX_ID0, CI_TEX_ID1, CI_TEXENV0, CI_TEXENV1,
@@ -18,7 +18,7 @@ import {
     GL_POLYGON, GL_POINTS, GL_LINES, GL_LINE_STRIP, GL_LINE_LOOP,
     GL_INVALID_OPERATION,
     GL_TEXTURE_GEN_S, GL_TEXTURE_GEN_T,
-    GL_OBJECT_LINEAR, GL_EYE_LINEAR, GL_SPHERE_MAP, GL_STENCIL_TEST, GL_RENDER,
+    GL_OBJECT_LINEAR, GL_EYE_LINEAR, GL_SPHERE_MAP, GL_STENCIL_TEST, GL_RENDER, GL_FOG,
 } from "./constants";
 import { Logger, LogCategory } from "../../core/logger";
 import { guestViews } from "./client-arrays";
@@ -184,11 +184,13 @@ export function transformFlatVerts(ctx: OpenGLContext, buf: Float32Array, offset
             `  mvp=[${Array.from(m).map(v => v.toFixed(4)).join(',')}]`);
     }
 
+    const fog = ctx.enableFlags.has(GL_FOG);
     // Output clip-space coordinates directly — GPU handles perspective divide,
     // near/far plane clipping, and viewport transform via setViewport().
     for (let i = 0; i < count; i++) {
         const b = offset + i * VERT_FLOATS;
         const x = buf[b], y = buf[b+1], z = buf[b+2], w = buf[b+3];
+        if (fog) buf[b + VERT_FOG_DIST] = Math.abs(mv[2]*x + mv[6]*y + mv[10]*z + mv[14]*w);
         buf[b]   = m[0]*x + m[4]*y + m[8]*z  + m[12]*w;  // clip.x
         buf[b+1] = m[1]*x + m[5]*y + m[9]*z  + m[13]*w;  // clip.y
         buf[b+2] = m[2]*x + m[6]*y + m[10]*z + m[14]*w;  // clip.z
@@ -1062,9 +1064,9 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
  * OUT-trap overhead in games using immediate mode.  Replacing them with JMP-trampoline stubs
  * saves ~75 ms/frame on a typical OpenGL game (140K glVertex3fv calls × 7 µs each).
  *
- * Flush triggers (glEnd, glFlush, wglSwapBuffers) remain as OUT traps.  drainWriteBuffer()
- * is called at the top of handlePortWrite(), so all buffered vertex data is applied before
- * glEnd's emitDrawCommandFlat() runs.
+ * glEnd is ring-borne too (wbuf-state.ts), so it is applied in FIFO order right after its
+ * vertices. drainWriteBuffer() runs at the top of handlePortWrite(), so every trapping call
+ * (glFlush, SwapBuffers, glGet*) observes all buffered work.
  *
  * Display-list recording: each handler checks ctx.compilingList.  During GL_COMPILE the
  * args are recorded into compilingCommands and execution is skipped.  During

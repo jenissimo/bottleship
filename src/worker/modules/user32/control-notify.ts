@@ -15,7 +15,9 @@ const WM_NOTIFY = 0x004e;
 export const NOTIFY_SLOT_SIZE = 64;
 const NOTIFY_RING = 8;
 
+// @participant(user32)
 let notifyScratchBase = 0;
+// @participant(user32)
 let notifyScratchIndex = 0;
 
 /** Next slot in the ring; allocates the arena on first use. 0 when unavailable. */
@@ -67,4 +69,13 @@ export function postNotify(
 export function resetNotifyScratch(): void {
     notifyScratchBase = 0;
     notifyScratchIndex = 0;
+}
+
+export function captureNotifyScratch(): [base: number, index: number] {
+    return [notifyScratchBase, notifyScratchIndex];
+}
+
+export function restoreNotifyScratch([base, index]: readonly [number, number]): void {
+    notifyScratchBase = base;
+    notifyScratchIndex = index;
 }

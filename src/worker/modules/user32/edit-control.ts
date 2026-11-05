@@ -107,11 +107,13 @@ interface EditState {
     undoInsertCount: number;
 }
 
+// @refuse(edit controls are not part of a v1 savestate)
 const editStates = new Map<number, EditState>();
 
 // Registered lazily: shared-state sits in an import cycle with this module
 // (shared-state → owner-draw → controls → edit-control), so a top-level call
 // would hit its consts in TDZ.
+// @transient(wiring done once per worker)
 let purgerRegistered = false;
 
 function getOrCreateEditState(child: WindowInfo): EditState {
@@ -166,6 +168,7 @@ export function getEditVisualState(child: WindowInfo): {
 // Measurement context for caret-from-click hit testing (font mirrors the painter's
 // getWindowFont fallback in controls.ts).
 const DEFAULT_CONTROL_FONT = "11px 'Liberation Sans', sans-serif";
+// @transient(host canvas for text metrics)
 let measureCtx: OffscreenCanvasRenderingContext2D | null = null;
 
 function getMeasureCtx(child: WindowInfo): OffscreenCanvasRenderingContext2D | null {
@@ -518,6 +521,7 @@ function clamp(v: number, lo: number, hi: number): number {
 // a thunk, which this synchronous LRESULT sink cannot do.
 /** Set by rich-edit-control: Rich Edit gates EN_* on its event mask, EDIT does not.
  *  Registered rather than imported so this module stays free of the rich-edit import. */
+// @transient(wiring set at module init)
 let editNotifyFilter: ((child: WindowInfo, code: number) => boolean) | null = null;
 export function registerEditNotifyFilter(fn: (child: WindowInfo, code: number) => boolean): void {
     editNotifyFilter = fn;
@@ -961,4 +965,12 @@ export function isEditContentMessage(msg: number): boolean {
 /** True when `child` is an EDIT — the only class the messages above belong to. */
 export function isEditControl(child: WindowInfo): boolean {
     return (child.systemControlClass ?? '').trim().toLowerCase() === 'edit';
+}
+
+export function editControlCount(): number {
+    return editStates.size;
+}
+
+export function resetEditStatesForTests(): void {
+    editStates.clear();
 }

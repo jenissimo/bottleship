@@ -46,7 +46,7 @@ const HID_CLASS_GUID = guidToHex(GUID_DEVINTERFACE_HID);
 const GAMEPAD_INTERFACE_NAME =
     '\\\\?\\HID#VID_FFFF&PID_0001#1&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}';
 
-interface DeviceNotification {
+export interface DeviceNotification {
     hRecipient: number;
     devicetype: number;
     /** null = DEVICE_NOTIFY_ALL_INTERFACE_CLASSES; dbcc_classguid is then ignored. */
@@ -54,7 +54,9 @@ interface DeviceNotification {
     unicode: boolean;
 }
 
+// @participant(user32)
 const registrations = new Map<number, DeviceNotification>();
+// @participant(user32)
 let nextHandle = 0x00021000;
 
 /**
@@ -203,4 +205,27 @@ export function resetDeviceNotifications(): void {
     }
     registrations.clear();
     nextHandle = 0x00021000;
+}
+
+export interface DeviceNotifyState {
+    registrations: Array<[number, DeviceNotification]>;
+    nextHandle: number;
+    payloads: [ansi: number, wide: number];
+}
+
+export function captureDeviceNotifications(): DeviceNotifyState {
+    return {
+        registrations: [...registrations].map(([h, r]) => [h, { ...r }]),
+        nextHandle,
+        payloads: [payloads.ansi.ptr, payloads.wide.ptr],
+    };
+}
+
+export function restoreDeviceNotifications(s: DeviceNotifyState): void {
+    registrations.clear();
+    for (const [h, r] of s.registrations) registrations.set(h, { ...r });
+    nextHandle = s.nextHandle;
+    const owner = System.getInstance().process?.memory ?? null;
+    payloads.ansi = { ptr: s.payloads[0], owner: s.payloads[0] ? owner : null };
+    payloads.wide = { ptr: s.payloads[1], owner: s.payloads[1] ? owner : null };
 }

@@ -127,6 +127,11 @@ export function forgetLossTrackedSurface(state: LossTrackedSurface): void {
     markSurfaceRestored(state);
 }
 
+export function recountLostSurfaces(states: Iterable<LossTrackedSurface>): void {
+    lostCount = 0;
+    for (const s of states) if (s.surfaceLost) lostCount++;
+}
+
 export function lostSurfaceCount(): number {
     return lostCount;
 }

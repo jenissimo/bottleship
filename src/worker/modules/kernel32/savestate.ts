@@ -21,6 +21,7 @@ import { ioCompletionInUse } from './sync';
 import { pendingReadExCount } from './file-io-ex';
 import { pendingSocketFileIoCount } from './socket-file-io';
 import { getVirtualProcessManager } from './process/virtual-process-manager';
+import { captureAddressWaits, restoreAddressWaits } from '../kernelbase';
 import { captureStartupSessionState, restoreStartupSessionState, type StartupSessionState } from '../../core/process-startup-info';
 
 export interface Kernel32State {
@@ -40,6 +41,7 @@ export interface Kernel32State {
     actCtx: ActCtxState;
     threadPool: ReturnType<typeof captureVistaRuntimeState>;
     startup: StartupSessionState;
+    addressWaits: Array<[number, number]>;
 }
 
 export function captureKernel32State(): Kernel32State {
@@ -66,6 +68,7 @@ export function captureKernel32State(): Kernel32State {
         actCtx: captureActCtxState(),
         threadPool: captureVistaRuntimeState(),
         startup: captureStartupSessionState(),
+        addressWaits: captureAddressWaits(),
     };
 }
 
@@ -86,12 +89,13 @@ export function restoreKernel32State(state: Kernel32State): void {
     restoreActCtxState(state.actCtx);
     restoreVistaRuntimeState(state.threadPool);
     restoreStartupSessionState(state.startup);
+    restoreAddressWaits(state.addressWaits);
 }
 
 export function registerKernel32Participant(): void {
     savestateParticipants.add({
-        id: 'kernel32', version: 1, order: 6, covers: ['kernel32', 'kernelbase', 'ntdll'],
-        schema: stateKeys<Kernel32State>({ atoms: true, fls: true, srwLocks: true, namedObjects: true, modules: true, resources: true, commandLine: true, pointerCookie: true, consoleModes: true, fileApisAnsi: true, console: true, process: true, vista: true, actCtx: true, threadPool: true, startup: true }),
+        id: 'kernel32', version: 2, order: 6, covers: ['kernel32', 'kernelbase', 'ntdll'],
+        schema: stateKeys<Kernel32State>({ atoms: true, fls: true, srwLocks: true, namedObjects: true, modules: true, resources: true, commandLine: true, pointerCookie: true, consoleModes: true, fileApisAnsi: true, console: true, process: true, vista: true, actCtx: true, threadPool: true, startup: true, addressWaits: true }),
         capture: () => {
             try {
                 return captureKernel32State() as unknown as SaveValue;

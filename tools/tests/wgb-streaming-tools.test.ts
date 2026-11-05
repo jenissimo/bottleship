@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, utimesSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, utimesSync } from "node:fs";
 import { basename, join, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
 import { BufferSource, ZipArchive } from "@bottleship/formats/zip";
-import { wgbEtag } from "../../deploy/wgb-etag";
+import { diskWgbEtag, wgbEtag } from "../../deploy/wgb-etag";
 import { WgbCache } from "../../src/worker/runtime/filesystem/wgb-cache";
 import { FakeDirHandle } from "./fixtures/fake-opfs";
 import { ZipStoreWriter } from "../internal/zip-store-writer";
@@ -48,6 +48,34 @@ test("local WGB ETags coalesce probes and detect a same-size rewrite", async () 
         utimesSync(path, new Date(), new Date(Date.now() + 1000));
         expect(await wgbEtag(path)).toBe(`"${createHash("sha256").update("wxyz").digest("hex")}"`);
     } finally { cleanup(root); }
+});
+
+test("disk-route WGB ETags are strong metadata stamps that never read the content", async () => {
+    const root = fixture(), path = join(root, "test.wgb");
+    try {
+        writeFileSync(path, "abcd");
+        const first = await diskWgbEtag(path);
+        expect(first).toMatch(/^"disk-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+"$/);
+        expect(first).not.toBe(`"${createHash("sha256").update("abcd").digest("hex")}"`);
+        expect(await diskWgbEtag(path)).toBe(first);
+        // A same-size rewrite is caught through mtime, exactly what the I/O worker's pin needs.
+        writeFileSync(path, "wxyz");
+        utimesSync(path, new Date(), new Date(Date.now() + 1000));
+        const rewritten = await diskWgbEtag(path);
+        expect(rewritten).not.toBe(first);
+        // ctime-only changes (attributes) keep the validator: the bytes did not change.
+        chmodSync(path, 0o444); chmodSync(path, 0o666);
+        expect(await diskWgbEtag(path)).toBe(rewritten);
+    } finally { cleanup(root); }
+});
+
+test("both dev disk routes use the metadata ETag; only the deploy stand hashes content", () => {
+    const read = (p: string) => readFileSync(resolve(p), "utf8");
+    for (const route of ["tools/dev-sidecar/dev-sidecar.ts", "vite.config.ts"]) {
+        expect(read(route), route).toContain("await diskWgbEtag(");
+        expect(read(route), route).not.toMatch(/\bawait wgbEtag\(/);
+    }
+    expect(read("deploy/server.ts")).toMatch(/\bawait wgbEtag\(/);
 });
 
 test("an old full cache is rejected even when another tab prevents its removal", async () => {

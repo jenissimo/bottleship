@@ -1,4 +1,5 @@
 import type { QualityConfig } from "../worker/core/quality-config";
+import type { InternalScaleSupport } from "../worker/backends/webgpu/shared/internal-resolution";
 import type { UiSettings } from "../ui-settings";
 import type { NetworkConfig, NetworkStatus } from "../network-config";
 
@@ -11,6 +12,10 @@ export interface SettingsDrawerProps {
    *  worker/backends/webgpu/shared/quality-capabilities.ts) — empty until the worker's
    *  first set_quality ack arrives. */
   unsupportedQualityKeys?: ReadonlySet<string>;
+  /** Whether the active backend applies `internalScale` at all, and what its Auto means.
+   *  Carried with the same ack: `unsupportedQualityKeys` only lists keys moved away from
+   *  their default, so a backend with no internal-resolution path is silent there. */
+  internalScaleSupport?: InternalScaleSupport;
   /** Quality keys the loaded game's manifest overrides — the control edits the global
    *  preference, but the game's value is what the frame uses. Also empty until the
    *  worker's first set_quality ack arrives. */

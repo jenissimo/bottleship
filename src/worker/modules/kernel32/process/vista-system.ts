@@ -98,8 +98,11 @@ function writeWideString(addr: number, s: string): boolean {
 
 // ─── Per-thread state ────────────────────────────────────────────────────────────
 
+// @participant(kernel32)
 const threadDescriptions = new Map<number, string>();
+// @participant(kernel32)
 const threadErrorModes = new Map<number, number>();
+// @participant(kernel32)
 const threadStackGuarantees = new Map<number, number>();
 
 // ─── Mitigation policies ─────────────────────────────────────────────────────────
@@ -108,7 +111,9 @@ const PROCESS_DEP_POLICY = 0;
 const PROCESS_MITIGATION_OPTIONS_MASK = 5;
 const MAX_PROCESS_MITIGATION_POLICY = 19;
 /** Flags (and, for DEP, the Permanent byte) the process has turned on. */
+// @participant(kernel32)
 const mitigationFlags = new Map<number, number>();
+// @participant(kernel32)
 let depPermanent = 0;
 
 function mitigationPolicySize(policy: number, requested: number): number {
@@ -119,6 +124,7 @@ function mitigationPolicySize(policy: number, requested: number): number {
 
 // ─── Fail-fast / WER ─────────────────────────────────────────────────────────────
 
+// @participant(kernel32)
 const werRuntimeExceptionModules: Array<{ dll: string; context: number }> = [];
 const WER_MAX_REGISTERED_RUNTIME_EXCEPTION_MODULES = 16;
 

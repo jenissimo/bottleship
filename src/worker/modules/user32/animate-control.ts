@@ -54,8 +54,10 @@ interface AnimateState {
     resumeOnShow?: boolean;
 }
 
+// @refuse(animation controls are not part of a v1 savestate)
 const animateStates = new Map<number, AnimateState>();
 
+// @transient(registers the animation classes once per worker; a restored class table already holds them)
 let classesRegistered = false;
 
 function emptyState(filePath = '', vfsPath = ''): AnimateState {
@@ -581,4 +583,8 @@ export function handleAnimateMessage(
 export function clearAnimateState(hwnd: number): void {
     stopPlayback(hwnd, false, 'clearAnimateState');
     animateStates.delete(hwnd);
+}
+
+export function animateControlCount(): number {
+    return animateStates.size;
 }

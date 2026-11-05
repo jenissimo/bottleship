@@ -325,6 +325,7 @@ function resolveModalOwner(owner: number): number {
 }
 
 /** Wine IsDialogMessage VK_RETURN / DM_GETDEFID path. */
+// @refuse(a dialog command is pending)
 let pendingDialogCommand: { hwnd: number; wParam: number; lParam: number } | null = null;
 
 /**
@@ -2078,11 +2079,13 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
         || Msg === WM_CHARTOITEM || Msg === WM_QUERYDRAGICON || Msg === WM_INITDIALOG;
 
     /** Messages the dialog manager must NOT default-process when the DlgProc declines. */
+    // @transient(constant message set)
     const NO_DEFAULT_PROCESSING = new Set(
         [WM_INITDIALOG, WM_VKEYTOITEM, WM_COMPAREITEM, WM_CHARTOITEM]);
 
     /** hwnd:msg:wParam:lParam of a DlgProc call in flight — a DlgProc that itself calls
      *  DefDlgProc would otherwise recurse until the callback pool is exhausted. */
+    // @transient(non-empty only while a DlgProc callback runs, and the safe point allows no callback in flight)
     const dlgProcInFlight = new Set<string>();
 
     /**
@@ -2277,4 +2280,8 @@ export function runModalDialogFromTemplate(
 
 export function isSentinelWndProc(wndProc: number): boolean {
     return (wndProc >>> 16) === 0xFFFF;
+}
+
+export function pendingDialogCommandFor(): number {
+    return pendingDialogCommand?.hwnd ?? 0;
 }

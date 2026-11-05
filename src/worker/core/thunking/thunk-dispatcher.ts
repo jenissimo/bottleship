@@ -521,7 +521,7 @@ export class ThunkDispatcher {
     // Pending registrations for stubs that aren't created yet
     private pendingRegistrations: Map<string, { impl: ThunkImplementation; dllName: string; functionName: string }> = new Map();
     private pendingFastPathRegistrations: Map<string, { impl: FastPathImplementation; dllName: string; functionName: string; trivial?: boolean }> = new Map();
-    private pendingWriteBufRegistrations: Map<string, { handler: WriteBufHandler; dllName: string; functionName: string; argCount: number; isStdcall: boolean; ptrDeref?: boolean; floatCount?: number; shaderConstant?: boolean; coalesceArgMask?: number; shadowSpec?: ShadowTrampolineSpec; barrier?: boolean; structCapture?: { ptrArgIndex: number; payloadDwords: number }; multiStructCapture?: { ptrArgIndices: number[]; payloadDwords: number }; upDraw?: boolean; ownerDisarm?: boolean }> = new Map();
+    private pendingWriteBufRegistrations: Map<string, { handler: WriteBufHandler; dllName: string; functionName: string; argCount: number; isStdcall: boolean; zeroArg?: boolean; ptrDeref?: boolean; floatCount?: number; shaderConstant?: boolean; coalesceArgMask?: number; shadowSpec?: ShadowTrampolineSpec; barrier?: boolean; structCapture?: { ptrArgIndex: number; payloadDwords: number }; multiStructCapture?: { ptrArgIndices: number[]; payloadDwords: number }; upDraw?: boolean; ownerDisarm?: boolean }> = new Map();
     private pendingConstStubRegistrations: Map<string, { dllName: string; functionName: string; value: number; popBytes: number }> = new Map();
     private pendingIncRefStubRegistrations: Map<string, { dllName: string; functionName: string; spec: IncRefStubSpec }> = new Map();
 
@@ -4491,10 +4491,9 @@ export class ThunkDispatcher {
      * Overflow safety: if the ring is full the trampoline falls back to OUT 0xB077, which
      * hits the existing fast-path or slow-path handler as usual.
      *
-     * NOTE: Display-list recording (glNewList/GL_COMPILE) is NOT supported for write-buffer
-     * functions.  Vertex calls during display-list compilation will be buffered and executed
-     * immediately (GL_COMPILE_AND_EXECUTE) or lost (GL_COMPILE).  Add a WBUF_DISABLED flag
-     * mechanism if display-list correctness is required.
+     * Display-list recording is the handler's job: opengl32 registers handlers that go through
+     * its display-list-wrapped export table, so GL_COMPILE records and skips, and
+     * GL_COMPILE_AND_EXECUTE records and executes, exactly like the trap path.
      *
      * @param dllName   DLL name (e.g. 'ddraw', 'opengl32')
      * @param funcName  Export name (exact or normalised)
@@ -5102,6 +5101,40 @@ export class ThunkDispatcher {
         Logger.log(LogCategory.THUNK,
             `[WBUF] Registered ShaderConstant [${id}] ${dllName}:${funcName} ` +
             `(stub=0x${stubAddr.toString(16)}, trampoline=0x${trampolineAddr.toString(16)})`);
+    }
+
+    registerZeroArgWriteBufferFunction(dllName: string, funcName: string, handler: WriteBufHandler): boolean {
+        if (this.writeBufControlAddr === 0) return false;
+        const key = `${dllName}:${funcName}`.toLowerCase();
+        this.pendingWriteBufRegistrations.set(key, {
+            handler, dllName, functionName: funcName, argCount: 1, isStdcall: true, zeroArg: true,
+        });
+        const trampolineAddr = this.writeBufTrampolineAddrs[21];
+        if (!trampolineAddr) return false;
+        let patched = 0;
+        for (const stub of this.findStubsByName(dllName, funcName)) {
+            if (stub.functionId >= MAX_THUNK_ID) continue;
+            if (typeof stub.argCount === "number" && stub.argCount !== 0) continue;
+            let mem8 = this.cachedMem8;
+            if (!mem8 || mem8.byteLength === 0) { this.updateMemoryCache(); mem8 = this.cachedMem8; }
+            if (!mem8 || mem8.byteLength === 0) return false;
+            const stubAddr = stub.address;
+            const rel32 = (trampolineAddr - (stubAddr + 10)) | 0;
+            mem8[stubAddr + 5] = 0xE9;
+            mem8[stubAddr + 6] = rel32 & 0xFF;
+            mem8[stubAddr + 7] = (rel32 >> 8) & 0xFF;
+            mem8[stubAddr + 8] = (rel32 >> 16) & 0xFF;
+            mem8[stubAddr + 9] = (rel32 >> 24) & 0xFF;
+            invalidateGuestCode(stubAddr, 16);
+            const id = stub.functionId;
+            this.writeBufHandlerTable[id] = handler;
+            this.noteWriteBufTransportSafety(id, dllName);
+            this.writeBufArgCountTable[id] = 1;
+            this.writeBufCoalesceMaskTable[id] = 0;
+            this.writeBufBarrierTable[id] = 0;
+            patched++;
+        }
+        return patched > 0;
     }
 
     /** Shared tail for the capture-family registrations: emit-time guards, stub JMP patch,
@@ -8448,6 +8481,11 @@ export class ThunkDispatcher {
                 pending.handler,
                 pending.isStdcall
             );
+            return;
+        }
+
+        if (pending.zeroArg) {
+            this.registerZeroArgWriteBufferFunction(pending.dllName, pending.functionName, pending.handler);
             return;
         }
 

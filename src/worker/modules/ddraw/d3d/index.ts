@@ -27,6 +27,7 @@ import { createExecuteBufferExports } from "./execute-buffer-impl";
 const D3D_OK = 0;
 
 // Shared DrawHandler instance for FastPath access
+// @transient(host draw pipeline, created on first use)
 let sharedDrawHandler: ReturnType<typeof createDrawHandler> | null = null;
 
 // Diagnostic: track RS[41] (COLORKEYENABLE) values from the game (first 20 calls)

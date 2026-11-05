@@ -15,6 +15,8 @@ import { pickSaved, savestateParticipants, stateKeys, type CaptureContext, type 
 import { CPU_FIELDS, captureCpu, restoreCpu, type V86Cpu } from './participants/cpu';
 import { CaptureRefusal, objectCodecs } from './object-codecs';
 import { registerKernel32Participant } from '../modules/kernel32/savestate';
+import { registerUser32Participants } from '../modules/user32/savestate';
+import { registerGdi32Participants } from '../modules/gdi32/savestate';
 import type { SaveValue } from './value-codec';
 
 function v86Cpu(): V86Cpu {
@@ -165,6 +167,8 @@ const schema = (v: unknown) => v as SaveValue;
 export function registerCoreParticipants(): void {
     registerKernelRecordCodecs();
     registerKernel32Participant();
+    registerUser32Participants();
+    registerGdi32Participants();
 
     savestateParticipants.add({
         id: 'time', version: 1, order: 1, schema: schema(SCHEMAS.time),
@@ -190,7 +194,7 @@ export function registerCoreParticipants(): void {
     });
     savestateParticipants.add({
         id: 'kernel32-memory', version: 1, order: 4, covers: ['kernel32'], schema: schema(SCHEMAS.kernel32Memory),
-        capture: () => save(captureKernel32Memory()),
+        capture: () => save(refusing('kernel32 memory', captureKernel32Memory)),
         restore: (s) => restoreKernel32Memory(as<Kernel32MemoryState>(s)),
     });
     savestateParticipants.add({

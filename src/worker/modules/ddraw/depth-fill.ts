@@ -22,8 +22,11 @@ import type { Rect } from "./helpers";
 import { absToRel } from "./helpers";
 import { toPlainGuestMemory } from "../../core/memory/guest-memory";
 
+// @transient(diagnostics)
 const warnedNoTarget = new Set<number>();
+// @transient(diagnostics)
 const warnedNonUniform = new Set<number>();
+// @transient(diagnostics)
 const loggedFill = new Set<number>();
 
 export const isZBufferSurface = (state: DirectDrawSurfaceState): boolean =>
@@ -50,6 +53,7 @@ function trailingZeros(mask: number): number {
 /** Addresses the reverse walk found for a z surface, so the whole-process scan runs once
  *  per surface rather than once per clear. Keyed by z-surface address; AddAttachedSurface
  *  fills zOwnerSurfaces for anything wired after we started tracking, which takes priority. */
+// @transient(cache of an attachment scan, repeated on demand over the restored attachments)
 const scannedOwners = new Map<number, number[]>();
 
 /**

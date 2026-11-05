@@ -27,7 +27,9 @@ function wantsAliasedText(state: { fontQuality: number }): boolean {
     return state.fontQuality === NONANTIALIASED_QUALITY;
 }
 
+// @transient(host scratch canvas)
 let aliasScratch: OffscreenCanvas | null = null;
+// @transient(host scratch canvas)
 let aliasScratchCtx: OffscreenCanvasRenderingContext2D | null = null;
 
 /** Binary (alpha-thresholded) glyph fill: rasterize to a scratch canvas, then

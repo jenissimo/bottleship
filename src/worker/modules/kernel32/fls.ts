@@ -14,11 +14,16 @@ import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 const FLS_OUT_OF_INDEXES = 0xffffffff;
 const MAX_SLOTS = 128;
 
+// @participant(kernel32)
 const allocated = new Set<number>();
+// @participant(kernel32)
 const valuesByThread = new Map<number, Map<number, number>>();
+// @participant(kernel32)
 let nextSlot = 1;
+// @transient(identity of the owning process object)
 let flsOwnerProcess: unknown = null;
 
+// @transient(identity of the owning process object)
 let flsOwnerResetGeneration = -1;
 
 function ensureProcessLocalFls(): void {

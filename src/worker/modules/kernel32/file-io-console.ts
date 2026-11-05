@@ -160,6 +160,7 @@ export function isConsoleDeviceHandle(handle: any): handle is ConsoleDeviceHandl
     return handle && (handle instanceof ConsoleDeviceHandle || handle[CONSOLE_DEVICE_MARKER] === true);
 }
 
+// @participant(kernel32)
 const consoleModeByHandle = new Map<number, number>();
 
 export function resetConsoleModeState(): void {

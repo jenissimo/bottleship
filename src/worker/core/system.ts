@@ -577,7 +577,9 @@ export class System {
     postProcessExitWhenDurable(payload: Record<string, unknown>): void {
         if (this.exitNotified) return;
         this.exitNotified = true;
-        finishProcessIpcLifetime();
+        // The exit code travels with the death notice: a process holding an inherited handle
+        // to this one reads it from GetExitCodeProcess without asking anybody.
+        finishProcessIpcLifetime(typeof payload.exitCode === 'number' ? payload.exitCode : undefined);
         const exitingProcess = this.process, generation = exitingProcess?.resetGeneration;
         const currentLifetime = () => this.process === exitingProcess && this.process?.resetGeneration === generation;
         const networkFinished = Promise.resolve().then(() => {

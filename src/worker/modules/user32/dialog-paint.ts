@@ -146,6 +146,7 @@ const DEFAULT_CHROME_DEADLINE_MS = 250;
  *  stamp entirely, so a control the guest paints OUTSIDE a WM_PAINT cycle keeps the
  *  guest's pixels. What the stamp costs is otherwise invisible — it looks exactly
  *  like a control the guest never drew. */
+// @refuse(a dialog is waiting for its first paint)
 const chromeDeadlines = new Map<number, ReturnType<typeof setTimeout>>();
 
 function stampDefaultChromeIfPaintNeverCame(hwnd: number): void {
@@ -626,4 +627,8 @@ export function finalizeDialogPaint(dialogHwnd: number): void {
             setTimeout(queueGuestPaint, 0);
         } else queueGuestPaint();
     }
+}
+
+export function pendingChromeDeadlineCount(): number {
+    return chromeDeadlines.size;
 }

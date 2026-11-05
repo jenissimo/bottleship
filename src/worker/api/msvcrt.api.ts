@@ -231,6 +231,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_difftime64", 4, { returnType: "f64" }),
         makeFunc("_strlwr", 1),
         makeFunc("_strdup", 1),
+        makeFunc("_wcsdup", 1),
         makeFunc("sprintf", 16),
         makeFunc("printf", 16),
         makeFunc("sscanf", 16),

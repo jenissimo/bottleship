@@ -3,6 +3,8 @@ import { type HleDispatcher, ThunkImplementation } from '../../core/thunking/thu
 import { registerPaintingDcStateExports } from './painting-dc-state';
 import { registerPaintingMiscExports } from './painting-misc';
 import { System } from '../../core/system';
+import { savestateParticipants, savestatesEnabled, stateKeys } from '../../savestate/participant';
+import type { SaveValue } from '../../savestate/value-codec';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Logger, LogCategory } from '../../core/logger';
 import { profiler } from '../../core/profiler';
@@ -10,17 +12,20 @@ import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { SystemResourceProvider } from '../../core/resources/system-resource-provider';
 import { toPlainGuestMemory } from '../../core/memory/guest-memory';
 import { LOGPEN_OFFSETS, LOGPEN_SIZE } from './gdi-objects';
-import { writeBackDibSectionRect } from './bitmap-resolve';
+import { writeBackDibSectionRect, readDibSectionRgbaGeneric } from './bitmap-resolve';
 import { patBlt } from './gdi-blit';
 import { extTextOut } from './ext-text-out';
 import { fontCellHeight, prefixWidths } from './text-extent-cache';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
 // Track GetPixel HDC usage for profiling
+// @transient(diagnostics)
 const getPixelHdcStats = new Map<number, { count: number; maxX: number; maxY: number }>();
 
 // Store last GetDIBits output buffer address for texture loading workaround
+// @participant(gdi32)
 let lastGetDIBitsBuffer: { address: number; width: number; height: number } | null = null;
+// @participant(gdi32)
 const pixelFormatByHdc = new Map<number, number>();
 
 export function getLastGetDIBitsBuffer(): { address: number; width: number; height: number } | null {
@@ -684,6 +689,27 @@ function writeTextMetrics(hdc: number, lptm: number, mem: Uint8Array): void {
     view.setUint8(lptm + 52, 0);              // tmCharSet: ANSI_CHARSET
 }
 
+export interface PaintingModuleState {
+    pixelFormatByHdc: Array<[number, number]>;
+    lastGetDIBitsBuffer: { address: number; width: number; height: number } | null;
+}
+
+export function capturePaintingModuleState(): PaintingModuleState {
+    return { pixelFormatByHdc: [...pixelFormatByHdc], lastGetDIBitsBuffer: lastGetDIBitsBuffer ? { ...lastGetDIBitsBuffer } : null };
+}
+
+export function restorePaintingModuleState(s: PaintingModuleState): void {
+    pixelFormatByHdc.clear();
+    for (const [h, f] of s.pixelFormatByHdc) pixelFormatByHdc.set(h, f);
+    lastGetDIBitsBuffer = s.lastGetDIBitsBuffer ? { ...s.lastGetDIBitsBuffer } : null;
+}
+
+export interface PaletteState {
+    palettes: Array<[number, Uint8Array]>;
+    nextPaletteHandle: number;
+    dcPalette: Array<[number, number]>;
+}
+
 export function createPaintingExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -1276,7 +1302,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const dibBpp = (userObj as any).dibBpp as number | undefined;
         const dibStride = (userObj as any).dibStride as number | undefined;
         const dibTopDown = !!(userObj as any).dibTopDown;
-        if (dibBitsPtr && dibBpp === 32 && dibStride && dibStride > 0) {
+        if (dibBitsPtr && dibBpp === 32 && outBpp === 32 && dibStride && dibStride > 0) {
             const actualStart = Math.max(0, start);
             const actualEnd = Math.min(height, actualStart + (cLines > 0 ? cLines : height));
             const linesToCopy = actualEnd - actualStart;
@@ -1299,16 +1325,23 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             return linesToCopy;
         }
 
-        // Copy pixel data to output buffer
-        if (!userObj.pixels) {
-            Logger.warn(LogCategory.GDI32, 'GetDIBits: Bitmap has no pixel data');
-            return 0;
-        }
-
         // Calculate actual lines to copy
         const actualStart = Math.max(0, start);
         const actualEnd = Math.min(height, actualStart + (cLines > 0 ? cLines : height));
         const linesToCopy = actualEnd - actualStart;
+
+        const dibRgba = dibBitsPtr && dibStride && dibStride > 0 && linesToCopy > 0
+            ? readDibSectionRgbaGeneric(mem, dibBitsPtr, width, height, dibStride, dibTopDown, dibBpp ?? 32,
+                (userObj as any).dibPalette, (userObj as any).dibMasks, actualStart, linesToCopy)
+            : null;
+        const dibRowBase = dibRgba ? actualStart : 0;
+        const zeroReserved = !!dibRgba && (dibBpp ?? 32) !== 32;
+
+        // Copy pixel data to output buffer
+        if (!dibRgba && !userObj.pixels) {
+            Logger.warn(LogCategory.GDI32, 'GetDIBits: Bitmap has no pixel data');
+            return 0;
+        }
 
         if (linesToCopy <= 0) {
             Logger.verbose(LogCategory.GDI32, 'GetDIBits: No lines to copy');
@@ -1325,7 +1358,9 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const renderedPixels = (userObj as any).compatibleBitmap
             ? System.getInstance().gdiContext.getBitmapRenderedPixels(hbm)
             : null;
-        if (renderedPixels) {
+        if (dibRgba) {
+            sourcePixels = dibRgba;
+        } else if (renderedPixels) {
             sourcePixels = renderedPixels;
         } else if (userObj.pixels instanceof Uint8ClampedArray || userObj.pixels instanceof Uint8Array) {
             sourcePixels = userObj.pixels;
@@ -1357,7 +1392,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             const dstLine = wantsTopDown ? i : (linesToCopy - 1 - i);
 
             // Source: top-down RGBA; Destination: caller's stride/depth (BGR or BGRA)
-            const srcOffset = srcLine * srcStride;
+            const srcOffset = (srcLine - dibRowBase) * srcStride;
             const dstOffset = dstLine * outStride;
 
             for (let x = 0; x < width; x++) {
@@ -1373,7 +1408,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
                 mem[lpvBits + dstPixel + 1] = g; // Green
                 mem[lpvBits + dstPixel + 2] = r; // Red
                 if (outBytesPerPixel === 4) {
-                    mem[lpvBits + dstPixel + 3] = sourcePixels[srcPixel + 3]; // Alpha
+                    mem[lpvBits + dstPixel + 3] = zeroReserved ? 0 : sourcePixels[srcPixel + 3]; // Alpha
                 }
             }
         }
@@ -1560,9 +1595,36 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
 
     // --- Palette management ---
     // Store palette entries keyed by handle
-    const paletteStore = new Map<number, Uint8Array>(); // handle -> PALETTEENTRY[256] (4 bytes each)
+    // handle -> PALETTEENTRY[palNumEntries] (R,G,B,flags); the length IS the palette size.
+    // @participant(gdi32-palettes)
+    const paletteStore = new Map<number, Uint8Array>();
+    // @participant(gdi32-palettes)
     let nextPaletteHandle = 0x50000001;
+    // @participant(gdi32-palettes)
     const dcPalette = new Map<number, number>(); // hdc -> hPal
+    if (savestatesEnabled()) savestateParticipants.add({
+        id: 'gdi32-palettes', version: 1, order: 46,
+        schema: stateKeys<PaletteState>({ palettes: true, nextPaletteHandle: true, dcPalette: true }),
+        capture: () => {
+            const state: PaletteState = {
+                palettes: [...paletteStore].map(([h, entries]) => [h, entries.slice()]),
+                nextPaletteHandle,
+                dcPalette: [...dcPalette],
+            };
+            return state as unknown as SaveValue;
+        },
+        restore: (saved) => {
+            const s = saved as unknown as PaletteState;
+            paletteStore.clear();
+            for (const [h, entries] of s.palettes) paletteStore.set(h, entries.slice());
+            nextPaletteHandle = s.nextPaletteHandle;
+            dcPalette.clear();
+            for (const [hdc, h] of s.dcPalette) dcPalette.set(hdc, h);
+        },
+    });
+
+    const PC_RESERVED = 0x01;
+    const STOCK_DEFAULT_PALETTE = (0x80000000 | 15) >>> 0; // GetStockObject(DEFAULT_PALETTE)
 
     /** The 20 static system colours, R,G,B triples: indices 0-9 then 246-255. */
     const STATIC_SYSTEM_COLORS = [
@@ -1577,6 +1639,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
      * CreateHalftonePalette is measured against: a 4x8x8 blue/green/red cube with the
      * 20 static system colours stamped over indices 0-9 and 246-255.
      */
+    // @transient(constant table, built on first use)
     let cachedHalftoneEntries: Uint8Array | null = null;
     function defaultColorTable8(): Uint8Array {
         if (cachedHalftoneEntries) return cachedHalftoneEntries;
@@ -1616,9 +1679,8 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         // LOGPALETTE: WORD palVersion (offset 0), WORD palNumEntries (offset 2), PALETTEENTRY[] (offset 4)
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const numEntries = view.getUint16(plpal + 2, true);
-        const entries = new Uint8Array(256 * 4); // max 256 entries, 4 bytes each (RGBF)
         const count = Math.min(numEntries, 256);
-        // Copy entries from guest memory
+        const entries = new Uint8Array(count * 4);
         entries.set(mem.subarray(plpal + 4, plpal + 4 + count * 4), 0);
         const handle = nextPaletteHandle++;
         paletteStore.set(handle, entries);
@@ -1642,7 +1704,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const hdc = args[0];
         const hPal = dcPalette.get(hdc) || 0;
         const entries = hPal ? paletteStore.get(hPal) : undefined;
-        const count = entries ? 256 : 0;
+        const count = entries ? entries.length >> 2 : 0;
         Logger.verbose(LogCategory.GDI32, `RealizePalette(hdc=0x${hdc.toString(16)}) -> ${count}`);
         return count;
     };
@@ -1662,12 +1724,45 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             paletteStore.set(hPal, entries);
         }
 
-        const end = Math.min(iStart + cEntries, 256);
+        const end = Math.min(iStart + cEntries, entries.length >> 2);
         const count = end - iStart;
         if (count > 0 && pPalEntries) {
             entries.set(mem.subarray(pPalEntries, pPalEntries + count * 4), iStart * 4);
         }
         return count > 0 ? count : 0;
+    };
+
+    // BOOL AnimatePalette(HPALETTE, UINT iStart, UINT cEntries, const PALETTEENTRY*):
+    // replaces the colour of the entries created with PC_RESERVED and leaves every other
+    // entry, and every entry's flags, alone. Logical palettes never reach the screen here
+    // (RealizePalette maps nothing — 8bpp DIBs present through their own colour table),
+    // so there is no system-palette entry to update in place.
+    exports['AnimatePalette'] = (ctx, mem, args): number => {
+        const hPal = args[0] >>> 0;
+        const iStart = args[1] >>> 0;
+        const cEntries = args[2] >>> 0;
+        const ppe = args[3] >>> 0;
+        // The stock DEFAULT_PALETTE holds only static colours: nothing to animate.
+        if (hPal === STOCK_DEFAULT_PALETTE) return 1;
+        const entries = paletteStore.get(hPal);
+        if (!entries) return 0;
+        const size = entries.length >> 2;
+        if (iStart >= size) return 0;
+        const count = Math.min(cEntries, size - iStart);
+        if (count > 0 && (!ppe || !isValidAddress(ppe, count * 4, 'r'))) return 0;
+        let animated = 0;
+        for (let i = 0; i < count; i++) {
+            const off = (iStart + i) * 4;
+            if (!(entries[off + 3] & PC_RESERVED)) continue;
+            const src = ppe + i * 4;
+            entries[off] = mem[src];
+            entries[off + 1] = mem[src + 1];
+            entries[off + 2] = mem[src + 2];
+            animated++;
+        }
+        Logger.verbose(LogCategory.GDI32,
+            `AnimatePalette(hPal=0x${hPal.toString(16)}, start=${iStart}, count=${cEntries}) -> ${animated} animated`);
+        return 1;
     };
 
     // GetPaletteEntries - retrieves entries from a logical palette
@@ -1685,10 +1780,10 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
 
         // If pPalEntries is NULL, return the number of entries in the palette
         if (!pPalEntries) {
-            return 256;
+            return entries.length >> 2;
         }
 
-        const end = Math.min(iStart + cEntries, 256);
+        const end = Math.min(iStart + cEntries, entries.length >> 2);
         const count = end - iStart;
         if (count > 0) {
             mem.set(entries.subarray(iStart * 4, iStart * 4 + count * 4), pPalEntries);
@@ -1713,7 +1808,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
 
         let bestIndex = 0;
         let bestDist = Number.MAX_SAFE_INTEGER;
-        for (let i = 0; i < 256; i++) {
+        for (let i = 0; i < entries.length >> 2; i++) {
             const off = i * 4;
             const dr = entries[off] - targetR;
             const dg = entries[off + 1] - targetG;
@@ -2283,6 +2378,23 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         });
         Logger.verbose(LogCategory.GDI32, `CreateBitmap(${nWidth}x${nHeight}) -> 0x${handle.toString(16)}`);
         return handle;
+    };
+
+    // HBITMAP CreateBitmapIndirect(const BITMAP*): CreateBitmap from the struct's fields.
+    // bmWidthBytes is not consulted — CreateBitmap derives the WORD-aligned stride itself.
+    exports['CreateBitmapIndirect'] = (ctx, mem, args): number => {
+        const pbm = args[0] >>> 0;
+        const BITMAP_SIZE = 24;
+        if (!pbm || !isValidAddress(pbm, BITMAP_SIZE, 'r') || (Mem.readUint32(pbm) ?? 1) !== 0) {
+            System.getInstance().scheduler?.setLastError(87); // ERROR_INVALID_PARAMETER: NULL or bmType != 0
+            return 0;
+        }
+        const bmWidth = Mem.readUint32(pbm + 4) ?? 0;
+        const bmHeight = Mem.readUint32(pbm + 8) ?? 0;
+        const bmPlanes = Mem.readUint16(pbm + 16) ?? 0;
+        const bmBitsPixel = Mem.readUint16(pbm + 18) ?? 0;
+        const bmBits = Mem.readUint32(pbm + 20) ?? 0;
+        return exports['CreateBitmap'](ctx, mem, [bmWidth, bmHeight, bmPlanes, bmBitsPixel, bmBits]) as number;
     };
 
     // GetBitmapBits - copies bitmap pixel data into a caller buffer (device format = BGRA for 32-bit)

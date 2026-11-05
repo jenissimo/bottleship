@@ -1,4 +1,6 @@
 import { surfaceAt } from "./helpers";
+import { savestatesEnabled } from "../../savestate/participant";
+import { liveSurfaceStates, registerDDrawParticipant } from "./savestate";
 import { IModule } from '../../core/module';
 import { Process } from '../../core/process';
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
@@ -583,6 +585,12 @@ export class DDraw implements IModule {
 
     initialize(process: Process): void {
         this.process = process;
+        if (savestatesEnabled()) {
+            registerDDrawParticipant({
+                context: () => this.context, bitmapSurfaces: () => this.bitmapToSurfaceCache,
+                surfaceStates: () => liveSurfaceStates(this.context.resourceProvider.getAllComObjects()),
+            });
+        }
 
         const interfaceRegistry = InterfaceRegistry.getInstance();
         interfaceRegistry.registerFromModuleDescriptor(ddrawModule);

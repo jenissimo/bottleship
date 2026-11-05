@@ -42,7 +42,7 @@ const SW_SHOWNORMAL = 1;
 const SW_SHOW = 5;
 const SW_RESTORE = 9;
 
-interface StoredWindowPlacement {
+export interface StoredWindowPlacement {
     flags: number;
     showCmd: number;
     ptMinX: number;
@@ -54,6 +54,7 @@ interface StoredWindowPlacement {
     normalRight: number;
     normalBottom: number;
 }
+// @participant(user32)
 const windowPlacements = new Map<number, StoredWindowPlacement>();
 
 /** Drop a window's stored placement (called from window.ts finalizeDestroy). */
@@ -84,9 +85,13 @@ function writeRect(address: number, left: number, top: number, right: number, bo
  * §3.1's sanctioned form applies — validate the WHOLE extent once at the
  * boundary (isValidAddress), then do the work through a hoisted view.
  */
+// @transient(host view of guest memory)
 let cachedGuestView: DataView | null = null;
+// @transient(host view of guest memory)
 let cachedGuestBuffer: ArrayBufferLike | null = null;
+// @transient(host view of guest memory)
 let cachedGuestOffset = -1;
+// @transient(host view of guest memory)
 let cachedGuestLength = -1;
 
 function guestView(mem: Uint8Array): DataView {
@@ -737,4 +742,15 @@ export function registerWindowGeometryExports(
         }
         return 0;
     };
+}
+
+export type SavedWindowPlacement = [hwnd: number, placement: StoredWindowPlacement];
+
+export function captureWindowPlacements(): SavedWindowPlacement[] {
+    return [...windowPlacements].map(([h, p]) => [h, { ...p }]);
+}
+
+export function restoreWindowPlacements(rows: readonly SavedWindowPlacement[]): void {
+    windowPlacements.clear();
+    for (const [h, p] of rows) windowPlacements.set(h, { ...p });
 }

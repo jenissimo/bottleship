@@ -5,7 +5,7 @@ export class ProcessIpcError extends Error {
 }
 type Handler = (payload: unknown, sourcePid: number) => unknown | Promise<unknown>;
 type Packet = { kind: string; from?: number; to?: number; id?: number; topic?: string; payload?: unknown;
-    value?: unknown; error?: ProcessIpcErrorCode; pids?: number[] };
+    value?: unknown; error?: ProcessIpcErrorCode; pids?: number[]; codes?: (number | null)[] };
 interface Link { port: MessagePort; pids: Set<number>; closed: boolean; }
 const validPid = (pid: unknown): pid is number => Number.isInteger(pid) && (pid as number) > 0 && (pid as number) <= 0x7fffffff;
 /** Same-host IPC routing is independent of network sockets and guest address spaces. */
@@ -16,7 +16,7 @@ export class ProcessIpc {
     private links = new Set<Link>();
     private parent?: Link;
     private pending = new Map<number, { target: number; resolve(value: unknown): void; reject(reason: unknown): void; timer: ReturnType<typeof setTimeout> | undefined }>();
-    private exits = new Set<(pid: number) => void>();
+    private exits = new Set<(pid: number, exitCode?: number) => void>();
     private deadPids = new Set<number>();
     private nextRequest = 1;
     private closed = false;
@@ -55,7 +55,7 @@ export class ProcessIpc {
         if (this.systemHandlers.has(topic)) throw new Error("IPC service already has an owner: " + topic);
         this.systemHandlers.set(topic, handler); return () => { if (this.systemHandlers.get(topic) === handler) this.systemHandlers.delete(topic); };
     }
-    onProcessExit(listener: (pid: number) => void): () => void { this.exits.add(listener); return () => this.exits.delete(listener); }
+    onProcessExit(listener: (pid: number, exitCode?: number) => void): () => void { this.exits.add(listener); return () => this.exits.delete(listener); }
     request(targetPid: number, topic: string, payload: unknown, timeout: number | null = 10000): Promise<unknown> {
         if (this.closed || this.exited) return Promise.reject(new ProcessIpcError("CLOSED"));
         if (targetPid !== 0 && this.deadPids.has(targetPid)) return Promise.reject(new ProcessIpcError("NO_PROCESS"));
@@ -87,15 +87,17 @@ export class ProcessIpc {
         if (this.parent || this.closed || this.pid === this.rootPid) throw new Error("Invalid parent IPC adoption");
         this.parent = this.attach(port);
     }
-    markProcessExited(pid: number): void {
+    /** `exitCode`, when the caller knows it, travels with the death notice to every process. */
+    markProcessExited(pid: number, exitCode?: number): void {
         this.routes.delete(pid);
         if (pid === this.pid) {
             this.exited = true; ++this.lifecycle; this.handlers.clear();
             for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new ProcessIpcError("CLOSED")); }
             this.pending.clear();
         }
-        this.notifyExited([pid]);
-        const message: Packet = { kind: "dead", pids: [pid] };
+        const codes = exitCode === undefined ? undefined : [exitCode >>> 0];
+        this.notifyExited([pid], codes);
+        const message: Packet = { kind: "dead", pids: [pid], codes };
         this.send(this.parent, message);
         for (const link of this.links) if (link !== this.parent) this.send(link, message);
     }
@@ -136,15 +138,18 @@ export class ProcessIpc {
             for (const child of this.links) if (child !== this.parent) this.send(child, message);
         }
     }
-    private notifyExited(pids: number[]): void {
-        for (const pid of pids) {
+    /** Whether this process has been told `pid` exited (bounded memory: the newest 4096). */
+    hasExited(pid: number): boolean { return this.deadPids.has(pid); }
+    private notifyExited(pids: number[], codes?: (number | null)[]): void {
+        for (let i = 0; i < pids.length; i++) {
+            const pid = pids[i]!, code = codes?.[i];
             if (this.deadPids.has(pid)) continue;
             this.deadPids.add(pid);
             if (this.deadPids.size > 4096) this.deadPids.delete(this.deadPids.values().next().value!);
             for (const [id, pending] of this.pending) if (pending.target === pid) {
                 clearTimeout(pending.timer); this.pending.delete(id); pending.reject(new ProcessIpcError("NO_PROCESS"));
             }
-            for (const listener of this.exits) listener(pid);
+            for (const listener of this.exits) listener(pid, typeof code === "number" ? code >>> 0 : undefined);
         }
     }
     private receive(packet: Packet, link: Link): void {
@@ -157,10 +162,13 @@ export class ProcessIpc {
             this.send(this.parent, { kind: "presence", pids }); return;
         }
         if (packet.kind === "dead" && Array.isArray(packet.pids)) {
-            const pids = packet.pids.filter(validPid);
+            const codes = Array.isArray(packet.codes) && packet.codes.length === packet.pids.length ? packet.codes : undefined;
+            const valid = packet.pids.map(validPid);
+            const pids = packet.pids.filter((_, i) => valid[i]);
+            const kept = codes?.filter((_, i) => valid[i]);
             for (const pid of pids) if (this.routes.get(pid) === link) { this.routes.delete(pid); link.pids.delete(pid); }
-            this.notifyExited(pids);
-            for (const child of this.links) if (child !== link) this.send(child, { kind: "dead", pids });
+            this.notifyExited(pids, kept);
+            for (const child of this.links) if (child !== link) this.send(child, { kind: "dead", pids, codes: kept });
             return;
         }
         if (!validPid(packet.from) || (!validPid(packet.to) && packet.to !== 0) ||
@@ -217,10 +225,10 @@ export function beginProcessIpcLifetime(): void {
     getProcessIpc().beginGuestLifetime();
     guestLifetimeStarted = true;
 }
-export function finishProcessIpcLifetime(): void {
+export function finishProcessIpcLifetime(exitCode?: number): void {
     if (!guestLifetimeStarted) return;
     guestLifetimeStarted = false;
-    if (ipc) ipc.markProcessExited(ipc.pid);
+    if (ipc) ipc.markProcessExited(ipc.pid, exitCode);
 }
 export function createChildProcessIpc(pid: number): { port: MessagePort; close(): void } {
     const channel = new MessageChannel(), close = getProcessIpc().connectChild(pid, channel.port1);

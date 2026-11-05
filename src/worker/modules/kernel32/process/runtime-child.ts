@@ -23,7 +23,7 @@ export function startProcessRuntime(
     const complete = (exitCode: number): void => {
         if (!manager.isRuntimeCurrent(processId, task)) return;
         completeRuntime(exitCode);
-        getProcessIpc().markProcessExited(processId);
+        getProcessIpc().markProcessExited(processId, exitCode);
     };
     task.onGuestExit = complete;
     task.completion.then(complete, error => {

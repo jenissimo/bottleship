@@ -65,6 +65,24 @@ async function savedSlot(storage: ReturnType<typeof memoryStorage>, game: string
     await store.save("one", result.bytes, 0);
 }
 
+describe("prepare runs before any capture", () => {
+    test("every prepare finishes, then readiness is checked, then participants capture and RAM is read", async () => {
+        const mem = new Uint8Array(RAM_CHUNK_SIZE);
+        const log: string[] = [];
+        const reg = new ParticipantRegistry();
+        reg.add({
+            id: "time", version: 1, order: 1,
+            prepare: async () => { await Promise.resolve(); mem[0] = 9; log.push("prepare time"); },
+            capture: () => { log.push("capture time"); return null; },
+            restore: () => undefined,
+        });
+        reg.add({ id: "cpu", version: 1, order: 99, capture: () => { log.push("capture cpu"); return null; }, restore: () => undefined });
+        const result = await captureSession(target(mem), new Set(), () => { log.push("ready"); }, reg);
+        expect(log).toEqual(["prepare time", "ready", "capture time", "capture cpu", "ready"]);
+        expect([...result.pending.values()].some(b => b[0] === 9)).toBe(true);
+    });
+});
+
 describe("restore is all or nothing", () => {
     test("a missing chunk is found before anything is written", async () => {
         const mem = new Uint8Array(3 * RAM_CHUNK_SIZE).fill(7);

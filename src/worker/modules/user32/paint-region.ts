@@ -18,6 +18,7 @@ interface WindowUpdateState {
 }
 
 const MAX_REGION_RECTS = 8;
+// @participant(user32)
 const updates = new Map<number, WindowUpdateState>();
 
 function normalizeClientRect(win: WindowInfo, rect: ClientRect): ClientRect | null {
@@ -185,4 +186,15 @@ export function writeClientRectToMem(mem: Uint8Array, lpRect: number, rect: Clie
     view.setInt32(lpRect + 4, rect.top, true);
     view.setInt32(lpRect + 8, rect.right, true);
     view.setInt32(lpRect + 12, rect.bottom, true);
+}
+
+export type SavedUpdateRegion = [hwnd: number, rects: ClientRect[], needsErase: boolean];
+
+export function capturePaintRegions(): SavedUpdateRegion[] {
+    return [...updates].map(([h, u]) => [h, u.rects.map(r => ({ left: r.left, top: r.top, right: r.right, bottom: r.bottom })), u.needsErase]);
+}
+
+export function restorePaintRegions(rows: readonly SavedUpdateRegion[]): void {
+    updates.clear();
+    for (const [h, rects, needsErase] of rows) updates.set(h, { rects: rects.map(r => ({ ...r })), needsErase });
 }

@@ -2065,7 +2065,11 @@ export class D3D9Device {
         this.d3d9MsaaProbe = d3d9MsaaProbe;
 
         this.backendExecutor = new D3D9BackendExecutor(backend);
-        registerBackendQualitySupport("d3d9", ["anisotropy", "forceTrilinear", "msaa", "internalScale"]);
+        // Auto pins to 1x here (see resolveOffscreenExtent): fractional supersampling would
+        // change the sample grid the guest reads back through occlusion queries.
+        registerBackendQualitySupport("d3d9", ["anisotropy", "forceTrilinear", "msaa", "internalScale"],
+            { autoInternalScale: "native" });
+
         this.pipelineCache = new LruCache<string, number>({
             maxEntries: this.pipelineCacheMaxSize,
             canEvict: (key) => key !== this.currentPipelineKey,

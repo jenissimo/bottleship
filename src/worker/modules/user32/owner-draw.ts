@@ -44,6 +44,7 @@ const BS_DEFPUSHBUTTON = 0x0001;
 const WS_DISABLED = 0x08000000;
 const BST_PUSHED = 4;
 
+// @participant(user32)
 let drawItemScratchPtr = 0;
 
 export function resetOwnerDrawScratch(): void {
@@ -524,4 +525,12 @@ export function tryRepaintOwnerDrawButton(
             `${thunkName} ${chain ? 'dispatched' : 'not-dispatched'}`);
     }
     return chain;
+}
+
+export function captureOwnerDrawScratch(): number {
+    return drawItemScratchPtr;
+}
+
+export function restoreOwnerDrawScratch(ptr: number): void {
+    drawItemScratchPtr = ptr;
 }

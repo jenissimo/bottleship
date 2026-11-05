@@ -11,7 +11,9 @@ import { Marshaler } from '../../core/memory/marshaler';
 import { encodeAnsi } from '../codepage-utils';
 
 // Global atom table
+// @participant(kernel32)
 const atomTable: Map<number, string> = new Map();
+// @participant(kernel32)
 let nextAtomId = 0xC000; // Start from user-defined atom range
 
 export function resetAtomTable(): void {

@@ -18,6 +18,7 @@ export interface SrwLockState {
     waitEvent: number;
 }
 
+// @participant(kernel32)
 const locks = new Map<number, SrwLockState>();
 
 export function resetSrwLock(lockPtr: number): void {

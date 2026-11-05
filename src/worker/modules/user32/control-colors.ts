@@ -37,11 +37,13 @@ const WS_DISABLED = 0x08000000;
 // Tri-state per control: absent = never queried (query on next EndPaint chain);
 // present with no override = queried, guest didn't handle it (classic defaults);
 // present with override = guest colors to apply.
+// @transient(WM_CTLCOLOR answers, asked again at the next paint)
 const colorCache = new Map<number, { override?: ControlColorOverride }>();
 
 // Registered lazily: shared-state sits in an import cycle with this module
 // (shared-state → owner-draw → control-colors), so a top-level call would hit
 // its consts in TDZ.
+// @transient(wiring done once per worker)
 let purgerRegistered = false;
 function ensurePurger(): void {
     if (purgerRegistered) return;
@@ -61,6 +63,7 @@ export function invalidateControlColors(hwnd: number): void {
 
 const BS_TYPEMASK = 0x0000000f;
 /** BS_CHECKBOX/AUTOCHECKBOX/RADIOBUTTON/3STATE/AUTO3STATE, BS_GROUPBOX, BS_AUTORADIOBUTTON. */
+// @transient(constant table)
 const STATIC_LIKE_BUTTON_TYPES = new Set([0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x09]);
 
 /**
