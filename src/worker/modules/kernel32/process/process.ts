@@ -719,9 +719,11 @@ export interface CommandLineImage {
  * (lpApplicationName = NULL, which is how WinExec calls it), in the documented
  * order: the directory the parent's application was loaded from, the parent's
  * current directory, the Windows system directories, then PATH from the parent's
- * environment.
+ * environment. The parent's current directory is `system.fileSystem.currentDir` —
+ * lpCurrentDirectory is the *child's* working directory, is not part of the
+ * search, and is only passed through to the child.
  */
-export function imageSearchDirectories(system: System, currentDirectory: string): string[] {
+export function imageSearchDirectories(system: System): string[] {
     const dirs: string[] = [];
     const push = (d: string): void => {
         const w = d.trim().replace(/\//g, '\\');
@@ -731,7 +733,7 @@ export function imageSearchDirectories(system: System, currentDirectory: string)
     };
     const self = system.executablePath.replace(/\//g, '\\');
     push(self.slice(0, self.lastIndexOf('\\') + 1));
-    push(currentDirectory || system.fileSystem.currentDir);
+    push(system.fileSystem.currentDir);
     for (const dir of WINDOWS_DIRS) push(dir);
     for (const [key, value] of system.process?.environment ?? []) {
         if (key.toLowerCase() !== 'path') continue;
@@ -754,9 +756,7 @@ const hasFileExtension = (name: string): boolean =>
  * (ERROR_PATH_NOT_FOUND) from a missing image (ERROR_FILE_NOT_FOUND) from a file
  * that exists but is not executable (ERROR_BAD_EXE_FORMAT).
  */
-export function resolveCommandLineImage(
-    system: System, commandLine: string, currentDirectory: string,
-): CommandLineImage {
+export function resolveCommandLineImage(system: System, commandLine: string): CommandLineImage {
     const line = commandLine.trimStart();
     if (!line) return { imagePath: "", reExecArgs: "", error: ERROR_FILE_NOT_FOUND };
     // The prefixes to try: a quoted run is one candidate; otherwise every
@@ -781,8 +781,8 @@ export function resolveCommandLineImage(
             if (!rest) break;
         }
     }
-    const dirs = imageSearchDirectories(system, currentDirectory);
-    let pathNotFound = false, badFormat = false;
+    const dirs = imageSearchDirectories(system);
+    let badFormat = false;
     const probe = (name: string): string | null => {
         const candidates = /^[a-z]:[\\/]/i.test(name) || /^[\\/]/.test(name)
             ? [name]
@@ -795,17 +795,28 @@ export function resolveCommandLineImage(
         }
         return null;
     };
+    // The lpCommandLine remark says ".exe is not appended if the file name contains
+    // a path", but the documented `c:\program files\sub dir\program name` example on
+    // the same page only resolves when it is appended (Wine appends it too). Follow
+    // the example and append; otherwise this line looks like the bug to fix.
     for (const prefix of prefixes) {
         const name = prefix.name;
         if (!name) continue;
         const found = probe(hasFileExtension(name) ? name : `${name}.exe`);
         if (found) return { imagePath: found, reExecArgs: prefix.args, error: 0 };
-        // A candidate that names a directory which does not exist is a path error,
-        // not a file error — the documented WinExec("C:\Missing\Dir\x.exe") case.
-        if (/[\\/]/.test(name)) {
-            const sep = Math.max(name.lastIndexOf('\\'), name.lastIndexOf('/'));
-            if (sep > 0 && !system.fileSystem.directoryExists(name.slice(0, sep))) pathNotFound = true;
-        }
+    }
+    // Path-vs-file is decided from the module-name candidate alone — the quoted
+    // name, or the first token of an unquoted line. The later prefixes are
+    // speculative re-splits that already contain arguments: for WinExec("setup /S")
+    // the prefix "setup /S" contains a separator, and reading it as a path would
+    // report ERROR_PATH_NOT_FOUND where Windows reports ERROR_FILE_NOT_FOUND. A
+    // module candidate whose directory does not exist is a path error — the
+    // documented WinExec("C:\Missing\Dir\x.exe") case.
+    let pathNotFound = false;
+    const moduleName = prefixes[0]?.name ?? '';
+    if (/[\\/]/.test(moduleName)) {
+        const sep = Math.max(moduleName.lastIndexOf('\\'), moduleName.lastIndexOf('/'));
+        if (sep > 0 && !system.fileSystem.directoryExists(moduleName.slice(0, sep))) pathNotFound = true;
     }
     return {
         imagePath: "", reExecArgs: "",
@@ -822,6 +833,7 @@ const finishVirtualProcess = (
     lpProcessInformation: number, applicationName: string, commandLine: string,
     currentDirectory: string, dwCreationFlags: number, isWide: boolean,
     childRequest?: ChildProcessRequest, childBackend: 'worker' | 'host' = 'worker',
+    errOut?: { code: number },
 ): ThunkResult | Promise<ThunkResult> => {
     const system = System.getInstance(), manager = getVirtualProcessManager();
     const ownerThread = system.scheduler.getCurrentThreadId();
@@ -861,7 +873,15 @@ const finishVirtualProcess = (
         system.resourceProvider.unregisterKernelObject(proc.threadHandle);
         system.resourceProvider.unregisterKernelObject(proc.processHandle);
         writeProcessInformationZeroed(lpProcessInformation);
-        setError(193);
+        // The child reports which Win32 error its own startup failed with when it
+        // can (a missing directory is not a bad image); 193 BAD_EXE_FORMAT is the
+        // answer for a child that could not load or prepare its image at all.
+        const code = typeof (error as { code?: number } | null)?.code === 'number'
+            ? (error as { code: number }).code : 193;
+        setError(code);
+        // Report the recorded code through errOut too: the calling thread at
+        // settlement time need not be the one that can read the scheduler.
+        if (errOut) errOut.code = code;
         Logger.warn(LogCategory.SYSTEM, 'Child image preparation failed: ' + String(error));
         return { value: 0, stackCleanup: 40 };
     });
@@ -907,7 +927,7 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
         imagePath = system.resolveImagePath(applicationName, currentDirectory || "");
         reExecArgs = commandLine || "";
     } else {
-        const resolved = resolveCommandLineImage(system, commandLine || "", currentDirectory || "");
+        const resolved = resolveCommandLineImage(system, commandLine || "");
         imagePath = resolved.imagePath;
         reExecArgs = resolved.reExecArgs;
         lookupError = resolved.error;
@@ -924,6 +944,7 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
                 environment: system.process ? [...system.process.environment] : undefined,
             },
             !startSuspended && isConsoleTool && hostToolsEnabled() ? 'host' : 'worker',
+            errOut,
         );
     }
     return failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide,
@@ -1253,7 +1274,11 @@ export const exports: Record<string, ThunkImplementation> = {
                 : ERROR_FILE_NOT_FOUND;
         if (result instanceof Promise) {
             return result.then(
-                r => toWinExec(r, ERROR_BAD_FORMAT),
+                // A child whose start fails resolves with value 0 and its code
+                // recorded (errOut, or the thread's last error). Map that code the
+                // same way the synchronous branch does, instead of assuming every
+                // asynchronous failure is a bad image.
+                r => toWinExec(r, toFailure(errOut.code || system.scheduler.getLastError())),
                 (): ThunkResult => {
                     // A rejected child start must not surface as an unhandled rejection:
                     // report the last error the failed start recorded.

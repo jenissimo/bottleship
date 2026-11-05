@@ -85,6 +85,7 @@ describe('CreateProcess image lookup for a bare command line', () => {
         mountRom(new Map<string, ZipEntry>([
             ['system/helper.exe', peEntry('system/helper.exe')],
             ['prog files/tool.exe', peEntry('prog files/tool.exe', 512)],
+            ['data/helper.exe', peEntry('data/helper.exe')],
         ]));
     });
     afterEach(async () => {
@@ -148,6 +149,41 @@ describe('CreateProcess image lookup for a bare command line', () => {
         expect(workers).toHaveLength(0);
     });
 
+    test('WinExec treats a switch argument as an argument, not a path', async () => {
+        system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
+        // "setup /S" has no setup.exe anywhere, so the answer is ERROR_FILE_NOT_FOUND.
+        // Deciding path-vs-file from every prefix would read the "/S" prefix as the
+        // path "setup " and report ERROR_PATH_NOT_FOUND instead.
+        const result = await processApi.WinExec!(undefined as never, memory, [text('setup /S'), 1]);
+        expect(typeof result === 'number' ? result : result.value).toBe(2);
+        expect(lastError).toBe(2);
+        expect(workers).toHaveLength(0);
+    });
+
+    test('lpCurrentDirectory is passed to the child but is not part of the image search', async () => {
+        system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
+        // helper.exe exists only in C:\System, which is where lpCurrentDirectory
+        // points. Searching it would start the child; Windows searches the parent's
+        // current directory instead and reports ERROR_FILE_NOT_FOUND.
+        const result = await processApi.CreateProcessA!(undefined as never, memory,
+            [0, text('helper.exe', 600), 0, 0, 0, 0, 0, text('C:\\System', 700), 0, 2048]);
+        expect(typeof result === 'number' ? result : result.value).toBe(0);
+        expect(lastError).toBe(2);
+        expect(workers).toHaveLength(0);
+    });
+
+    test('a pathless image is searched in the parent current directory and the child still gets lpCurrentDirectory', async () => {
+        system.fileSystem.currentDir = 'C:\\Data';
+        system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
+        const result = await processApi.CreateProcessA!(undefined as never, memory,
+            [0, text('helper.exe', 600), 0, 0, 0, 0, 0, text('C:\\Nowhere', 700), 0, 2048]);
+        expect(typeof result === 'number' ? result : result.value).toBe(1);
+        const worker = await booted();
+        expect(worker.boot!.imagePath.toLowerCase()).toBe('c:\\data\\helper.exe');
+        // lpCurrentDirectory only travels through to the child.
+        expect(worker.boot!.currentDirectory).toBe('C:\\Nowhere');
+    });
+
     test('a failed child start maps the recorded error instead of always ERROR_BAD_FORMAT', async () => {
         system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
         autoReady = false;
@@ -156,6 +192,22 @@ describe('CreateProcess image lookup for a bare command line', () => {
         worker.onmessage?.({ data: { type: 'error', message: 'child loader failed' } });
         const result = await pending;
         expect(typeof result === 'number' ? result : result.value).toBe(11); // ERROR_BAD_FORMAT, from the child's 193
+        await stopChildProcesses();
+        expect(worker.terminated).toBe(true);
+    });
+
+    test('a failed child start that reports its own code has that code mapped', async () => {
+        system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
+        autoReady = false;
+        const pending = Promise.resolve(processApi.WinExec!(undefined as never, memory, [text('C:\\System\\helper.exe'), 1]));
+        const worker = await booted();
+        // The child knows its failure was a missing directory, not a bad image.
+        // Hard-coding ERROR_BAD_FORMAT would turn this into 11; mapping the
+        // recorded code keeps WinExec's answer equal to CreateProcess's.
+        worker.onmessage?.({ data: { type: 'error', message: 'child loader failed', code: 3 } });
+        const result = await pending;
+        expect(typeof result === 'number' ? result : result.value).toBe(3); // ERROR_PATH_NOT_FOUND
+        expect(lastError).toBe(3);
         await stopChildProcesses();
         expect(worker.terminated).toBe(true);
     });
