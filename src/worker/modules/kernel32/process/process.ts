@@ -774,15 +774,21 @@ export function resolveCommandLineImage(system: System, commandLine: string): Co
             args: end < 0 ? '' : line.slice(end + 1).trimStart(),
         });
     } else {
-        let base = '', rest = line;
+        // Each prefix is a slice of the line as written, not a rebuild of it. A directory
+        // may contain a run of spaces (`c:\program  files`), and rejoining tokens with a
+        // single separator would probe a path that does not exist while the real one is
+        // skipped. A prefix that ends inside a whitespace run cannot name a file at all
+        // (Windows forbids trailing spaces in a name), so the walk resumes at the next
+        // token instead of trying it.
+        let start = 0;
         for (;;) {
-            const sp = rest.search(/\s/);
-            const token = sp < 0 ? rest : rest.slice(0, sp);
-            base = base ? `${base} ${token}` : token;
-            prefixes.push({ name: base, args: sp < 0 ? '' : rest.slice(sp).trimStart() });
-            if (sp < 0) break;
-            rest = rest.slice(sp).trimStart();
-            if (!rest) break;
+            let end = start;
+            while (end < line.length && !/\s/.test(line.charAt(end))) end++;
+            if (end > start) prefixes.push({ name: line.slice(0, end), args: line.slice(end).trimStart() });
+            if (end >= line.length) break;
+            while (end < line.length && /\s/.test(line.charAt(end))) end++;
+            if (end >= line.length) break;
+            start = end;
         }
     }
     const dirs = imageSearchDirectories(system);
@@ -844,7 +850,8 @@ const finishVirtualProcess = (
     const ownerProcess = system.process, ownerGeneration = ownerProcess?.resetGeneration;
     const ownerCurrent = (): boolean => !system.isExiting && system.process === ownerProcess && ownerProcess?.resetGeneration === ownerGeneration;
     const proc = manager.createProcess({
-        applicationName, commandLine, currentDirectory, creationFlags: dwCreationFlags, runtimeBacked: !!childRequest,
+        applicationName, commandLine, currentDirectory, creationFlags: dwCreationFlags,
+        runtimeBacked: !!childRequest, imagePath: childRequest?.imagePath,
     });
     const setError = (code: number): void => {
         if (system.scheduler.getCurrentThreadId() === ownerThread) system.scheduler.setLastError(code);
