@@ -299,6 +299,8 @@ export const user32Module: ModuleDescriptor = {
         makeFunc("DdeCreateStringHandleA", 3),
         makeFunc("DdeQueryStringA", 5),
         makeFunc("DdeConnect", 4),
+        makeFunc("DdeDisconnect", 1),
+        makeFunc("DdeNameService", 4),
         makeFunc("DdeClientTransaction", 8),
         makeFunc("ReuseDDElParam", 5),
         makeFunc("UnpackDDElParam", 4),

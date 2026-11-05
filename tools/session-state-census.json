@@ -1751,8 +1751,11 @@
     "nextHookHandle"
   ],
   "src/worker/modules/user32/input.ts": [
+    "createInputExports.ddeClientOnly",
+    "createInputExports.ddeConversations",
     "createInputExports.ddeInstances",
     "createInputExports.ddeLastError",
+    "createInputExports.ddeServices",
     "createInputExports.ddeStrings",
     "createInputExports.nextDdeConv",
     "createInputExports.nextDdeInstance",

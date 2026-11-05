@@ -71,6 +71,29 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     const ddeInstances = new Set<number>();
     const ddeLastError = new Map<number, number>();
     const ddeStrings = new Map<number, string>();
+    const ddeServices = new Map<string, Set<number>>();
+    const ddeConversations = new Set<number>();
+    const ddeClientOnly = new Set<number>();
+    // Wine's shell32 DDE server registers Progman, Shell and Folders, and also accepts
+    // AppProperties as a service; it answers the Progman and Shell topics.
+    // @transient(constant name table)
+    const ddeShellServices = new Set(['progman', 'shell', 'folders', 'appproperties']);
+    // @transient(constant name table)
+    const ddeShellTopics = new Set(['progman', 'shell']);
+    const DNS_REGISTER = 0x0001;
+    const DNS_UNREGISTER = 0x0002;
+    const APPCMD_CLIENTONLY = 0x00000010;
+    const DMLERR_DLL_USAGE = 0x4004;
+    const ddeServiceKey = (hsz: number): string | null => {
+        const name = ddeStrings.get(hsz);
+        return name === undefined ? null : name.toLowerCase();
+    };
+    const ddeDropInstanceServices = (idInst: number): void => {
+        for (const [key, owners] of ddeServices) {
+            owners.delete(idInst);
+            if (owners.size === 0) ddeServices.delete(key);
+        }
+    };
     function resolvePropertyKey(mem: Uint8Array, lpString: number, wide: boolean): string | null {
         if (lpString === 0) {
             return null;
@@ -492,6 +515,7 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         }
         const inst = nextDdeInstance++;
         ddeInstances.add(inst);
+        if ((args[2] >>> 0) & APPCMD_CLIENTONLY) ddeClientOnly.add(inst);
         ddeLastError.set(inst, DMLERR_NO_ERROR);
         Mem.writeUint32(pidInst, inst >>> 0);
         return DMLERR_NO_ERROR;
@@ -505,7 +529,49 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         }
         ddeInstances.delete(idInst);
         ddeLastError.delete(idInst);
+        ddeClientOnly.delete(idInst);
+        ddeDropInstanceServices(idInst);
         return 1;
+    };
+
+    // HDDEDATA DdeNameService(DWORD idInst, HSZ hsz1, HSZ hsz2, UINT afCmd)
+    exports['DdeNameService'] = (ctx, mem, args) => {
+        const idInst = args[0] >>> 0;
+        const hsz1 = args[1] >>> 0;
+        const afCmd = args[3] >>> 0;
+        if (!ddeInstances.has(idInst)) {
+            return 0;
+        }
+        if (ddeClientOnly.has(idInst)) {
+            ddeLastError.set(idInst, DMLERR_DLL_USAGE);
+            return 0;
+        }
+        if (afCmd & DNS_UNREGISTER) {
+            if (hsz1 === 0) {
+                ddeDropInstanceServices(idInst);
+            } else {
+                const key = ddeServiceKey(hsz1);
+                const owners = key === null ? undefined : ddeServices.get(key);
+                owners?.delete(idInst);
+                if (key !== null && owners && owners.size === 0) ddeServices.delete(key);
+            }
+        } else if (afCmd & DNS_REGISTER) {
+            const key = ddeServiceKey(hsz1);
+            if (key === null) {
+                ddeLastError.set(idInst, DMLERR_INVALIDPARAMETER);
+                return 0;
+            }
+            let owners = ddeServices.get(key);
+            if (!owners) ddeServices.set(key, owners = new Set());
+            owners.add(idInst);
+        }
+        ddeLastError.set(idInst, DMLERR_NO_ERROR);
+        return 1;
+    };
+
+    // BOOL DdeDisconnect(HCONV hConv)
+    exports['DdeDisconnect'] = (ctx, mem, args) => {
+        return ddeConversations.delete(args[0] >>> 0) ? 1 : 0;
     };
 
     // UINT DdeGetLastError(DWORD idInst)
@@ -567,14 +633,27 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         const idInst = args[0] >>> 0;
         const hszService = args[1] >>> 0;
         const hszTopic = args[2] >>> 0;
-        if (!ddeInstances.has(idInst) || hszService === 0 || hszTopic === 0) {
-            if (ddeInstances.has(idInst)) {
-                ddeLastError.set(idInst, DMLERR_NO_CONV_ESTABLISHED);
-            }
+        if (!ddeInstances.has(idInst)) {
+            return 0;
+        }
+        // A NULL service or topic is a wildcard: any server, or any topic the server
+        // supports. Registration alone accepts the connection here; real DDEML also asks
+        // the server's callback (XTYP_CONNECT, refused under CBF_FAIL_CONNECTIONS). The
+        // service table is per process, while DDEML's is system-wide, so a service a
+        // parent process registered is not visible to its child.
+        const service = hszService === 0 ? null : ddeServiceKey(hszService);
+        const topic = hszTopic === 0 ? null : ddeServiceKey(hszTopic);
+        const connectable = hszService === 0
+            ? ddeServices.size > 0 || hszTopic === 0 || (topic !== null && ddeShellTopics.has(topic))
+            : service !== null && (ddeServices.has(service) || ddeShellServices.has(service));
+        if (!connectable) {
+            ddeLastError.set(idInst, DMLERR_NO_CONV_ESTABLISHED);
             return 0;
         }
         ddeLastError.set(idInst, DMLERR_NO_ERROR);
-        return (0xD0000000 | (nextDdeConv++ & 0x0FFFFFFF)) >>> 0;
+        const hConv = (0xD0000000 | (nextDdeConv++ & 0x0FFFFFFF)) >>> 0;
+        ddeConversations.add(hConv);
+        return hConv;
     };
 
     // HDDEDATA DdeClientTransaction(...)
