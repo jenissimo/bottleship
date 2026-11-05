@@ -71,6 +71,10 @@ export interface WindowInfo {
     /** WM_SHOWWINDOW/WM_SIZE were delivered synchronously inside CreateWindowEx
      *  (Win32 order); the post-create path must not queue duplicates. */
     createSyncVisibleDelivered?: boolean;
+    /** An overlapped window created hidden: the ShowWindow that first makes it visible (or
+     *  changes its min/max state) sends WM_SIZE/WM_MOVE (Wine WIN_NEED_SIZE); SetWindowPos
+     *  in between does not clear it. */
+    sizeMovePending?: boolean;
     /** The activation chain was SENT synchronously inside CreateWindowEx (Win32 activates a
      *  window as it shows it); the post-create path must not queue it a second time. */
     createSyncActivationDelivered?: boolean;
