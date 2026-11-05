@@ -12,6 +12,7 @@ import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { getWindowClass, getWindowClassByName } from './class';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
+import { takeStartupShowWindow } from '../../core/process-startup-info';
 import { WindowInfo, windows, getWindowByHandle, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, markWindowPaintCycleRan, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, isWindowPosZOrderRequestValid, shouldSeedPaintFromParent, tryLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect } from './shared-state';
 import {
     invalidateWindow,
@@ -1809,6 +1810,15 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         const window = windows.get(hWnd);
         if (!window || nCmdShow < 0 || nCmdShow > 11) return 0;
+
+        // SW_SHOWDEFAULT means "whatever STARTUPINFO says": when the parent set
+        // STARTF_USESHOWWINDOW, the documented answer is its wShowWindow, and only the
+        // first such call resolves to it. A later SW_SHOWDEFAULT is an ordinary show,
+        // which is why an application can still hide its own window after starting.
+        if (nCmdShow === 10) {
+            const fromStartup = takeStartupShowWindow();
+            if (fromStartup !== null && fromStartup >= 0 && fromStartup <= 11) nCmdShow = fromStartup;
+        }
 
         const WS_VISIBLE = 0x10000000;
         const WS_CHILD = 0x40000000;

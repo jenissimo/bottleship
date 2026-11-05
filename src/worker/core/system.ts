@@ -25,6 +25,7 @@ import { loadDiagnostics } from "./diagnostics/load-diagnostics";
 import { serializeCpu } from "../harness/serialize";
 import { buildHarnessReport, type HarnessReport } from "../harness/build-report";
 import { frameProfiler } from "./frame-profiler";
+import { resetProcessStartupInfo } from "./process-startup-info";
 import { VideoRoutingService } from "../video/video-routing-service";
 import { harnessBus } from "../harness/event-bus";
 import { TimeService } from "../runtime/time";
@@ -448,6 +449,9 @@ export class System {
         add('named-objects', 'subsystems', () => namedObjects.reset());
         add('profiler', 'subsystems', () => profiler.reset());
         add('frame-profiler', 'subsystems', () => frameProfiler.reset());
+        // The parent's STARTUPINFO and the child's copies of its strings are addresses in
+        // this image; the next game must not inherit either.
+        add('process-startup-info', 'subsystems', () => resetProcessStartupInfo());
     }
 
     /**
