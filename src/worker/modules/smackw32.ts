@@ -42,6 +42,11 @@ const SMACK_FROM_HANDLE = 0x1000;
 const SMACK_NEW_PALETTE = 0x68;   // set by the frame-prepare step, cleared when the frame has no palette
 const SMACK_PALETTE = 0x6c;       // 256 x RGB triples
 
+/** SmackSum (Smacker 3.x): 19 DWORDs. Only the fields we fill are named here. */
+const SMACKSUM_SIZE = 0x4c;
+const SMACKSUM_MS100_PER_FRAME = 0x04; // 100000 / MS100PerFrame = frames per second
+const SMACKSUM_TOTAL_FRAMES = 0x0c;    // frames displayed
+
 /**
  * Detect destination bpp from pitch vs video width.
  */
@@ -152,6 +157,8 @@ interface SmackSession {
     audioWrapCount: number;   // detected ring buffer wraps
     audioBaselineMs: number;   // audio time (ms) at first frame decode; -1 = not set
     frameDecodeCount: number;  // frames decoded so far
+    /** DoFrame calls that showed a frame; unlike frameDecodeCount, not reset on auto-loop. */
+    framesDisplayed: number;
     internalBuf: number;  // guest address of internal pixel buffer (allocated when SmackToBuffer buf=0)
     /** SmackToBufferRect: one full-frame dirty rect pending after DoFrame. */
     pendingBufferRect: boolean;
@@ -836,7 +843,7 @@ export class SmackW32 implements IModule {
                         destTop: 0, destHeight: 0, destBpp: 0,
                         audioCtrl: null, lastPlayCursor: 0,
                         audioWrapCount: 0, audioBaselineMs: -1,
-                        frameDecodeCount: 0, internalBuf: 0,
+                        frameDecodeCount: 0, framesDisplayed: 0, internalBuf: 0,
                         pendingBufferRect: false, prepared: false,
                         paletteRgb: null, paletteDirty: false,
                         explicitDdrawSurface: null,
@@ -905,7 +912,7 @@ export class SmackW32 implements IModule {
                     destTop: 0, destHeight: 0, destBpp: 0,
                     audioCtrl: null, lastPlayCursor: 0,
                     audioWrapCount: 0, audioBaselineMs: -1,
-                    frameDecodeCount: 0, internalBuf: 0,
+                    frameDecodeCount: 0, framesDisplayed: 0, internalBuf: 0,
                     pendingBufferRect: false, prepared: false,
                     paletteRgb: null, paletteDirty: false,
                     explicitDdrawSurface: null,
@@ -991,6 +998,7 @@ export class SmackW32 implements IModule {
 
                 s.lastFrameMs = performance.now();
                 s.frameDecodeCount++;
+                s.framesDisplayed++;
 
                 // Set audio baseline on first frame with active audio
                 if (s.audioBaselineMs < 0 && s.audioCtrl) {
@@ -1396,12 +1404,22 @@ export class SmackW32 implements IModule {
             return 0;
         };
 
-        // void SmackSummary(HSMACK, SmackSum*): playback statistics. The SmackSum layout is
-        // not verified against a source we can cite, so the buffer is left untouched rather
-        // than filled through a guessed layout.
-        this.exports["_SmackSummary@8"] = (_ctx, _mem, args) => {
-            Logger.log(LogCategory.SYSTEM,
-                `SmackSummary(0x${(args[0] >>> 0).toString(16)}, 0x${(args[1] >>> 0).toString(16)}): layout unverified, not filled`);
+        // void SmackSummary(HSMACK, SmackSum*): playback statistics, 19 DWORDs (0x4c) in
+        // Smacker 3.x. Field order from the public smack.h shipped in the Jagged Alliance 2
+        // (3.2f) and Aliens vs Predator (3.1s) source releases; HEROES2W.EXE (3.0r DLL)
+        // labels the same offsets in its own summary dump and reads +0x08/+0x1c/+0x20 for
+        // its video-speed benchmark. We fill what the decoder knows; every measured time,
+        // speed and memory statistic is 0 - emulated wall time is not the guest's, and a
+        // nonzero time would push HOMM2 into its slow-machine video mode.
+        this.exports["_SmackSummary@8"] = (_ctx, mem, args) => {
+            const smk = args[0] >>> 0, sum = args[1] >>> 0;
+            if (!sum) return 0;
+            mem.fill(0, sum, sum + SMACKSUM_SIZE);
+            const s = this.sessions.get(smk);
+            if (s) {
+                if (s.fps > 0) this.writeU32(mem, sum + SMACKSUM_MS100_PER_FRAME, Math.round(100000 / s.fps));
+                this.writeU32(mem, sum + SMACKSUM_TOTAL_FRAMES, s.framesDisplayed);
+            }
             return 0;
         };
     }
