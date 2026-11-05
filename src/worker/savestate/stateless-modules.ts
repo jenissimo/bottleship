@@ -1,2 +1,14 @@
 export const STATELESS_MODULES: Readonly<Record<string, string>> = {
+    shlwapi: 'path, string and URL helpers that read and write only the caller\'s buffers',
+    shfolder: 'SHGetFolderPath forwarder that answers from the fixed folder layout',
+    psapi: 'answers from the process and module tables, which kernel32 and the loader own',
+    uxtheme: 'theme queries answer constants; SetThemeAppProperties is logged and dropped',
+    dwmapi: 'composition queries answer constants; window attributes are not kept',
+    shcore: 'DPI awareness lives in user32/dpi-awareness.ts, which the user32 participant saves',
+    msimg32: 'AlphaBlend, GradientFill and TransparentBlt draw into DCs that gdi32 owns',
+    wintrust: 'WinVerifyTrust answers a fixed verdict',
+    crypt32: 'certificate and message calls fail or answer fixed values; no store or context is opened',
+    winspool: 'OpenPrinter fails and the queries answer fixed values; no printer handle exists',
+    hid: 'HidD queries answer fixed data; no device is opened',
+    oledlg: 'OleUIAddVerbMenu answers without creating or keeping a menu',
 };
