@@ -5,6 +5,7 @@ import { stopChildProcesses, type ChildBoot } from '../../src/worker/core/child-
 import { closeProcessNetworkNamespace } from '../../src/worker/core/process-network';
 import { VirtualFileSystem } from '../../src/worker/runtime/filesystem/vfs';
 import { exports as processApi } from '../../src/worker/modules/kernel32/process/process';
+import { getVirtualProcessManager } from '../../src/worker/modules/kernel32/process/virtual-process-manager';
 import type { ZipArchive, ZipEntry } from '@bottleship/formats/zip';
 
 describe('CreateProcess image lookup for a bare command line', () => {
@@ -85,6 +86,7 @@ describe('CreateProcess image lookup for a bare command line', () => {
         mountRom(new Map<string, ZipEntry>([
             ['system/helper.exe', peEntry('system/helper.exe')],
             ['prog files/tool.exe', peEntry('prog files/tool.exe', 512)],
+            ['prog  files/deep tool.exe', peEntry('prog  files/deep tool.exe', 512)],
             ['data/helper.exe', peEntry('data/helper.exe')],
             ['system/my.app/helper.exe', peEntry('system/my.app/helper.exe', 768)],
         ]));
@@ -270,6 +272,31 @@ describe('CreateProcess image lookup for a bare command line', () => {
         expect(typeof result === 'number' ? result : result.value).toBe(11);
         expect(lastError).toBe(193);
         await stopChildProcesses();
+    });
+
+    test('a directory written with a run of spaces is tried as written', async () => {
+        system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
+        // The two spaces are part of the directory name: Windows takes the prefix from
+        // the line as written. Rebuilding it with a single separator would probe
+        // `c:\prog files\deep tool.exe` and miss the file that is actually there.
+        const result = await processApi.CreateProcessA!(undefined as never, memory,
+            [0, text('C:\\prog  files\\deep tool.exe -x'), 0, 0, 0, 0, 0, 0, 0, 2048]);
+        expect(typeof result === 'number' ? result : result.value).toBe(1);
+        const worker = await booted();
+        expect(worker.boot!.imagePath.toLowerCase()).toBe('c:\\prog  files\\deep tool.exe');
+        expect(worker.boot!.commandLine).toBe('-x');
+    });
+
+    test('a process is named after the image the lookup resolved, not the first word', async () => {
+        system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
+        const result = await processApi.CreateProcessA!(undefined as never, memory,
+            [0, text('C:\\prog files\\tool.exe -x'), 0, 0, 0, 0, 0, 0, 0, 2048]);
+        expect(typeof result === 'number' ? result : result.value).toBe(1);
+        await booted();
+        // `C:\prog` is only the first prefix the walk tried; the process runs tool.exe,
+        // and that is the name a task list has to show.
+        const handle = Mem.readUint32(2048);
+        expect(getVirtualProcessManager().describeProcessHandle(handle)?.imageName).toBe('tool.exe');
     });
 
     test('an extensionless module after a dotted directory gets .exe appended', async () => {

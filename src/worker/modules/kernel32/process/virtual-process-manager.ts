@@ -16,6 +16,12 @@ const STILL_ACTIVE = 259;
 const CREATE_SUSPENDED = 0x00000004;
 const AUTO_EXIT_DELAY_MS = 1;
 
+/** The last component of a path written with either separator. */
+const baseName = (path: string): string => {
+    const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+    return slash >= 0 ? path.slice(slash + 1) : path;
+};
+
 import { currentProcessId as VIRTUAL_CURRENT_PROCESS_ID, allocateProcessId, getProcessIdentity } from '../../../core/process-identity';
 export { currentProcessId as VIRTUAL_CURRENT_PROCESS_ID } from '../../../core/process-identity';
 
@@ -83,6 +89,8 @@ interface VirtualProcessRecord {
 interface CreateVirtualProcessParams {
     applicationName: string;
     commandLine: string;
+    /** The executable the lookup settled on, when it settled on one. */
+    imagePath?: string;
     currentDirectory: string;
     creationFlags: number;
     /**
@@ -180,7 +188,15 @@ export class VirtualProcessManager {
         return handle;
     }
 
-    private deriveImageName(applicationName: string, commandLine: string): string {
+    /**
+     * The executable a process is named after. The resolved image wins when there is
+     * one: for a bare command line the first word is only the first thing the lookup
+     * tried, and `c:\program files\my app\tool.exe` would otherwise be named after a
+     * directory fragment the walk happened to stop on.
+     */
+    private deriveImageName(applicationName: string, commandLine: string, imagePath?: string): string {
+        const resolved = imagePath ? baseName(imagePath.trim()) : '';
+        if (resolved) return resolved;
         const tokenSource = applicationName.trim() || commandLine.trim();
         if (!tokenSource) return 'child.exe';
 
@@ -189,13 +205,11 @@ export class VirtualProcessManager {
             const endQuote = token.indexOf('"', 1);
             token = endQuote > 1 ? token.slice(1, endQuote) : token.slice(1);
         } else {
-            const firstSpace = token.indexOf(' ');
+            const firstSpace = token.search(/\s/);
             token = firstSpace > 0 ? token.slice(0, firstSpace) : token;
         }
 
-        if (!token) return 'child.exe';
-        const slash = Math.max(token.lastIndexOf('/'), token.lastIndexOf('\\'));
-        return slash >= 0 ? token.slice(slash + 1) : token;
+        return baseName(token) || 'child.exe';
     }
 
     private createDefaultThreadContext(): VirtualThreadContext {
@@ -274,7 +288,7 @@ export class VirtualProcessManager {
         const pid = allocateProcessId();
         const tid = this.nextTid++;
         const isSuspended = (params.creationFlags & CREATE_SUSPENDED) !== 0;
-        const imageName = this.deriveImageName(params.applicationName, params.commandLine);
+        const imageName = this.deriveImageName(params.applicationName, params.commandLine, params.imagePath);
 
         const process: VirtualProcessRecord = {
             handle: processHandle,
