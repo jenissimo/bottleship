@@ -32,7 +32,7 @@ describe("session state registry", () => {
         System.getInstance();
         expect(sessionState.ids('game-switch')).toEqual(['time', 'video-engine', 'lib-hle', 'hooks', 'gpu-resources', 'hypercall-tables', 'implicit-tls']);
         expect(sessionState.ids('subsystems')).toEqual([
-            'load-diagnostics', 'window-manager', 'gdi', 'input', 'services', 'video-routing', 'com-resources', 'scheduler',
+            'load-diagnostics', 'crt-binding', 'window-manager', 'gdi', 'input', 'services', 'video-routing', 'com-resources', 'scheduler',
             'memory-watch', 'leases', 'memory-events', 'seh-dispatch', 'named-objects', 'profiler', 'frame-profiler',
             'process-startup-info',
         ]);

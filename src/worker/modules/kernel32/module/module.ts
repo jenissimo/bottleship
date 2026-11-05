@@ -20,6 +20,7 @@ import { moduleHandleMissRegistry } from '../../../core/diagnostics/module-handl
 import { isSuspectSilentStub } from '../../../core/diagnostics/api-census';
 import { resolveHleExportAddress } from '../../../core/thunking/export-resolver';
 import { shippedExportNames } from '../../../core/pe-export-names';
+import { processCrtBinding } from '../../../core/crt-binding';
 
 export const exports: Record<string, ThunkImplementation> = {};
 
@@ -470,6 +471,15 @@ function requestsSystemCopyOfAppDirDll(requestedName: string): boolean {
  * files, so a hit under the system directory is our own presence, not the game's copy.
  */
 function appDirDllShadowsHle(dllName: string): boolean {
+    // The process bound this C runtime to the shipped DLL (crt-binding.ts): a LoadLibrary of
+    // it must hand back that same module, not the HLE one the IATs never saw.
+    if (processCrtBinding.choiceFor(dllName) === 'native') {
+        const path = System.getInstance().process?.loader?.findDllPath(dllName);
+        if (path) {
+            Logger.verbose(LogCategory.KERNEL32, `"${dllName}" -> the shipped ${path} (process CRT binding is native)`);
+            return true;
+        }
+    }
     if (!prefersAppDirDll(dllName)) return false;
     const path = System.getInstance().process?.loader?.findDllPath(dllName);
     return !!path && !isUnderSystemDirectory(normalizeDllPathToken(path));

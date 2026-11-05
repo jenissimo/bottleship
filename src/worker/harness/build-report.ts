@@ -14,6 +14,7 @@ import { getCxxExceptionRing, getSehDispatchTrace } from "../core/seh-dispatch";
 import { getStackGuardViolations } from "../core/memory/stack-write-guard";
 import { hypercallDataManager } from "../core/cpu/hypercall-data";
 import { loadDiagnostics } from "../core/diagnostics/load-diagnostics";
+import { processCrtBinding, type CrtPlanSummary } from "../core/crt-binding";
 import { getGpuErrorReport, type GpuErrorReport } from "../core/gpu-error-log";
 import { gpuDeviceLifecycle, type GpuDeviceLifecycleReport } from "../core/gpu/gpu-device-lifecycle";
 import { pendingMessageBoxes } from "../runtime/dialog-bridge";
@@ -277,6 +278,8 @@ export interface HarnessReport {
     /** DLL names bound to our HLE module for some images and to the shipped file for others:
      *  two copies of one library in one process (for a CRT: two heaps, two FILE tables). */
     mixedDllBindings: string[];
+    /** The process-wide C runtime decision (crt-binding.ts): HLE or shipped, per CRT name. */
+    crtBinding: CrtPlanSummary;
 }
 
 function readStackWords(esp: number, count = 4): string[] {
@@ -467,5 +470,6 @@ export function buildHarnessReport(esp?: number): HarnessReport {
         })),
         dllLoadFailures: loadDiagnostics.listDllFailures(),
         mixedDllBindings: loadDiagnostics.listMixedBindings(),
+        crtBinding: processCrtBinding.summary(),
     };
 }

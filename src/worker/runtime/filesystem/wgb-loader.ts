@@ -214,6 +214,13 @@ export interface WgbManifest {
          */
         appDirDlls?: string[];
         /**
+         * Which C runtime the whole process binds to when the bundle ships its own msvcrt.dll
+         * (or msvcrNN / msvcpNN). "auto" (default): HLE when it covers every module's CRT
+         * imports, else the shipped DLL for every module. "hle" / "native" force one side.
+         * One CRT per process either way (src/worker/core/crt-binding.ts).
+         */
+        crt?: "auto" | "hle" | "native";
+        /**
          * Registry subtrees a process names under one key but Windows serves from another — the
          * VirtualRegistry ADDREDIRECT shims of a shim database the game's installer registers
          * (make-wgb --sdb reads them). Each rule is bound to an exe: a process gets the rules

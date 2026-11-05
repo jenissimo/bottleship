@@ -11,6 +11,7 @@ import { QualityConfig, DEFAULT_QUALITY, mergeQuality } from "./quality-config";
 import { asBufferSource } from "../../dom-buffer";
 import { normalizeNetworkConfig, type NetworkConfig } from "../../network-config";
 import type { ExeRegistryRedirect } from "@bottleship/formats/sdb";
+import { parseCrtBindingMode, type CrtBindingMode } from "./crt-binding";
 
 // OS Version constants
 export const VER_PLATFORM_WIN32_WINDOWS = 0x1;
@@ -366,6 +367,10 @@ export class EmulatorConfig {
     // disabledDlls. Opt-in per bundle while the default order is still HLE-first.
     public appDirDlls: string[] = [];
 
+    // manifest.emulator.crt: one C runtime per process, HLE or the bundle's own msvcrt.dll
+    // (crt-binding.ts). "auto" decides from the CRT imports of every statically known image.
+    public crtBinding: CrtBindingMode = "auto";
+
     // The game's own VirtualRegistry shims, each bound to the exe its database entry names.
     // Every process selects its own set by image name when it starts (the owner for the boot
     // image, a child for its own image, which it inherits this list to choose from):
@@ -654,6 +659,16 @@ export class EmulatorConfig {
             );
         }
 
+        if (config.crt !== undefined) {
+            const mode = parseCrtBindingMode(config.crt);
+            if (mode) {
+                this.crtBinding = mode;
+                Logger.log(LogCategory.SYSTEM, `EmulatorConfig: crt binding "${mode}"`);
+            } else {
+                Logger.warn(LogCategory.SYSTEM, `EmulatorConfig: crt "${String(config.crt)}" ignored (auto | hle | native)`);
+            }
+        }
+
         if (config.registryRedirects && config.registryRedirects.length > 0) {
             const rules = config.registryRedirects;
             this.registryRedirects = rules.filter((r) =>
@@ -747,6 +762,7 @@ export class EmulatorConfig {
         this.ddrawHoldPresentsUntilFlip = false;
         this.disabledDlls = [];
         this.appDirDlls = [];
+        this.crtBinding = "auto";
         this.registryRedirects = [];
         this.deleteOnBoot = [];
         this.writeFiles = [];
