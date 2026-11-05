@@ -1435,6 +1435,13 @@ export class PELoader {
         processCrtBinding.reset();
         const mode = EmulatorConfig.getInstance().crtBinding;
         processCrtBinding.mode = mode;
+        // A/B: dbgFlag('__perModuleCrt', true) BEFORE loading a game restores the old
+        // per-module rule (and with it the mixed bindings) to compare against.
+        if ((globalThis as { __perModuleCrt?: boolean }).__perModuleCrt) {
+            processCrtBinding.disable();
+            Logger.warn(LogCategory.SYSTEM, `[PE] Process CRT binding OFF (__perModuleCrt): binding per module`);
+            return;
+        }
         if (!this.vfs) return;
         const searchDirectories = this.getDllSearchDirectories();
         if (!PELoader.SHIPPED_CRT_PROBES.some(n => this.findDllPath(n, 0, searchDirectories) !== null)) return;
@@ -1502,6 +1509,12 @@ export class PELoader {
                 ...this.importBindingDeps(searchDirectories),
                 processCrtChoice: (raw) => processCrtBinding.choiceFor(raw),
             });
+            const crtChoice = processCrtBinding.choiceFor(dllNameRaw);
+            if (crtChoice !== undefined &&
+                resolveImportBinding(dllNameRaw, functions, this.importBindingDeps(searchDirectories, true)).isThunked !== isThunked) {
+                const image = this.moduleRegistry?.getModuleContainingAddress(baseAddress)?.name ?? `0x${baseAddress.toString(16)}`;
+                processCrtBinding.noteOverride(image, dllNameRaw, crtChoice);
+            }
             // A CRT name no static image imported: this first binding becomes the process's.
             processCrtBinding.noteLateBinding(dllNameRaw, isThunked);
 

@@ -84,6 +84,9 @@ export interface CrtPlanSummary {
     choices: Record<string, CrtChoice>;
     /** Images whose CRT imports took part in the decision. */
     importers: string[];
+    /** "image: dll -> choice" for every import the per-module rule alone would have bound the
+     *  other way — exactly the bindings this decision changed. */
+    overridden: string[];
 }
 
 function key(dllName: string): string {
@@ -199,7 +202,19 @@ export async function planProcessCrt(
 class ProcessCrtBinding {
     private choices = new Map<string, CrtChoice>();
     private importerImages: string[] = [];
+    private overrides: string[] = [];
+    private disabled = false;
     mode: CrtBindingMode = 'auto';
+
+    /** No process decision at all: every module binds by its own coverage (A/B only). */
+    disable(): void {
+        this.disabled = true;
+    }
+
+    /** An import the process decision bound differently from the module's own coverage. */
+    noteOverride(image: string, dllName: string, choice: CrtChoice): void {
+        if (this.overrides.length < 64) this.overrides.push(`${image}: ${key(dllName)} -> ${choice}`);
+    }
 
     adoptPlan(mode: CrtBindingMode, choices: ReadonlyMap<string, CrtChoice>, importers: readonly string[] = []): void {
         this.mode = mode;
@@ -209,7 +224,7 @@ class ProcessCrtBinding {
 
     /** The process choice for this CRT import name, or undefined when none was made yet. */
     choiceFor(dllName: string): CrtChoice | undefined {
-        if (crtRuntimeKind(dllName) === null) return undefined;
+        if (this.disabled || crtRuntimeKind(dllName) === null) return undefined;
         return this.choices.get(key(dllName));
     }
 
@@ -218,17 +233,19 @@ class ProcessCrtBinding {
      * becomes the process choice, so the modules after it agree with it.
      */
     noteLateBinding(dllName: string, thunked: boolean): void {
-        if (crtRuntimeKind(dllName) === null || this.choices.has(key(dllName))) return;
+        if (this.disabled || crtRuntimeKind(dllName) === null || this.choices.has(key(dllName))) return;
         this.choices.set(key(dllName), thunked ? 'hle' : 'native');
     }
 
     summary(): CrtPlanSummary {
-        return { mode: this.mode, choices: Object.fromEntries(this.choices), importers: [...this.importerImages] };
+        return { mode: this.mode, choices: Object.fromEntries(this.choices), importers: [...this.importerImages], overridden: [...this.overrides] };
     }
 
     reset(): void {
         this.choices.clear();
         this.importerImages = [];
+        this.overrides = [];
+        this.disabled = false;
         this.mode = 'auto';
     }
 }
