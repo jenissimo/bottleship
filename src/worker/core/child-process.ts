@@ -384,9 +384,12 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
                 } else if (message.type === 'error' || message.type === 'crash') {
                     const failure = new Error(message.message ?? message.reason ?? 'Child process crashed');
                     // A child that knows which Win32 error its startup failed with
-                    // reports it; the kernel32 launch path records that code instead
-                    // of assuming a bad image.
-                    if (typeof message.code === 'number') (failure as Error & { code?: number }).code = message.code;
+                    // reports it under a dedicated field; the kernel32 launch path reads
+                    // only this one, so a generic `code` (a DOMException, an errno from
+                    // somewhere else) cannot pose as a Win32 error.
+                    if (typeof message.win32Error === 'number') {
+                        (failure as Error & { win32Error?: number }).win32Error = message.win32Error;
+                    }
                     finish(undefined, failure);
                 } else if ((message.type === 'window_title' && message.visible !== false) || message.type === 'show_message_box') {
                     // MessageBox is a titled top-level window on Windows; ours is host-served

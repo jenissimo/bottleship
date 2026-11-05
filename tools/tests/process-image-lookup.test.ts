@@ -86,6 +86,7 @@ describe('CreateProcess image lookup for a bare command line', () => {
             ['system/helper.exe', peEntry('system/helper.exe')],
             ['prog files/tool.exe', peEntry('prog files/tool.exe', 512)],
             ['data/helper.exe', peEntry('data/helper.exe')],
+            ['system/my.app/helper.exe', peEntry('system/my.app/helper.exe', 768)],
         ]));
     });
     afterEach(async () => {
@@ -204,11 +205,52 @@ describe('CreateProcess image lookup for a bare command line', () => {
         // The child knows its failure was a missing directory, not a bad image.
         // Hard-coding ERROR_BAD_FORMAT would turn this into 11; mapping the
         // recorded code keeps WinExec's answer equal to CreateProcess's.
-        worker.onmessage?.({ data: { type: 'error', message: 'child loader failed', code: 3 } });
+        worker.onmessage?.({ data: { type: 'error', message: 'child loader failed', win32Error: 3 } });
         const result = await pending;
         expect(typeof result === 'number' ? result : result.value).toBe(3); // ERROR_PATH_NOT_FOUND
         expect(lastError).toBe(3);
         await stopChildProcesses();
         expect(worker.terminated).toBe(true);
+    });
+
+    test('a failure code that is not a reported Win32 error is not adopted as one', async () => {
+        system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
+        autoReady = false;
+        const pending = Promise.resolve(processApi.WinExec!(undefined as never, memory, [text('C:\\System\\helper.exe'), 1]));
+        const worker = await booted();
+        // A DOMException carries a legacy numeric `code` (NotFoundError is 8). Reading
+        // a duck-typed field would report GetLastError 8 for a VFS failure that never
+        // was a Win32 error; only the dedicated field counts, so this stays 193.
+        worker.onmessage?.({ data: { type: 'error', message: 'child loader failed', code: 8 } });
+        const result = await pending;
+        expect(typeof result === 'number' ? result : result.value).toBe(11); // ERROR_BAD_FORMAT, from 193
+        expect(lastError).toBe(193);
+        await stopChildProcesses();
+        worker.terminated = false;
+    });
+
+    test('a child that reports code 0 falls back instead of failing with GetLastError 0', async () => {
+        system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
+        autoReady = false;
+        const pending = Promise.resolve(processApi.WinExec!(undefined as never, memory, [text('C:\\System\\helper.exe'), 1]));
+        const worker = await booted();
+        // 0 is not a report: CreateProcess cannot fail with GetLastError 0, so a
+        // failure that reports nothing usable reads as the bad-image code.
+        worker.onmessage?.({ data: { type: 'error', message: 'child loader failed', win32Error: 0 } });
+        const result = await pending;
+        expect(typeof result === 'number' ? result : result.value).toBe(11);
+        expect(lastError).toBe(193);
+        await stopChildProcesses();
+    });
+
+    test('an extensionless module after a dotted directory gets .exe appended', async () => {
+        system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
+        // `C:/System/my.app/helper` has no extension on the module name, but the dot
+        // in the directory reads as one when only a backslash ends the search.
+        const result = await processApi.CreateProcessA!(undefined as never, memory,
+            [0, text('C:/System/my.app/helper'), 0, 0, 0, 0, 0, 0, 0, 2048]);
+        expect(typeof result === 'number' ? result : result.value).toBe(1);
+        const worker = await booted();
+        expect(worker.boot!.imagePath.toLowerCase()).toBe('c:\\system\\my.app\\helper.exe');
     });
 });
