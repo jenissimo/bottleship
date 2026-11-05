@@ -9,6 +9,7 @@ import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setC
 import { ChildStartupGate } from "./core/child-startup";
 import { createChildVfsClient } from "./core/child-vfs";
 import { adoptProcessIdentity } from "./core/process-identity";
+import { adoptProcessStartupInfo } from "./core/process-startup-info";
 import { adoptProcessIpc, beginProcessIpcLifetime } from "./core/process-ipc";
 import { adoptProcessNetworkNamespace, getProcessNetworkNamespace, beginProcessNetworkLifetime, finishProcessNetworkLifetime, flushProcessNetworkNamespace } from "./core/process-network";
 import type { RegistryMutation } from "./runtime/filesystem/registry";
@@ -3453,6 +3454,9 @@ const handleWorkerMessage = (event: MessageEvent): void => {
       adoptProcessIdentity(childBoot.processIdentity);
       if (childBoot.ipcPort) adoptProcessIpc(childBoot.processIdentity, childBoot.ipcPort);
     }
+    // Always adopted, even when the parent passed none: a worker that ran a child
+    // before must not answer GetStartupInfo with the previous child's window state.
+    adoptProcessStartupInfo(childBoot.startupInfo);
     if (childBoot.networkNamespace) adoptProcessNetworkNamespace(childBoot.networkNamespace);
     childImageReady = new Promise<void>(resolve => { resolveChildImageReady = resolve; });
     childSessionTransport = new ChildSessionTransport((message, transfer = []) => postToParent(message, transfer), handleWorkerMessage);

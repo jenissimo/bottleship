@@ -31,6 +31,10 @@ import { createActCtxExports } from './actctx';
 import { versionVerifyExports } from './version-verify';
 import { GUEST_COMPUTER_NAME } from '../../../core/guest-identity';
 import { SYSTEM32_DIR } from '../../../core/dll-search-order';
+import {
+    cachedStartupStrings, getProcessStartupInfo, STARTF_USESHOWWINDOW,
+    STARTUPINFO_OFFSETS, STARTUPINFO_SIZE, type ProcessStartupInfo,
+} from '../../../core/process-startup-info';
 
 const ERROR_INVALID_HANDLE = 6;
 const ERROR_INVALID_PARAMETER = 87;
@@ -421,6 +425,80 @@ const writeProcessInformation = (
 const readNullableProcessString = (memory: Uint8Array, ptr: number, isWide: boolean): string => {
     if (!ptr) return '';
     return isWide ? Marshaler.readWideString(memory, ptr) : Marshaler.readString(memory, ptr);
+};
+
+/**
+ * The caller's lpStartupInfo, copied out of its memory.
+ *
+ * The strings are read here, while the caller is still the running process: keeping
+ * lpTitle/lpDesktop as pointers would hand the child addresses that mean something
+ * else in its own address space.
+ */
+const readStartupInfo = (memory: Uint8Array, ptr: number, isWide: boolean): ProcessStartupInfo | null => {
+    if (!ptr || !isValidAddress(ptr, STARTUPINFO_SIZE, 'r')) return null;
+    const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
+    const word = (offset: number): number => view.getUint32(ptr + offset, true);
+    return {
+        dwFlags: word(STARTUPINFO_OFFSETS.dwFlags),
+        wShowWindow: view.getUint16(ptr + STARTUPINFO_OFFSETS.wShowWindow, true),
+        dwX: view.getInt32(ptr + STARTUPINFO_OFFSETS.dwX, true),
+        dwY: view.getInt32(ptr + STARTUPINFO_OFFSETS.dwY, true),
+        dwXSize: view.getInt32(ptr + STARTUPINFO_OFFSETS.dwXSize, true),
+        dwYSize: view.getInt32(ptr + STARTUPINFO_OFFSETS.dwYSize, true),
+        desktop: readNullableProcessString(memory, word(STARTUPINFO_OFFSETS.lpDesktop), isWide),
+        title: readNullableProcessString(memory, word(STARTUPINFO_OFFSETS.lpTitle), isWide),
+    };
+};
+
+/**
+ * The child's own copies of lpDesktop/lpTitle, placed once per process.
+ *
+ * Windows keeps these strings for the life of the process, so a second GetStartupInfo
+ * has to hand back the same addresses rather than allocating another pair. The block
+ * lives in the session-state store, which is what makes it go away with the image it
+ * points into.
+ */
+const startupStrings = (memory: Uint8Array, info: ProcessStartupInfo, isWide: boolean): { desktop: number; title: number } => {
+    const key = (isWide ? 'w:' : 'a:') + info.desktop + '\u0000' + info.title;
+    return cachedStartupStrings(key, () => {
+        const owner = System.getInstance().process;
+        const place = (text: string): number => {
+            if (!text || !owner) return 0;
+            const size = isWide ? (text.length + 1) * 2 : text.length + 1;
+            try {
+                const at = owner.memory.alloc(size, 'THUNK_DATA', 'rw');
+                if (!at) return 0;
+                if (isWide) Marshaler.writeWideString(memory, at, text);
+                else Marshaler.writeString(memory, at, text);
+                return at;
+            } catch { return 0; }
+        };
+        return { desktop: place(info.desktop), title: place(info.title) };
+    });
+};
+
+/**
+ * GetStartupInfoA/W: the parent's copy, cb set.
+ *
+ * A process this build booted directly has no parent, so it gets what Windows gives an
+ * Explorer start: cb filled, dwFlags 0 and every other field zero.
+ */
+const writeStartupInfo = (memory: Uint8Array, ptr: number, isWide: boolean): void => {
+    if (!ptr || ptr + STARTUPINFO_SIZE > memory.length) return;
+    const info = getProcessStartupInfo();
+    const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
+    memory.fill(0, ptr, ptr + STARTUPINFO_SIZE);
+    view.setUint32(ptr + STARTUPINFO_OFFSETS.cb, STARTUPINFO_SIZE, true);
+    if (!info) return;
+    view.setUint32(ptr + STARTUPINFO_OFFSETS.dwFlags, info.dwFlags, true);
+    view.setUint16(ptr + STARTUPINFO_OFFSETS.wShowWindow, info.wShowWindow, true);
+    view.setInt32(ptr + STARTUPINFO_OFFSETS.dwX, info.dwX, true);
+    view.setInt32(ptr + STARTUPINFO_OFFSETS.dwY, info.dwY, true);
+    view.setInt32(ptr + STARTUPINFO_OFFSETS.dwXSize, info.dwXSize, true);
+    view.setInt32(ptr + STARTUPINFO_OFFSETS.dwYSize, info.dwYSize, true);
+    const strings = startupStrings(memory, info, isWide);
+    view.setUint32(ptr + STARTUPINFO_OFFSETS.lpDesktop, strings.desktop, true);
+    view.setUint32(ptr + STARTUPINFO_OFFSETS.lpTitle, strings.title, true);
 };
 
 /** argv[0] of a Win32 command line: a quoted run, else up to the first space. */
@@ -905,11 +983,12 @@ const finishVirtualProcess = (
 // must map that exact code, and a threadless harness cannot read it back from the
 // scheduler, so the value travels with the result instead of through the thread.
 const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolean,
-    errOut?: { code: number }): ThunkResult | Promise<ThunkResult> => {
+    errOut?: { code: number }, startupOverride?: ProcessStartupInfo): ThunkResult | Promise<ThunkResult> => {
     const lpApplicationName = args[0] >>> 0;
     const lpCommandLine = args[1] >>> 0;
     const dwCreationFlags = args[5] >>> 0;
     const lpCurrentDirectory = args[7] >>> 0;
+    const lpStartupInfo = args[8] >>> 0;
     const lpProcessInformation = args[9] >>> 0;
 
     const applicationName = readNullableProcessString(memory, lpApplicationName, isWide);
@@ -956,6 +1035,10 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
                 currentDirectory: currentDirectory || system.fileSystem.currentDir,
                 rawCommandLine: commandLine || applicationName,
                 environment: system.process ? [...system.process.environment] : undefined,
+                // Copied here, while the caller's memory is still readable: a child
+                // cannot follow a pointer into the parent's address space. WinExec has
+                // no caller structure to read, so it passes the one it would have built.
+                startupInfo: startupOverride ?? readStartupInfo(memory, lpStartupInfo, isWide) ?? undefined,
             },
             !startSuspended && isConsoleTool && hostToolsEnabled() ? 'host' : 'worker',
             errOut,
@@ -1177,24 +1260,13 @@ export const exports: Record<string, ThunkImplementation> = {
     },
 
     'GetStartupInfoW': (ctx, mem, args) => {
-        const lpStartupInfo = args[0];
-        // Clear the structure (size is 68 bytes for STARTUPINFOW)
-        if (lpStartupInfo && lpStartupInfo + 68 <= mem.length) {
-            mem.fill(0, lpStartupInfo, lpStartupInfo + 68);
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(lpStartupInfo, 68, true); // cb
-        }
+        // The parent's copy, or the zeroed structure Windows gives a direct launch.
+        writeStartupInfo(mem, args[0] >>> 0, true);
         return { value: 0, stackCleanup: 4 };
     },
 
     'GetStartupInfoA': (ctx, mem, args) => {
-        const lpStartupInfo = args[0];
-        // Clear the structure (size is 68 bytes for STARTUPINFOA)
-        if (lpStartupInfo && lpStartupInfo + 68 <= mem.length) {
-            mem.fill(0, lpStartupInfo, lpStartupInfo + 68);
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(lpStartupInfo, 68, true); // cb
-        }
+        writeStartupInfo(mem, args[0] >>> 0, false);
         return { value: 0, stackCleanup: 4 };
     },
 
@@ -1260,6 +1332,7 @@ export const exports: Record<string, ThunkImplementation> = {
     // so an error must never leak out as a value that reads as success.
     'WinExec': (ctx, mem, args): ThunkResult | Promise<ThunkResult> => {
         const lpCmdLine = args[0] >>> 0;
+        const uCmdShow = args[1] >>> 0;
         const system = System.getInstance();
         const ownerProcess = system.process;
         let processInfo = 0;
@@ -1279,7 +1352,15 @@ export const exports: Record<string, ThunkImplementation> = {
             return { value: 33, stackCleanup: 8 };
         };
         const errOut = { code: 0 };
-        const result = createVirtualProcess(mem, [0, lpCmdLine, 0, 0, 0, 0, 0, 0, 0, processInfo], false, errOut);
+        // WinExec is CreateProcess with the caller's window state folded into
+        // STARTUPINFO: dwFlags says wShowWindow is meaningful, wShowWindow is uCmdShow.
+        // Wine builds exactly this on the stack (dlls/kernel32/process.c) before calling
+        // CreateProcess, so it is passed as a value here rather than placed in guest memory.
+        const startupInfo: ProcessStartupInfo = {
+            dwFlags: STARTF_USESHOWWINDOW, wShowWindow: uCmdShow & 0xFFFF,
+            dwX: 0, dwY: 0, dwXSize: 0, dwYSize: 0, desktop: '', title: '',
+        };
+        const result = createVirtualProcess(mem, [0, lpCmdLine, 0, 0, 0, 0, 0, 0, 0, processInfo], false, errOut, startupInfo);
         // WinExec's return value doubles as its error code: anything under 32 is the
         // GetLastError of the failed CreateProcess, anything else means failure.
         // Wine (dlls/kernel32/process.c) therefore hands back the recorded code as it

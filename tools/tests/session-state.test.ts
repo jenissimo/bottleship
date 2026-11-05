@@ -34,6 +34,7 @@ describe("session state registry", () => {
         expect(sessionState.ids('subsystems')).toEqual([
             'load-diagnostics', 'window-manager', 'gdi', 'input', 'services', 'video-routing', 'com-resources', 'scheduler',
             'memory-watch', 'leases', 'memory-events', 'seh-dispatch', 'named-objects', 'profiler', 'frame-profiler',
+            'process-startup-info',
         ]);
     });
 });

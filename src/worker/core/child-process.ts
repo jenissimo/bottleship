@@ -9,6 +9,7 @@ import type { RegistryMutation, RegistryStore } from '../runtime/filesystem/regi
 import type { NamedObjectSpec } from '../modules/kernel32/named-objects';
 import type { GuestImagePatch } from './system';
 import type { HostJitMode } from '../../utils/host-jit-policy';
+import type { ProcessStartupInfo } from './process-startup-info';
 
 export interface ChildProcessPreparation { imagePatches?: GuestImagePatch[]; }
 
@@ -63,6 +64,8 @@ export interface ChildProcessRequest {
     currentDirectory: string;
     rawCommandLine?: string;
     environment?: [string, string][];
+    /** The caller's lpStartupInfo, already copied out of its memory. */
+    startupInfo?: ProcessStartupInfo;
 }
 
 export interface ChildBoot extends ChildProcessRequest {
