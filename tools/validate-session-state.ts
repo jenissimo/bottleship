@@ -79,6 +79,9 @@ const ANNOTATION = /@(transient|participant|refuse)\(([^)]*)\)/;
 const COVERS = /\bcovers\s*:\s*\[([^\]]*)\]/g;
 const QUOTED = /['"]([^'"]+)['"]/g;
 const PARTICIPANT_IDS = join("savestate", "participant-ids.ts");
+const STATELESS_MODULES = join("savestate", "stateless-modules.ts");
+const STATELESS_ENTRY = /^\s*(['"]?)([\w.-]+)\1\s*:\s*(['"])(.*?)\3\s*,?\s*$/;
+const BARE_REASON = /^(?:stateless|no state|nothing|none|n\/a)\.?$/i;
 
 /** Keywords after which a `/` starts a regex literal rather than a division. */
 const REGEX_AFTER_WORD = /(?:^|[^\w$])(?:return|typeof|case|in|of|delete|void|throw|new|else|yield|await|do)$/;
@@ -186,6 +189,8 @@ export interface Census {
     emptyReasons: number[];
     /** `@participant(<id>)` annotations, by 1-based line. */
     participants: { line: number; id: string }[];
+    /** 1-based lines carrying `@refuse(<reason>)`. */
+    refusals: number[];
 }
 
 export function censusOf(source: string): Census {
@@ -194,6 +199,7 @@ export function censusOf(source: string): Census {
     const names: string[] = [];
     const emptyReasons: number[] = [];
     const participants: { line: number; id: string }[] = [];
+    const refusals: number[] = [];
     const classes: { name: string; depth: number }[] = [];
     let depth = 0;
     let factory: { name: string; entered: boolean } | null = null;
@@ -205,6 +211,7 @@ export function censusOf(source: string): Census {
             const arg = m[2]!.trim();
             if (!arg) return "empty";
             if (m[1] === "participant") participants.push({ line: i + 1, id: arg });
+            if (m[1] === "refuse") refusals.push(i + 1);
             return "ok";
         }
         return "none";
@@ -258,13 +265,32 @@ export function censusOf(source: string): Census {
             else if (depth === 0) factory = null;
         }
     }
-    return { names, emptyReasons, participants };
+    return { names, emptyReasons, participants, refusals };
 }
 
 /** The DLL a file under src/worker implements, by the modules/<dll>… layout; null outside it. */
 export function moduleOfFile(relToRoot: string): string | null {
     const m = /^modules\/([^/]+?)(?:\/|\.ts$|-[^/]*\.ts$)/.exec(relToRoot);
     return m ? m[1]!.toLowerCase() : null;
+}
+
+export function statelessModulesOf(source: string): { modules: Map<string, string>; bad: string[] } {
+    const modules = new Map<string, string>();
+    const bad: string[] = [];
+    const lines = source.split(/\r?\n/);
+    let inside = false;
+    lines.forEach((line, i) => {
+        if (/STATELESS_MODULES\b[^=]*=\s*\{/.test(line)) { inside = true; return; }
+        if (!inside) return;
+        if (/^\s*\}/.test(line)) { inside = false; return; }
+        if (!line.trim()) return;
+        const m = STATELESS_ENTRY.exec(line);
+        if (!m) { bad.push(`${i + 1}: cannot read the entry`); return; }
+        const reason = m[4]!.trim();
+        if (!reason || BARE_REASON.test(reason)) bad.push(`${i + 1}: ${m[2]} needs a reason that says why nothing survives a call`);
+        modules.set(m[2]!.toLowerCase(), reason);
+    });
+    return { modules, bad };
 }
 
 /** DLL names some participant lists in `covers: [...]` anywhere in the scanned tree. */
@@ -315,7 +341,23 @@ function checkCoverage(root: string, scanned: FileCensus[]): string[] {
     } catch {
         ids.clear();
     }
+    let stateless = new Map<string, string>();
+    try {
+        const parsed = statelessModulesOf(readFileSync(join(root, STATELESS_MODULES), "utf8"));
+        stateless = parsed.modules;
+        for (const b of parsed.bad) problems.push(`  STATELESS REASON: ${STATELESS_MODULES.split(sep).join("/")}:${b}`);
+    } catch {
+        stateless.clear();
+    }
+    for (const name of stateless.keys()) {
+        if (covered.has(name)) problems.push(`  STATELESS AND COVERED: ${name} — a participant covers it, so it cannot also be declared stateless`);
+    }
     for (const { rel, module, census } of scanned) {
+        if (module && stateless.has(module)) {
+            const lines = [...census.participants.map(p => p.line), ...census.refusals].sort((a, b) => a - b);
+            if (lines.length) problems.push(`  STATEFUL: ${rel}:${lines.join(",")} — ${module} is declared stateless, but a binding here is captured or refused`);
+            if (census.names.length) problems.push(`  UNCLASSIFIED: ${rel} — ${census.names.join(", ")} (${module} is declared stateless: annotate each @transient(reason))`);
+        }
         for (const p of census.participants) {
             if (!ids.has(p.id)) problems.push(`  UNKNOWN PARTICIPANT: ${rel}:${p.line} — ${p.id} is not listed in ${PARTICIPANT_IDS.split(sep).join("/")}`);
         }

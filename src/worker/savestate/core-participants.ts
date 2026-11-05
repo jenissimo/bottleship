@@ -19,6 +19,7 @@ import { registerKernel32Participant } from '../modules/kernel32/savestate';
 import { registerUser32Participants } from '../modules/user32/savestate';
 import { registerGdi32Participants } from '../modules/gdi32/savestate';
 import type { SaveValue } from './value-codec';
+import { STATELESS_MODULES } from './stateless-modules';
 
 function v86Cpu(): V86Cpu {
     const v86 = System.getInstance().process?.v86 as { cpu?: V86Cpu; v86?: { cpu?: V86Cpu } } | undefined;
@@ -166,6 +167,7 @@ const SCHEMAS = {
 const schema = (v: unknown) => v as SaveValue;
 
 export function registerCoreParticipants(): void {
+    for (const [module, reason] of Object.entries(STATELESS_MODULES)) savestateParticipants.stateless(module, reason);
     registerKernelRecordCodecs();
     registerKernel32Participant();
     registerUser32Participants();
