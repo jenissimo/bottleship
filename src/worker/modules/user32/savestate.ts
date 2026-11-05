@@ -189,7 +189,7 @@ export function registerUser32Participants(): void {
         restore: (s) => System.getInstance().windowManager.restoreQueueState(s as unknown as MessageQueueState),
     });
     savestateParticipants.add({
-        id: 'user32', version: 1, order: 40, covers: ['user32'], schema: USER32_SCHEMA as unknown as SaveValue,
+        id: 'user32', version: 2, order: 40, covers: ['user32'], schema: USER32_SCHEMA as unknown as SaveValue,
         capture: () => refusing(captureUser32State) as unknown as SaveValue,
         restore: (s) => restoreUser32State(s as unknown as User32State),
     });

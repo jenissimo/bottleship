@@ -1090,7 +1090,7 @@ export const WINDOW_INFO_FIELDS = {
     isSystemControl: 'save', systemControlClass: 'save', externalPaintManaged: 'save', lastActivePopupHwnd: 'save',
     nativeClassName: 'save', fontHandle: 'save', touchWindowFlags: 'save', dialogDefaultId: 'save',
     dialogBaseUnitX: 'save', dialogBaseUnitY: 'save', guestCustomPaint: 'save', paintCycleRan: 'save',
-    wndProcSubclassed: 'save', createSyncVisibleDelivered: 'save', createSyncActivationDelivered: 'save',
+    wndProcSubclassed: 'save', createSyncVisibleDelivered: 'save', sizeMovePending: 'save', createSyncActivationDelivered: 'save',
     activationDelivered: 'save', dialogInitInProgress: 'transient', createInProgress: 'transient',
     pendingDestroy: 'save', overlayOnFlipScreen: 'save', lastOverlayFillBounds: 'host',
 } as const satisfies Record<keyof WindowInfo, FieldPolicy>;
