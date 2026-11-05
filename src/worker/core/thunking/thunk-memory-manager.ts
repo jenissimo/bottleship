@@ -661,7 +661,7 @@ export class ThunkMemoryManager {
         capacity: number,
     ): number[] {
         const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const addrs: number[] = new Array(21);  // 16 standard + 4 PtrDeref + 1 shader-constant
+        const addrs: number[] = new Array(22);  // 16 standard + 4 PtrDeref + 1 shader-constant + 1 zero-arg
         let off = base;
         const lean = (globalThis as { __wbufLeanTrampolines?: boolean }).__wbufLeanTrampolines === true;
         // pushfd shifts every stack argument by 4 when the saving frame is emitted.
@@ -1028,6 +1028,54 @@ export class ThunkMemoryManager {
             w8(0xEF); // out dx, eax
             w8(0xC2); w8(16); w8(0); // ret 16
             }
+        }
+
+        addrs[21] = off;
+        if (lean) {
+            w8(0x8B); w8(0x15); w32(ctrlAddr);
+            w8(0x81); w8(0xFA); w32(capacityLimit);
+            w8(0x0F); w8(0x8D);
+            const zeroJgePatchOff = off; w32(0);
+            w8(0xB9); w32(dataBase);
+            w8(0x01); w8(0xD1);
+            w8(0x89); w8(0x01);
+            w8(0xC7); w8(0x41); w8(0x04); w32(0);
+            w8(0x83); w8(0x05); w32(ctrlAddr); w8(8);
+            w8(0xBA); w32(0xB077);
+            w8(0x31); w8(0xC0);
+            w8(0xC3);
+            const zeroOverflowAddr = off;
+            w8(0xBA); w32(0xB077);
+            w8(0xEF);
+            w8(0xC3);
+            dv.setInt32(zeroJgePatchOff, zeroOverflowAddr - (zeroJgePatchOff + 4), true);
+        } else {
+            if (pf) w8(0x9C);
+            w8(0x52);
+            w8(0x53);
+            w8(0x8B); w8(0x15); w32(ctrlAddr);
+            w8(0x81); w8(0xFA); w32(capacityLimit);
+            w8(0x0F); w8(0x8D);
+            const zeroJgePatchOff = off; w32(0);
+            w8(0xBB); w32(dataBase);
+            w8(0x03); w8(0xDA);
+            w8(0x89); w8(0x03);
+            w8(0xC7); w8(0x43); w8(0x04); w32(0);
+            w8(0x83); w8(0x05); w32(ctrlAddr); w8(8);
+            w8(0x5B);
+            w8(0x5A);
+            w8(0xBA); w32(0xB077);
+            w8(0x31); w8(0xC0);
+            if (pf) w8(0x9D);
+            w8(0xC3);
+            const zeroOverflowAddr = off;
+            w8(0x5B);
+            w8(0x5A);
+            if (pf) w8(0x9D);
+            w8(0xBA); w32(0xB077);
+            w8(0xEF);
+            w8(0xC3);
+            dv.setInt32(zeroJgePatchOff, zeroOverflowAddr - (zeroJgePatchOff + 4), true);
         }
 
         Logger.log(LogCategory.SYSTEM,
