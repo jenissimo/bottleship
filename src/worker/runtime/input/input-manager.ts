@@ -685,7 +685,7 @@ export class InputManager {
         // Flush buffered keyboard events now that we can enqueue
         if (enqueue && this.pendingKeyEvents.length > 0) {
             for (const evt of this.pendingKeyEvents) {
-                this.windowManager.postMessage(
+                this.windowManager.postInputMessage(
                     targetHwnd,
                     evt.pressed ? WM_KEYDOWN : WM_KEYUP,
                     evt.vk,
@@ -719,7 +719,7 @@ export class InputManager {
             if (!mouseInside && deviceMouseMessages) {
                 // Mouse left canvas — fire WM_MOUSELEAVE for all tracked windows (one-shot)
                 for (const hwnd of this.tmeLeaveHwnds) {
-                    this.windowManager.postMessage(hwnd, WM_MOUSELEAVE, 0, 0, screenX, screenY, 0, keyStateSnapshot);
+                    this.windowManager.postInputMessage(hwnd, WM_MOUSELEAVE, 0, 0, screenX, screenY, 0, keyStateSnapshot);
                     Logger.verbose(LogCategory.SYSTEM, `Input: WM_MOUSELEAVE hwnd=0x${hwnd.toString(16)}`);
                 }
                 this.tmeLeaveHwnds.clear();
@@ -764,7 +764,7 @@ export class InputManager {
             for (const [hwnd, entry] of this.tmeHoverMap) {
                 if (now >= entry.fireAt && cursorX === entry.x && cursorY === entry.y) {
                     const hoverWParam = this.buttonsToWParam(buttons);
-                    this.windowManager.postMessage(hwnd, WM_MOUSEHOVER, hoverWParam, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
+                    this.windowManager.postInputMessage(hwnd, WM_MOUSEHOVER, hoverWParam, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
                     Logger.verbose(LogCategory.SYSTEM, `Input: WM_MOUSEHOVER hwnd=0x${hwnd.toString(16)}`);
                     this.tmeHoverMap.delete(hwnd); // hover is one-shot; app must re-register
                 }
@@ -790,13 +790,13 @@ export class InputManager {
         if (leftDown !== wasLeftDown && deviceMouseMessages) {
             let msg = leftDown ? WM_LBUTTONDOWN : WM_LBUTTONUP;
             if (leftDown) msg = this.checkDblClick(0, mouseTargetHwnd, clientX, clientY, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK);
-            this.windowManager.postMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
+            this.windowManager.postInputMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
         }
 
         if (rightDown !== wasRightDown && deviceMouseMessages) {
             let msg = rightDown ? WM_RBUTTONDOWN : WM_RBUTTONUP;
             if (rightDown) msg = this.checkDblClick(1, mouseTargetHwnd, clientX, clientY, WM_RBUTTONDOWN, WM_RBUTTONDBLCLK);
-            this.windowManager.postMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
+            this.windowManager.postInputMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
 
             Logger.verbose(LogCategory.SYSTEM, `Input: ${
                 rightDown
@@ -808,7 +808,7 @@ export class InputManager {
         if (middleDown !== wasMiddleDown && deviceMouseMessages) {
             let msg = middleDown ? WM_MBUTTONDOWN : WM_MBUTTONUP;
             if (middleDown) msg = this.checkDblClick(2, mouseTargetHwnd, clientX, clientY, WM_MBUTTONDOWN, WM_MBUTTONDBLCLK);
-            this.windowManager.postMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
+            this.windowManager.postInputMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
             Logger.verbose(LogCategory.SYSTEM, `Input: ${
                 middleDown
                     ? (msg === WM_MBUTTONDBLCLK ? 'MButtonDblClk' : 'MButtonDown')
@@ -824,7 +824,7 @@ export class InputManager {
             const lParamWheel = ((clampScreenCoord(screenY) & 0xFFFF) << 16) | (clampScreenCoord(screenX) & 0xFFFF);
             const wheelDelta = Math.round(-mouseWheel * 1.2);
             const wParam = (this.buttonsToWParam(buttons) & 0xFFFF) | ((wheelDelta & 0xFFFF) << 16);
-            if (deviceMouseMessages) this.windowManager.postMessage(mouseTargetHwnd, WM_MOUSEWHEEL, wParam, lParamWheel, screenX, screenY, 0, keyStateSnapshot);
+            if (deviceMouseMessages) this.windowManager.postInputMessage(mouseTargetHwnd, WM_MOUSEWHEEL, wParam, lParamWheel, screenX, screenY, 0, keyStateSnapshot);
             Logger.verbose(LogCategory.SYSTEM, `Input: MouseWheel delta=${wheelDelta} at (${clientX},${clientY})`);
             // Slot already consumed atomically at the top of poll(); a store(0) here
             // would race a scroll that arrived in between and drop it.
@@ -859,7 +859,7 @@ export class InputManager {
             if (newKeyEvents.length > 0) {
                 if (enqueue) {
                     for (const evt of newKeyEvents) {
-                        this.windowManager.postMessage(
+                        this.windowManager.postInputMessage(
                             targetHwnd,
                             evt.pressed ? WM_KEYDOWN : WM_KEYUP,
                             evt.vk,
@@ -946,10 +946,10 @@ export class InputManager {
         const client = this.clientPointFor(target, screenX, screenY);
         const lParam = ((client.y & 0xFFFF) << 16) | (client.x & 0xFFFF);
         if (withSetCursor) {
-            this.windowManager.postMessage(target.hwnd, WM_SETCURSOR, target.hwnd,
+            this.windowManager.postInputMessage(target.hwnd, WM_SETCURSOR, target.hwnd,
                 (HTCLIENT | (WM_MOUSEMOVE << 16)) >>> 0, screenX, screenY, 0, keyState);
         }
-        this.windowManager.postMessage(target.hwnd, WM_MOUSEMOVE, this.buttonsToWParam(buttons),
+        this.windowManager.postInputMessage(target.hwnd, WM_MOUSEMOVE, this.buttonsToWParam(buttons),
             lParam, screenX, screenY, 0, keyState);
     }
 
@@ -1022,7 +1022,7 @@ export class InputManager {
         const scan = vkToScanCode(vk);
         const ext = isExtendedKey(vk) ? 0x01000000 : 0;
         const lParam = ((repeatCount & 0xFFFF) | (scan << 16) | ext | 0x40000000) >>> 0;
-        this.windowManager.postMessage(
+        this.windowManager.postInputMessage(
             targetWin.hwnd, WM_KEYDOWN, vk, lParam, 0, 0, 0,
             this.buildPackedKeyState(this.packedKeyStateScratch),
         );

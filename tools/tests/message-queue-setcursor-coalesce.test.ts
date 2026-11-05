@@ -68,7 +68,7 @@ describe("WM_SETCURSOR coalesces with its mouse move", () => {
     it("a click flushes the pending pair ahead of it, in order", () => {
         const q = new MessageQueue();
         postMove(q, 3);
-        q.enqueue(HWND, WM_LBUTTONDOWN, 1, 3);
+        q.enqueue(HWND, WM_LBUTTONDOWN, 1, 3, 0, 0, 0, undefined, 0, true, 0, true);
         expect(drain(q).map(([m]) => m)).toEqual([WM_SETCURSOR, WM_MOUSEMOVE, WM_LBUTTONDOWN]);
     });
 

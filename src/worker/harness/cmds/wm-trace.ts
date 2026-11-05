@@ -180,6 +180,7 @@ export function registerWmTraceCommands(svc: HarnessService): void {
             w.postMessage = (
                 hwnd: number, msg: number, wParam: number, lParam: number,
                 ptX = 0, ptY = 0, targetThreadId = 0, keyStatePacked?: Uint8Array,
+                ...rest: unknown[]
             ): void => {
                 const name = TRACED_MSG[msg];
                 if (name) {
@@ -192,7 +193,7 @@ export function registerWmTraceCommands(svc: HarnessService): void {
                         seq: (sys().inputManager as any)?.lastSeq ?? -1,
                     });
                 }
-                original(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked);
+                (original as (...a: unknown[]) => void)(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked, ...rest);
             };
             // Control notifications are delivered synchronously, not posted — tap them
             // at the source or the ring shows the input and never the outcome.
