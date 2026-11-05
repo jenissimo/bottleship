@@ -11,4 +11,5 @@ export const STATELESS_MODULES: Readonly<Record<string, string>> = {
     winspool: 'OpenPrinter fails and the queries answer fixed values; no printer handle exists',
     hid: 'HidD queries answer fixed data; no device is opened',
     oledlg: 'OleUIAddVerbMenu answers without creating or keeping a menu',
+    advapi32: 'state lives only in kernel handles (registry keys, service and crypto handles); those have no codec yet, so an open one is refused by name, and the registry is disk',
 };
