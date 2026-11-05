@@ -175,7 +175,7 @@ export class AudioEngine {
         const ctx = this.context;
         if (!ctx || ctx.state !== "suspended" || this.userPaused) return;
         const ua = (navigator as unknown as { userActivation?: { hasBeenActive: boolean } }).userActivation;
-        if (!ua || ua.hasBeenActive) void this.resume();
+        if (!ua || ua.hasBeenActive) void this.resumeIfNotPaused();
       });
     }
     // Arming is idempotent; do it here too so the first audio use is covered even
@@ -200,10 +200,13 @@ export class AudioEngine {
     const onGesture = () => {
       if (this.userPaused) return;
       if (this.context && this.context.state === "running") return;
-      void this.resume();
+      void this.resumeIfNotPaused();
     };
     // Capture phase + passive: fire before app handlers, never block the gesture.
-    for (const type of ["pointerdown", "keydown", "touchstart", "mousedown"] as const) {
+    // A touch pointerdown/touchstart is not activation-triggering (HTML user activation);
+    // pointerup/touchend are, so the first unlock on a touch screen does not depend on
+    // the compatibility mousedown.
+    for (const type of ["pointerdown", "pointerup", "keydown", "touchstart", "touchend", "mousedown"] as const) {
       window.addEventListener(type, onGesture, { capture: true, passive: true });
     }
   }
