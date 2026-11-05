@@ -291,6 +291,8 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_MDI_driver_type@4", 1),
         makeFunc("_AIL_set_XMIDI_master_volume@8", 2),
         makeFunc("_AIL_XMIDI_master_volume@4", 1),
+        makeFunc("_AIL_midiOutOpen@12", 3),              // (HMDIDRIVER*, LPHMIDIOUT*, device id)
+        makeFunc("_AIL_midiOutClose@4", 1),
         // Digital master volume. MSS 5 spells it S32 0–127, MSS 6 adds the F32
         // 0.0–1.0 `_level` pair; a shipped DLL exports both and they share a field.
         makeFunc("_AIL_set_digital_master_volume@8", 2),

@@ -108,6 +108,7 @@ import { Wtsapi32 } from "./modules/wtsapi32";
 import { Msacm32 } from "./modules/msacm32";
 import { Imm32 } from "./modules/imm32";
 import { Msimg32 } from "./modules/msimg32";
+import { Wing32 } from "./modules/wing32";
 import { Uxtheme } from "./modules/uxtheme";
 import { Wintrust } from "./modules/wintrust";
 import { Crypt32 } from "./modules/crypt32";
@@ -2743,6 +2744,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const msacm32 = new Msacm32();
       const imm32 = new Imm32();
       const msimg32 = new Msimg32();
+      const wing32 = new Wing32();
       const uxtheme = new Uxtheme();
       const wintrust = new Wintrust();
       const crypt32 = new Crypt32();
@@ -2826,6 +2828,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       msacm32.initialize(process);
       imm32.initialize(process);
       msimg32.initialize(process);
+      wing32.initialize(process);
       uxtheme.initialize(process);
       wintrust.initialize(process);
       crypt32.initialize(process);
@@ -2906,6 +2909,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(msacm32.name, msacm32);
       process.registerModule(imm32.name, imm32);
       process.registerModule(msimg32.name, msimg32);
+      process.registerModule(wing32.name, wing32);
       process.registerModule(uxtheme.name, uxtheme);
       process.registerModule(wintrust.name, wintrust);
       process.registerModule(crypt32.name, crypt32);
@@ -2988,6 +2992,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(msacm32.name, msacm32.exports);
       process.dispatcher.registerModule(imm32.name, imm32.exports);
       process.dispatcher.registerModule(msimg32.name, msimg32.exports);
+      process.dispatcher.registerModule(wing32.name, wing32.exports);
       process.dispatcher.registerModule(uxtheme.name, uxtheme.exports);
       process.dispatcher.registerModule(wintrust.name, wintrust.exports);
       process.dispatcher.registerModule(crypt32.name, crypt32.exports);

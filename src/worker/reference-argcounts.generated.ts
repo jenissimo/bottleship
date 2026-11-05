@@ -12698,6 +12698,18 @@ export const REFERENCE_ARG_COUNTS: ReferenceArgCountMap = {
     "rtlntstatustodoserror": 1,
     "w32s_backto32": 0
   },
+  "wing32": {
+    "wingbitblt": 8,
+    "wingcreatebitmap": 3,
+    "wingcreatedc": 0,
+    "wingcreatehalftonebrush": 3,
+    "wingcreatehalftonepalette": 0,
+    "winggetdibcolortable": 4,
+    "winggetdibpointer": 2,
+    "wingrecommenddibformat": 1,
+    "wingsetdibcolortable": 4,
+    "wingstretchblt": 10
+  },
   "wininet": {
     "commiturlcacheentrya": 11,
     "commiturlcacheentryw": 11,

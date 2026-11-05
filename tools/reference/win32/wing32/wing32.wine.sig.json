@@ -1,0 +1,47 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-11-05T00:00:00.000Z",
+  "module": "wing32",
+  "functions": [
+    {
+      "name": "WinGBitBlt",
+      "argCount": 8
+    },
+    {
+      "name": "WinGCreateBitmap",
+      "argCount": 3
+    },
+    {
+      "name": "WinGCreateDC",
+      "argCount": 0
+    },
+    {
+      "name": "WinGCreateHalftoneBrush",
+      "argCount": 3
+    },
+    {
+      "name": "WinGCreateHalftonePalette",
+      "argCount": 0
+    },
+    {
+      "name": "WinGGetDIBColorTable",
+      "argCount": 4
+    },
+    {
+      "name": "WinGGetDIBPointer",
+      "argCount": 2
+    },
+    {
+      "name": "WinGRecommendDIBFormat",
+      "argCount": 1
+    },
+    {
+      "name": "WinGSetDIBColorTable",
+      "argCount": 4
+    },
+    {
+      "name": "WinGStretchBlt",
+      "argCount": 10
+    }
+  ]
+}
