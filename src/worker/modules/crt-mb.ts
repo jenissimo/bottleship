@@ -169,10 +169,12 @@ export function registerCrtMbExports(exports: Record<string, ThunkImplementation
         return n;
     };
 
+    // _mbsinc is str + _mbclen(str): one byte per character under SBCS, the terminator
+    // included (Wine mbcs.c; MS docs: "pointer to the character that immediately follows").
     exports["_mbsinc"] = (_c, _m, a) => {
         const ptr = a[0] ?? 0;
         if (!ptr) return 0;
-        return chr(ptr, 0) === 0 ? ptr >>> 0 : (ptr + 1) >>> 0;
+        return (ptr + 1) >>> 0;
     };
 
     exports["_mbsdec"] = (_c, _m, a) => {
@@ -182,10 +184,11 @@ export function registerCrtMbExports(exports: Record<string, ThunkImplementation
         return (current - 1) >>> 0;
     };
 
+    // 1 or 2 (MS docs); a lone byte — the terminator included — is 1 (Wine _mbclen_l).
     exports["_mbclen"] = (_c, _m, a) => {
         const ptr = a[0] ?? 0;
         if (!ptr) return 0;
-        return chr(ptr, 0) === 0 ? 0 : 1;
+        return 1;
     };
 
     // Characters, not bytes; with one byte per character that is strlen.
@@ -234,6 +237,15 @@ export function registerCrtMbExports(exports: Record<string, ThunkImplementation
 
     exports["_ismbcspace"] = (_c, _m, a) => host.ischartype(a[0] ?? 0, 0x0008);
     exports["_ismbcdigit"] = (_c, _m, a) => host.ischartype(a[0] ?? 0, 0x0004);
+    // _ismbcalpha: a single-byte value classifies like isalpha (_ALPHA = 0x0103). A value
+    // above 0xFF is a double-byte character; no SBCS code page has one, and classifying a
+    // DBCS one needs the page's Unicode mapping (Wine: iswalpha(mbc_to_wc(c))), so refuse it.
+    exports["_ismbcalpha"] = (_c, _m, a) => {
+        const ch = (a[0] ?? 0) >>> 0;
+        if (ch <= 0xff) return host.ischartype(ch, 0x0103);
+        requireSbcs();
+        return 0;
+    };
 
     exports["_setmbcp"] = (_c, _m, a) => host.setMbcp(a[0] ?? 0);
     exports["_getmbcp"] = () => host.getMbcp();

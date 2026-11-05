@@ -613,6 +613,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_mbsdec", 2),
         makeFunc("_ismbcspace", 1),
         makeFunc("_ismbcdigit", 1),
+        makeFunc("_ismbcalpha", 1),
         makeFunc("_mbsnbcmp", 3),
         makeFunc("_mbclen", 1),
         makeFunc("_mbstrlen", 1),
