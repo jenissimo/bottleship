@@ -90,7 +90,17 @@ export function createChildVfsServer(vfs: VirtualFileSystem, buffer: SharedArray
                 const value = decoded[0];
                 onMutation?.(typeof value === 'string' ? value : (value as VfsFileHandle).path);
             }
-            response = { value: pack(await fn.apply(vfs, decoded)) };
+            // A child's WriteFile lands like the parent's own (kernel32 WriteFile fast path):
+            // a copy into the cache, persistence deferred. Waiting on the OPFS commit instead
+            // leaves a CREATE_ALWAYS-truncated file empty to every other process for the
+            // commit's milliseconds.
+            if (method === 'write' || method === 'writeSync') {
+                const [handle, data] = decoded as [VfsFileHandle, Uint8Array];
+                const buffered = vfs.writeSync(handle, data);
+                response = { value: buffered >= 0 ? buffered : await vfs.write(handle, data) };
+            } else {
+                response = { value: pack(await fn.apply(vfs, decoded)) };
+            }
         } catch (error) {
             response = { error: String(error) };
         }
