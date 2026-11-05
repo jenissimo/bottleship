@@ -208,3 +208,29 @@ test("explicit resume waits for an in-flight suspend before reopening context", 
     assert.equal(context.state, "running");
     assert.equal(calls.resume, 1);
 });
+
+test("gesture unlock listens for activation-triggering touch ends and only resumes when not paused", async () => {
+    const listeners = new Map<string, () => void>();
+    const g = globalThis as { window?: unknown };
+    const hadWindow = "window" in g;
+    const previous = g.window;
+    g.window = { addEventListener: (type: string, fn: () => void) => { listeners.set(type, fn); } };
+    try {
+        const engine = new AudioEngine();
+        let automatic = 0;
+        let explicit = 0;
+        Object.assign(engine, {
+            resumeIfNotPaused: async () => { automatic++; },
+            resume: async () => { explicit++; },
+        });
+        engine.armAutoResume();
+        for (const type of ["pointerdown", "pointerup", "touchstart", "touchend", "mousedown", "keydown"]) {
+            assert.ok(listeners.has(type), type);
+        }
+        listeners.get("touchend")!();
+        assert.equal(automatic, 1);
+        assert.equal(explicit, 0);
+    } finally {
+        if (hadWindow) g.window = previous; else delete g.window;
+    }
+});
