@@ -5,7 +5,9 @@ import { MemoryDir, type Dir } from "../../src/worker/savestate/slots";
 import { ParticipantRegistry } from "../../src/worker/savestate/participant";
 import { captureSession, restoreSession, RestoreFailed, type SavestateTarget } from "../../src/worker/savestate/session";
 import { decodeSavestate, type CompatibilityKey } from "../../src/worker/savestate/container";
-import { writeRamChunks } from "../../src/worker/savestate/ram";
+import { snapshotRam, writeRamChunks } from "../../src/worker/savestate/ram";
+import { sha256HexSync } from "../../src/worker/savestate/sha256";
+import { sha256Hex } from "../../src/worker/savestate/chunk-store";
 import { CaptureRefusal } from "../../src/worker/savestate/object-codecs";
 import {
     guestConfig, openGameStore, PENDING_TTL_MS, runPendingLoad, writePendingLoad, type SavestateStorage,
@@ -190,5 +192,35 @@ describe("halt", () => {
         const h = io({ readiness: () => busy });
         await expect(haltAtSafePoint(h)).rejects.toBeInstanceOf(CaptureRefusal);
         expect(h.calls.filter(c => c === "pause").length).toBe(HALT_ATTEMPTS);
+    });
+});
+
+describe("synchronous RAM hash", () => {
+    test("matches WebCrypto SHA-256 at every padding boundary", async () => {
+        for (const n of [0, 1, 55, 56, 57, 63, 64, 65, 119, 120, 128, 1000, RAM_CHUNK_SIZE]) {
+            const bytes = new Uint8Array(n);
+            for (let i = 0; i < n; i++) bytes[i] = (i * 131 + 7) & 0xff;
+            expect(sha256HexSync(bytes)).toBe(await sha256Hex(bytes));
+        }
+    });
+
+    test("snapshotRam runs in one turn", () => {
+        const mem = new Uint8Array(2 * RAM_CHUNK_SIZE).fill(1);
+        const snap = snapshotRam(mem, new Set());
+        expect(snap instanceof Promise).toBe(false);
+        expect(snap.manifest.chunks.length).toBe(2);
+        expect(snap.pending.size).toBe(1);
+    });
+
+    test("a manifest for another RAM size is refused before anything is written", async () => {
+        const mem = new Uint8Array(2 * RAM_CHUNK_SIZE).fill(5);
+        const store = new MemoryChunkStore();
+        const result = await captureSession(target(mem), new Set(), () => undefined, registry([]));
+        await writeRamChunks(result.pending, store);
+        const other = new Uint8Array(3 * RAM_CHUNK_SIZE).fill(1);
+        const err = await restoreSession(target(other), decodeSavestate(result.bytes), store, registry([])).catch(e => e);
+        expect(err).toBeInstanceOf(Error);
+        expect(err).not.toBeInstanceOf(RestoreFailed);
+        expect(other.every(b => b === 1)).toBe(true);
     });
 });
