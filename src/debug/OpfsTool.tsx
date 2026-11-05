@@ -9,6 +9,7 @@ import { cx } from '../ui/cx';
 import s from './OpfsTool.module.css';
 import ms from '../ui/Modal/Modal.module.css';
 import { ActionButton } from '../ui/ActionButton';
+import { bundleCacheClearPlan, clearBundleCache } from '../worker/runtime/filesystem/wgb-cache-policy';
 
 /**
  * OPFS Raw Browser — dev-only, file-level escape hatch.
@@ -364,7 +365,7 @@ const OpfsTool: React.FC<OpfsToolProps> = ({ isOpen, onClose }) => {
     const reclaim = formatBytes(items.reduce((s, f) => s + f.size, 0));
     const label =
       cat === 'bundle'
-        ? `Evict all ${items.length} cached game bundle(s)? Frees ${reclaim}. Bundles re-download on next launch; saves are kept.`
+        ? `Evict all ${items.length} cached game bundle(s)? Frees ${reclaim}. Bundles re-download on next launch; saves are kept. Imported (bring-your-own) games are deleted too — use "Clear bundle cache" to keep them.`
         : `Clean all ${items.length} ephemeral file(s)? Frees ${reclaim}. Saves are kept.`;
     if (!confirm(label)) return;
     return withBusy(async () => {
@@ -379,6 +380,31 @@ const OpfsTool: React.FC<OpfsToolProps> = ({ isOpen, onClose }) => {
       }
       if (failures.length) setError(`Some entries could not be removed:\n${failures.join('\n')}`);
       await loadFiles();
+    });
+  };
+
+  /** Drop URL-bundle copies only (streamed sparse chunks, promoted archives, .part) —
+   *  imported bring-your-own bundles, saves and overlays are kept. */
+  const handleClearStreamCache = () => {
+    const doomed = new Set(
+      bundleCacheClearPlan(
+        files.filter((f) => f.category === 'bundle' && f.segments.length === 2).map((f) => f.segments[1]),
+      ),
+    );
+    const reclaim = formatBytes(
+      files.filter((f) => f.segments.length === 2 && doomed.has(f.segments[1])).reduce((sum, f) => sum + f.size, 0),
+    );
+    if (!confirm(`Clear the bundle cache (${doomed.size} file(s), ${reclaim})?\n\nRemoves streamed/downloaded copies of URL bundles. Imported games, saves and overlays are kept.`)) return;
+    return withBusy(async () => {
+      try {
+        const result = await clearBundleCache();
+        if (result.failed.length) {
+          setError(`In use by the running game, not removed:\n${result.failed.join('\n')}`);
+        }
+        await loadFiles();
+      } catch (err: any) {
+        setError(`Failed to clear bundle cache: ${explainOpfsError(err)}`);
+      }
     });
   };
 
@@ -484,6 +510,12 @@ const OpfsTool: React.FC<OpfsToolProps> = ({ isOpen, onClose }) => {
               disabled={disabled || totals.bundle === 0}
             >
               Evict bundles
+            </ActionButton>
+            <ActionButton
+              onClick={handleClearStreamCache}
+              disabled={disabled || totals.bundle === 0}
+            >
+              Clear bundle cache
             </ActionButton>
             <ActionButton
               onClick={() => handleClearCategory('ephemeral')}
