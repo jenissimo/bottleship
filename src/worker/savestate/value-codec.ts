@@ -1,3 +1,14 @@
+/**
+ * Plain-data values for savestate sections, encoded as JSON plus binary blobs.
+ *
+ * - Object keys are written sorted, so a value encodes to the same bytes whatever order its
+ *   keys were built in.
+ * - Typed arrays become blobs in host byte order, which is little-endian on every target,
+ *   like the container itself.
+ * - A shared, non-cyclic reference is written once per place it appears; a cycle is refused.
+ * - `undefined` is dropped from objects and refused in arrays; holes in a sparse array come
+ *   back as `null`.
+ */
 export type SaveValue =
     | null | boolean | number | string
     | Uint8Array | Uint16Array | Uint32Array | Int8Array | Int16Array | Int32Array | Float32Array | Float64Array
@@ -10,11 +21,17 @@ const TYPED = {
 } as const;
 type TypedTag = keyof typeof TYPED;
 
+const SPECIAL_NUMBERS: Readonly<Record<string, number>> = { '-0': -0, NaN: NaN, Infinity: Infinity, '-Infinity': -Infinity };
+
 function typedTag(v: unknown): TypedTag | null {
     for (const tag of Object.keys(TYPED) as TypedTag[]) {
         if (Object.getPrototypeOf(v) === TYPED[tag].prototype) return tag;
     }
     return null;
+}
+
+function isTypedTag(tag: unknown): tag is TypedTag {
+    return typeof tag === 'string' && Object.prototype.hasOwnProperty.call(TYPED, tag);
 }
 
 export class SaveValueError extends Error {
@@ -27,6 +44,7 @@ export interface EncodedValue { json: string; blobs: Uint8Array[] }
 
 export function encodeValue(value: SaveValue): EncodedValue {
     const blobs: Uint8Array[] = [];
+    const ancestors = new Set<object>();
     const walk = (v: unknown, path: string): unknown => {
         if (v === null || typeof v === 'boolean' || typeof v === 'string') return v;
         if (typeof v === 'number') {
@@ -40,37 +58,67 @@ export function encodeValue(value: SaveValue): EncodedValue {
             blobs.push(new Uint8Array(t.buffer, t.byteOffset, t.byteLength).slice());
             return { $typed: tag, blob: blobs.length - 1 };
         }
-        if (Array.isArray(v)) return v.map((x, i) => walk(x, `${path}[${i}]`));
-        if (Object.getPrototypeOf(v) !== Object.prototype) {
-            throw new SaveValueError(path, `${(v as object).constructor?.name ?? 'object'} is not a plain object`);
+        if (ancestors.has(v)) throw new SaveValueError(path, 'cycle');
+        ancestors.add(v);
+        try {
+            if (Array.isArray(v)) {
+                const arr: unknown[] = [];
+                for (let i = 0; i < v.length; i++) {
+                    if (i in v && v[i] === undefined) throw new SaveValueError(`${path}[${i}]`, 'undefined in an array');
+                    arr.push(i in v ? walk(v[i], `${path}[${i}]`) : null);
+                }
+                return arr;
+            }
+            if (Object.getPrototypeOf(v) !== Object.prototype) {
+                throw new SaveValueError(path, `${(v as object).constructor?.name ?? 'object'} is not a plain object`);
+            }
+            const out: Record<string, unknown> = Object.create(null);
+            for (const k of Object.keys(v).sort()) {
+                if (k.startsWith('$')) throw new SaveValueError(`${path}.${k}`, 'keys may not start with $');
+                if (k === '__proto__') throw new SaveValueError(`${path}.${k}`, 'the key __proto__ is not allowed');
+                const x = (v as Record<string, unknown>)[k];
+                if (x === undefined) continue;
+                out[k] = walk(x, `${path}.${k}`);
+            }
+            return out;
+        } finally {
+            ancestors.delete(v);
         }
-        const out: Record<string, unknown> = {};
-        for (const [k, x] of Object.entries(v)) {
-            if (k.startsWith('$')) throw new SaveValueError(`${path}.${k}`, 'keys may not start with $');
-            if (x === undefined) continue;
-            out[k] = walk(x, `${path}.${k}`);
-        }
-        return out;
     };
     return { json: JSON.stringify(walk(value, '')), blobs };
 }
 
 export function decodeValue(encoded: EncodedValue): SaveValue {
-    const walk = (v: unknown): SaveValue => {
+    const walk = (v: unknown, path: string): SaveValue => {
         if (v === null || typeof v !== 'object') return v as SaveValue;
-        if (Array.isArray(v)) return v.map(walk);
+        if (Array.isArray(v)) return v.map((x, i) => walk(x, `${path}[${i}]`));
         const o = v as Record<string, unknown>;
-        if (typeof o.$num === 'string') return o.$num === '-0' ? -0 : Number(o.$num);
-        if (typeof o.$typed === 'string') {
-            const Ctor = TYPED[o.$typed as TypedTag];
-            const blob = encoded.blobs[o.blob as number];
-            if (!Ctor || !blob) throw new Error(`savestate value: bad typed array ${o.$typed}/${o.blob}`);
+        if (Object.prototype.hasOwnProperty.call(o, '$num')) {
+            const n = o.$num;
+            if (typeof n !== 'string' || !Object.prototype.hasOwnProperty.call(SPECIAL_NUMBERS, n)) {
+                throw new SaveValueError(path, `bad number ${String(n)}`);
+            }
+            return SPECIAL_NUMBERS[n]!;
+        }
+        if (Object.prototype.hasOwnProperty.call(o, '$typed')) {
+            const index = o.blob;
+            if (!isTypedTag(o.$typed) || typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= encoded.blobs.length) {
+                throw new SaveValueError(path, `bad typed array ${String(o.$typed)}/${String(index)}`);
+            }
+            const Ctor = TYPED[o.$typed];
+            const blob = encoded.blobs[index]!;
+            if (blob.byteLength % Ctor.BYTES_PER_ELEMENT !== 0) {
+                throw new SaveValueError(path, `${blob.byteLength} bytes is not a whole number of ${o.$typed} elements`);
+            }
             const copy = blob.slice();
             return new Ctor(copy.buffer, 0, copy.byteLength / Ctor.BYTES_PER_ELEMENT) as SaveValue;
         }
         const out: Record<string, SaveValue> = {};
-        for (const [k, x] of Object.entries(o)) out[k] = walk(x);
+        for (const k of Object.keys(o)) {
+            if (k === '__proto__' || k.startsWith('$')) throw new SaveValueError(`${path}.${k}`, 'reserved key');
+            out[k] = walk(o[k], `${path}.${k}`);
+        }
         return out;
     };
-    return walk(JSON.parse(encoded.json));
+    return walk(JSON.parse(encoded.json), '');
 }

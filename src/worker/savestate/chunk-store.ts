@@ -7,31 +7,47 @@ export interface ChunkStore {
     size(hash: string): Promise<number>;
 }
 
-export class MemoryChunkStore implements ChunkStore {
-    readonly chunks = new Map<string, Uint8Array>();
-    async has(hash: string): Promise<boolean> { return this.chunks.has(hash); }
-    async get(hash: string): Promise<Uint8Array | null> { return this.chunks.get(hash)?.slice() ?? null; }
-    async put(hash: string, bytes: Uint8Array): Promise<void> { this.chunks.set(hash, bytes.slice()); }
-    async list(): Promise<string[]> { return [...this.chunks.keys()]; }
-    async delete(hash: string): Promise<void> { this.chunks.delete(hash); }
-    async size(hash: string): Promise<number> { return this.chunks.get(hash)?.length ?? 0; }
+const HASH_NAME = /^[0-9a-f]{64}$/;
+
+export function isChunkHash(hash: unknown): hash is string {
+    return typeof hash === 'string' && HASH_NAME.test(hash);
 }
 
-const HASH_NAME = /^[0-9a-f]{64}$/;
+function checkHash(hash: string): string {
+    if (!isChunkHash(hash)) throw new Error(`savestate: ${JSON.stringify(hash)} is not a chunk hash`);
+    return hash;
+}
+
+export class MemoryChunkStore implements ChunkStore {
+    readonly chunks = new Map<string, Uint8Array>();
+    async has(hash: string): Promise<boolean> { return this.chunks.has(checkHash(hash)); }
+    async get(hash: string): Promise<Uint8Array | null> { return this.chunks.get(checkHash(hash))?.slice() ?? null; }
+    async put(hash: string, bytes: Uint8Array): Promise<void> { this.chunks.set(checkHash(hash), bytes.slice()); }
+    async list(): Promise<string[]> { return [...this.chunks.keys()]; }
+    async delete(hash: string): Promise<void> { this.chunks.delete(checkHash(hash)); }
+    async size(hash: string): Promise<number> { return this.chunks.get(checkHash(hash))?.length ?? 0; }
+}
 
 export class OpfsChunkStore implements ChunkStore {
     private constructor(private readonly dir: FileSystemDirectoryHandle) {}
 
-    static async open(name = 'savestate-chunks'): Promise<OpfsChunkStore> {
-        const root = await navigator.storage.getDirectory();
-        return new OpfsChunkStore(await root.getDirectoryHandle(name, { create: true }));
+    static async open(path: readonly string[], root?: FileSystemDirectoryHandle): Promise<OpfsChunkStore> {
+        let dir = root ?? await navigator.storage.getDirectory();
+        for (const segment of path) {
+            if (!segment || segment === '.' || segment === '..' || /[\\/]/.test(segment)) {
+                throw new Error(`savestate: bad chunk directory segment ${JSON.stringify(segment)}`);
+            }
+            dir = await dir.getDirectoryHandle(segment, { create: true });
+        }
+        return new OpfsChunkStore(dir);
     }
 
     async has(hash: string): Promise<boolean> {
-        try { await this.dir.getFileHandle(hash); return true; } catch { return false; }
+        try { await this.dir.getFileHandle(checkHash(hash)); return true; } catch { return false; }
     }
 
     async get(hash: string): Promise<Uint8Array | null> {
+        checkHash(hash);
         try {
             const file = await (await this.dir.getFileHandle(hash)).getFile();
             return new Uint8Array(await file.arrayBuffer());
@@ -39,7 +55,7 @@ export class OpfsChunkStore implements ChunkStore {
     }
 
     async put(hash: string, bytes: Uint8Array): Promise<void> {
-        const handle = await this.dir.getFileHandle(hash, { create: true });
+        const handle = await this.dir.getFileHandle(checkHash(hash), { create: true });
         const writable = await handle.createWritable();
         await writable.write(bytes as Uint8Array<ArrayBuffer>);
         await writable.close();
@@ -54,11 +70,11 @@ export class OpfsChunkStore implements ChunkStore {
     }
 
     async delete(hash: string): Promise<void> {
-        await this.dir.removeEntry(hash).catch(() => undefined);
+        await this.dir.removeEntry(checkHash(hash)).catch(() => undefined);
     }
 
     async size(hash: string): Promise<number> {
-        try { return (await (await this.dir.getFileHandle(hash)).getFile()).size; } catch { return 0; }
+        try { return (await (await this.dir.getFileHandle(checkHash(hash))).getFile()).size; } catch { return 0; }
     }
 }
 
@@ -69,10 +85,32 @@ export async function sha256Hex(bytes: Uint8Array): Promise<string> {
     return hex;
 }
 
-async function transform(bytes: Uint8Array, stream: CompressionStream | DecompressionStream): Promise<Uint8Array> {
-    const out = new Response(new Blob([bytes as Uint8Array<ArrayBuffer>]).stream().pipeThrough(stream));
-    return new Uint8Array(await out.arrayBuffer());
+async function readCapped(stream: ReadableStream<Uint8Array>, limit: number): Promise<Uint8Array> {
+    const reader = stream.getReader();
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            total += value.byteLength;
+            if (total > limit) {
+                await reader.cancel().catch(() => undefined);
+                throw new Error(`savestate: chunk inflates past ${limit} bytes`);
+            }
+            parts.push(value);
+        }
+    } finally {
+        reader.releaseLock();
+    }
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) { out.set(p, off); off += p.byteLength; }
+    return out;
 }
 
-export const deflate = (bytes: Uint8Array) => transform(bytes, new CompressionStream('deflate-raw'));
-export const inflate = (bytes: Uint8Array) => transform(bytes, new DecompressionStream('deflate-raw'));
+const piped = (bytes: Uint8Array, stream: CompressionStream | DecompressionStream) =>
+    new Blob([bytes as Uint8Array<ArrayBuffer>]).stream().pipeThrough(stream) as ReadableStream<Uint8Array>;
+
+export const deflate = (bytes: Uint8Array) => readCapped(piped(bytes, new CompressionStream('deflate-raw')), Number.MAX_SAFE_INTEGER);
+export const inflate = (bytes: Uint8Array, limit: number) => readCapped(piped(bytes, new DecompressionStream('deflate-raw')), limit);
