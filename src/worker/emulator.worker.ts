@@ -2022,7 +2022,11 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         : payload.preload ? "preload-full" : policy.mode ?? "stream+fill";
       if (mode === "preload-full") {
         await liveIo.preloadFull();
-      } else if (policy.profileUrl) {
+      } else if (policy.profileUrl && mode !== "stream") {
+        // The profile only orders preload/fill; plain "stream" (always the case for a local
+        // disk route, whose ETag is a size/mtime stamp rather than the content hash a
+        // profile may have been recorded against) has no use for it, so it is neither
+        // fetched nor allowed to fail the boot.
         const response = await fetch(policy.profileUrl, { signal: AbortSignal.timeout(15_000), cache: "no-cache" });
         if (!response.ok) throw new Error(`WGB profile HTTP ${response.status}`);
         const profile = parseIoProfile(await response.json());
@@ -2033,8 +2037,8 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         if (mode === "preload-profile") {
           await liveIo.preloadChunks(profileChunkOrder(profile, liveIo.chunkBytes, policy.preloadPhases ?? ["loading", "first-level"]));
         }
-        if (mode !== "stream") liveIo.armFill(order);
-      } else {
+        liveIo.armFill(order);
+      } else if (mode !== "stream") {
         if (mode === "preload-profile") throw new Error("preload-profile requires io.profileUrl");
         if (mode === "stream+fill") liveIo.armFill();
       }
