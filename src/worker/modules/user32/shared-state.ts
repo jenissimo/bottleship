@@ -124,6 +124,7 @@ export function killWindowTimers(hwnd: number): void {
 // whichever loop removes it — the timer map lives in message.ts, the modal dialog pump
 // in dialog.ts retrieves messages without going through Get/PeekMessage.
 type RemovedTimerMessage = { hwnd: number; message: number; wParam: number; lParam: number; generatedTimer?: boolean; timerEpoch?: number };
+// @transient(cross-module wiring: createMessageExports registers it, the timer map it reaches lives in that factory)
 let removedTimerHook: ((msg: RemovedTimerMessage) => void) | null = null;
 export function registerRemovedTimerHook(fn: (msg: RemovedTimerMessage) => void): void {
     removedTimerHook = fn;

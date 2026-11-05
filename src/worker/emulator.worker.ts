@@ -34,6 +34,7 @@ setChildSessionPublisher((port, record) => {
   (self as unknown as Worker).postMessage({ type: 'child_session', port, imagePath: record.imagePath, record }, [port]);
 }, () => System.getInstance().releaseChildSessionBroker());
 /** Set by the page (set_jit_policy) or inherited by a child; applied at every v86 init. */
+// @transient(host JIT policy from the page, applies to every session in this worker by design)
 let hostJitMode: HostJitMode = "on";
 setChildBootContext(() => ({
   jitMode: hostJitMode,

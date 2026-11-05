@@ -1,0 +1,183 @@
+import { describe, expect, test } from "bun:test";
+import { SessionStateRegistry } from "../../src/worker/core/session-state";
+import { System } from "../../src/worker/core/system";
+import { sessionState } from "../../src/worker/core/session-state";
+
+describe("session state registry", () => {
+    test("resets one phase in registration order and keeps going past a failure", () => {
+        const reg = new SessionStateRegistry();
+        const order: string[] = [];
+        reg.register({ id: 'a', phase: 'subsystems', reset: () => order.push('a') });
+        reg.register({ id: 'x', phase: 'game-switch', reset: () => order.push('x') });
+        reg.register({ id: 'b', phase: 'subsystems', reset: () => { throw new Error('boom'); } });
+        reg.register({ id: 'c', phase: 'subsystems', reset: () => order.push('c') });
+        const failures = reg.resetPhase('subsystems');
+        expect(order).toEqual(['a', 'c']);
+        expect(failures.map(f => f.id)).toEqual(['b']);
+    });
+
+    test("re-registering an id replaces the entry in place; the disposer removes it", () => {
+        const reg = new SessionStateRegistry();
+        const seen: number[] = [];
+        reg.register({ id: 'a', phase: 'subsystems', reset: () => seen.push(1) });
+        reg.register({ id: 'b', phase: 'subsystems', reset: () => seen.push(2) });
+        const dispose = reg.register({ id: 'a', phase: 'subsystems', reset: () => seen.push(3) });
+        reg.resetPhase('subsystems');
+        expect(seen).toEqual([3, 2]);
+        dispose();
+        expect(reg.ids()).toEqual(['b']);
+    });
+
+    test("System registers its per-session stores in reset order", () => {
+        System.getInstance();
+        expect(sessionState.ids('game-switch')).toEqual(['time', 'video-engine', 'lib-hle', 'hooks', 'gpu-resources', 'hypercall-tables', 'implicit-tls']);
+        expect(sessionState.ids('subsystems')).toEqual([
+            'load-diagnostics', 'window-manager', 'gdi', 'input', 'services', 'video-routing', 'com-resources', 'scheduler',
+            'memory-watch', 'leases', 'memory-events', 'seh-dispatch', 'named-objects', 'profiler', 'frame-profiler',
+        ]);
+    });
+});
+
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { censusOf, runCensus, stripNonCode } from "../validate-session-state";
+
+describe("session-state census", () => {
+    test("names module-scope and factory-scope mutable bindings, skips ones with a stated reason", () => {
+        const src = [
+            "let counter = 0;",
+            "export const cache = new Map<number, string>();",
+            "const TABLE = { a: 1 };",
+            "const list = [];",
+            "// @transient(diagnostics ring)",
+            "const ring = new Array(64);",
+            "let seen = new Set(); // @session-state",
+            "export function createFooExports(ctx: unknown) {",
+            "    const handles = new Map();",
+            "    let next = 1;",
+            "    const fixed = 3;",
+            "    function inner() { let x = 0; }",
+            "}",
+            "function helper() {",
+            "    let local = 1;",
+            "}",
+        ].join("\n");
+        expect(censusOf(src).names).toEqual(["counter", "cache", "list", "seen", "createFooExports.handles", "createFooExports.next"]);
+    });
+
+    test("sees arrow factories, class singletons, static fields, => in types, any indentation", () => {
+        const src = [
+            "export const registry = new HandleRegistry();",
+            "const h: Map<number, () => void> = new Map();",
+            "const scratch = new DataView(new ArrayBuffer(8)); // @transient(scratch)",
+            "export const createBarExports = (ctx: { a: number }): Record<string, unknown> => {",
+            "  let next = 1;",
+            "  const byId = new Map<number, string>();",
+            "  const helper = () => { let inner = 0; };",
+            "  return {};",
+            "};",
+            "export const createBazExports = function () {",
+            "\tlet count = 0;",
+            "};",
+            "export class Cache {",
+            "    private static instance: Cache | null = null;",
+            "    private static readonly map = new Map<string, number>();",
+            "    static readonly LIMIT = 4;",
+            "    static get(): Cache { return Cache.instance!; }",
+            "}",
+            "const doc = `let notBinding = 1; ${`nested ${'{'}`}`;",
+            "const re = /[{]let x/g;",
+        ].join("\n");
+        expect(censusOf(src).names).toEqual([
+            "registry", "h", "createBarExports.next", "createBarExports.byId", "createBazExports.count",
+            "static Cache.instance", "static Cache.map",
+        ]);
+    });
+
+    test("@transient() with an empty reason is reported and does not exempt", () => {
+        const c = censusOf(["let a = 0; // @transient()", "// @transient(   )", "let b = 0;"].join("\n"));
+        expect(c.names).toEqual(["a", "b"]);
+        expect(c.emptyReasons).toEqual([1, 3]);
+    });
+
+    test("stripping keeps every src/worker file brace-balanced", () => {
+        const files: string[] = [];
+        const walk = (d: string) => {
+            for (const n of readdirSync(d)) {
+                const f = join(d, n);
+                if (statSync(f).isDirectory()) walk(f); else if (n.endsWith(".ts")) files.push(f);
+            }
+        };
+        walk(join(import.meta.dir, "..", "..", "src", "worker"));
+        const unbalanced = files.filter(f => {
+            let depth = 0;
+            for (const ch of stripNonCode(readFileSync(f, "utf8"))) {
+                if (ch === "{") depth++;
+                else if (ch === "}" && --depth < 0) return true;
+            }
+            return depth !== 0;
+        });
+        expect(unbalanced).toEqual([]);
+    });
+});
+
+describe("session-state census gate", () => {
+    const setup = (files: Record<string, string>, pin: Record<string, string[]>) => {
+        const base = mkdtempSync(join(tmpdir(), "session-census-"));
+        const root = join(base, "src");
+        mkdirSync(root);
+        for (const [name, body] of Object.entries(files)) writeFileSync(join(root, name), body);
+        const pinPath = join(base, "pin.json");
+        writeFileSync(pinPath, JSON.stringify(pin));
+        return { base, root, pin: pinPath, done: () => rmSync(base, { recursive: true, force: true }) };
+    };
+    const run = (files: Record<string, string>, pin: Record<string, string[]>) => {
+        const t = setup(files, pin);
+        try { return runCensus(t); } finally { t.done(); }
+    };
+
+    test("passes when the tree matches the pin exactly", () => {
+        expect(run({ "a.ts": "let x = 0;\nlet y = 0;\n" }, { "src/a.ts": ["x", "y"] }).ok).toBe(true);
+    });
+
+    test("fails on growth", () => {
+        const r = run({ "a.ts": "let x = 0;\nlet y = 0;\n", "b.ts": "let z = 0;\n" }, { "src/a.ts": ["x"] });
+        expect(r.ok).toBe(false);
+        expect(r.lines.join("\n")).toContain("NEW: src/a.ts — y");
+        expect(r.lines.join("\n")).toContain("NEW: src/b.ts — z");
+    });
+
+    test("fails on drift below the pin", () => {
+        const r = run({ "a.ts": "let x = 0;\n" }, { "src/a.ts": ["x", "y"] });
+        expect(r.ok).toBe(false);
+        expect(r.lines.join("\n")).toContain("DRIFT: src/a.ts — pinned but gone: y");
+    });
+
+    test("fails when one binding is swapped for another at the same count", () => {
+        const r = run({ "a.ts": "let x = 0;\nlet w = 0;\n" }, { "src/a.ts": ["x", "y"] });
+        expect(r.ok).toBe(false);
+        expect(r.lines.join("\n")).toMatch(/NEW: src\/a\.ts — w[\s\S]*DRIFT: src\/a\.ts — pinned but gone: y/);
+    });
+
+    test("fails on a stale pin", () => {
+        const r = run({ "a.ts": "let x = 0;\n", "b.ts": "const fixed = 1;\n" }, { "src/a.ts": ["x"], "src/b.ts": ["gone"] });
+        expect(r.ok).toBe(false);
+        expect(r.lines.join("\n")).toContain("STALE PIN: src/b.ts");
+    });
+
+    test("fails on an empty @transient() reason", () => {
+        const r = run({ "a.ts": "let x = 0; // @transient()\n" }, { "src/a.ts": ["x"] });
+        expect(r.ok).toBe(false);
+        expect(r.lines.join("\n")).toContain("EMPTY REASON: src/a.ts:1");
+    });
+
+    test("--update writes a pin the check then accepts", () => {
+        const t = setup({ "a.ts": "let y = 0;\nlet x = 0;\n" }, {});
+        try {
+            expect(runCensus({ ...t, update: true }).ok).toBe(true);
+            expect(JSON.parse(readFileSync(t.pin, "utf8"))).toEqual({ "src/a.ts": ["x", "y"] });
+            expect(runCensus(t).ok).toBe(true);
+        } finally { t.done(); }
+    });
+});

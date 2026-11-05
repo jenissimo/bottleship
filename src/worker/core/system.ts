@@ -35,6 +35,7 @@ import { resetSehDispatchState } from "./seh-dispatch";
 import { namedObjects } from "../modules/kernel32/named-objects";
 import { hasWaitingModalPump } from "../modules/user32/modal-dialog-state";
 import { hypercallDataManager } from "./cpu/hypercall-data";
+import { sessionState, type SessionResetFailure } from "./session-state";
 import type { PointerClipRect } from "./pointer-policy";
 
 /**
@@ -404,6 +405,61 @@ export class System {
         this.comResourceManager = new ComResourceManager();
         this.apiRegistry = APIRegistry.getInstance();
         this.scheduler = new Scheduler({ enabled: true });
+        this.registerSessionState();
+    }
+
+    /** Per-session stores that System.reset() walks (see session-state.ts), in reset order. */
+    private registerSessionState(): void {
+        const add = (id: string, phase: 'game-switch' | 'subsystems', reset: () => void) =>
+            sessionState.register({ id, phase, reset });
+        add('time', 'game-switch', () => TimeService.getInstance().resetForGameSwitch());
+        add('video-engine', 'game-switch', () => videoEngine.closeAll());
+        add('lib-hle', 'game-switch', () => libHleManager.resetOnGameSwitch());
+        add('hooks', 'game-switch', () => hookRegistry.reset());
+        // Flush deferred destroys (return-to-pool), then wipe the pool — sizes/formats
+        // from game A must not be handed to game B. clear() alone would drop the pending
+        // queue without destroying those textures.
+        add('gpu-resources', 'game-switch', () => {
+            this.gpuResourceManager?.flushPendingDestruction();
+            this.gpuResourceManager?.clear();
+        });
+        add('hypercall-tables', 'game-switch', () => {
+            hypercallDataManager.resetDispatchTable();
+            hypercallDataManager.resetThreadSuspendTable();
+        });
+        // PE-loader TLS templates are guest VAs that die with Process.reset().
+        add('implicit-tls', 'game-switch', () => { this.implicitTlsEntries = []; });
+
+        add('load-diagnostics', 'subsystems', () => loadDiagnostics.reset());
+        add('window-manager', 'subsystems', () => this.windowManager.reset());
+        add('gdi', 'subsystems', () => this.gdiContext.reset());
+        add('input', 'subsystems', () => this.inputManager.reset());
+        add('services', 'subsystems', () => this.services.reset());
+        add('video-routing', 'subsystems', () => this.videoRouting.reset());
+        add('com-resources', 'subsystems', () => this.comResourceManager.reset());
+        add('scheduler', 'subsystems', () => this.scheduler.reset());
+        add('memory-watch', 'subsystems', () => memoryWatch.reset());
+        // Surfaces are gone after Process.reset, so their leases are stale.
+        add('leases', 'subsystems', () => leaseRegistry.reset());
+        add('memory-events', 'subsystems', () => memoryEventBuffer.reset());
+        // In-flight exceptions and active-catch records are keyed by TEB.
+        add('seh-dispatch', 'subsystems', () => resetSehDispatchState());
+        // Named mutex/event/semaphore refcounts: a fresh run must not resolve the previous game's names.
+        add('named-objects', 'subsystems', () => namedObjects.reset());
+        add('profiler', 'subsystems', () => profiler.reset());
+        add('frame-profiler', 'subsystems', () => frameProfiler.reset());
+    }
+
+    /**
+     * A failed per-session reset is the cross-game leak the registry exists to prevent, so it
+     * is logged as an error and collected for the caller of reset(); the remaining entries
+     * still run, as the module reset() loop does.
+     */
+    private resetSessionPhase(phase: 'game-switch' | 'subsystems', failures: SessionResetFailure[]): void {
+        for (const failure of sessionState.resetPhase(phase)) {
+            Logger.error(LogCategory.SYSTEM, `Failed to reset session state "${failure.id}": ${failure.error}`);
+            failures.push(failure);
+        }
     }
 
     static getInstance(): System {
@@ -936,9 +992,11 @@ export class System {
     }
 
     /**
-     * Reset all system state - clear all subsystems
+     * Reset all system state - clear all subsystems. Resolves to the per-session stores whose
+     * reset threw (empty when the switch is clean); see resetSessionPhase().
      */
-    async reset(): Promise<void> {
+    async reset(): Promise<SessionResetFailure[]> {
+        const sessionResetFailures: SessionResetFailure[] = [];
         this.brokerExit = null;
         finishProcessIpcLifetime();
         await stopChildProcesses();
@@ -967,19 +1025,7 @@ export class System {
         this.registry.reset();
         await this.cleanupProcessFiles();
         this.fileSystem.reset();
-        TimeService.getInstance().resetForGameSwitch();
-        videoEngine.closeAll();
-        libHleManager.resetOnGameSwitch();
-        hookRegistry.reset();
-        // Flush deferred destroys (return-to-pool), then wipe the pool — sizes/formats
-        // from game A must not be handed to game B. clear() alone would drop the pending
-        // queue without destroying those textures.
-        this.gpuResourceManager?.flushPendingDestruction();
-        this.gpuResourceManager?.clear();
-        hypercallDataManager.resetDispatchTable();
-        hypercallDataManager.resetThreadSuspendTable();
-        // PE-loader TLS templates are guest VAs that die with Process.reset().
-        this.implicitTlsEntries = [];
+        this.resetSessionPhase('game-switch', sessionResetFailures);
 
         // Stop and restart v86 if running to fully reset CPU/MMU/JIT state
         if (this.process?.v86) {
@@ -1036,24 +1082,8 @@ export class System {
         // game loaded after the first — the failure looks like a hang, not an error.
         this.exitNotified = false;
         this.isReExecPending = false;
-        loadDiagnostics.reset();
 
-        // Reset all subsystems
-        this.windowManager.reset();
-        this.gdiContext.reset();
-        this.inputManager.reset();
-        this.services.reset();
-        this.videoRouting.reset();
-        this.comResourceManager.reset();
-        this.scheduler.reset();
-        memoryWatch.reset();
-        // Clear per-game singletons that otherwise bleed state across a game switch.
-        leaseRegistry.reset();       // surfaces gone after Process.reset → leases are stale
-        memoryEventBuffer.reset();   // diagnostics ring — no cross-game bleed
-        resetSehDispatchState();     // stale in-flight exceptions / active-catch records (keyed by TEB) must not leak into the fresh run
-        namedObjects.reset();        // named mutex/event/semaphore refcounts — a fresh run must not resolve the previous game's names
-        profiler.reset();            // perf counters scoped per game
-        frameProfiler.reset();
+        this.resetSessionPhase('subsystems', sessionResetFailures);
 
         // Reset process if exists
         if (this.process) {
@@ -1098,6 +1128,7 @@ export class System {
         }
 
         Logger.log(LogCategory.SYSTEM, 'System reset complete');
+        return sessionResetFailures;
     }
 
     /**
