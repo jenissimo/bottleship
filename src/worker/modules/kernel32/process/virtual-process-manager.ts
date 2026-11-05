@@ -279,6 +279,10 @@ export class VirtualProcessManager {
         }
     }
 
+    recordCount(): number {
+        return this.processesByHandle.size + this.threadsByHandle.size;
+    }
+
     createProcess(params: CreateVirtualProcessParams): VirtualProcessInfo {
         this.pruneStaleHandles();
         this.ensureCurrentProcessRecord();

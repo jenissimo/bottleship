@@ -166,6 +166,15 @@ export function resetConsoleModeState(): void {
     consoleModeByHandle.clear();
 }
 
+export function captureConsoleModes(): Array<[number, number]> {
+    return [...consoleModeByHandle];
+}
+
+export function restoreConsoleModes(modes: Array<[number, number]>): void {
+    consoleModeByHandle.clear();
+    for (const [h, m] of modes) consoleModeByHandle.set(h, m);
+}
+
 const resolveConsoleOutputBuffer = (hConsoleOutput: number): ConsoleScreenBuffer => {
     const direct = consoleScreenBuffers.resolveOutputHandle(hConsoleOutput);
     if (direct) return direct;

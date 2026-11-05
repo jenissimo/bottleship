@@ -31,6 +31,17 @@ export function resetAllSrwLocks(): void {
     locks.clear();
 }
 
+export function captureSrwLocks(): Array<[number, SrwMode, number, number[], number]> {
+    return [...locks].map(([ptr, st]) => [ptr, st.mode, st.exclusiveOwner, [...st.sharedHolders], st.waitEvent]);
+}
+
+export function restoreSrwLocks(state: Array<[number, SrwMode, number, number[], number]>): void {
+    locks.clear();
+    for (const [ptr, mode, exclusiveOwner, shared, waitEvent] of state) {
+        locks.set(ptr, { mode, exclusiveOwner, sharedHolders: new Set(shared), waitEvent });
+    }
+}
+
 function getOrCreate(lockPtr: number): SrwLockState {
     let st = locks.get(lockPtr);
     if (!st) {

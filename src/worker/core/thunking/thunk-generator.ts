@@ -31,6 +31,15 @@ export interface ThunkStub {
 /** Size of the shared "missing import" trap stub (UD2) – must be 16-byte aligned like other stubs */
 const TRAP_STUB_SIZE = 16;
 
+export interface ThunkGeneratorState {
+    currentAddress: number;
+    nextFunctionId: number;
+    stubs: ThunkStub[];
+    aliases: ThunkStub[];
+    names: Array<[string, number]>;
+    dataExports: Array<[string, number]>;
+}
+
 function normalizeThunkExportName(name: string): string {
     return name.toLowerCase().replace(/^_/, '').replace(/@\d+$/, '');
 }
@@ -539,6 +548,34 @@ export class ThunkGenerator {
      */
     getDataExportAddress(dllName: string, exportName: string): number | undefined {
         return this.lookupDataExportAddress(dllName, exportName);
+    }
+
+    captureState(): ThunkGeneratorState {
+        const plain = (st: ThunkStub): ThunkStub => ({ ...st });
+        const primary = new Set([...this.stubs.values()]);
+        return {
+            currentAddress: this.currentAddress,
+            nextFunctionId: this.nextFunctionId,
+            stubs: [...this.stubs.values()].map(plain),
+            aliases: [...this.addressToStub.values()].filter(st => !primary.has(st)).map(plain),
+            names: [...this.nameToAddress],
+            dataExports: [...this.dataExportAddresses],
+        };
+    }
+
+    restoreState(state: ThunkGeneratorState): void {
+        this.reset();
+        this.currentAddress = state.currentAddress;
+        this.nextFunctionId = state.nextFunctionId;
+        for (const st of state.stubs) {
+            const stub = { ...st };
+            this.stubs.set(stub.functionId, stub);
+            this.addressToStub.set(stub.address, stub);
+            this.indexStub(stub);
+        }
+        for (const st of state.aliases) this.addressToStub.set(st.address, { ...st });
+        for (const [k, v] of state.names) this.nameToAddress.set(k, v);
+        for (const [k, v] of state.dataExports) this.dataExportAddresses.set(k, v);
     }
 
     /**

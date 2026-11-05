@@ -15,6 +15,7 @@ export class TimeService {
     // permanently. The game sees consistent dt every frame (no rubber-banding).
     private virtualTimeActive = false;
     private virtualTimeMs = 0;
+    private wallOffsetMs = 0;
 
     static getInstance(): TimeService {
         if (!TimeService.instance) {
@@ -62,7 +63,7 @@ export class TimeService {
     enableVirtualTime(): void {
         if (this.virtualTimeActive) return;
         this.virtualTimeActive = true;
-        this.virtualTimeMs = performance.now();
+        this.virtualTimeMs = this.wallMs();
     }
 
     /**
@@ -105,7 +106,7 @@ export class TimeService {
      */
     creditIdleMs(ms: number): number {
         if (!this.virtualTimeActive || ms <= 0) return 0;
-        const headroom = performance.now() + TimeService.MAX_AHEAD_MS - this.virtualTimeMs;
+        const headroom = this.wallMs() + TimeService.MAX_AHEAD_MS - this.virtualTimeMs;
         const credit = Math.max(0, Math.min(ms, headroom));
         this.virtualTimeMs += credit;
         return credit;
@@ -145,7 +146,7 @@ export class TimeService {
      */
     private reanchorForward(): void {
         if (!this.virtualTimeActive) return;
-        this.virtualTimeMs = Math.max(this.virtualTimeMs, this.lastReturnedMs, performance.now());
+        this.virtualTimeMs = Math.max(this.virtualTimeMs, this.lastReturnedMs, this.wallMs());
     }
 
     isVirtualTimeActive(): boolean {
@@ -158,8 +159,9 @@ export class TimeService {
         this.manualNowMs = 0;
         this.manualUnixMs = 0;
         this.lastReturnedMs = 0;
+        this.wallOffsetMs = 0;
         if (this.virtualTimeActive) {
-            this.virtualTimeMs = performance.now();
+            this.virtualTimeMs = this.wallMs();
         }
     }
 
@@ -262,7 +264,21 @@ export class TimeService {
     }
 
     private nowMsRealtime(): number {
-        return performance.now();
+        return this.wallMs();
+    }
+
+    wallMs(): number {
+        return performance.now() + this.wallOffsetMs;
+    }
+
+    captureClock(): { nowMs: number; mode: TimeMode } {
+        return { nowMs: this.nowMs(), mode: this.mode };
+    }
+
+    restoreClock(saved: { nowMs: number }): void {
+        this.wallOffsetMs = saved.nowMs - performance.now();
+        this.lastReturnedMs = saved.nowMs;
+        if (this.virtualTimeActive) this.virtualTimeMs = saved.nowMs;
     }
 
     /**

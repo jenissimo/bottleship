@@ -236,6 +236,10 @@ export function resetIoCompletionWaiters(): void {
     ioCompletionWaiters.clear();
 }
 
+export function ioCompletionInUse(): boolean {
+    return ioCompletionAssociations.size > 0 || ioCompletionWaiters.size > 0 || socketCompletionScopes.size > 0;
+}
+
 /**
  * Run the thread's queued APCs, then return WAIT_IO_COMPLETION — what an ALERTABLE wait
  * does on Windows. Returns null when nothing is queued, so the caller falls through to

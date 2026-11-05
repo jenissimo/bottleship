@@ -16,6 +16,10 @@ function state(process: Process): ReadState {
     }
     return result;
 }
+export function pendingReadExCount(process: Process): number {
+    const current = states.get(process);
+    return current && current.generation === process.resetGeneration ? current.pending.size : 0;
+}
 /** Cancellation selects the issuing thread for CancelIo, and any thread for CancelIoEx/close. */
 export function cancelFileReadEx(process: Process, handle: number, overlapped = 0, thread?: number): number {
     const current = states.get(process); if (!current || current.generation !== process.resetGeneration) return 0;

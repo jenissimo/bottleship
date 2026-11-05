@@ -118,6 +118,17 @@ export function resetProcessApiState(): void {
     childImagePathsByPid.clear();
 }
 
+export function captureProcessApiState(): { priorityClass: number; executionState: number } {
+    if (toolhelpSnapshots.size > 0) throw new Error('kernel32: open toolhelp snapshots are not part of a v1 savestate');
+    if (childImageByPid.size > 0 || virtualProcessMemoryByPid.size > 0) throw new Error('kernel32: child process images are not part of a v1 savestate');
+    return { priorityClass: currentPriorityClass, executionState: threadExecutionState };
+}
+
+export function restoreProcessApiState(state: { priorityClass: number; executionState: number }): void {
+    currentPriorityClass = state.priorityClass;
+    threadExecutionState = state.executionState;
+}
+
 function getSnapshot(handle: number): ToolhelpSnapshot | null {
     const snap = toolhelpSnapshots.get(handle);
     if (snap) return snap;

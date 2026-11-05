@@ -86,6 +86,30 @@ export function resetActCtxState(): void {
     threadActCtxFrames.clear();
 }
 
+export interface ActCtxState {
+    contexts: Array<[number, ActivationContextRecord]>;
+    processDefault: number | null;
+    nextCookie: number;
+    frames: Array<[number, Array<{ cookie: number; handle: number }>]>;
+}
+
+export function captureActCtxState(): ActCtxState {
+    return {
+        contexts: [...contextsByHandle].map(([h, r]) => [h, structuredClone(r)]),
+        processDefault: processDefaultActCtx,
+        nextCookie: nextActCtxCookie,
+        frames: [...threadActCtxFrames].map(([tid, f]) => [tid, f.map(x => ({ ...x }))]),
+    };
+}
+
+export function restoreActCtxState(state: ActCtxState): void {
+    resetActCtxState();
+    for (const [h, r] of state.contexts) contextsByHandle.set(h, structuredClone(r));
+    processDefaultActCtx = state.processDefault;
+    nextActCtxCookie = state.nextCookie;
+    for (const [tid, f] of state.frames) threadActCtxFrames.set(tid, f.map(x => ({ ...x })));
+}
+
 const ASSEMBLY_DLL_MAP: Record<string, string[]> = {
     'microsoft.windows.common-controls': ['comctl32.dll'],
     'microsoft.vc90.crt': ['msvcr90.dll'],

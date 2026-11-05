@@ -1704,6 +1704,35 @@ export class ThunkDispatcher {
         if (this.wbufQueueEnd > this.wbufDeferStats.peakQueueBytes) this.wbufDeferStats.peakQueueBytes = this.wbufQueueEnd;
     }
 
+    captureState(): { wbufTail: number; asyncEpoch: number; uef: number; callbacks: ReturnType<CallbackManager['captureState']> } {
+        if (this.activeAsyncThunks.size > 0 && [...this.activeAsyncThunks.values()].some(i => i.restartable?.() !== true)) {
+            throw new Error('dispatcher: a thread waits on host work');
+        }
+        if (this.pendingAsyncRestores.length > 0 || this.sehDispatchStack.length > 0) throw new Error('dispatcher: not at a safe point');
+        return { wbufTail: this.wbufTail, asyncEpoch: this.asyncEpoch, uef: this.unhandledExceptionFilterAddr, callbacks: this.callbackManager.captureState() };
+    }
+
+    restoreState(state: { wbufTail: number; asyncEpoch: number; uef: number; callbacks: ReturnType<CallbackManager['captureState']> }): void {
+        this.applyPendingRegistrations();
+        this.wbufTail = state.wbufTail;
+        this.wbufQueueEnd = 0;
+        this.asyncEpoch = state.asyncEpoch;
+        this.unhandledExceptionFilterAddr = state.uef;
+        this.callbackManager.restoreState(state.callbacks);
+    }
+
+    restartableParks(): Array<{ threadId: number; functionId: number; esp: number; returnAddr: number; spinAddr: number; spinBytes: [number, number] }> {
+        const out = [];
+        for (const info of this.activeAsyncThunks.values()) {
+            if (info.restartable?.() !== true || info.returnAddr === undefined || info.esp === undefined) continue;
+            out.push({
+                threadId: info.threadId ?? 0, functionId: info.functionId, esp: info.esp, returnAddr: info.returnAddr,
+                spinAddr: info.spinAddr ?? this.spinLoopAddress, spinBytes: info.originalSpinBytes ?? [0, 0] as [number, number],
+            });
+        }
+        return out;
+    }
+
     /** Threads parked on host Promises, for savestate readiness. */
     asyncParks(): Array<{ name: string; threadId: number | null; restartable: boolean }> {
         const out: Array<{ name: string; threadId: number | null; restartable: boolean }> = [];

@@ -72,6 +72,38 @@ function ensureProcessLocalCaches(): void {
     hleLibraryReferences.clear();
 }
 
+export interface ModuleRefState {
+    pinned: number[];
+    dynamicRefs: Array<[number, number]>;
+    hleReferences: Array<[number, string[]]>;
+    loadLibraryHandles: Array<[string, number]>;
+    handlePaths: Array<[number, string]>;
+}
+
+export function captureModuleRefs(): ModuleRefState {
+    for (const base of dynamicLoadRefs.keys()) {
+        if (hleModuleNameByBase(base) === undefined) {
+            throw new Error(`kernel32: a DLL loaded at run time (0x${base.toString(16)}) is not part of a v1 savestate`);
+        }
+    }
+    return {
+        pinned: [...pinnedModuleBases],
+        dynamicRefs: [...dynamicLoadRefs],
+        hleReferences: [...hleLibraryReferences].map(([h, aliases]) => [h, [...aliases.keys()]]),
+        loadLibraryHandles: [...loadLibraryHandleCache],
+        handlePaths: [...handleToPathCache],
+    };
+}
+
+export function restoreModuleRefs(state: ModuleRefState): void {
+    ensureProcessLocalCaches();
+    for (const base of state.pinned) pinnedModuleBases.add(base);
+    for (const [base, n] of state.dynamicRefs) dynamicLoadRefs.set(base, n);
+    for (const [handle, names] of state.hleReferences) for (const name of names) rememberHleLibraryReference(name, handle);
+    for (const [name, handle] of state.loadLibraryHandles) loadLibraryHandleCache.set(name, handle);
+    for (const [handle, path] of state.handlePaths) handleToPathCache.set(handle, path);
+}
+
 /** Pin every registered module that holds no dynamic LoadLibrary ref (see
  *  pinnedModuleBases). Must run BEFORE the current call registers anything new —
  *  i.e. at the top of each LoadLibrary/FreeLibrary handler — so a module being

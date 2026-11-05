@@ -122,6 +122,51 @@ interface SwitchTraceRecord {
     cleanup: number;
 }
 
+export interface SavedThread {
+    id: number; handle: number; state: ThreadState; kernelObject: number;
+    context: CpuContext | null; lastFpuState: Uint8Array | null; lastSimdState: Uint8Array | null;
+    stackBase: number; stackSize: number; stackTop: number; startAddress: number; parameter: number;
+    waitInfo: WaitInfo | null; exitCode: number | null; tlsValues: number[][]; lastError: number;
+    suspendCount: number; priority: number; backgroundMode: boolean; tebAddress: number; kernelPinCount: number;
+    apcQueue: Array<{ routine: number; arg0: number; arg1: number; arg2: number; arg3: number | null; kind: ApcKind }>;
+    quitPosted: boolean; quitExitCode: number; asyncParkGeneration: number;
+}
+
+export const THREAD_FIELDS = {
+    kernelObject: 'save', id: 'save', handle: 'save', state: 'save', context: 'save',
+    lastFpuState: 'save', lastSimdState: 'save', stackBase: 'save', stackSize: 'save', stackTop: 'save',
+    startAddress: 'save', parameter: 'save', waitInfo: 'save', exitCode: 'save', tlsValues: 'save',
+    lastError: 'save', suspendCount: 'save', priority: 'save', backgroundMode: 'save',
+    lastSwitchTime: 'host', lastSwitchInsn: 'derive', tebAddress: 'save', kernelPinCount: 'save',
+    apcQueue: 'save', quitPosted: 'save', quitExitCode: 'save', asyncParkGeneration: 'save',
+} as const satisfies Record<keyof Thread, 'save' | 'derive' | 'host' | 'transient'>;
+
+export interface SchedulerState {
+    threads: SavedThread[];
+    currentThreadId: number | null;
+    nextThreadId: number;
+    mainThreadId: number;
+    runQueue: number[];
+    bootstrapUntilFirstWait: number[];
+    tlsSlots: number[];
+    nextTlsIndex: number;
+    criticalSectionOwners: number[][];
+    csLockSemaphores: number[][];
+    stackPool: Array<[number, number[]]>;
+    stackBytesPooled: number;
+    stackBytesReserved: number;
+    ownedStackBases: number[];
+    mainStack: number[];
+    threadExitStubAddr: number;
+    apcDispatchStub: number;
+    apcDispatchGeneration: number;
+    alertedWaitResults: number[][];
+    reapQueue: number[];
+    reapRetryQueue: number[];
+    teb: { peb: number; params: number; tebs: number[][]; tls: number[][] };
+    sync: { events: number[]; semaphores: number[]; mutexes: number[] };
+}
+
 export class Scheduler {
     private process: Process | null = null;
     public config: SchedulerConfig;
@@ -735,6 +780,115 @@ export class Scheduler {
     setMainStackInfo(stackPointer: number, stackSize: number): void {
         this.mainStackTop = stackPointer;
         this.mainStackBase = stackPointer - stackSize;
+    }
+
+    captureState(ref: (obj: unknown, where: string) => number): SchedulerState {
+        this.syncObjects.syncFromMirrors();
+        const threads: SavedThread[] = [];
+        for (const t of this.threads.values()) {
+            if (this.activeOwnedApcs.get(t.id)?.size) throw new Error(`thread ${t.id}: an APC callback is running`);
+            if (t.apcQueue.some(a => a.lifetime)) throw new Error(`thread ${t.id}: an APC carries host lifetime hooks`);
+            threads.push({
+                id: t.id, handle: t.handle, state: t.state,
+                kernelObject: t.kernelObject ? ref(t.kernelObject, `thread ${t.id} kernel object`) : -1,
+                context: t.context ? { ...t.context } : null,
+                lastFpuState: t.lastFpuState ?? null, lastSimdState: t.lastSimdState ?? null,
+                stackBase: t.stackBase, stackSize: t.stackSize, stackTop: t.stackTop,
+                startAddress: t.startAddress, parameter: t.parameter,
+                waitInfo: t.waitInfo ? { ...t.waitInfo } : null,
+                exitCode: t.exitCode, tlsValues: [...t.tlsValues], lastError: t.lastError,
+                suspendCount: t.suspendCount, priority: t.priority, backgroundMode: t.backgroundMode ?? false,
+                tebAddress: t.tebAddress, kernelPinCount: t.kernelPinCount,
+                apcQueue: t.apcQueue.map(a => ({ routine: a.routine, arg0: a.arg0, arg1: a.arg1, arg2: a.arg2, arg3: a.arg3 ?? null, kind: a.kind })),
+                quitPosted: t.quitPosted, quitExitCode: t.quitExitCode, asyncParkGeneration: t.asyncParkGeneration,
+            } satisfies SavedThread);
+        }
+        return {
+            threads,
+            currentThreadId: this.currentThreadId,
+            nextThreadId: this.nextThreadId,
+            mainThreadId: this.mainThreadId,
+            runQueue: [...this.runQueue],
+            bootstrapUntilFirstWait: [...this.bootstrapUntilFirstWait],
+            tlsSlots: [...this.tlsSlots],
+            nextTlsIndex: this.nextTlsIndex,
+            criticalSectionOwners: [...this.criticalSectionOwners],
+            csLockSemaphores: [...this.csLockSemaphores],
+            stackPool: [...this.stackPool].map(([size, bases]) => [size, [...bases]]),
+            stackBytesPooled: this.stackBytesPooled,
+            stackBytesReserved: this.stackBytesReserved,
+            ownedStackBases: [...this.ownedStackBases],
+            mainStack: [this.mainStackBase, this.mainStackTop, this.imageStackReserve],
+            threadExitStubAddr: this.threadExitStubAddr,
+            apcDispatchStub: this.apcDispatchStub,
+            apcDispatchGeneration: this.apcDispatchGeneration,
+            alertedWaitResults: [...this.alertedWaitResults],
+            reapQueue: this.reapQueue.slice(this.reapHead).map(r => r.threadId),
+            reapRetryQueue: [...this.reapRetryQueue],
+            teb: this.tebManager.captureState(),
+            sync: this.syncObjects.captureState(),
+        };
+    }
+
+    restoreState(state: SchedulerState, object: (ref: number) => unknown): void {
+        this.threads.clear();
+        this.stackSpanIndex = null;
+        this.waitEngine.reset();
+        const insn = this.readInsnCounterForRestore();
+        for (const saved of state.threads) {
+            const t: Thread = {
+                kernelObject: saved.kernelObject >= 0 ? object(saved.kernelObject) as KernelThreadObject : undefined,
+                id: saved.id, handle: saved.handle, state: saved.state,
+                context: saved.context ? { ...saved.context } : null,
+                lastFpuState: saved.lastFpuState ?? undefined, lastSimdState: saved.lastSimdState ?? undefined,
+                stackBase: saved.stackBase, stackSize: saved.stackSize, stackTop: saved.stackTop,
+                startAddress: saved.startAddress, parameter: saved.parameter,
+                waitInfo: saved.waitInfo ? { ...saved.waitInfo } : null,
+                exitCode: saved.exitCode, tlsValues: new Map(saved.tlsValues.map(([k, v]) => [k, v])),
+                lastError: saved.lastError, suspendCount: saved.suspendCount, priority: saved.priority,
+                backgroundMode: saved.backgroundMode || undefined,
+                lastSwitchTime: performance.now(), lastSwitchInsn: insn,
+                tebAddress: saved.tebAddress, kernelPinCount: saved.kernelPinCount,
+                apcQueue: saved.apcQueue.map(a => ({ routine: a.routine, arg0: a.arg0, arg1: a.arg1, arg2: a.arg2, arg3: a.arg3 ?? undefined, kind: a.kind })),
+                quitPosted: saved.quitPosted, quitExitCode: saved.quitExitCode, asyncParkGeneration: saved.asyncParkGeneration,
+            };
+            this.threads.set(t.id, t);
+        }
+        this.currentThreadId = state.currentThreadId;
+        this.nextThreadId = state.nextThreadId;
+        this.mainThreadId = state.mainThreadId;
+        this.runQueue = [...state.runQueue];
+        this.bootstrapUntilFirstWait = new Set(state.bootstrapUntilFirstWait);
+        this.tlsSlots = new Set(state.tlsSlots);
+        this.nextTlsIndex = state.nextTlsIndex;
+        this.criticalSectionOwners = new Map(state.criticalSectionOwners.map(([a, t]) => [a, t]));
+        this.csLockSemaphores = new Map(state.csLockSemaphores.map(([a, h]) => [a, h]));
+        this.stackPool = new Map(state.stackPool.map(([size, bases]) => [size, [...bases]]));
+        this.stackBytesPooled = state.stackBytesPooled;
+        this.stackBytesReserved = state.stackBytesReserved;
+        this.ownedStackBases = new Set(state.ownedStackBases);
+        [this.mainStackBase, this.mainStackTop, this.imageStackReserve] = state.mainStack;
+        this.threadExitStubAddr = state.threadExitStubAddr;
+        this.apcDispatchStub = state.apcDispatchStub;
+        this.apcDispatchGeneration = state.apcDispatchGeneration;
+        this.alertedWaitResults.clear();
+        for (const [t, r] of state.alertedWaitResults) this.alertedWaitResults.set(t, r);
+        this.reapQueue = state.reapQueue.map(threadId => ({ threadId }));
+        this.reapHead = 0;
+        this.reapRetryQueue = [...state.reapRetryQueue];
+        this.tebManager.restoreState(state.teb);
+        this.syncObjects.restoreState(state.sync);
+        this.fpuLiveOwnerThreadId = null;
+        this.switchRequested = false;
+        for (const t of this.threads.values()) {
+            if (t.state === ThreadState.WAITING && t.waitInfo) this.waitEngine.registerWait(t);
+        }
+    }
+
+    private readInsnCounterForRestore(): number {
+        const counter = (this.process?.v86 as { cpu?: { instruction_counter?: Int32Array }; v86?: { cpu?: { instruction_counter?: Int32Array } } } | undefined);
+        const c = counter?.cpu?.instruction_counter ?? counter?.v86?.cpu?.instruction_counter;
+        return c ? c[0] >>> 0 : 0;
     }
 
     reset(): void {

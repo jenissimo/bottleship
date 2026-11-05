@@ -308,6 +308,20 @@ export function resetVistaRuntimeState(): void {
     tpInstances.clear();
 }
 
+export function captureVistaRuntimeState(): { onceWaits: Array<[number, number]>; nextTpHandle: number; nextTpInstance: number } {
+    if (tpTimers.size + tpWaits.size + tpWork.size + tpInstances.size > 0) {
+        throw new Error('kernel32: thread-pool objects are not part of a v1 savestate');
+    }
+    return { onceWaits: [...onceWaitEvents], nextTpHandle, nextTpInstance };
+}
+
+export function restoreVistaRuntimeState(state: { onceWaits: Array<[number, number]>; nextTpHandle: number; nextTpInstance: number }): void {
+    resetVistaRuntimeState();
+    for (const [once, evt] of state.onceWaits) onceWaitEvents.set(once, evt);
+    nextTpHandle = state.nextTpHandle;
+    nextTpInstance = state.nextTpInstance;
+}
+
 function initVistaRuntime(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 

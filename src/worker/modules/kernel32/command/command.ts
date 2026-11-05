@@ -30,6 +30,16 @@ export function resetCommandLineState(): void {
     lastExeName = "";
 }
 
+export function captureCommandLineState(): { a: number; w: number; exe: string } {
+    return { a: cmdLineAddrA, w: cmdLineAddrW, exe: lastExeName };
+}
+
+export function restoreCommandLineState(state: { a: number; w: number; exe: string }): void {
+    cmdLineAddrA = state.a;
+    cmdLineAddrW = state.w;
+    lastExeName = state.exe;
+}
+
 /**
  * The command line the guest sees: "argv0 args", with argv[0] QUOTED when it contains a
  * space, as every real producer of a command line does. Unquoted, argv[0] ends at the

@@ -125,6 +125,31 @@ export class AddressSpace {
         this.ensureLowMemRegion(0x00100000);
     }
 
+    captureState(): { nextRegionId: number; regions: RegionEntry[]; buckets: Array<[RegionKind, number]> } {
+        return {
+            nextRegionId: this.nextRegionId,
+            regions: this.regions.map(r => ({ ...r })),
+            buckets: [...this.layoutBucketMap].map(([kind, r]) => [kind, r.id]),
+        };
+    }
+
+    restoreState(state: { nextRegionId: number; regions: RegionEntry[]; buckets: Array<[RegionKind, number]> }): void {
+        for (const r of this.regions) setWriteMapBase(r.base, r.size, false);
+        this.regions = state.regions.map(r => ({ ...r }));
+        this.nextRegionId = state.nextRegionId;
+        const byId = new Map(this.regions.map(r => [r.id, r]));
+        this.layoutBucketMap.clear();
+        for (const [kind, id] of state.buckets) {
+            const r = byId.get(id);
+            if (!r) throw new Error(`address space: layout bucket ${kind} names missing region ${id}`);
+            this.layoutBucketMap.set(kind, r);
+        }
+        this.invalidateRegionIndex();
+        for (const r of this.regions) {
+            if (isWriteMapFastRegion(r.kind, r.perms)) setWriteMapBase(r.base, r.size, true);
+        }
+    }
+
     registerRegion(entry: Omit<RegionEntry, "id">): number {
         const newEntry: RegionEntry = {
             ...entry,

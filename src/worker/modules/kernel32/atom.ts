@@ -19,6 +19,16 @@ export function resetAtomTable(): void {
     nextAtomId = 0xC000;
 }
 
+export function captureAtoms(): { atoms: Array<[number, string]>; nextAtomId: number } {
+    return { atoms: [...atomTable], nextAtomId };
+}
+
+export function restoreAtoms(state: { atoms: Array<[number, string]>; nextAtomId: number }): void {
+    atomTable.clear();
+    for (const [id, name] of state.atoms) atomTable.set(id, name);
+    nextAtomId = state.nextAtomId;
+}
+
 export const exports: Record<string, ThunkImplementation> = {
     /**
      * GlobalAddAtomA - Adds a character string to the global atom table
