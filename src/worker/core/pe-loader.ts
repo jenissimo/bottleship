@@ -1444,7 +1444,11 @@ export class PELoader {
         }
         if (!this.vfs) return;
         const searchDirectories = this.getDllSearchDirectories();
-        if (!PELoader.SHIPPED_CRT_PROBES.some(n => this.findDllPath(n, 0, searchDirectories) !== null)) return;
+        if (!PELoader.SHIPPED_CRT_PROBES.some(n => this.findDllPath(n, 0, searchDirectories) !== null)) {
+            Logger.log(LogCategory.SYSTEM, `[PE] Process CRT binding: ${exeName} — no shipped C runtime in ` +
+                `${searchDirectories.join(' ')}; nothing to choose between`);
+            return;
+        }
 
         const deps = this.importBindingDeps(searchDirectories, true);
         const importsOf = async (image: Uint8Array): Promise<CrtScanImport[]> => {
