@@ -11,18 +11,19 @@ import { pendingMessageBoxes } from "../../runtime/dialog-bridge";
 import { hasWaitingModalPump } from "../../modules/user32/modal-dialog-state";
 import { videoEngine } from "../../../video/video-engine";
 import { assessReadiness, type Readiness } from "../../savestate/readiness";
-import { deleteSlot, listSlots, requestLoadOnNextBoot, saveToSlot, type SafePoint } from "../../savestate/host";
-import { CaptureRefusal } from "../../savestate/object-codecs";
+import { deleteSlot, lastLoad, listSlots, requestLoadOnNextBoot, saveToSlot } from "../../savestate/host";
+import { haltAtSafePoint, type HaltIo } from "../../savestate/halt";
 
 export function registerSavestateCommands(svc: HarnessService): void {
     svc.register("savestateReadiness", () => readiness());
-    svc.register("savestateSave", async (args) => saveToSlot(String(args[0] ?? "quick"), haltAtSafePoint));
+    svc.register("savestateSave", async (args) => saveToSlot(String(args[0] ?? "quick"), () => haltAtSafePoint(haltIo()), permanentBlockers));
     svc.register("savestateSlots", async () => listSlots());
     svc.register("savestateDelete", async (args) => deleteSlot(String(args[0] ?? "")));
     svc.register("savestateLoadOnNextBoot", async (args) => {
         await requestLoadOnNextBoot(String(args[0] ?? "quick"));
-        return { pending: String(args[0] ?? "quick") };
+        return { pending: String(args[0] ?? "quick"), reloadRequired: true, note: "the load runs when the game boots in a fresh worker: reload the tab" };
     });
+    svc.register("savestateLastLoad", () => lastLoad());
 }
 
 function readiness(): Readiness {
@@ -44,34 +45,22 @@ function readiness(): Readiness {
     });
 }
 
-const HALT_ATTEMPTS = 200;
-
-async function stopped(): Promise<void> {
-    const v86 = System.getInstance().process?.v86 as { is_running?: () => boolean } | undefined;
-    for (let i = 0; i < 500 && (v86?.is_running?.() ?? false); i++) await new Promise(r => setTimeout(r, 2));
+function haltIo(): HaltIo {
+    const g = globalThis as unknown as { __harnessPause?: () => void; __harnessResume?: () => void };
+    return {
+        isPaused: () => System.getInstance().isPaused,
+        pause: () => g.__harnessPause?.(),
+        resume: () => g.__harnessResume?.(),
+        isRunning: () => (System.getInstance().process?.v86 as { is_running?: () => boolean } | undefined)?.is_running?.() ?? false,
+        flushWriteBuffer: () => System.getInstance().process?.dispatcher?.executeWbufQueue(),
+        readiness,
+        sleep: (ms) => new Promise(r => setTimeout(r, ms)),
+    };
 }
 
-async function haltAtSafePoint(): Promise<SafePoint> {
-    const g = globalThis as unknown as { __harnessPause?: () => void; __harnessResume?: () => void };
-    const wasPaused = System.getInstance().isPaused;
-    let last: Readiness | null = null;
-    for (let attempt = 0; attempt < HALT_ATTEMPTS; attempt++) {
-        g.__harnessPause?.();
-        await stopped();
-        System.getInstance().process?.dispatcher?.executeWbufQueue();
-        last = readiness();
-        if (last.ready) {
-            return {
-                release: () => { if (!wasPaused) g.__harnessResume?.(); },
-                stillReady: () => {
-                    const now = readiness();
-                    if (!now.ready) throw new CaptureRefusal(`savestate: the safe point was lost: ${now.blockers.map(b => `${b.kind} (${b.detail})`).join(", ")}`);
-                },
-            };
-        }
-        g.__harnessResume?.();
-        await new Promise(r => setTimeout(r, 3 + (attempt % 7)));
-    }
-    if (wasPaused) g.__harnessPause?.();
-    throw new Error(`savestate: no safe point: ${last?.blockers.map(b => `${b.kind} (${b.detail})`).join(", ")}`);
+function permanentBlockers(): string[] {
+    const out: string[] = [];
+    if (liveChildProcessCount() > 0) out.push('a child process is running');
+    if (videoEngine.activeSessionCount() > 0) out.push('a video is playing');
+    return out;
 }

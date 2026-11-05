@@ -2,7 +2,8 @@ import { parseIoProfile, profileChunkOrder, type WgbIoPolicy } from "@bottleship
 import { V86 } from "v86";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { adoptFreshGuestMemory } from "./core/memory/guest-page-dirty";
-import { noteBootError, noteBootIdentity, restorePendingAtEntry, savestatesEnabled } from "./savestate/host";
+import { noteBootError, noteBootIdentity, restorePendingAtEntry, savestatesEnabled, type BundleEntryKey } from "./savestate/host";
+import { RestoreFailed } from "./savestate/session";
 import { registerCoreParticipants } from "./savestate/core-participants";
 import { Process } from "./core/process";
 import { System, type GuestImagePatch } from "./core/system";
@@ -1609,6 +1610,9 @@ const postBundleMeta = (manifest: WgbManifest, gameId: string): void => {
   });
 };
 
+/** @transient(boots this worker has run; a savestate loads only on the first, into untouched module state) */
+let bootsInThisWorker = 0;
+
 const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean; io?: WgbIoPolicy }) => {
   const system = System.getInstance();
   if (!system.process) {
@@ -1617,6 +1621,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
   }
   // The Process exists but the dispatch table may still be empty (see hleReady).
   await hleReady;
+  bootsInThisWorker++;
 
   bootMark("load-bundle-start");
   // Scope the GPU-error census to this run, so report().gpuErrors answers "this game",
@@ -2233,6 +2238,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     if (savestatesEnabled()) {
       pauseEmulator();
       let savestateStep = "participants";
+      let loadFailed: string | null = null;
       try {
         registerCoreParticipants();
         savestateStep = "layout";
@@ -2240,22 +2246,30 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
           thunks: system.process?.thunkGenerator.getAllStubs().map((st: { functionId: number; dllName: string; functionName: string }) => [st.functionId, `${st.dllName}:${st.functionName}`]) ?? [],
           modules: [...(system.process?.modules.keys() ?? [])],
         };
-        let entries = 0;
-        try { entries = bundle.archive.listEntries().length; } catch { entries = -1; }
+        let entries: BundleEntryKey[] = [];
+        try {
+          entries = bundle.archive.listEntries().map((e) => ({ name: e.name, size: e.uncompressedSize, compressedSize: e.compressedSize, crc32: e.crc32 }));
+        } catch { entries = []; }
         savestateStep = "identity";
         await noteBootIdentity({
-          gameId, manifest: bundle.manifest, bundleSize: entries,
+          gameId, manifest: bundle.manifest, entries,
           config: EmulatorConfig.getInstance().snapshotForChild(), layout,
         });
         savestateStep = "restore";
-        const restored = await restorePendingAtEntry();
-        if (restored) (globalThis as Record<string, unknown>).__bsSavestateRestored = restored;
+        const outcome = await restorePendingAtEntry(bootsInThisWorker === 1);
+        (globalThis as Record<string, unknown>).__bsSavestateRestored = outcome;
       } catch (e) {
-        Logger.error(LogCategory.SYSTEM, `[SAVESTATE] ${savestateStep} at entry failed: ${e instanceof Error ? e.stack : e}`);
-        noteBootError(`${savestateStep}: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`.slice(0, 600));
+        const message = e instanceof Error ? (e.stack ?? e.message) : String(e);
+        Logger.error(LogCategory.SYSTEM, `[SAVESTATE] ${savestateStep} at entry failed: ${message}`);
         (globalThis as Record<string, unknown>).__bsSavestateRestored = { error: String(e) };
+        if (e instanceof RestoreFailed) loadFailed = e.message;
+        else noteBootError(`${savestateStep}: ${message}`.slice(0, 600));
       } finally {
-        resumeEmulator();
+        if (loadFailed === null) resumeEmulator();
+      }
+      if (loadFailed !== null) {
+        system.reportGuestCrash({ reason: `Savestate load failed: ${loadFailed}`, eip: 0, threadId: null });
+        return;
       }
     }
 

@@ -2,11 +2,14 @@ import { System } from '../core/system';
 import { Logger, LogCategory } from '../core/logger';
 import { OpfsChunkStore, sha256Hex } from './chunk-store';
 import { writeRamChunks } from './ram';
-import { captureSession, checkSavestate, restoreSession, type SavestateTarget } from './session';
-import { savestateParticipants } from './participant';
+import { captureSession, checkSavestate, coverageRefusal, restoreSession, RestoreFailed, type SavestateTarget } from './session';
+import { CaptureRefusal } from './object-codecs';
+import type { ChunkStore } from './chunk-store';
+import type { SafePoint } from './halt';
+import { savestateParticipants, type ParticipantRegistry } from './participant';
 import { touchedModules } from './core-participants';
-import { decodeSavestate, incompatibilities, type CompatibilityKey } from './container';
-import { OpfsDir, SlotStore, type SlotInfo } from './slots';
+import { incompatibilities, type CompatibilityKey } from './container';
+import { OpfsDir, SlotStore, type Dir, type SlotInfo } from './slots';
 import { gameIdToContainerDir } from '@bottleship/formats/wgb/container-id';
 
 declare const __BUILD_SHA__: string;
@@ -34,13 +37,25 @@ const safeJson = (v: unknown): string => {
     try { return JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x)) ?? ''; } catch { return ''; }
 };
 
+export interface BundleEntryKey { name: string; size: number; compressedSize: number; crc32?: number }
+
+const HOST_ONLY_CONFIG = ['quality', 'qualityUserPref', 'network'];
+
+export function guestConfig(config: Record<string, unknown>): Record<string, unknown> {
+    const out = { ...config };
+    for (const key of HOST_ONLY_CONFIG) delete out[key];
+    return out;
+}
+
 export async function noteBootIdentity(input: {
-    gameId: string; manifest: unknown; bundleSize: number; config: unknown; layout: unknown;
+    gameId: string; manifest: unknown; entries: BundleEntryKey[]; config: Record<string, unknown>; layout: unknown;
 }): Promise<BootIdentity> {
+    const entries = [...input.entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+        .map(e => [e.name, e.size, e.compressedSize, e.crc32 ?? null]);
     boot = {
         gameId: input.gameId,
-        contentHash: await sha256Hex(text(safeJson([input.manifest, input.bundleSize]))),
-        configHash: await sha256Hex(text(safeJson(input.config))),
+        contentHash: await sha256Hex(text(safeJson([input.manifest, entries]))),
+        configHash: await sha256Hex(text(safeJson(guestConfig(input.config)))),
         bootLayout: await sha256Hex(text(safeJson(input.layout))),
     };
     return boot;
@@ -89,8 +104,10 @@ async function overlayDigest(): Promise<string> {
 const gameLocks = new Map<string, Promise<unknown>>();
 
 export async function withGameLock<T>(game: string, run: () => Promise<T>): Promise<T> {
+    const locks = (globalThis as { navigator?: { locks?: { request<R>(name: string, cb: () => Promise<R>): Promise<R> } } }).navigator?.locks;
+    const guarded = locks ? () => locks.request(`savestate:${game}`, run) : run;
     const previous = gameLocks.get(game) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(run);
+    const next = previous.catch(() => undefined).then(guarded);
     gameLocks.set(game, next);
     try {
         return await next;
@@ -110,24 +127,95 @@ function gameDir(): string {
     return gameIdToContainerDir(requireBoot().gameId);
 }
 
-async function gameStore(game: string): Promise<SlotStore> {
-    return new SlotStore(await OpfsDir.open(['savestates', game, 'slots']), await OpfsChunkStore.open(['savestates', game, 'chunks']));
+export interface SavestateStorage {
+    gameDir(game: string): Promise<Dir>;
+    chunks(game: string): Promise<ChunkStore>;
 }
 
+const STORAGE_ROOT = ['bottleship', 'savestates'];
+
+const opfsStorage: SavestateStorage = {
+    gameDir: (game) => OpfsDir.open([...STORAGE_ROOT, game]),
+    chunks: (game) => OpfsChunkStore.open([...STORAGE_ROOT, game, 'chunks']),
+};
+
+export async function openGameStore(storage: SavestateStorage, game: string): Promise<SlotStore> {
+    const dir = await storage.gameDir(game);
+    const slots = await dir.dir('slots', true);
+    if (!slots) throw new Error(`savestate: no slot directory for ${game}`);
+    return new SlotStore(slots, await storage.chunks(game));
+}
+
+const gameStore = (game: string) => openGameStore(opfsStorage, game);
+
 const PENDING = 'pending-load.json';
+export const PENDING_TTL_MS = 15 * 60 * 1000;
+
+export async function writePendingLoad(storage: SavestateStorage, game: string, slot: string, now: number): Promise<void> {
+    await (await storage.gameDir(game)).write(PENDING, text(JSON.stringify({ slot, at: now })));
+}
 
 export async function requestLoadOnNextBoot(slot: string): Promise<void> {
     const game = gameDir();
     if (!(await (await gameStore(game)).read(checkSlotName(slot)))) throw new Error(`savestate: slot ${slot} is empty`);
-    await (await OpfsDir.open(['savestates'])).write(PENDING, text(JSON.stringify({ game, slot, at: Date.now() })));
+    await writePendingLoad(opfsStorage, game, slot, Date.now());
 }
 
-async function takePendingLoad(): Promise<{ game: string; slot: string } | null> {
-    const root = await OpfsDir.open(['savestates']);
-    const bytes = await root.read(PENDING);
-    if (!bytes) return null;
-    await root.remove(PENDING);
-    try { return JSON.parse(new TextDecoder().decode(bytes)) as { game: string; slot: string }; } catch { return null; }
+export type PendingLoadOutcome =
+    | { kind: 'none' }
+    | { kind: 'needs-fresh-worker'; slot: string }
+    | { kind: 'expired'; slot: string }
+    | { kind: 'restored'; name: string; ms: number; overlayChanged: boolean };
+
+export interface PendingLoadInput {
+    participants?: ParticipantRegistry;
+    storage: SavestateStorage;
+    game: string;
+    target: SavestateTarget;
+    freshWorker: boolean;
+    now: number;
+}
+
+/**
+ * Runs the pending load of this game, if any. The pending file belongs to the game; a boot of
+ * another game never sees it. A load is only attempted in a worker whose first boot this is;
+ * otherwise the request stays for the next fresh worker. Anything thrown before the first
+ * write leaves the guest untouched; a RestoreFailed means it is half restored.
+ */
+export async function runPendingLoad(input: PendingLoadInput): Promise<PendingLoadOutcome> {
+    const dir = await input.storage.gameDir(input.game);
+    const bytes = await dir.read(PENDING);
+    if (!bytes) return { kind: 'none' };
+    let pending: { slot?: unknown; at?: unknown };
+    try { pending = JSON.parse(new TextDecoder().decode(bytes)) as typeof pending; } catch { pending = {}; }
+    const slot = typeof pending.slot === 'string' ? pending.slot : '';
+    if (!input.freshWorker) {
+        Logger.warn(LogCategory.SYSTEM, `[SAVESTATE] load of ${slot} needs a fresh worker (reload the tab); the request stays pending`);
+        return { kind: 'needs-fresh-worker', slot };
+    }
+    await dir.remove(PENDING);
+    const at = typeof pending.at === 'number' ? pending.at : 0;
+    if (!(input.now - at >= 0 && input.now - at <= PENDING_TTL_MS)) return { kind: 'expired', slot };
+    const name = checkSlotName(slot);
+    const store = await openGameStore(input.storage, input.game);
+    const state = await store.read(name);
+    if (!state) throw new Error(`savestate: slot ${name} is empty`);
+    const t0 = performance.now();
+    const check = checkSavestate(input.target, state);
+    if (!check.ok) throw new Error(`savestate ${name} does not fit this boot: ${check.reasons.join('; ')}`);
+    if (check.overlayChanged) Logger.warn(LogCategory.SYSTEM, `[SAVESTATE] ${name}: the game's files changed since it was taken`);
+    await restoreSession(input.target, check.state, store.chunkStore, input.participants);
+    return { kind: 'restored', name, ms: Math.round(performance.now() - t0), overlayChanged: check.overlayChanged };
+}
+
+export type LastLoad = PendingLoadOutcome | { kind: 'refused'; error: string } | { kind: 'failed'; error: string };
+
+/** @transient(outcome of this worker's entry-point load, reported by savestateLastLoad) */
+let lastLoadOutcome: LastLoad | null = null;
+
+export function lastLoad(): LastLoad | null {
+    requireEnabled();
+    return lastLoadOutcome;
 }
 
 export async function listSlots(): Promise<{ gameId: string; game: string; slots: SlotInfo[] }> {
@@ -147,35 +235,32 @@ export async function deleteSlot(slot: string): Promise<{ removedChunks: number 
     return withGameLock(game, async () => ({ removedChunks: await (await gameStore(game)).remove(slot) }));
 }
 
-export interface SafePoint {
-    release(): void;
-    stillReady(): void;
-}
-
 export interface SaveReport {
     name: string; bytes: number; chunkBytes: number; chunkWrites: number;
     ms: { paused: number; store: number }; sections: Record<string, number>; ram: unknown;
 }
 
-export async function saveToSlot(name: string, halt: () => Promise<SafePoint>): Promise<SaveReport> {
+export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, permanentBlockers: () => string[] = () => []): Promise<SaveReport> {
     checkSlotName(name);
     const game = gameDir();
+    const early = coverageRefusal({ touchedModules }) ?? permanentBlockers().map(b => `savestate: ${b}`)[0] ?? null;
+    if (early) throw new CaptureRefusal(early);
     return withGameLock(game, async () => {
         const store = await gameStore(game);
         const known = new Set(await store.chunkStore.list());
+        const t = target(await overlayDigest());
         const t0 = performance.now();
         const safe = await halt();
         let result;
         try {
-            result = await captureSession(target(await overlayDigest()), known, () => safe.stillReady());
+            result = await captureSession(t, known, () => safe.stillReady());
         } finally {
             safe.release();
         }
         const t1 = performance.now();
         await writeRamChunks(result.pending, store.chunkStore);
-        const manifest = decodeSavestate(result.bytes).header.ram;
         let chunkBytes = 0;
-        for (const [, hash] of manifest.chunks) chunkBytes += await store.chunkStore.size(hash);
+        for (const [, hash] of result.manifest.chunks) chunkBytes += await store.chunkStore.size(hash);
         await store.save(name, result.bytes, chunkBytes);
         const t2 = performance.now();
         return {
@@ -185,21 +270,22 @@ export async function saveToSlot(name: string, halt: () => Promise<SafePoint>): 
     });
 }
 
-export async function restorePendingAtEntry(): Promise<{ name: string; ms: number; overlayChanged: boolean } | null> {
-    const pending = await takePendingLoad();
-    if (!pending) return null;
-    if (pending.game !== gameDir()) return null;
-    const name = checkSlotName(pending.slot);
-    const store = await gameStore(pending.game);
-    const bytes = await store.read(name);
-    if (!bytes) throw new Error(`savestate: slot ${name} is empty`);
-    const t0 = performance.now();
-    const t = target(await overlayDigest());
-    const check = checkSavestate(t, bytes);
-    if (!check.ok) throw new Error(`savestate ${name} does not fit this boot: ${check.reasons.join('; ')}`);
-    if (check.overlayChanged) Logger.warn(LogCategory.SYSTEM, `[SAVESTATE] ${name}: the game's files changed since it was taken`);
-    await restoreSession(t, check.state, store.chunkStore);
-    const ms = Math.round(performance.now() - t0);
-    Logger.log(LogCategory.SYSTEM, `[SAVESTATE] restored ${name} in ${ms} ms`);
-    return { name, ms, overlayChanged: check.overlayChanged };
+export async function restorePendingAtEntry(freshWorker: boolean): Promise<PendingLoadOutcome> {
+    lastLoadOutcome = null;
+    try {
+        const outcome = await runPendingLoad({ storage: opfsStorage, game: gameDir(), target: target(await overlayDigest()), freshWorker, now: Date.now() });
+        lastLoadOutcome = outcome;
+        if (outcome.kind === 'restored') Logger.log(LogCategory.SYSTEM, `[SAVESTATE] restored ${outcome.name} in ${outcome.ms} ms`);
+        return outcome;
+    } catch (e) {
+        const error = e instanceof Error ? e.message : String(e);
+        if (e instanceof RestoreFailed) {
+            lastLoadOutcome = { kind: 'failed', error };
+            boot = null;
+            bootError = `the load failed after it started writing, so this session cannot be saved: ${error}`;
+        } else {
+            lastLoadOutcome = { kind: 'refused', error };
+        }
+        throw e;
+    }
 }

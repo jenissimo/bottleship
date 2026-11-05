@@ -92,6 +92,7 @@ export class SlotStore {
 
     async save(slot: string, bytes: Uint8Array, chunkBytes: number): Promise<SlotInfo> {
         const createdAt = Date.now();
+        for (const name of await this.slots.list()) if (name.endsWith('.tmp')) await this.slots.remove(name);
         await this.slots.write(slot + STATE, bytes);
         await this.slots.write(slot + META, text({ createdAt, bytes: bytes.length, chunkBytes }));
         await this.collectGarbage();
