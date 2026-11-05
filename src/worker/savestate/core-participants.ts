@@ -1,4 +1,5 @@
 import { System } from '../core/system';
+import { loadedHleModules } from '../core/hle-module-images';
 import { TimeService, type ClockState } from '../runtime/time';
 import type { AddressSpace, RegionEntry } from '../core/memory/address-space';
 import type { TimerWheel } from '../core/scheduler/timer-wheel';
@@ -232,14 +233,27 @@ export function registerCoreParticipants(): void {
         restore: (s) => process().dispatcher.restoreState(as(s)),
     });
     savestateParticipants.add({
+        id: 'loaded-modules', version: 1, order: 98, schema: { modules: ['name'] },
+        capture: () => touchedModules().sort(),
+        restore: (s) => checkLoadedModules(s as string[], touchedModules()),
+    });
+    savestateParticipants.add({
         id: 'cpu', version: 1, order: 99, schema: schema(SCHEMAS.cpu),
         capture: (ctx) => captureCpu(v86Cpu(), ctx.cpuOverride()),
         restore: (s) => restoreCpu(v86Cpu(), s),
     });
 }
 
-export function touchedModules(): string[] {
-    const out = new Set<string>();
-    for (const stub of process().thunkGenerator.getAllStubs()) out.add(stub.dllName);
-    return [...out];
+export function checkLoadedModules(saved: readonly string[], now: readonly string[]): void {
+    const have = new Set(now);
+    const want = new Set(saved);
+    const missing = saved.filter(m => !have.has(m));
+    const extra = now.filter(m => !want.has(m));
+    if (missing.length || extra.length) {
+        throw new Error(`savestate: the restored session loads different modules (missing ${missing.join(', ') || 'none'}, extra ${extra.join(', ') || 'none'})`);
+    }
+}
+
+export function touchedModules(loaded: () => ReadonlyArray<{ name: string }> = loadedHleModules): string[] {
+    return [...new Set(loaded().map(m => m.name))];
 }

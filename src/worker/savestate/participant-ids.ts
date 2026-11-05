@@ -19,6 +19,7 @@ export const PARTICIPANT_IDS = [
     'gdi32-palettes',
     'ddraw',
     'dispatcher',
+    'loaded-modules',
     'cpu',
 ] as const;
 
