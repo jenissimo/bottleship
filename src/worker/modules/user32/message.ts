@@ -11,6 +11,7 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
 import { TimeService } from '../../runtime/time';
 import { TimerKind } from '../../core/scheduler/types';
+import { setTimerHandler } from '../../core/scheduler/timer-wheel';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 import { installHook, uninstallHook, getHooksOfType, getNextHookInChain, hasHooksOfType, pushActiveHook, popActiveHook, currentActiveHook, WH_KEYBOARD, WH_GETMESSAGE, WH_CBT, HC_ACTION, HC_NOREMOVE } from './hooks';
 import { isSentinelWndProc } from './dialog';
@@ -333,22 +334,26 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             state.intervalMs,
             false,
             TimerKind.USER32_TIMER,
-            () => {
-                const system = System.getInstance();
-                if (system.isExiting || timers.get(timerKey(state.hWnd, state.timerId)) !== state) return;
-                timerDiag.ticks++;
-
-                // USER timers are synthesized messages, not periodic host callbacks.
-                // Once due, Win32 keeps one timer in the expired set and restarts it
-                // only when Get/PeekMessage removes that WM_TIMER (Wine queue.c:
-                // find_expired_timer -> restart_timer). Reposting while the previous
-                // tick is pending can leave an MFC modal loop permanently non-idle.
-                postTimerMessages(system, state, 1);
-                maybeLogTimerDiag();
-            },
+            state.hWnd,
             TimeService.getInstance().nowMs(),
+            state.timerId,
         );
     }
+
+    setTimerHandler(TimerKind.USER32_TIMER, (hWnd, timerId, wheelId) => {
+        const system = System.getInstance();
+        const state = timers.get(timerKey(hWnd, timerId));
+        if (system.isExiting || !state || state.wheelTimerId !== wheelId) return;
+        timerDiag.ticks++;
+
+        // USER timers are synthesized messages, not periodic host callbacks.
+        // Once due, Win32 keeps one timer in the expired set and restarts it
+        // only when Get/PeekMessage removes that WM_TIMER (Wine queue.c:
+        // find_expired_timer -> restart_timer). Reposting while the previous
+        // tick is pending can leave an MFC modal loop permanently non-idle.
+        postTimerMessages(system, state, 1);
+        maybeLogTimerDiag();
+    });
 
     function restartRemovedTimer(msg: TimerMessage): void {
         if (msg.message !== WM_TIMER || !msg.generatedTimer) return;

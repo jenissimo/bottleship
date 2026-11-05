@@ -15,6 +15,7 @@ import { WAIT_FAILED, WAIT_TIMEOUT, WAIT_BLOCKED_NO_SWITCH, WAIT_IO_COMPLETION, 
 import { Mem } from '../../core/memory/mem-accessor';
 import { dispatchThreadApcs } from '../../core/scheduler/apc-dispatch';
 import { TimeService } from '../../runtime/time';
+import { setTimerHandler, TIMER_PHASE_DUE, TIMER_PHASE_EVERY } from '../../core/scheduler/timer-wheel';
 import { asBufferSource } from '../../../dom-buffer';
 import {
     ensureSrwWaitEvent,
@@ -1843,22 +1844,10 @@ const syncModule = (() => {
         }
 
         timer.periodMs = lPeriod;
-        const fire = () => { System.getInstance().scheduler.setEvent(hTimer); };
-
-        if (timer.periodMs > 0) {
-            // Fire once after the due time, then re-arm a periodic wheel timer at the
-            // period (due time and period can differ — a single periodic add() can't
-            // express both, so the due fire arms the recurring one).
-            timer.wheelId = wheel.add(Math.max(1, delayMs), false, TimerKind.WAITABLE_TIMER, () => {
-                fire();
-                const t = waitableTimers.get(hTimer);
-                if (t && t.periodMs > 0) {
-                    t.wheelId = wheel.add(t.periodMs, true, TimerKind.WAITABLE_TIMER, fire, TimeService.getInstance().nowMs());
-                }
-            }, TimeService.getInstance().nowMs());
-        } else {
-            timer.wheelId = wheel.add(Math.max(1, delayMs), false, TimerKind.WAITABLE_TIMER, fire, TimeService.getInstance().nowMs());
-        }
+        // Due time and period can differ, so a periodic timer's due fire (phase DUE)
+        // arms the recurring entry (phase EVERY) itself.
+        timer.wheelId = wheel.add(Math.max(1, delayMs), false, TimerKind.WAITABLE_TIMER, hTimer,
+            TimeService.getInstance().nowMs(), timer.periodMs > 0 ? TIMER_PHASE_DUE : TIMER_PHASE_EVERY);
 
         return 1;
     };
@@ -1875,28 +1864,40 @@ const syncModule = (() => {
     // (periodic=true); the callback must NOT re-add another entry, or each fire would spawn a
     // fresh periodic timer → exponential timer-wheel growth. Mirrors SetWaitableTimer.
     const armTimerQueueTimer = (hTimer: number, dueMs: number): void => {
-        const wheel = cachedScheduler.timerWheel;
-        const invoke = (): void => {
-            const cur = timerQueueTimers.get(hTimer);
-            if (!cur) return;
-            // WAITORTIMERCALLBACK(PVOID Parameter, BOOLEAN TimerOrWaitFired=TRUE).
-            cachedScheduler.postTimerCallback(cur.callback, [cur.parameter, 1]);
-        };
         const entry = timerQueueTimers.get(hTimer);
         if (!entry) return;
-        entry.wheelId = wheel.add(dueMs, false, TimerKind.WAITABLE_TIMER, () => {
-            invoke();
-            const cur = timerQueueTimers.get(hTimer);
-            if (cur && cur.periodMs > 0) {
-                cur.wheelId = wheel.add(
-                    Math.max(1, cur.periodMs), true, TimerKind.WAITABLE_TIMER,
-                    invoke, TimeService.getInstance().nowMs(),
-                );
-            } else if (cur) {
-                cur.wheelId = null;
-            }
-        }, TimeService.getInstance().nowMs());
+        entry.wheelId = cachedScheduler.timerWheel.add(
+            dueMs, false, TimerKind.TIMER_QUEUE_TIMER, hTimer, TimeService.getInstance().nowMs(), TIMER_PHASE_DUE);
     };
+
+    setTimerHandler(TimerKind.WAITABLE_TIMER, (hTimer, phase) => {
+        const sched = System.getInstance().scheduler;
+        sched.setEvent(hTimer);
+        if (phase !== TIMER_PHASE_DUE) return;
+        const t = waitableTimers.get(hTimer);
+        if (t && t.periodMs > 0) {
+            t.wheelId = sched.timerWheel.add(
+                t.periodMs, true, TimerKind.WAITABLE_TIMER, hTimer, TimeService.getInstance().nowMs(), TIMER_PHASE_EVERY);
+        }
+    });
+
+    setTimerHandler(TimerKind.TIMER_QUEUE_TIMER, (hTimer, phase) => {
+        const sched = cachedScheduler;
+        const cur = timerQueueTimers.get(hTimer);
+        if (!cur) return;
+        // WAITORTIMERCALLBACK(PVOID Parameter, BOOLEAN TimerOrWaitFired=TRUE).
+        sched.postTimerCallback(cur.callback, [cur.parameter, 1]);
+        if (phase !== TIMER_PHASE_DUE) return;
+        const after = timerQueueTimers.get(hTimer);
+        if (after && after.periodMs > 0) {
+            after.wheelId = sched.timerWheel.add(
+                Math.max(1, after.periodMs), true, TimerKind.TIMER_QUEUE_TIMER, hTimer,
+                TimeService.getInstance().nowMs(), TIMER_PHASE_EVERY,
+            );
+        } else if (after) {
+            after.wheelId = null;
+        }
+    });
 
     exports['CreateTimerQueueTimer'] = (_ctx, _mem, args) => {
         const phNewTimer = args[0] >>> 0;

@@ -140,7 +140,20 @@ export interface WaitInfo {
     onWake?: WaitCompletion;
 }
 
-export type WaitCompletion = (waitResult: number) => { value: number; lastError?: number };
+export const enum WaitCompletionKind {
+    WAIT_ON_ADDRESS = 1,
+    OVERLAPPED_RESULT = 2,
+    RERUN_FROM_STUB = 3,
+}
+
+export interface WaitCompletion {
+    kind: WaitCompletionKind;
+    a: number;
+    b: number;
+    c: number;
+}
+
+export interface WaitAnswer { value: number; lastError?: number }
 
 // ─── APC ────────────────────────────────────────────────────────────────────────
 
@@ -404,6 +417,12 @@ export const enum TimerKind {
     MSS_TIMER = 6,
     QUARTZ_VIDEO = 7,
     DMUSIC_SYNTH = 8,
+    JOYSTICK_CAPTURE = 9,
+    WAVEOUT_COMPLETION = 10,
+    TIMER_QUEUE_TIMER = 11,
+    THREADPOOL_TIMER = 12,
+    THREADPOOL_WAIT = 13,
+    MSS_HEARTBEAT = 14,
 }
 
 // ─── Scheduler Configuration ────────────────────────────────────────────────────

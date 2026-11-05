@@ -38,6 +38,7 @@ import {
     simdSnapshot,
 } from '../fpu-helper';
 import { TimerWheel } from './timer-wheel';
+import { completeWait } from './wait-completion';
 import { dispatchThreadApcs } from './apc-dispatch';
 import { SyncObjectManager, recordSyncEvent } from './sync-objects';
 import { WaitEngine } from './wait-engine';
@@ -651,7 +652,7 @@ export class Scheduler {
 
     constructor(config: Partial<SchedulerConfig> = {}) {
         this.config = { ...DEFAULT_SCHEDULER_CONFIG, ...config };
-
+        this.timerWheel.bind(TimerKind.SLEEP_TIMEOUT, (tid) => this.onWaitTimeout(tid));
     }
 
     private readonly onYieldTask = (): void => {
@@ -4376,7 +4377,8 @@ export class Scheduler {
         }
 
         const now = this.timeService.nowMs();
-        // Telemetry: count WINMM timers fired by a wall-paced idle pump.
+        // Telemetry: count timeSetEvent timers (TimerKind.WINMM_TIMER only; joystick and waveOut
+        // polls have their own kinds) fired by a wall-paced idle pump.
         const winmmFiredBefore = this.timerWheel.firedByKind[TimerKind.WINMM_TIMER];
         this.timerWheel.poll(now);
         if (pumpedIdle) {
@@ -4717,14 +4719,7 @@ export class Scheduler {
         // Create timeout timer if needed
         let timerId = 0;
         if (timeoutMs !== null) {
-            const tid = thread.id;
-            timerId = this.timerWheel.add(timeoutMs, false, TimerKind.SLEEP_TIMEOUT, () => {
-                const t = this.threads.get(tid);
-                if (t && t.state === ThreadState.WAITING) {
-                    const wakeResult = t.waitInfo?.reason === WaitReason.SLEEP ? 0 : WAIT_TIMEOUT;
-                    this.wakeThread(t, wakeResult);
-                }
-            }, this.timeService.nowMs());
+            timerId = this.timerWheel.add(timeoutMs, false, TimerKind.SLEEP_TIMEOUT, thread.id, this.timeService.nowMs());
         }
 
         const waitInfo: WaitInfo = {
@@ -4760,6 +4755,14 @@ export class Scheduler {
                 this.syncObjects.consumeWait(recheck, thread.id);
                 this.wakeThread(thread, recheck.result);
             }
+        }
+    }
+
+    private onWaitTimeout(tid: number): void {
+        const t = this.threads.get(tid);
+        if (t && t.state === ThreadState.WAITING) {
+            const wakeResult = t.waitInfo?.reason === WaitReason.SLEEP ? 0 : WAIT_TIMEOUT;
+            this.wakeThread(t, wakeResult);
         }
     }
 
@@ -4834,7 +4837,7 @@ export class Scheduler {
 
         const onWake = thread.waitInfo?.onWake;
         if (onWake) {
-            const done = onWake(result);
+            const done = completeWait(onWake, result);
             result = done.value;
             if (done.lastError !== undefined) this.setThreadLastError(thread, done.lastError);
         }

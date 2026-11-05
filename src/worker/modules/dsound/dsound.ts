@@ -7,6 +7,7 @@ import { dsoundModule } from "../../api/dsound.api";
 import { System } from "../../core/system";
 import { allocateComObject, freeComObject } from "../../core/com/com-memory";
 import { TimerKind } from "../../core/scheduler/types";
+import { setTimerHandler } from "../../core/scheduler/timer-wheel";
 import { TimeService } from "../../runtime/time";
 import {
     createAudioRingBuffer,
@@ -357,6 +358,10 @@ export class DSound implements IModule {
     private vtables: Record<string, VTableInfo> = {};
     private nextBufferId = DSOUND_AUDIO_ID_BASE;
     private notifyTimerId: number | null = null;
+
+    constructor() {
+        setTimerHandler(TimerKind.DSOUND_NOTIFY, () => this.checkNotifications());
+    }
     /** Singleton primary buffer COM pointer (CreateSoundBuffer PRIMARYBUFFER). */
     private primaryBufferPtr = 0;
     private speakerConfig = DEFAULT_SPEAKER_CONFIG;
@@ -2598,7 +2603,7 @@ export class DSound implements IModule {
             10,
             true,
             TimerKind.DSOUND_NOTIFY,
-            () => this.checkNotifications(),
+            0,
             TimeService.getInstance().nowMs(),
         );
     }

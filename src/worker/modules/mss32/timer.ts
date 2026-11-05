@@ -2,6 +2,7 @@ import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
 import { TimerKind } from "../../core/scheduler/types";
+import { setTimerHandler } from "../../core/scheduler/timer-wheel";
 import { TimeService } from "../../runtime/time";
 import { MSSContext } from "./context";
 import { MSSTimer } from "./types";
@@ -27,6 +28,25 @@ function withdrawPendingTicks(ctx: MSSContext, timer: MSSTimer): void {
 
 export function createTimerExports(ctx: MSSContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
+
+    setTimerHandler(TimerKind.MSS_TIMER, (handle, _arg, wheelId) => {
+        const timer = ctx.timers.get(handle);
+        if (!timer || timer.timerId !== wheelId) return;
+        const system = System.getInstance();
+        const scheduler = system.scheduler;
+        const cb = timer.callback;
+        const onReturn = timer.pumpOnReturn;
+        if (!timer.active || !cb || !onReturn) return;
+        if (!system.process || system.isExiting) return;
+        // Coalesce while our tick is queued or running. If it was lost without
+        // returning (pump queue reset, pump thread gone) stop waiting for it.
+        if (timer.inFlight && scheduler.isTimerCallbackPending((posted) => posted.onReturn === onReturn)) return;
+        timer.inFlight = true;
+        if (!scheduler.postTimerCallback(cb, [timer.user], onReturn)) {
+            timer.inFlight = false;
+            ctx.pendingTimerCallbacks.push({ callback: cb, user: timer.user, handle });
+        }
+    });
 
     // _AIL_register_timer@4
     exports["_AIL_register_timer@4"] = (ctxThunk, mem, args) => {
@@ -83,28 +103,13 @@ export function createTimerExports(ctx: MSSContext): Record<string, ThunkImpleme
             // the app ever calls AIL_serve, so ticks go to the shared timer-pump thread; the
             // AIL_serve queue is only the fallback when no pump thread can be created.
             scheduler.ensureTimerPumpThread();
-            const cbArgs = [0];
             // A tick posted by an earlier start (still running after a stop) must not clear
             // this start's coalescing flag, hence the identity check.
             const onReturn = () => { if (timer.pumpOnReturn === onReturn) timer.inFlight = false; };
-            const isOurs = (posted: { onReturn?: () => void }) => posted.onReturn === onReturn;
             timer.pumpOnReturn = onReturn;
             timer.inFlight = false;
             timer.timerId = scheduler.timerWheel.add(
-                periodMs, true, TimerKind.MSS_TIMER,
-                () => {
-                    if (!timer.active || !cb) return;
-                    if (!system.process || system.isExiting) return;
-                    // Coalesce while our tick is queued or running. If it was lost without
-                    // returning (pump queue reset, pump thread gone) stop waiting for it.
-                    if (timer.inFlight && scheduler.isTimerCallbackPending(isOurs)) return;
-                    timer.inFlight = true;
-                    cbArgs[0] = timer.user;
-                    if (!scheduler.postTimerCallback(cb, cbArgs, onReturn)) {
-                        timer.inFlight = false;
-                        ctx.pendingTimerCallbacks.push({ callback: cb, user: timer.user, handle });
-                    }
-                },
+                periodMs, true, TimerKind.MSS_TIMER, handle,
                 TimeService.getInstance().nowMs(),
             );
             Logger.verbose(LogCategory.SYSTEM, `MSS32: _AIL_start_timer@4 started handle=${handle} period=${periodMs}ms cb=0x${cb.toString(16)}`);

@@ -1830,7 +1830,8 @@ describe("scheduler/timer wheel kinds", () => {
     test("DSound notification timers are scheduler-wheel timers with their own tally", () => {
         const wheel = new TimerWheel();
         let fired = 0;
-        wheel.add(10, true, TimerKind.DSOUND_NOTIFY, () => { fired++; }, 100);
+        wheel.bind(TimerKind.DSOUND_NOTIFY, () => { fired++; });
+        wheel.add(10, true, TimerKind.DSOUND_NOTIFY, 0, 100);
 
         expect(wheel.poll(109)).toBe(0);
         expect(fired).toBe(0);
@@ -1848,8 +1849,10 @@ describe("scheduler/timer wheel kinds", () => {
         let bFired = 0;
         // A (due at 10) throws; B (due at 10) must still run in the same poll, and
         // the throw must not propagate out of poll() into the scheduler tick.
-        wheel.add(5, false, TimerKind.USER32_TIMER, () => { throw new Error("boom"); }, 5);
-        wheel.add(5, false, TimerKind.DSOUND_NOTIFY, () => { bFired++; }, 5);
+        wheel.bind(TimerKind.USER32_TIMER, () => { throw new Error("boom"); });
+        wheel.bind(TimerKind.DSOUND_NOTIFY, () => { bFired++; });
+        wheel.add(5, false, TimerKind.USER32_TIMER, 0, 5);
+        wheel.add(5, false, TimerKind.DSOUND_NOTIFY, 0, 5);
 
         expect(() => wheel.poll(10)).not.toThrow();
         expect(bFired).toBe(1);
@@ -1858,11 +1861,11 @@ describe("scheduler/timer wheel kinds", () => {
     test("a periodic timer can cancel itself from its callback before re-arm", () => {
         const wheel = new TimerWheel();
         let fired = 0;
-        let id = 0;
-        id = wheel.add(5, true, TimerKind.USER32_TIMER, () => {
+        wheel.bind(TimerKind.USER32_TIMER, (_owner, _arg, id) => {
             fired++;
             expect(wheel.cancel(id)).toBe(true);
-        }, 10);
+        });
+        wheel.add(5, true, TimerKind.USER32_TIMER, 0, 10);
 
         expect(wheel.poll(15)).toBe(1);
         expect(fired).toBe(1);
@@ -1878,8 +1881,9 @@ describe("scheduler/timer wheel kinds", () => {
         const wheel = new TimerWheel();
         const order: number[] = [];
         // USER32_TIMER floor is 1ms → all due at the same fireAt (base 0 + 1 = 1).
+        wheel.bind(TimerKind.USER32_TIMER, (n) => { order.push(n); });
         for (let n = 0; n < 6; n++) {
-            wheel.add(1, false, TimerKind.USER32_TIMER, () => { order.push(n); }, 0);
+            wheel.add(1, false, TimerKind.USER32_TIMER, n, 0);
         }
         expect(wheel.poll(1)).toBe(6);
         expect(order).toEqual([0, 1, 2, 3, 4, 5]);
@@ -1890,8 +1894,10 @@ describe("scheduler/timer wheel kinds", () => {
         const order: string[] = [];
         // Two periodic pumps with the same period added in a known order. After both fire
         // and re-arm at the same fireAt, the next poll must replay the same A-before-B order.
-        wheel.add(5, true, TimerKind.DSOUND_NOTIFY, () => { order.push("A"); }, 0);
-        wheel.add(5, true, TimerKind.WINMM_TIMER, () => { order.push("B"); }, 0);
+        wheel.bind(TimerKind.DSOUND_NOTIFY, () => { order.push("A"); });
+        wheel.bind(TimerKind.WINMM_TIMER, () => { order.push("B"); });
+        wheel.add(5, true, TimerKind.DSOUND_NOTIFY, 0, 0);
+        wheel.add(5, true, TimerKind.WINMM_TIMER, 0, 0);
         wheel.poll(5);
         wheel.poll(10);
         expect(order).toEqual(["A", "B", "A", "B"]);
@@ -1900,7 +1906,8 @@ describe("scheduler/timer wheel kinds", () => {
     test("reschedule moves an existing timer without changing its periodic cadence", () => {
         const wheel = new TimerWheel();
         let fired = 0;
-        const id = wheel.add(5, true, TimerKind.WINMM_TIMER, () => { fired++; }, 0);
+        wheel.bind(TimerKind.WINMM_TIMER, () => { fired++; });
+        const id = wheel.add(5, true, TimerKind.WINMM_TIMER, 0, 0);
 
         expect(wheel.reschedule(id, 20, true, TimerKind.WINMM_TIMER, 1)).toBe(true);
         expect(wheel.poll(20)).toBe(0);
@@ -1916,9 +1923,10 @@ describe("scheduler/timer wheel kinds", () => {
     test("reschedule preserves heap order when moving timers earlier and later", () => {
         const wheel = new TimerWheel();
         const order: string[] = [];
-        const a = wheel.add(30, false, TimerKind.USER32_TIMER, () => { order.push("A"); }, 0);
-        const b = wheel.add(10, false, TimerKind.USER32_TIMER, () => { order.push("B"); }, 0);
-        const c = wheel.add(20, false, TimerKind.USER32_TIMER, () => { order.push("C"); }, 0);
+        wheel.bind(TimerKind.USER32_TIMER, (owner) => { order.push(String.fromCharCode(owner)); });
+        const a = wheel.add(30, false, TimerKind.USER32_TIMER, 0x41, 0);
+        const b = wheel.add(10, false, TimerKind.USER32_TIMER, 0x42, 0);
+        const c = wheel.add(20, false, TimerKind.USER32_TIMER, 0x43, 0);
 
         expect(wheel.reschedule(a, 5, false, TimerKind.USER32_TIMER, 0)).toBe(true);
         expect(wheel.reschedule(b, 40, false, TimerKind.USER32_TIMER, 0)).toBe(true);
@@ -2045,7 +2053,7 @@ describe("scheduler/shouldPumpIdleVirtualTime — wheel-driven wakeups (audio-pu
     test("all threads blocked on an event + active wheel timer → pump engages", () => {
         const s = new Scheduler();
         blockOnEvent(s, 1);
-        s.timerWheel.add(5, true, TimerKind.WINMM_TIMER, () => {}, 0);
+        s.timerWheel.add(5, true, TimerKind.WINMM_TIMER, 0, 0);
         expect((s as any).shouldPumpIdleVirtualTime()).toBe(true);
     });
 
@@ -2058,7 +2066,7 @@ describe("scheduler/shouldPumpIdleVirtualTime — wheel-driven wakeups (audio-pu
     test("control: a RUNNING thread → never pump (guest owns the clock)", () => {
         const s = new Scheduler();
         inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
-        s.timerWheel.add(5, true, TimerKind.WINMM_TIMER, () => {}, 0);
+        s.timerWheel.add(5, true, TimerKind.WINMM_TIMER, 0, 0);
         expect((s as any).shouldPumpIdleVirtualTime()).toBe(false);
     });
 
@@ -2066,7 +2074,7 @@ describe("scheduler/shouldPumpIdleVirtualTime — wheel-driven wakeups (audio-pu
         const s = new Scheduler();
         const t = inject(s, mkThread(1, ThreadState.WAITING), {});
         t.waitInfo = { reason: WaitReason.ASYNC_THUNK, handles: [], waitAll: false } as any;
-        s.timerWheel.add(5, true, TimerKind.WINMM_TIMER, () => {}, 0);
+        s.timerWheel.add(5, true, TimerKind.WINMM_TIMER, 0, 0);
         // Only an ASYNC_THUNK waiter exists (woken by its JS promise) → no non-async waiter
         // for the wheel to wake → don't pump.
         expect((s as any).shouldPumpIdleVirtualTime()).toBe(false);
@@ -2085,8 +2093,8 @@ describe("scheduler/shouldPumpIdleVirtualTime — wheel-driven wakeups (audio-pu
             advanceVirtualTime: (ms: number) => { virtualMs += ms; },
         };
         const message = queue.waitForMessage(1);
-        s.timerWheel.add(5, false, TimerKind.USER32_TIMER,
-            () => queue.enqueue(0x10001, 0x113, 2, 0, 0, 0, 1), 0);
+        s.timerWheel.bind(TimerKind.USER32_TIMER, () => queue.enqueue(0x10001, 0x113, 2, 0, 0, 0, 1));
+        s.timerWheel.add(5, false, TimerKind.USER32_TIMER, 0, 0);
 
         s.pollTimeouts(); // establish the stopped guest's wall-clock anchor
         (s as any).idleAnchorWallMs -= 20;

@@ -2,6 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { System } from "../../src/worker/core/system";
 import { createTimerExports } from "../../src/worker/modules/mss32/timer";
 import type { MSSContext } from "../../src/worker/modules/mss32/context";
+import { clearTimerHandler, getTimerHandler } from "../../src/worker/core/scheduler/timer-wheel";
+import { TimerKind } from "../../src/worker/core/scheduler/types";
 
 type Posted = { callbackAddr: number; args: number[]; onReturn?: () => void };
 const CB = 0x401000, USER = 0x1234;
@@ -16,7 +18,11 @@ function rig(pump = true) {
     let nextWheelId = 1;
     const scheduler = {
         timerWheel: {
-            add: (_ms: number, _periodic: boolean, _kind: unknown, fn: () => void) => { fires.set(nextWheelId, fn); return nextWheelId++; },
+            add: (_ms: number, _periodic: boolean, kind: TimerKind, owner: number) => {
+                const id = nextWheelId++;
+                fires.set(id, () => getTimerHandler(kind)!(owner, 0, id));
+                return id;
+            },
             cancel: (id: number) => fires.delete(id),
         },
         ensureTimerPumpThread: () => {},
@@ -27,6 +33,7 @@ function rig(pump = true) {
     };
     Object.assign(system, { scheduler, process: {}, isExiting: false });
     const ctx = { timers: new Map(), nextTimerId: 1, pendingTimerCallbacks: [] } as unknown as MSSContext;
+    clearTimerHandler(TimerKind.MSS_TIMER);
     const api = createTimerExports(ctx);
     const call = (name: string, ...args: number[]) => api[name]!({} as never, new Uint8Array(0), args);
     const tick = () => [...fires.values()].forEach((fn) => fn());
