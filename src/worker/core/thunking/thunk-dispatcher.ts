@@ -265,6 +265,18 @@ interface ActiveAsyncThunk {
     restartable?: () => boolean;
 }
 
+export interface RestartablePark {
+    threadId: number;
+    functionId: number;
+    functionName: string;
+    generation: number;
+    esp: number;
+    returnAddr: number;
+    args: Uint8Array;
+    spinAddr: number;
+    spinBytes: [number, number];
+}
+
 interface PendingAsyncRestore {
     info: ActiveAsyncThunk;
     returnValue: number;
@@ -1705,6 +1717,7 @@ export class ThunkDispatcher {
     }
 
     captureState(): { wbufTail: number; asyncEpoch: number; uef: number; callbacks: ReturnType<CallbackManager['captureState']> } {
+        if (this.writeBufferPendingBytes() > 0) throw new Error('dispatcher: write-buffer entries are not flushed');
         if (this.activeAsyncThunks.size > 0 && [...this.activeAsyncThunks.values()].some(i => i.restartable?.() !== true)) {
             throw new Error('dispatcher: a thread waits on host work');
         }
@@ -1721,12 +1734,14 @@ export class ThunkDispatcher {
         this.callbackManager.restoreState(state.callbacks);
     }
 
-    restartableParks(): Array<{ threadId: number; functionId: number; esp: number; returnAddr: number; spinAddr: number; spinBytes: [number, number] }> {
-        const out = [];
+    restartableParks(): RestartablePark[] {
+        const out: RestartablePark[] = [];
         for (const info of this.activeAsyncThunks.values()) {
-            if (info.restartable?.() !== true || info.returnAddr === undefined || info.esp === undefined) continue;
+            if (info.restartable?.() !== true || info.returnAddr === undefined || info.esp === undefined || !info.stackSnapshot) continue;
             out.push({
-                threadId: info.threadId ?? 0, functionId: info.functionId, esp: info.esp, returnAddr: info.returnAddr,
+                threadId: info.threadId ?? 0, functionId: info.functionId, functionName: info.functionName ?? `#${info.functionId}`,
+                generation: info.asyncParkGeneration ?? 0, esp: info.esp, returnAddr: info.returnAddr,
+                args: info.stackSnapshot.slice(4),
                 spinAddr: info.spinAddr ?? this.spinLoopAddress, spinBytes: info.originalSpinBytes ?? [0, 0] as [number, number],
             });
         }
@@ -3502,7 +3517,9 @@ export class ThunkDispatcher {
                 Logger.error(LogCategory.THUNK,
                     `SUSPICIOUS: Async thunk ${name} returnAddr 0x${returnAddr.toString(16)} inside THUNK region! ESP=0x${esp.toString(16)}`);
             }
-            stackSnapshot = mem.slice(esp, Math.min(esp + 16, mem.length));
+            const stub = this.thunkGenerator.getStubById(id);
+            const argBytes = stub ? (stub.stackCleanupBytes ?? (stub.argCount ?? 0) * 4) : 0;
+            stackSnapshot = mem.slice(esp, Math.min(esp + Math.max(16, 4 + argBytes), mem.length));
         }
 
         const tid = System.getInstance().scheduler.getCurrentThreadId();

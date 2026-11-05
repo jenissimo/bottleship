@@ -1,5 +1,5 @@
 import { System } from '../../core/system';
-import { savestateParticipants } from '../../savestate/participant';
+import { savestateParticipants, stateKeys } from '../../savestate/participant';
 import type { SaveValue } from '../../savestate/value-codec';
 import { captureAtoms, restoreAtoms } from './atom';
 import { captureFls, restoreFls } from './fls';
@@ -20,6 +20,7 @@ import { ioCompletionInUse } from './sync';
 import { pendingReadExCount } from './file-io-ex';
 import { pendingSocketFileIoCount } from './socket-file-io';
 import { getVirtualProcessManager } from './process/virtual-process-manager';
+import { captureStartupSessionState, restoreStartupSessionState, type StartupSessionState } from '../../core/process-startup-info';
 
 export interface Kernel32State {
     atoms: ReturnType<typeof captureAtoms>;
@@ -37,6 +38,7 @@ export interface Kernel32State {
     vista: VistaSystemState;
     actCtx: ActCtxState;
     threadPool: ReturnType<typeof captureVistaRuntimeState>;
+    startup: StartupSessionState;
 }
 
 export function captureKernel32State(): Kernel32State {
@@ -62,6 +64,7 @@ export function captureKernel32State(): Kernel32State {
         vista: captureVistaSystemState(),
         actCtx: captureActCtxState(),
         threadPool: captureVistaRuntimeState(),
+        startup: captureStartupSessionState(),
     };
 }
 
@@ -81,11 +84,13 @@ export function restoreKernel32State(state: Kernel32State): void {
     restoreVistaSystemState(state.vista);
     restoreActCtxState(state.actCtx);
     restoreVistaRuntimeState(state.threadPool);
+    restoreStartupSessionState(state.startup);
 }
 
 export function registerKernel32Participant(): void {
     savestateParticipants.add({
         id: 'kernel32', version: 1, order: 6, covers: ['kernel32', 'kernelbase', 'ntdll'],
+        schema: stateKeys<Kernel32State>({ atoms: true, fls: true, srwLocks: true, namedObjects: true, modules: true, resources: true, commandLine: true, pointerCookie: true, consoleModes: true, fileApisAnsi: true, console: true, process: true, vista: true, actCtx: true, threadPool: true, startup: true }),
         capture: () => captureKernel32State() as unknown as SaveValue,
         restore: (s) => restoreKernel32State(s as unknown as Kernel32State),
     });

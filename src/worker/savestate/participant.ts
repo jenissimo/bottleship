@@ -1,8 +1,13 @@
 import { encodeValue, type SaveValue } from './value-codec';
 import type { ParticipantSchema } from './container';
 
+export interface CpuOverride { eip: number; esp: number }
+
 export interface CaptureContext {
     ref(obj: unknown, where: string): number;
+    patchRam(address: number, bytes: readonly number[]): void;
+    overrideCpu(regs: CpuOverride): void;
+    cpuOverride(): CpuOverride | null;
 }
 
 export interface RestoreContext {
@@ -35,6 +40,10 @@ export function pickSaved<T, P extends Record<keyof T, FieldPolicy>>(
 
 export function normalizeModuleName(name: string): string {
     return (name.split(/[\\/]/).pop() ?? name).toLowerCase().replace(/\.(dll|drv|exe)$/, '');
+}
+
+export function stateKeys<T>(keys: Record<keyof T, true>): string[] {
+    return Object.keys(keys).sort();
 }
 
 export function schemaHash(schema: SaveValue): string {

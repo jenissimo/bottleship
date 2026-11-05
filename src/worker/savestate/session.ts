@@ -1,4 +1,4 @@
-import { savestateParticipants, uncoveredModules } from './participant';
+import { savestateParticipants, uncoveredModules, type CaptureContext, type CpuOverride } from './participant';
 import { restoreRam, snapshotRam, writeRamChunks, type RamCaptureStats, type RamPatch } from './ram';
 import type { ChunkStore } from './chunk-store';
 import {
@@ -9,15 +9,34 @@ import { CaptureRefusal, newObjectGraph, restoreObjectGraph } from './object-cod
 
 const OBJECTS = '$objects';
 
-/** @transient(patches queued by participants during one capture and consumed by it) */
-export const ramPatches: RamPatch[] = [];
-
 export interface SavestateTarget {
     guestMemory(): Uint8Array;
     compatibilityKey(): CompatibilityKey;
     overlayState(): string;
     gameId(): string;
     touchedModules(): Iterable<string>;
+}
+
+export interface CaptureRun extends CaptureContext {
+    readonly objects: Array<[string, SaveValue]>;
+    readonly ramPatches: readonly RamPatch[];
+}
+
+export function newCaptureRun(): CaptureRun {
+    const graph = newObjectGraph();
+    const ramPatches: RamPatch[] = [];
+    let cpu: CpuOverride | null = null;
+    return {
+        objects: graph.objects,
+        ramPatches,
+        ref: (obj, where) => graph.ref(obj, where),
+        patchRam: (address, bytes) => { ramPatches.push({ address, bytes: [...bytes] }); },
+        overrideCpu: (regs) => {
+            if (cpu) throw new CaptureRefusal('savestate: two threads claim the live CPU');
+            cpu = { ...regs };
+        },
+        cpuOverride: () => cpu,
+    };
 }
 
 export interface CaptureResult { bytes: Uint8Array; ram: RamCaptureStats; sections: Record<string, number> }
@@ -27,15 +46,15 @@ export async function captureSession(target: SavestateTarget, store: ChunkStore)
     if (missing.length > 0) throw new CaptureRefusal(`savestate: no participant captures ${missing.join(', ')}`);
     const sections = new Map<string, SaveValue>();
     const sizes: Record<string, number> = {};
-    const graph = newObjectGraph();
+    const run = newCaptureRun();
     for (const p of savestateParticipants.all()) {
-        const value = p.capture(graph);
+        const value = p.capture(run);
         sections.set(p.id, value);
         const enc = encodeValue(value);
         sizes[p.id] = enc.json.length + enc.blobs.reduce((n, b) => n + b.length, 0);
     }
-    sections.set(OBJECTS, graph.objects as unknown as SaveValue);
-    const snap = await snapshotRam(target.guestMemory(), new Set(await store.list()), ramPatches.splice(0));
+    sections.set(OBJECTS, run.objects as unknown as SaveValue);
+    const snap = await snapshotRam(target.guestMemory(), new Set(await store.list()), run.ramPatches);
     await writeRamChunks(snap.pending, store);
     const { manifest, stats } = snap;
     const state: Savestate = {

@@ -141,6 +141,12 @@ export const THREAD_FIELDS = {
     apcQueue: 'save', quitPosted: 'save', quitExitCode: 'save', asyncParkGeneration: 'save',
 } as const satisfies Record<keyof Thread, 'save' | 'derive' | 'host' | 'transient'>;
 
+type SavedThreadField = { [K in keyof typeof THREAD_FIELDS]: (typeof THREAD_FIELDS)[K] extends 'save' ? K : never }[keyof typeof THREAD_FIELDS];
+
+export type SavedThreadMatchesPolicy = [Exclude<keyof SavedThread, SavedThreadField>, Exclude<SavedThreadField, keyof SavedThread>] extends [never, never] ? true : never;
+
+export const SAVED_THREAD_MATCHES_POLICY: SavedThreadMatchesPolicy = true;
+
 export interface SchedulerState {
     threads: SavedThread[];
     currentThreadId: number | null;

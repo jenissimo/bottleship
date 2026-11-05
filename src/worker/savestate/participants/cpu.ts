@@ -1,5 +1,5 @@
 import { cpuViews } from '../../core/cpu/cpu-views';
-import type { FieldPolicy } from '../participant';
+import type { CpuOverride, FieldPolicy } from '../participant';
 import type { SaveValue } from '../value-codec';
 
 type Reg = Int32Array | Uint32Array | Uint16Array | Uint8Array;
@@ -116,10 +116,16 @@ type SavedName = { [K in keyof typeof CPU_FIELDS]: (typeof CPU_FIELDS)[K] extend
 const SAVED = (Object.keys(CPU_FIELDS) as (keyof V86RegisterFile)[])
     .filter((k): k is SavedName => CPU_FIELDS[k] === 'save');
 
-export function captureCpu(cpu: V86Cpu): SaveValue {
+export function captureCpu(cpu: V86Cpu, override: CpuOverride | null = null): SaveValue {
     cpu.store_current_tsc();
     const regs: Record<string, SaveValue> = {};
     for (const name of SAVED) regs[name] = (cpu[name] as Reg).slice();
+    if (override) {
+        (regs.instruction_pointer as Reg)[0] = override.eip | 0;
+        (regs.previous_ip as Reg)[0] = override.eip | 0;
+        (regs.reg32 as Reg)[4] = override.esp | 0;
+        (regs.last_virt_eip as Reg)[0] = -1;
+    }
     return { memorySize: cpuViews(cpu).memorySize[0]!, regs };
 }
 

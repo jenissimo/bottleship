@@ -2,6 +2,8 @@ import type { FastPathImplementation } from '../core/thunking/thunk-dispatcher';
 
 export type TimeMode = "realtime" | "manual";
 
+export interface ClockState { nowMs: number }
+
 export class TimeService {
     private static instance: TimeService | null = null;
     private mode: TimeMode = "realtime";
@@ -271,11 +273,12 @@ export class TimeService {
         return performance.now() + this.wallOffsetMs;
     }
 
-    captureClock(): { nowMs: number; mode: TimeMode } {
-        return { nowMs: this.nowMs(), mode: this.mode };
+    captureClock(): ClockState {
+        if (this.mode !== 'realtime') throw new Error('time: a manual clock is not part of a v1 savestate');
+        return { nowMs: this.nowMs() };
     }
 
-    restoreClock(saved: { nowMs: number }): void {
+    restoreClock(saved: ClockState): void {
         this.wallOffsetMs = saved.nowMs - performance.now();
         this.lastReturnedMs = saved.nowMs;
         if (this.virtualTimeActive) this.virtualTimeMs = saved.nowMs;

@@ -3,7 +3,7 @@ import { encodeValue, type SaveValue } from "../../src/worker/savestate/value-co
 import { CPU_FIELDS, captureCpu, restoreCpu, type V86Cpu } from "../../src/worker/savestate/participants/cpu";
 import { TimerWheel } from "../../src/worker/core/scheduler/timer-wheel";
 import { TimerKind, ThreadState, WaitReason, type Thread } from "../../src/worker/core/scheduler/types";
-import { Scheduler } from "../../src/worker/core/scheduler/scheduler";
+import { Scheduler, THREAD_FIELDS } from "../../src/worker/core/scheduler/scheduler";
 import { AddressSpace } from "../../src/worker/core/memory/address-space";
 import { MemoryManager } from "../../src/worker/core/process";
 import { ThunkGenerator } from "../../src/worker/core/thunking/thunk-generator";
@@ -16,6 +16,23 @@ import { namedObjects } from "../../src/worker/modules/kernel32/named-objects";
 import { captureAtoms } from "../../src/worker/modules/kernel32/atom";
 import { consoleScreenBuffers } from "../../src/worker/modules/kernel32/console-screen-buffer";
 import { System } from "../../src/worker/core/system";
+import { ThunkDispatcher } from "../../src/worker/core/thunking/thunk-dispatcher";
+import { newCaptureRun } from "../../src/worker/savestate/session";
+import { resetAtomTable } from "../../src/worker/modules/kernel32/atom";
+import { resetFlsState } from "../../src/worker/modules/kernel32/fls";
+import { resetAllSrwLocks } from "../../src/worker/modules/kernel32/srw-lock";
+import { resetResourceCache } from "../../src/worker/modules/kernel32/resource";
+import { resetCommandLineState } from "../../src/worker/modules/kernel32/command/command";
+import { resetConsoleModeState } from "../../src/worker/modules/kernel32/file-io-console";
+import { resetPointerCookie } from "../../src/worker/modules/kernel32/exception";
+import { resetIoCompletionWaiters, resetSyncState } from "../../src/worker/modules/kernel32/sync";
+import { resetVistaRuntimeState } from "../../src/worker/modules/kernel32/vista-runtime";
+import { resetProcessApiState } from "../../src/worker/modules/kernel32/process/process";
+import { resetVistaSystemState } from "../../src/worker/modules/kernel32/process/vista-system";
+import { resetActCtxState } from "../../src/worker/modules/kernel32/process/actctx";
+import { getVirtualProcessManager } from "../../src/worker/modules/kernel32/process/virtual-process-manager";
+import { resetProcessStartupInfo } from "../../src/worker/core/process-startup-info";
+import { setFileApisAnsi } from "../../src/worker/modules/kernel32/file-io-strings";
 import { TimeService } from "../../src/worker/runtime/time";
 
 const bytes = (v: unknown) => {
@@ -49,6 +66,27 @@ function fakeCpu(): V86Cpu {
     cpu.jit_clear_cache = () => {};
     cpu.fw_value = null;
     return cpu as unknown as V86Cpu;
+}
+
+function resetKernel32Session(): void {
+    resetAtomTable();
+    resetFlsState();
+    resetAllSrwLocks();
+    namedObjects.reset();
+    resetResourceCache();
+    resetCommandLineState();
+    resetConsoleModeState();
+    resetPointerCookie();
+    resetIoCompletionWaiters();
+    resetSyncState();
+    resetVistaRuntimeState();
+    resetProcessApiState();
+    resetVistaSystemState();
+    resetActCtxState();
+    getVirtualProcessManager().reset();
+    resetProcessStartupInfo();
+    setFileApisAnsi(true);
+    consoleScreenBuffers.reset();
 }
 
 function mkThread(id: number, state: ThreadState): Thread {
@@ -153,20 +191,37 @@ describe("capture → restore → capture is byte-identical", () => {
         expect(fresh.getByHandle(h1)?.v).toBe(1);
     });
 
-    test("kernel32 module state", () => {
-        namedObjects.reset();
+    test("kernel32 module state, restored over a session that holds other state", () => {
+        resetKernel32Session();
         namedObjects.register("mutex", "Global\\Single", 0x120, { initialState: false });
         namedObjects.acquire("mutex", "Global\\Single");
         consoleScreenBuffers.createScreenBuffer(40, 10);
         const saved = captureKernel32State();
-        namedObjects.reset();
-        consoleScreenBuffers.reset();
+        resetKernel32Session();
+        namedObjects.register("event", "Other", 0x200, {});
+        consoleScreenBuffers.createScreenBuffer(80, 25);
+        consoleScreenBuffers.createScreenBuffer(10, 10);
         restoreKernel32State(structuredClone(saved));
         expect(bytes(captureKernel32State())).toEqual(bytes(saved));
         expect(namedObjects.peek("mutex", "Global\\Single")).toBe(0x120);
+        expect(namedObjects.peek("event", "Other")).toBeUndefined();
         expect(captureAtoms().atoms).toEqual(saved.atoms.atoms);
-        namedObjects.reset();
-        consoleScreenBuffers.reset();
+        resetKernel32Session();
+    });
+
+    test("the dispatcher refuses unflushed write-buffer entries", () => {
+        const fake = { writeBufferPendingBytes: () => 8 };
+        expect(() => ThunkDispatcher.prototype.captureState.call(fake as never)).toThrow(/write-buffer/);
+    });
+
+    test("RAM patches and the CPU override belong to one capture", () => {
+        const a = newCaptureRun();
+        a.patchRam(0x1000, [1, 2]);
+        a.overrideCpu({ eip: 0x401000, esp: 0x2ff000 });
+        const b = newCaptureRun();
+        expect(b.ramPatches).toEqual([]);
+        expect(b.cpuOverride()).toBeNull();
+        expect(() => a.overrideCpu({ eip: 1, esp: 2 })).toThrow(/two threads/);
     });
 });
 
@@ -204,6 +259,71 @@ describe("participant schemas", () => {
     });
 });
 
+describe("schema pin and mutation", () => {
+    test("participant versions and schema hashes are pinned; a change here needs a version bump", () => {
+        registerCoreParticipants();
+        expect(savestateParticipants.schemas()).toEqual({
+            "kernel32": { version: 1, schemaHash: "17264d450fb069e1" },
+            "time": { version: 1, schemaHash: "728d1b2522148901" },
+            "address-space": { version: 1, schemaHash: "a1c4ce059654c36f" },
+            "memory-manager": { version: 1, schemaHash: "4a5dbc8ebbd40e94" },
+            "kernel32-memory": { version: 1, schemaHash: "1fbf402fadbc144f" },
+            "thunk-generator": { version: 1, schemaHash: "2673e673145253a5" },
+            "resources": { version: 1, schemaHash: "de537d8b445269ef" },
+            "hypercall-page": { version: 1, schemaHash: "5ea73324ac1a4cda" },
+            "scheduler": { version: 1, schemaHash: "9ca6e9ac5f1ca162" },
+            "timer-wheel": { version: 1, schemaHash: "3e2f3b81b4d37775" },
+            "dispatcher": { version: 1, schemaHash: "88687a30dd0036f2" },
+            "cpu": { version: 1, schemaHash: "4aad346ee75f6054" },
+        });
+    });
+
+    test("every saved thread field reaches the capture", () => {
+        registerCoreParticipants();
+        const captureOf = (t: Thread) => {
+            const s = new Scheduler();
+            (s as unknown as { threads: Map<number, Thread> }).threads.set(t.id, t);
+            const graph = newObjectGraph();
+            return bytes(s.captureState((o, w) => graph.ref(o, w)));
+        };
+        const base = () => {
+            const t = mkThread(1, ThreadState.READY);
+            t.context = { eax: 1, ebx: 2, ecx: 3, edx: 4, esi: 5, edi: 6, ebp: 7, esp: 8, eip: 9, eflags: 0x202 } as Thread['context'];
+            return t;
+        };
+        const mutate: Partial<Record<keyof Thread, (t: Thread) => void>> = {
+            kernelObject: t => { t.kernelObject = { kind: 'thread', threadId: 1 }; },
+            context: t => { t.context!.eax = 99; },
+            lastFpuState: t => { t.lastFpuState = new Uint8Array([1]); },
+            lastSimdState: t => { t.lastSimdState = new Uint8Array([2]); },
+            waitInfo: t => { t.waitInfo = { reason: WaitReason.SLEEP } as unknown as Thread['waitInfo']; },
+            exitCode: t => { t.exitCode = 5; },
+            tlsValues: t => { t.tlsValues.set(9, 9); },
+            backgroundMode: t => { t.backgroundMode = true; },
+            apcQueue: t => { t.apcQueue.push({ routine: 1, arg0: 0, arg1: 0, arg2: 0, kind: 0 } as Thread['apcQueue'][number]); },
+            quitPosted: t => { t.quitPosted = true; },
+        };
+        const before = captureOf(base());
+        for (const [field, policy] of Object.entries(THREAD_FIELDS) as Array<[keyof Thread, string]>) {
+            if (policy !== 'save') continue;
+            const t = base();
+            const change = mutate[field] ?? ((x: Thread) => { (x as unknown as Record<string, number>)[field] = ((x as unknown as Record<string, number>)[field] as number) + 1; });
+            change(t);
+            expect({ field, same: JSON.stringify(captureOf(t)) === JSON.stringify(before) }).toEqual({ field, same: false });
+        }
+    });
+
+    test("every saved CPU register reaches the capture", () => {
+        const before = bytes(captureCpu(fakeCpu()));
+        for (const [name, policy] of Object.entries(CPU_FIELDS)) {
+            if (policy !== 'save' || name === 'current_tsc') continue;
+            const cpu = fakeCpu();
+            (cpu as unknown as Record<string, Int32Array>)[name]![0] += 1;
+            expect({ name, same: JSON.stringify(bytes(captureCpu(cpu))) === JSON.stringify(before) }).toEqual({ name, same: false });
+        }
+    });
+});
+
 describe("module coverage", () => {
     test("names every touched module that no participant captures", () => {
         expect(uncoveredModules(["KERNEL32.dll", "user32.dll", "C:\\GAME\\ddraw.DLL", "ntdll"], new Set(["kernel32", "ntdll"])))
@@ -231,52 +351,92 @@ describe("module coverage", () => {
 });
 
 describe("restartable park rewind", () => {
-    test("a thread parked in GetMessage is captured at the call: stub EIP, return address on the stack, spin bytes put back", async () => {
+    type Park = { threadId: number; functionId: number; functionName: string; generation: number; esp: number; returnAddr: number; args: Uint8Array; spinAddr: number; spinBytes: [number, number] };
+    const args = new Uint8Array([0x00, 0x20, 0x40, 0x00, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
+    const park = (over: Partial<Park> = {}): Park => ({
+        threadId: 1, functionId: 9, functionName: "user32:GetMessageA", generation: 3, esp: 0x2fff00, returnAddr: 0x401234,
+        args, spinAddr: 0x7000, spinBytes: [0x55, 0x8b], ...over,
+    });
+
+    function parkedThread(id: number, esp: number): Thread {
+        const t = mkThread(id, ThreadState.WAITING);
+        t.context = { eax: 0, ebx: 7, ecx: 0, edx: 0, esi: 8, edi: 9, ebp: 0x2fff40, esp: esp + 20, eip: 0x7000, eflags: 0x202 } as Thread['context'];
+        t.waitInfo = { reason: WaitReason.ASYNC_THUNK, handles: [], waitAll: false, timeoutTimerId: 0, alertable: false, csAddress: 0, srwWantExclusive: false } as unknown as Thread['waitInfo'];
+        return t;
+    }
+
+    function withSession(threads: Thread[], current: number, parks: Park[], run: (capture: () => { state: any; ctx: ReturnType<typeof newCaptureRun> }) => void): void {
         registerCoreParticipants();
-        const { ramPatches } = await import("../../src/worker/savestate/session");
-        const { snapshotRam } = await import("../../src/worker/savestate/ram");
         const system = System.getInstance();
         const previous = { process: system.process, scheduler: system.scheduler };
         const sched = new Scheduler();
         const any = sched as unknown as { threads: Map<number, Thread>; currentThreadId: number | null };
-        const t = mkThread(1, ThreadState.WAITING);
-        t.context = { eax: 0, ebx: 0, ecx: 0, edx: 0, esi: 0, edi: 0, ebp: 0, esp: 0x2fff00, eip: 0x7000, eflags: 0x202 } as Thread['context'];
-        t.waitInfo = { reason: WaitReason.MESSAGE, handles: [], waitAll: false, timeoutTimerId: 0, alertable: false, csAddress: 0, srwWantExclusive: false } as unknown as Thread['waitInfo'];
-        any.threads.set(1, t);
-        any.currentThreadId = 1;
+        for (const t of threads) any.threads.set(t.id, t);
+        any.currentThreadId = current;
         system.scheduler = sched;
         system.process = {
-            dispatcher: { restartableParks: () => [{ threadId: 1, functionId: 9, esp: 0x2fff00, returnAddr: 0x401234, spinAddr: 0x7000, spinBytes: [0xeb, 0xfe] }] },
-            thunkGenerator: { getStubById: (id: number) => id === 9 ? { address: 0x21046090 } : undefined },
+            dispatcher: { restartableParks: () => parks },
+            thunkGenerator: { getStubById: (id: number) => id === 9 ? { address: 0x21046090, argCount: 4 } : undefined },
         } as never;
-        ramPatches.length = 0;
         try {
-            const participant = savestateParticipants.all().find(p => p.id === 'scheduler')!;
-            const graph = newObjectGraph();
-            const state = participant.capture(graph) as unknown as { threads: Array<{ id: number; state: number; waitInfo: unknown; context: { eip: number; esp: number } }>; runQueue: number[] };
-            const saved = state.threads.find(x => x.id === 1)!;
-            expect(saved.context.eip).toBe(0x21046090);
-            expect(saved.context.esp).toBe(0x2fff00);
-            expect(saved.state).toBe(ThreadState.READY);
-            expect(saved.waitInfo).toBeNull();
-            expect(state.runQueue).toContain(1);
-            expect(ramPatches).toEqual([
-                { address: 0x2fff00, bytes: [0x34, 0x12, 0x40, 0x00] },
-                { address: 0x7000, bytes: [0xeb, 0xfe] },
-            ]);
-            const guest = new Uint8Array(4 * 1024 * 1024);
-            guest.fill(0x90, 0x2fff00, 0x2fff04);
-            const snap = await snapshotRam(guest, new Set(), ramPatches.splice(0));
-            const at = 0x2fff00 % 65536;
-            const stack = snap.pending.get(snap.manifest.chunks.find(([i]) => i === Math.floor(0x2fff00 / 65536))![1])!;
-            expect([...stack.subarray(at, at + 4)]).toEqual([0x34, 0x12, 0x40, 0x00]);
-            const low = snap.pending.get(snap.manifest.chunks.find(([i]) => i === 0)![1])!;
-            expect([...low.subarray(0x7000, 0x7002)]).toEqual([0xeb, 0xfe]);
-            expect(guest[0x2fff00]).toBe(0x90);
+            run(() => {
+                const ctx = newCaptureRun();
+                const state = savestateParticipants.all().find(p => p.id === 'scheduler')!.capture(ctx) as any;
+                return { state, ctx };
+            });
         } finally {
-            ramPatches.length = 0;
             system.process = previous.process;
             system.scheduler = previous.scheduler;
         }
+    }
+
+    test("a parked thread that is not current comes back READY at the stub, with its return address and arguments", () => {
+        const t1 = parkedThread(1, 0x2fff00), t2 = mkThread(2, ThreadState.RUNNING);
+        t1.asyncParkGeneration = 3;
+        withSession([t1, t2], 2, [park()], (capture) => {
+            const { state, ctx } = capture();
+            const saved = state.threads.find((x: { id: number }) => x.id === 1);
+            expect([saved.state, saved.context.eip, saved.context.esp, saved.waitInfo]).toEqual([ThreadState.READY, 0x21046090, 0x2fff00, null]);
+            expect(state.runQueue).toContain(1);
+            expect(ctx.cpuOverride()).toBeNull();
+            expect(ctx.ramPatches).toEqual([
+                { address: 0x2fff00, bytes: [0x34, 0x12, 0x40, 0x00, ...args] },
+                { address: 0x7000, bytes: [0x55, 0x8b] },
+            ]);
+        });
+    });
+
+    test("the current thread stays RUNNING and the live CPU is moved to the stub", () => {
+        const t1 = parkedThread(1, 0x2fff00);
+        t1.asyncParkGeneration = 3;
+        withSession([t1], 1, [park()], (capture) => {
+            const { state, ctx } = capture();
+            expect(state.threads[0].state).toBe(ThreadState.RUNNING);
+            expect(ctx.cpuOverride()).toEqual({ eip: 0x21046090, esp: 0x2fff00 });
+            const cpu = captureCpu(fakeCpu(), ctx.cpuOverride()) as any;
+            expect([cpu.regs.instruction_pointer[0] >>> 0, cpu.regs.reg32[4], cpu.regs.last_virt_eip[0]]).toEqual([0x21046090, 0x2fff00, -1]);
+        });
+    });
+
+    test("the spin bytes are put back once, from a park that saw the original code", () => {
+        const t1 = parkedThread(1, 0x2fff00), t2 = parkedThread(2, 0x3fff00);
+        t1.asyncParkGeneration = 3;
+        t2.asyncParkGeneration = 5;
+        withSession([t1, t2], 1, [park(), park({ threadId: 2, generation: 5, esp: 0x3fff00, spinBytes: [0xeb, 0xfe] })], (capture) => {
+            const { ctx } = capture();
+            expect(ctx.ramPatches.filter(p => p.address === 0x7000)).toEqual([{ address: 0x7000, bytes: [0x55, 0x8b] }]);
+        });
+    });
+
+    test("refuses a thread that is not really parked, a stale park and lost arguments", () => {
+        const running = mkThread(1, ThreadState.RUNNING);
+        running.context = { eip: 0x7000, esp: 0x2fff14 } as Thread['context'];
+        withSession([running], 1, [park()], (capture) => expect(capture).toThrow(/is not parked/));
+        const stale = parkedThread(1, 0x2fff00);
+        stale.asyncParkGeneration = 4;
+        withSession([stale], 1, [park()], (capture) => expect(capture).toThrow(/is not parked/));
+        const parked = parkedThread(1, 0x2fff00);
+        parked.asyncParkGeneration = 3;
+        withSession([parked], 1, [park({ args: new Uint8Array(12) })], (capture) => expect(capture).toThrow(/arguments/));
     });
 });
