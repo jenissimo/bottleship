@@ -5695,8 +5695,12 @@ export class D3D9Device {
             this.guestFree(tex.guestPtr);
         }
         if (tex.gpuTexture) {
-            // Recorded draws may still reference this view after COM Release.
-            this.commandRecorder.registerTemporaryTexture(tex.gpuTexture);
+            // Recorded draws may still reference this view after COM Release, so it lives
+            // until the open frame is released. An open frame that has recorded nothing
+            // cannot reference it: destroy now, so a level unload does not hold the old
+            // textures next to the new ones until the next Present.
+            if (this.commandRecorder.hasWork()) this.commandRecorder.registerTemporaryTexture(tex.gpuTexture);
+            else tex.gpuTexture.destroy();
         }
     }
 
