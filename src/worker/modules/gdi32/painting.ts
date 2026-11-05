@@ -10,7 +10,7 @@ import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { SystemResourceProvider } from '../../core/resources/system-resource-provider';
 import { toPlainGuestMemory } from '../../core/memory/guest-memory';
 import { LOGPEN_OFFSETS, LOGPEN_SIZE } from './gdi-objects';
-import { writeBackDibSectionRect } from './bitmap-resolve';
+import { writeBackDibSectionRect, readDibSectionRgbaGeneric } from './bitmap-resolve';
 import { patBlt } from './gdi-blit';
 import { extTextOut } from './ext-text-out';
 import { fontCellHeight, prefixWidths } from './text-extent-cache';
@@ -1276,7 +1276,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const dibBpp = (userObj as any).dibBpp as number | undefined;
         const dibStride = (userObj as any).dibStride as number | undefined;
         const dibTopDown = !!(userObj as any).dibTopDown;
-        if (dibBitsPtr && dibBpp === 32 && dibStride && dibStride > 0) {
+        if (dibBitsPtr && dibBpp === 32 && outBpp === 32 && dibStride && dibStride > 0) {
             const actualStart = Math.max(0, start);
             const actualEnd = Math.min(height, actualStart + (cLines > 0 ? cLines : height));
             const linesToCopy = actualEnd - actualStart;
@@ -1299,8 +1299,13 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             return linesToCopy;
         }
 
+        const dibRgba = dibBitsPtr && dibStride && dibStride > 0
+            ? readDibSectionRgbaGeneric(mem, dibBitsPtr, width, height, dibStride, dibTopDown, dibBpp ?? 32,
+                (userObj as any).dibPalette, (userObj as any).dibMasks)
+            : null;
+
         // Copy pixel data to output buffer
-        if (!userObj.pixels) {
+        if (!dibRgba && !userObj.pixels) {
             Logger.warn(LogCategory.GDI32, 'GetDIBits: Bitmap has no pixel data');
             return 0;
         }
@@ -1325,7 +1330,9 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const renderedPixels = (userObj as any).compatibleBitmap
             ? System.getInstance().gdiContext.getBitmapRenderedPixels(hbm)
             : null;
-        if (renderedPixels) {
+        if (dibRgba) {
+            sourcePixels = dibRgba;
+        } else if (renderedPixels) {
             sourcePixels = renderedPixels;
         } else if (userObj.pixels instanceof Uint8ClampedArray || userObj.pixels instanceof Uint8Array) {
             sourcePixels = userObj.pixels;

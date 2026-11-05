@@ -371,7 +371,7 @@ export function resolveDib32RawAlphaRgba(
 }
 
 /** Read 4/8/16/24/32 bpp DIBSection row data into RGBA (best-effort). */
-function readDibSectionRgbaGeneric(
+export function readDibSectionRgbaGeneric(
     mem: Uint8Array,
     bitsPtr: number,
     w: number,
