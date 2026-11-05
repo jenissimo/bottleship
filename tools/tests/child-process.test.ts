@@ -452,6 +452,36 @@ describe('child filesystem ownership', () => {
         expect((await invoke('read', { childHandle: 9999 }, 1)).error).toContain('Invalid child');
         expect(vfs.fileExists('C:\\helper.exe')).toBe(true);
     });
+
+    test('a child WriteFile lands in the cache like the parent\'s, not after the OPFS commit', async () => {
+        // UE1's config wizard child truncates DeusEx.ini (CREATE_ALWAYS) and rewrites it while
+        // the parent polls for its marker file; a write parked on the commit left the file
+        // empty to the parent for milliseconds.
+        const calls: string[] = [];
+        let syncAnswer = 4;
+        const handle = { kind: 'file', path: 'C:\\System\\DeusEx.ini', access: 0x40000000, source: 'overlay', position: 0 };
+        const vfs = {
+            openSync: () => handle,
+            tell: () => 0,
+            writeSync: (_h: unknown, data: Uint8Array) => { calls.push(`sync:${data.length}`); return syncAnswer; },
+            write: async (_h: unknown, data: Uint8Array) => { calls.push(`async:${data.length}`); return data.length; },
+        } as unknown as VirtualFileSystem;
+        const buffer = new SharedArrayBuffer(CHILD_IO_BYTES);
+        const serve = createChildVfsServer(vfs, buffer);
+        const invoke = async (method: string, ...args: unknown[]) => {
+            await serve({ method, args });
+            const length = Atomics.load(new Int32Array(buffer), 1);
+            return JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 8, length).slice()));
+        };
+        const child = (await invoke('openSync', 'C:\\System\\DeusEx.ini', 0x40000000, 2)).value;
+
+        expect((await invoke('write', child, Uint8Array.from([1, 2, 3, 4]))).value).toBe(4);
+        expect(calls).toEqual(['sync:4']);
+
+        syncAnswer = -1; // overlay not ready: the commit path still serves it
+        expect((await invoke('writeSync', child, Uint8Array.from([5, 6]))).value).toBe(2);
+        expect(calls).toEqual(['sync:4', 'sync:2', 'async:2']);
+    });
 });
 
 // A start that fails for a condition Windows names must report that condition: the

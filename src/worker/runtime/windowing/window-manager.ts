@@ -929,8 +929,8 @@ export class WindowManager {
     }
 
     // Get message from queue (with priority handling built into MessageQueue)
-    getMessage(): Message | null {
-        return this.messageQueue.dequeue();
+    getMessage(callerThreadId = 0): Message | null {
+        return this.messageQueue.dequeue(0, 0, callerThreadId);
     }
 
     waitForMessage(callerThreadId = 0, msgMin = 0, msgMax = 0): Promise<Message> {

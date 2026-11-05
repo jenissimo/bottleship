@@ -141,6 +141,20 @@ interface DeferredFrameCompletion {
     source: string;
 }
 
+/** A suspended-frame dispatch waiting for its owner thread to become current. */
+interface DeferredFrameDispatch {
+    frameId: number;
+    source: string;
+    dispatch: () => { callbackId: number };
+}
+
+/**
+ * invokeCallback's answer for a dispatch accepted but queued for the frame's owner thread.
+ * Non-zero because the dispatch WILL happen: the caller's completeThunk still runs, later.
+ * No return stub carries this id.
+ */
+export const CALLBACK_DISPATCH_DEFERRED = 0xFFFFFFFF;
+
 function frameLabel(source: string | undefined, frameId: number): string {
     return source && source !== 'unknown' ? source : `frame ${frameId}`;
 }
@@ -214,6 +228,9 @@ export class CallbackManager {
      *  thread-mismatch branch in the callback-return path). At most one per thread: a frame
      *  completes exactly once, and its owner is parked until it does. */
     private deferredCompletions = new Map<number, DeferredFrameCompletion>();
+    /** Chain dispatches onto a frame whose owner was not current, keyed by owner thread.
+     *  At most one per thread: a frame's chain has one callback in flight at a time. */
+    private deferredDispatches = new Map<number, DeferredFrameDispatch>();
     private lastInvokeForensics: CallbackForensicRecord | null = null;
     private lastReturnForensics: CallbackForensicRecord | null = null;
     private lastWinMmForensicLogMs = 0;
@@ -988,6 +1005,60 @@ export class CallbackManager {
         return true;
     }
 
+    private deferDispatchToFrameOwner(
+        ownerTid: number, currentTid: number, frameId: number, source: string,
+        dispatch: () => { callbackId: number },
+    ): { callbackId: number } {
+        if (this.deferredDispatches.has(ownerTid)) {
+            Logger.error(LogCategory.CALLBACK,
+                `Deferred dispatch already queued for T${ownerTid}; refusing frameId=${frameId} source=${source}`);
+            return { callbackId: 0 };
+        }
+        this.deferredDispatches.set(ownerTid, { frameId, source, dispatch });
+        Logger.log(LogCategory.CALLBACK,
+            `Deferring suspended-frame dispatch to owner: frameId=${frameId} ownerThread=${ownerTid} ` +
+            `currentThread=${currentTid} source=${source}`);
+        // The owner is parked between pump steps with no other waker.
+        const scheduler = System.getInstance().scheduler;
+        scheduler.wakeThreadForAsyncCompletion(ownerTid);
+        scheduler.requestSwitchToThread(ownerTid);
+        scheduler.wakeEarlyFromIdleYield();
+        return { callbackId: CALLBACK_DISPATCH_DEFERRED };
+    }
+
+    /** True when `threadId` has a chain dispatch waiting for it to become current. */
+    hasDeferredDispatchForThread(threadId: number): boolean {
+        return this.deferredDispatches.has(threadId >>> 0);
+    }
+
+    /**
+     * Run the dispatch deferred to `threadId`. Only at that thread's own safe point: it is
+     * current and parked at the spin loop, the state a same-thread pump step dispatches from.
+     * Returns true when a callback was set up on the CPU.
+     */
+    dispatchDeferredToOwner(threadId: number): boolean {
+        const tid = threadId >>> 0;
+        const deferred = this.deferredDispatches.get(tid);
+        if (!deferred) return false;
+        this.deferredDispatches.delete(tid);
+        const frameIndex = this.findFrameIndexById(deferred.frameId);
+        if (frameIndex < 0 || (this.frameThreadId[frameIndex] >>> 0) !== tid) {
+            Logger.warn(LogCategory.CALLBACK,
+                `Deferred dispatch dropped: frame ${deferred.frameId} gone (owner T${tid}, source=${deferred.source})`);
+            return false;
+        }
+        try {
+            const { callbackId } = deferred.dispatch();
+            if (callbackId !== 0 && callbackId !== CALLBACK_DISPATCH_DEFERRED) return true;
+        } catch (e) {
+            Logger.error(LogCategory.CALLBACK, `Deferred dispatch for frame ${deferred.frameId} threw: ${e}`);
+            return false;
+        }
+        Logger.error(LogCategory.CALLBACK,
+            `Deferred dispatch for frame ${deferred.frameId} could not be set up on owner T${tid} (source=${deferred.source})`);
+        return false;
+    }
+
     /** True while a thunk is suspended inside a guest callback (diagnostics gate). */
     public isInsideSuspendedCallback(): boolean { return this.frameStackDepth > 0; }
 
@@ -1168,6 +1239,7 @@ export class CallbackManager {
         this.nextFrameId = 1;
         this.frameStackDepth = 0;
         this.frameStack.fill(-1);
+        this.deferredDispatches.clear();
     }
 
     private snapshotSuspendedFrames(): SuspendedThunkFrame[] {
@@ -1372,6 +1444,22 @@ export class CallbackManager {
                 stub.inUse = false;
                 System.getInstance().scheduler.reportCallbackFrameFatal(stub.callbackId >>> 0, threadId);
                 return { callbackId: 0 };
+            }
+        }
+
+        // The dispatch below rewrites the CURRENT thread's EIP/ESP and anchors on the frame's
+        // stack, so it may only run while the frame's owner is current. A JS-driven pump
+        // (the modal DialogBox loop, re-armed from setTimeout) can step while a sibling is
+        // current; dispatching then runs the owner's window procedure on the sibling's
+        // register file over the owner's stack, and both threads end up sharing one stack.
+        if (completeThunk) {
+            const ownerTid = this.frameThreadId[resolvedFrameIndex] >>> 0;
+            const currentTid = System.getInstance().scheduler.getCurrentThreadId() >>> 0;
+            if (ownerTid !== currentTid) {
+                stub.inUse = false;
+                return this.deferDispatchToFrameOwner(ownerTid, currentTid, resolvedFrameId, source,
+                    () => this.invokeCallback(callbackAddress, args, callerCleanup, completeThunk,
+                        isCdecl, source, resolvedFrameId, options));
             }
         }
 

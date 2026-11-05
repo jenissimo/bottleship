@@ -7,7 +7,7 @@
  * surviving pump fires into the next guest loaded into the same worker, where its
  * frame does not exist.
  */
-import { describe, expect, test, beforeEach } from 'bun:test';
+import { describe, expect, test, beforeEach, spyOn } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import {
     activeDialogs,
@@ -252,6 +252,27 @@ describe('a modal pump that cannot dispatch', () => {
         expect(timer?.wndProc).toBe(timerProc);
         expect(timer?.args.slice(0, 3)).toEqual([dialogHwnd, 0x0113, 7]);
         expect(timer?.args[3]).not.toBe(timerProc); // dwTime, not the TIMERPROC
+    });
+
+    test("the pump retrieves only its own thread's messages, as DialogBox's GetMessage does", async () => {
+        // A sibling thread's window (a launcher splash with its own GetMessage loop) is
+        // served by that thread. The modal loop taking its messages ran them through the
+        // dialog thread's frame and starved the sibling's loop.
+        const DIALOG_THREAD = 1, SIBLING_THREAD = 2, SIBLING_HWND = 0x7777;
+        const sched = System.getInstance().scheduler;
+        const tid = spyOn(sched, 'getCurrentThreadId').mockReturnValue(DIALOG_THREAD);
+        try {
+            const { invocations, dialogHwnd } = runDialog(() => 0x2000, 0);
+            const wm = System.getInstance().windowManager;
+            wm.postMessage(SIBLING_HWND, 0x0409, 0, 0, 0, 0, SIBLING_THREAD);
+            wm.postMessage(dialogHwnd, 0x0405, 0, 0, 0, 0, DIALOG_THREAD);
+
+            await completeUntil(invocations, 0x0405);
+
+            expect(pumpDispatches(invocations).some(i => i.args[1] === 0x0405)).toBe(true);
+            expect(pumpDispatches(invocations).some(i => i.args[0] === SIBLING_HWND)).toBe(false);
+            expect(wm.getMessage(SIBLING_THREAD)?.hwnd).toBe(SIBLING_HWND);
+        } finally { tid.mockRestore(); }
     });
 
     test('a permanently refused dispatch ends the dialog and completes the frame', async () => {

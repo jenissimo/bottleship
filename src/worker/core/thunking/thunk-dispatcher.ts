@@ -3775,6 +3775,25 @@ export class ThunkDispatcher {
         return cbMgr.tryApplyDeferredCompletion(tid, cpu);
     }
 
+    /**
+     * Run the current thread's deferred suspended-frame DISPATCH (a pump step that fired while
+     * a sibling was current). Same safe point and wake sequence as the deferred completion.
+     */
+    private drainDeferredFrameDispatch(cpu: any): boolean {
+        const cbMgr = this._callbackManager;
+        if (typeof cbMgr?.hasDeferredDispatchForThread !== "function") return false;
+        const scheduler = this.ensureScheduler();
+        const currentTid = scheduler.getCurrentThreadId();
+        if (currentTid === null || currentTid === undefined) return false;
+        const tid = currentTid >>> 0;
+        if (!cbMgr.hasDeferredDispatchForThread(tid)) return false;
+        const eip = cpu.instruction_pointer[0] >>> 0;
+        if (!this.isParkedAtSpinLoop(eip) && !(scheduler as any).isThreadAsyncParked?.(tid)) return false;
+        scheduler.wakeThreadForAsyncCompletion(tid);
+        (scheduler as any).markThreadRunningAfterAsyncWake?.(tid, cpu);
+        return cbMgr.dispatchDeferredToOwner(tid);
+    }
+
     hasPendingAsyncRestoreForThread(threadId: number | null): boolean {
         if (this.pendingAsyncRestores.length === 0) return false;
         if (threadId === null) return true;
@@ -3827,6 +3846,7 @@ export class ThunkDispatcher {
         // independently of pendingAsyncRestores, which may be empty) so a JS-driven pump
         // whose terminal step landed on a sibling thread is not stranded.
         if (this.drainDeferredFrameCompletion(cpu)) return true;
+        if (this.drainDeferredFrameDispatch(cpu)) return true;
 
         if (this.pendingAsyncRestores.length === 0) return false;
 

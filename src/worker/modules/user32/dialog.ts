@@ -574,10 +574,12 @@ export function createDialogChildren(
  * Dequeue the next message from the queue (like real GetMessage(NULL, 0, 0)).
  * Modal behavior comes from disabling the owner, not from message filtering.
  * WM_NULL (hwnd=0, message=0) idle messages are skipped automatically.
+ * Like GetMessage, the loop sees only the queue of the thread that called DialogBox:
+ * another thread's windows are served by that thread's own loop.
  */
-function dequeueNextDialogMessage(system: System): { hwnd: number; message: number; wParam: number; lParam: number; time: number } | undefined {
+function dequeueNextDialogMessage(system: System, threadId: number): { hwnd: number; message: number; wParam: number; lParam: number; time: number } | undefined {
     for (let i = 0; i < 32; i++) {
-        const msg = system.windowManager.getMessage();
+        const msg = system.windowManager.getMessage(threadId);
         if (!msg) return undefined;
         if (msg.hwnd === 0 && msg.message === 0) continue; // WM_NULL idle
         // Removing an expired timer's WM_TIMER is what re-arms it; without this every
@@ -873,6 +875,7 @@ function runModalDialog(
         restoreOwnerActivation();
         return IDCANCEL;
     }
+    const pumpThreadId = (system.scheduler?.getCurrentThreadId() ?? 0) >>> 0;
 
     const completeClosedDialog = (reason: string): number | null => {
         const dialog = activeDialogs.get(dialogHwnd);
@@ -1059,7 +1062,7 @@ function runModalDialog(
 
         system.inputManager.poll(true);
 
-        const msg = dequeueNextDialogMessage(system);
+        const msg = dequeueNextDialogMessage(system, pumpThreadId);
         if (!msg) {
             if (pumpIterations <= 5 || pumpIterations % 100 === 0) {
                 Logger.warn(LogCategory.USER32,
