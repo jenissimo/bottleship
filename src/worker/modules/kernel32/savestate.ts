@@ -1,6 +1,7 @@
 import { System } from '../../core/system';
 import { savestateParticipants, stateKeys } from '../../savestate/participant';
 import type { SaveValue } from '../../savestate/value-codec';
+import { CaptureRefusal } from '../../savestate/object-codecs';
 import { captureAtoms, restoreAtoms } from './atom';
 import { captureFls, restoreFls } from './fls';
 import { captureSrwLocks, restoreSrwLocks } from './srw-lock';
@@ -91,7 +92,13 @@ export function registerKernel32Participant(): void {
     savestateParticipants.add({
         id: 'kernel32', version: 1, order: 6, covers: ['kernel32', 'kernelbase', 'ntdll'],
         schema: stateKeys<Kernel32State>({ atoms: true, fls: true, srwLocks: true, namedObjects: true, modules: true, resources: true, commandLine: true, pointerCookie: true, consoleModes: true, fileApisAnsi: true, console: true, process: true, vista: true, actCtx: true, threadPool: true, startup: true }),
-        capture: () => captureKernel32State() as unknown as SaveValue,
+        capture: () => {
+            try {
+                return captureKernel32State() as unknown as SaveValue;
+            } catch (e) {
+                throw new CaptureRefusal(e instanceof Error ? e.message : String(e));
+            }
+        },
         restore: (s) => restoreKernel32State(s as unknown as Kernel32State),
     });
 }

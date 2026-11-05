@@ -4748,6 +4748,10 @@ export class Scheduler {
         else Logger.error(LogCategory.THREAD, message);
     }
 
+    lazyFpuOwnerThreadId(): number | null {
+        return this.fpuLiveOwnerThreadId;
+    }
+
     getAsyncParkGeneration(threadId: number): number {
         return (this.threads.get(threadId)?.asyncParkGeneration ?? 0) >>> 0;
     }

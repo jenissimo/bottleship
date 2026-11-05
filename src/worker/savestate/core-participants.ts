@@ -46,14 +46,17 @@ function rewindRestartableParks(state: SchedulerState, ctx: CaptureContext): voi
             || park.generation === 0 || sched.getAsyncParkGeneration(thread.id) !== park.generation) {
             throw new CaptureRefusal(`savestate: ${what} is not parked`);
         }
-        const argBytes = stub.stackCleanupBytes ?? (stub.argCount ?? 0) * 4;
+        const argBytes = park.argBytes;
         if (park.args.length < argBytes) throw new CaptureRefusal(`savestate: the arguments of ${what} were not kept`);
         const regs = { eip: stub.address, esp: park.esp };
         thread.context = { ...thread.context, ...regs };
         thread.waitInfo = null;
         if (thread.id === state.currentThreadId) {
+            const owner = sched.lazyFpuOwnerThreadId();
+            if (owner !== null && owner !== thread.id) throw new CaptureRefusal(`savestate: the live FPU of ${what} belongs to thread ${owner}`);
             thread.state = ThreadState.RUNNING;
-            ctx.overrideCpu(regs);
+            const c = thread.context;
+            ctx.overrideCpu({ ...regs, eax: c.eax, ecx: c.ecx, edx: c.edx, ebx: c.ebx, ebp: c.ebp, esi: c.esi, edi: c.edi, eflags: c.eflags });
         } else {
             thread.state = ThreadState.READY;
             if (!state.runQueue.includes(thread.id)) state.runQueue.push(thread.id);
@@ -65,6 +68,20 @@ function rewindRestartableParks(state: SchedulerState, ctx: CaptureContext): voi
             spinPatched.add(park.spinAddr);
             ctx.patchRam(park.spinAddr, park.spinBytes);
         }
+    }
+    for (const t of state.threads) {
+        if (t.state === ThreadState.WAITING && t.waitInfo?.reason === WaitReason.ASYNC_THUNK) {
+            throw new CaptureRefusal(`savestate: thread ${t.id} waits on host work that cannot be re-issued`);
+        }
+    }
+}
+
+function refusing<T>(what: string, run: () => T): T {
+    try {
+        return run();
+    } catch (e) {
+        if (e instanceof CaptureRefusal) throw e;
+        throw new CaptureRefusal(e instanceof Error ? e.message : `${what}: ${String(e)}`);
     }
 }
 
@@ -151,13 +168,13 @@ export function registerCoreParticipants(): void {
 
     savestateParticipants.add({
         id: 'time', version: 1, order: 1, schema: schema(SCHEMAS.time),
-        capture: () => save(TimeService.getInstance().captureClock()),
+        capture: () => save(refusing('time', () => TimeService.getInstance().captureClock())),
         restore: (s) => TimeService.getInstance().restoreClock(as<ClockState>(s)),
     });
     savestateParticipants.add({
         id: 'address-space', version: 1, order: 2, schema: schema(SCHEMAS.addressSpace),
         capture: () => {
-            if (process().pageTableManager?.hasExternalDataPages()) throw new Error('address space: external data page mappings are not part of a v1 savestate');
+            if (process().pageTableManager?.hasExternalDataPages()) throw new CaptureRefusal('address space: external data page mappings are not part of a v1 savestate');
             return save(process().addressSpace.captureState());
         },
         restore: (s) => {
@@ -194,20 +211,20 @@ export function registerCoreParticipants(): void {
     savestateParticipants.add({
         id: 'scheduler', version: 1, order: 20, schema: schema(SCHEMAS.scheduler),
         capture: (ctx) => {
-            const state = System.getInstance().scheduler.captureState((o, w) => ctx.ref(o, w));
-            rewindRestartableParks(state, ctx);
+            const state = refusing('scheduler', () => System.getInstance().scheduler.captureState((o, w) => ctx.ref(o, w)));
+            refusing('scheduler', () => rewindRestartableParks(state, ctx));
             return save(state);
         },
         restore: (s, ctx) => System.getInstance().scheduler.restoreState(as<SchedulerState>(s), r => ctx.object(r)),
     });
     savestateParticipants.add({
         id: 'timer-wheel', version: 1, order: 21, schema: schema(SCHEMAS.timerWheel),
-        capture: () => save(System.getInstance().scheduler.timerWheel.captureState()),
+        capture: () => save(refusing('timer wheel', () => System.getInstance().scheduler.timerWheel.captureState())),
         restore: (s) => System.getInstance().scheduler.timerWheel.restoreState(as<{ nextId: number; entries: number[][] }>(s)),
     });
     savestateParticipants.add({
         id: 'dispatcher', version: 1, order: 90, schema: schema(SCHEMAS.dispatcher),
-        capture: () => save(process().dispatcher.captureState()),
+        capture: () => save(refusing('dispatcher', () => process().dispatcher.captureState())),
         restore: (s) => process().dispatcher.restoreState(as(s)),
     });
     savestateParticipants.add({

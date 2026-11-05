@@ -272,6 +272,7 @@ export interface RestartablePark {
     generation: number;
     esp: number;
     returnAddr: number;
+    argBytes: number;
     args: Uint8Array;
     spinAddr: number;
     spinBytes: [number, number];
@@ -1737,10 +1738,14 @@ export class ThunkDispatcher {
     restartableParks(): RestartablePark[] {
         const out: RestartablePark[] = [];
         for (const info of this.activeAsyncThunks.values()) {
-            if (info.restartable?.() !== true || info.returnAddr === undefined || info.esp === undefined || !info.stackSnapshot) continue;
+            if (info.restartable?.() !== true) continue;
+            if (info.returnAddr === undefined || info.esp === undefined || !info.stackSnapshot) {
+                throw new Error(`dispatcher: ${info.functionName ?? `#${info.functionId}`} parked without its stack`);
+            }
             out.push({
                 threadId: info.threadId ?? 0, functionId: info.functionId, functionName: info.functionName ?? `#${info.functionId}`,
                 generation: info.asyncParkGeneration ?? 0, esp: info.esp, returnAddr: info.returnAddr,
+                argBytes: this.resolveThunkCleanup(info.functionId, 0, `rewind:${info.functionName ?? ''}`),
                 args: info.stackSnapshot.slice(4),
                 spinAddr: info.spinAddr ?? this.spinLoopAddress, spinBytes: info.originalSpinBytes ?? [0, 0] as [number, number],
             });
@@ -3517,8 +3522,7 @@ export class ThunkDispatcher {
                 Logger.error(LogCategory.THUNK,
                     `SUSPICIOUS: Async thunk ${name} returnAddr 0x${returnAddr.toString(16)} inside THUNK region! ESP=0x${esp.toString(16)}`);
             }
-            const stub = this.thunkGenerator.getStubById(id);
-            const argBytes = stub ? (stub.stackCleanupBytes ?? (stub.argCount ?? 0) * 4) : 0;
+            const argBytes = this.resolveThunkCleanup(id, 0, `park:${name}`);
             stackSnapshot = mem.slice(esp, Math.min(esp + Math.max(16, 4 + argBytes), mem.length));
         }
 

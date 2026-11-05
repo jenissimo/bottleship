@@ -18,6 +18,7 @@ import { consoleScreenBuffers } from "../../src/worker/modules/kernel32/console-
 import { System } from "../../src/worker/core/system";
 import { ThunkDispatcher } from "../../src/worker/core/thunking/thunk-dispatcher";
 import { newCaptureRun } from "../../src/worker/savestate/session";
+import { markRestartable } from "../../src/worker/core/thunking/restartable";
 import { resetAtomTable } from "../../src/worker/modules/kernel32/atom";
 import { resetFlsState } from "../../src/worker/modules/kernel32/fls";
 import { resetAllSrwLocks } from "../../src/worker/modules/kernel32/srw-lock";
@@ -351,10 +352,10 @@ describe("module coverage", () => {
 });
 
 describe("restartable park rewind", () => {
-    type Park = { threadId: number; functionId: number; functionName: string; generation: number; esp: number; returnAddr: number; args: Uint8Array; spinAddr: number; spinBytes: [number, number] };
+    type Park = { threadId: number; functionId: number; functionName: string; generation: number; esp: number; returnAddr: number; argBytes: number; args: Uint8Array; spinAddr: number; spinBytes: [number, number] };
     const args = new Uint8Array([0x00, 0x20, 0x40, 0x00, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
     const park = (over: Partial<Park> = {}): Park => ({
-        threadId: 1, functionId: 9, functionName: "user32:GetMessageA", generation: 3, esp: 0x2fff00, returnAddr: 0x401234,
+        threadId: 1, functionId: 9, functionName: "user32:GetMessageA", generation: 3, esp: 0x2fff00, returnAddr: 0x401234, argBytes: 16,
         args, spinAddr: 0x7000, spinBytes: [0x55, 0x8b], ...over,
     });
 
@@ -406,15 +407,27 @@ describe("restartable park rewind", () => {
         });
     });
 
-    test("the current thread stays RUNNING and the live CPU is moved to the stub", () => {
+    test("the current thread stays RUNNING and the CPU section takes the parked registers, at the stub", () => {
         const t1 = parkedThread(1, 0x2fff00);
         t1.asyncParkGeneration = 3;
         withSession([t1], 1, [park()], (capture) => {
             const { state, ctx } = capture();
             expect(state.threads[0].state).toBe(ThreadState.RUNNING);
-            expect(ctx.cpuOverride()).toEqual({ eip: 0x21046090, esp: 0x2fff00 });
-            const cpu = captureCpu(fakeCpu(), ctx.cpuOverride()) as any;
-            expect([cpu.regs.instruction_pointer[0] >>> 0, cpu.regs.reg32[4], cpu.regs.last_virt_eip[0]]).toEqual([0x21046090, 0x2fff00, -1]);
+            const live = fakeCpu();
+            (live as unknown as { reg32: Int32Array }).reg32.set([11, 12, 13, 14, 15, 16, 17, 18]);
+            const cpu = captureCpu(live, ctx.cpuOverride()) as any;
+            expect([...cpu.regs.reg32]).toEqual([0, 0, 0, 7, 0x2fff00, 0x2fff40, 8, 9]);
+            expect([cpu.regs.instruction_pointer[0] >>> 0, cpu.regs.flags[0], cpu.regs.flags_changed[0], cpu.regs.last_virt_eip[0]])
+                .toEqual([0x21046090, 0x202, 0, -1]);
+        });
+    });
+
+    test("refuses the current thread when another thread owns the live FPU", () => {
+        const t1 = parkedThread(1, 0x2fff00);
+        t1.asyncParkGeneration = 3;
+        withSession([t1], 1, [park()], (capture) => {
+            (System.getInstance().scheduler as unknown as { fpuLiveOwnerThreadId: number }).fpuLiveOwnerThreadId = 2;
+            expect(capture).toThrow(/live FPU/);
         });
     });
 
@@ -438,5 +451,38 @@ describe("restartable park rewind", () => {
         const parked = parkedThread(1, 0x2fff00);
         parked.asyncParkGeneration = 3;
         withSession([parked], 1, [park({ args: new Uint8Array(12) })], (capture) => expect(capture).toThrow(/arguments/));
+        const unlisted = parkedThread(1, 0x2fff00);
+        unlisted.asyncParkGeneration = 3;
+        withSession([unlisted], 1, [], (capture) => expect(capture).toThrow(/cannot be re-issued/));
+    });
+});
+
+describe("parking keeps what the rewind needs", () => {
+    test("a real park of a 4-argument stub keeps the return address and all 16 argument bytes", () => {
+        const d = new ThunkDispatcher({ add_listener: () => {} } as never, { getStubById: () => undefined } as never) as any;
+        const mem = new Uint8Array(0x10000);
+        d.cachedMem8 = mem;
+        d.cachedDataView = new DataView(mem.buffer);
+        d.memLength = mem.length;
+        d.spinLoopAddress = 0x7000;
+        d.cachedWasmBuffer = mem.buffer;
+        d.cachedReg32Raw = new Int32Array(mem.buffer, 64, 8);
+        d.cachedFlagsRaw = new Int32Array(mem.buffer, 120, 1);
+        d.isDataViewValid = () => true;
+        d.stackCleanupTable[9] = 16;
+        const esp = 0x8000;
+        mem.set([0x34, 0x12, 0x40, 0x00, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0], esp);
+        const system = System.getInstance();
+        const previous = system.scheduler;
+        system.scheduler = { getCurrentThreadId: () => 1, markThreadAsyncParked: () => true, getAsyncParkGeneration: () => 3 } as never;
+        try {
+            const promise = markRestartable(new Promise(() => {}));
+            d.parkThreadAsync(promise, 9, "user32:GetMessageA", {}, esp);
+            const [p] = d.restartableParks();
+            expect([p.returnAddr, p.argBytes, p.generation]).toEqual([0x401234, 16, 3]);
+            expect([...p.args.subarray(0, 16)]).toEqual([1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]);
+        } finally {
+            system.scheduler = previous;
+        }
     });
 });

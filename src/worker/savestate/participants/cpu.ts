@@ -121,9 +121,14 @@ export function captureCpu(cpu: V86Cpu, override: CpuOverride | null = null): Sa
     const regs: Record<string, SaveValue> = {};
     for (const name of SAVED) regs[name] = (cpu[name] as Reg).slice();
     if (override) {
+        const gpr = regs.reg32 as Reg;
+        [gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5], gpr[6], gpr[7]] = [
+            override.eax, override.ecx, override.edx, override.ebx, override.esp, override.ebp, override.esi, override.edi,
+        ].map(v => v | 0);
+        (regs.flags as Reg)[0] = override.eflags | 0;
+        (regs.flags_changed as Reg)[0] = 0;
         (regs.instruction_pointer as Reg)[0] = override.eip | 0;
         (regs.previous_ip as Reg)[0] = override.eip | 0;
-        (regs.reg32 as Reg)[4] = override.esp | 0;
         (regs.last_virt_eip as Reg)[0] = -1;
     }
     return { memorySize: cpuViews(cpu).memorySize[0]!, regs };

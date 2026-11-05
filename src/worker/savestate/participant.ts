@@ -1,7 +1,11 @@
 import { encodeValue, type SaveValue } from './value-codec';
 import type { ParticipantSchema } from './container';
 
-export interface CpuOverride { eip: number; esp: number }
+export interface CpuOverride {
+    eip: number; esp: number;
+    eax: number; ecx: number; edx: number; ebx: number; ebp: number; esi: number; edi: number;
+    eflags: number;
+}
 
 export interface CaptureContext {
     ref(obj: unknown, where: string): number;
