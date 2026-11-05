@@ -37,6 +37,7 @@ import { getActive, launchSmokeItem, updateSmokeStore, useSmokeStore } from "./s
 import { currentAppVersion, currentBuild } from "./smoke-env";
 import { NoteInput } from "./NoteInput";
 import s from "./SmokeRun.module.css";
+import { clearBundleCache } from "../../worker/runtime/filesystem/wgb-cache-policy";
 
 /**
  * Dev "Smoke run" checklist: walk every title of one source (the library catalog, or one
@@ -213,6 +214,14 @@ const SmokeRunModal: React.FC<SmokeRunModalProps> = ({ isOpen, onClose, catalog 
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }, [run, prev]);
+
+  const clearCache = useCallback(() => {
+    if (!window.confirm("Clear the bundle cache? Removes streamed/downloaded copies of URL bundles from browser storage. Imported games, saves and overlays are kept.")) return;
+    void clearBundleCache().then(
+      (r) => say(`Freed ${(r.freedBytes / 1048576).toFixed(0)} MB${r.failed.length ? ` · ${r.failed.length} in use` : ""}`),
+      (e: unknown) => say(`Clear failed: ${e instanceof Error ? e.message : String(e)}`),
+    );
+  }, [say]);
 
   const onKeyDown = useCallback((ev: React.KeyboardEvent) => {
     if (ev.key === "Escape") {
@@ -395,6 +404,7 @@ const SmokeRunModal: React.FC<SmokeRunModalProps> = ({ isOpen, onClose, catalog 
         <div className={s["footer"]}>
           <span className={s["keys"]}>↑↓ move · Enter launch · 1 OK · 2 regression · 3 skip · 0 clear</span>
           {flash && <span className={s["flash"]}>{flash}</span>}
+          <ActionButton size="small" onClick={clearCache} title="Free browser storage held by cached bundle copies">Clear bundle cache</ActionButton>
           <ActionButton size="small" onClick={newRun} disabled={!run}>New run</ActionButton>
           <ActionButton size="small" onClick={downloadJson} disabled={!run}>Download JSON</ActionButton>
           <ActionButton size="small" variant="primary" onClick={copyReport} disabled={!run}>Copy report</ActionButton>

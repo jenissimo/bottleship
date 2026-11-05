@@ -148,6 +148,7 @@ import {
 } from "./core/cpu/emulator-config";
 import { WgbLoader, buildRomIndex, readEntrypointBytes, type WgbManifest, type WgbWriteFileSpec } from "./runtime/filesystem/wgb-loader";
 import { WgbCache } from "./runtime/filesystem/wgb-cache";
+import { shouldPersistBundleUrl } from "./runtime/filesystem/wgb-cache-policy";
 import { detectSourceFormat, sniffBlobHead } from "@bottleship/repack/detect";
 import { blobRandomAccess } from "./runtime/filesystem/installer-opfs";
 import { InnoFormatError } from "@bottleship/formats/inno";
@@ -1644,7 +1645,10 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       // no 1.5GB BufferSource held in worker RAM, and the same OPFS copy a disk-blob
       // load of this game would use (one copy per game, not two).
       const url = payload.url;
-      let cachedSource = await WgbCache.openSyncSourceForUrl(url);
+      // A dev disk route (sidecar /wgb?path=, Vite /__wgb/?path=) is already a local file:
+      // stream it, never copy it into OPFS (see wgb-cache-policy.ts).
+      const persist = shouldPersistBundleUrl(url);
+      let cachedSource = persist ? await WgbCache.openSyncSourceForUrl(url) : null;
       if (cachedSource) {
         try { bundle = await WgbLoader.fromSource(cachedSource); }
         catch (error) {
@@ -1667,9 +1671,9 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       // against a local synchronous pread — the ceiling for any transport change.
       const streamCapable = (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true
         && !bundle
-        && payload.preload !== true
-        && payload.io?.mode !== "preload-full"
+        && (!persist || (payload.preload !== true && payload.io?.mode !== "preload-full"))
         && (globalThis as Record<string, unknown>).__noSabIo !== true;
+      let streamError: unknown = null;
       if (streamCapable) {
         try {
           // Cold reads from async-capable APIs park their guest thread; disk hits
@@ -1696,8 +1700,18 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
             throw loadErr;
           }
         } catch (e) {
-          Logger.log(LogCategory.SYSTEM, `WGB: sync-stream unavailable (${(e as Error).message}) — staging to OPFS`);
+          streamError = e;
+          Logger.log(LogCategory.SYSTEM, `WGB: sync-stream unavailable (${(e as Error).message})${persist ? " — staging to OPFS" : ""}`);
         }
+      }
+
+      // The fallback below downloads the WHOLE bundle into OPFS; for a local disk bundle
+      // that is the multi-GB copy this policy exists to avoid. `__noSabIo` still opts in.
+      if (!bundle && !persist && (globalThis as Record<string, unknown>).__noSabIo !== true) {
+        const reason = streamError instanceof Error ? streamError.message
+          : streamError ? String(streamError) : "page is not cross-origin isolated";
+        throw new Error(`Could not stream local bundle ${url} (${reason}). Local disk bundles are not ` +
+          `copied into browser storage; check that the dev sidecar (:3001) or Vite /__wgb/ route is serving it.`);
       }
 
       if (!bundle) {
@@ -1993,7 +2007,9 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     const liveIo = (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo;
     if (liveIo && payload.url) {
       const policy = payload.io ?? bundle.manifest.emulator?.io ?? {};
-      const mode = payload.preload ? "preload-full" : policy.mode ?? "stream+fill";
+      // No background fill for a local disk bundle: fill exists to complete the OPFS copy.
+      const mode = !shouldPersistBundleUrl(payload.url) ? "stream"
+        : payload.preload ? "preload-full" : policy.mode ?? "stream+fill";
       if (mode === "preload-full") {
         await liveIo.preloadFull();
       } else if (policy.profileUrl) {

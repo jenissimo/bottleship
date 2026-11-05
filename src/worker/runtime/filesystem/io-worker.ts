@@ -2,6 +2,7 @@ import { HttpRangeSource, type ReadHint } from "@bottleship/formats/zip";
 import * as P from "./sab-io-protocol";
 import { SparseWgbCache } from "./sparse-wgb-cache";
 import { StreamIoRuntime } from "./stream-io-runtime";
+import { shouldPersistBundleUrl } from "./wgb-cache-policy";
 
 let ctl: Int32Array;
 let meta: Float64Array;
@@ -53,7 +54,9 @@ async function initialize(msg: any): Promise<void> {
     }
     const residencySab = new SharedArrayBuffer(Math.ceil(Math.ceil(source.size / chunkBytes) / 32) * 4);
     const residency = new Int32Array(residencySab);
-    const disk = tune.disk === false ? null : await SparseWgbCache.open({ url: msg.url, size: source.size, etag: source.etag ?? "" }, chunkBytes, residency);
+    // A dev disk route is already a local file: no sparse chunks, no fill, no promotion.
+    const persist = tune.disk !== false && shouldPersistBundleUrl(msg.url);
+    const disk = !persist ? null : await SparseWgbCache.open({ url: msg.url, size: source.size, etag: source.etag ?? "" }, chunkBytes, residency);
     if (disk && disk.downloadedChunks === disk.chunkCount) {
         try { await disk.promote(); } catch (error) { post({ type: "log", msg: `promotion failed: ${error}` }); }
     }

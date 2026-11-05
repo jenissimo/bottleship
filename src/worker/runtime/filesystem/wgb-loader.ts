@@ -5,6 +5,7 @@ import { CachedSource, computeAdaptiveMaxBytes } from "./cached-source";
 import { SabIoSource } from "./sab-io-source";
 import { Logger, LogCategory } from "../../core/logger";
 import { WgbCache } from "./wgb-cache";
+import { shouldPersistBundleUrl } from "./wgb-cache-policy";
 
 /**
  * Wrap a source in an LRU block-cache where that makes the guest's SYNCHRONOUS
@@ -313,6 +314,19 @@ export class WgbLoader {
     }
 
     static async fromUrl(url: string, options?: { preload?: boolean; io?: import("@bottleship/formats/wgb/io-profile").WgbIoPolicy }): Promise<WgbBundle> {
+        // A dev disk route is already a local file: stream it, never stage it in OPFS.
+        if (!shouldPersistBundleUrl(url)) {
+            const io = await SabIoSource.create(url);
+            (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo = io;
+            try { return await this.fromSource(io); }
+            catch (error) {
+                (globalThis as { __wgbBlockCache?: CachedSource }).__wgbBlockCache?.close();
+                await io.closeAsync();
+                (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo = undefined;
+                (globalThis as { __wgbBlockCache?: unknown }).__wgbBlockCache = undefined;
+                throw error;
+            }
+        }
         // Fastest path: a cached bundle read SYNCHRONOUSLY off disk (no RAM copy).
         const syncSource = await WgbCache.openSyncSourceForUrl(url);
         if (syncSource) return this.fromSource(syncSource);
