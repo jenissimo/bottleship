@@ -122,6 +122,8 @@ export class VirtualCdAudio {
     /** Index 0 == track 1. Empty means no media. */
     private trackTable: CdTrack[] = [];
     private scanned = false;
+    /** Whether the unbudgeted probe pass over the TOC has run — see completeToc. */
+    private tocCompleted = false;
     private refining = false;
     private refinePasses = 0;
 
@@ -181,8 +183,46 @@ export class VirtualCdAudio {
     /** Re-scan on the next query (bundle swap / guest process restart). */
     invalidateDisc(): void {
         this.scanned = false;
+        this.tocCompleted = false;
         this.trackTable = [];
         this.refinePasses = 0;
+    }
+
+    /**
+     * Make the track lengths final before any of them reaches the guest.
+     *
+     * A real drive reads the whole TOC when the disc is mounted, and every start/length
+     * it reports afterwards is fixed. Games rely on that: they read the track spans once
+     * (Miles AIL_redbook_track_info, MCI status position/length) and later play those
+     * exact millisecond ranges. The initial scan's probes are budgeted, so the tracks it
+     * did not reach carry the fallback length. If a guest copies such a span and the
+     * async refine pass then shortens the disc, its saved start lies past the real end:
+     * play() clamps it to the last millisecond of the disc, the request ends at once,
+     * and the game asks again and again without any music (HOMM2 does exactly this).
+     *
+     * So every query that exposes geometry probes the remaining tracks here, without a
+     * budget and with blocking reads allowed. It runs once per disc. Queries that only
+     * ask for the mode or the track count do not come here and stay cheap. A track
+     * whose bytes cannot be read synchronously keeps the fallback, and refineDurations
+     * still handles it later.
+     */
+    private completeToc(): void {
+        this.ensureDisc();
+        if (this.tocCompleted) return;
+        this.tocCompleted = true;
+        let changed = false;
+        for (const t of this.trackTable) {
+            if (!t.isAudio || t.lengthKnown) continue;
+            const probed = this.probeDuration(t.file);
+            if (probed <= 0) continue;
+            t.lengthMs = probed;
+            t.lengthKnown = true;
+            changed = true;
+        }
+        if (!changed) return;
+        this.recomputeStarts();
+        Logger.log(LogCategory.SYSTEM,
+            `VirtualCd: TOC completed — disc length ${this.discLengthMs() | 0}ms`);
     }
 
     private needsRefine(): boolean {
@@ -203,26 +243,31 @@ export class VirtualCdAudio {
 
     /** Ordered audio tracks only (the data track is skipped). */
     audioTracks(): readonly CdTrack[] {
-        this.ensureDisc();
+        this.completeToc();
         return this.trackTable.filter((t) => t.isAudio);
     }
 
     track(number: number): CdTrack | null {
-        this.ensureDisc();
+        this.completeToc();
         if (number < 1 || number > this.trackTable.length) return null;
         return this.trackTable[number - 1];
     }
 
     /** Total playing time of the disc, ms. */
     discLengthMs(): number {
-        this.ensureDisc();
+        this.completeToc();
+        return this.tocEndMs();
+    }
+
+    /** End of the table as it stands, without completing it. */
+    private tocEndMs(): number {
         const last = this.trackTable[this.trackTable.length - 1];
         return last ? last.startMs + last.lengthMs : 0;
     }
 
     /** Track containing a disc-relative position, or null when past the end. */
     trackAt(discMs: number): CdTrack | null {
-        this.ensureDisc();
+        this.completeToc();
         for (const t of this.trackTable) {
             if (discMs >= t.startMs && discMs < t.startMs + t.lengthMs) return t;
         }
@@ -526,6 +571,8 @@ export class VirtualCdAudio {
         // The buffer is ours (allocated in readTrackBytes), so it can be transferred
         // outright unless a short read left it oversized.
         const payloadData = data.byteLength === data.buffer.byteLength ? data : data.slice();
+        // Read before the post: transferring the buffer detaches it (length 0 afterwards).
+        const byteLength = payloadData.byteLength;
         self.postMessage({
             type: "audio_play_encoded",
             payload: {
@@ -555,7 +602,7 @@ export class VirtualCdAudio {
         this.armCompletionBackstop();
         Logger.log(LogCategory.SYSTEM,
             `VirtualCd: streaming track ${track.number} "${track.file}" ` +
-            `(id=${audioId}, ${startOffsetMs | 0}..${endOffsetMs | 0}ms, ${data.length} bytes)`);
+            `(id=${audioId}, ${startOffsetMs | 0}..${endOffsetMs | 0}ms, ${byteLength} bytes)`);
     }
 
     /**
@@ -700,8 +747,9 @@ export class VirtualCdAudio {
         }
 
         const audioCount = this.trackTable.filter((t) => t.isAudio).length;
+        // startMs is the running total here; discLengthMs() would complete the TOC.
         Logger.log(LogCategory.SYSTEM,
-            `VirtualCd: disc mounted — ${maxTrack} tracks (${audioCount} audio), ${this.discLengthMs() | 0}ms`);
+            `VirtualCd: disc mounted — ${maxTrack} tracks (${audioCount} audio), ${startMs | 0}ms`);
     }
 
     private collectFrom(dirPath: string, inMusicDir: boolean, out: Map<number, CdCandidate>): void {
@@ -768,7 +816,7 @@ export class VirtualCdAudio {
         const active = this.segTrack > 0 ? this.trackTable[this.segTrack - 1] : undefined;
         const activeStart = active ? active.startMs : 0;
         const activeEnd = active ? active.startMs + active.lengthMs : 0;
-        const discEnd = this.discLengthMs();
+        const discEnd = this.tocEndMs();
         try {
             let changed = false;
             for (const t of this.trackTable) {
@@ -787,7 +835,7 @@ export class VirtualCdAudio {
             this.recomputeStarts();
             if (active) this.retimeActiveSegment(active, activeStart, activeEnd, discEnd);
             Logger.log(LogCategory.SYSTEM,
-                `VirtualCd: durations refined — disc length ${this.discLengthMs() | 0}ms`);
+                `VirtualCd: durations refined — disc length ${this.tocEndMs() | 0}ms`);
         } finally {
             this.refining = false;
         }
