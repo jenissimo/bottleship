@@ -4491,10 +4491,9 @@ export class ThunkDispatcher {
      * Overflow safety: if the ring is full the trampoline falls back to OUT 0xB077, which
      * hits the existing fast-path or slow-path handler as usual.
      *
-     * NOTE: Display-list recording (glNewList/GL_COMPILE) is NOT supported for write-buffer
-     * functions.  Vertex calls during display-list compilation will be buffered and executed
-     * immediately (GL_COMPILE_AND_EXECUTE) or lost (GL_COMPILE).  Add a WBUF_DISABLED flag
-     * mechanism if display-list correctness is required.
+     * Display-list recording is the handler's job: opengl32 registers handlers that go through
+     * its display-list-wrapped export table, so GL_COMPILE records and skips, and
+     * GL_COMPILE_AND_EXECUTE records and executes, exactly like the trap path.
      *
      * @param dllName   DLL name (e.g. 'ddraw', 'opengl32')
      * @param funcName  Export name (exact or normalised)

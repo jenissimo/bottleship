@@ -198,6 +198,57 @@ describe('ThunkDispatcher — WBUF dynarec lifecycle', () => {
     });
 });
 
+describe('ThunkDispatcher — zero-argument WBUF registration', () => {
+    it('patches every zero-arity stub to the zero-arg trampoline, skips declared arities, replays after reset', () => {
+        let generation = 0;
+        const makeStubs = () => [
+            { dllName: 'opengl32', functionName: 'glPushMatrix', functionId: 200 + generation * 10, address: 0x1000 + generation * 0x100, argCount: 0 },
+            { dllName: 'opengl32', functionName: 'glPushMatrix', functionId: 201 + generation * 10, address: 0x1020 + generation * 0x100 },
+            { dllName: 'opengl32', functionName: 'glPushMatrix', functionId: 202 + generation * 10, address: 0x1040 + generation * 0x100, argCount: 2 },
+        ];
+        let stubs = makeStubs();
+        const generator = {
+            findStubsByName: (dll: string, fn: string) => stubs.filter(s =>
+                s.dllName.toLowerCase() === dll.toLowerCase() && s.functionName.toLowerCase() === fn.toLowerCase()),
+            getAllStubs: () => stubs,
+            getStubById: (id: number) => stubs.find(s => s.functionId === id),
+        };
+        const pm = preemptionManager as any;
+        const oldExports = pm.wasmExports;
+        pm.wasmExports = { jit_dirty_cache: () => {}, jit_wbuf_intrinsic_clear_registry: () => {} };
+        try {
+            const d = new ThunkDispatcher({ add_listener: () => {} } as any, generator as any) as any;
+            const { mem } = bindMemory(d, 0x10000);
+            d.writeBufControlAddr = 0x3000;
+            d.writeBufTrampolineAddrs[21] = 0x2a00;
+            const handler = () => {};
+            expect(d.registerZeroArgWriteBufferFunction('opengl32', 'glPushMatrix', handler)).toBe(true);
+            const jmpTarget = (addr: number) => (addr + 10 + new DataView(mem.buffer).getInt32(addr + 6, true)) >>> 0;
+            for (const s of stubs.slice(0, 2)) {
+                expect(mem[s.address + 5]).toBe(0xE9);
+                expect(jmpTarget(s.address)).toBe(0x2a00);
+                expect(d.writeBufHandlerTable[s.functionId]).toBe(handler);
+                expect(d.writeBufArgCountTable[s.functionId]).toBe(1);
+            }
+            expect(mem[stubs[2]!.address + 5]).not.toBe(0xE9);
+            expect(d.writeBufHandlerTable[stubs[2]!.functionId]).toBeFalsy();
+
+            d.reset();
+            generation++;
+            stubs = makeStubs();
+            bindMemory(d, 0x10000);
+            d.writeBufControlAddr = 0x3000;
+            d.writeBufTrampolineAddrs[21] = 0x2a00;
+            d.applyPendingRegistrations();
+            const fresh = d.cachedMem8 as Uint8Array;
+            expect(fresh[stubs[0]!.address + 5]).toBe(0xE9);
+            expect(d.writeBufHandlerTable[stubs[0]!.functionId]).toBe(handler);
+        } finally {
+            pm.wasmExports = oldExports;
+        }
+    });
+});
+
 describe('ThunkDispatcher — cache validity is Proxy-free', () => {
     /** v86's memory view (vendor/v86/src/lib.js): every property read is a trap. */
     function proxyMem(memory: WebAssembly.Memory): { view: Uint8Array; gets: () => number } {

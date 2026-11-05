@@ -26,7 +26,8 @@ import { APIRegistry } from "../../core/api-registry";
  * sizes both the ring entry and the trampoline's RET N.
  *
  * Deliberately absent, with the reason:
- *   glUnlockArraysEXT                   — zero args.
+ *   glUnlockArraysEXT                   — ends the CVA lock; dropping the cache must not be
+ *                                        deferred past a following trap that reads arrays.
  *   glLoadMatrix* / glMultMatrix* / gl*fv — GL dereferences the pointer AT CALL TIME, so a
  *                                        deferred read can see a scratch the guest reused.
  *   glOrtho / glFrustum                 — six GLdoubles = 12 DWORDs, past the 8-arg trampolines.

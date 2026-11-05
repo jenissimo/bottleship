@@ -280,7 +280,7 @@ export class ThunkMemoryManager {
         }
 
         // Write Tier-0 write-buffer trampolines in the spare area of the spin-loop page.
-        // 16 standard + 4 PtrDeref + 1 D3D9 shader-constant (variable float vector).
+        // 16 standard + 4 PtrDeref + 1 D3D9 shader-constant (variable float vector) + 1 zero-arg.
         // All addresses are hardcoded as imm32 in the x86 so trampolines are written
         // after the THUNK_DATA alloc above.
         this.regions.writeBufTrampolineAddrs = this.writeWriteBufTrampolines(
@@ -638,7 +638,8 @@ export class ThunkMemoryManager {
     /**
      * Write the Tier-0 write-buffer trampolines into the spare area of the spin-loop page.
      *
-     * Generates 16 trampolines: (argCount 1–8) × (stdcall / cdecl).
+     * Generates 16 trampolines: (argCount 1–8) × (stdcall / cdecl), then 4 PtrDeref, the
+     * shader-constant one (index 20) and the zero-argument one (index 21).
      * Each trampoline:
      *   1. Reads WBUF_HEAD from THUNK_DATA control block.
      *   2. If head < capacity: writes [funcId, arg0…argN] to the ring, advances head, returns 0.
@@ -1076,6 +1077,10 @@ export class ThunkMemoryManager {
             w8(0xEF);
             w8(0xC3);
             dv.setInt32(zeroJgePatchOff, zeroOverflowAddr - (zeroJgePatchOff + 4), true);
+        }
+
+        if (off > base + 0xA00) {
+            throw new Error(`Write-buffer trampolines overrun their area: ${off - base} bytes`);
         }
 
         Logger.log(LogCategory.SYSTEM,
