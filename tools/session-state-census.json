@@ -412,6 +412,7 @@
     "traceCount"
   ],
   "src/worker/core/hle-module-images.ts": [
+    "attachHooks",
     "exportsByLowerName",
     "exportsByName",
     "loadedNames",
@@ -1272,7 +1273,8 @@
     "installing"
   ],
   "src/worker/modules/dplayx/network-api.ts": [
-    "EMPTY"
+    "EMPTY",
+    "currentDirectPlayApi"
   ],
   "src/worker/modules/dplayx/session.ts": [
     "BROADCAST",
