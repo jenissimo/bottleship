@@ -9,7 +9,7 @@ import { MemoryManager } from "../../src/worker/core/process";
 import { ThunkGenerator } from "../../src/worker/core/thunking/thunk-generator";
 import { ResourceTable } from "../../src/worker/core/resource-table";
 import { newObjectGraph, restoreObjectGraph } from "../../src/worker/savestate/object-codecs";
-import { registerCoreParticipants, touchedModules } from "../../src/worker/savestate/core-participants";
+import { checkLoadedModules, registerCoreParticipants, touchedModules } from "../../src/worker/savestate/core-participants";
 import { savestateParticipants, schemaHash, uncoveredModules } from "../../src/worker/savestate/participant";
 import { captureKernel32State, restoreKernel32State } from "../../src/worker/modules/kernel32/savestate";
 import { namedObjects } from "../../src/worker/modules/kernel32/named-objects";
@@ -328,6 +328,7 @@ describe("schema pin and mutation", () => {
             "scheduler": { version: 1, schemaHash: "9ca6e9ac5f1ca162" },
             "timer-wheel": { version: 1, schemaHash: "3e2f3b81b4d37775" },
             "dispatcher": { version: 1, schemaHash: "88687a30dd0036f2" },
+            "loaded-modules": { version: 1, schemaHash: "1294dbb9b5a4d85f" },
             "cpu": { version: 1, schemaHash: "4aad346ee75f6054" },
             "window-manager": { version: 1, schemaHash: "0a7d493b700e7f53" },
             "message-queue": { version: 1, schemaHash: "58fb335bdd9764ed" },
@@ -393,7 +394,13 @@ describe("module coverage", () => {
             .toEqual(["ddraw", "user32"]);
     });
 
-    test("core participants cover kernel32, user32 and gdi32, and touched modules come from the thunk table", () => {
+    test("a restore whose loaded modules differ from the save fails and names them", () => {
+        expect(() => checkLoadedModules(["ddraw", "kernel32", "user32"], ["user32", "kernel32", "ddraw"])).not.toThrow();
+        expect(() => checkLoadedModules(["ddraw", "kernel32", "winmm"], ["kernel32", "ddraw", "dsound"]))
+            .toThrow("missing winmm, extra dsound");
+    });
+
+    test("core participants cover kernel32, user32 and gdi32; touched modules are the ones the process loaded", () => {
         registerCoreParticipants();
         const covered = savestateParticipants.coveredModules();
         expect(covered.has("kernel32")).toBe(true);
@@ -404,13 +411,14 @@ describe("module coverage", () => {
         const previous = system.process;
         const gen = new ThunkGenerator();
         gen.setBaseAddress(0x21046000);
-        gen.generateStubDll("KERNEL32.dll", [{ name: "GetTickCount", argCount: 0 }]);
-        gen.generateStubDll("USER32.dll", [{ name: "GetMessageA", argCount: 4 }]);
-        gen.generateStubDll("GDI32.dll", [{ name: "GetStockObject", argCount: 1 }]);
         gen.generateStubDll("DSOUND.dll", [{ name: "DirectSoundCreate", argCount: 3 }]);
+        gen.generateStubDll("BINKW32.dll", [{ name: "BinkOpen", argCount: 2 }]);
         system.process = { thunkGenerator: gen } as never;
         try {
-            expect(uncoveredModules(touchedModules(), covered)).toEqual(["dsound"]);
+            const loaded = () => [{ name: "kernel32" }, { name: "user32" }, { name: "gdi32" }, { name: "dsound" }, { name: "kernel32" }];
+            expect(touchedModules(loaded)).toEqual(["kernel32", "user32", "gdi32", "dsound"]);
+            expect(uncoveredModules(touchedModules(loaded), covered)).toEqual(["dsound"]);
+            expect(touchedModules(() => [])).toEqual([]);
         } finally {
             system.process = previous;
         }
