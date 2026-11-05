@@ -822,14 +822,15 @@ export class WindowManager {
         keyStatePacked?: Uint8Array,
         extraInfo = 0,
         synthesizedTimer = true,
-        timerEpoch = 0
+        timerEpoch = 0,
+        hardware = false
     ): void {
         // Auto-resolve thread targeting from window ownership (matches Windows behavior:
         // PostMessage routes to the thread that created the window)
         if (targetThreadId === 0 && hwnd > 0) {
             targetThreadId = this.getWindowOwnerThread(hwnd);
         }
-        const discrete = this.messageQueue.enqueue(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked, extraInfo, synthesizedTimer, timerEpoch);
+        const discrete = this.messageQueue.enqueue(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked, extraInfo, synthesizedTimer, timerEpoch, hardware);
         if (discrete) {
             // Eagerly update shared flag so WASM PeekMessage sees new messages immediately.
             // Coalesced WM_MOUSEMOVE does NOT set the flag (starvation / spin avoidance).
@@ -843,6 +844,15 @@ export class WindowManager {
                 targetThreadId > 0 ? targetThreadId : undefined,
             );
         }
+    }
+
+    /** Queue a HARDWARE input message (device input, keybd_event/mouse_event/SendInput):
+     *  retrieved after every posted message, as USER's input queue is. */
+    postInputMessage(
+        hwnd: number, msg: number, wParam: number, lParam: number,
+        ptX = 0, ptY = 0, targetThreadId = 0, keyStatePacked?: Uint8Array, extraInfo = 0,
+    ): void {
+        this.postMessage(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked, extraInfo, true, 0, true);
     }
 
     // Get message from queue (with priority handling built into MessageQueue)

@@ -35,7 +35,7 @@ function rig() {
         getTopLevelAncestor: () => win.hwnd,
         getActiveHwnd: () => win.hwnd,
         setActiveWindow: () => { },
-        postMessage: (_h: number, msg: number, wParam: number, lParam: number) => {
+        postInputMessage: (_h: number, msg: number, wParam: number, lParam: number) => {
             posted.push({ msg, wParam, lParam: lParam >>> 0 });
         },
     };

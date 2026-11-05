@@ -22,6 +22,9 @@
  *   --list        only print the file table; do not extract
  *   --quiet       suppress per-file progress
  *   --ignore-obfuscation  explicitly recover plaintext payloads with a wrong flag
+ *   --install-layout  place each file where setup would: under its FILE GROUP's
+ *                 <TARGETDIR>-relative destination (All_Maps -> Maps\...), skipping
+ *                 the installer's own support/runtime groups
  *
  * Not supported: encryption.
  */
@@ -46,10 +49,10 @@ const COMMON_HEADER_SIZE = 20;
 function parseArgs() {
   const a = process.argv.slice(2);
   if (a.length < 2) { console.error('Usage: bun tools/unshield-extract.ts <data1.hdr> <out-dir> [--list] [--quiet]'); process.exit(1); }
-  return { hdrPath: a[0]!, outDir: a[1]!, list: a.includes('--list'), quiet: a.includes('--quiet'), ignoreObfuscation: a.includes('--ignore-obfuscation') };
+  return { hdrPath: a[0]!, outDir: a[1]!, list: a.includes('--list'), quiet: a.includes('--quiet'), ignoreObfuscation: a.includes('--ignore-obfuscation'), installLayout: a.includes('--install-layout') };
 }
 
-const { hdrPath, outDir, list, quiet, ignoreObfuscation } = parseArgs();
+const { hdrPath, outDir, list, quiet, ignoreObfuscation, installLayout } = parseArgs();
 const hdr = new Uint8Array(readFileSync(hdrPath));
 
 let info;
@@ -59,7 +62,16 @@ try {
   console.error((e as Error).message);
   process.exit(1);
 }
-const { major, dirs, files } = info;
+const { major, dirs, files, groupDirByIndex } = info;
+
+/** Where a file lands: its cabinet dir/name, or (--install-layout) under its group's
+ *  destination; null = not installed by any game file group. */
+function destRelPath(f: InstallShieldFile): string | null {
+  if (!installLayout) return fileRelPath(f);
+  const groupDir = groupDirByIndex.get(f.index);
+  if (groupDir == null) return null;
+  return groupDir ? `${groupDir}\\${fileRelPath(f)}` : fileRelPath(f);
+}
 
 // ---- volume loading (Node fs) ----
 const volCache = new Map<number, Uint8Array>();
@@ -186,6 +198,8 @@ let ok = 0, fail = 0, skipped = 0, md5fail = 0;
 mkdirSync(outDir, { recursive: true });
 for (const fd of files) {
   if ((fd.flags & FILE_INVALID) || fd.dataOffset === 0 || !fd.name) { skipped++; continue; }
+  const rel = destRelPath(fd);
+  if (rel == null) { skipped++; continue; }
   try {
     const data = extractFile(fd);
     if (!data) { skipped++; continue; }
@@ -196,7 +210,7 @@ for (const fd of files) {
       for (let i = 0; eq && i < sum.length; i++) if (sum[i] !== fd.md5[i]) eq = false;
       if (!eq) { console.error(`MD5 FAIL ${fileRelPath(fd)}`); md5fail++; }
     }
-    const dest = resolveArchiveExtractPath(outDir, fileRelPath(fd));
+    const dest = resolveArchiveExtractPath(outDir, rel);
     mkdirSync(dirname(dest), { recursive: true });
     writeFileSync(dest, data);
     ok++;

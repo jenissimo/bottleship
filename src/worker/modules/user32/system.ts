@@ -722,7 +722,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const dwExtraInfo = args[3] >>> 0;
         const hwnd = System.getInstance().windowManager.getInputTargetWindow()?.hwnd ?? 0;
         if (hwnd) {
-            System.getInstance().windowManager.postMessage(hwnd, msg, bVk, lParam, 0, 0, 0, undefined, dwExtraInfo);
+            System.getInstance().windowManager.postInputMessage(hwnd, msg, bVk, lParam, 0, 0, 0, undefined, dwExtraInfo);
         }
         return 0;
     };
@@ -775,7 +775,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const pos = inputManager.getMouseState();
         const lParam = ((pos.y & 0xffff) << 16) | (pos.x & 0xffff);
         const post = (msg: number, wParam = 0) =>
-            wm.postMessage(hwnd, msg, wParam, lParam, 0, 0, 0, undefined, dwExtraInfo);
+            wm.postInputMessage(hwnd, msg, wParam, lParam, 0, 0, 0, undefined, dwExtraInfo);
 
         if (dwFlags & MOUSEEVENTF_LEFTDOWN) post(0x0201, 0x0001);
         if (dwFlags & MOUSEEVENTF_LEFTUP) post(0x0202, 0);

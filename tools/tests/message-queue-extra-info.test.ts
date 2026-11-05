@@ -16,8 +16,8 @@ describe("message queue dwExtraInfo", () => {
 
     it("keeps it across a coalesced mouse move flushed ahead of a click", () => {
         const q = new MessageQueue();
-        q.enqueue(0x10, WM_MOUSEMOVE, 0, 0, 0, 0, 0, undefined, 0x1234);
-        q.enqueue(0x10, WM_LBUTTONDOWN, 1, 0, 0, 0, 0, undefined, 0x5678);
+        q.enqueue(0x10, WM_MOUSEMOVE, 0, 0, 0, 0, 0, undefined, 0x1234, true, 0, true);
+        q.enqueue(0x10, WM_LBUTTONDOWN, 1, 0, 0, 0, 0, undefined, 0x5678, true, 0, true);
         const move = q.dequeue();
         expect(move?.message).toBe(WM_MOUSEMOVE);
         expect(move?.extraInfo).toBe(0x1234);
