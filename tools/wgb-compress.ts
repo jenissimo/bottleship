@@ -4,10 +4,11 @@ import {
     BLOCK_STREAM_END, deflateRawBlock, encodeBlockIndex, unixToDosDateTime, WGB_BLOCK_INDEX_ENTRY, WGB_BLOCK_INDEX_VERSION, ZipArchive,
     type BlockIndexRow, type ZipSource,
 } from "@bottleship/formats/zip";
-import { crc32, crc32Final, crc32Update, ZipStoreWriter } from "./internal/zip-store-writer";
+import { crc32, ZipStoreWriter } from "./internal/zip-store-writer";
 
 const ALWAYS_STORED = ["manifest.json", "registry.json"];
-const PRECOMPRESSED = new Set(["ogg", "mp3", "wma", "bik", "smk", "jpg", "jpeg", "png", "gif", "cab", "zip", "7z", "rar", "gz", "mp4", "webm"]);
+const PRECOMPRESSED = new Set(["ogg", "mp3", "wma", "flac", "bik", "bk2", "smk", "avi", "wmv", "mpg", "mpeg", "xmv", "mp4", "webm", "jpg", "jpeg", "png", "gif", "cab", "zip", "7z", "rar", "gz"]);
+const MAX_MEMBER_BYTES = 2 ** 31 - 1;
 
 export interface CompressOptions {
     blockKiB?: number;
@@ -95,14 +96,19 @@ export async function compressWgb(input: string, output: string, options: Compre
         let deflated = 0, stored = 0, blocks = 0;
         for (const entry of entries) {
             const stamp = entry.modified === undefined ? 0 : unixToDosDateTime(entry.modified);
+            if (entry.uncompressedSize > MAX_MEMBER_BYTES) throw new Error(`${entry.name}: members of 2 GiB or more are not supported (each member is packed in RAM)`);
             let data = entry.isDirectory ? new Uint8Array(0) : await archive.readEntry(entry);
-            if (entry.crc32 !== undefined && !entry.isDirectory && entry.name.toLowerCase() !== "manifest.json" && crc32(data) !== entry.crc32) {
+            let crc = crc32(data);
+            if (entry.crc32 !== undefined && !entry.isDirectory && crc !== entry.crc32) {
                 throw new Error(`${entry.name}: CRC mismatch in input`);
             }
-            if (entry.name.toLowerCase() === "manifest.json") data = withBlockIndexRef(data);
+            if (entry.name.toLowerCase() === "manifest.json") {
+                data = withBlockIndexRef(data);
+                crc = crc32(data);
+            }
             const ext = entry.name.slice(entry.name.lastIndexOf(".") + 1).toLowerCase();
             if (entry.isDirectory || data.byteLength === 0 || keep.has(entry.name.toLowerCase()) || skipExt.has(ext)) {
-                writer.addStored(entry.name, data, stamp);
+                writer.addStored(entry.name, data, stamp, crc);
                 stored++;
                 continue;
             }
@@ -110,11 +116,10 @@ export async function compressWgb(input: string, output: string, options: Compre
             let compressedSize = 0;
             for (const p of parts) compressedSize += p.byteLength;
             if (data.byteLength - compressedSize < Math.max(4096, data.byteLength * minSaving)) {
-                writer.addStored(entry.name, data, stamp);
+                writer.addStored(entry.name, data, stamp, crc);
                 stored++;
                 continue;
             }
-            const crc = crc32Final(crc32Update(data));
             const localHeaderOffset = writer.addDeflated(entry.name, parts, data.byteLength, crc, stamp);
             rows.push({ name: entry.name, localHeaderOffset, uncompressedSize: data.byteLength, compressedSize, crc32: crc, shift, blockLengths: lengths });
             deflated++;
@@ -179,7 +184,7 @@ function parseArgs(argv: string[]): { input: string; output: string; options: Co
         else pos.push(a);
     }
     if (pos.length !== 2) {
-        console.error("usage: bun tools/wgb-compress.ts <in.wgb> <out.wgb> [--block-kib 64] [--level 9] [--min-saving-pct 5] [--store <entry>]... [--compress-all] [--no-verify] [--json <report.json>]");
+        console.error("usage: bun tools/wgb-compress.ts <in.wgb> <out.wgb> [--block-kib 64] [--level 9] [--min-saving-pct 5] [--store <entry>]... [--compress-all] [--no-verify] [--json <report.json>]\nMembers are packed in RAM one at a time; members of 2 GiB or more are not supported.");
         process.exit(2);
     }
     options.store = store;

@@ -69,6 +69,13 @@ interface RomDirNode {
     selfEntry: boolean;
 }
 
+function syncWidenTarget(entry: ZipEntry, position: number, length: number): number {
+    if (!entry.blocks) return VirtualFileSystem.SYNC_WIDEN_BYTES;
+    const blockSize = 2 ** entry.blocks.shift;
+    const blockEnd = (Math.floor((position + Math.max(1, length) - 1) / blockSize) + 1) * blockSize;
+    return blockEnd - position;
+}
+
 export interface VfsFindHandle {
     kind: "find";
     entries: VfsEntry[];
@@ -327,6 +334,7 @@ export class VirtualFileSystem {
     private static readonly READ_INTO_CHUNK = 256 * 1024;
     /** Sequential read-ahead chunk size (512KB) */
     private static readonly PREFETCH_CHUNK_SIZE = 512 * 1024;
+    static readonly SYNC_WIDEN_BYTES = VirtualFileSystem.PREFETCH_CHUNK_SIZE;
     /** Trigger prefetch when less than this many bytes remain in current window */
     private static readonly PREFETCH_TRIGGER_REMAINING = 256 * 1024;
     /** Align ROM/OPFS range reads to 4KB pages for steadier I/O behavior */
@@ -1031,7 +1039,7 @@ export class VirtualFileSystem {
         // A/B kill-switch: globalThis.__noRomReadWindow restores the un-widened read.
         const widen = !(globalThis as { __noRomReadWindow?: boolean }).__noRomReadWindow
             && (sequential || handle.lastReadEnd === undefined);
-        const want = widen ? Math.max(length, VirtualFileSystem.PREFETCH_CHUNK_SIZE) : length;
+        const want = widen ? Math.max(length, syncWidenTarget(entry, handle.position, length)) : length;
         const data = this.romArchive.readEntryRangeSync(entry, handle.position, want, sequential);
         if (!data) return null;
         // A SHORT answer mid-file is not a small read, it is a MISS: the block cache below

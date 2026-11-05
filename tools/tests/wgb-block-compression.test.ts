@@ -78,16 +78,19 @@ const packed = new Uint8Array(readFileSync(packedPath));
 class CountingSource implements ZipSource {
     readonly size: number;
     readonly hints: ReadHint[] = [];
+    readonly syncSpans: Array<[number, number]> = [];
     syncAnswers = true;
+    shortBy = 0;
     constructor(private readonly data: Uint8Array) { this.size = data.byteLength; }
     async readRange(start: number, end: number, hint?: ReadHint): Promise<Uint8Array> {
         if (hint) this.hints.push(hint);
         await Promise.resolve();
-        return this.data.slice(start, end);
+        return this.data.slice(start, end - this.shortBy);
     }
     readRangeSync(start: number, end: number, hint?: ReadHint): Uint8Array | null {
         if (!this.syncAnswers) return null;
         if (hint) this.hints.push(hint);
+        if (hint) this.syncSpans.push([start, end]);
         return this.data.slice(start, end);
     }
 }
@@ -242,7 +245,7 @@ describe("block range reads", () => {
         expect(a.readEntryRangeSync(e, 50, 100)).not.toBeNull();
     });
 
-    test("a corrupted block fails loudly instead of returning wrong bytes", async () => {
+    test("a structurally corrupted block never returns bytes: sync answers null, async throws", async () => {
         const a0 = await open(packed);
         const e0 = a0.getEntry(name)!;
         const lho = e0.localHeaderOffset;
@@ -255,8 +258,57 @@ describe("block range reads", () => {
         await a.init();
         const e = a.getEntry(name)!;
         check(a.readEntryRangeSync(e, 0, BLOCK * 2), 0, BLOCK * 2);
-        expect(() => a.readEntryRangeSync(e, BLOCK * 2, 10)).toThrow(/block inflate/);
+        expect(a.readEntryRangeSync(e, BLOCK * 2, 10)).toBeNull();
         await expect(a.readEntryRange(e, BLOCK * 2, 10)).rejects.toThrow(/block inflate/);
+        installFakeOpfs();
+        const vfs = new VirtualFileSystem();
+        vfs.mountRom(a, "rom", buildRomIndex(a, "rom"));
+        await vfs.initOverlay("test:wgb-block-corrupt");
+        const h = vfs.openSync("C:\\data.mix", 0x80000000, 3)!;
+        vfs.setPosition(h, BLOCK * 2, 0);
+        expect(vfs.readSync(h, 10)).toBeNull();
+        await expect(vfs.read(h, 10)).rejects.toThrow(/inflate/);
+    });
+
+    test("a short async read is reported as one", async () => {
+        const src = new CountingSource(packed);
+        const a = await open(packed, 0, src);
+        const e = a.getEntry(name)!;
+        check(a.readEntryRangeSync(e, 0, 1), 0, 1);
+        src.shortBy = 7;
+        await expect(a.readEntryRange(e, 0, BLOCK * 2)).rejects.toThrow(/short read/);
+    });
+
+    test("a whole-member read of a block member carries an entry-bounded sequential hint", async () => {
+        const src = new CountingSource(packed);
+        const a = await open(packed, undefined, src);
+        const e = a.getEntry(name)!;
+        src.hints.length = 0;
+        check(await a.readEntry(e), 0, want.length);
+        expect(src.hints.length).toBe(1);
+        const h = src.hints[0];
+        expect(h.entryName).toBe(name);
+        expect(h.cursor).toBe(h.entryStart);
+        expect(h.entryEnd - h.entryStart).toBe(e.compressedSize);
+        expect(h.sequential).toBe(true);
+    });
+
+    test("a sync VFS read widens only to the end of the block it touches", async () => {
+        installFakeOpfs();
+        const src = new CountingSource(packed);
+        const a = await open(packed, undefined, src);
+        const e = a.getEntry(name)!;
+        const vfs = new VirtualFileSystem();
+        vfs.mountRom(a, "rom", buildRomIndex(a, "rom"));
+        await vfs.initOverlay("test:wgb-block-widen");
+        const h = vfs.openSync("C:\\data.mix", 0x80000000, 3)!;
+        src.syncSpans.length = 0;
+        check(vfs.readSync(h, 100), 0, 100);
+        expect(src.syncSpans.length).toBe(1);
+        const [s0, s1] = src.syncSpans[0];
+        expect(s1 - s0).toBe(e.blocks!.offsets[1] - e.blocks!.offsets[0]);
+        check(vfs.readSync(h, BLOCK - 100), 100, BLOCK - 100);
+        expect(src.syncSpans.length).toBe(1);
     });
 });
 
@@ -289,6 +341,14 @@ describe("index validation and the VFS", () => {
         const b = await withIndex(rows => { rows.find(r => r.name === "rom/game.exe")!.localHeaderOffset += 1; });
         expect(b.getEntry("rom/game.exe")!.blocks).toBeUndefined();
         expect(b.getEntry("rom/data.mix")!.blocks).toBeDefined();
+    });
+
+    test("a row whose blocks do not end exactly before the end marker is ignored", async () => {
+        const b = await withIndex(rows => {
+            const r = rows.find(x => x.name === "rom/data.mix")!;
+            (r.blockLengths as Uint32Array)[r.blockLengths.length - 1] -= 1;
+        });
+        expect(b.getEntry("rom/data.mix")!.blocks).toBeUndefined();
     });
 
     test("a row whose block count disagrees with the size is ignored", async () => {

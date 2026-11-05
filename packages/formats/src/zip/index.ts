@@ -484,7 +484,7 @@ export class ZipArchive {
 
         const dataStart = await this.getEntryDataStart(entry);
         const dataEnd = dataStart + entry.compressedSize;
-        const compressed = await this.source.readRange(dataStart, dataEnd);
+        const compressed = await this.source.readRange(dataStart, dataEnd, entry.blocks ? this.blockHint(entry, dataStart, dataStart, true) : undefined);
 
         if (entry.compression === 8) {
             return inflateRaw(compressed, entry.uncompressedSize);
@@ -502,11 +502,17 @@ export class ZipArchive {
             const dataStart = await this.getEntryDataStart(entry);
             const span = this.missingSpan(entry, dataStart, plan.first, plan.last);
             const compressed = span ? await this.source.readRange(span.start, span.end, this.blockHint(entry, dataStart, span.start, sequential)) : null;
+            if (span && compressed!.byteLength < span.end - span.start) {
+                throw new Error(`short read in ${entry.name}: ${compressed!.byteLength} of ${span.end - span.start} compressed bytes`);
+            }
             const out = this.assembleBlocks(entry, dataStart, plan, span, compressed);
             if (out) return out;
             const offsets = entry.blocks.offsets;
             const whole = { start: dataStart + offsets[plan.first], end: dataStart + offsets[plan.last + 1], first: plan.first, last: plan.last };
             const all = await this.source.readRange(whole.start, whole.end, this.blockHint(entry, dataStart, whole.start, sequential));
+            if (all.byteLength < whole.end - whole.start) {
+                throw new Error(`short read in ${entry.name}: ${all.byteLength} of ${whole.end - whole.start} compressed bytes`);
+            }
             return this.assembleBlocks(entry, dataStart, plan, whole, all)!;
         }
         if (entry.compression !== 0) {
@@ -548,7 +554,11 @@ export class ZipArchive {
                 compressed = this.source.readRangeSync(span.start, span.end, this.blockHint(entry, dataStart, span.start, sequential));
                 if (!compressed || compressed.byteLength < span.end - span.start) return null;
             }
-            return this.assembleBlocks(entry, dataStart, plan, span, compressed);
+            try {
+                return this.assembleBlocks(entry, dataStart, plan, span, compressed);
+            } catch {
+                return null;
+            }
         }
         if (entry.compression !== 0 || !this.source.readRangeSync) return null;
         if (length <= 0 || offset >= entry.uncompressedSize) return new Uint8Array();
