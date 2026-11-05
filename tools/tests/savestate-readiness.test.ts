@@ -4,6 +4,8 @@ import { markRestartable, restartableCheck } from "../../src/worker/core/thunkin
 import { registerSavestateCommands } from "../../src/worker/harness/cmds/savestate";
 import { System } from "../../src/worker/core/system";
 import { createMessageExports } from "../../src/worker/modules/user32/message";
+import { resetDialogPumps } from "../../src/worker/modules/user32/modal-dialog-state";
+import { stopChildProcesses } from "../../src/worker/core/child-process";
 
 const idle: ReadinessProbe = {
     asyncParks: () => [], pendingAsyncRestores: () => 0, pendingCallbacks: () => 0,
@@ -54,7 +56,12 @@ describe("savestate readiness", () => {
         ]);
     });
 
-    test("the registered verb reads every owner of a session without a process", () => {
+    test("the registered verb reads every owner of a session without a process", async () => {
+        // Module-scope owners outlive a test file in one `bun test` process: an earlier
+        // file can leave an armed dialog pump or an unfinished child behind, and the verb
+        // would rightly report them. Start from an empty session.
+        resetDialogPumps();
+        await stopChildProcesses();
         const handlers = new Map<string, (args: unknown[]) => unknown>();
         registerSavestateCommands({ register: (name: string, h: (args: unknown[]) => unknown) => handlers.set(name, h) } as never);
         const system = System.getInstance();
