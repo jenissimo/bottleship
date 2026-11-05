@@ -22,6 +22,7 @@ import { leaseRegistry } from "./memory/lease-registry";
 import { memoryEventBuffer } from "./memory/memory-event-buffer";
 import { faultRecorder } from "./memory/fault-recorder";
 import { loadDiagnostics } from "./diagnostics/load-diagnostics";
+import { processCrtBinding } from "./crt-binding";
 import { serializeCpu } from "../harness/serialize";
 import { buildHarnessReport, type HarnessReport } from "../harness/build-report";
 import { frameProfiler } from "./frame-profiler";
@@ -432,6 +433,7 @@ export class System {
         add('implicit-tls', 'game-switch', () => { this.implicitTlsEntries = []; });
 
         add('load-diagnostics', 'subsystems', () => loadDiagnostics.reset());
+        add('crt-binding', 'subsystems', () => processCrtBinding.reset());
         add('window-manager', 'subsystems', () => this.windowManager.reset());
         add('gdi', 'subsystems', () => this.gdiContext.reset());
         add('input', 'subsystems', () => this.inputManager.reset());

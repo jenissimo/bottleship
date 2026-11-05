@@ -29,9 +29,14 @@ import { serializeMbwcStubTable, writeMbwcStubDestLimit } from '../modules/kerne
 import { loadDiagnostics } from './diagnostics/load-diagnostics';
 import { writeGuestCode, invalidateGuestCode } from './memory/guest-code';
 import { markGuestPagesDirty, zeroGuestRange } from './memory/guest-page-dirty';
-import { resolveImportBinding, isD3dx9VersionedDll } from './pe-import-binding';
+import {
+    resolveImportBinding, isD3dx9VersionedDll, uncoveredHleImports,
+    type ImportBindingDeps, type ImportFn,
+} from './pe-import-binding';
+import { planProcessCrt, processCrtBinding, type CrtScanImport } from './crt-binding';
+import { parsePeImports } from '@bottleship/formats/pe';
 import { nameOrdinalImports, readExportNameDirectory, shippedExportNames } from './pe-export-names';
-import { resolveThunkedDllAlias } from './dll-aliases';
+import { normalizeDllBaseName, resolveThunkedDllAlias } from './dll-aliases';
 import { dllSearchDirectories } from './dll-search-order';
 
 export interface LoadedModule {
@@ -531,6 +536,8 @@ export class PELoader {
 
         // Process Imports (now async to support real DLL loading)
         const importDirRVA = peView.getUint32(optHeaderPtr + 104, true);
+        // One C runtime for the whole process, decided before the first import is bound.
+        await this.planProcessCrtBinding(system.executableName || 'exe', peData);
         if (importDirRVA !== 0) {
             await this.processImports(baseAddress, importDirRVA);
         }
@@ -1389,6 +1396,83 @@ export class PELoader {
         }
     }
 
+    /** What resolveImportBinding needs from the loader, bound to one search order. */
+    private importBindingDeps(searchDirectories: readonly string[], quiet = false): ImportBindingDeps {
+        return {
+            hasThunkedModule: (n) => this.apiRegistry.hasModule(n),
+            findDllPath: (n) => this.findDllPath(n, 0, searchDirectories),
+            appDirRule: (raw) => findDllRule(EmulatorConfig.getInstance().appDirDlls, raw),
+            isUnderSystemDirectory: (p) => isUnderSystemDirectory(normalizeDllPathToken(p)),
+            exportFacts: (thunked, f) => f.name !== undefined
+                ? {
+                    callingConvention: this.apiRegistry.getCallingConvention(thunked, f.name),
+                    argCount: this.apiRegistry.getArgCount(thunked, f.name),
+                    stackCleanupBytes: this.apiRegistry.getStackCleanupBytes(thunked, f.name),
+                    isDataExport: this.thunkGenerator.getDataExportAddress(thunked, f.name) !== undefined,
+                }
+                : { argCount: f.ordinal !== undefined ? this.apiRegistry.getArgCountByOrdinal(thunked, f.ordinal) : undefined },
+            log: quiet ? () => {} : (m) => Logger.log(LogCategory.SYSTEM, m),
+            warn: quiet ? () => {} : (m) => Logger.warn(LogCategory.SYSTEM, m),
+        };
+    }
+
+    /**
+     * C runtime names a bundle may ship. Without any of them on disk there is nothing to
+     * choose between, and the walk (which reads every statically linked DLL) is skipped.
+     */
+    private static readonly SHIPPED_CRT_PROBES = [
+        'msvcrt', 'msvcrtd', 'msvcr70', 'msvcr71', 'msvcr80', 'msvcr90', 'msvcr100', 'msvcr110', 'msvcr120',
+        'msvcp60', 'msvcp70', 'msvcp71', 'msvcp80', 'msvcp90', 'msvcp100', 'msvcp110', 'msvcp120',
+        'ucrtbase', 'vcruntime140',
+    ];
+
+    /**
+     * Decide, once per process, whether each CRT the images import binds to HLE or to the
+     * shipped DLL (crt-binding.ts). Walks the EXE and the real DLLs it links, transitively,
+     * reading them from the VFS; the per-import walk in processImports then follows it.
+     */
+    private async planProcessCrtBinding(exeName: string, exeData: Uint8Array): Promise<void> {
+        processCrtBinding.reset();
+        const mode = EmulatorConfig.getInstance().crtBinding;
+        processCrtBinding.mode = mode;
+        if (!this.vfs) return;
+        const searchDirectories = this.getDllSearchDirectories();
+        if (!PELoader.SHIPPED_CRT_PROBES.some(n => this.findDllPath(n, 0, searchDirectories) !== null)) return;
+
+        const deps = this.importBindingDeps(searchDirectories, true);
+        const importsOf = async (image: Uint8Array): Promise<CrtScanImport[]> => {
+            const out: CrtScanImport[] = [];
+            for (const d of parsePeImports(image).dlls) {
+                const functions: ImportFn[] = d.entries.map(e =>
+                    e.name !== undefined ? { name: e.name } : { ordinal: e.ordinal });
+                await this.nameOrdinalImportsFromShippedDll(d.dll, functions, searchDirectories);
+                out.push({ dll: d.dll, functions });
+            }
+            return out;
+        };
+        try {
+            const { choices, importers } = await planProcessCrt(exeName.toLowerCase(), await importsOf(exeData), mode, {
+                readImports: async (raw) => {
+                    const path = this.findDllPath(normalizeDllBaseName(raw), 0, searchDirectories);
+                    if (!path || !this.vfs) return null;
+                    const handle = await this.vfs.open(path, 0x80000000, 3);
+                    if (!handle) return null;
+                    const image = await this.vfs.read(handle, this.vfs.getFileSize(path));
+                    return image.length > 0 ? importsOf(image) : null;
+                },
+                bindAlone: (raw, functions) => resolveImportBinding(raw, functions, deps),
+                uncovered: (raw, functions) => uncoveredHleImports(raw, functions, deps),
+                shipped: (raw) => this.findDllPath(normalizeDllBaseName(raw), 0, searchDirectories) !== null,
+                log: (m) => Logger.log(LogCategory.SYSTEM, m),
+                warn: (m) => Logger.warn(LogCategory.SYSTEM, m),
+            });
+            processCrtBinding.adoptPlan(mode, choices, importers);
+        } catch (e) {
+            // The per-module rule still binds every import; only the one-CRT guarantee is lost.
+            Logger.warn(LogCategory.SYSTEM, `[PE] Process CRT binding walk failed, binding per module: ${e}`);
+        }
+    }
+
     private async processImports(baseAddress: number, importDirRVA: number,
         searchDirectories: readonly string[] = this.getDllSearchDirectories()): Promise<void> {
         let descriptorAddr = baseAddress + importDirRVA;
@@ -1415,21 +1499,11 @@ export class PELoader {
             await this.nameOrdinalImportsFromShippedDll(dllNameRaw, functions, searchDirectories);
 
             const { dllName, aliasTarget, isThunked } = resolveImportBinding(dllNameRaw, functions, {
-                hasThunkedModule: (n) => this.apiRegistry.hasModule(n),
-                findDllPath: (n) => this.findDllPath(n, 0, searchDirectories),
-                appDirRule: (raw) => findDllRule(EmulatorConfig.getInstance().appDirDlls, raw),
-                isUnderSystemDirectory: (p) => isUnderSystemDirectory(normalizeDllPathToken(p)),
-                exportFacts: (thunked, f) => f.name !== undefined
-                    ? {
-                        callingConvention: this.apiRegistry.getCallingConvention(thunked, f.name),
-                        argCount: this.apiRegistry.getArgCount(thunked, f.name),
-                        stackCleanupBytes: this.apiRegistry.getStackCleanupBytes(thunked, f.name),
-                        isDataExport: this.thunkGenerator.getDataExportAddress(thunked, f.name) !== undefined,
-                    }
-                    : { argCount: f.ordinal !== undefined ? this.apiRegistry.getArgCountByOrdinal(thunked, f.ordinal) : undefined },
-                log: (m) => Logger.log(LogCategory.SYSTEM, m),
-                warn: (m) => Logger.warn(LogCategory.SYSTEM, m),
+                ...this.importBindingDeps(searchDirectories),
+                processCrtChoice: (raw) => processCrtBinding.choiceFor(raw),
             });
+            // A CRT name no static image imported: this first binding becomes the process's.
+            processCrtBinding.noteLateBinding(dllNameRaw, isThunked);
 
             if (loadDiagnostics.noteImportBinding(dllNameRaw, isThunked)) {
                 Logger.warn(LogCategory.SYSTEM,
