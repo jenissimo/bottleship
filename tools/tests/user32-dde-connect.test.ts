@@ -7,7 +7,8 @@
  * running and exits. These cases pin the server-side bookkeeping: no server -> no
  * conversation, DdeNameService(DNS_REGISTER) -> conversation, DNS_UNREGISTER (by name,
  * by NULL, or via DdeUninitialize) -> no conversation again. The Explorer shell services
- * (PROGMAN, Folders, AppProperties), which installers talk to, stay connectable.
+ * (Progman, Shell, Folders, AppProperties, as Wine's shell32 registers them), which
+ * installers talk to, stay connectable. A NULL service or topic is a wildcard.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -18,6 +19,8 @@ const DNS_REGISTER = 0x0001;
 const DNS_UNREGISTER = 0x0002;
 const DMLERR_NO_ERROR = 0;
 const DMLERR_NO_CONV_ESTABLISHED = 0x400a;
+const DMLERR_DLL_USAGE = 0x4004;
+const APPCMD_CLIENTONLY = 0x10;
 
 const mem = new Uint8Array(0x10000);
 const view = new DataView(mem.buffer);
@@ -31,8 +34,8 @@ function call(name: string, ...args: number[]): number {
     return (exports[name]({} as any, mem, args) as number) >>> 0;
 }
 
-function init(): number {
-    expect(call("DdeInitializeA", PID, 0, 0, 0)).toBe(DMLERR_NO_ERROR);
+function init(afCmd = 0): number {
+    expect(call("DdeInitializeA", PID, 0, afCmd, 0)).toBe(DMLERR_NO_ERROR);
     return view.getUint32(PID, true);
 }
 
@@ -112,9 +115,47 @@ describe("DdeConnect requires a registered service", () => {
 
     test("Explorer shell services remain connectable without a registration", () => {
         const client = init();
-        for (const service of ["PROGMAN", "Folders", "AppProperties"]) {
+        for (const service of ["PROGMAN", "Shell", "Folders", "AppProperties"]) {
             expect(connect(client, service)).not.toBe(0);
         }
+        call("DdeUninitialize", client);
+    });
+
+    test("a NULL service connects to any registered server", () => {
+        const server = init();
+        const client = init();
+        const topic = hsz(client, "GameTopic");
+        expect(call("DdeConnect", client, 0, topic, 0)).toBe(0);
+        expect(call("DdeGetLastError", client)).toBe(DMLERR_NO_CONV_ESTABLISHED);
+        call("DdeNameService", server, hsz(server, "AnyServer"), 0, DNS_REGISTER);
+        expect(call("DdeConnect", client, 0, hsz(client, "GameTopic"), 0)).not.toBe(0);
+        call("DdeUninitialize", server);
+        call("DdeUninitialize", client);
+    });
+
+    test("a NULL service reaches the shell for a shell topic or a NULL topic", () => {
+        const client = init();
+        expect(call("DdeConnect", client, 0, hsz(client, "PROGMAN"), 0)).not.toBe(0);
+        expect(call("DdeConnect", client, 0, hsz(client, "Shell"), 0)).not.toBe(0);
+        expect(call("DdeConnect", client, 0, 0, 0)).not.toBe(0);
+        expect(call("DdeConnect", client, 0, hsz(client, "System"), 0)).toBe(0);
+        call("DdeUninitialize", client);
+    });
+
+    test("a NULL topic with a named service follows the service", () => {
+        const client = init();
+        expect(call("DdeConnect", client, hsz(client, "Progman"), 0, 0)).not.toBe(0);
+        expect(call("DdeConnect", client, hsz(client, "NobodyHere"), 0, 0)).toBe(0);
+        call("DdeUninitialize", client);
+    });
+
+    test("an APPCMD_CLIENTONLY instance cannot register services", () => {
+        const client = init(APPCMD_CLIENTONLY);
+        expect(call("DdeNameService", client, hsz(client, "ClientOnly"), 0, DNS_REGISTER)).toBe(0);
+        expect(call("DdeGetLastError", client)).toBe(DMLERR_DLL_USAGE);
+        const other = init();
+        expect(connect(other, "ClientOnly")).toBe(0);
+        call("DdeUninitialize", other);
         call("DdeUninitialize", client);
     });
 

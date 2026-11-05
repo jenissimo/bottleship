@@ -73,9 +73,15 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     const ddeStrings = new Map<number, string>();
     const ddeServices = new Map<string, Set<number>>();
     const ddeConversations = new Set<number>();
-    const ddeShellServices = new Set(['progman', 'folders', 'appproperties']);
+    const ddeClientOnly = new Set<number>();
+    // Wine's shell32 DDE server registers Progman, Shell and Folders, and also accepts
+    // AppProperties as a service; it answers the Progman and Shell topics.
+    const ddeShellServices = new Set(['progman', 'shell', 'folders', 'appproperties']);
+    const ddeShellTopics = new Set(['progman', 'shell']);
     const DNS_REGISTER = 0x0001;
     const DNS_UNREGISTER = 0x0002;
+    const APPCMD_CLIENTONLY = 0x00000010;
+    const DMLERR_DLL_USAGE = 0x4004;
     const ddeServiceKey = (hsz: number): string | null => {
         const name = ddeStrings.get(hsz);
         return name === undefined ? null : name.toLowerCase();
@@ -507,6 +513,7 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         }
         const inst = nextDdeInstance++;
         ddeInstances.add(inst);
+        if ((args[2] >>> 0) & APPCMD_CLIENTONLY) ddeClientOnly.add(inst);
         ddeLastError.set(inst, DMLERR_NO_ERROR);
         Mem.writeUint32(pidInst, inst >>> 0);
         return DMLERR_NO_ERROR;
@@ -520,6 +527,7 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         }
         ddeInstances.delete(idInst);
         ddeLastError.delete(idInst);
+        ddeClientOnly.delete(idInst);
         ddeDropInstanceServices(idInst);
         return 1;
     };
@@ -530,6 +538,10 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         const hsz1 = args[1] >>> 0;
         const afCmd = args[3] >>> 0;
         if (!ddeInstances.has(idInst)) {
+            return 0;
+        }
+        if (ddeClientOnly.has(idInst)) {
+            ddeLastError.set(idInst, DMLERR_DLL_USAGE);
             return 0;
         }
         if (afCmd & DNS_UNREGISTER) {
@@ -619,14 +631,20 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         const idInst = args[0] >>> 0;
         const hszService = args[1] >>> 0;
         const hszTopic = args[2] >>> 0;
-        if (!ddeInstances.has(idInst) || hszService === 0 || hszTopic === 0) {
-            if (ddeInstances.has(idInst)) {
-                ddeLastError.set(idInst, DMLERR_NO_CONV_ESTABLISHED);
-            }
+        if (!ddeInstances.has(idInst)) {
             return 0;
         }
-        const key = ddeServiceKey(hszService);
-        if (key === null || (!ddeServices.has(key) && !ddeShellServices.has(key))) {
+        // A NULL service or topic is a wildcard: any server, or any topic the server
+        // supports. Registration alone accepts the connection here; real DDEML also asks
+        // the server's callback (XTYP_CONNECT, refused under CBF_FAIL_CONNECTIONS). The
+        // service table is per process, while DDEML's is system-wide, so a service a
+        // parent process registered is not visible to its child.
+        const service = hszService === 0 ? null : ddeServiceKey(hszService);
+        const topic = hszTopic === 0 ? null : ddeServiceKey(hszTopic);
+        const connectable = hszService === 0
+            ? ddeServices.size > 0 || hszTopic === 0 || (topic !== null && ddeShellTopics.has(topic))
+            : service !== null && (ddeServices.has(service) || ddeShellServices.has(service));
+        if (!connectable) {
             ddeLastError.set(idInst, DMLERR_NO_CONV_ESTABLISHED);
             return 0;
         }
