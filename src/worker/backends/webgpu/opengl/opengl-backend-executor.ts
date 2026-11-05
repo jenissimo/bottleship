@@ -127,7 +127,7 @@ interface SelectedVertices {
     topology: OpenGLTopology;
 }
 
-const VERTEX_FLOAT_STRIDE = 13;
+const VERTEX_FLOAT_STRIDE = 13; // clip.xyzw + color.rgba + uv0.xy + uv1.xy + eye-space fog distance
 const VERTEX_BYTE_STRIDE = VERTEX_FLOAT_STRIDE * 4;
 const UNIFORM_BLOCK_SIZE = 144;
 

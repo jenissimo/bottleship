@@ -18,7 +18,8 @@ import { GL_MODELVIEW, GL_LESS, GL_ONE, GL_ZERO, GL_ALWAYS, GL_BACK, GL_CCW, GL_
 
 // ---- Draw command types ----
 
-/** Floats per vertex in the flat buffer: [x,y,z,w, r,g,b,a, nx,ny,nz, s0,t0,s1,t1] */
+/** Floats per vertex in the flat buffer: [x,y,z,w, r,g,b,a, nx,ny,nz, s0,t0,s1,t1]; after
+ *  transformFlatVerts with GL_FOG enabled, nx (VERT_FOG_DIST) holds the eye-space |z_e|. */
 export const VERT_FLOATS = 15;
 
 export const VERT_FOG_DIST = 8;
