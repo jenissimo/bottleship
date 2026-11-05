@@ -372,6 +372,37 @@ export class SyncObjectManager {
         }
     }
 
+    captureState(): { events: number[]; semaphores: number[]; mutexes: number[] } {
+        return { events: [...this.eventHandles], semaphores: [...this.semaphoreHandles], mutexes: [...this.mutexHandles] };
+    }
+
+    restoreState(state: { events: number[]; semaphores: number[]; mutexes: number[] }): void {
+        this.eventHandles = new Set(state.events);
+        this.semaphoreHandles = new Set(state.semaphores);
+        this.mutexHandles = new Set(state.mutexes);
+        this.eventAliasGroups = new WeakMap();
+        for (const h of state.events) {
+            const event = this.resourceProvider.getKernelObject(h) as KernelEventObject | null;
+            if (!event) continue;
+            const group = this.eventAliasGroups.get(event) ?? new Set<number>();
+            group.add(h);
+            this.eventAliasGroups.set(event, group);
+        }
+    }
+
+    syncFromMirrors(): void {
+        for (const h of this.eventHandles) {
+            const event = this.resourceProvider.getKernelObject(h) as KernelEventObject | null;
+            const live = hypercallDataManager.readEventMirrorState(h);
+            if (event && live) { event.signaled = live.signaled; event.pendingWake = live.pendingWake; }
+        }
+        for (const h of this.mutexHandles) {
+            const mutex = this.resourceProvider.getKernelObject(h) as KernelMutexObject | null;
+            const live = hypercallDataManager.readMutexMirrorState(h);
+            if (mutex && live) { mutex.ownerThreadId = live.owner; mutex.recursion = live.recursion; mutex.abandoned = live.abandoned; }
+        }
+    }
+
     reset(): void {
         for (const h of this.eventHandles) this.resourceProvider.unregisterKernelObject(h);
         for (const h of this.semaphoreHandles) this.resourceProvider.unregisterKernelObject(h);

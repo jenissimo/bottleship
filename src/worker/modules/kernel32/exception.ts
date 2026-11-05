@@ -125,6 +125,14 @@ const getPointerCookie = (): number => {
     return pointerCookie;
 };
 
+export function capturePointerCookie(): number {
+    return pointerCookie;
+}
+
+export function restorePointerCookie(cookie: number): void {
+    pointerCookie = cookie;
+}
+
 /** New process ⇒ fresh EncodePointer cookie (Process.reset reuses the Process object). */
 export function resetPointerCookie(): void {
     pointerCookie = 0;

@@ -484,6 +484,54 @@ function buildHeapWalkSnapshot(view: DataView): HeapBlock[] {
 /** Reset slab state on process cleanup. */
 let resetVirtualAllocationState = (): void => { virtualAllocRegions.clear(); decommittedPages.clear(); };
 
+export interface Kernel32MemoryState {
+    createdHeaps: number[];
+    nextCreatedHeapHandle: number;
+    heapCompatibility: number[][];
+    terminationOnCorruption: boolean;
+    slabRanges: Array<{ base: number; end: number }>;
+    totalSlabBytes: number;
+    nextSlabSize: number;
+    virtualAllocRegions: number[][];
+    decommittedPages: number[][];
+    freeVirtualPages: number[][];
+}
+
+export function captureKernel32Memory(): Kernel32MemoryState {
+    return {
+        createdHeaps: [...createdHeaps],
+        nextCreatedHeapHandle,
+        heapCompatibility: [...heapCompatibility],
+        terminationOnCorruption,
+        slabRanges: slabRanges.map(r => ({ ...r })),
+        totalSlabBytes,
+        nextSlabSize,
+        virtualAllocRegions: [...virtualAllocRegions],
+        decommittedPages: [...decommittedPages],
+        freeVirtualPages: [...freeVirtualPages],
+    };
+}
+
+export function restoreKernel32Memory(state: Kernel32MemoryState): void {
+    heapManagerOwnerProcess = System.getInstance().process;
+    virtualMemoryOwner = System.getInstance().process?.memory;
+    createdHeaps.clear();
+    for (const h of state.createdHeaps) createdHeaps.add(h);
+    nextCreatedHeapHandle = state.nextCreatedHeapHandle;
+    heapCompatibility.clear();
+    for (const [h, v] of state.heapCompatibility) heapCompatibility.set(h, v);
+    terminationOnCorruption = state.terminationOnCorruption;
+    heapWalkState = null;
+    slabRanges = state.slabRanges.map(r => ({ ...r }));
+    totalSlabBytes = state.totalSlabBytes;
+    nextSlabSize = state.nextSlabSize;
+    slabGrowLastAttempt = 0;
+    for (const [map, rows] of [[virtualAllocRegions, state.virtualAllocRegions], [decommittedPages, state.decommittedPages], [freeVirtualPages, state.freeVirtualPages]] as const) {
+        map.clear();
+        for (const [base, size] of rows) map.set(base, size);
+    }
+}
+
 export function resetHeapSlab(): void {
     slabRanges = [];
     totalSlabBytes = 0;

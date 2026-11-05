@@ -857,6 +857,27 @@ export class CallbackManager {
         return this.deferredCompletions.has(threadId >>> 0);
     }
 
+    captureState(): { nextCallbackId: number; nextFrameId: number; stubs: number[][] } {
+        if (this.pendingCallbacks.size > 0 || this.frameStackDepth > 0) throw new Error('callbacks: a guest callback is in flight');
+        const stubs: number[][] = [];
+        for (const st of this.stubsById.values()) stubs.push([st.address, st.callbackId, st.cleanup]);
+        return { nextCallbackId: this.nextCallbackId, nextFrameId: this.nextFrameId, stubs };
+    }
+
+    restoreState(state: { nextCallbackId: number; nextFrameId: number; stubs: number[][] }): void {
+        this.nextCallbackId = state.nextCallbackId;
+        this.nextFrameId = state.nextFrameId;
+        this.stubsByCleanup.clear();
+        this.stubsById.clear();
+        for (const [address, callbackId, cleanup] of state.stubs) {
+            const stub: CallbackReturnStub = { address, callbackId, cleanup, inUse: false };
+            this.stubsById.set(callbackId, stub);
+            const list = this.stubsByCleanup.get(cleanup) ?? [];
+            list.push(stub);
+            this.stubsByCleanup.set(cleanup, list);
+        }
+    }
+
     /** Guest callbacks invoked from JS whose completion has not run yet. */
     pendingCallbackCount(): number {
         return this.pendingCallbacks.size;

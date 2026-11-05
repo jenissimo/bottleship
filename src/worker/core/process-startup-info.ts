@@ -118,3 +118,17 @@ export function resetProcessStartupInfo(): void {
     state.showWindowPending = false;
     state.strings = null;
 }
+
+export interface StartupSessionState {
+    showWindowPending: boolean;
+    strings: { key: string; desktop: number; title: number } | null;
+}
+
+export function captureStartupSessionState(): StartupSessionState {
+    return { showWindowPending: state.showWindowPending, strings: state.strings ? { ...state.strings } : null };
+}
+
+export function restoreStartupSessionState(saved: StartupSessionState): void {
+    state.showWindowPending = saved.showWindowPending;
+    state.strings = saved.strings ? { ...saved.strings } : null;
+}

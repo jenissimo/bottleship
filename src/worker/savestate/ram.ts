@@ -24,6 +24,8 @@ export interface RamSnapshot {
 
 export class RamManifestError extends Error {}
 
+export interface RamPatch { address: number; bytes: readonly number[] }
+
 function isAllZero(bytes: Uint8Array): boolean {
     const words = new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength >>> 2);
     for (let i = 0; i < words.length; i++) if (words[i] !== 0) return false;
@@ -63,16 +65,29 @@ export function validateRamManifest(manifest: unknown, guestLength?: number): Ra
  * the memory held afterwards follows the delta. The guest must stay paused until this
  * resolves; writing the pending chunks (writeRamChunks) can run after it resumes.
  */
-export async function snapshotRam(mem: Uint8Array, known: ReadonlySet<string>): Promise<RamSnapshot> {
+export async function snapshotRam(mem: Uint8Array, known: ReadonlySet<string>, patches: readonly RamPatch[] = []): Promise<RamSnapshot> {
     const count = Math.ceil(mem.length / RAM_CHUNK_SIZE);
+    const patched = new Map<number, Array<[number, number]>>();
+    for (const { address, bytes } of patches) {
+        for (let k = 0; k < bytes.length; k++) {
+            const a = address + k;
+            if (a < 0 || a >= mem.length) throw new Error(`ram: patch at 0x${a.toString(16)} is outside guest memory`);
+            const i = Math.floor(a / RAM_CHUNK_SIZE);
+            let list = patched.get(i);
+            if (!list) patched.set(i, list = []);
+            list.push([a - i * RAM_CHUNK_SIZE, bytes[k]! & 0xff]);
+        }
+    }
     const manifest: RamManifest = { chunkSize: RAM_CHUNK_SIZE, length: mem.length, chunks: [] };
     const stats: RamCaptureStats = { chunks: count, knownZero: 0, scannedZero: 0, written: 0, reused: 0 };
     const pending = new Map<string, Uint8Array>();
     for (let i = 0; i < count; i++) {
         const base = i * RAM_CHUNK_SIZE;
         const size = Math.min(RAM_CHUNK_SIZE, mem.length - base);
-        if (isGuestRangeKnownZero(mem, base, size)) { stats.knownZero++; continue; }
+        const fix = patched.get(i);
+        if (!fix && isGuestRangeKnownZero(mem, base, size)) { stats.knownZero++; continue; }
         const bytes = mem.slice(base, base + size);
+        if (fix) for (const [off, b] of fix) bytes[off] = b;
         if (isAllZero(bytes)) { stats.scannedZero++; continue; }
         const hash = await sha256Hex(bytes);
         manifest.chunks.push([i, hash]);

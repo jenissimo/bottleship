@@ -43,6 +43,19 @@ interface BucketState {
                       // anything below it that a bump re-hands-out was previously written.
 }
 
+export interface MemoryManagerState {
+    allocs: Array<[number, number, RegionKind | null]>;
+    totalAllocated: number;
+    currentBytes: number;
+    peakBytes: number;
+    freeBlocks: Array<[RegionKind, number[][]]>;
+    largeFreeBlocks: Array<[RegionKind, number[][]]>;
+    bucketState: Array<[RegionKind, BucketState]>;
+    sysPoolArena: { next: number; limit: number } | null;
+    sysPoolFree: Array<[number, number[]]>;
+    systemPoolGeneration: number;
+}
+
 const BUCKET_KINDS: RegionKind[] = ['HEAP', 'HEAP_HIGH', 'SURFACE', 'THUNK_CODE', 'THUNK_DATA'];
 
 /** Both halves of the guest heap. HEAP sub-allocations are covered by the layout bucket and
@@ -134,6 +147,40 @@ export class MemoryManager {
     private sysPoolFree: Map<number, number[]> = new Map();
     /** Address-keyed COM pools must expire when this allocator rewinds in place. */
     systemPoolGeneration = 0;
+
+    captureState(): MemoryManagerState {
+        return {
+            allocs: this.allocs.entriesByInsertion().map(e => [e.addr, e.size, e.bucket ?? null]),
+            totalAllocated: this.totalAllocated,
+            currentBytes: this.currentBytes,
+            peakBytes: this.peakBytes,
+            freeBlocks: [...this.freeBlocks].map(([k, v]) => [k, v.map(b => [b.addr, b.size])]),
+            largeFreeBlocks: [...this.largeFreeBlocks].map(([k, v]) => [k, v.map(b => [b.addr, b.size])]),
+            bucketState: [...this.bucketState].map(([k, b]) => [k, { ...b }]),
+            sysPoolArena: this.sysPoolArena ? { ...this.sysPoolArena } : null,
+            sysPoolFree: [...this.sysPoolFree].map(([size, addrs]) => [size, [...addrs]]),
+            systemPoolGeneration: this.systemPoolGeneration,
+        };
+    }
+
+    restoreState(state: MemoryManagerState): void {
+        this.allocs.clear();
+        for (const [addr, size, bucket] of state.allocs) {
+            this.allocs.setSize(addr, size);
+            if (bucket !== null) this.allocs.setBucket(addr, bucket);
+        }
+        this.totalAllocated = state.totalAllocated;
+        this.currentBytes = state.currentBytes;
+        this.peakBytes = state.peakBytes;
+        const blocks = (list: Array<[RegionKind, number[][]]>) =>
+            new Map(list.map(([k, v]) => [k, v.map(([addr, size]) => ({ addr, size }))]));
+        this.freeBlocks = blocks(state.freeBlocks);
+        this.largeFreeBlocks = blocks(state.largeFreeBlocks);
+        this.bucketState = new Map(state.bucketState.map(([k, b]) => [k, { ...b }]));
+        this.sysPoolArena = state.sysPoolArena ? { ...state.sysPoolArena } : null;
+        this.sysPoolFree = new Map(state.sysPoolFree.map(([size, addrs]) => [size, [...addrs]]));
+        this.systemPoolGeneration = state.systemPoolGeneration;
+    }
 
     allocSystemBlock(size: number): number {
         const aligned = this.alignUp(size, 16);

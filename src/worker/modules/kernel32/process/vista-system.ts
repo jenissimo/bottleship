@@ -131,6 +131,32 @@ export function resetVistaSystemState(): void {
     werRuntimeExceptionModules.length = 0;
 }
 
+export interface VistaSystemState {
+    descriptions: Array<[number, string]>;
+    errorModes: Array<[number, number]>;
+    stackGuarantees: Array<[number, number]>;
+    mitigations: Array<[number, number]>;
+    depPermanent: number;
+    werModules: Array<{ dll: string; context: number }>;
+}
+
+export function captureVistaSystemState(): VistaSystemState {
+    return {
+        descriptions: [...threadDescriptions], errorModes: [...threadErrorModes], stackGuarantees: [...threadStackGuarantees],
+        mitigations: [...mitigationFlags], depPermanent, werModules: werRuntimeExceptionModules.map(m => ({ ...m })),
+    };
+}
+
+export function restoreVistaSystemState(state: VistaSystemState): void {
+    resetVistaSystemState();
+    for (const [k, v] of state.descriptions) threadDescriptions.set(k, v);
+    for (const [k, v] of state.errorModes) threadErrorModes.set(k, v);
+    for (const [k, v] of state.stackGuarantees) threadStackGuarantees.set(k, v);
+    for (const [k, v] of state.mitigations) mitigationFlags.set(k, v);
+    depPermanent = state.depPermanent;
+    for (const m of state.werModules) werRuntimeExceptionModules.push({ ...m });
+}
+
 // ─── SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX (x86 layout) ──────────────────────
 
 const RELATION_PROCESSOR_CORE = 0;

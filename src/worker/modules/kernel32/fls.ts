@@ -44,6 +44,21 @@ export function resetFlsState(): void {
     hypercallDataManager.clearFlsSlots();
 }
 
+export function captureFls(): { allocated: number[]; values: Array<[number, Array<[number, number]>]>; nextSlot: number } {
+    return { allocated: [...allocated], values: [...valuesByThread].map(([tid, v]) => [tid, [...v]]), nextSlot };
+}
+
+export function restoreFls(state: { allocated: number[]; values: Array<[number, Array<[number, number]>]>; nextSlot: number }): void {
+    const process = System.getInstance().process;
+    flsOwnerProcess = process;
+    flsOwnerResetGeneration = process?.resetGeneration ?? 0;
+    allocated.clear();
+    for (const slot of state.allocated) allocated.add(slot);
+    valuesByThread.clear();
+    for (const [tid, v] of state.values) valuesByThread.set(tid, new Map(v));
+    nextSlot = state.nextSlot;
+}
+
 function currentTid(): number {
     return System.getInstance().scheduler?.getCurrentThreadId?.() ?? 0;
 }

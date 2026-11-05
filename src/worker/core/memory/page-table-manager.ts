@@ -450,6 +450,10 @@ export class PageTableManager {
         return true;
     }
 
+    hasExternalDataPages(): boolean {
+        return this.externalDataPages.size > 0;
+    }
+
     isPagingEnabled(): boolean {
         return this.pagingEnabled;
     }

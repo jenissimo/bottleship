@@ -308,6 +308,17 @@ export class TebManager {
         return tebAddress;
     }
 
+    captureState(): { peb: number; params: number; tebs: number[][]; tls: number[][] } {
+        return { peb: this.pebAddress, params: this.processParametersAddress, tebs: [...this.tebMap], tls: [...this.tlsArrayMap] };
+    }
+
+    restoreState(state: { peb: number; params: number; tebs: number[][]; tls: number[][] }): void {
+        this.pebAddress = state.peb;
+        this.processParametersAddress = state.params;
+        this.tebMap = new Map(state.tebs.map(([t, a]) => [t, a]));
+        this.tlsArrayMap = new Map(state.tls.map(([t, a]) => [t, a]));
+    }
+
     /**
      * Get TEB address for a thread.
      */

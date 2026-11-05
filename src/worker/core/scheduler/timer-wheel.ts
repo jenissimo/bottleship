@@ -244,6 +244,26 @@ export class TimerWheel {
         return this.heap.length;
     }
 
+    captureState(): { nextId: number; entries: number[][] } {
+        if (this.activeCallbacks.size > 0) throw new Error('timer wheel: captured while a timer callback runs');
+        const entries: number[][] = [];
+        for (const e of this.entries.values()) {
+            if (!e.cancelled) entries.push([e.id, e.fireAt, e.intervalMs, e.kind, e.owner, e.arg]);
+        }
+        entries.sort((a, b) => a[0] - b[0]);
+        return { nextId: this.nextId, entries };
+    }
+
+    restoreState(state: { nextId: number; entries: number[][] }): void {
+        this.reset();
+        for (const [id, fireAt, intervalMs, kind, owner, arg] of state.entries) {
+            const entry: TimerEntry = { id, fireAt, intervalMs, kind: kind as TimerKind, owner, arg, cancelled: false, heapIndex: -1 };
+            this.entries.set(id, entry);
+            this._heapPush(entry);
+        }
+        this.nextId = state.nextId;
+    }
+
     reset(): void {
         for (const entry of this.entries.values()) {
             entry.cancelled = true;

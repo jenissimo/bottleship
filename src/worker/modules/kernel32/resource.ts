@@ -67,6 +67,16 @@ export function resetResourceCache(): void {
     nextResourceHandle = 0x80000001;
 }
 
+export function captureResourceHandles(): { entries: Array<[number, ResourceEntry]>; next: number } {
+    return { entries: [...resourceCache].map(([h, e]) => [h, { ...e }]), next: nextResourceHandle };
+}
+
+export function restoreResourceHandles(state: { entries: Array<[number, ResourceEntry]>; next: number }): void {
+    resourceCache.clear();
+    for (const [h, e] of state.entries) resourceCache.set(h, { ...e });
+    nextResourceHandle = state.next;
+}
+
 /**
  * Parse PE resource directory to find a specific resource
  */
