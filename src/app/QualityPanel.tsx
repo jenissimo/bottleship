@@ -1,6 +1,6 @@
 import React from "react";
 import type { QualityConfig } from "../worker/core/quality-config";
-import { resolveInternalScaleFactor } from "../worker/backends/webgpu/shared/internal-resolution";
+import { resolveEffectiveInternalScale, type InternalScaleSupport } from "../worker/backends/webgpu/shared/internal-resolution";
 import s from "./QualityPanel.module.css";
 
 type QualityPanelProps = {
@@ -20,6 +20,9 @@ type QualityPanelProps = {
   /** The canvas's current physical-pixel backing size (App.tsx's renderSize: clientWidth/
    *  Height × devicePixelRatio) — what "Auto" fits internal resolution to. */
   renderSize: { width: number; height: number };
+  /** What the active backend declared about `internalScale` (via the set_quality ack). Its
+   *  absence means "no backend has registered yet", which reads as before this was carried. */
+  internalScaleSupport?: InternalScaleSupport;
 };
 
 const ANISO_OPTIONS = [1, 2, 4, 8, 16] as const;
@@ -69,15 +72,21 @@ function SliderRow(props: {
   );
 }
 
-export default function QualityPanel({ quality, onChange, unsupported, overridden, guestResolution, renderSize }: QualityPanelProps): React.ReactElement {
+export default function QualityPanel({ quality, onChange, unsupported, overridden, guestResolution, renderSize, internalScaleSupport }: QualityPanelProps): React.ReactElement {
   const guestW = Math.max(1, Math.round(guestResolution.width));
   const guestH = Math.max(1, Math.round(guestResolution.height));
-  const factor = resolveInternalScaleFactor(quality.internalScale, guestW, guestH, renderSize.width, renderSize.height);
+  // What this backend will actually render at — not what the setting would mean if it were
+  // honoured. A backend that never reads the setting renders the guest resolution, and
+  // D3D9's Auto is Native; both used to be labelled with a multiplier that never happened.
+  const effective = resolveEffectiveInternalScale(
+    quality.internalScale, guestW, guestH, renderSize.width, renderSize.height,
+    internalScaleSupport ?? { implemented: true, autoIsNative: false },
+  );
+  const factor = effective.factor;
   const targetW = Math.round(guestW * factor);
   const targetH = Math.round(guestH * factor);
-  const isSupported = !unsupported?.has("internalScale");
-  const internalResolutionLabel = !isSupported
-    ? `not applied on this backend — game still renders at ${guestW}×${guestH}`
+  const internalResolutionLabel = !effective.applied
+    ? `Native — this renderer doesn't support internal resolution yet, so the game still renders at ${guestW}×${guestH}`
     : `currently ${targetW}×${targetH} (${factor.toFixed(2)}× from ${guestW}×${guestH})`;
 
   return (
