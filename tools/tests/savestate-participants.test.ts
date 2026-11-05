@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { encodeValue, type SaveValue } from "../../src/worker/savestate/value-codec";
 import { CPU_FIELDS, captureCpu, restoreCpu, type V86Cpu } from "../../src/worker/savestate/participants/cpu";
 import { TimerWheel } from "../../src/worker/core/scheduler/timer-wheel";
@@ -42,6 +44,9 @@ import { createInputExports } from "../../src/worker/modules/user32/input";
 import { createSystemExports } from "../../src/worker/modules/user32/system";
 import { createPaintingExports } from "../../src/worker/modules/gdi32/painting";
 import { registerDDrawParticipant } from "../../src/worker/modules/ddraw/savestate";
+import { WinMM } from "../../src/worker/modules/winmm";
+import { DSound } from "../../src/worker/modules/dsound/dsound";
+import { DInput } from "../../src/worker/modules/dinput/dinput";
 import { clearTimerHandler } from "../../src/worker/core/scheduler/timer-wheel";
 import { exports as vistaRuntimeExports } from "../../src/worker/modules/kernel32/vista-runtime";
 import { exports as processExports } from "../../src/worker/modules/kernel32/process/process";
@@ -253,9 +258,23 @@ function registerAllParticipants(): void {
 }
 
 describe("participant ids", () => {
-    test("the static id list the census reads is exactly what registers", () => {
+    test("every listed id is registered somewhere, and everything registered is listed", () => {
         registerAllParticipants();
-        expect(savestateParticipants.all().map(p => p.id).sort()).toEqual([...PARTICIPANT_IDS].sort());
+        const listed = new Set<string>(PARTICIPANT_IDS);
+        for (const p of savestateParticipants.all()) expect(listed.has(p.id)).toBe(true);
+        const sources: string[] = [];
+        const walk = (d: string) => {
+            for (const n of readdirSync(d)) {
+                const f = join(d, n);
+                if (statSync(f).isDirectory()) walk(f); else if (n.endsWith(".ts")) sources.push(readFileSync(f, "utf8"));
+            }
+        };
+        walk(join(import.meta.dir, "..", "..", "src", "worker"));
+        const registered = new Set<string>();
+        for (const src of sources) {
+            for (const m of src.matchAll(/savestateParticipants\.add\(\{\s*id: '([^']+)'/g)) registered.add(m[1]!);
+        }
+        expect([...registered].sort()).toEqual([...listed].sort());
     });
 });
 
@@ -317,7 +336,10 @@ describe("participant schemas", () => {
 describe("schema pin and mutation", () => {
     test("participant versions and schema hashes are pinned; a change here needs a version bump", () => {
         registerAllParticipants();
-        expect(savestateParticipants.schemas()).toEqual({
+        const undo = [new WinMM(), new DSound(), new DInput()].map(m => m.registerSavestate());
+        const schemas = savestateParticipants.schemas();
+        for (const u of undo) u();
+        expect(schemas).toEqual({
             "kernel32": { version: 2, schemaHash: "6bbba5ed115386df" },
             "time": { version: 1, schemaHash: "728d1b2522148901" },
             "address-space": { version: 1, schemaHash: "a1c4ce059654c36f" },
@@ -340,6 +362,9 @@ describe("schema pin and mutation", () => {
             "gdi32": { version: 1, schemaHash: "f5495edbe7c4ae9d" },
             "gdi32-palettes": { version: 1, schemaHash: "fdca280b054649f9" },
             "ddraw": { version: 1, schemaHash: "844462508bc4ae1e" },
+            "dsound": { version: 1, schemaHash: "7f9b27888eeb9718" },
+            "dinput": { version: 1, schemaHash: "d7eaf2cafce58a42" },
+            "winmm": { version: 1, schemaHash: "c409a6582f9b8004" },
         });
     });
 

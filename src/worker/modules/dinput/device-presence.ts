@@ -14,6 +14,7 @@ export interface LosableDevice {
     inputLost: boolean;
 }
 
+// @participant(dinput)
 const devices = new Set<LosableDevice>();
 
 export function trackLosableDevice(device: LosableDevice): void {

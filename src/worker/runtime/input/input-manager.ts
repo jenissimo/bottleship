@@ -58,6 +58,19 @@ export interface DInputBufferedEvent {
     dwSequence: number;  // sequence number
 }
 
+export interface DInputBufferLane {
+    size: number;
+    seq: number;
+    events: DInputBufferedEvent[];
+    overflowed: boolean;
+}
+
+export interface DInputBufferState {
+    mouse: DInputBufferLane;
+    keyboard: DInputBufferLane;
+    gamepad: DInputBufferLane;
+}
+
 /** @deprecated use DInputBufferedEvent */
 export type DInputMouseEvent = DInputBufferedEvent;
 
@@ -1522,6 +1535,34 @@ export class InputManager {
             produced: this.dinputMouseSeq,
             stateReads: this.guestRelativeMouseReads,
         };
+    }
+
+    captureDInputBuffers(): DInputBufferState {
+        const lane = (size: number, seq: number, events: DInputBufferedEvent[], overflowed: boolean): DInputBufferLane =>
+            ({ size, seq, events: events.map(e => ({ ...e })), overflowed });
+        return {
+            mouse: lane(this.dinputMouseBufferSize, this.dinputMouseSeq, this.dinputMouseEvents, this.dinputMouseOverflowed),
+            keyboard: lane(this.dinputKeyboardBufferSize, this.dinputKeyboardSeq, this.dinputKeyboardEvents, this.dinputKeyboardOverflowed),
+            gamepad: lane(this.dinputGamepadBufferSize, this.dinputGamepadSeq, this.dinputGamepadEvents, this.dinputGamepadOverflowed),
+        };
+    }
+
+    restoreDInputBuffers(s: DInputBufferState): void {
+        this.dinputMouseBufferSize = s.mouse.size;
+        this.dinputMouseSeq = s.mouse.seq;
+        this.dinputMouseEvents = s.mouse.events.map(e => ({ ...e }));
+        this.dinputMouseOverflowed = s.mouse.overflowed;
+        this.dinputKeyboardBufferSize = s.keyboard.size;
+        this.dinputKeyboardSeq = s.keyboard.seq;
+        this.dinputKeyboardEvents = s.keyboard.events.map(e => ({ ...e }));
+        this.dinputKeyboardOverflowed = s.keyboard.overflowed;
+        this.dinputGamepadBufferSize = s.gamepad.size;
+        this.dinputGamepadSeq = s.gamepad.seq;
+        this.dinputGamepadEvents = s.gamepad.events.map(e => ({ ...e }));
+        this.dinputGamepadOverflowed = s.gamepad.overflowed;
+        this.baselineDInputMouse();
+        this.baselineDInputKeyboard();
+        this.baselineDInputGamepad();
     }
 
     /** Set DirectInput mouse buffer size (DIPROP_BUFFERSIZE). 0 = unbuffered. */

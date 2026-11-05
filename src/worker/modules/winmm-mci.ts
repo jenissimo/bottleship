@@ -127,6 +127,7 @@ const MCI_MODE_PAUSE = 529;
 const MM_MCINOTIFY = 0x03B9;
 
 /** Simple (non-compound) MCI device types openable by name alone. */
+// @transient(constant set)
 const MCI_SIMPLE_DEVICE_TYPES = new Set([
     "cdaudio", "videodisc", "vcr", "dat", "scanner", "sequencer", "other",
 ]);
@@ -304,6 +305,10 @@ export class WinmmMci {
         this.writeAnsiString = host.writeAnsiString;
         this.readWideString = host.readWideString;
         this.writeWideString = host.writeWideString;
+    }
+
+    openDeviceCount(): number {
+        return this.mciDevices.size;
     }
 
     private tokenizeMciCommand(command: string): string[] {

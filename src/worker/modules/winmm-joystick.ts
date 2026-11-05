@@ -71,7 +71,7 @@ const JOYCAPS_HASPOV = 0x0010;
 const JOYCAPS_POV4DIR = 0x0020;
 const JOY_POVCENTERED = 0xFFFF;
 
-interface JoyCapture {
+export interface JoyCapture {
     hwnd: number;
     /** Only post a message when the axis moved past the threshold. */
     changedOnly: boolean;
@@ -84,7 +84,9 @@ interface JoyCapture {
     primed: boolean;
 }
 
+// @participant(winmm)
 const thresholds: number[] = new Array(JOY_PORTS).fill(DEFAULT_THRESHOLD);
+// @participant(winmm)
 const captures: Array<JoyCapture | null> = new Array(JOY_PORTS).fill(null);
 
 /** Signed host axis (-32768..32767) → the 0..65535 range JOYCAPS declares. */
@@ -374,5 +376,19 @@ export function resetWinmmJoystick(): void {
     for (let i = 0; i < JOY_PORTS; i++) {
         stopCapture(i);
         thresholds[i] = DEFAULT_THRESHOLD;
+    }
+}
+
+export interface JoystickState { thresholds: number[]; captures: Array<JoyCapture | null> }
+
+export function captureWinmmJoystick(): JoystickState {
+    return { thresholds: [...thresholds], captures: captures.map(c => (c ? { ...c } : null)) };
+}
+
+export function restoreWinmmJoystick(s: JoystickState): void {
+    for (let i = 0; i < JOY_PORTS; i++) {
+        thresholds[i] = s.thresholds[i] ?? DEFAULT_THRESHOLD;
+        const c = s.captures[i];
+        captures[i] = c ? { ...c } : null;
     }
 }

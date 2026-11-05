@@ -16,6 +16,7 @@ export const DIERR_BETADIRECTINPUTVERSION = 0x80070481;
 export const DIRECTINPUT_VERSION_8 = 0x0800;
 
 /** The released DirectInput versions a DX3–DX7 interface accepts. */
+// @transient(constant set)
 const RELEASED_LEGACY_VERSIONS = new Set([0x0300, 0x0500, 0x050a, 0x05b2, 0x0602, 0x061a, 0x0700]);
 
 export function directInputInitialize(hinst: number, version: number, isDirectInput8: boolean): number {

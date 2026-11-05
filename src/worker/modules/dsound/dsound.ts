@@ -9,6 +9,9 @@ import { allocateComObject, freeComObject } from "../../core/com/com-memory";
 import { TimerKind } from "../../core/scheduler/types";
 import { setTimerHandler } from "../../core/scheduler/timer-wheel";
 import { TimeService } from "../../runtime/time";
+import { pickDefined, savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../../savestate/participant";
+import { CaptureRefusal } from "../../savestate/object-codecs";
+import type { SaveValue } from "../../savestate/value-codec";
 import {
     createAudioRingBuffer,
     writeRingData,
@@ -325,6 +328,55 @@ type SoundBuffer = {
     deferredDs3d: Ds3dState | null;
 };
 
+export const SOUND_BUFFER_FIELDS = {
+    id: 'save', bytes: 'save', format: 'save', flags: 'save', ptr: 'save', currentPosition: 'save', volume: 'save',
+    volumeDb: 'save', pan: 'save', frequency: 'save', playbackRate: 'save', isPlaying: 'save', isLooping: 'save',
+    playAnchorVirtualMs: 'derive', playAnchorByte: 'derive', lockOffset: 'transient', lockFirstSize: 'transient',
+    lockSecondSize: 'transient', lockFlags: 'transient', lockRequestedBytes: 'transient', lastUnlockCursor: 'save',
+    cumulativeWritten: 'save', streamed: 'save', premixMs: 'host', premixStepMs: 'host', premixAdvancedAtMs: 'host',
+    reportedLeadBytes: 'host', lastReportedPlayCursor: 'host', smoothRawCursor: 'host', smoothRawAtMs: 'host',
+    smoothFromCursor: 'host', stepLastQueryAt: 'host', stepLastCursor: 'host', stepTypicalGapMs: 'host', stepGaps: 'host',
+    stepGapCount: 'host', stepLockSizes: 'host', stepLockCount: 'host', ringBytes: 'save', trailRaw: 'host', sab: 'host',
+    registered: 'host', notifications: 'save', lastNotifyCursor: 'save', bufferRefCount: 'save', bufferLost: 'save',
+    has3D: 'save', ds3d: 'save', deferredDs3d: 'save',
+} as const satisfies Record<keyof SoundBuffer, FieldPolicy>;
+
+type SavedSoundBuffer = ReturnType<typeof pickSoundBuffer>;
+
+function pickSoundBuffer(b: SoundBuffer) {
+    return pickDefined(b, SOUND_BUFFER_FIELDS);
+}
+
+export interface DSoundState {
+    objects: Array<{ ptr: number; type: string; refCount: number; isDs8: boolean; duplex: { ds: number; dsc: number } | null; buffer: SavedSoundBuffer | null; ring: boolean }>;
+    nextBufferId: number;
+    notifyTimerId: number | null;
+    primaryBufferPtr: number;
+    speakerConfig: number;
+    listener: Record<string, number>;
+    deferredListener: Record<string, number> | null;
+}
+
+export const DSOUND_FIELDS = {
+    name: 'transient', exports: 'host', process: 'host', objects: 'save', vtables: 'derive', nextBufferId: 'save',
+    notifyTimerId: 'save', primaryBufferPtr: 'save', speakerConfig: 'save', dbgAudioCalls: 'transient', bufferLifeRing: 'transient',
+    dbgLockTrace: 'transient', listenerState: 'save', listenerSab: 'host', deferredListenerState: 'save', stepGapScratch: 'transient',
+} as const satisfies Record<string, FieldPolicy>;
+
+export const DSOUND_SCHEMA = {
+    module: DSOUND_FIELDS,
+    object: stateKeys<DSoundState['objects'][number]>({ ptr: true, type: true, refCount: true, isDs8: true, duplex: true, buffer: true, ring: true }),
+    listener: stateKeys<DSound['listenerState']>({
+        posX: true, posY: true, posZ: true, velX: true, velY: true, velZ: true, frontX: true, frontY: true, frontZ: true,
+        topX: true, topY: true, topZ: true, distanceFactor: true, rolloffFactor: true, dopplerFactor: true,
+    }),
+    state: stateKeys<DSoundState>({
+        objects: true, nextBufferId: true, notifyTimerId: true, primaryBufferPtr: true, speakerConfig: true,
+        listener: true, deferredListener: true,
+    }),
+    buffer: SOUND_BUFFER_FIELDS,
+} as const;
+
 type CaptureBuffer = {
     bytes: number;
     format: SoundFormat;
@@ -415,9 +467,24 @@ export class DSound implements IModule {
     private listenerSab: SharedArrayBuffer | null = null;
     private deferredListenerState: typeof DSound.prototype.listenerState | null = null;
 
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'dsound', version: 1, order: 61, covers: ['dsound'], schema: DSOUND_SCHEMA as unknown as SaveValue,
+            capture: () => {
+                try {
+                    return this.captureSavestate() as unknown as SaveValue;
+                } catch (e) {
+                    throw e instanceof CaptureRefusal ? e : new CaptureRefusal(e instanceof Error ? e.message : String(e));
+                }
+            },
+            restore: (saved) => this.restoreSavestate(saved as unknown as DSoundState),
+        });
+    }
+
     initialize(process: Process): void {
         this.process = process;
         this.vtables = createVTablesFromDescriptor(this.process, dsoundModule);
+        if (savestatesEnabled()) this.registerSavestate();
 
         // Log vtable addresses for debugging
         for (const [name, info] of Object.entries(this.vtables)) {
@@ -2710,6 +2777,91 @@ export class DSound implements IModule {
     private holdsAtFrontier(buffer: SoundBuffer): boolean {
         return !!buffer.streamed && buffer.isLooping && this.ringSize(buffer) > buffer.bytes
             && !(globalThis as { __noFrontierHold?: boolean }).__noFrontierHold;
+    }
+
+    captureSavestate(): DSoundState {
+        const objects: DSoundState['objects'] = [];
+        for (const [ptr, o] of this.objects) {
+            if (o.capture) throw new Error('dsound: capture buffers are not part of a v1 savestate');
+            const b = o.buffer;
+            if (b && b.lockFirstSize !== undefined) throw new Error('dsound: a sound buffer is locked');
+            let buffer: SavedSoundBuffer | null = null;
+            if (b) {
+                const picked = pickSoundBuffer(b);
+                const finished = !!b.sab && b.isPlaying && getCtrl(b.sab, CTRL_STATE) === STATE_STOPPED;
+                const playing = b.isPlaying && !finished;
+                buffer = {
+                    ...picked,
+                    ...(finished ? { isPlaying: false, isLooping: false } : {}),
+                    format: { ...b.format },
+                    currentPosition: b.sab && playing ? getCtrl(b.sab, CTRL_PLAY_CURSOR) % Math.max(1, b.bytes) : b.currentPosition,
+                    ds3d: { ...b.ds3d },
+                    deferredDs3d: b.deferredDs3d ? { ...b.deferredDs3d } : null,
+                    ...(b.notifications ? { notifications: b.notifications.map(n => ({ ...n })) } : {}),
+                };
+            }
+            objects.push({ ptr, type: o.type, refCount: o.refCount, isDs8: o.isDs8 ?? false, duplex: o.duplex ? { ...o.duplex } : null, buffer, ring: !!b?.sab });
+        }
+        return {
+            objects, nextBufferId: this.nextBufferId, notifyTimerId: this.notifyTimerId, primaryBufferPtr: this.primaryBufferPtr,
+            speakerConfig: this.speakerConfig, listener: { ...this.listenerState },
+            deferredListener: this.deferredListenerState ? { ...this.deferredListenerState } : null,
+        };
+    }
+
+    restoreSavestate(s: DSoundState): void {
+        this.objects.clear();
+        const mem = this.getMemory();
+        for (const o of s.objects) {
+            let buffer: SoundBuffer | undefined;
+            if (o.buffer) {
+                const b = o.buffer;
+                const ringBytes = b.ringBytes ?? b.bytes;
+                buffer = {
+                    ...(b as Partial<SoundBuffer>),
+                    format: { ...b.format }, ds3d: { ...b.ds3d }, deferredDs3d: b.deferredDs3d ? { ...b.deferredDs3d } : null,
+                    notifications: b.notifications?.map(n => ({ ...n })),
+                    isPlaying: false, sab: null, registered: false,
+                } as SoundBuffer;
+                if (o.ring) {
+                    const sab = createAudioRingBuffer(ringBytes, {
+                        channels: b.format.channels, sampleRate: b.format.sampleRate, bitsPerSample: b.format.bitsPerSample,
+                    }, true);
+                    setCtrl(sab, CTRL_FREQUENCY, b.frequency);
+                    const src = mem.subarray(b.ptr, b.ptr + b.bytes);
+                    // Every lap of the ring is refilled from the buffer as it is now. For a static or
+                    // looping buffer that is exact. For a streamed buffer the laps behind the cursor
+                    // get the current lap's data instead of what was played, so the first lap after
+                    // a load can glitch briefly until the game writes ahead again.
+                    for (let at = 0; at < ringBytes; at += b.bytes) writeRingData(sab, at, src, Math.min(b.bytes, ringBytes - at));
+                    buffer.sab = sab;
+                    if (b.has3D) this.flushBuffer3dToSab(buffer);
+                    self.postMessage({ type: "audio_register", payload: { id: buffer.id, sab } });
+                    buffer.registered = true;
+                    if (b.isPlaying) {
+                        buffer.isPlaying = true;
+                        buffer.playAnchorVirtualMs = TimeService.getInstance().nowMs();
+                        buffer.playAnchorByte = b.currentPosition;
+                        setCtrl(sab, CTRL_STOP_REQUESTED, 0);
+                        setCtrl(sab, CTRL_PLAY_CURSOR, b.currentPosition);
+                        setCtrl(sab, CTRL_LOOP_MODE, b.isLooping ? -1 : 1);
+                        setCtrl(sab, CTRL_VOLUME, b.volumeDb);
+                        setCtrl(sab, CTRL_PAN, b.pan);
+                        setCtrl(sab, CTRL_DATA_LENGTH, b.isLooping ? this.ringSize(buffer) : b.bytes);
+                        setCtrl(sab, CTRL_STATE, STATE_PLAYING);
+                        this.syncFrontierHold(buffer);
+                    }
+                }
+            }
+            this.objects.set(o.ptr, { type: o.type as DSoundObjectType, refCount: o.refCount, buffer, isDs8: o.isDs8 || undefined, duplex: o.duplex ?? undefined });
+        }
+        this.nextBufferId = s.nextBufferId;
+        this.notifyTimerId = s.notifyTimerId;
+        this.primaryBufferPtr = s.primaryBufferPtr;
+        this.speakerConfig = s.speakerConfig;
+        Object.assign(this.listenerState, s.listener);
+        this.deferredListenerState = s.deferredListener ? { ...this.listenerState, ...s.deferredListener } : null;
+        this.flushListenerToSab();
     }
 
     /** Switch the worklet's hold on or off to match holdsAtFrontier. Switching on marks the
