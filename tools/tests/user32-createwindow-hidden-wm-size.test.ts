@@ -174,3 +174,16 @@ test('WM_SIZE and WM_MOVE follow a WM_SHOWWINDOW that suspended into the guest, 
     invoked[before + 1]!.complete?.(0);
     expect(invoked.slice(before).map((c) => c.args[1])).toEqual([WM_SHOWWINDOW, WM_SIZE, WM_MOVE]);
 });
+
+test('ShowWindow from inside WM_CREATE delivers the size once and CreateWindowEx adds none', () => {
+    const r = createWindowExports()['CreateWindowExA']!({ esp: ESP } as never, mem,
+        [0, CLASS_NAME, 0, WS_OVERLAPPEDWINDOW, 10, 20, 400, 300, 0, 0, 0x400000, 0] as never) as { value: number } | number;
+    const hwnd = typeof r === 'number' ? r : r.value;
+    created.push(hwnd);
+    invoked[0]!.complete?.(0);
+    expect(invoked.map((c) => c.args[1])).toEqual([WM_NCCREATE, WM_CREATE]);
+    const fromCreate = show(hwnd, SW_SHOWNORMAL);
+    expect(fromCreate).toEqual([WM_SHOWWINDOW, WM_SIZE, WM_MOVE]);
+    drain();
+    expect(invoked.filter((c) => c.args[1] === WM_SIZE).length).toBe(1);
+});
