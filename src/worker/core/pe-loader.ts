@@ -1431,6 +1431,13 @@ export class PELoader {
                 warn: (m) => Logger.warn(LogCategory.SYSTEM, m),
             });
 
+            if (loadDiagnostics.noteImportBinding(dllNameRaw, isThunked)) {
+                Logger.warn(LogCategory.SYSTEM,
+                    `[PE] ${dllNameRaw} is now bound ${isThunked ? 'to the HLE module' : 'to the shipped DLL'} here and ` +
+                    `${isThunked ? 'to the shipped DLL' : 'to the HLE module'} for an earlier image: two copies of one ` +
+                    `library in one process (a CRT's heap, FILE table and locale are not shared between them)`);
+            }
+
             // Log ALL DLLs and their functions
             const importedNames = functions.map(f => this.resolveImportName(dllName, f));
             const thunkedStatus = isThunked ? "THUNKED" : "NOT THUNKED";

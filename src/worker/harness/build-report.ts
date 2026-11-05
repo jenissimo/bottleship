@@ -274,6 +274,9 @@ export interface HarnessReport {
     unknownArgCounts: Array<{ api: string; aliasedFrom: string | null; count: number }>;
     /** Failed runtime DLL loads, even when the guest catches the error and exits cleanly. */
     dllLoadFailures: ReturnType<typeof loadDiagnostics.listDllFailures>;
+    /** DLL names bound to our HLE module for some images and to the shipped file for others:
+     *  two copies of one library in one process (for a CRT: two heaps, two FILE tables). */
+    mixedDllBindings: string[];
 }
 
 function readStackWords(esp: number, count = 4): string[] {
@@ -463,5 +466,6 @@ export function buildHarnessReport(esp?: number): HarnessReport {
             count: u.count,
         })),
         dllLoadFailures: loadDiagnostics.listDllFailures(),
+        mixedDllBindings: loadDiagnostics.listMixedBindings(),
     };
 }
