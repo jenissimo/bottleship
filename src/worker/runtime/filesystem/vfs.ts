@@ -355,6 +355,10 @@ export class VirtualFileSystem {
     /** The disc's volume label, as GetVolumeInformation reports it for D:\. See manifest emulator.cdLabel. */
     private cdVolumeLabel: string | null = null;
 
+    async describeOverlay(): Promise<string[]> {
+        return this.overlay ? this.overlay.describeEntries() : [];
+    }
+
     /** Overlay (game save tree) writes not yet durable in OPFS. */
     pendingOverlayWrites(): number {
         return this.overlay?.pendingWriteCount() ?? 0;
@@ -2499,6 +2503,20 @@ class OpfsOverlay {
      */
     private policy: PathPolicy = DEFAULT_PATH_POLICY;
     private ephemeralFiles = new Map<string, Uint8Array>();
+
+    async describeEntries(): Promise<string[]> {
+        const rows: string[] = [];
+        for (const key of [...this.entries.keys()].sort()) {
+            const e = this.entries.get(key)!;
+            let modified = 0;
+            if (e.kind === 'file') {
+                try { modified = (await (await this.getFileHandle(e.path, false)).getFile()).lastModified; } catch { modified = -1; }
+            }
+            rows.push(`${key}\t${e.kind}\t${e.size}\t${modified}`);
+        }
+        for (const key of [...this.shadowed].sort()) rows.push(`${key}\tshadowed`);
+        return rows;
+    }
 
     /** Overlay paths with writes buffered or still being committed to OPFS. */
     pendingWriteCount(): number {

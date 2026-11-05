@@ -2,6 +2,8 @@ import { parseIoProfile, profileChunkOrder, type WgbIoPolicy } from "@bottleship
 import { V86 } from "v86";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { adoptFreshGuestMemory } from "./core/memory/guest-page-dirty";
+import { noteBootError, noteBootIdentity, restorePendingAtEntry, savestatesEnabled } from "./savestate/host";
+import { registerCoreParticipants } from "./savestate/core-participants";
 import { Process } from "./core/process";
 import { System, type GuestImagePatch } from "./core/system";
 import { applyHostJitMode, isHostJitMode, type HostJitMode } from "../utils/host-jit-policy";
@@ -2228,6 +2230,34 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     // put the launch overlay back over that dialog and read as a hang.
     if (await loadPeData(bundle.entrypointBytes, true) === "failed") return;
     bootMark("pe-loaded");
+    if (savestatesEnabled()) {
+      pauseEmulator();
+      let savestateStep = "participants";
+      try {
+        registerCoreParticipants();
+        savestateStep = "layout";
+        const layout = {
+          thunks: system.process?.thunkGenerator.getAllStubs().map((st: { functionId: number; dllName: string; functionName: string }) => [st.functionId, `${st.dllName}:${st.functionName}`]) ?? [],
+          modules: [...(system.process?.modules.keys() ?? [])],
+        };
+        let entries = 0;
+        try { entries = bundle.archive.listEntries().length; } catch { entries = -1; }
+        savestateStep = "identity";
+        await noteBootIdentity({
+          gameId, manifest: bundle.manifest, bundleSize: entries,
+          config: EmulatorConfig.getInstance().snapshotForChild(), layout,
+        });
+        savestateStep = "restore";
+        const restored = await restorePendingAtEntry();
+        if (restored) (globalThis as Record<string, unknown>).__bsSavestateRestored = restored;
+      } catch (e) {
+        Logger.error(LogCategory.SYSTEM, `[SAVESTATE] ${savestateStep} at entry failed: ${e instanceof Error ? e.stack : e}`);
+        noteBootError(`${savestateStep}: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`.slice(0, 600));
+        (globalThis as Record<string, unknown>).__bsSavestateRestored = { error: String(e) };
+      } finally {
+        resumeEmulator();
+      }
+    }
 
     // AOT units must be transaction-committed BEFORE the JIT claims their pages
     // refuses a page the live JIT already owns (rc 2), and that is the whole ordering problem
@@ -3336,6 +3366,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         system.executableArgs = boot.commandLine;
         system.executableCommandLine = boot.rawCommandLine ?? null;
         if (boot.environment) process.environment = new Map(boot.environment);
+        noteBootError('this game runs as a child process, which a savestate does not cover yet');
         if (await loadPeData(boot.bytes, true) === 'ok') resolveChildImageReady?.();
       }
 

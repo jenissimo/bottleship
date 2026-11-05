@@ -1,5 +1,5 @@
 import { savestateParticipants, uncoveredModules, type CaptureContext, type CpuOverride } from './participant';
-import { restoreRam, snapshotRam, writeRamChunks, type RamCaptureStats, type RamPatch } from './ram';
+import { restoreRam, snapshotRam, type RamCaptureStats, type RamPatch } from './ram';
 import type { ChunkStore } from './chunk-store';
 import {
     decodeSavestate, encodeSavestate, incompatibilities, type CompatibilityKey, type Savestate,
@@ -39,9 +39,14 @@ export function newCaptureRun(): CaptureRun {
     };
 }
 
-export interface CaptureResult { bytes: Uint8Array; ram: RamCaptureStats; sections: Record<string, number> }
+export interface CaptureResult {
+    bytes: Uint8Array;
+    pending: Map<string, Uint8Array>;
+    ram: RamCaptureStats;
+    sections: Record<string, number>;
+}
 
-export async function captureSession(target: SavestateTarget, store: ChunkStore): Promise<CaptureResult> {
+export async function captureSession(target: SavestateTarget, known: ReadonlySet<string>, stillReady: () => void = () => undefined): Promise<CaptureResult> {
     const missing = uncoveredModules(target.touchedModules(), savestateParticipants.coveredModules());
     if (missing.length > 0) throw new CaptureRefusal(`savestate: no participant captures ${missing.join(', ')}`);
     const sections = new Map<string, SaveValue>();
@@ -54,18 +59,16 @@ export async function captureSession(target: SavestateTarget, store: ChunkStore)
         sizes[p.id] = enc.json.length + enc.blobs.reduce((n, b) => n + b.length, 0);
     }
     sections.set(OBJECTS, run.objects as unknown as SaveValue);
-    const snap = await snapshotRam(target.guestMemory(), new Set(await store.list()), run.ramPatches);
-    await writeRamChunks(snap.pending, store);
-    const { manifest, stats } = snap;
+    const snap = await snapshotRam(target.guestMemory(), known, run.ramPatches);
+    stillReady();
     const state: Savestate = {
         header: {
             key: target.compatibilityKey(), overlay: target.overlayState(),
-            createdAt: Date.now(), gameId: target.gameId(), ram: manifest,
+            createdAt: Date.now(), gameId: target.gameId(), ram: snap.manifest,
         },
         sections,
     };
-    const bytes = encodeSavestate(state);
-    return { bytes, ram: stats, sections: sizes };
+    return { bytes: encodeSavestate(state), pending: snap.pending, ram: snap.stats, sections: sizes };
 }
 
 export interface LoadCheck { ok: boolean; reasons: string[]; overlayChanged: boolean; state: Savestate }
