@@ -57,7 +57,14 @@ describe("savestate readiness", () => {
     test("the registered verb reads every owner of a session without a process", () => {
         const handlers = new Map<string, (args: unknown[]) => unknown>();
         registerSavestateCommands({ register: (name: string, h: (args: unknown[]) => unknown) => handlers.set(name, h) } as never);
-        expect(handlers.get("savestateReadiness")!([])).toEqual({ ready: true, blockers: [], restartableParks: 0 });
+        const system = System.getInstance();
+        const previous = system.process;
+        system.process = null as never;
+        try {
+            expect(handlers.get("savestateReadiness")!([])).toEqual({ ready: true, blockers: [], restartableParks: 0 });
+        } finally {
+            system.process = previous;
+        }
     });
 });
 

@@ -355,16 +355,16 @@ export class VirtualFileSystem {
     /** The disc's volume label, as GetVolumeInformation reports it for D:\. See manifest emulator.cdLabel. */
     private cdVolumeLabel: string | null = null;
 
-    /**
-     * Open the writable overlay for a game's container (bottleship/games/<containerDir>/overlay/).
-     * On a game switch (different gameId) the previous overlay is closed and re-rooted, so game B
-     * never sees game A's written files (per-game isolation). gameId is the namespaced container key.
-     */
     /** Overlay (game save tree) writes not yet durable in OPFS. */
     pendingOverlayWrites(): number {
         return this.overlay?.pendingWriteCount() ?? 0;
     }
 
+    /**
+     * Open the writable overlay for a game's container (bottleship/games/<containerDir>/overlay/).
+     * On a game switch (different gameId) the previous overlay is closed and re-rooted, so game B
+     * never sees game A's written files (per-game isolation). gameId is the namespaced container key.
+     */
     async initOverlay(gameId: string): Promise<void> {
         if (this.overlay && this.overlayGameId === gameId) return;
         if (this.overlay) {

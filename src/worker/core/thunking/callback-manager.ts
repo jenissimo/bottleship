@@ -141,6 +141,10 @@ interface DeferredFrameCompletion {
     source: string;
 }
 
+function frameLabel(source: string | undefined, frameId: number): string {
+    return source && source !== 'unknown' ? source : `frame ${frameId}`;
+}
+
 export class CallbackManager {
     private v86: any;
     private thunkGenerator: ThunkGenerator;
@@ -862,13 +866,20 @@ export class CallbackManager {
      *  and terminal completions still waiting for their owner, by thread and frame source. */
     suspendedFrames(): Array<{ threadId: number; source: string }> {
         const out: Array<{ threadId: number; source: string }> = [];
+        const listed = new Set<number>();
         for (let i = 0; i < this.frameStackDepth; i++) {
             const slot = this.frameStack[i];
             if (slot < 0 || slot >= SUSPENDED_FRAME_RING_SIZE || this.frameActive[slot] !== 1) continue;
-            out.push({ threadId: this.frameThreadId[slot] >>> 0, source: this.frameSource[slot] || `frame ${this.frameIdRing[slot] >>> 0}` });
+            const frameId = this.frameIdRing[slot] >>> 0;
+            const threadId = this.frameThreadId[slot] >>> 0;
+            const deferred = this.deferredCompletions.get(threadId);
+            const label = frameLabel(this.frameSource[slot], frameId);
+            listed.add(frameId);
+            out.push({ threadId, source: deferred?.frameId === frameId ? `${label} (completion deferred)` : label });
         }
         for (const [threadId, completion] of this.deferredCompletions) {
-            out.push({ threadId, source: `${completion.source || `frame ${completion.frameId}`} (completion deferred)` });
+            if (listed.has(completion.frameId >>> 0)) continue;
+            out.push({ threadId, source: `${frameLabel(completion.source, completion.frameId)} (completion deferred)` });
         }
         return out;
     }
