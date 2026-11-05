@@ -13,10 +13,14 @@ import { getWindowByHandle } from './shared-state';
 import { encodeAnsi } from '../codepage-utils';
 import { getBuiltinSystemClass, getDefDlgProcAddress, getDefWindowProcAddress, resetDefWindowProcCache } from './system-classes';
 import { getSystemCursorHandle, IDC_ARROW } from './system-cursors';
+import { pickDefined, type FieldPolicy } from '../../savestate/participant';
 
 // Store for registered window classes
+// @participant(user32)
 const windowClasses: Map<number, any> = new Map();
+// @participant(user32)
 const windowClassesByName: Map<string, number> = new Map();
+// @participant(user32)
 let nextClassId = 1;
 
 /**
@@ -28,6 +32,7 @@ let nextClassId = 1;
  * forever — no chrome, no fallback. That is the distinction our paint paths need, and it
  * is not derivable from the class NAME.
  */
+// @participant(user32)
 const appRegisteredClasses = new Set<string>();
 
 /** True if `className` was registered by the guest, not materialized by us. */
@@ -846,6 +851,7 @@ const SYSTEM_CLASS_STUB = Object.freeze({
 
 // Materialized descriptors for built-in user32 classes (Button/Static/Edit/...).
 // Cached so SetClassLong mutations stick, like the real per-process global class.
+// @participant(user32)
 const builtinClassInfoCache = new Map<string, any>();
 
 function getBuiltinClassInfo(nameLower: string): any | undefined {
@@ -911,4 +917,59 @@ export function getWindowClassByName(name: string) {
         return SYSTEM_CLASS_STUB;
     }
     return undefined;
+}
+
+export interface User32ClassInfo {
+    className: string;
+    style: number;
+    lpfnWndProc: number;
+    cbClsExtra: number;
+    cbWndExtra: number;
+    hInstance: number;
+    hIcon: number;
+    hCursor: number;
+    hbrBackground: number;
+    lpszMenuName: number;
+    appRegistered?: boolean;
+    isBuiltinSystemClass?: boolean;
+    controlClass?: string;
+    externalPaintManaged?: boolean;
+}
+
+export const USER32_CLASS_FIELDS = {
+    className: 'save', style: 'save', lpfnWndProc: 'save', cbClsExtra: 'save', cbWndExtra: 'save', hInstance: 'save',
+    hIcon: 'save', hCursor: 'save', hbrBackground: 'save', lpszMenuName: 'save', appRegistered: 'save',
+    isBuiltinSystemClass: 'save', controlClass: 'save', externalPaintManaged: 'save',
+} as const satisfies Record<keyof User32ClassInfo, FieldPolicy>;
+
+export interface User32ClassState {
+    classes: Array<[number, User32ClassInfo]>;
+    byName: Array<[string, number]>;
+    nextClassId: number;
+    appRegistered: string[];
+    builtins: Array<[string, User32ClassInfo]>;
+}
+
+const savedClass = (c: User32ClassInfo): User32ClassInfo => pickDefined(c, USER32_CLASS_FIELDS);
+
+export function captureUser32Classes(): User32ClassState {
+    return {
+        classes: [...windowClasses].map(([id, c]) => [id, savedClass(c)]),
+        byName: [...windowClassesByName],
+        nextClassId,
+        appRegistered: [...appRegisteredClasses],
+        builtins: [...builtinClassInfoCache].map(([name, c]) => [name, savedClass(c)]),
+    };
+}
+
+export function restoreUser32Classes(s: User32ClassState): void {
+    windowClasses.clear();
+    for (const [id, c] of s.classes) windowClasses.set(id, { ...c });
+    windowClassesByName.clear();
+    for (const [name, id] of s.byName) windowClassesByName.set(name, id);
+    nextClassId = s.nextClassId;
+    appRegisteredClasses.clear();
+    for (const name of s.appRegistered) appRegisteredClasses.add(name);
+    builtinClassInfoCache.clear();
+    for (const [name, c] of s.builtins) builtinClassInfoCache.set(name, { ...c });
 }

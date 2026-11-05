@@ -72,11 +72,15 @@ interface ActivationContextRecord {
     assemblySectionSize: number;
 }
 
+// @participant(kernel32)
 const contextsByHandle = new Map<number, ActivationContextRecord>();
+// @participant(kernel32)
 let processDefaultActCtx: number | null = null;
+// @participant(kernel32)
 let nextActCtxCookie = 1;
 
 /** Per-thread activation stack top frames: tid -> { cookie, handle }[] */
+// @participant(kernel32)
 const threadActCtxFrames = new Map<number, Array<{ cookie: number; handle: number }>>();
 
 export function resetActCtxState(): void {

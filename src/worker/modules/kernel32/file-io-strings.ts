@@ -5,6 +5,7 @@
 import { decodeAnsiString, encodeAnsiString, EmulatorConfig } from '../../core/emulator-config-manager';
 
 /** SetFileApisToOEM / SetFileApisToANSI: the code page every A file API speaks. */
+// @participant(kernel32)
 let fileApisAnsi = true;
 
 export function setFileApisAnsi(ansi: boolean): void {

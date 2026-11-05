@@ -22,6 +22,7 @@ export interface ActiveDialog {
 }
 
 /** Modal dialogs of the CURRENT process, keyed by HWND (EndDialog result capture). */
+// @refuse(a modal dialog is open)
 export const activeDialogs = new Map<number, ActiveDialog>();
 
 export interface PumpScheduler {
@@ -32,7 +33,9 @@ export interface PumpScheduler {
     abandon(): void;
 }
 
+// @transient(generation of the host modal pump timers)
 let pumpEpoch = 0;
+// @transient(host timers of a modal pump, which only runs while a modal dialog is open)
 const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
 
 export function createPumpScheduler(): PumpScheduler {

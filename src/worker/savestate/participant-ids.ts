@@ -1,0 +1,24 @@
+export const PARTICIPANT_IDS = [
+    'time',
+    'address-space',
+    'memory-manager',
+    'kernel32-memory',
+    'thunk-generator',
+    'kernel32',
+    'resources',
+    'hypercall-page',
+    'scheduler',
+    'timer-wheel',
+    'window-manager',
+    'message-queue',
+    'user32',
+    'user32-timers',
+    'user32-input',
+    'user32-system',
+    'gdi32',
+    'gdi32-palettes',
+    'dispatcher',
+    'cpu',
+] as const;
+
+export type ParticipantId = typeof PARTICIPANT_IDS[number];

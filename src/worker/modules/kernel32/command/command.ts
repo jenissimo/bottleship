@@ -8,8 +8,11 @@ import { encodeAnsi } from '../../codepage-utils';
 export const exports: Record<string, ThunkImplementation> = {};
 
 // Command line storage — allocated dynamically from THUNK_DATA
+// @participant(kernel32)
 let cmdLineAddrA = 0;
+// @participant(kernel32)
 let cmdLineAddrW = 0;
+// @participant(kernel32)
 let lastExeName = "";
 const CMD_LINE_BUF_SIZE = 2048; // bytes for ANSI
 const CMD_LINE_BUF_SIZE_W = 4096; // bytes for wide (2048 chars)

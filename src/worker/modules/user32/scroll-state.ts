@@ -14,6 +14,7 @@ export type ScrollBarState = {
     downEnabled: boolean;
 };
 
+// @participant(user32)
 const scrollBarState = new Map<string, ScrollBarState>();
 
 export const SIF_RANGE = 0x1;
@@ -164,4 +165,13 @@ export function applyScrollInfo(mem: Uint8Array, hwnd: number, bar: number, lpsi
 
 export function resetScrollState(): void {
     scrollBarState.clear();
+}
+
+export function captureScrollState(): Array<[string, ScrollBarState]> {
+    return [...scrollBarState].map(([k, v]) => [k, { ...v }]);
+}
+
+export function restoreScrollState(rows: ReadonlyArray<[string, ScrollBarState]>): void {
+    scrollBarState.clear();
+    for (const [k, v] of rows) scrollBarState.set(k, { ...v });
 }

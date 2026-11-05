@@ -17,10 +17,12 @@ import { encodeAnsi } from '../codepage-utils';
 type IniData = Map<string, Map<string, string>>;
 
 // Cache: normalized file path -> parsed data
+// @transient(parsed INI files; the files live on the disk outside the snapshot and are read again)
 const iniCache = new Map<string, IniData>();
 // Raw file text per normalized path. Windows edits the FILE, not a model of it: comments,
 // key order and unknown sections all survive a WritePrivateProfileString, and an app that
 // hand-edits its own ini alongside the API must not have the rest of it rewritten away.
+// @transient(INI file text; the files live on the disk outside the snapshot and are read again)
 const iniText = new Map<string, string>();
 
 export function resetIniCache(): void {

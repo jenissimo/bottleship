@@ -12,6 +12,7 @@ import { PS_STYLE_MASK } from './gdi-objects';
 import { DEFAULT_CHARSET, fontSignature, systemDefaultCharset } from './font-charset';
 import { enumerateFontFamilies } from './font-enumeration';
 
+// @participant(gdi32)
 let nextMetafileHandle = 0x50000;
 
 /** ExtCreatePen pen-type bits: cosmetic (0) vs geometric (PS_GEOMETRIC). */
@@ -312,4 +313,12 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
         Logger.verbose(LogCategory.GDI32, `GetICMProfileW(hdc=0x${hdc.toString(16)}) -> "${ICM_PROFILE}"`);
         return 1; // TRUE
     };
+}
+
+export function captureMetafileCounter(): number {
+    return nextMetafileHandle;
+}
+
+export function restoreMetafileCounter(next: number): void {
+    nextMetafileHandle = next;
 }

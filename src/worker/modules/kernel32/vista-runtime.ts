@@ -84,6 +84,7 @@ function onceComplete(once: number, flags: number, context: number): number {
 }
 
 /** INIT_ONCE address -> the event its waiters park on while another thread initializes. */
+// @participant(kernel32)
 const onceWaitEvents = new Map<number, number>();
 
 const callerRegs = (ctx: X86Context) =>
@@ -153,11 +154,17 @@ interface TpWait extends TpTracked {
 
 type TpWork = TpTracked;
 
+// @refuse(thread-pool objects are not part of a v1 savestate)
 const tpTimers = new Map<number, TpTimer>();
+// @refuse(thread-pool objects are not part of a v1 savestate)
 const tpWaits = new Map<number, TpWait>();
+// @refuse(thread-pool objects are not part of a v1 savestate)
 const tpWork = new Map<number, TpWork>();
+// @refuse(thread-pool objects are not part of a v1 savestate)
 const tpInstances = new Map<number, TpInstance>();
+// @participant(kernel32)
 let nextTpHandle = 0x00080000;
+// @participant(kernel32)
 let nextTpInstance = 0x000C0000;
 
 /** How often a thread-pool wait re-checks its object, in virtual milliseconds. */

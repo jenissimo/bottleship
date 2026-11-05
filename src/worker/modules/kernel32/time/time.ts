@@ -13,15 +13,21 @@ import { getCPU } from '../../../core/thunking/thunk-utils';
 
 
 export const exports: Record<string, ThunkImplementation> = {};
+// @transient(diagnostics)
 let lastSleepLog = 0;
+// @transient(diagnostics)
 let sleepCallCount = 0;
+// @transient(diagnostics)
 let lastSleepMs = 0;
 // Sleep is the top thunk in spin-yield titles, and "how many" is useless without
 // "of what": a Sleep(0) yield and a Sleep(2) block are different bugs, and the
 // last-value-seen the line used to print names neither.
 const sleepArgHist = { zero: 0, one: 0, two: 0, more: 0 };
+// @transient(diagnostics)
 let lastSleepExApcDepth = -1;
+// @transient(diagnostics)
 let sleepExStormUnchangedTicks = 0;
+// @transient(diagnostics)
 let lastSleepExStormWarnMs = 0;
 
 /**

@@ -106,14 +106,14 @@ describe("cursor state has one owner", () => {
     // start-anchored census reads as no write at all.
     const assignedIn = (name: string) => enclosingFunction(new RegExp(`${name}\\s*(?:\\+=|-=|=(?!=))`));
 
-    test("cursorDisplayCount is written only by its update and the reset", () => {
+    test("cursorDisplayCount is written only by its update, the reset and a savestate restore", () => {
         expect(new Set(assignedIn("cursorDisplayCount")))
-            .toEqual(new Set(["updateCursorDisplayCount", "resetUser32SharedState"]));
+            .toEqual(new Set(["updateCursorDisplayCount", "resetUser32SharedState", "restoreUser32Windows"]));
     });
 
-    test("currentCursorHandle is written only by SetCursor's setter and the reset", () => {
+    test("currentCursorHandle is written only by SetCursor's setter, the reset and a savestate restore", () => {
         expect(new Set(assignedIn("currentCursorHandle")))
-            .toEqual(new Set(["setCurrentCursorHandle", "resetUser32SharedState"]));
+            .toEqual(new Set(["setCurrentCursorHandle", "resetUser32SharedState", "restoreUser32Windows"]));
     });
 
     test("no module outside user32 shared-state can force the guest's cursor state", () => {

@@ -24,6 +24,7 @@ import { codePageToUnicodeLut, codePageToByteLut } from './codepage-lut';
 import { localeString } from './locale-db';
 import { LocaleField } from './locale-db-schema';
 
+// @transient(constant table)
 const GREGORIAN_CALENDAR_IDS = new Set([0, 1, 2, 9, 10, 11, 12]);
 
 /** CAL_ITWODIGITYEARMAX of the Gregorian calendars. */
@@ -1352,6 +1353,7 @@ export const localeFastPathStats = {
  * multi-byte page is not conservative — it makes the caller allocate too little.
  */
 const CPINFO_SIZE = 18;
+// @transient(constant table)
 const DBCS_CODE_PAGES = new Set([932, 936, 949, 950, 1361]);
 
 /** CP_ACP/CP_OEMCP/CP_THREAD_ACP are indirections, not code pages; resolve them first. */

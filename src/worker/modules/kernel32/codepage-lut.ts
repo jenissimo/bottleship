@@ -11,6 +11,7 @@
 
 import { EmulatorConfig, getCodePageDecoder, isSingleByteCodePage } from '../../core/emulator-config-manager';
 
+// @transient(cache of code page tables)
 const _cpLutCache = new Map<number, Uint16Array | null>();
 
 /**
@@ -47,6 +48,7 @@ export function codePageToUnicodeLut(codePage: number): Uint16Array | null {
     return lut;
 }
 
+// @transient(cache of code page tables)
 const _cpRevLutCache = new Map<number, Uint16Array | null>();
 
 /**
@@ -141,6 +143,7 @@ export interface MbwcStubTable {
  * whose bound was never installed decline rather than trusting a bare length check.
  */
 /** Guest address of the installed MBWC table, or 0 when no stub was emitted. */
+// @transient(written while the image loads; the fresh worker writes the same table, which the boot-layout key pins)
 let installedMbwcStubTable = 0;
 export function mbwcStubTableAddr(): number { return installedMbwcStubTable; }
 

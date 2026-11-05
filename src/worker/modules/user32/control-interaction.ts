@@ -232,6 +232,7 @@ export interface PendingControlNotification {
     lParam: number;
 }
 
+// @refuse(a control notification is pending)
 let pendingControlNotification: PendingControlNotification | null = null;
 
 export function takePendingControlNotification(): PendingControlNotification | null {
@@ -247,6 +248,7 @@ export function takePendingControlNotification(): PendingControlNotification | n
  * the raw WM_LBUTTONDOWN/UP and nothing else, and "the click did nothing" and "the
  * click produced BN_CLICKED the guest ignored" look identical.
  */
+// @transient(diagnostic tap)
 let controlNotifyObserver: ((n: PendingControlNotification) => void) | null = null;
 export function setControlNotifyObserver(fn: ((n: PendingControlNotification) => void) | null): void {
     controlNotifyObserver = fn;
@@ -380,9 +382,12 @@ function eraseAndCloseCombo(combo: WindowInfo, hostHwnd: number): void {
 }
 
 // --- Interaction state (single-cursor UI, module-level is fine) ---
+// @refuse(a control is held down or dragged)
 let trackbarDragHwnd = 0;
+// @refuse(a control is held down or dragged)
 let pressedButtonHwnd = 0;
 /** Listbox whose selection follows the cursor because its button is still down. */
+// @refuse(a control is held down or dragged)
 let listboxDragHwnd = 0;
 
 export function resetControlInteractionState(): void {
@@ -706,7 +711,9 @@ interface ScrollDrag {
     outside: boolean;
 }
 
+// @refuse(a control is held down or dragged)
 let scrollPress: ScrollPress | null = null;
+// @refuse(a control is held down or dragged)
 let scrollDrag: ScrollDrag | null = null;
 
 /**
@@ -1423,6 +1430,7 @@ export function handleSystemControlKey(
  */
 const WHEEL_DELTA = 120;
 const WHEEL_PAGESCROLL = 0xFFFFFFFF;
+// @participant(user32)
 let wheelScrollLines = 3;
 
 /** SPI_SETWHEELSCROLLLINES. WHEEL_PAGESCROLL means one page per notch. */
@@ -1499,6 +1507,7 @@ function rootDialogOf(control: WindowInfo): number | undefined {
 
 // Full-dialog repaint hook — dialog.ts registers paintDialogToOverlay-based repaint
 // (cross-module hook avoids a dialog.ts <-> control-interaction.ts import cycle).
+// @transient(wiring set at module init)
 let fullDialogRepainter: ((dialogHwnd: number) => void) | null = null;
 export function registerFullDialogRepainter(fn: (dialogHwnd: number) => void): void {
     fullDialogRepainter = fn;
@@ -1508,6 +1517,7 @@ export function invokeFullDialogRepaint(dialogHwnd: number): void {
 }
 
 /** Overlay repair after clearOverlayRect — routes guest-painted menus to WM_PAINT. */
+// @transient(wiring set at module init)
 let overlayRepairRepainter: ((dialogHwnd: number) => void) | null = null;
 export function registerOverlayRepairRepainter(fn: (dialogHwnd: number) => void): void {
     overlayRepairRepainter = fn;
@@ -1518,4 +1528,10 @@ export function invokeOverlayRepairRepaint(dialogHwnd: number): void {
 
 function requestFullDialogRepaint(dialogHwnd: number): void {
     invokeFullDialogRepaint(dialogHwnd);
+}
+
+export function controlGestureInProgress(): string | null {
+    if (pressedButtonHwnd || trackbarDragHwnd || listboxDragHwnd || scrollPress || scrollDrag) return 'a control is held down or dragged';
+    if (pendingControlNotification) return 'a control notification is pending';
+    return null;
 }

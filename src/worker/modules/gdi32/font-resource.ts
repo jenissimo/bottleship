@@ -114,8 +114,11 @@ export function parseSfntFace(data: Uint8Array): SfntFace | null {
 
 // The worker owns one guest process, so its FontFaceSet also scopes FR_PRIVATE fonts.
 interface InstalledFont { faces: FontFace[]; family: string; fullName: string | null; references: Map<number, number> }
+// @refuse(fonts added at run time are not part of a v1 savestate)
 const installedFonts = new Map<string, InstalledFont>();
+// @refuse(fonts added at run time are not part of a v1 savestate)
 const pendingFonts = new Map<string, Promise<InstalledFont | null>>();
+// @participant(gdi32)
 let fontGeneration = 0;
 
 /** A new guest container must not inherit installed faces or pending loads from the old one. */
@@ -242,4 +245,16 @@ export function removeFontResource(resolvedPath: string, flags = 0): boolean {
     invalidateTextExtentCache();
     installedFonts.delete(key);
     return true;
+}
+
+export function runtimeFontCount(): number {
+    return installedFonts.size + pendingFonts.size;
+}
+
+export function captureFontGeneration(): number {
+    return fontGeneration;
+}
+
+export function restoreFontGeneration(generation: number): void {
+    fontGeneration = generation;
 }

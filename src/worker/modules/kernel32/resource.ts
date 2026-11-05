@@ -59,7 +59,9 @@ interface ResourceEntry {
 }
 
 // Cache of found resources (HRSRC -> ResourceEntry)
+// @participant(kernel32)
 const resourceCache: Map<number, ResourceEntry> = new Map();
+// @participant(kernel32)
 let nextResourceHandle = 0x80000001;
 
 export function resetResourceCache(): void {

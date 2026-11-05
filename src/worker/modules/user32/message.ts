@@ -13,6 +13,8 @@ import { System } from '../../core/system';
 import { TimeService } from '../../runtime/time';
 import { TimerKind } from '../../core/scheduler/types';
 import { setTimerHandler } from '../../core/scheduler/timer-wheel';
+import { savestateParticipants, savestatesEnabled, stateKeys, pickDefined, type FieldPolicy } from '../../savestate/participant';
+import type { SaveValue } from '../../savestate/value-codec';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 import { installHook, uninstallHook, getHooksOfType, getNextHookInChain, hasHooksOfType, pushActiveHook, popActiveHook, currentActiveHook, WH_KEYBOARD, WH_GETMESSAGE, WH_CBT, HC_ACTION, HC_NOREMOVE } from './hooks';
 import { isSentinelWndProc } from './dialog';
@@ -58,6 +60,7 @@ const WM_GETTEXTLENGTH_MSG = 0x000E;
 const USER_TIMER_MINIMUM = 10;
 
 type TimerMessage = { hwnd: number; message: number; wParam: number; lParam: number; generatedTimer?: boolean; timerEpoch?: number };
+// @transient(wiring set at module init)
 let noteFastPathTimerDelivery: ((msg: TimerMessage, removed: boolean) => void) | null = null;
 
 /**
@@ -253,6 +256,24 @@ export function sendWindowGetTextLength(
     );
 }
 
+export interface User32TimerRecord {
+    wheelTimerId: number;
+    epoch: number;
+    hWnd: number;
+    timerId: number;
+    timerFunc: number;
+    intervalMs: number;
+    pendingTicks: number;
+}
+
+export interface User32TimerState {
+    timers: User32TimerRecord[];
+    nextTimerId: number;
+    nextTimerEpoch: number;
+    messageExtraInfo: Array<[number, number]>;
+    lastHoverChildHwnd: number;
+}
+
 export function createMessageExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -264,19 +285,14 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     const ERROR_INVALID_WINDOW_HANDLE = 1400;
     const SMTO_ABORTIFHUNG = 0x0002;
     const SMTO_ERRORONEXIT = 0x0020;
+    // @transient(diagnostics)
     let lastPeekLog = 0;
+    // @transient(diagnostics)
     let peekCalls = 0;
+    // @transient(diagnostics)
     let peekHits = 0;
 
-    interface TimerState {
-        wheelTimerId: number;
-        epoch: number;
-        hWnd: number;
-        timerId: number;
-        timerFunc: number;
-        intervalMs: number;
-        pendingTicks: number;
-    }
+    type TimerState = User32TimerRecord;
 
     interface TimerDiagCounters {
         ticks: number;
@@ -314,17 +330,50 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         pendingFlushed: 0,
         pendingDropped: 0,
     };
+    // @transient(diagnostics)
     let timerDiagLastLogMs = performance.now();
+    // @transient(diagnostics)
     let timerDiagLastHcCallCount = hypercallDataManager.getCallCount();
 
     // Keyed by "hwnd:id" — timer ids are PER-WINDOW in Win32, so two windows may each
     // own a timer with the same id (e.g. HL's menu buttons all SetTimer(hwnd, 1, ...)).
     // Keying by id alone made the second SetTimer overwrite the first's map entry while
     // its timer kept running orphaned (unkillable) → runaway hover-glow repaints.
+    // @participant(user32-timers)
     const timers: Map<string, TimerState> = new Map();
     const timerKey = (hWnd: number, id: number) => `${hWnd >>> 0}:${id >>> 0}`;
+    // @participant(user32-timers)
     let nextTimerId = 1;
+    // @participant(user32-timers)
     let nextTimerEpoch = 1;
+
+    const TIMER_FIELDS = {
+        wheelTimerId: 'save', epoch: 'save', hWnd: 'save', timerId: 'save', timerFunc: 'save', intervalMs: 'save', pendingTicks: 'save',
+    } as const satisfies Record<keyof TimerState, FieldPolicy>;
+
+    if (savestatesEnabled()) savestateParticipants.add({
+        id: 'user32-timers', version: 1, order: 41,
+        schema: { state: stateKeys<User32TimerState>({ timers: true, nextTimerId: true, nextTimerEpoch: true, messageExtraInfo: true, lastHoverChildHwnd: true }), timer: TIMER_FIELDS },
+        capture: () => {
+            const state: User32TimerState = {
+                timers: [...timers.values()].map(t => pickDefined(t, TIMER_FIELDS)),
+                nextTimerId, nextTimerEpoch,
+                messageExtraInfo: [...messageExtraInfo],
+                lastHoverChildHwnd,
+            };
+            return state as unknown as SaveValue;
+        },
+        restore: (saved) => {
+            const s = saved as unknown as User32TimerState;
+            timers.clear();
+            for (const t of s.timers) timers.set(timerKey(t.hWnd, t.timerId), { ...t });
+            nextTimerId = s.nextTimerId;
+            nextTimerEpoch = s.nextTimerEpoch;
+            messageExtraInfo.clear();
+            for (const [tid, v] of s.messageExtraInfo) messageExtraInfo.set(tid, v);
+            lastHoverChildHwnd = s.lastHoverChildHwnd;
+        },
+    });
 
     function cancelTimerState(state: TimerState): void {
         System.getInstance().scheduler?.timerWheel.cancel(state.wheelTimerId);
@@ -396,6 +445,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
     // Last owner-draw child we forwarded a WM_MOUSEMOVE to, so we only re-post on ENTER
     // (the child's own hover timer then polls the cursor) instead of on every move.
+    // @participant(user32-timers)
     let lastHoverChildHwnd = 0;
 
     function getTotalPendingTicks(): number {
@@ -488,6 +538,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     // Per-thread GetMessageExtraInfo value: the dwExtraInfo of the input behind the last
     // message GetMessage/PeekMessage handed this thread (0 for posted and host input), or
     // whatever SetMessageExtraInfo stored since.
+    // @participant(user32-timers)
     const messageExtraInfo = new Map<number, number>();
     function noteRetrievedExtraInfo(threadId: number, msg: { extraInfo?: number }): void {
         messageExtraInfo.set(threadId, (msg.extraInfo ?? 0) >>> 0);

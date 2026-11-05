@@ -32,13 +32,17 @@ import { cancelWsaIo, hasWsaSocket, getWsaNativeSocketTable } from '../wsa-stub-
 import { trySocketFileIo, cancelSocketFileIo } from './socket-file-io';
 import { installReadFileEx, cancelFileReadEx } from './file-io-ex';
 
+// @transient(diagnostics)
 const readFileFirstLogged = new Set<number>();
+// @transient(diagnostics)
 let shortReadLogCount = 0;
 // A handle whose file position is driven from two threads is a race the guest can only
 // win by serialising itself: SetFilePointer and ReadFile are separate calls, and our
 // scheduler preempts between them. Reported once per handle — the pair reads the wrong
 // offset and the caller sees plausible-looking garbage, not an error.
+// @transient(diagnostics)
 const readFileLastThread = new Map<number, number>();
+// @transient(diagnostics)
 let sharedHandleLogCount = 0;
 function noteReadFileThread(hFile: number, path: string): void {
     const tid = System.getInstance().scheduler.getCurrentThread()?.id ?? 0;

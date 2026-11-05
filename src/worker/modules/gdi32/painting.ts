@@ -3,6 +3,8 @@ import { type HleDispatcher, ThunkImplementation } from '../../core/thunking/thu
 import { registerPaintingDcStateExports } from './painting-dc-state';
 import { registerPaintingMiscExports } from './painting-misc';
 import { System } from '../../core/system';
+import { savestateParticipants, savestatesEnabled, stateKeys } from '../../savestate/participant';
+import type { SaveValue } from '../../savestate/value-codec';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Logger, LogCategory } from '../../core/logger';
 import { profiler } from '../../core/profiler';
@@ -17,10 +19,13 @@ import { fontCellHeight, prefixWidths } from './text-extent-cache';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
 // Track GetPixel HDC usage for profiling
+// @transient(diagnostics)
 const getPixelHdcStats = new Map<number, { count: number; maxX: number; maxY: number }>();
 
 // Store last GetDIBits output buffer address for texture loading workaround
+// @participant(gdi32)
 let lastGetDIBitsBuffer: { address: number; width: number; height: number } | null = null;
+// @participant(gdi32)
 const pixelFormatByHdc = new Map<number, number>();
 
 export function getLastGetDIBitsBuffer(): { address: number; width: number; height: number } | null {
@@ -682,6 +687,27 @@ function writeTextMetrics(hdc: number, lptm: number, mem: Uint8Array): void {
     view.setUint8(lptm + 50, 0);              // tmStruckOut
     view.setUint8(lptm + 51, 0x22);           // tmPitchAndFamily: VARIABLE_PITCH | FF_SWISS
     view.setUint8(lptm + 52, 0);              // tmCharSet: ANSI_CHARSET
+}
+
+export interface PaintingModuleState {
+    pixelFormatByHdc: Array<[number, number]>;
+    lastGetDIBitsBuffer: { address: number; width: number; height: number } | null;
+}
+
+export function capturePaintingModuleState(): PaintingModuleState {
+    return { pixelFormatByHdc: [...pixelFormatByHdc], lastGetDIBitsBuffer: lastGetDIBitsBuffer ? { ...lastGetDIBitsBuffer } : null };
+}
+
+export function restorePaintingModuleState(s: PaintingModuleState): void {
+    pixelFormatByHdc.clear();
+    for (const [h, f] of s.pixelFormatByHdc) pixelFormatByHdc.set(h, f);
+    lastGetDIBitsBuffer = s.lastGetDIBitsBuffer ? { ...s.lastGetDIBitsBuffer } : null;
+}
+
+export interface PaletteState {
+    palettes: Array<[number, Uint8Array]>;
+    nextPaletteHandle: number;
+    dcPalette: Array<[number, number]>;
 }
 
 export function createPaintingExports(): Record<string, ThunkImplementation> {
@@ -1560,9 +1586,32 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
 
     // --- Palette management ---
     // Store palette entries keyed by handle
+    // @participant(gdi32-palettes)
     const paletteStore = new Map<number, Uint8Array>(); // handle -> PALETTEENTRY[256] (4 bytes each)
+    // @participant(gdi32-palettes)
     let nextPaletteHandle = 0x50000001;
+    // @participant(gdi32-palettes)
     const dcPalette = new Map<number, number>(); // hdc -> hPal
+    if (savestatesEnabled()) savestateParticipants.add({
+        id: 'gdi32-palettes', version: 1, order: 46,
+        schema: stateKeys<PaletteState>({ palettes: true, nextPaletteHandle: true, dcPalette: true }),
+        capture: () => {
+            const state: PaletteState = {
+                palettes: [...paletteStore].map(([h, entries]) => [h, entries.slice()]),
+                nextPaletteHandle,
+                dcPalette: [...dcPalette],
+            };
+            return state as unknown as SaveValue;
+        },
+        restore: (saved) => {
+            const s = saved as unknown as PaletteState;
+            paletteStore.clear();
+            for (const [h, entries] of s.palettes) paletteStore.set(h, entries.slice());
+            nextPaletteHandle = s.nextPaletteHandle;
+            dcPalette.clear();
+            for (const [hdc, h] of s.dcPalette) dcPalette.set(hdc, h);
+        },
+    });
 
     /** The 20 static system colours, R,G,B triples: indices 0-9 then 246-255. */
     const STATIC_SYSTEM_COLORS = [
@@ -1577,6 +1626,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
      * CreateHalftonePalette is measured against: a 4x8x8 blue/green/red cube with the
      * 20 static system colours stamped over indices 0-9 and 246-255.
      */
+    // @transient(constant table, built on first use)
     let cachedHalftoneEntries: Uint8Array | null = null;
     function defaultColorTable8(): Uint8Array {
         if (cachedHalftoneEntries) return cachedHalftoneEntries;

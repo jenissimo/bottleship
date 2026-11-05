@@ -557,6 +557,7 @@ class ConsoleScreenBufferManager {
     }
 }
 
+// @participant(kernel32)
 export const consoleScreenBuffers = new ConsoleScreenBufferManager();
 
 export function readCoordFromMem(mem: Uint8Array, addr: number): Coord {

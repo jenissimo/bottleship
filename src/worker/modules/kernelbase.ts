@@ -27,6 +27,7 @@ setWaitCompletionHandler(WaitCompletionKind.WAIT_ON_ADDRESS, (_c, waitResult) =>
     : { value: 0, lastError: ERROR_TIMEOUT });
 
 /** WaitOnAddress: guest address -> the event its waiters park on. */
+// @participant(kernel32)
 const addressWaitEvents = new Map<number, number>();
 
 // WaitOnAddress parks on a per-address wake event. Like a condition variable it carries
@@ -38,6 +39,15 @@ function addressWaitEvent(address: number, create: boolean): number {
         addressWaitEvents.set(address, evt);
     }
     return evt;
+}
+
+export function captureAddressWaits(): Array<[number, number]> {
+    return [...addressWaitEvents];
+}
+
+export function restoreAddressWaits(rows: ReadonlyArray<[number, number]>): void {
+    addressWaitEvents.clear();
+    for (const [address, evt] of rows) addressWaitEvents.set(address, evt);
 }
 
 function createKernelbaseOwnExports(): Record<string, ThunkImplementation> {
