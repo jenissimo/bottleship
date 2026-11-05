@@ -1299,21 +1299,23 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             return linesToCopy;
         }
 
-        const dibRgba = dibBitsPtr && dibStride && dibStride > 0
+        // Calculate actual lines to copy
+        const actualStart = Math.max(0, start);
+        const actualEnd = Math.min(height, actualStart + (cLines > 0 ? cLines : height));
+        const linesToCopy = actualEnd - actualStart;
+
+        const dibRgba = dibBitsPtr && dibStride && dibStride > 0 && linesToCopy > 0
             ? readDibSectionRgbaGeneric(mem, dibBitsPtr, width, height, dibStride, dibTopDown, dibBpp ?? 32,
-                (userObj as any).dibPalette, (userObj as any).dibMasks)
+                (userObj as any).dibPalette, (userObj as any).dibMasks, actualStart, linesToCopy)
             : null;
+        const dibRowBase = dibRgba ? actualStart : 0;
+        const zeroReserved = !!dibRgba && (dibBpp ?? 32) !== 32;
 
         // Copy pixel data to output buffer
         if (!dibRgba && !userObj.pixels) {
             Logger.warn(LogCategory.GDI32, 'GetDIBits: Bitmap has no pixel data');
             return 0;
         }
-
-        // Calculate actual lines to copy
-        const actualStart = Math.max(0, start);
-        const actualEnd = Math.min(height, actualStart + (cLines > 0 ? cLines : height));
-        const linesToCopy = actualEnd - actualStart;
 
         if (linesToCopy <= 0) {
             Logger.verbose(LogCategory.GDI32, 'GetDIBits: No lines to copy');
@@ -1364,7 +1366,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             const dstLine = wantsTopDown ? i : (linesToCopy - 1 - i);
 
             // Source: top-down RGBA; Destination: caller's stride/depth (BGR or BGRA)
-            const srcOffset = srcLine * srcStride;
+            const srcOffset = (srcLine - dibRowBase) * srcStride;
             const dstOffset = dstLine * outStride;
 
             for (let x = 0; x < width; x++) {
@@ -1380,7 +1382,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
                 mem[lpvBits + dstPixel + 1] = g; // Green
                 mem[lpvBits + dstPixel + 2] = r; // Red
                 if (outBytesPerPixel === 4) {
-                    mem[lpvBits + dstPixel + 3] = sourcePixels[srcPixel + 3]; // Alpha
+                    mem[lpvBits + dstPixel + 3] = zeroReserved ? 0 : sourcePixels[srcPixel + 3]; // Alpha
                 }
             }
         }

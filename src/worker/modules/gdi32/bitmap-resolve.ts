@@ -381,18 +381,30 @@ export function readDibSectionRgbaGeneric(
     dibBpp: number,
     palette?: Uint32Array,
     masks?: readonly number[],
+    firstRow = 0,
+    rowCount = h,
 ): Uint8ClampedArray | null {
-    if (dibBpp === 32) {
+    const whole = firstRow === 0 && rowCount === h;
+    if (dibBpp === 32 && whole) {
         return readDibSectionRgba(mem, bitsPtr, w, h, dibStride, dibTopDown);
     }
-    if (!bitsPtr || w <= 0 || h <= 0) return null;
-    const out = new Uint8ClampedArray(w * h * 4);
+    if (!bitsPtr || w <= 0 || h <= 0 || firstRow < 0 || rowCount <= 0 || firstRow + rowCount > h) return null;
+    const out = new Uint8ClampedArray(w * rowCount * 4);
     const decoder16 = dibBpp === 16 ? new Dib16Decoder(dibColorMasks(16, masks)) : null;
-    for (let y = 0; y < h; y++) {
+    for (let y = firstRow; y < firstRow + rowCount; y++) {
         const srcY = dibTopDown ? y : (h - 1 - y);
         const srcRow = bitsPtr + srcY * dibStride;
-        const dstOff = y * w * 4;
-        if (dibBpp === 24) {
+        const dstOff = (y - firstRow) * w * 4;
+        if (dibBpp === 32) {
+            for (let x = 0; x < w; x++) {
+                const si = srcRow + x * 4;
+                const di = dstOff + x * 4;
+                out[di] = mem[si + 2];
+                out[di + 1] = mem[si + 1];
+                out[di + 2] = mem[si];
+                out[di + 3] = 255;
+            }
+        } else if (dibBpp === 24) {
             for (let x = 0; x < w; x++) {
                 const si = srcRow + x * 3;
                 const di = dstOff + x * 4;
