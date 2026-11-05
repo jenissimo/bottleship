@@ -265,6 +265,7 @@ export class Msvcrt implements IModule {
         exports["_strlwr"] = (ctx, mem, args) => this.strlwr(args[0] ?? 0);
         exports["_strdup"] = (ctx, mem, args) => this.strdup(args[0] ?? 0);
         exports["_strdup_dbg"] = (ctx, mem, args) => this.strdup(args[0] ?? 0);
+        exports["_wcsdup"] = (ctx, mem, args) => this.wcsdup(args[0] ?? 0);
 
         exports["sprintf"] = (ctx, mem, args) => this.sprintf(args);
         exports["printf"] = (ctx, mem, args) => this.printf(args);
@@ -1758,6 +1759,19 @@ export class Msvcrt implements IModule {
         const outPtr = this.malloc(bytes.length);
         if (!outPtr) return 0;
         Mem.writeBytes(outPtr, bytes);
+        return outPtr >>> 0;
+    }
+
+    private wcsdup(ptr: number): number {
+        if (!ptr) return 0;
+        const bytes = (this.wcslen(ptr) + 1) * 2;
+        const outPtr = this.malloc(bytes);
+        if (!outPtr) {
+            this.setErrno(12);
+            return 0;
+        }
+        for (let i = 0; i < bytes - 2; i += 2) Mem.writeUint16(outPtr + i, Mem.readUint16(ptr + i) ?? 0);
+        Mem.writeUint16(outPtr + bytes - 2, 0);
         return outPtr >>> 0;
     }
 
