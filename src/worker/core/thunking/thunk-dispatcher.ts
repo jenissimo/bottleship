@@ -38,7 +38,7 @@ import {
     WBUF_ARG_PAYLOAD, WBUF_ARG_SHADER_CONSTANT, WBUF_ARG_UP_DRAW, WBUF_PAYLOAD_MAX_BYTES, wbufEntryStride,
 } from './wbuf-format';
 export { WBUF_ARG_PAYLOAD, WBUF_ARG_SHADER_CONSTANT, WBUF_ARG_UP_DRAW };
-import { cpuViews, cpuViewsForBuffer, readRetiredInsns, PROXY_BASELINE } from '../cpu/cpu-views';
+import { cpuViews, cpuViewsForBuffer, readEip, readRetiredInsns, PROXY_BASELINE } from '../cpu/cpu-views';
 import { PF_HALT_TARGET, TRAP_MARKER_VECTOR } from '../bootloader';
 import { faultRecorder, cr2RegisterCandidates, isFaultEipConsistent, analyzeIndirectCallFault, classifyWildTransfer } from '../memory/fault-recorder';
 import { stubRegistry } from '../diagnostics/stub-registry';
@@ -3787,7 +3787,7 @@ export class ThunkDispatcher {
         if (currentTid === null || currentTid === undefined) return false;
         const tid = currentTid >>> 0;
         if (!cbMgr.hasDeferredDispatchForThread(tid)) return false;
-        const eip = cpu.instruction_pointer[0] >>> 0;
+        const eip = readEip(cpu);
         if (!this.isParkedAtSpinLoop(eip) && !(scheduler as any).isThreadAsyncParked?.(tid)) return false;
         scheduler.wakeThreadForAsyncCompletion(tid);
         (scheduler as any).markThreadRunningAfterAsyncWake?.(tid, cpu);
