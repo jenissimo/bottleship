@@ -718,6 +718,20 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
 
     exports['MessageBeep'] = () => 1;
 
+    // BOOL WinHelp(HWND, LPCSTR lpszHelp, UINT uCommand, ULONG_PTR dwData). There is no
+    // help engine (winhlp32) to start, so every request fails; HELP_QUIT with no help
+    // window open has nothing to close and succeeds, as Windows and Wine answer it.
+    const HELP_QUIT = 0x0002;
+    const winHelp = (wide: boolean): ThunkImplementation => (ctx, mem, args) => {
+        const command = args[2] >>> 0;
+        const ok = command === HELP_QUIT ? 1 : 0;
+        Logger.log(LogCategory.USER32,
+            `WinHelp${wide ? 'W' : 'A'}(hwnd=0x${(args[0] >>> 0).toString(16)}, cmd=0x${command.toString(16)}) -> ${ok ? 'TRUE' : 'FALSE (no help engine)'}`);
+        return ok;
+    };
+    exports['WinHelpA'] = winHelp(false);
+    exports['WinHelpW'] = winHelp(true);
+
     exports['GetKeyboardType'] = (ctx, mem, args) => {
         const typeFlag = args[0] | 0;
         // 0 = keyboard type, 1 = subtype, 2 = number of function keys

@@ -38,6 +38,11 @@ const SMACK_STRUCT_SIZE = 0x500;
 const SMACKBUF_STRUCT_SIZE = 0x450;
 const SMACK_FROM_HANDLE = 0x1000;
 
+/** SmackSum (RAD Smacker SDK): TotalTime, MS100PerFrame, TotalOpenTime, TotalFrames, ... */
+const SMACK_SUM_SIZE = 19 * 4;
+const SMACK_SUM_MS100_PER_FRAME = 4;
+const SMACK_SUM_TOTAL_FRAMES = 12;
+
 /** HSMACK fields the caller polls between frames (offsets from the shipped smackw32.dll). */
 const SMACK_NEW_PALETTE = 0x68;   // set by the frame-prepare step, cleared when the frame has no palette
 const SMACK_PALETTE = 0x6c;       // 256 x RGB triples
@@ -1393,6 +1398,24 @@ export class SmackW32 implements IModule {
                 const centibels = linear <= 0 ? -10000 : Math.max(-10000, Math.round(2000 * Math.log10(linear)));
                 setCtrl(s.audioSab, CTRL_VOLUME, centibels);
             }
+            return 0;
+        };
+
+        // void SmackSummary(HSMACK, SmackSum*): playback statistics, 19 DWORDs. We keep
+        // no timing ledger, so only the frame count and rate are real; the timings,
+        // skip counts and memory figures read as zero rather than as invented numbers.
+        this.exports["_SmackSummary@8"] = (_ctx, _mem, args) => {
+            const smk = args[0] >>> 0;
+            const sum = args[1] >>> 0;
+            if (!this.validateWritableSpan(sum, SMACK_SUM_SIZE)) return 0;
+            const out = new Uint8Array(SMACK_SUM_SIZE);
+            const s = this.sessions.get(smk);
+            if (s) {
+                const view = new DataView(out.buffer);
+                view.setUint32(SMACK_SUM_MS100_PER_FRAME, s.fps > 0 ? Math.round(100000 / s.fps) : 0, true);
+                view.setUint32(SMACK_SUM_TOTAL_FRAMES, s.frameDecodeCount >>> 0, true);
+            }
+            this.writeBytesChecked(sum, out);
             return 0;
         };
     }

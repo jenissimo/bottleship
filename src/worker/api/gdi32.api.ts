@@ -120,6 +120,7 @@ export const gdi32Module: ModuleDescriptor = {
         // Additional GDI imports seen in modern compatibility layers
         makeFunc("GetRandomRgn", 3),
         makeFunc("SetPaletteEntries", 4),
+        makeFunc("AnimatePalette", 4),
         makeFunc("ResizePalette", 2),
         makeFunc("GetRegionData", 3),
         makeFunc("ExtCreateRegion", 3),

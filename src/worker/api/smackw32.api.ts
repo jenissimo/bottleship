@@ -38,6 +38,7 @@ export const smackw32Module: ModuleDescriptor = {
         makeFunc("_SmackNextFrame@4", 1),         // handle
         makeFunc("_SmackWait@4", 1),              // handle
         makeFunc("_SmackGoto@8", 2),              // handle, frame
+        makeFunc("_SmackSummary@8", 2),           // handle, SmackSum*
 
         // Buffer operations
         makeFunc("_SmackToBuffer@28", 7),         // handle, left, top, pitch, height, buf, flags

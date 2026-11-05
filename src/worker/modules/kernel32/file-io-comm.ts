@@ -16,6 +16,8 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { releaseSocketCompletionWait, socketCompletionWait } from './socket-completion-wait';
 import { completeWait, setWaitCompletionHandler } from '../../core/scheduler/wait-completion';
 
+const ERROR_INVALID_FUNCTION = 1;
+const ERROR_INVALID_HANDLE = 6;
 const ERROR_INVALID_PARAMETER = 87;
 const ERROR_IO_INCOMPLETE = 996;
 const COMMCONFIG_SIZE = 48;
@@ -154,6 +156,18 @@ export function registerFileIoCommExports(exports: Record<string, ThunkImplement
 
     exports['SetCommTimeouts'] = (ctx, mem, args) => {
         return 1;
+    };
+
+    // BOOL GetCommTimeouts(HANDLE, LPCOMMTIMEOUTS). No serial port is emulated, so no
+    // handle is a comm device and the struct is never filled. Windows issues
+    // IOCTL_SERIAL_GET_TIMEOUTS: a file or other device rejects it as
+    // ERROR_INVALID_FUNCTION, a value that is no I/O handle at all as ERROR_INVALID_HANDLE.
+    exports['GetCommTimeouts'] = (ctx, mem, args) => {
+        const hFile = args[0] >>> 0;
+        const system = System.getInstance();
+        const isIoHandle = !!system.resourceProvider.getFileHandle(hFile);
+        system.scheduler.setLastError(isIoHandle ? ERROR_INVALID_FUNCTION : ERROR_INVALID_HANDLE);
+        return 0;
     };
 
     exports['GetCommModemStatus'] = (ctx, mem, args) => {
