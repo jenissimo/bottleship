@@ -178,7 +178,7 @@ import { EmulatorConfig } from "./core/emulator-config-manager";
 import { configureNetplay } from "./net/configure-netplay";
 import { lanNetwork } from "./net/lan-network";
 import type { NetworkStatus } from "../network-config";
-import { logQualityGapsOnce, activeQualityBackend, onQualityBackendChanged } from "./backends/webgpu/shared/quality-capabilities";
+import { logQualityGapsOnce, activeQualityBackend, onQualityBackendChanged, internalScaleSupport } from "./backends/webgpu/shared/quality-capabilities";
 import type { QualityConfig } from "./core/quality-config";
 import { videoEngine } from "../video/video-engine";
 import { preemptionManager } from "./core/cpu/preemption-manager";
@@ -3475,7 +3475,14 @@ function resumeEmulator(): void {
  */
 function postQualityState(q: QualityConfig): void {
     const gaps = logQualityGapsOnce(q);
-    self.postMessage({ type: "set_quality", ok: true, quality: q, unsupported: gaps, backend: activeQualityBackend() });
+    // `unsupported` answers "did the user ask this backend for something it cannot do".
+    // That is a different question from "can this backend apply internalScale at all", and
+    // only the second one lets the panel label the resolution honestly: an untouched Auto
+    // is never a gap, so a backend with no internal-resolution path looks supported.
+    self.postMessage({
+        type: "set_quality", ok: true, quality: q, unsupported: gaps,
+        backend: activeQualityBackend(), internalScale: internalScaleSupport(),
+    });
 }
 
 onQualityBackendChanged(() => postQualityState(EmulatorConfig.getInstance().quality));

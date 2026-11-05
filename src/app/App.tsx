@@ -48,6 +48,7 @@ import { loadGamesCatalog } from "../games-catalog";
 import { browserPolicyBlock, loadDeploymentConfig } from "../deployment-config";
 import { DEFAULT_QUALITY, mergeQuality, parseStoredQuality, serializeStoredQuality } from "../worker/core/quality-config";
 import type { QualityConfig } from "../worker/core/quality-config";
+import type { InternalScaleSupport } from "../worker/backends/webgpu/shared/internal-resolution";
 import {
   clientToGuestPoint,
   contentRectFromPresentRect,
@@ -418,6 +419,10 @@ export default function App() {
   // not implement — see shared/quality-capabilities.ts. Surfaced in QualityPanel so a
   // knob that provably does nothing on this backend reads as such, not as "applied".
   const [unsupportedQualityKeys, setUnsupportedQualityKeys] = useState<ReadonlySet<string>>(new Set());
+  // Whether the active backend applies `internalScale` at all, and what Auto means there —
+  // a different question from "is this key currently a gap" (see QualityPanel). Optimistic
+  // until the first ack, so a panel opened before any backend registered reads as before.
+  const [internalScaleSupport, setInternalScaleSupport] = useState<InternalScaleSupport>({ implemented: true, autoIsNative: false });
   // Keys where the worker's EFFECTIVE config differs from the preference we sent — i.e. the
   // loaded game's manifest is overriding them. Derived from the ack rather than asked for
   // separately: the ack already carries the effective config, and anything else could drift
@@ -1785,6 +1790,13 @@ export default function App() {
       if (event.data?.type === "set_quality") {
         const unsupported = Array.isArray(event.data.unsupported) ? event.data.unsupported : [];
         setUnsupportedQualityKeys(new Set(unsupported));
+        const support = event.data.internalScale as Partial<InternalScaleSupport> | undefined;
+        if (support && typeof support === "object") {
+          setInternalScaleSupport({
+            implemented: !!support.implemented,
+            autoIsNative: !!support.autoIsNative,
+          });
+        }
         const effective = event.data.quality as Partial<QualityConfig> | undefined;
         const pref = qualityRef.current as unknown as Record<string, unknown>;
         setOverriddenQualityKeys(effective
@@ -3010,6 +3022,7 @@ export default function App() {
       quality={quality}
       onChange={handleQualityChange}
       unsupportedQualityKeys={unsupportedQualityKeys}
+      internalScaleSupport={internalScaleSupport}
       overriddenQualityKeys={overriddenQualityKeys}
       uiSettings={uiSettings}
       onUiChange={handleUiChange}

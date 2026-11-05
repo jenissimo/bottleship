@@ -35,6 +35,52 @@ const AUTO_SUPERSAMPLE = 2;
 const MAX_SCALE = 4;
 
 /**
+ * What a backend declared about `internalScale`. Answered by the backend's own registration
+ * (shared/quality-capabilities.ts) and carried to the host with the quality ack, so the
+ * panel never has to guess from the backend's name.
+ */
+export interface InternalScaleSupport {
+    /** Whether the backend's render path reads `internalScale` at all. */
+    implemented: boolean;
+    /** Whether Auto (0) means "guest resolution", not "fit the canvas and supersample". */
+    autoIsNative: boolean;
+}
+
+/**
+ * What a backend will actually render at, given what it can honour.
+ *
+ * `resolveInternalScaleFactor` answers "what would this setting mean if the backend applied
+ * it". The panel cannot use that answer alone: a backend that never reads `internalScale`
+ * renders the guest's own resolution whatever is asked for, and D3D9 reads the setting but
+ * maps Auto (0) to Native for a documented reason of its own (its occlusion queries expose
+ * the raster sample grid, so fractional supersampling changes edge coverage). Both used to
+ * be reported as if the setting had been applied — ddraw at 640x480 was labelled "4.00x".
+ *
+ * So this takes the backend's answer as a parameter rather than guessing it, and returns
+ * `applied: false` where nothing reads the setting at all: the honest label there is "the
+ * game still renders at WxH", not a multiplier that never happened.
+ */
+export function resolveEffectiveInternalScale(
+    internalScaleSetting: number,
+    guestWidth: number,
+    guestHeight: number,
+    canvasWidth: number,
+    canvasHeight: number,
+    support: InternalScaleSupport,
+): { applied: boolean; factor: number } {
+    if (!support.implemented) return { applied: false, factor: 1 };
+    const n = Number(internalScaleSetting);
+    // Auto is the default, and the one regime a backend may reinterpret: D3D9 pins it to 1x.
+    if (support.autoIsNative && !(Number.isFinite(n) && n >= 1)) {
+        return { applied: true, factor: 1 };
+    }
+    return {
+        applied: true,
+        factor: resolveInternalScaleFactor(internalScaleSetting, guestWidth, guestHeight, canvasWidth, canvasHeight),
+    };
+}
+
+/**
  * The single uniform scale factor to render `guestWidth x guestHeight` at, given the
  * canvas's own physical-pixel size and the user's `internalScale` setting.
  *
