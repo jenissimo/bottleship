@@ -14,8 +14,9 @@
  *   1. EA WinZip self-installer   (`compressed.zip` payload + `common_filelist.txt` manifest)
  *   2. InstallShield 5/6 cabinet  (`<stem>1.hdr` + `<stem>{N}.cab`)
  *   3. FreeArc archive            (`ArC\x01` magic — `.pak`/`.arc`/`.bin` repack payload)
- *   4. CAB self-extractor (MSCF appended to a stub → installer or direct game payload)
+ *   4. PackageForTheWeb (MSCF appended to a stub, holding an InstallShield disk set)
  *   5. Inno Setup, self-contained (a `setup.exe` whose data is embedded in the exe)
+ *   6. CAB / ZIP self-extractor (an archive appended to a stub → direct game payload)
  * The EA format is probed FIRST: its container also carries an `eauninstall.exe`/`setup.exe`
  * shell that the Inno probe would waste time parsing, and its signature is unambiguous.
  * FreeArc is probed BEFORE Inno on purpose: Russian repacks ship an Inno `setup.exe`
@@ -32,6 +33,7 @@
 import {
     BufferSource,
     extractInnoToMap,
+    loadOffsets,
     parseInnoHeader,
     type InnoParseResult,
 } from "@bottleship/formats/inno";
@@ -465,6 +467,11 @@ const innoFormat: InstallerFormat<{ bytes: Uint8Array; parsed: InnoParseResult; 
 function findCabSelfExtractor(files: Map<string, Uint8Array>, requireInstaller: boolean): { exe: Uint8Array } | null {
     for (const [rel, data] of files) {
         if (!rel.toLowerCase().endsWith('.exe') || data.length < 4 || data[0] !== 0x4d || data[1] !== 0x5a) continue;
+        // An Inno Setup loader stores its payload behind the stub too, and that payload can
+        // hold a whole stored cabinet (GOG installers carry DirectX's). Its own setup-loader
+        // table names it, so it is never a cabinet self-extractor — even when no LZMA codec
+        // was supplied and the Inno format could not claim it first.
+        if (isInnoSetupLoader(data)) continue;
         const off = findCabinet(data);
         if (off == null || off === 0) continue;
         const cab = parseCabHeader(data, off);
@@ -473,6 +480,16 @@ function findCabSelfExtractor(files: Map<string, Uint8Array>, requireInstaller: 
         return { exe: data };
     }
     return null;
+}
+
+/** True when `exe` carries an Inno Setup loader offset table with a known loader magic. */
+export function isInnoSetupLoader(exe: Uint8Array): boolean {
+    try {
+        const offsets = loadOffsets(new BufferSource(exe));
+        return offsets.foundMagic && offsets.loaderVersion !== 0xffffffff && offsets.dataOffset > 0;
+    } catch {
+        return false;
+    }
 }
 
 async function unwrapCabSelfExtractor(match: { exe: Uint8Array }, ctx: ContainerExtractOptions) {
@@ -640,7 +657,7 @@ const INSTALLER_FORMATS: InstallerFormat<any>[] = [
     singlePayload('installshield3', 'InstallShield 3 Z archive', isInstallShield3, extractInstallShield3),
     singlePayload('wise', 'Wise DEFLATE installer', isWise, extractWise),
     singlePayload('vise', 'VISE object-table installer', isVise, extractVise),
-    rar4Format, isoFormat, freeArcFormat, pftwFormat, cabSfxFormat, zipSfxFormat, innoFormat,
+    rar4Format, isoFormat, freeArcFormat, pftwFormat, innoFormat, cabSfxFormat, zipSfxFormat,
 ];
 
 // --- the recursion ------------------------------------------------------------------
