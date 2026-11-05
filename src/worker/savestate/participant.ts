@@ -88,6 +88,7 @@ export function uncoveredModules(touched: Iterable<string>, covered: ReadonlySet
 
 export class ParticipantRegistry {
     private readonly list: Participant[] = [];
+    private readonly statelessList = new Map<string, string>();
 
     add(participant: Participant): () => void {
         const at = this.list.findIndex(p => p.id === participant.id);
@@ -103,8 +104,17 @@ export class ParticipantRegistry {
         return [...this.list].sort((a, b) => (a.order ?? 50) - (b.order ?? 50));
     }
 
+    stateless(module: string, reason: string): void {
+        if (!reason.trim()) throw new Error(`savestate: ${module} is declared stateless without a reason`);
+        this.statelessList.set(normalizeModuleName(module), reason);
+    }
+
+    statelessModules(): ReadonlyMap<string, string> {
+        return this.statelessList;
+    }
+
     coveredModules(): Set<string> {
-        const out = new Set<string>();
+        const out = new Set<string>(this.statelessList.keys());
         for (const p of this.list) for (const m of p.covers ?? []) out.add(normalizeModuleName(m));
         return out;
     }

@@ -42,7 +42,7 @@ describe("session state registry", () => {
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { censusOf, coveredModulesOf, moduleOfFile, runCensus, stripNonCode } from "../validate-session-state";
+import { censusOf, coveredModulesOf, moduleOfFile, runCensus, statelessModulesOf, stripNonCode } from "../validate-session-state";
 
 describe("session-state census", () => {
     test("names module-scope and factory-scope mutable bindings, skips ones with a stated reason", () => {
@@ -220,6 +220,44 @@ describe("session-state census gate", () => {
             writeFileSync(join(t.root, "modules/user32/a.ts"), "// @transient(diagnostics)\nlet pinned = 0;\n// @participant(user32)\nlet saved = 0;\n");
             expect(runCensus(t).ok).toBe(true);
         } finally { t.done(); }
+    });
+
+    test("a module declared stateless may only hold @transient bindings, with a reason that says why", () => {
+        const write = (root: string, files: Record<string, string>) => {
+            for (const [name, body] of Object.entries(files)) {
+                mkdirSync(join(root, name, ".."), { recursive: true });
+                writeFileSync(join(root, name), body);
+            }
+        };
+        const t = setup({}, {});
+        try {
+            write(t.root, {
+                "savestate/participant-ids.ts": "export const PARTICIPANT_IDS = ['user32'] as const;\n",
+                "savestate/stateless-modules.ts": "export const STATELESS_MODULES = {\n    shlwapi: 'path helpers over guest buffers; nothing kept between calls',\n    psapi: 'stateless',\n} as const;\n",
+                "modules/shlwapi.ts": "let loose = 0;\n// @participant(user32)\nlet saved = 0;\n// @refuse(open thing)\nlet refused = 0;\n// @transient(constant table)\nconst table = [];\n",
+            });
+            writeFileSync(t.pin, JSON.stringify({ "src/modules/shlwapi.ts": ["loose"] }));
+            const out = runCensus(t).lines.join("\n");
+            expect(out).toContain("UNCLASSIFIED: src/modules/shlwapi.ts — loose (shlwapi is declared stateless");
+            expect(out).toContain("STATEFUL: src/modules/shlwapi.ts:3,5 — shlwapi is declared stateless");
+            expect(out).toContain("STATELESS REASON: savestate/stateless-modules.ts:3: psapi needs a reason");
+            write(t.root, {
+                "savestate/stateless-modules.ts": "export const STATELESS_MODULES = {\n    shlwapi: 'path helpers over guest buffers; nothing kept between calls',\n    user32: 'windows',\n} as const;\n",
+                "savestate/user32.ts": "savestateParticipants.add({ id: 'user32', covers: ['user32'] });\n",
+                "modules/shlwapi.ts": "// @transient(constant table)\nconst table = [];\n",
+            });
+            writeFileSync(t.pin, JSON.stringify({}));
+            const both = runCensus(t);
+            expect(both.lines.join("\n")).toContain("STATELESS AND COVERED: user32");
+            write(t.root, { "savestate/stateless-modules.ts": "export const STATELESS_MODULES = {\n    shlwapi: 'path helpers over guest buffers; nothing kept between calls',\n} as const;\n" });
+            expect(runCensus(t).ok).toBe(true);
+        } finally { t.done(); }
+    });
+
+    test("statelessModulesOf reads names and reasons and rejects a bare reason", () => {
+        const { modules, bad } = statelessModulesOf("export const STATELESS_MODULES = {\n    \"Shlwapi\": \"path helpers; nothing kept\",\n    version: 'none',\n} as const;\n");
+        expect([...modules]).toEqual([["shlwapi", "path helpers; nothing kept"], ["version", "none"]]);
+        expect(bad).toEqual(["3: version needs a reason that says why nothing survives a call"]);
     });
 
     test("--update writes a pin the check then accepts", () => {

@@ -9,8 +9,9 @@ import { MemoryManager } from "../../src/worker/core/process";
 import { ThunkGenerator } from "../../src/worker/core/thunking/thunk-generator";
 import { ResourceTable } from "../../src/worker/core/resource-table";
 import { newObjectGraph, restoreObjectGraph } from "../../src/worker/savestate/object-codecs";
+import { STATELESS_MODULES } from "../../src/worker/savestate/stateless-modules";
 import { checkLoadedModules, registerCoreParticipants, touchedModules } from "../../src/worker/savestate/core-participants";
-import { savestateParticipants, schemaHash, uncoveredModules } from "../../src/worker/savestate/participant";
+import { ParticipantRegistry, savestateParticipants, schemaHash, uncoveredModules } from "../../src/worker/savestate/participant";
 import { captureKernel32State, restoreKernel32State } from "../../src/worker/modules/kernel32/savestate";
 import { namedObjects } from "../../src/worker/modules/kernel32/named-objects";
 import { captureAtoms } from "../../src/worker/modules/kernel32/atom";
@@ -392,6 +393,21 @@ describe("module coverage", () => {
     test("names every touched module that no participant captures", () => {
         expect(uncoveredModules(["KERNEL32.dll", "user32.dll", "C:\\GAME\\ddraw.DLL", "ntdll"], new Set(["kernel32", "ntdll"])))
             .toEqual(["ddraw", "user32"]);
+    });
+
+    test("a module declared stateless counts as covered and needs a reason", () => {
+        const reg = new ParticipantRegistry();
+        reg.stateless("SHLWAPI.dll", "path helpers over guest buffers; nothing kept between calls");
+        expect(reg.coveredModules().has("shlwapi")).toBe(true);
+        expect(uncoveredModules(["shlwapi", "psapi"], reg.coveredModules())).toEqual(["psapi"]);
+        expect(() => reg.stateless("psapi", " ")).toThrow("without a reason");
+    });
+
+    test("every declared stateless module is registered with the core participants", () => {
+        registerCoreParticipants();
+        for (const [module, reason] of Object.entries(STATELESS_MODULES)) {
+            expect(savestateParticipants.statelessModules().get(module)).toBe(reason);
+        }
     });
 
     test("a restore whose loaded modules differ from the save fails and names them", () => {
