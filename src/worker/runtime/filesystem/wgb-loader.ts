@@ -1,4 +1,4 @@
-import { BlobSource, BufferSource, SyncHttpRangeSource, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
+import { BlobSource, BufferSource, SyncHttpRangeSource, WGB_BLOCK_INDEX_ENTRY, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
 import type { ZipSource } from "@bottleship/formats/zip";
 import type { ExeRegistryRedirect } from "@bottleship/formats/sdb";
 import { CachedSource, computeAdaptiveMaxBytes } from "./cached-source";
@@ -475,7 +475,7 @@ export function buildRomIndex(archive: ZipArchive, romRoot: string): Map<string,
 
     for (const entry of archive.listEntries()) {
         const entryName = normalizeZipPath(entry.name);
-        if (!entryName.startsWith(prefix) || entry.isDirectory) continue;
+        if (!entryName.startsWith(prefix) || entry.isDirectory || entryName === WGB_BLOCK_INDEX_ENTRY) continue;
         const rel = entryName.slice(prefix.length);
         index.set(rel, entry);
     }

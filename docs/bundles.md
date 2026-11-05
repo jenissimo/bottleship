@@ -1,6 +1,7 @@
 # Game bundles (`.wgb`)
 
-BottleShip runs a game from a **`.wgb`** bundle — a *store-only* (uncompressed) ZIP that
+BottleShip runs a game from a **`.wgb`** bundle — a *store-only* (uncompressed) ZIP, optionally
+block-compressed (see below), that
 packages a game together with the metadata the engine needs to boot it. This document covers
 the format and the tools for creating and inspecting bundles, plus how to bring your own games.
 
@@ -68,6 +69,33 @@ MATCHING_FILE could identify (NAME `*`) are skipped and reported, as are other s
 VirtualRegistry commands. Per exe, a rule whose target overlaps a source (its own or another
 rule's: a target inside the source, chains, cycles) and a rule on a whole root key (`HKLM`) are
 rejected with a warning, both here and again when the bundle loads.
+
+## Block compression: `wgb-compress`
+
+A bundle may carry DEFLATE members as long as each one is **block-indexed**. The tool
+turns a store-only bundle into one:
+
+```bash
+bun tools/wgb-compress.ts game.wgb game.packed.wgb --block-kib 64
+```
+
+- Each member that shrinks by at least 5 % (and 4 KiB) becomes an ordinary ZIP method-8
+  member whose DEFLATE stream is cut with a full flush every 64 KiB of file data. A full
+  flush byte-aligns the stream and clears the history window, so every block decodes on
+  its own. Everything else, and `manifest.json` / `registry.json`, stays STORED.
+- `wgb-blocks.idx` (a STORED member) lists, per compressed member, its name, sizes, CRC,
+  block size and the compressed length of every block. A row that no longer matches its
+  member (size or CRC changed) is ignored, and such a member is rejected at mount like
+  any other compressed member.
+- The archive stays a standard ZIP; any unzip tool extracts it. The decompressed bytes
+  are identical to the input, and the tool verifies every member before it renames the
+  output into place. Packing is deterministic.
+- At run time a range read fetches only the compressed blocks it overlaps, as one range
+  request, and decodes them synchronously; decoded blocks are kept in a small LRU (16 MiB
+  by default). The streaming transport, the sparse OPFS copy, the strong-ETag check and
+  I/O profiles all keep working on archive offsets, i.e. on the compressed bytes.
+
+`wgb.ts` edits store-only bundles; edit the store-only source and compress again.
 
 ## Inspecting & patching: `wgb.ts`
 
