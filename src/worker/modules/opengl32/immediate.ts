@@ -1064,9 +1064,9 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
  * OUT-trap overhead in games using immediate mode.  Replacing them with JMP-trampoline stubs
  * saves ~75 ms/frame on a typical OpenGL game (140K glVertex3fv calls × 7 µs each).
  *
- * Flush triggers (glEnd, glFlush, wglSwapBuffers) remain as OUT traps.  drainWriteBuffer()
- * is called at the top of handlePortWrite(), so all buffered vertex data is applied before
- * glEnd's emitDrawCommandFlat() runs.
+ * glEnd is ring-borne too (wbuf-state.ts), so it is applied in FIFO order right after its
+ * vertices. drainWriteBuffer() runs at the top of handlePortWrite(), so every trapping call
+ * (glFlush, SwapBuffers, glGet*) observes all buffered work.
  *
  * Display-list recording: each handler checks ctx.compilingList.  During GL_COMPILE the
  * args are recorded into compilingCommands and execution is skipped.  During
