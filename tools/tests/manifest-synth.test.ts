@@ -33,6 +33,38 @@ function fakeParsed(header: Partial<Record<string, string>>): InnoParseResult {
     } as unknown as InnoParseResult;
 }
 
+function shortcut(filename: string, parameters: string) {
+    return { name: "{group}\\Play", filename, parameters, workingDir: "{app}", iconFile: "", comment: "",
+        appUserModelId: "", iconIndex: 0, showCommand: 1, closeOnExit: 0, hotkey: 0, options: 0 };
+}
+
+describe("gog-import/synthesizeManifest shortcut command line", () => {
+    // Pre-Galaxy GOG installers (no goggame-*.info) start Cossacks: European Wars through a
+    // playlist player that quits when it gets no arguments.
+    const cossacks = ".\\videos\\cdv.avi .\\videos\\kz.avi .\\videos\\Logo.avi dmln.exe";
+
+    test("the shortcut that picks the entrypoint also supplies its arguments", () => {
+        const parsed = { ...fakeParsed({}), icons: [shortcut("{app}\\Cossacks.exe", cossacks)] } as unknown as InnoParseResult;
+        const { manifest } = synthesizeManifest({ parsed, gameFiles: new Map() });
+        expect(manifest.entrypoint).toBe("rom/Cossacks.exe");
+        expect(manifest.args).toBe(cossacks);
+    });
+
+    test("{app} in parameters resolves; other unresolved constants drop the arguments", () => {
+        const resolved = { ...fakeParsed({}), icons: [shortcut("{app}\\game.exe", "-data {app}\\data")] } as unknown as InnoParseResult;
+        expect(synthesizeManifest({ parsed: resolved, gameFiles: new Map() }).manifest.args).toBe("-data C:\\data");
+        const unresolved = { ...fakeParsed({}), icons: [shortcut("{app}\\game.exe", "-cd {src}")] } as unknown as InnoParseResult;
+        expect(synthesizeManifest({ parsed: unresolved, gameFiles: new Map() }).manifest.args).toBeUndefined();
+    });
+
+    test("an explicit --exe does not inherit a shortcut's arguments", () => {
+        const parsed = { ...fakeParsed({}), icons: [shortcut("{app}\\Cossacks.exe", cossacks)] } as unknown as InnoParseResult;
+        const { manifest } = synthesizeManifest({ parsed, gameFiles: new Map(), cli: { exe: "dmcr.exe" } });
+        expect(manifest.entrypoint).toBe("rom/dmcr.exe");
+        expect(manifest.args).toBeUndefined();
+    });
+});
+
 describe("gog-import/synthesizeManifest meta block", () => {
     test("emits manifest.meta with developer + year from the Inno header", () => {
         const { manifest } = synthesizeManifest({

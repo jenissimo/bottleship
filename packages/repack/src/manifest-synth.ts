@@ -176,12 +176,24 @@ export function synthesizeRegistry(
     return [...byHive.values()];
 }
 
-function iconEntrypoint(icons: IconEntry[]): string | undefined {
+/**
+ * The first `{app}` shortcut: its target AND its command line. Pre-Galaxy GOG installers
+ * carry no goggame-*.info, so the shortcut is the only record of how the game is started —
+ * and some start it with arguments it cannot run without (Cossacks: European Wars runs
+ * `Cossacks.exe .\videos\cdv.avi .\videos\kz.avi .\videos\Logo.avi dmln.exe`, a GOG
+ * playlist player that terminates at once when ParamStr(1) is empty).
+ */
+export function iconEntrypoint(icons: IconEntry[], installRoot = "C:\\"): { exe: string; args?: string } | undefined {
     for (const icon of icons) {
         const target = icon.filename.replace(/\\/g, "/");
         if (target.toLowerCase().includes("{app}")) {
             const rel = target.replace(/^\{app\}[\\/]/i, "");
-            if (rel && !rel.includes("{")) return rel;
+            if (rel && !rel.includes("{")) {
+                const params = resolveAppPath(icon.parameters ?? "", installRoot).trim();
+                // A parameter that still names an unresolved Inno constant ({src}, {code:…})
+                // cannot be reproduced here; launching without it beats a bogus argument.
+                return params && !params.includes("{") ? { exe: rel, args: params } : { exe: rel };
+            }
         }
     }
     return undefined;
@@ -257,9 +269,10 @@ export function synthesizeManifest(opts: SynthOptions): SynthResult {
     const osVer = OS_PRESETS[osKey] ?? OS_PRESETS.win98!;
 
     const filteredPaths = [...opts.gameFiles.keys()].filter((p) => !p.startsWith("__"));
+    const icon = cli.exe || gogInfo.exe ? undefined : iconEntrypoint(opts.parsed.icons ?? [], cli.regInstall ?? "C:\\");
     const exeName = cli.exe
         ?? gogInfo.exe
-        ?? iconEntrypoint(opts.parsed.icons)
+        ?? icon?.exe
         ?? detectExeFromPaths(filteredPaths);
 
     if (!exeName) {
@@ -267,7 +280,9 @@ export function synthesizeManifest(opts: SynthOptions): SynthResult {
     }
 
     const name = cli.name ?? gogInfo.name ?? opts.parsed.header.appName ?? "GOG Game";
-    const gameArgs = cli.args ?? gogInfo.args;
+    // Arguments travel with the entrypoint they were written for: a shortcut's command
+    // line is only meaningful when the shortcut also chose the exe.
+    const gameArgs = cli.args ?? (gogInfo.exe ? gogInfo.args : icon?.args ?? gogInfo.args);
     const width = cli.width ?? 1024;
     const height = cli.height ?? 768;
     const bpp = cli.bpp ?? 32;
