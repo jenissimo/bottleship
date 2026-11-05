@@ -6,6 +6,8 @@ interface DevPanelProps {
   onLoadFile: (file: File) => boolean;
   /** Dev-server only (the listing route does not exist in a build) — omitted otherwise. */
   onOpenBundles?: () => void;
+  /** Dev-server only: the manual smoke-run checklist. */
+  onOpenSmokeRun?: () => void;
   onOpenSettings: () => void;
   onCaptureFrame: () => void;
   statsOverlayEnabled: boolean;
@@ -53,6 +55,11 @@ export default function DevPanel(props: DevPanelProps) {
         {props.onOpenBundles && (
           <ActionButton onClick={props.onOpenBundles} title="Browse .wgb bundles on disk (public/apps, the external-wgb drop folder, BS_WGB_ROOTS)">
             Bundles...
+          </ActionButton>
+        )}
+        {props.onOpenSmokeRun && (
+          <ActionButton onClick={props.onOpenSmokeRun} title="Manual smoke run: walk every game of a source, mark OK / regression, export a report">
+            Smoke run...
           </ActionButton>
         )}
         <ActionButton variant="secondary" onClick={props.onOpenSettings}>

@@ -51,6 +51,8 @@ interface GameSelectScreenProps {
   onAddGame: () => void;
   onDevMode: () => void;
   onManageStorage?: () => void;
+  /** Dev server only: the manual smoke-run checklist. Omitted in a build. */
+  onSmokeRun?: () => void;
   onOpenSettings?: () => void;
   disableSelection?: boolean;
   unsupportedMessage?: string | null;
@@ -84,6 +86,7 @@ export default function GameSelectScreen({
   onAddGame,
   onDevMode,
   onManageStorage,
+  onSmokeRun,
   onOpenSettings,
   disableSelection = false,
   unsupportedMessage = null,
@@ -432,6 +435,12 @@ export default function GameSelectScreen({
             <a onClick={() => onManageStorage?.()}>Storage</a>
             <span className={s["sep"]}>·</span>
             <a onClick={() => !disableSelection && onDevMode()}>Developer</a>
+            {onSmokeRun && (
+              <>
+                <span className={s["sep"]}>·</span>
+                <a onClick={onSmokeRun}>Smoke run</a>
+              </>
+            )}
           </div>
         </div>
       )}

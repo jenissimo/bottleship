@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SessionWorker } from './session-worker';
 import { ChildSessionSurface } from './child-session-surface';
 import { cx } from "../ui/cx";
@@ -12,6 +12,17 @@ import MemoryPanel from '../debug/MemoryPanel';
 import ProfilerPanel from '../debug/ProfilerPanel';
 import DebugGPUPanel from '../debug/DebugGPUPanel';
 import FrameAnalysisPanel from '../debug/FrameAnalysisPanel';
+// Dev-only smoke-run checklist. Behind import.meta.env.DEV so a production build drops
+// the chunk entirely (the list needs the dev-only /__wgb/list route anyway).
+const SmokeRunModal = import.meta.env.DEV ? lazy(() => import('../debug/smoke/SmokeRunModal')) : null;
+const SmokePanel = import.meta.env.DEV
+  ? lazy(() => import('../debug/smoke/SmokePanel').then((m) => ({ default: m.SmokePanel })))
+  : null;
+/** Keys typed into a host overlay that takes text (smoke-run note) belong to it, not to
+ *  the guest. Opt-in by `data-host-keys` so every other overlay keeps today's routing. */
+function isHostKeyTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest("[data-host-keys]") !== null;
+}
 import { InputStatusOverlay, type InputStatus } from './InputStatusOverlay';
 import { AudioEngine, AudioPlayEncodedPayload, AudioPlayPayload, AudioUpdatePayload } from "../audio/audio-engine";
 import { getLogClient, sendLogToServer, writeDebugFile, writeDebugFileBase64, rotateLogFile, logArtifactPath } from "../utils/log-client";
@@ -327,6 +338,10 @@ export default function App() {
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [opfsToolOpen, setOpfsToolOpen] = useState(false);
   const [wgbBrowserOpen, setWgbBrowserOpen] = useState(false);
+  // `?smoke` opens the smoke-run checklist straight away (library or game screen).
+  const [smokeRunOpen, setSmokeRunOpen] = useState(
+    () => import.meta.env.DEV && new URLSearchParams(window.location.search).has("smoke"),
+  );
   const [storageOpen, setStorageOpen] = useState(false);
   /** Chrome-free presentation where the Fullscreen API does not exist (iPhone Safari). */
   const [immersive, setImmersive] = useState(false);
@@ -1997,6 +2012,14 @@ export default function App() {
       const inputView = globalInputView;
       if (!inputView) return;
 
+      // A press that started in a host text overlay is the overlay's, and so is its
+      // release — a lone key-up must not reach the guest (Esc closing a note would
+      // otherwise read as a menu key). A key already held in the game still releases.
+      if (state === 1 ? isHostKeyTarget(event.target) : hostOwnedKeys.has(event.code)) {
+        if (state === 1) hostOwnedKeys.add(event.code); else hostOwnedKeys.delete(event.code);
+        return;
+      }
+
       // F11 = host fullscreen (Element Fullscreen API on the canvas panel). Not forwarded
       // to the guest — browsers reserve F11 for chrome fullscreen, and our hint advertises it.
       if (event.code === "F11") {
@@ -2046,6 +2069,8 @@ export default function App() {
     };
 
 
+    /** Codes whose key-down went to a host overlay (see isHostKeyTarget). */
+    const hostOwnedKeys = new Set<string>();
     const handleKeyDown = (event: KeyboardEvent) => handleKey(event, 1);
     const handleKeyUp = (event: KeyboardEvent) => handleKey(event, 0);
 
@@ -3030,6 +3055,7 @@ export default function App() {
             if (!launchBlocked) window.location.assign("?game=dev");
           }}
           onManageStorage={() => setStorageOpen(true)}
+          onSmokeRun={import.meta.env.DEV ? () => setSmokeRunOpen(true) : undefined}
           onOpenSettings={() => setMainSettingsOpen(true)}
           disableSelection={launchBlocked}
           unsupportedMessage={browserUnsupportedMessage}
@@ -3037,6 +3063,11 @@ export default function App() {
         {settingsDrawer}
         <VirtualKeyboardSheet open={oskOpen} onClose={() => setOskOpen(false)} />
         <StorageManagerModal isOpen={storageOpen} onClose={() => setStorageOpen(false)} />
+        {SmokeRunModal && smokeRunOpen && (
+          <Suspense fallback={null}>
+            <SmokeRunModal isOpen onClose={() => setSmokeRunOpen(false)} catalog={gamesCatalog} />
+          </Suspense>
+        )}
         <WgbWizardModal
           isOpen={addGameOpen}
           onClose={() => setAddGameOpen(false)}
@@ -3300,6 +3331,7 @@ export default function App() {
           onOpenFrameAnalysis={() => setFrameAnalysisOpen(true)}
           onOpenStorage={() => setStorageOpen(true)}
           onOpenBundles={import.meta.env.DEV ? () => setWgbBrowserOpen(true) : undefined}
+          onOpenSmokeRun={import.meta.env.DEV ? () => setSmokeRunOpen(true) : undefined}
           onOpenOpfsTool={() => setOpfsToolOpen(true)}
           onOpenRegistryTool={() => setRegistryToolOpen(true)}
           fpuStrictEnabled={fpuStrictEnabled}
@@ -3421,6 +3453,15 @@ export default function App() {
           gameName={gameDisplayName}
           onDismissError={() => setErrorMessage(null)}
         />
+        {SmokePanel && (
+          <Suspense fallback={null}>
+            <SmokePanel
+              hidden={smokeRunOpen}
+              onOpenList={() => setSmokeRunOpen(true)}
+              onReturnFocus={() => canvasRef.current?.focus()}
+            />
+          </Suspense>
+        )}
       </section>
 
       {/* Info strip — catalog games always; destin mode once the WGB manifest name arrives. */}
@@ -3451,6 +3492,15 @@ export default function App() {
           onClose={() => setWgbBrowserOpen(false)}
           onLaunch={handleLaunchBundle}
         />
+      )}
+      {SmokeRunModal && smokeRunOpen && (
+        <Suspense fallback={null}>
+          <SmokeRunModal
+            isOpen
+            onClose={() => { setSmokeRunOpen(false); canvasRef.current?.focus(); }}
+            catalog={gamesCatalog}
+          />
+        </Suspense>
       )}
       <StorageManagerModal isOpen={storageOpen} onClose={() => setStorageOpen(false)} />
       <RegistryTool isOpen={registryToolOpen} onClose={() => setRegistryToolOpen(false)} worker={globalWorker} />
