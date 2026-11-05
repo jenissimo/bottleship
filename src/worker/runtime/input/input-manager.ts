@@ -6,7 +6,7 @@
 import { WindowManager } from '../windowing/window-manager';
 import type { WindowObject } from '../windowing/window-manager';
 import { Logger, LogCategory } from '../../core/logger';
-import { getAbsoluteWindowPosition, clampToCursorClip, getWindowByHandle, getDoubleClickTimeMs } from '../../modules/user32/shared-state';
+import { getAbsoluteWindowPosition, clampToCursorClip, getVirtualScreenRect, getWindowByHandle, getDoubleClickTimeMs } from '../../modules/user32/shared-state';
 import { vkToDik } from '../../modules/dinput/dinput-vk-dik';
 import { TimeService } from '../time';
 import { markJoystickInputLost } from '../../modules/dinput/device-presence';
@@ -1730,20 +1730,29 @@ export class InputManager {
     }
 
     /**
-     * Feed RELATIVE pointer motion, leaving the absolute pointer where it is — the
-     * worker-side twin of the host's Pointer Lock branch (App.tsx addPointerRelative),
-     * which likewise publishes movement with no position. A guest steering by motion
-     * (DirectInput axes) sees this; one reading position does not. That split is the
-     * whole point: an absolute injector cannot express a delta larger than the screen,
-     * and a guest whose own cursor is already at the edge needs exactly that.
+     * Feed RELATIVE pointer motion — the worker-side twin of the host's Pointer Lock
+     * branch (App.tsx addPointerRelative). The raw delta goes to the DirectInput axes
+     * unclamped, so a guest whose own cursor is already at the edge still turns. As on
+     * Windows, the same device motion is also added to the one system cursor (from
+     * where the guest last put it, so a SetCursorPos recentre is honoured), clamped to
+     * the screen and ClipCursor: a title that emulates a relative mouse by reading
+     * WM_MOUSEMOVE against a recentred cursor (UE1's WinDrv) steers by this too.
      */
     injectPointerDelta(dx: number, dy: number): boolean {
         const view = this.inputView;
         if (!view) return false;
+        const screen = getVirtualScreenRect();
+        const x = Math.max(screen.left, Math.min(screen.right - 1, this.currentMouseX + (dx | 0)));
+        const y = Math.max(screen.top, Math.min(screen.bottom - 1, this.currentMouseY + (dy | 0)));
         beginInputWrite(view);
         if (dx) Atomics.add(view, INPUT_INDEX.dinputDX, dx | 0);
         if (dy) Atomics.add(view, INPUT_INDEX.dinputDY, dy | 0);
+        view[INPUT_INDEX.mouseX] = x;
+        view[INPUT_INDEX.mouseY] = y;
+        view[INPUT_INDEX.mouseInside] = 1;
         endInputWrite(view);
+        const confined = clampToCursorClip(x, y);
+        this.commitCursorPosition(confined.x, confined.y);
         this.poll(true);
         return true;
     }
