@@ -1,5 +1,5 @@
 import { savestateParticipants, uncoveredModules, type CaptureContext, type CpuOverride, type ParticipantRegistry } from './participant';
-import { restoreRam, snapshotRam, type RamCaptureStats, type RamManifest, type RamPatch } from './ram';
+import { restoreRam, snapshotRam, validateRamManifest, type RamCaptureStats, type RamManifest, type RamPatch } from './ram';
 import type { ChunkStore } from './chunk-store';
 import {
     decodeSavestate, encodeSavestate, incompatibilities, type CompatibilityKey, type Savestate,
@@ -45,6 +45,7 @@ export interface CaptureResult {
     pending: Map<string, Uint8Array>;
     ram: RamCaptureStats;
     sections: Record<string, number>;
+    ramHashMs: number;
 }
 
 export function coverageRefusal(target: Pick<SavestateTarget, 'touchedModules'>, participants: ParticipantRegistry = savestateParticipants): string | null {
@@ -68,7 +69,9 @@ export async function captureSession(
         sizes[p.id] = enc.json.length + enc.blobs.reduce((n, b) => n + b.length, 0);
     }
     sections.set(OBJECTS, run.objects as unknown as SaveValue);
-    const snap = await snapshotRam(target.guestMemory(), known, run.ramPatches);
+    const t0 = performance.now();
+    const snap = snapshotRam(target.guestMemory(), known, run.ramPatches);
+    const ramHashMs = performance.now() - t0;
     stillReady();
     const state: Savestate = {
         header: {
@@ -77,7 +80,7 @@ export async function captureSession(
         },
         sections,
     };
-    return { bytes: encodeSavestate(state), manifest: snap.manifest, pending: snap.pending, ram: snap.stats, sections: sizes };
+    return { bytes: encodeSavestate(state), manifest: snap.manifest, pending: snap.pending, ram: snap.stats, sections: sizes, ramHashMs };
 }
 
 export interface LoadCheck { ok: boolean; reasons: string[]; overlayChanged: boolean; state: Savestate }
@@ -92,9 +95,10 @@ export function checkSavestate(target: SavestateTarget, bytes: Uint8Array): Load
 export class RestoreFailed extends Error {}
 
 export async function missingChunks(manifest: RamManifest, store: ChunkStore): Promise<string[]> {
+    const present = new Set(await store.list());
     const out: string[] = [];
     for (const [, hash] of manifest.chunks) {
-        if (!(await store.has(hash)) || (await store.size(hash)) <= 1) out.push(hash);
+        if (!present.has(hash) || (await store.size(hash)) <= 1) out.push(hash);
     }
     return out;
 }
@@ -106,6 +110,7 @@ export async function missingChunks(manifest: RamManifest, store: ChunkStore): P
 export async function restoreSession(
     target: SavestateTarget, state: Savestate, store: ChunkStore, participants: ParticipantRegistry = savestateParticipants,
 ): Promise<void> {
+    validateRamManifest(state.header.ram, target.guestMemory().length);
     const missing = await missingChunks(state.header.ram, store);
     if (missing.length > 0) throw new Error(`savestate: ${missing.length} RAM chunk(s) are missing, e.g. ${missing[0]}`);
     try {

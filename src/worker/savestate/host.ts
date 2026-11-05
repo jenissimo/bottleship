@@ -182,7 +182,11 @@ export interface PendingLoadInput {
  * otherwise the request stays for the next fresh worker. Anything thrown before the first
  * write leaves the guest untouched; a RestoreFailed means it is half restored.
  */
-export async function runPendingLoad(input: PendingLoadInput): Promise<PendingLoadOutcome> {
+export function runPendingLoad(input: PendingLoadInput): Promise<PendingLoadOutcome> {
+    return withGameLock(input.game, () => runPendingLoadLocked(input));
+}
+
+async function runPendingLoadLocked(input: PendingLoadInput): Promise<PendingLoadOutcome> {
     const dir = await input.storage.gameDir(input.game);
     const bytes = await dir.read(PENDING);
     if (!bytes) return { kind: 'none' };
@@ -237,7 +241,7 @@ export async function deleteSlot(slot: string): Promise<{ removedChunks: number 
 
 export interface SaveReport {
     name: string; bytes: number; chunkBytes: number; chunkWrites: number;
-    ms: { paused: number; store: number }; sections: Record<string, number>; ram: unknown;
+    ms: { paused: number; ramHash: number; store: number }; sections: Record<string, number>; ram: unknown;
 }
 
 export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, permanentBlockers: () => string[] = () => []): Promise<SaveReport> {
@@ -265,7 +269,7 @@ export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, p
         const t2 = performance.now();
         return {
             name, bytes: result.bytes.length, chunkBytes, chunkWrites: result.ram.written,
-            ms: { paused: Math.round(t1 - t0), store: Math.round(t2 - t1) }, sections: result.sections, ram: result.ram,
+            ms: { paused: Math.round(t1 - t0), ramHash: Math.round(result.ramHashMs), store: Math.round(t2 - t1) }, sections: result.sections, ram: result.ram,
         };
     });
 }

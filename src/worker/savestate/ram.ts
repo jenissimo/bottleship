@@ -1,5 +1,6 @@
 import { isGuestRangeKnownZero, markGuestPagesDirty, zeroGuestRange } from '../core/memory/guest-page-dirty';
 import { deflate, inflate, isChunkHash, sha256Hex, type ChunkStore } from './chunk-store';
+import { sha256HexSync } from './sha256';
 
 export const RAM_CHUNK_SIZE = 64 * 1024;
 export const RAM_PAGE_SIZE = 4096;
@@ -62,10 +63,11 @@ export function validateRamManifest(manifest: unknown, guestLength?: number): Ra
 
 /**
  * Hashes the guest's non-zero chunks and copies only those the store does not have yet, so
- * the memory held afterwards follows the delta. The guest must stay paused until this
- * resolves; writing the pending chunks (writeRamChunks) can run after it resumes.
+ * the memory held afterwards follows the delta. It runs in one turn, so nothing can change
+ * guest RAM between the participants' records and this; writing the pending chunks
+ * (writeRamChunks) can run after the guest resumes.
  */
-export async function snapshotRam(mem: Uint8Array, known: ReadonlySet<string>, patches: readonly RamPatch[] = []): Promise<RamSnapshot> {
+export function snapshotRam(mem: Uint8Array, known: ReadonlySet<string>, patches: readonly RamPatch[] = []): RamSnapshot {
     const count = Math.ceil(mem.length / RAM_CHUNK_SIZE);
     const patched = new Map<number, Array<[number, number]>>();
     for (const { address, bytes } of patches) {
@@ -89,7 +91,7 @@ export async function snapshotRam(mem: Uint8Array, known: ReadonlySet<string>, p
         const bytes = mem.slice(base, base + size);
         if (fix) for (const [off, b] of fix) bytes[off] = b;
         if (isAllZero(bytes)) { stats.scannedZero++; continue; }
-        const hash = await sha256Hex(bytes);
+        const hash = sha256HexSync(bytes);
         manifest.chunks.push([i, hash]);
         if (known.has(hash) || pending.has(hash)) { stats.reused++; continue; }
         pending.set(hash, bytes);
