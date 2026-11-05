@@ -30,6 +30,7 @@ import { startProcessRuntime } from './runtime-child';
 import { createActCtxExports } from './actctx';
 import { versionVerifyExports } from './version-verify';
 import { GUEST_COMPUTER_NAME } from '../../../core/guest-identity';
+import { SYSTEM32_DIR } from '../../../core/dll-search-order';
 
 const ERROR_INVALID_HANDLE = 6;
 const ERROR_INVALID_PARAMETER = 87;
@@ -688,8 +689,10 @@ const failVirtualProcess = (
     currentDirectory: string,
     isWide: boolean,
     errorCode: number,
+    errOut?: { code: number },
 ): ThunkResult => {
     writeProcessInformationZeroed(lpProcessInformation);
+    if (errOut) errOut.code = errorCode;
     System.getInstance().scheduler.setLastError(errorCode);
     Logger.warn(
         LogCategory.KERNEL32,
@@ -698,6 +701,128 @@ const failVirtualProcess = (
     );
     return { value: 0, stackCleanup: 40 };
 };
+
+/** The Windows directories CreateProcess probes after the application directory. */
+const WINDOWS_DIRS = [SYSTEM32_DIR, 'C:\\WINDOWS\\SYSTEM\\', 'C:\\WINDOWS\\'];
+
+export interface CommandLineImage {
+    /** The resolved image to start, or "" when no prefix names an executable. */
+    imagePath: string;
+    /** Everything that followed the image token on the command line. */
+    reExecArgs: string;
+    /** The error CreateProcess must report when the image cannot be started. */
+    error: number;
+}
+
+/**
+ * The directories CreateProcess probes for a module named without a path
+ * (lpApplicationName = NULL, which is how WinExec calls it), in the documented
+ * order: the directory the parent's application was loaded from, the parent's
+ * current directory, the Windows system directories, then PATH from the parent's
+ * environment. The parent's current directory is `system.fileSystem.currentDir` —
+ * lpCurrentDirectory is the *child's* working directory, is not part of the
+ * search, and is only passed through to the child.
+ */
+export function imageSearchDirectories(system: System): string[] {
+    const dirs: string[] = [];
+    const push = (d: string): void => {
+        const w = d.trim().replace(/\//g, '\\');
+        if (!w) return;
+        const s = w.endsWith('\\') ? w : `${w}\\`;
+        if (!dirs.some((x) => x.toLowerCase() === s.toLowerCase())) dirs.push(s);
+    };
+    const self = system.executablePath.replace(/\//g, '\\');
+    push(self.slice(0, self.lastIndexOf('\\') + 1));
+    push(system.fileSystem.currentDir);
+    for (const dir of WINDOWS_DIRS) push(dir);
+    for (const [key, value] of system.process?.environment ?? []) {
+        if (key.toLowerCase() !== 'path') continue;
+        for (const dir of value.split(';')) push(dir);
+    }
+    return dirs;
+}
+
+/** A final path component with a period names the extension Windows takes literally. */
+const hasFileExtension = (name: string): boolean =>
+    name.slice(name.lastIndexOf('\\') + 1).includes('.');
+
+/**
+ * Resolve the image a bare command line (lpApplicationName = NULL) names, the way
+ * CreateProcess does: each space-separated prefix of the command line is tried in
+ * turn, shortest first; a name without an extension gets `.exe` appended; and a name
+ * without a path is looked up in the documented directory order. The first prefix
+ * that names an existing executable wins and carries the rest of the line as its
+ * arguments; when none does, the error distinguishes a missing directory
+ * (ERROR_PATH_NOT_FOUND) from a missing image (ERROR_FILE_NOT_FOUND) from a file
+ * that exists but is not executable (ERROR_BAD_EXE_FORMAT).
+ */
+export function resolveCommandLineImage(system: System, commandLine: string): CommandLineImage {
+    const line = commandLine.trimStart();
+    if (!line) return { imagePath: "", reExecArgs: "", error: ERROR_FILE_NOT_FOUND };
+    // The prefixes to try: a quoted run is one candidate; otherwise every
+    // space-separated prefix, shortest first, exactly as the documented example
+    // walks `c:\program files\sub dir\program name`.
+    const prefixes: { name: string; args: string }[] = [];
+    if (line.startsWith('"')) {
+        const end = line.indexOf('"', 1);
+        prefixes.push({
+            name: end < 0 ? line.slice(1) : line.slice(1, end),
+            args: end < 0 ? '' : line.slice(end + 1).trimStart(),
+        });
+    } else {
+        let base = '', rest = line;
+        for (;;) {
+            const sp = rest.search(/\s/);
+            const token = sp < 0 ? rest : rest.slice(0, sp);
+            base = base ? `${base} ${token}` : token;
+            prefixes.push({ name: base, args: sp < 0 ? '' : rest.slice(sp).trimStart() });
+            if (sp < 0) break;
+            rest = rest.slice(sp).trimStart();
+            if (!rest) break;
+        }
+    }
+    const dirs = imageSearchDirectories(system);
+    let badFormat = false;
+    const probe = (name: string): string | null => {
+        const candidates = /^[a-z]:[\\/]/i.test(name) || /^[\\/]/.test(name)
+            ? [name]
+            : dirs.map((dir) => dir + name);
+        for (const candidate of candidates) {
+            const path = system.resolveImagePath(candidate, "");
+            if (!path) continue;
+            if (isBundledImage(path)) return path;
+            if (system.fileSystem.fileExists(path)) badFormat = true;
+        }
+        return null;
+    };
+    // The lpCommandLine remark says ".exe is not appended if the file name contains
+    // a path", but the documented `c:\program files\sub dir\program name` example on
+    // the same page only resolves when it is appended (Wine appends it too). Follow
+    // the example and append; otherwise this line looks like the bug to fix.
+    for (const prefix of prefixes) {
+        const name = prefix.name;
+        if (!name) continue;
+        const found = probe(hasFileExtension(name) ? name : `${name}.exe`);
+        if (found) return { imagePath: found, reExecArgs: prefix.args, error: 0 };
+    }
+    // Path-vs-file is decided from the module-name candidate alone — the quoted
+    // name, or the first token of an unquoted line. The later prefixes are
+    // speculative re-splits that already contain arguments: for WinExec("setup /S")
+    // the prefix "setup /S" contains a separator, and reading it as a path would
+    // report ERROR_PATH_NOT_FOUND where Windows reports ERROR_FILE_NOT_FOUND. A
+    // module candidate whose directory does not exist is a path error — the
+    // documented WinExec("C:\Missing\Dir\x.exe") case.
+    let pathNotFound = false;
+    const moduleName = prefixes[0]?.name ?? '';
+    if (/[\\/]/.test(moduleName)) {
+        const sep = Math.max(moduleName.lastIndexOf('\\'), moduleName.lastIndexOf('/'));
+        if (sep > 0 && !system.fileSystem.directoryExists(moduleName.slice(0, sep))) pathNotFound = true;
+    }
+    return {
+        imagePath: "", reExecArgs: "",
+        error: pathNotFound ? ERROR_PATH_NOT_FOUND : badFormat ? 193 : ERROR_FILE_NOT_FOUND,
+    };
+}
 
 const CREATE_SUSPENDED = 0x00000004;
 
@@ -708,6 +833,7 @@ const finishVirtualProcess = (
     lpProcessInformation: number, applicationName: string, commandLine: string,
     currentDirectory: string, dwCreationFlags: number, isWide: boolean,
     childRequest?: ChildProcessRequest, childBackend: 'worker' | 'host' = 'worker',
+    errOut?: { code: number },
 ): ThunkResult | Promise<ThunkResult> => {
     const system = System.getInstance(), manager = getVirtualProcessManager();
     const ownerThread = system.scheduler.getCurrentThreadId();
@@ -747,13 +873,25 @@ const finishVirtualProcess = (
         system.resourceProvider.unregisterKernelObject(proc.threadHandle);
         system.resourceProvider.unregisterKernelObject(proc.processHandle);
         writeProcessInformationZeroed(lpProcessInformation);
-        setError(193);
+        // The child reports which Win32 error its own startup failed with when it
+        // can (a missing directory is not a bad image); 193 BAD_EXE_FORMAT is the
+        // answer for a child that could not load or prepare its image at all.
+        const code = typeof (error as { code?: number } | null)?.code === 'number'
+            ? (error as { code: number }).code : 193;
+        setError(code);
+        // Report the recorded code through errOut too: the calling thread at
+        // settlement time need not be the one that can read the scheduler.
+        if (errOut) errOut.code = code;
         Logger.warn(LogCategory.SYSTEM, 'Child image preparation failed: ' + String(error));
         return { value: 0, stackCleanup: 40 };
     });
 };
 
-const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolean): ThunkResult | Promise<ThunkResult> => {
+// errOut, when given, receives the error code the failure path reported — WinExec
+// must map that exact code, and a threadless harness cannot read it back from the
+// scheduler, so the value travels with the result instead of through the thread.
+const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolean,
+    errOut?: { code: number }): ThunkResult | Promise<ThunkResult> => {
     const lpApplicationName = args[0] >>> 0;
     const lpCommandLine = args[1] >>> 0;
     const dwCreationFlags = args[5] >>> 0;
@@ -765,24 +903,35 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
     const currentDirectory = readNullableProcessString(memory, lpCurrentDirectory, isWide);
 
     if (!lpProcessInformation || !isValidAddress(lpProcessInformation, 16, 'rw')) {
+        if (errOut) errOut.code = ERROR_INVALID_PARAMETER;
         System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
         return { value: 0, stackCleanup: 40 };
     }
 
     if (!applicationName && !commandLine) {
         writeProcessInformationZeroed(lpProcessInformation);
+        if (errOut) errOut.code = ERROR_INVALID_PARAMETER;
         System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
         return { value: 0, stackCleanup: 40 };
     }
 
     // lpApplicationName may be NULL, in which case the image is argv[0] of the command
     // line and the arguments are what follows it, the split CreateProcess itself performs.
+    // For a bare command line the split follows the documented lookup: prefixes tried
+    // shortest first, `.exe` appended to extensionless names, pathless names probed in
+    // the documented directory order. With an explicit lpApplicationName the name is
+    // taken literally — Windows does not append `.exe` and does not search.
     const system = System.getInstance();
-    const argv0 = applicationName || firstCommandLineToken(commandLine || "");
-    const reExecArgs = applicationName
-        ? (commandLine || "")
-        : stripFirstCommandLineToken(commandLine || "");
-    const imagePath = argv0 ? system.resolveImagePath(argv0, currentDirectory || "") : "";
+    let imagePath: string, reExecArgs: string, lookupError = ERROR_FILE_NOT_FOUND;
+    if (applicationName) {
+        imagePath = system.resolveImagePath(applicationName, currentDirectory || "");
+        reExecArgs = commandLine || "";
+    } else {
+        const resolved = resolveCommandLineImage(system, commandLine || "");
+        imagePath = resolved.imagePath;
+        reExecArgs = resolved.reExecArgs;
+        lookupError = resolved.error;
+    }
     const startSuspended = (dwCreationFlags & CREATE_SUSPENDED) !== 0;
     const isConsoleTool = !!imagePath && isBundledImage(imagePath) && isConsoleSubsystemImage(imagePath);
     if (imagePath && isBundledImage(imagePath)) {
@@ -795,10 +944,11 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
                 environment: system.process ? [...system.process.environment] : undefined,
             },
             !startSuspended && isConsoleTool && hostToolsEnabled() ? 'host' : 'worker',
+            errOut,
         );
     }
     return failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide,
-        imagePath && system.fileSystem.fileExists(imagePath) ? 193 : 2); // BAD_EXE_FORMAT / FILE_NOT_FOUND
+        imagePath && system.fileSystem.fileExists(imagePath) ? 193 : lookupError, errOut); // BAD_EXE_FORMAT / FILE_NOT_FOUND / PATH_NOT_FOUND
 };
 
 /**
@@ -1114,10 +1264,30 @@ export const exports: Record<string, ThunkImplementation> = {
             release();
             return { value: 33, stackCleanup: 8 };
         };
-        const result = createVirtualProcess(mem, [0, lpCmdLine, 0, 0, 0, 0, 0, 0, 0, processInfo], false);
-        if (result instanceof Promise) return result.then(r => toWinExec(r, ERROR_BAD_FORMAT));
-        const error = system.scheduler.getLastError();
-        return toWinExec(result, error === 193 ? ERROR_BAD_FORMAT : error === ERROR_PATH_NOT_FOUND ? ERROR_PATH_NOT_FOUND : ERROR_FILE_NOT_FOUND);
+        const errOut = { code: 0 };
+        const result = createVirtualProcess(mem, [0, lpCmdLine, 0, 0, 0, 0, 0, 0, 0, processInfo], false, errOut);
+        // WinExec's failure value is the CreateProcess error, minus BAD_EXE_FORMAT which
+        // reads as ERROR_BAD_FORMAT (the historical WinExec code for a non-executable).
+        const toFailure = (code: number): number =>
+            code === 193 ? ERROR_BAD_FORMAT
+                : code === ERROR_PATH_NOT_FOUND ? ERROR_PATH_NOT_FOUND
+                : ERROR_FILE_NOT_FOUND;
+        if (result instanceof Promise) {
+            return result.then(
+                // A child whose start fails resolves with value 0 and its code
+                // recorded (errOut, or the thread's last error). Map that code the
+                // same way the synchronous branch does, instead of assuming every
+                // asynchronous failure is a bad image.
+                r => toWinExec(r, toFailure(errOut.code || system.scheduler.getLastError())),
+                (): ThunkResult => {
+                    // A rejected child start must not surface as an unhandled rejection:
+                    // report the last error the failed start recorded.
+                    release();
+                    return { value: toFailure(system.scheduler.getLastError()), stackCleanup: 8 };
+                },
+            );
+        }
+        return toWinExec(result, toFailure(errOut.code || system.scheduler.getLastError()));
     },
 
     // CreateProcessAsUser* = CreateProcess* with hToken prepended (11 args).
