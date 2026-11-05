@@ -14,6 +14,7 @@ import { WGB_CACHE_DIR } from "./wgb-cache-identity";
  */
 
 /** Vite's disk route (vite.config.ts serveWgbFromDisk) and the dev sidecar's (tools/dev-sidecar). */
+// @transient(constant route table)
 const LOCAL_DISK_ROUTES = new Set(["/__wgb/", "/__wgb", "/wgb"]);
 
 /** True for a dev URL that streams a bundle from the host's own disk (`…/wgb?path=` / `/__wgb/?path=`). */
