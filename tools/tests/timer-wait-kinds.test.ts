@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Scheduler } from "../../src/worker/core/scheduler/scheduler";
 import { clearTimerHandler, getTimerHandler, replaceTimerHandler, setTimerHandler, TimerWheel } from "../../src/worker/core/scheduler/timer-wheel";
 import { completeWait } from "../../src/worker/core/scheduler/wait-completion";
@@ -44,7 +44,26 @@ function call(name: string, ...args: number[]): number {
 const now = () => TimeService.getInstance().nowMs();
 const signaled = (handle: number) => !!(System.getInstance().resourceProvider.getKernelObject(handle) as any).signaled;
 
+type MemBinding = { memoryGetter: unknown; validateRange: unknown; getRegion: unknown; dataRoutes: unknown };
+let saved: { scheduler: unknown; process: unknown; mem: MemBinding } | null = null;
+
+afterEach(() => {
+    if (!saved) return;
+    const system = System.getInstance() as any;
+    system.scheduler = saved.scheduler;
+    system.process = saved.process;
+    const m = saved.mem;
+    Mem.bind(m.memoryGetter as never, m.validateRange as never, m.getRegion as never, m.dataRoutes as never);
+    saved = null;
+});
+
 beforeEach(() => {
+    const system0 = System.getInstance() as any;
+    const binding = Mem as unknown as MemBinding;
+    saved = {
+        scheduler: system0.scheduler, process: system0.process,
+        mem: { memoryGetter: binding.memoryGetter, validateRange: binding.validateRange, getRegion: binding.getRegion, dataRoutes: binding.dataRoutes },
+    };
     mem = new Uint8Array(0x10000);
     view = new DataView(mem.buffer);
     Mem.bind(() => mem);
