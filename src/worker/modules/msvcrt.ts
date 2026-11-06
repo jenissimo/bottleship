@@ -748,7 +748,6 @@ export class Msvcrt implements IModule {
             fseek: (a: number, b: number, c: number) => this.fseek(a, b, c),
             ftell: (a: number) => this.ftell(a),
             filelength: (a: number) => this.filelength(a),
-            fileStreams: this.fileStreams,
             malloc: (n: number) => this.malloc(n),
             writeCString: (p: number, v: string) => this.writeCString(p, v),
             memset: (p: number, v: number, n: number) => this.memset(p, v, n),
