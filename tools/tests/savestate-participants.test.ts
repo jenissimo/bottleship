@@ -362,7 +362,7 @@ describe("schema pin and mutation", () => {
             "gdi32": { version: 1, schemaHash: "f5495edbe7c4ae9d" },
             "gdi32-palettes": { version: 1, schemaHash: "fdca280b054649f9" },
             "ddraw": { version: 1, schemaHash: "844462508bc4ae1e" },
-            "dsound": { version: 1, schemaHash: "7f9b27888eeb9718" },
+            "dsound": { version: 2, schemaHash: "af7b6bdbc3a44ecb" },
             "dinput": { version: 1, schemaHash: "d7eaf2cafce58a42" },
             "winmm": { version: 1, schemaHash: "c409a6582f9b8004" },
         });

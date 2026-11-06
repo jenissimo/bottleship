@@ -351,7 +351,7 @@ export interface DSoundState {
     objects: Array<{ ptr: number; type: string; refCount: number; isDs8: boolean; duplex: { ds: number; dsc: number } | null; buffer: SavedSoundBuffer | null; ring: boolean }>;
     nextBufferId: number;
     notifyTimerId: number | null;
-    primaryBufferPtr: number;
+    primaryByDevice: Array<[number, number]>;
     speakerConfig: number;
     listener: Record<string, number>;
     deferredListener: Record<string, number> | null;
@@ -359,19 +359,20 @@ export interface DSoundState {
 
 export const DSOUND_FIELDS = {
     name: 'transient', exports: 'host', process: 'host', objects: 'save', vtables: 'derive', nextBufferId: 'save',
-    notifyTimerId: 'save', primaryBufferPtr: 'save', speakerConfig: 'save', dbgAudioCalls: 'transient', bufferLifeRing: 'transient',
+    notifyTimerId: 'save', primaryByDevice: 'save', speakerConfig: 'save', dbgAudioCalls: 'transient', bufferLifeRing: 'transient',
     dbgLockTrace: 'transient', listenerState: 'save', listenerSab: 'host', deferredListenerState: 'save', stepGapScratch: 'transient',
 } as const satisfies Record<string, FieldPolicy>;
 
 export const DSOUND_SCHEMA = {
     module: DSOUND_FIELDS,
+    primaryRow: ['deviceObject', 'primaryBuffer'],
     object: stateKeys<DSoundState['objects'][number]>({ ptr: true, type: true, refCount: true, isDs8: true, duplex: true, buffer: true, ring: true }),
     listener: stateKeys<DSound['listenerState']>({
         posX: true, posY: true, posZ: true, velX: true, velY: true, velZ: true, frontX: true, frontY: true, frontZ: true,
         topX: true, topY: true, topZ: true, distanceFactor: true, rolloffFactor: true, dopplerFactor: true,
     }),
     state: stateKeys<DSoundState>({
-        objects: true, nextBufferId: true, notifyTimerId: true, primaryBufferPtr: true, speakerConfig: true,
+        objects: true, nextBufferId: true, notifyTimerId: true, primaryByDevice: true, speakerConfig: true,
         listener: true, deferredListener: true,
     }),
     buffer: SOUND_BUFFER_FIELDS,
@@ -475,7 +476,7 @@ export class DSound implements IModule {
 
     registerSavestate(): () => void {
         return savestateParticipants.add({
-            id: 'dsound', version: 1, order: 61, covers: ['dsound'], schema: DSOUND_SCHEMA as unknown as SaveValue,
+            id: 'dsound', version: 2, order: 61, covers: ['dsound'], schema: DSOUND_SCHEMA as unknown as SaveValue,
             capture: () => {
                 try {
                     return this.captureSavestate() as unknown as SaveValue;
@@ -2810,7 +2811,7 @@ export class DSound implements IModule {
             objects.push({ ptr, type: o.type, refCount: o.refCount, isDs8: o.isDs8 ?? false, duplex: o.duplex ? { ...o.duplex } : null, buffer, ring: !!b?.sab });
         }
         return {
-            objects, nextBufferId: this.nextBufferId, notifyTimerId: this.notifyTimerId, primaryBufferPtr: this.primaryBufferPtr,
+            objects, nextBufferId: this.nextBufferId, notifyTimerId: this.notifyTimerId, primaryByDevice: [...this.primaryByDevice],
             speakerConfig: this.speakerConfig, listener: { ...this.listenerState },
             deferredListener: this.deferredListenerState ? { ...this.deferredListenerState } : null,
         };
@@ -2864,7 +2865,7 @@ export class DSound implements IModule {
         }
         this.nextBufferId = s.nextBufferId;
         this.notifyTimerId = s.notifyTimerId;
-        this.primaryBufferPtr = s.primaryBufferPtr;
+        this.primaryByDevice = new Map(s.primaryByDevice);
         this.speakerConfig = s.speakerConfig;
         Object.assign(this.listenerState, s.listener);
         this.deferredListenerState = s.deferredListener ? { ...this.listenerState, ...s.deferredListener } : null;
