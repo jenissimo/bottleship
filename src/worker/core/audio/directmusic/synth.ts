@@ -326,13 +326,15 @@ export class DlsSynth {
         const ch = this.channel(channelId);
         const inst = ch.instrument;
         if (!inst) { this.stats.noInstrument++; return; }
-        let region: PreparedRegion | null = null;
-        for (const r of inst.regions) {
-            if (key >= r.region.keyLow && key <= r.region.keyHigh) { region = r; break; }
-        }
-        if (!region) { this.stats.noRegion++; return; }
+        const matches = inst.regions.filter((r) => key >= r.region.keyLow && key <= r.region.keyHigh
+            && (r.region.velocityHigh === 0 || (velocity >= r.region.velocityLow && velocity <= r.region.velocityHigh)));
+        if (matches.length === 0) { this.stats.noRegion++; return; }
         this.stats.notes++;
+        for (const region of matches) this.cutExclusive(ch, key, region);
+        for (const region of matches) this.startVoice(channelId, ch, key, velocity, region);
+    }
 
+    private cutExclusive(ch: Channel, key: number, region: PreparedRegion): void {
         // A key group is exclusive (an open hi-hat is cut by the closed one), and unless the
         // region says otherwise so is a second strike of the same key.
         const group = region.region.keyGroup;
@@ -341,7 +343,9 @@ export class DlsSynth {
             if (!v.active || v.channel !== ch || v.stage === Stage.Off) continue;
             if ((group !== 0 && v.region.region.keyGroup === group) || (selfExclusive && v.key === key)) this.cut(v);
         }
+    }
 
+    private startVoice(channelId: number, ch: Channel, key: number, velocity: number, region: PreparedRegion): void {
         const voice = this.allocateVoice();
         const art = region.articulation;
         const rate = this.sampleRate;
