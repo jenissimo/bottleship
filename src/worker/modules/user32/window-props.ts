@@ -96,10 +96,17 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
                 prev = window.controlId ?? 0;
                 window.controlId = dwNewLong >>> 0;
                 break;
-            case GWL_STYLE:
+            case GWL_STYLE: {
                 prev = window.style >>> 0;
                 window.style = dwNewLong >>> 0;
+                const visible = (window.style & 0x10000000) !== 0;
+                if (((prev ^ window.style) & 0x10000000) !== 0 && window.visible !== visible) {
+                    window.visible = visible;
+                    const wmWin = System.getInstance().windowManager.getWindow(hWnd);
+                    if (wmWin) wmWin.visible = visible;
+                }
                 break;
+            }
             case GWL_EXSTYLE:
                 prev = window.exStyle ?? 0;
                 window.exStyle = dwNewLong >>> 0;

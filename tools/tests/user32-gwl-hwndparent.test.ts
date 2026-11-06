@@ -22,6 +22,27 @@ beforeEach(() => {
     windows.set(CTRL, win({ handle: CTRL, parent: DLG, style: 0x50000000, isSystemControl: true, systemControlClass: "Button" }));
 });
 
+const setLong = (hwnd: number, index: number, value: number): number =>
+    exportsTable["SetWindowLongA"]({ esp: 0 }, new Uint8Array(16), [hwnd, index >>> 0, value >>> 0]) >>> 0;
+
+describe("SetWindowLong(GWL_STYLE) and WS_VISIBLE", () => {
+    test("setting WS_VISIBLE on a hidden control makes it visible", () => {
+        const ctrl = windows.get(CTRL)!;
+        ctrl.style = 0x4000000b;
+        ctrl.visible = false;
+        setLong(CTRL, -16, 0x5000000b);
+        expect(ctrl.visible).toBe(true);
+    });
+
+    test("negative control: a style change that leaves WS_VISIBLE alone keeps visibility", () => {
+        const ctrl = windows.get(CTRL)!;
+        ctrl.style = 0x4000000b;
+        ctrl.visible = false;
+        setLong(CTRL, -16, 0x4000000c);
+        expect(ctrl.visible).toBe(false);
+    });
+});
+
 describe("GetWindowLong(GWL_HWNDPARENT)", () => {
     test("a child reports its parent, so GetWindowRect on it succeeds", () => {
         expect(getLong(CTRL, GWL_HWNDPARENT)).toBe(DLG);
