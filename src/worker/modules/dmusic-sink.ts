@@ -137,7 +137,7 @@ export class DirectSoundSink {
  * DirectSound object when it passed one to the performance, else on a new one.
  * Returns the buffer's guest address, or 0.
  */
-export function createSinkBuffer(process: Process, directSound: number, channels: number, sampleRate: number): number {
+export function createSinkBuffer(process: Process, directSound: number, channels: number, sampleRate: number, flags?: number): number {
     const dsound = process.getModule("dsound");
     const mem = Mem.getView();
     if (!dsound || !mem) return 0;
@@ -164,7 +164,7 @@ export function createSinkBuffer(process: Process, directSound: number, channels
         const out = format + 18;
         Mem.writeBytes(scratch, new Uint8Array(DSBUFFERDESC_SIZE + 18 + 8));
         Mem.writeUint32(scratch, DSBUFFERDESC_SIZE);
-        Mem.writeUint32(scratch + 4, DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLPAN | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS);
+        Mem.writeUint32(scratch + 4, flags ?? (DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLPAN | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS));
         Mem.writeUint32(scratch + 8, sinkBufferBytes(channels, sampleRate));
         Mem.writeUint32(scratch + 16, format);
         writeWaveFormat(format, channels, sampleRate);

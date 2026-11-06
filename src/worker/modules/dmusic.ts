@@ -15,7 +15,7 @@
 import { type Band, parseBand } from "@bottleship/formats/dmusic/band";
 import { type DlsCollection, parseDls } from "@bottleship/formats/dmusic/dls";
 import {
-    DMUS_OBJ_CATEGORY, DMUS_OBJ_CLASS, DMUS_OBJ_FILENAME, DMUS_OBJ_FULLPATH, DMUS_OBJ_LOADED, DMUS_OBJ_NAME, DMUS_OBJ_OBJECT,
+    DMUS_OBJ_CATEGORY, DMUS_OBJ_CLASS, DMUS_OBJ_FILENAME, DMUS_OBJ_FULLPATH, DMUS_OBJ_LOADED, DMUS_OBJ_MEMORY, DMUS_OBJ_NAME, DMUS_OBJ_OBJECT,
     DMUS_OBJ_VERSION, type ObjectReference, parseIdentity,
 } from "@bottleship/formats/dmusic/reference";
 import { riffChunks } from "@bottleship/formats/dmusic/riff";
@@ -25,6 +25,7 @@ import { dmusicModule } from "../api/dmusic.api";
 import { createVTablesFromDescriptor, VTableInfo } from "../api/adapters/module-adapter";
 import { buildSegment, loadBand } from "../core/audio/directmusic/build";
 import { isStandardMidiFile, smfToSegment } from "../core/audio/directmusic/smf";
+import { decodeWave, isRiffWave, type WaveData } from "../core/audio/directmusic/wave";
 import {
     DMUS_SEGF_SECONDARY, type LoadedBand, PerfSegment, type PerfSegmentState, Performance,
 } from "../core/audio/directmusic/performance";
@@ -42,7 +43,7 @@ import { TimerKind } from "../core/scheduler/types";
 import { setTimerHandler } from "../core/scheduler/timer-wheel";
 import { System } from "../core/system";
 import { type GuestCall, type GuestRoutine, runGuestRoutine } from "../core/thunking/guest-routine";
-import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
+import { ThunkImplementation, type X86Context } from "../core/thunking/thunk-dispatcher";
 import { TimeService } from "../runtime/time";
 import {
     AudioPathObject, BandObject, CLSID_DirectMusic, CLSID_DirectMusicBand, CLSID_DirectMusicCollection,
@@ -102,7 +103,19 @@ const DMUS_PORTPARAMS_AUDIOCHANNELS = 0x04;
 const DMUS_PORTPARAMS_SAMPLERATE = 0x08;
 
 /** DMUS_OBJECTDESC field offsets (dmusici.h). */
-const DESC = { size: 0x350, validData: 4, guidObject: 8, guidClass: 0x18, version: 0x30, name: 0x38, category: 0xb8, fileName: 0x138 } as const;
+const DESC = { size: 0x350, validData: 4, guidObject: 8, guidClass: 0x18, version: 0x30, name: 0x38, category: 0xb8, fileName: 0x138, memLength: 0x340, memData: 0x348 } as const;
+const WAVE_CACHE_ENTRIES = 64;
+const DMUS_APATH_DYNAMIC_3D = 6;
+const DMUS_APATH_DYNAMIC_MONO = 7;
+const DMUS_APATH_DYNAMIC_STEREO = 8;
+const DMUS_PATH_BUFFER = 0x6000;
+const DSBCAPS_CTRL3D = 0x10;
+const DSBCAPS_CTRLFREQUENCY = 0x20;
+const DSBCAPS_CTRLPAN = 0x40;
+const DSBCAPS_CTRLVOLUME = 0x80;
+const DSBCAPS_GLOBALFOCUS = 0x8000;
+const DSBCAPS_GETCURRENTPOSITION2 = 0x10000;
+const NO_CONTEXT = { eax: 0, ecx: 0, edx: 0, ebx: 0, esp: 0, ebp: 0, esi: 0, edi: 0, eip: 0, eflags: 0 } as X86Context;
 const DESC_NAME_CHARS = 64;
 const DESC_FILENAME_CHARS = 260;
 
@@ -170,6 +183,7 @@ export class DMusic implements IModule {
     vtables: Record<string, VTableInfo> = {};
     private process!: Process;
     private readonly ports = new Set<PortObject>();
+    private readonly pathOutputs = new Set<AudioPathObject>();
     private readonly performances = new Set<PerformanceObject>();
     private readonly loading = new Set<LoadableObject>();
     private pumpTimer: number | null = null;
@@ -640,6 +654,7 @@ export class DMusic implements IModule {
         if (this.loading.size > 0) return 'dmusic: an object is still loading';
         if (this.messages.size > 0) return 'dmusic: performance messages are still allocated';
         if (this.pumpTimer !== null) return 'dmusic: the synth pump is running';
+        if (this.pathOutputs.size > 0) return 'dmusic: an audio path with its own buffer is not part of a savestate';
         return null;
     }
 
@@ -714,7 +729,40 @@ export class DMusic implements IModule {
         return DMUS_E_LOADER_OBJECTNOTFOUND;
     }
 
+    private readonly decodedWaves = new Map<string, WaveData>();
+
+    private waveSegment(bytes: Uint8Array, key: string | null, fileName: string): SegmentObject | null {
+        if ((globalThis as { __dmusicWaveSegments?: boolean }).__dmusicWaveSegments === false) return null;
+        let wave = key ? this.decodedWaves.get(key) ?? null : null;
+        if (!wave) {
+            wave = decodeWave(bytes);
+            if (!wave) return null;
+            if (key) {
+                if (this.decodedWaves.size >= WAVE_CACHE_ENTRIES) this.decodedWaves.delete(this.decodedWaves.keys().next().value!);
+                this.decodedWaves.set(key, wave);
+            }
+        }
+        const obj = new SegmentObject();
+        obj.segment = PerfSegment.fromWave(wave);
+        obj.identity = { objectId: "", name: fileName, versionMS: 0, versionLS: 0, hasVersion: false };
+        obj.fileName = fileName;
+        obj.loaded = true;
+        return obj;
+    }
+
+    private objectFromMemory(desc: number): LoadableObject | null {
+        const length = Mem.readUint32(desc + DESC.memLength) ?? 0;
+        const data = Mem.readUint32(desc + DESC.memData) ?? 0;
+        if (!data || length < 12 || length > MAX_OBJECT_BYTES || !validPointer(data, length, "r")) return null;
+        const bytes = Mem.readBytes(data, length);
+        if (!bytes || !isRiffWave(bytes)) return null;
+        let h = 0x811c9dc5;
+        for (let i = 0; i < bytes.length; i += Math.max(1, bytes.length >> 12)) h = Math.imul(h ^ bytes[i]!, 0x01000193);
+        return this.waveSegment(bytes, `${length}:${h >>> 0}`, "");
+    }
+
     private objectFromFile(loader: LoaderObject, bytes: Uint8Array, fileName: string): LoadableObject | null {
+        if (isRiffWave(bytes)) return this.waveSegment(bytes, null, fileName);
         if (!isStandardMidiFile(bytes)) return null;
         const gmRef = {
             validData: DMUS_OBJ_OBJECT, classId: "", objectId: GUID_DefaultGMCollection, name: "", category: "",
@@ -787,6 +835,13 @@ export class DMusic implements IModule {
                 const hr = this.queryInterface(obj, guidAt(a[2]! >>> 0), ppv);
                 if (hr === S_OK && this.loaderCaches(loader, obj.classId)) loader.cache.set(key, obj);
                 else obj.release();
+                return hr;
+            }
+            if (valid & DMUS_OBJ_MEMORY) {
+                const obj = this.objectFromMemory(desc);
+                if (!obj) return DMUS_E_LOADER_FAILEDOPEN;
+                const hr = this.queryInterface(obj, guidAt(a[2]! >>> 0), ppv);
+                obj.release();
                 return hr;
             }
             Logger.log(LogCategory.COM, `[DMusic] system loader GetObject -> DMUS_E_LOADER_OBJECTNOTFOUND`);
@@ -1092,7 +1147,7 @@ export class DMusic implements IModule {
 
         // HRESULT PlaySegment(IDirectMusicSegment *pSegment, DWORD dwFlags, __int64 i64StartTime,
         //                     IDirectMusicSegmentState **ppSegmentState)
-        const play = (perf: PerformanceObject | null, segPtr: number, flags: number, ppState: number): number => {
+        const play = (perf: PerformanceObject | null, segPtr: number, flags: number, ppState: number, pathPtr = 0): number => {
             if (ppState && !validPointer(ppState, 4, "w")) return E_POINTER;
             if (ppState) Mem.writeUint32(ppState, 0);
             const seg = this.object<SegmentObject>(segPtr);
@@ -1100,12 +1155,14 @@ export class DMusic implements IModule {
             if (!perf.engine) return DMUS_E_NOT_INIT;
             if (!seg.segment) return E_FAIL;
             const state = perf.engine.playSegment(seg.segment, flags >>> 0);
+            const path = pathPtr ? this.object<AudioPathObject>(pathPtr) : null;
+            if (state && seg.segment.wave && path instanceof AudioPathObject && this.ensurePathOutput(path)) state.output = path;
             if (state) this.holdStateSegment(this.stateObject(perf, state), seg);
             return this.publishState(perf, state, seg, ppState);
         };
         e["IDirectMusicPerformance8_PlaySegment"] = (_c, _m, a) => play(perfOf(a), a[1]!, a[2]!, a[5]! >>> 0);
         // PlaySegmentEx(pSource, pwzSegmentName, pTransition, dwFlags, i64StartTime, ppSegmentState, pFrom, pAudioPath)
-        e["IDirectMusicPerformance8_PlaySegmentEx"] = (_c, _m, a) => play(perfOf(a), a[1]!, a[4]!, a[7]! >>> 0);
+        e["IDirectMusicPerformance8_PlaySegmentEx"] = (_c, _m, a) => play(perfOf(a), a[1]!, a[4]!, a[7]! >>> 0, a[9]! >>> 0);
 
         // HRESULT Stop(IDirectMusicSegment *pSegment, IDirectMusicSegmentState *pSegmentState,
         //              MUSIC_TIME mtTime, DWORD dwFlags)
@@ -1311,9 +1368,14 @@ export class DMusic implements IModule {
             return S_OK;
         };
 
-        const audioPath = (ppOut: number): number => this.publish(new AudioPathObject(), ppOut);
-        e["IDirectMusicPerformance8_CreateAudioPath"] = (_c, _m, a) => audioPath(a[3]! >>> 0);
-        e["IDirectMusicPerformance8_CreateStandardAudioPath"] = (_c, _m, a) => audioPath(a[4]! >>> 0);
+        const audioPath = (perf: PerformanceObject | null, type: number, ppOut: number): number => {
+            const path = new AudioPathObject();
+            path.performance = perf;
+            path.pathType = type;
+            return this.publish(path, ppOut);
+        };
+        e["IDirectMusicPerformance8_CreateAudioPath"] = (_c, _m, a) => audioPath(perfOf(a), 0, a[3]! >>> 0);
+        e["IDirectMusicPerformance8_CreateStandardAudioPath"] = (_c, _m, a) => audioPath(perfOf(a), a[1]! >>> 0, a[4]! >>> 0);
         e["IDirectMusicPerformance8_GetDefaultAudioPath"] = (_c, _m, a) => {
             const perf = perfOf(a);
             if (!perf || !a[1]) return E_POINTER;
@@ -1477,7 +1539,10 @@ export class DMusic implements IModule {
             return this.queryInterface(seg, IID_IUnknown, a[1] >>> 0);
         };
         e["IDirectMusicSegmentState8_SetTrackConfig"] = () => S_OK;
-        e["IDirectMusicSegmentState8_GetObjectInPath"] = (_c, _m, a) => { Mem.writeUint32(a[7]! >>> 0, 0); return DMUS_E_NOT_FOUND; };
+        e["IDirectMusicSegmentState8_GetObjectInPath"] = (_c, _m, a) => {
+            const output = this.object<SegmentStateObject>(a[0]!)?.state?.output;
+            return this.objectInPath(output instanceof AudioPathObject ? output : null, a);
+        };
     }
 
     // ── styles, bands, collections ──────────────────────────────────────────────
@@ -1625,9 +1690,14 @@ export class DMusic implements IModule {
         const e = this.exports;
         // The caller QIs the returned object (usually for IDirectSoundBuffer to set volume);
         // an audio path here has no buffer of its own to hand back.
-        e["IDirectMusicAudioPath_GetObjectInPath"] = (_c, _m, a) => { Mem.writeUint32(a[7]! >>> 0, 0); return DMUS_E_NOT_FOUND; };
+        e["IDirectMusicAudioPath_GetObjectInPath"] = (_c, _m, a) => this.objectInPath(this.object<AudioPathObject>(a[0]!), a);
         e["IDirectMusicAudioPath_Activate"] = () => S_OK;
-        e["IDirectMusicAudioPath_SetVolume"] = () => S_OK;
+        e["IDirectMusicAudioPath_SetVolume"] = (_c, _m, a) => {
+            const path = this.object<AudioPathObject>(a[0]!);
+            if (!path) return E_POINTER;
+            if (path.buffer) this.callBuffer(path.buffer, "idirectsoundbuffer8_setvolume", [a[1]! | 0]);
+            return S_OK;
+        };
         e["IDirectMusicAudioPath_ConvertPChannel"] = (_c, _m, a) => { Mem.writeUint32(a[2]! >>> 0, a[1]! >>> 0); return S_OK; };
     }
 
@@ -1889,6 +1959,86 @@ export class DMusic implements IModule {
             if (!port.active || !port.sink) continue;
             port.sink.pump((pcm, frames) => this.render(port, pcm, frames));
         }
+        for (const path of this.pathOutputs) {
+            path.sink?.pump((pcm, frames) => this.renderPath(path, pcm, frames));
+        }
+    }
+
+    private static readonly PATH_RATE = 22050;
+
+    private ensurePathOutput(path: AudioPathObject): boolean {
+        if (path.sink) return true;
+        const type = path.pathType;
+        if (type !== DMUS_APATH_DYNAMIC_3D && type !== DMUS_APATH_DYNAMIC_MONO && type !== DMUS_APATH_DYNAMIC_STEREO) return false;
+        const channels = type === DMUS_APATH_DYNAMIC_STEREO ? 2 : 1;
+        const flags = DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLFREQUENCY | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS
+            | (type === DMUS_APATH_DYNAMIC_3D ? DSBCAPS_CTRL3D : DSBCAPS_CTRLPAN);
+        const buffer = createSinkBuffer(this.process, path.performance?.directMusic?.directSound ?? 0, channels, DMusic.PATH_RATE, flags);
+        if (!buffer) return false;
+        const sink = new DirectSoundSink(this.process, buffer, channels, DMusic.PATH_RATE);
+        if (!sink.start()) {
+            soundReference(this.process, buffer, true, false);
+            return false;
+        }
+        path.buffer = buffer;
+        path.sink = sink;
+        path.channels = channels;
+        this.pathOutputs.add(path);
+        path.onDestroy = () => {
+            this.pathOutputs.delete(path);
+            path.sink?.release();
+            path.sink = null;
+            if (path.buffer) soundReference(this.process, path.buffer, true, false);
+            path.buffer = 0;
+        };
+        this.startPump();
+        return true;
+    }
+
+    private renderPath(path: AudioPathObject, pcm: Int16Array, frames: number): void {
+        if (this.mixLeft.length < frames) {
+            this.mixLeft = new Float32Array(frames);
+            this.mixRight = new Float32Array(frames);
+        }
+        const left = this.mixLeft;
+        const right = this.mixRight;
+        left.fill(0, 0, frames);
+        right.fill(0, 0, frames);
+        const perf = path.performance;
+        if (perf?.engine) {
+            perf.engine.renderWaves(path, left, right, frames, DMusic.PATH_RATE);
+            this.releaseEndedStates(perf);
+        }
+        const clamp = (v: number): number => v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+        if (path.channels === 1) {
+            for (let i = 0; i < frames; i++) pcm[i] = clamp(Math.round((left[i]! + right[i]!) * 16383.5));
+        } else {
+            for (let i = 0; i < frames; i++) {
+                pcm[i * 2] = clamp(Math.round(left[i]! * 32767));
+                pcm[i * 2 + 1] = clamp(Math.round(right[i]! * 32767));
+            }
+        }
+    }
+
+    private callBuffer(buffer: number, method: string, args: number[]): number {
+        const fn = this.process.getModule("dsound")?.exports[method] as ThunkImplementation | undefined;
+        const mem = Mem.getView();
+        if (!fn || !mem) return E_FAIL;
+        const result = fn(NO_CONTEXT, mem, [buffer, ...args]);
+        return typeof result === "number" ? result | 0 : E_FAIL;
+    }
+
+    private objectInPath(path: AudioPathObject | null, a: number[]): number {
+        const ppObject = a[7]! >>> 0;
+        if (!ppObject || !validPointer(ppObject, 4, "w")) return E_POINTER;
+        Mem.writeUint32(ppObject, 0);
+        if (!path || (a[2]! >>> 0) !== DMUS_PATH_BUFFER || (a[3]! >>> 0) !== 0 || (a[5]! >>> 0) !== 0) return DMUS_E_NOT_FOUND;
+        if (!this.ensurePathOutput(path)) return DMUS_E_NOT_FOUND;
+        const fn = this.process.getModule("dsound")?.exports["IDirectSoundBuffer8_QueryInterface"] as ThunkImplementation | undefined;
+        const mem = Mem.getView();
+        if (!fn || !mem) return DMUS_E_NOT_FOUND;
+        const result = fn(NO_CONTEXT, mem, [path.buffer, a[6]! >>> 0, ppObject]);
+        return typeof result === "number" ? result | 0 : E_FAIL;
     }
 
     /** Render `frames` of the port's music as interleaved 16-bit PCM. */

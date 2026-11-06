@@ -40,6 +40,7 @@ export const DEFAULT_COLLECTION_FIELDS = {
 export const DMUSIC_MODULE_FIELDS = {
     name: 'transient', exports: 'host', vtables: 'derive', process: 'host', ports: 'transient', performances: 'transient',
     loading: 'transient', pumpTimer: 'transient', mixLeft: 'transient', mixRight: 'transient', messages: 'transient',
+    pathOutputs: 'transient', decodedWaves: 'transient',
 } as const satisfies Record<string, FieldPolicy>;
 
 export const DMUSIC_SCHEMA = {
@@ -158,7 +159,7 @@ export function registerDMusicCodecs(host: DMusicHost): void {
 export function registerDMusicParticipant(host: DMusicHost): () => void {
     registerDMusicCodecs(host);
     return savestateParticipants.add({
-        id: 'dmusic', version: 1, order: 64, covers: ['dmusic'], schema: DMUSIC_SCHEMA as unknown as SaveValue,
+        id: 'dmusic', version: 2, order: 64, covers: ['dmusic'], schema: DMUSIC_SCHEMA as unknown as SaveValue,
         capture: () => {
             const refusal = host.idleRefusal();
             if (refusal) throw new CaptureRefusal(refusal);
