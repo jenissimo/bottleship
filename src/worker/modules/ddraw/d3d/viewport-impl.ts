@@ -18,6 +18,8 @@ import {
     DirectDrawSurfaceObject,
 } from "../com-objects";
 import { D3DExports, D3D_OK, D3DERR_INVALIDCALL } from "./types";
+import { ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
+import { transformVertices } from "./transform-vertices";
 
 const E_POINTER = 0x80004003;
 
@@ -121,6 +123,9 @@ const findExistingViewport3ForHandle = (
     }
     return null;
 };
+
+// @transient(diagnostics)
+let warnedTransformNoDevice = false;
 
 export const createViewportExports = (context: DDrawContext): D3DExports => {
     const exports: D3DExports = {};
@@ -494,9 +499,36 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
         return D3D_OK;
     };
 
+    // TransformVertices(this, dwVertexCount, lpData, dwFlags, lpOffscreen). Shared by the v2
+    // and v3 vtables: both resolve to the Viewport3 object (COM identity), which knows the
+    // device whose transforms apply and its own pixel rect / clip-space remap.
+    const transformVerticesImpl: ThunkImplementation = (ctx, mem, args) => {
+        const vpObj = resourceProvider.getComObjectByAddress(args[0]) as Direct3DViewport3Object | null;
+        const dev = vpObj instanceof Direct3DViewport3Object
+            ? resourceProvider.getComObjectByAddress(vpObj.getDevice()) as Direct3DDevice3Object | null
+            : null;
+        const mvp = dev && typeof dev.getCachedMVP === "function" ? dev.getCachedMVP() : null;
+        if (!(vpObj instanceof Direct3DViewport3Object) || !mvp) {
+            // Wine dereferences the active device unconditionally; without one there is no
+            // transform to apply, so refuse rather than hand back untouched output.
+            if (!warnedTransformNoDevice) {
+                warnedTransformNoDevice = true;
+                Logger.warn(LogCategory.DDRAW,
+                    `IDirect3DViewport_TransformVertices: viewport 0x${(args[0] >>> 0).toString(16)} has no device/transform`);
+            }
+            return D3DERR_INVALIDCALL;
+        }
+        const v = vpObj.getViewport();
+        return transformVertices(mem, args[1] >>> 0, args[2] >>> 0, args[3] >>> 0, args[4] >>> 0, {
+            mvp,
+            viewport: { x: v.x, y: v.y, width: v.width, height: v.height },
+            clipSpace: vpObj.getClipSpace(),
+        });
+    };
+    exports["IDirect3DViewport3_TransformVertices"] = transformVerticesImpl;
+
     const viewportStubs = [
         "Initialize",
-        "TransformVertices",
         "LightElements",
         "GetBackground",
         "SetBackgroundDepth",
@@ -771,9 +803,10 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
         return D3D_OK;
     };
 
+    exports["IDirect3DViewport2_TransformVertices"] = transformVerticesImpl;
+
     const viewport2Stubs = [
         "Initialize",
-        "TransformVertices",
         "LightElements",
         "GetBackground",
         "SetBackgroundDepth",
