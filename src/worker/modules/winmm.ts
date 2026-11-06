@@ -32,6 +32,7 @@ import {
     CTRL_PAN,
     CTRL_DATA_LENGTH,
     CTRL_STOP_REQUESTED,
+    CTRL_RESERVED as CTRL_RESET_POSITION,
     CTRL_WRITE_CURSOR,
     CTRL_FLAGS,
     STATE_PLAYING,
@@ -1840,7 +1841,9 @@ export class WinMM implements IModule {
                 device.pendingBuffers.length = 0;
 
                 if (device.sab) {
-                    setCtrl(device.sab, CTRL_STOP_REQUESTED, 1);
+                    setCtrl(device.sab, CTRL_STATE, STATE_STOPPED);
+                    setCtrl(device.sab, CTRL_PLAY_CURSOR, 0);
+                    setCtrl(device.sab, CTRL_RESET_POSITION, 1);
                     device.writeOffset = 0;
                     setCtrl(device.sab, CTRL_WRITE_CURSOR, 0);
                 }
