@@ -108,6 +108,9 @@ const WS_EX_CLIENTEDGE = 0x00000200;
 const WS_EX_NOPARENTNOTIFY = 0x00000004;
 
 const DS_CENTER = 0x0800;
+const DS_NOIDLEMSG = 0x0100;
+const WM_ENTERIDLE = 0x0121;
+const MSGF_DIALOGBOX = 0;
 const DS_CENTERMOUSE = 0x1000;
 
 /**
@@ -978,6 +981,25 @@ function runModalDialog(
     // -------------------------------------------------------------------------
     let pumpIterations = 0;
     let pumpCompleteThunk: (_ret: number) => number | null;
+    let idleNotified = false;
+    const sendEnterIdle = (): boolean => {
+        if (!hWndParent) return false;
+        const dialogInfo = windows.get(dialogHwnd);
+        if (!dialogInfo || (dialogInfo.style & DS_NOIDLEMSG) !== 0) return false;
+        const owner = windows.get(hWndParent);
+        const ownerProc = owner?.wndProc ?? 0;
+        if (!ownerProc || isSentinelWndProc(ownerProc)) return false;
+        const result = callbackManager.invokeCallback(
+            ownerProc,
+            [hWndParent, WM_ENTERIDLE, MSGF_DIALOGBOX, dialogHwnd],
+            0,
+            (ret) => pumpCompleteThunk(ret),
+            false,
+            `${label}:enter-idle`,
+            frameId,
+        );
+        return result.callbackId !== 0;
+    };
 
     const pumpScheduler = createPumpScheduler();
     const schedulePump = (delayMs: number): void => pumpScheduler.schedule(pumpStep, delayMs);
@@ -1063,6 +1085,11 @@ function runModalDialog(
         system.inputManager.poll(true);
 
         const msg = dequeueNextDialogMessage(system, pumpThreadId);
+        if (!msg && !idleNotified) {
+            idleNotified = true;
+            if (sendEnterIdle()) return;
+        }
+        if (msg) idleNotified = false;
         if (!msg) {
             if (pumpIterations <= 5 || pumpIterations % 100 === 0) {
                 Logger.warn(LogCategory.USER32,
