@@ -7,9 +7,8 @@
  * So the numbers state what is actually behind each API:
  *   - aux: one device, and its volume really does drive the CD-audio line.
  *   - waveIn: one device (the capture stubs accept and complete headers).
- *   - MIDI out/in: NONE. There is no synthesizer and no MIDI port; a game told
- *     otherwise plays its whole soundtrack into a sink and hears silence, or fails
- *     inside midiOutOpen with no way to fall back.
+ *   - MIDI out: see winmm-midi.ts (one software synth when a General MIDI bank exists).
+ *   - MIDI in: NONE. There is no host MIDI capture.
  *   - mixer: NONE. No mixer line/control topology is implemented, and returning
  *     MMSYSERR_NOERROR from mixerGetLineInfo with the caller's MIXERLINE untouched
  *     hands it stack garbage as a line id it then queries controls for.
@@ -33,9 +32,6 @@ function isValidAuxDeviceId(uDeviceID: number): boolean {
     return uDeviceID === 0 || uDeviceID === AUX_MAPPER;
 }
 
-/** MIDI output devices we can serve. There is no synth, so there are none, and
- *  MIDI_MAPPER has nothing to map to either. */
-const MIDI_OUT_DEVICES = 0;
 /** MIDI input devices — no port, no host MIDI capture. */
 const MIDI_IN_DEVICES = 0;
 
@@ -153,25 +149,7 @@ export function registerWinmmCapsExports(exports: Record<string, ThunkImplementa
 
     // ==================== MIDI Output Functions ====================
 
-    // No synthesizer is emulated. Saying so at midiOutGetNumDevs is the difference
-    // between a game disabling its MIDI music (and often falling back to CD/wave audio)
-    // and a game handing every note to an open that fails for no stated reason.
-    exports["midiOutGetNumDevs"] = () => MIDI_OUT_DEVICES;
-    exports["midiOutGetDevCapsA"] = () => MMSYSERR_BADDEVICEID;
-    exports["midiOutOpen"] = (ctx, mem, args) => {
-        const phmo = args[0] >>> 0;
-        // The handle is the caller's whole result; leaving it as stack garbage on a
-        // failure it may not check is how a NULL-ish handle becomes a wild call.
-        if (phmo && phmo + 4 <= mem.length) {
-            new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(phmo, 0, true);
-        }
-        Logger.log(LogCategory.SYSTEM, "midiOutOpen -> MMSYSERR_BADDEVICEID (no MIDI synthesizer)");
-        return MMSYSERR_BADDEVICEID;
-    };
-    exports["midiOutGetID"] = () => MMSYSERR_INVALHANDLE;
-    for (const name of ["midiOutClose", "midiOutReset", "midiOutShortMsg", "midiOutLongMsg",
-                        "midiOutPrepareHeader", "midiOutUnprepareHeader", "midiOutGetVolume",
-                        "midiOutSetVolume", "midiOutMessage", "midiConnect", "midiDisconnect"]) {
+    for (const name of ["midiConnect", "midiDisconnect"]) {
         exports[name] = () => MMSYSERR_INVALHANDLE;
     }
     // The stream API is the same output device by another name.
