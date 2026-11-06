@@ -92,6 +92,8 @@ export class LoaderObject extends DMusicObject {
     /** The default GM collection, one per loader, made on first request. */
     defaultCollection: CollectionObject | null = null;
     searchDirectory = "";
+    readonly cache = new Map<string, LoadableObject>();
+    readonly cacheDisabled = new Set<string>();
 }
 
 export interface PendingNotification {
