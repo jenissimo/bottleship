@@ -170,7 +170,7 @@ describe("dsound", () => {
     test("every module-level field survives a restore into a fresh module", () => {
         const listener = { posX: 1, posY: 2, posZ: 3, velX: 4, velY: 5, velZ: 6, frontX: 0, frontY: 1, frontZ: 0, topX: 1, topY: 0, topZ: 0, distanceFactor: 2, rolloffFactor: 3, dopplerFactor: 4 };
         const values: Partial<Record<keyof DSoundState, unknown>> = {
-            nextBufferId: 77, notifyTimerId: 31, primaryBufferPtr: 0x5000, speakerConfig: 0x00050004, listener,
+            nextBufferId: 77, notifyTimerId: 31, primaryByDevice: [[0x5000, 0x5100], [0x5300, 0x5400]], speakerConfig: 0x00050004, listener,
             deferredListener: { ...listener, posX: 9 },
         };
         for (const [field, value] of Object.entries(values) as Array<[keyof DSoundState, unknown]>) {
