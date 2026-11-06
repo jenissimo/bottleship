@@ -360,6 +360,7 @@ describe("schema pin and mutation", () => {
             "user32-timers": { version: 1, schemaHash: "e6c18e508aea7e24" },
             "user32-input": { version: 1, schemaHash: "60f3b0b9b4e027fb" },
             "user32-system": { version: 1, schemaHash: "b93e806912786ec3" },
+            "user32-accelerators": { version: 1, schemaHash: "4ab3bf298a09550d" },
             "gdi32": { version: 1, schemaHash: "f5495edbe7c4ae9d" },
             "gdi32-palettes": { version: 1, schemaHash: "fdca280b054649f9" },
             "ddraw": { version: 1, schemaHash: "844462508bc4ae1e" },

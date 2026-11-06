@@ -14,9 +14,15 @@ import {
     getWindowByHandle,
 } from './shared-state';
 import { GUEST_INPUT_FLAG } from '../../../input/sab-layout';
+
+const WS_DISABLED_ACCEL = 0x08000000;
+const WS_MINIMIZE_ACCEL = 0x20000000;
 import { savestateParticipants, savestatesEnabled, stateKeys } from '../../savestate/participant';
 import { CaptureRefusal } from '../../savestate/object-codecs';
 import type { SaveValue } from '../../savestate/value-codec';
+import { ACCEL_WM_COMMAND, copyAccelerators, createAccelerators, destroyAcceleratorTable, findAcceleratorFor, loadAccelerators, registerAcceleratorParticipant } from './accelerators';
+import { isSentinelWndProc } from './dialog';
+import { invokeGuestWndProcSync } from './message';
 
 // The three polled key readers are the hottest thunks any title issues (a per-frame
 // input poll, millions of calls over a session), so each has a fast path. The bodies
@@ -387,43 +393,42 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         return 1; // TRUE
     };
 
+    registerAcceleratorParticipant();
+
     exports['LoadAcceleratorsA'] = (ctx, mem, args) => {
-        const hInstance = args[0];
-        const lpTableName = args[1];
-        Logger.verbose(LogCategory.USER32, `LoadAcceleratorsA(0x${hInstance.toString(16)}, 0x${lpTableName.toString(16)})`);
-        return 0; // NULL - accelerator table not found
+        const name = args[1] >>> 0;
+        return loadAccelerators(mem, args[0] >>> 0, name < 0x10000 ? name : Marshaler.readString(mem, name));
     };
 
-    exports['CopyAcceleratorTableA'] = (ctx, mem, args) => {
-        const hAccelSrc = args[0];
-        const lpAccelDst = args[1];
-        const cAccelEntries = args[2];
-        Logger.verbose(LogCategory.USER32, `CopyAcceleratorTableA(0x${hAccelSrc.toString(16)}, 0x${lpAccelDst.toString(16)}, ${cAccelEntries})`);
-        // No real accelerator tables — return 0 entries copied
-        return 0;
+    exports['LoadAcceleratorsW'] = (ctx, mem, args) => {
+        const name = args[1] >>> 0;
+        return loadAccelerators(mem, args[0] >>> 0, name < 0x10000 ? name : Marshaler.readWideString(mem, name));
     };
 
-    exports['CreateAcceleratorTableA'] = (ctx, mem, args) => {
-        const lpAccel = args[0];
-        const cAccel = args[1];
-        Logger.verbose(LogCategory.USER32, `CreateAcceleratorTableA(0x${lpAccel.toString(16)}, ${cAccel})`);
-        // Return a non-zero dummy handle so callers don't treat it as failure
-        return 0x1ACC;
-    };
+    exports['CopyAcceleratorTableA'] = (ctx, mem, args) =>
+        copyAccelerators(mem, args[0] >>> 0, args[1] >>> 0, args[2] | 0);
+
+    exports['CreateAcceleratorTableA'] = (ctx, mem, args) =>
+        createAccelerators(mem, args[0] >>> 0, args[1] | 0);
 
     exports['TranslateAcceleratorA'] = exports['TranslateAcceleratorW'] = (ctx, mem, args) => {
-        const hWnd = args[0];
-        const hAccTable = args[1];
-        const lpMsg = args[2];
-        Logger.verbose(LogCategory.USER32, `TranslateAccelerator(0x${hWnd.toString(16)}, 0x${hAccTable.toString(16)}, 0x${lpMsg.toString(16)})`);
-        return 0; // Message not translated
+        const hWnd = args[0] >>> 0;
+        const hit = hWnd ? findAcceleratorFor(mem, args[1] >>> 0, args[2] >>> 0) : null;
+        if (!hit) return 0;
+        const win = windows.get(hWnd);
+        if (!win || getCapture() || (win.style & (WS_DISABLED_ACCEL | WS_MINIMIZE_ACCEL)) !== 0) return 1;
+        const wParam = ((1 << 16) | hit.cmd) >>> 0;
+        if (win.wndProc && !isSentinelWndProc(win.wndProc) && !(win.isSystemControl && !win.wndProcSubclassed)) {
+            const sent = invokeGuestWndProcSync(ctx, mem, win.wndProc, hWnd, ACCEL_WM_COMMAND, wParam, 0, 12,
+                'TranslateAccelerator', () => 1);
+            if (sent) return sent;
+        }
+        System.getInstance().windowManager.postMessage(hWnd, ACCEL_WM_COMMAND, wParam, 0);
+        System.getInstance().scheduler.wakeMessageWaiters();
+        return 1;
     };
 
-    exports['DestroyAcceleratorTable'] = (ctx, mem, args) => {
-        const hAccel = args[0];
-        Logger.verbose(LogCategory.USER32, `DestroyAcceleratorTable(0x${hAccel.toString(16)})`);
-        return 1; // TRUE - success
-    };
+    exports['DestroyAcceleratorTable'] = (ctx, mem, args) => (destroyAcceleratorTable(args[0] >>> 0) ? 1 : 0);
 
     exports['SetPropA'] = (ctx, mem, args) => {
         const hWnd = args[0];
