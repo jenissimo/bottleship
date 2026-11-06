@@ -341,7 +341,7 @@ describe("schema pin and mutation", () => {
         const schemas = savestateParticipants.schemas();
         for (const u of undo) u();
         expect(schemas).toEqual({
-            "kernel32": { version: 2, schemaHash: "6bbba5ed115386df" },
+            "kernel32": { version: 3, schemaHash: "6bbba5ed115386df" },
             "time": { version: 1, schemaHash: "728d1b2522148901" },
             "address-space": { version: 1, schemaHash: "a1c4ce059654c36f" },
             "memory-manager": { version: 1, schemaHash: "4a5dbc8ebbd40e94" },

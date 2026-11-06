@@ -94,7 +94,7 @@ export function restoreKernel32State(state: Kernel32State): void {
 
 export function registerKernel32Participant(): void {
     savestateParticipants.add({
-        id: 'kernel32', version: 2, order: 6, covers: ['kernel32', 'kernelbase', 'ntdll'],
+        id: 'kernel32', version: 3, order: 6, covers: ['kernel32', 'kernelbase', 'ntdll'],
         schema: stateKeys<Kernel32State>({ atoms: true, fls: true, srwLocks: true, namedObjects: true, modules: true, resources: true, commandLine: true, pointerCookie: true, consoleModes: true, fileApisAnsi: true, console: true, process: true, vista: true, actCtx: true, threadPool: true, startup: true, addressWaits: true }),
         capture: () => {
             try {

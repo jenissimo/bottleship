@@ -563,6 +563,7 @@ export class Msvcrt implements IModule {
         exports["fwrite"] = (ctx, mem, args) => this.fwrite(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0, args[3] ?? 0);
         exports["fgets"] = (ctx, mem, args) => this.fgets(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
         exports["fputs"] = (ctx, mem, args) => this.fputs(args[0] ?? 0, args[1] ?? 0);
+        exports["puts"] = (ctx, mem, args) => this.puts(args[0] ?? 0);
         exports["fseek"] = (ctx, mem, args) => this.fseek(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
         exports["ftell"] = (ctx, mem, args) => this.ftell(args[0] ?? 0);
         exports["fflush"] = () => 0;
@@ -3516,6 +3517,13 @@ export class Msvcrt implements IModule {
         stream.ungetChar = ch & 0xff;
         stream.eof = false;                // ungetc clears EOF indicator
         return ch & 0xff;
+    }
+
+    private puts(strPtr: number): number {
+        if (!strPtr) return -1;
+        const text = this.readCString(strPtr, 0x100000);
+        Logger.info(LogCategory.SYSTEM, `[CRT] ${text}`);
+        return text.length + 1;
     }
 
     private fputs(strPtr: number, filePtr: number): number {

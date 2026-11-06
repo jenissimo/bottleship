@@ -457,6 +457,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("fwrite", 4),
         makeFunc("fgets", 3),
         makeFunc("fputs", 2),
+        makeFunc("puts", 1),
         makeFunc("fseek", 3),
         makeFunc("ftell", 1),
         makeFunc("fflush", 1),
