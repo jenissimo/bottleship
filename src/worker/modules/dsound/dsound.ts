@@ -362,8 +362,14 @@ export class DSound implements IModule {
     constructor() {
         setTimerHandler(TimerKind.DSOUND_NOTIFY, () => this.checkNotifications());
     }
-    /** Singleton primary buffer COM pointer (CreateSoundBuffer PRIMARYBUFFER). */
-    private primaryBufferPtr = 0;
+    /** Primary buffer COM pointer per DirectSound device object (CreateSoundBuffer
+     *  PRIMARYBUFFER). Each device object owns its own primary buffer, created with the
+     *  DSBCAPS controls THAT caller asked for; a second request on the same device object
+     *  returns the existing one. A process-wide singleton handed a second device object
+     *  the first creator's caps — Star Wars Episode I Racer's Smush.dll creates its own
+     *  device beside a3dapi.dll's, asks for a CTRLVOLUME primary, and abandons all
+     *  cutscene audio when GetVolume on a primary created without it fails. */
+    private primaryByDevice = new Map<number, number>();
     private speakerConfig = DEFAULT_SPEAKER_CONFIG;
     /** IDirectSoundBuffer method call counters (dbg.audio()). */
     public dbgAudioCalls = {
@@ -850,8 +856,8 @@ export class DSound implements IModule {
                     `obj=${obj.refCount} buf=${obj.buffer.bufferRefCount} ptr=0x${(ptr >>> 0).toString(16)}`);
             }
             if (obj.refCount <= 0) {
-                if (ptr === this.primaryBufferPtr) {
-                    this.primaryBufferPtr = 0;
+                for (const [device, primary] of this.primaryByDevice) {
+                    if (primary === ptr) this.primaryByDevice.delete(device);
                 }
                 if (obj.buffer) {
                     obj.buffer.bufferRefCount--;
@@ -1508,11 +1514,12 @@ export class DSound implements IModule {
                 if (desc.format) {
                     return DSERR_INVALIDPARAM;
                 }
-                if (this.primaryBufferPtr) {
-                    const existing = this.objects.get(this.primaryBufferPtr);
-                    if (existing) existing.refCount += 1;
+                const existingPtr = this.primaryByDevice.get(args[0] >>> 0);
+                const existing = existingPtr !== undefined ? this.objects.get(existingPtr) : undefined;
+                if (existingPtr !== undefined && existing) {
+                    existing.refCount += 1;
                     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                    if (ppBuffer) view.setUint32(ppBuffer, this.primaryBufferPtr, true);
+                    if (ppBuffer) view.setUint32(ppBuffer, existingPtr, true);
                     return DS_OK;
                 }
             } else {
@@ -1618,7 +1625,7 @@ export class DSound implements IModule {
                 view.setUint32(ppBuffer, bufPtr, true);
             }
             if (isPrimary) {
-                this.primaryBufferPtr = bufPtr;
+                this.primaryByDevice.set(args[0] >>> 0, bufPtr);
             }
 
             // Register SAB with audio engine (lazy — on first Play, or now if created)
@@ -1708,7 +1715,7 @@ export class DSound implements IModule {
         this.exports["idirectsound8_duplicatesoundbuffer"] = (ctx, mem, args) => {
             const srcBufPtr = args[1];
             const ppBuffer = args[2];
-            if (srcBufPtr === this.primaryBufferPtr) {
+            if (this.isPrimaryBuffer(srcBufPtr)) {
                 if (ppBuffer) {
                     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                     view.setUint32(ppBuffer, 0, true);
@@ -3181,6 +3188,13 @@ export class DSound implements IModule {
         return objPtr;
     }
 
+    private isPrimaryBuffer(ptr: number): boolean {
+        for (const primary of this.primaryByDevice.values()) {
+            if (primary === (ptr >>> 0)) return true;
+        }
+        return false;
+    }
+
     private getBuffer(ptr: number): SoundBuffer | null {
         const obj = this.objects.get(ptr);
         if (!obj || !obj.buffer) return null;
@@ -3454,7 +3468,7 @@ export class DSound implements IModule {
             freeComObject(this.process.memory, ptr);
         }
         this.objects.clear();
-        this.primaryBufferPtr = 0;
+        this.primaryByDevice.clear();
         this.speakerConfig = DEFAULT_SPEAKER_CONFIG;
         this.nextBufferId = DSOUND_AUDIO_ID_BASE;
         this.listenerState = {
