@@ -1000,6 +1000,40 @@ export class GDIContext {
         state.windowBlit = { absX, absY, width, height };
     }
 
+    windowDCsFor(hwnd: number): number[] {
+        const out: number[] = [];
+        for (const [hdc, state] of this.hdcStates) {
+            if (state.windowBlit && state.hwnd === hwnd) out.push(hdc);
+        }
+        return out;
+    }
+
+    retargetWindowDC(hdc: number, absX: number, absY: number, width: number, height: number): void {
+        const state = this.hdcStates.get(hdc);
+        const ctx = this.contexts.get(hdc);
+        if (!state?.windowBlit || !ctx) return;
+        const w = Math.max(1, width | 0);
+        const h = Math.max(1, height | 0);
+        const canvas = ctx.canvas as OffscreenCanvas;
+        if (canvas.width !== w || canvas.height !== h) {
+            const keepW = Math.min(canvas.width, w);
+            const keepH = Math.min(canvas.height, h);
+            const kept = keepW > 0 && keepH > 0 ? ctx.getImageData(0, 0, keepW, keepH) : null;
+            canvas.width = w;
+            canvas.height = h;
+            ctx.textBaseline = 'top';
+            if (kept) ctx.putImageData(kept, 0, 0);
+            state.appliedFont = '';
+            state.appliedFillStyle = '';
+            state.cachedImageData = undefined;
+            state.cachedPixels32 = undefined;
+            state.imageDataDirty = true;
+            state.dirty = true;
+            state.dirtyRect = null;
+        }
+        state.windowBlit = { absX, absY, width: w, height: h };
+    }
+
     /**
      * Mark a window DC as belonging to a BeginPaint/EndPaint bracket, and give it the
      * clip such a DC has in Win32: the window's update region. Everything drawn through

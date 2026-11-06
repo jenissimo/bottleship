@@ -5,6 +5,7 @@
  */
 
 import { type HleDispatcher, FastPathImplementation, ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
+import { syncWindowDCsToGeometry } from './window-dc-geometry';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
@@ -347,6 +348,8 @@ function applyWindowPosGeometry(
     if (!(uFlags & 0x0008 /* SWP_NOREDRAW */)) {
         repaintParentDialogIfSystemControlGeometryChanged(window, moving, resizing);
     }
+
+    if (moving || resizing) syncWindowDCsToGeometry(hWnd);
 
     if (!options?.skipDialogOverlayRepaint && !(uFlags & 0x0008 /* SWP_NOREDRAW */)
         && window.visible && window.nativeClassName === '#32770'

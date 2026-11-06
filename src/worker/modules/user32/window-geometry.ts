@@ -12,6 +12,7 @@ import { isValidAddress } from '../../core/memory/address-guard';
 import { WindowInfo, windows, getAbsoluteWindowPosition, getVirtualScreenRect } from './shared-state';
 import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { invalidateWindow } from './paint-region';
+import { syncWindowDCsToGeometry } from './window-dc-geometry';
 import { repaintDialogOverlayIfVisible } from './dialog-paint';
 import { applyComboBoxClosedHeight } from './controls';
 import { USER_DEFAULT_SCREEN_DPI } from './monitor';
@@ -374,6 +375,8 @@ export function registerWindowGeometryExports(
             wmWin.rect.w = window.width;
             wmWin.rect.h = window.height;
         }
+
+        if (moving || resizing) syncWindowDCsToGeometry(hWnd);
 
         if (bRepaint && window.visible) {
             invalidateWindow(hWnd, null, true);
