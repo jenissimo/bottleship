@@ -134,6 +134,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         const GWL_STYLE = -16;
         const GWL_EXSTYLE = -20;
         const GWL_USERDATA = -21;
+        const GWL_HWNDPARENT = -8;
 
         const idx = nIndex | 0;
         if (idx >= 0) {
@@ -155,6 +156,8 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
                 return (window.exStyle ?? 0) >>> 0;
             case GWL_USERDATA:
                 return (window.userData ?? 0) >>> 0;
+            case GWL_HWNDPARENT:
+                return (window.parent ?? 0) >>> 0;
             default:
                 return 0;
         }
