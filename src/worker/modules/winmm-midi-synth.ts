@@ -29,6 +29,7 @@ export class MidiSynthOutput {
     private unsubscribe: (() => void) | null = null;
     private left = new Float32Array(0);
     private right = new Float32Array(0);
+    private readonly tickers = new Set<(now: number) => void>();
 
     private constructor(process: Process) {
         this.process = process;
@@ -92,6 +93,7 @@ export class MidiSynthOutput {
     private shutdown(): void {
         this.unsubscribe?.();
         this.unsubscribe = null;
+        this.tickers.clear();
         if (this.pumpTimer !== null) System.getInstance().scheduler?.timerWheel.cancel(this.pumpTimer);
         this.pumpTimer = null;
         this.router.allNotesOff();
@@ -100,6 +102,11 @@ export class MidiSynthOutput {
         this.sink = null;
         if (this.buffer) soundReference(this.process, this.buffer, true, false);
         this.buffer = 0;
+    }
+
+    addTicker(ticker: (now: number) => void): () => void {
+        this.tickers.add(ticker);
+        return () => this.tickers.delete(ticker);
     }
 
     shortMessage(message: number): void {
@@ -112,6 +119,7 @@ export class MidiSynthOutput {
         const now = TimeService.getInstance().nowMs();
         const since = this.lastPumpMs;
         this.lastPumpMs = now;
+        for (const ticker of [...this.tickers]) ticker(now);
         this.sink.pump((pcm, frames) => this.render(pcm, frames, since, now));
         this.router.flush();
     }
