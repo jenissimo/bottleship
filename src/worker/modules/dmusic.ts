@@ -1491,6 +1491,7 @@ export class DMusic implements IModule {
         e["IDirectMusicSegment8_GetAudioPathConfig"] = (_c, _m, a) => { Mem.writeUint32(a[1]! >>> 0, 0); return DMUS_E_NOT_FOUND; };
         e["IDirectMusicSegment8_InitPlay"] = (_c, _m, a) => { if (a[1]) Mem.writeUint32(a[1] >>> 0, 0); return E_NOTIMPL; };
         e["IDirectMusicSegment8_Clone"] = (_c, _m, a) => { if (a[3]) Mem.writeUint32(a[3] >>> 0, 0); return E_NOTIMPL; };
+        e["IDirectMusicSegment8_Compose"] = (_c, _m, a) => { if (a[4]) Mem.writeUint32(a[4] >>> 0, 0); return E_NOTIMPL; };
     }
 
     private registerTrackExports(): void {

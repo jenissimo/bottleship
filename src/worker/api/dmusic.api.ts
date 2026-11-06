@@ -150,6 +150,7 @@ export const IDirectMusicSegment8: InterfaceDescriptor = {
         // IDirectMusicSegment8
         m("SetTrackConfig", 6),
         m("GetAudioPathConfig", 2),
+        m("Compose", 5),
         m("Download", 2),
         m("Unload", 2),
     ],
