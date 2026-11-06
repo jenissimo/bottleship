@@ -3983,4 +3983,79 @@ export function registerFastPathMsvcrtFunctions(dispatcher: HleDispatcher): void
     dispatcher.registerFastPath('msvcrt', '_ftol', fastPathFtol);
     dispatcher.registerFastPath('crtdll', '_ftol', fastPathFtol);
     dispatcher.registerFastPath('msvcr90', '_ftol', fastPathFtol);
+
+    registerFastPathMbsFunctions(dispatcher);
 }
+
+/**
+ * Read-only _mbs* helpers on the fast path, SBCS code page only.
+ *
+ * Empires: Dawn of the Modern World binds its whole process to HLE msvcrt (#116/#123), and
+ * its loader's UWideString::copy calls _mbslen/_mbsnbcnt/_mbsninc/_mbscmp/_mbsinc about
+ * 180K times a second while the game loads (apiCensus: ~1.8M calls in 10 s, none on the
+ * fast path). A slow-path round trip for a call that does a few bytes of work is what kept
+ * the screen black for 50-115 s. These mirror the crt-mb.ts handlers exactly under SBCS
+ * (one byte = one character); under a DBCS page, or for a pointer the view cannot read,
+ * they return null and the slow handler answers as before (including its errors).
+ */
+function registerFastPathMbsFunctions(dispatcher: HleDispatcher): void {
+    const sbcs = (): boolean => !DBCS_PAGES_FOR_FAST_PATH.has(EmulatorConfig.getInstance().ansiCodePage);
+    /** Bytes before the terminator, at most `max`; -1 when the view ends first. */
+    const count = (mem8: Uint8Array, ptr: number, max: number): number => {
+        if (!ptr) return -1;
+        const end = Math.min(mem8.length, ptr + max);
+        let p = ptr;
+        while (p < end && mem8[p] !== 0) p++;
+        if (p - ptr < max && p >= mem8.length) return -1;
+        return p - ptr;
+    };
+    const arg = (view: DataView, esp: number, i: number): number => view.getUint32(esp + 4 + i * 4, true) >>> 0;
+
+    const mbslen: FastPathImplementation = (esp, view, mem8) => {
+        if (esp + 8 > mem8.length || !sbcs()) return null;
+        const n = count(mem8, arg(view, esp, 0), 0xffffffff);
+        return n < 0 ? null : n;
+    };
+    const mbsnbcnt: FastPathImplementation = (esp, view, mem8) => {
+        if (esp + 12 > mem8.length || !sbcs()) return null;
+        const n = count(mem8, arg(view, esp, 0), arg(view, esp, 1));
+        return n < 0 ? null : n;
+    };
+    const mbsninc: FastPathImplementation = (esp, view, mem8) => {
+        if (esp + 12 > mem8.length || !sbcs()) return null;
+        const p = arg(view, esp, 0);
+        if (!p) return 0;
+        const n = count(mem8, p, arg(view, esp, 1));
+        return n < 0 ? null : ((p + n) >>> 0) | 0;
+    };
+    const mbsinc: FastPathImplementation = (esp, view, mem8) => {
+        if (esp + 8 > mem8.length) return null;
+        const p = arg(view, esp, 0);
+        return p ? ((p + 1) >>> 0) | 0 : 0;
+    };
+    const mbscmp: FastPathImplementation = (esp, view, mem8) => {
+        if (esp + 12 > mem8.length) return null;
+        const a = arg(view, esp, 0), b = arg(view, esp, 1);
+        for (let i = 0; ; i++) {
+            if (a + i >= mem8.length || b + i >= mem8.length) return null;
+            const ac = mem8[a + i]!, bc = mem8[b + i]!;
+            if (ac !== bc) return (ac - bc) | 0;
+            if (ac === 0) return 0;
+        }
+    };
+
+    for (const dll of ['msvcrt', 'crtdll', 'msvcr90']) {
+        // Pure reads of guest memory: no scheduler boundary needed on every call.
+        dispatcher.registerFastPath(dll, '_mbslen', mbslen, { trivial: true });
+        dispatcher.registerFastPath(dll, '_mbsnbcnt', mbsnbcnt, { trivial: true });
+        dispatcher.registerFastPath(dll, '_mbsnccnt', mbsnbcnt, { trivial: true });
+        dispatcher.registerFastPath(dll, '_mbsninc', mbsninc, { trivial: true });
+        dispatcher.registerFastPath(dll, '_mbsinc', mbsinc, { trivial: true });
+        dispatcher.registerFastPath(dll, '_mbscmp', mbscmp, { trivial: true });
+    }
+}
+
+// @transient(constant table)
+const DBCS_PAGES_FOR_FAST_PATH: ReadonlySet<number> = new Set([
+    932, 936, 949, 950, 1361, 50225, 50227, 50229, 51932, 51936, 51949, 52936, 54936,
+]);
