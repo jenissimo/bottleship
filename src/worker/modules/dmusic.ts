@@ -78,6 +78,7 @@ const GUID_Unload = "d2ac28a8-b39b-11d1-8704-00600893b1bd";
 const GUID_PerfMasterTempo = "d2ac28b0-b39b-11d1-8704-00600893b1bd";
 const GUID_PerfMasterVolume = "d2ac28b1-b39b-11d1-8704-00600893b1bd";
 const GUID_DefaultGMCollection = "f17e8673-c3b4-11d1-870b-00600893b1bd";
+const GUID_DirectMusicAllTypes = "d2ac2893-b39b-11d1-8704-00600893b1bd";
 const CLSID_DirectMusicBandTrack = "d2ac2894-b39b-11d1-8704-00600893b1bd";
 
 /** DMUS_PORTCAPS (dmusicc.h): 52 bytes of fields, then a 128-WCHAR description. */
@@ -296,7 +297,7 @@ export class DMusic implements IModule {
         switch (clsid) {
             case CLSID_DirectMusicLoader:
             case "d2ac2891-b39b-11d1-8704-00600893b1bd":
-                obj = new LoaderObject(); break;
+                obj = this.createLoader(); break;
             case CLSID_DirectMusicPerformance: {
                 const perf = new PerformanceObject();
                 this.performances.add(perf);
@@ -640,11 +641,39 @@ export class DMusic implements IModule {
             Logger.log(LogCategory.COM, "[DMusic] no gm.dls in the bundle: instruments from the default GM collection are silent");
         }
         loader.defaultCollection = obj;
-        loader.onDestroy = () => {
-            loader.defaultCollection = null;
-            obj.release();
-        };
         return obj;
+    }
+
+    private createLoader(): LoaderObject {
+        const loader = new LoaderObject();
+        loader.onDestroy = () => {
+            this.clearLoaderCache(loader, GUID_DirectMusicAllTypes);
+            loader.defaultCollection?.release();
+            loader.defaultCollection = null;
+        };
+        return loader;
+    }
+
+    private loaderCaches(loader: LoaderObject, classId: string): boolean {
+        return !loader.cacheDisabled.has(GUID_DirectMusicAllTypes) && !loader.cacheDisabled.has(classId);
+    }
+
+    private clearLoaderCache(loader: LoaderObject, classId: string): void {
+        for (const [key, obj] of loader.cache) {
+            if (classId !== GUID_DirectMusicAllTypes && obj.classId !== classId) continue;
+            loader.cache.delete(key);
+            obj.release();
+        }
+    }
+
+    private releaseFromLoaderCache(loader: LoaderObject, obj: DMusicObject | null): number {
+        for (const [key, cached] of loader.cache) {
+            if (cached !== obj) continue;
+            loader.cache.delete(key);
+            cached.release();
+            return S_OK;
+        }
+        return DMUS_E_LOADER_OBJECTNOTFOUND;
     }
 
     private objectFromFile(loader: LoaderObject, bytes: Uint8Array, fileName: string): LoadableObject | null {
@@ -710,12 +739,16 @@ export class DMusic implements IModule {
                 const dir = loader.searchDirectory;
                 const full = (valid & DMUS_OBJ_FULLPATH) || !dir || /^[a-z]:|^\\/i.test(name)
                     ? name : dir.replace(/[\\/]+$/, "") + "\\" + name;
+                const key = full.toLowerCase();
+                const cached = loader.cache.get(key);
+                if (cached) return this.queryInterface(cached, guidAt(a[2]! >>> 0), ppv);
                 const bytes = this.readSystemFile([full]);
                 const obj = bytes ? this.objectFromFile(loader, bytes, name) : null;
                 Logger.log(LogCategory.COM, `[DMusic] system loader GetObject("${full}") -> ${obj ? "loaded" : "DMUS_E_LOADER_FAILEDOPEN"}`);
                 if (!obj) return DMUS_E_LOADER_FAILEDOPEN;
                 const hr = this.queryInterface(obj, guidAt(a[2]! >>> 0), ppv);
-                obj.release();
+                if (hr === S_OK && this.loaderCaches(loader, obj.classId)) loader.cache.set(key, obj);
+                else obj.release();
                 return hr;
             }
             Logger.log(LogCategory.COM, `[DMusic] system loader GetObject -> DMUS_E_LOADER_OBJECTNOTFOUND`);
@@ -725,18 +758,42 @@ export class DMusic implements IModule {
         e["IDirectMusicLoader8_SetSearchDirectory"] = (_c, _m, a) => {
             const loader = this.object<LoaderObject>(a[0]);
             if (!loader) return E_POINTER;
-            const path = readWide(a[2]! >>> 0, DESC_FILENAME_CHARS);
-            if (path) loader.searchDirectory = path;
+            const path = a[2] ? readWide(a[2] >>> 0, DESC_FILENAME_CHARS) : "";
+            loader.searchDirectory = path || System.getInstance().fileSystem.currentDir || "";
             return S_OK;
         };
         e["IDirectMusicLoader8_ScanDirectory"] = () => S_FALSE;   // "no files found"
         e["IDirectMusicLoader8_CacheObject"] = () => S_OK;
-        e["IDirectMusicLoader8_ReleaseObject"] = () => S_OK;
-        e["IDirectMusicLoader8_ClearCache"] = () => S_OK;
-        e["IDirectMusicLoader8_EnableCache"] = () => S_OK;
+        e["IDirectMusicLoader8_ReleaseObject"] = (_c, _m, a) => {
+            const loader = this.object<LoaderObject>(a[0]);
+            return loader ? this.releaseFromLoaderCache(loader, this.object(a[1])) : E_POINTER;
+        };
+        e["IDirectMusicLoader8_ClearCache"] = (_c, _m, a) => {
+            const loader = this.object<LoaderObject>(a[0]);
+            if (!loader) return E_POINTER;
+            this.clearLoaderCache(loader, validPointer(a[1]! >>> 0, 16, "r") ? guidAt(a[1]! >>> 0) : GUID_DirectMusicAllTypes);
+            return S_OK;
+        };
+        e["IDirectMusicLoader8_EnableCache"] = (_c, _m, a) => {
+            const loader = this.object<LoaderObject>(a[0]);
+            if (!loader) return E_POINTER;
+            const classId = validPointer(a[1]! >>> 0, 16, "r") ? guidAt(a[1]! >>> 0) : GUID_DirectMusicAllTypes;
+            const was = this.loaderCaches(loader, classId);
+            if (a[2]) {
+                if (classId === GUID_DirectMusicAllTypes) loader.cacheDisabled.clear();
+                else loader.cacheDisabled.delete(classId);
+            } else {
+                loader.cacheDisabled.add(classId);
+                this.clearLoaderCache(loader, classId);
+            }
+            return was === !!a[2] ? S_FALSE : S_OK;
+        };
         e["IDirectMusicLoader8_EnumObject"] = () => S_FALSE;      // end of enumeration
         e["IDirectMusicLoader8_CollectGarbage"] = () => S_OK;
-        e["IDirectMusicLoader8_ReleaseObjectByUnknown"] = () => S_OK;
+        e["IDirectMusicLoader8_ReleaseObjectByUnknown"] = (_c, _m, a) => {
+            const loader = this.object<LoaderObject>(a[0]);
+            return loader ? this.releaseFromLoaderCache(loader, this.object(a[1])) : E_POINTER;
+        };
         // HRESULT LoadObjectFromFile(REFGUID rguidClassID, REFIID iidInterfaceID,
         //                            WCHAR *pwzFilePath, void **ppObject)
         e["IDirectMusicLoader8_LoadObjectFromFile"] = (_c, _m, a) => {

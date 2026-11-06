@@ -108,6 +108,27 @@ describe("SMF parsing", () => {
     });
 });
 
+describe("SMF running status", () => {
+    const notesOf = (events: number[]) => {
+        const bytes = Uint8Array.from([...ascii("MThd"), ...be32(6), ...be16(0), ...be16(1), ...be16(96), ...track(events)]);
+        const seq = smfToSegment(bytes, "rs.mid", GM)!.tracks.find((t) => t.kind === "seq") as any;
+        return seq.events.filter((e: any) => (e.status & 0xf0) === 0x90).map((e: any) => e.byte1);
+    };
+
+    test("running status carries a note-on to the next data bytes", () => {
+        expect(notesOf([0x00, 0x90, 0x3c, 0x64, 0x00, 0x3e, 0x64, 0x00, 0xff, 0x2f, 0x00])).toEqual([0x3c, 0x3e]);
+    });
+
+    test("a meta event cancels running status", () => {
+        expect(notesOf([0x00, 0x90, 0x3c, 0x64, 0x00, 0xff, 0x01, 0x00, 0x00, 0x3e, 0x64, 0x00, 0xff, 0x2f, 0x00])).toEqual([0x3c]);
+    });
+
+    test("a sysex event cancels running status", () => {
+        expect(notesOf([0x00, 0x90, 0x3c, 0x64, 0x00, 0xf0, 0x01, 0xf7, 0x00, 0x3e, 0x64, 0x00, 0xff, 0x2f, 0x00])).toEqual([0x3c]);
+        expect(notesOf([0x00, 0x90, 0x3c, 0x64, 0x00, 0xf7, 0x00, 0x00, 0x3e, 0x64, 0x00, 0xff, 0x2f, 0x00])).toEqual([0x3c]);
+    });
+});
+
 describe("SMF segment playback", () => {
     test("plays the file's notes on its channels with the band's programs", () => {
         const synth = new RecordingSynth();

@@ -76,6 +76,7 @@ export function smfToSegment(bytes: Uint8Array, name: string, gm: ObjectReferenc
             if (status & 0x80) pos.o++;
             else status = running;
             if (status === 0xff) {
+                running = 0;
                 const type = bytes[pos.o++]!;
                 const len = readVarLen(bytes, pos, end);
                 const d = pos.o;
@@ -90,6 +91,7 @@ export function smfToSegment(bytes: Uint8Array, name: string, gm: ObjectReferenc
                 continue;
             }
             if (status === 0xf0 || status === 0xf7) {
+                running = 0;
                 pos.o += readVarLen(bytes, pos, end);
                 continue;
             }
