@@ -876,6 +876,10 @@ export class WindowManager {
         return this.windows.get(hwnd)?.creatorThreadId ?? 0;
     }
 
+    removePostedMessages(match: (msg: Message) => boolean): number {
+        return this.messageQueue.removePosted(match);
+    }
+
     // Message Pump / Queue
     postMessage(
         hwnd: number,

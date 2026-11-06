@@ -1028,6 +1028,20 @@ export class MessageQueue {
         }
     }
 
+    removePosted(match: (msg: Message) => boolean): number {
+        const kept: Message[] = [];
+        let removed = 0;
+        let msg: Message | null;
+        while ((msg = this.postedQueue.dequeue()) !== null) {
+            if (match(msg)) removed++;
+            else kept.push(msg);
+        }
+        for (const m of kept) {
+            this.postedQueue.enqueue(m.hwnd, m.message, m.wParam, m.lParam, m.time, m.ptX, m.ptY, m.targetThreadId ?? 0, m.keyStatePacked, m.extraInfo ?? 0);
+        }
+        return removed;
+    }
+
     /** Put a removed mouse move back as the pending one, unless a newer move replaced it. */
     restorePendingMouseMove(msg: Message): void {
         if (this.lastMouseMove.has(msg.hwnd)) return;

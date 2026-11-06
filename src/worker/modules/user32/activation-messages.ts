@@ -24,6 +24,26 @@ export interface ActivationStep {
     lParam: number;
 }
 
+// @transient(which queued WM_ACTIVATE messages USER posted itself; after a load the queue is restored without them and they are simply delivered)
+const postedActivations = new Map<number, { wParam: number; lParam: number }>();
+
+function postActivation(hwnd: number, wParam: number, lParam: number): void {
+    const wm = System.getInstance().windowManager;
+    wm.removePostedMessages((m) => {
+        if (m.message !== WM_ACTIVATE || (m.wParam & 0xffff) === WA_INACTIVE || m.hwnd === hwnd) return false;
+        const own = postedActivations.get(m.hwnd);
+        if (!own || own.wParam !== m.wParam || own.lParam !== m.lParam) return false;
+        postedActivations.delete(m.hwnd);
+        return true;
+    });
+    wm.postMessage(hwnd, WM_ACTIVATE, wParam, lParam);
+    postedActivations.set(hwnd >>> 0, { wParam: wParam >>> 0, lParam: lParam >>> 0 });
+}
+
+export function resetPostedActivations(): void {
+    postedActivations.clear();
+}
+
 function resolveWndProc(hwnd: number): number {
     return windows.get(hwnd)?.wndProc ?? 0;
 }
@@ -176,7 +196,7 @@ export function postActivationTransition(newHwnd: number, prevHwnd: number): voi
     if (newHwnd) {
         if (appBoundary) wm.postMessage(newHwnd, WM_ACTIVATEAPP, 1, 0);
         wm.postMessage(newHwnd, WM_NCACTIVATE, 1, prevHwnd >>> 0);
-        wm.postMessage(newHwnd, WM_ACTIVATE, WA_ACTIVE, prevHwnd >>> 0);
+        postActivation(newHwnd, WA_ACTIVE, prevHwnd >>> 0);
     }
     // Focus moves after activation has settled (Wine input.c:2094).
     if (deactivating) wm.postMessage(prevHwnd, WM_KILLFOCUS, newHwnd >>> 0, 0);
@@ -196,7 +216,7 @@ export function postInitialActivationMessages(hwnd: number): void {
     const wm = System.getInstance().windowManager;
     wm.postMessage(hwnd, WM_ACTIVATEAPP, 1, 0);
     wm.postMessage(hwnd, WM_NCACTIVATE, 1, 0);
-    wm.postMessage(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
+    postActivation(hwnd, WA_ACTIVE, 0);
     wm.postMessage(hwnd, WM_SETFOCUS, 0, 0);
     markActivationDelivered(hwnd); // queued counts as delivered (see postActivationTransition)
 }
@@ -277,7 +297,7 @@ export function activateOwnedDialog(hwnd: number): number {
     if (hwnd === prevActive) {
         if (needsActivationDelivery(hwnd)) {
             wm.postMessage(hwnd, WM_NCACTIVATE, 1, 0);
-            wm.postMessage(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
+            postActivation(hwnd, WA_ACTIVE, 0);
             wm.postMessage(hwnd, WM_SETFOCUS, 0, 0);
             markActivationDelivered(hwnd);
         }
