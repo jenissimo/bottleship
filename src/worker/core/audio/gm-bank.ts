@@ -1,13 +1,15 @@
-import { type DlsCollection, parseDls } from "@bottleship/formats/dmusic/dls";
-import { decodeCompressedWaves, hasCompressedWaves, parseSoundFont } from "@bottleship/formats/dmusic/sf2";
+import { type DlsCollection, type DlsInstrument, type DlsWave, parseDls } from "@bottleship/formats/dmusic/dls";
+import { hasCompressedWaves, parseSoundFont } from "@bottleship/formats/dmusic/sf2";
 import { DEPLOYMENT_CONFIG_URL, loadDeploymentConfig } from "../../../deployment-config";
 import { Logger, LogCategory } from "../logger";
 import { System } from "../system";
-import { decodeOggVorbis, webCodecsVorbisPresent } from "./vorbis-decode";
+import { setWaveDecoder } from "./directmusic/synth";
+import { decodeOggVorbisBatch, webCodecsVorbisPresent } from "./vorbis-decode";
 
 export const GM_DLS_PATHS = ["C:\\WINDOWS\\SYSTEM32\\DRIVERS\\GM.DLS", "C:\\WINDOWS\\SYSTEM\\GM.DLS"];
 const MAX_BANK_BYTES = 256 * 1024 * 1024;
-const DECODE_PARALLEL = 8;
+const DECODE_BATCH = 32;
+const BACKGROUND_DECODE_DELAY_MS = 3000;
 
 // @transient(the General MIDI bank is read-only and the same for every session in this worker)
 let sources: string[] | null = null;
@@ -80,21 +82,67 @@ export function resetGmBankForTests(): void {
     bankPromise = null;
     bank = null;
     listeners.clear();
+    decoding.clear();
+    instrumentDecodes.clear();
+    progressListeners.clear();
+    setWaveDecoder(null);
 }
 
-async function decodeAll(collection: DlsCollection): Promise<boolean> {
-    let ok = true;
-    const pending = collection.waves.map((w, i) => ({ w, i })).filter(({ w }) => w && w.formatTag !== 1);
-    const work = async (): Promise<void> => {
-        for (let next = pending.shift(); next; next = pending.shift()) {
-            const one: DlsCollection = { ...collection, waves: [next.w] };
-            await decodeCompressedWaves(one, (ogg) => decodeOggVorbis(ogg));
-            if (!one.waves[0]) ok = false;
-            collection.waves[next.i] = one.waves[0] ?? null;
-        }
-    };
-    await Promise.all(Array.from({ length: DECODE_PARALLEL }, work));
-    return ok;
+// @transient(decodes of the read-only bank, shared by every session in this worker)
+const decoding = new Map<DlsWave, Promise<void>>();
+
+function decodeWaves(collection: DlsCollection, indices: number[]): Promise<void> {
+    const todo = indices.filter((index) => {
+        const wave = collection.waves[index];
+        return wave && wave.formatTag !== 1 && !decoding.has(wave);
+    });
+    const waves = todo.map((index) => collection.waves[index]!);
+    if (todo.length > 0) {
+        const batch = decodeOggVorbisBatch(waves.map((w) => w.data)).then((pcms) => {
+            todo.forEach((index, n) => {
+                if (collection.waves[index] !== waves[n]) return;
+                const pcm = pcms[n];
+                collection.waves[index] = pcm
+                    ? { ...waves[n]!, formatTag: 1, data: new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength) }
+                    : null;
+            });
+        });
+        for (const wave of waves) decoding.set(wave, batch);
+    }
+    const pending = indices.map((index) => collection.waves[index]).filter((w): w is DlsWave => !!w && decoding.has(w)).map((w) => decoding.get(w)!);
+    return Promise.all(pending).then(() => undefined);
+}
+
+// @transient(decodes of the read-only bank, shared by every session in this worker)
+const instrumentDecodes = new Map<DlsInstrument, Promise<void>>();
+// @transient(subscribers to a running decode; they only refresh synth channels)
+const progressListeners = new Map<DlsInstrument, Set<() => void>>();
+
+function decodeInstrument(collection: DlsCollection, inst: DlsInstrument, progress: () => void): Promise<void> {
+    let listeners = progressListeners.get(inst);
+    if (!listeners) progressListeners.set(inst, listeners = new Set());
+    listeners.add(progress);
+    let pending = instrumentDecodes.get(inst);
+    if (!pending) {
+        pending = (async () => {
+            const started = Date.now();
+            const indices = [...new Set(inst.regions.map((r) => r.waveIndex))];
+            for (let i = 0; i < indices.length; i += DECODE_BATCH) {
+                await decodeWaves(collection, indices.slice(i, i + DECODE_BATCH));
+                for (const notify of progressListeners.get(inst) ?? []) notify();
+            }
+            progressListeners.delete(inst);
+            Logger.log(LogCategory.SYSTEM, `[GM bank] "${inst.name}": ${indices.length} samples ready in ${Date.now() - started} ms`);
+        })();
+        instrumentDecodes.set(inst, pending);
+    }
+    return pending;
+}
+
+async function decodeRest(collection: DlsCollection): Promise<void> {
+    for (const inst of collection.instruments) {
+        await decodeInstrument(collection, inst, () => undefined);
+    }
 }
 
 async function fromUrl(url: string): Promise<DlsCollection | null> {
@@ -105,9 +153,13 @@ async function fromUrl(url: string): Promise<DlsCollection | null> {
     if (!parsed) throw new Error("not a SoundFont or DLS bank");
     if (hasCompressedWaves(parsed)) {
         if (!webCodecsVorbisPresent()) throw new Error("no Vorbis decoder in this browser");
-        const first = parsed.waves.find((w) => w && w.formatTag !== 1);
-        if (first && !(await decodeOggVorbis(first.data))) throw new Error("Vorbis decoding unsupported");
-        if (!(await decodeAll(parsed))) Logger.warn(LogCategory.SYSTEM, `[GM bank] ${url}: some samples did not decode and stay silent`);
+        const first = parsed.waves.findIndex((w) => w && w.formatTag !== 1);
+        if (first >= 0) {
+            await decodeWaves(parsed, [first]);
+            if (!parsed.waves[first]) throw new Error("Vorbis decoding unsupported");
+        }
+        setWaveDecoder(decodeInstrument);
+        setTimeout(() => void decodeRest(parsed), BACKGROUND_DECODE_DELAY_MS);
     }
     return parsed;
 }

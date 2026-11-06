@@ -134,6 +134,22 @@ function decodeWave(wave: DlsWave): Float32Array {
 
 const preparedInstruments = new WeakMap<DlsInstrument, PreparedInstrument>();
 
+export type WaveDecoder = (collection: DlsCollection, inst: DlsInstrument, progress: () => void) => Promise<void>;
+
+// @transient(installed once per worker by the bank loader; holds no session data)
+let waveDecoder: WaveDecoder | null = null;
+
+export function setWaveDecoder(decoder: WaveDecoder | null): void {
+    waveDecoder = decoder;
+}
+
+function hasUndecodedWaves(collection: DlsCollection, inst: DlsInstrument): boolean {
+    return inst.regions.some((r) => {
+        const wave = collection.waves[r.waveIndex];
+        return wave !== null && wave !== undefined && wave.formatTag !== 1;
+    });
+}
+
 function prepareInstrument(collection: DlsCollection, inst: DlsInstrument): PreparedInstrument {
     let prepared = preparedInstruments.get(inst);
     if (prepared) return prepared;
@@ -185,6 +201,7 @@ export function findInstrument(collection: DlsCollection, patch: number): DlsIns
 
 class Channel {
     instrument: PreparedInstrument | null = null;
+    pendingDecode: object | null = null;
     volume = 100;
     expression = 127;
     pan = 64;
@@ -285,6 +302,19 @@ export class DlsSynth {
     setInstrument(channelId: number, collection: DlsCollection | null, patch: number): boolean {
         const ch = this.channel(channelId);
         const inst = collection ? findInstrument(collection, patch) : null;
+        ch.pendingDecode = null;
+        if (inst && collection && waveDecoder && hasUndecodedWaves(collection, inst)) {
+            const token = {};
+            ch.pendingDecode = token;
+            const refresh = (): void => {
+                preparedInstruments.delete(inst);
+                if (ch.pendingDecode === token) ch.instrument = prepareInstrument(collection, inst);
+            };
+            void waveDecoder(collection, inst, refresh).then(() => {
+                refresh();
+                if (ch.pendingDecode === token) ch.pendingDecode = null;
+            });
+        }
         ch.instrument = inst && collection ? prepareInstrument(collection, inst) : null;
         return ch.instrument !== null;
     }
