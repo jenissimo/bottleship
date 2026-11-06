@@ -31,6 +31,10 @@ export function isD3dx9VersionedDll(dllNameLower: string): boolean {
 
 export interface ImportFn { name?: string; ordinal?: number }
 
+export function trapsUnknownImport(f: ImportFn, aliased: boolean): boolean {
+    return aliased || (f.name === undefined && f.ordinal !== undefined);
+}
+
 /** What the API registry knows about one export of the thunked module. */
 export interface ExportFacts {
     callingConvention?: string;
