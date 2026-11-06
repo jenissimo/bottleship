@@ -7,6 +7,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { readStringA, readStringW, encodeFileApiString } from './file-io-strings';
 import { fileTimeOf } from '../../runtime/filesystem/file-time';
+import type { VfsEntry } from '../../runtime/filesystem/vfs';
 
 const INVALID_HANDLE_VALUE = -1;
 const ERROR_FILE_NOT_FOUND = 2;
@@ -73,6 +74,15 @@ const splitFindPattern = (rawPattern: string): { searchPath: string; searchMask:
     if (/^[A-Za-z]:$/.test(searchPath) && lastSlash !== -1) searchPath += '\\';
     if (searchMask === '') searchMask = '*';
     return { searchPath, searchMask };
+};
+
+const dotEntriesFor = (searchPath: string, searchMask: string): VfsEntry[] => {
+    if (searchMask !== '*' && searchMask !== '*.*') return [];
+    const vfs = System.getInstance().fileSystem;
+    if (searchPath === '\\' || /^[A-Za-z]:\\$/.test(searchPath)) return [];
+    const full = vfs.resolvePath(searchPath);
+    if (/^[A-Za-z]:\\?$/.test(full) || !vfs.directoryExists(full)) return [];
+    return ['.', '..'].map(name => ({ path: full, name, kind: 'dir' as const, size: 0, source: 'overlay' as const }));
 };
 
 const fillFindDataA = (mem: Uint8Array, addr: number, entry: any) => {
@@ -151,7 +161,7 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
 
         const entries = vfs.listDirectory(searchPath);
         const regex = patternToRegex(searchMask);
-        const matches = entries.filter(e => regex.test(e.name));
+        const matches = [...dotEntriesFor(searchPath, searchMask), ...entries.filter(e => regex.test(e.name))];
 
         if (matches.length === 0) {
             Logger.log(LogCategory.KERNEL32, `FindFirstFileA("${pattern}") -> NOT FOUND (searchPath="${searchPath}", mask="${searchMask}", cwd="${vfs.currentDir}")`);
@@ -206,7 +216,7 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
 
         const entries = vfs.listDirectory(searchPath);
         const regex = patternToRegex(searchMask);
-        const matches = entries.filter(e => regex.test(e.name));
+        const matches = [...dotEntriesFor(searchPath, searchMask), ...entries.filter(e => regex.test(e.name))];
 
         if (matches.length === 0) {
             System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
