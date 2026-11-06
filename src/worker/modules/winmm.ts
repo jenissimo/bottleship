@@ -121,6 +121,8 @@ const MMIO_GUEST_BUFSIZE  = 64 * 1024;
 const FCC_DOS = 0x20534f44; // 'DOS ' — fccIOProc for a plain disk file
 const FCC_MEM = 0x204d454d; // 'MEM ' — fccIOProc for a memory file
 
+const TIME_PERIOD_MAX = 1000000;
+
 /**
  * Does this mmioOpen select the MEMORY I/O proc? MMIOINFO decides: fccIOProc, else pIOProc,
  * and ONLY when both are absent does mmioOpen parse the name (Wine MMIO_Open). So 'MEM ' is a
@@ -128,6 +130,7 @@ const FCC_MEM = 0x204d454d; // 'MEM ' — fccIOProc for a memory file
  * passes the asset's own name alongside its buffer (THPS2 does, for every sound it has already
  * read out of its .pkr) must not be sent to the disk path, where that name does not exist.
  */
+
 export function mmioSelectsMemoryIoProc(
     hasInfo: boolean, fccIOProc: number, pIOProc: number, filename: string,
 ): boolean {
@@ -563,7 +566,8 @@ export class WinMM implements IModule {
         for (const period of this.periodRefCounts.keys()) {
             if (finest === null || period < finest) finest = period;
         }
-        TimeService.getInstance().setTimerResolutionMs(finest);
+        TimeService.getInstance().setTimerResolutionMs(
+            finest !== null && finest < TimeService.DEFAULT_TIMER_RESOLUTION_MS ? finest : null);
     }
     private waveOutDevices: Map<number, WaveOutDevice> = new Map();
     private nextWaveOutId = 0x20000000;
@@ -1484,13 +1488,13 @@ export class WinMM implements IModule {
             }
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             view.setUint32(ptc + 0, 1, true);    // wPeriodMin
-            view.setUint32(ptc + 4, 1000, true); // wPeriodMax
+            view.setUint32(ptc + 4, TIME_PERIOD_MAX, true); // wPeriodMax
             return MMSYSERR_NOERROR;
         };
 
         this.exports["timeBeginPeriod"] = (ctx, mem, args) => {
             const uPeriod = args[0] >>> 0;
-            if (uPeriod < 1 || uPeriod > 1000) {
+            if (uPeriod < 1 || uPeriod > TIME_PERIOD_MAX) {
                 this.timerDebug(`timeBeginPeriod(${uPeriod}) -> MMSYSERR_INVALPARAM`);
                 return MMSYSERR_INVALPARAM;
             }
@@ -1502,7 +1506,7 @@ export class WinMM implements IModule {
 
         this.exports["timeEndPeriod"] = (ctx, mem, args) => {
             const uPeriod = args[0] >>> 0;
-            if (uPeriod < 1 || uPeriod > 1000) {
+            if (uPeriod < 1 || uPeriod > TIME_PERIOD_MAX) {
                 this.timerDebug(`timeEndPeriod(${uPeriod}) -> MMSYSERR_INVALPARAM`);
                 return MMSYSERR_INVALPARAM;
             }
