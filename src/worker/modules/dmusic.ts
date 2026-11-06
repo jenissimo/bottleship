@@ -625,12 +625,6 @@ export class DMusic implements IModule {
         e["IDirectMusicPersistStream_GetSizeMax"] = () => E_NOTIMPL;
     }
 
-    // ── system loader ───────────────────────────────────────────────────────────
-
-    /**
-     * The default GM collection: Windows' gm.dls when the bundle has one, else an empty
-     * collection. The loader keeps it, as its cache would, for as long as the loader lives.
-     */
     registerSavestate(): () => void {
         return registerDMusicParticipant({
             idleRefusal: () => this.savestateRefusal(),
@@ -648,26 +642,29 @@ export class DMusic implements IModule {
         return null;
     }
 
-    private defaultGmCollection(): DlsCollection {
-        const bytes = this.readSystemFile(DEFAULT_COLLECTION_PATHS);
-        return (bytes ? parseDls(bytes) : null)
-            ?? { identity: { objectId: GUID_DefaultGMCollection, name: "GM", versionMS: 0, versionLS: 0, hasVersion: false }, instruments: [], waves: [] };
-    }
+    // ── system loader ───────────────────────────────────────────────────────────
 
+    /**
+     * The default GM collection: Windows' gm.dls when the bundle has one, else an empty
+     * collection. The loader keeps it, as its cache would, for as long as the loader lives.
+     */
     private defaultCollection(loader: LoaderObject): CollectionObject {
         if (loader.defaultCollection) return loader.defaultCollection;
         const obj = new CollectionObject();
         obj.identity.objectId = GUID_DefaultGMCollection;
         obj.identity.name = "GM";
-        const bytes = this.readSystemFile(DEFAULT_COLLECTION_PATHS);
-        obj.collection = (bytes ? parseDls(bytes) : null)
-            ?? { identity: { ...obj.identity }, instruments: [], waves: [] };
+        obj.collection = this.defaultGmCollection();
         obj.loaded = true;
-        if (!bytes) {
-            Logger.log(LogCategory.COM, "[DMusic] no gm.dls in the bundle: instruments from the default GM collection are silent");
-        }
         loader.defaultCollection = obj;
         return obj;
+    }
+
+    private defaultGmCollection(): DlsCollection {
+        const bytes = this.readSystemFile(DEFAULT_COLLECTION_PATHS);
+        const parsed = bytes ? parseDls(bytes) : null;
+        if (parsed) return parsed;
+        if (!bytes) Logger.log(LogCategory.COM, "[DMusic] no gm.dls in the bundle: instruments from the default GM collection are silent");
+        return { identity: { objectId: GUID_DefaultGMCollection, name: "GM", versionMS: 0, versionLS: 0, hasVersion: false }, instruments: [], waves: [] };
     }
 
     private createLoader(): LoaderObject {
