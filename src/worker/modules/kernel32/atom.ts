@@ -26,19 +26,19 @@ export interface SavedAtomTable { entries: Array<[number, string, number]>; next
 
 class AtomTable {
     readonly entries = new Map<number, AtomEntry>();
+    private readonly byName = new Map<string, number>();
     next = MAXINTATOM;
 
     constructor(readonly label: string) {}
 
     reset(): void {
         this.entries.clear();
+        this.byName.clear();
         this.next = MAXINTATOM;
     }
 
     find(name: string): number {
-        const key = name.toLowerCase();
-        for (const [atom, entry] of this.entries) if (entry.name.toLowerCase() === key) return atom;
-        return 0;
+        return this.byName.get(name.toLowerCase()) ?? 0;
     }
 
     add(name: string): number {
@@ -55,6 +55,7 @@ class AtomTable {
             return 0;
         }
         this.entries.set(atom, { name, refs: 1 });
+        this.byName.set(name.toLowerCase(), atom);
         Logger.log(LogCategory.KERNEL32, `${this.label}: created atom 0x${atom.toString(16)} for "${name}"`);
         return atom;
     }
@@ -71,6 +72,7 @@ class AtomTable {
             return true;
         }
         this.entries.delete(atom);
+        this.byName.delete(entry.name.toLowerCase());
         Logger.log(LogCategory.KERNEL32, `${this.label}: deleted atom 0x${atom.toString(16)} ("${entry.name}")`);
         return true;
     }
@@ -85,7 +87,11 @@ class AtomTable {
 
     restore(saved: SavedAtomTable): void {
         this.entries.clear();
-        for (const [atom, name, refs] of saved.entries) this.entries.set(atom, { name, refs });
+        this.byName.clear();
+        for (const [atom, name, refs] of saved.entries) {
+            this.entries.set(atom, { name, refs });
+            this.byName.set(name.toLowerCase(), atom);
+        }
         this.next = saved.next;
     }
 
