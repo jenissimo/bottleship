@@ -27,7 +27,7 @@ import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dial
 import { handleAnimateMessage } from './animate-control';
 import { handleMciWndMessage } from '../msvfw32-mciwnd';
 import { windows, buttonCheckStates, registerWindowTimerKiller, registerRemovedTimerHook, finalizeWindowDestroy, getAbsoluteWindowPosition, getWindowByHandle, isEffectivelyVisible } from './shared-state';
-import { validateWindow } from './paint-region';
+import { clearWindowUpdate, hasPendingUpdate, validateWindow } from './paint-region';
 import { translateKeyMessage } from './translate-message';
 import { repaintChildControls, isButtonSystemControl, hitTestSystemControlAtClient } from './controls';
 import { isOwnerDrawButton } from './owner-draw';
@@ -1635,6 +1635,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                 // Re-enter the guest WndProc via the shared suspended-thunk mechanism so
                 // EAX receives the actual callback return value. DispatchMessage(lpMsg)
                 // is stdcall with a single argument → 4 bytes of stack cleanup.
+                const subclassedPaint = message === WM_PAINT && window.isSystemControl && window.wndProcSubclassed
+                    && !isOwnerDrawButton(window);
                 const dispatchResult = invokeGuestWndProcSync(
                     ctx, mem, window.wndProc, hwnd, message, wParam, lParam,
                     4, 'DispatchMessageW',
@@ -1642,6 +1644,11 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                         // Finalize a deferred-destroy window only after its wndProc has
                         // processed WM_NCDESTROY (MFC OnNcDestroy → detach).
                         if (message === WM_NCDESTROY) finalizeWindowDestroy(hwnd);
+                        if (subclassedPaint && hasPendingUpdate(hwnd)) {
+                            const control = windows.get(hwnd);
+                            clearWindowUpdate(hwnd);
+                            if (control) handleSystemControlMessage(control, WM_PAINT, 0, 0, mem);
+                        }
                         return wndRet >>> 0;
                     },
                 );

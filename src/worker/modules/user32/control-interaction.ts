@@ -82,6 +82,7 @@ import {
     MK_SHIFT as LV_MK_SHIFT,
 } from './list-view-control';
 import { hitTestTab, selectTabFromUser, handleTabKey, tabInvalidateRect } from './tab-control';
+import { requestSubclassedControlPaint } from './owner-draw';
 
 const WM_MOUSEMOVE   = 0x0200;
 const WM_LBUTTONDOWN = 0x0201;
@@ -421,6 +422,11 @@ function repaintHost(
     alsoChanged?: readonly number[],
     damage?: ControlDamage | null,
 ): void {
+    const repainted = [control.handle, ...(alsoChanged ?? [])];
+    if (repainted.every((h) => windows.get(h)?.wndProcSubclassed)) {
+        for (const h of repainted) requestSubclassedControlPaint(windows.get(h));
+        return;
+    }
     // A control inside a dialog composited over a DDraw flip chain needs the FULL
     // dialog repainted (gray face + all controls) — the overlay canvas can be wiped
     // between frames and a controls-only paint would lose the background. The full
