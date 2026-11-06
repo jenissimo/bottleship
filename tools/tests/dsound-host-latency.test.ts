@@ -71,6 +71,25 @@ describe("dsound host output latency", () => {
         expect(t.span(22384, 23408)).toEqual(new Set([0xee]));
     });
 
+    test("a whole-buffer span is split at the shown cursor: ahead plays this lap, behind the next", () => {
+        // Quake II locks and unlocks the entire buffer every frame. The bytes it just mixed sit
+        // right after the shown cursor and are due now, not a lap later.
+        const t = setup();
+        t.setRaw(4096);
+        t.buffer.stepLastCursor = 4096 + 6000; // buffer offset 10096, 6000 ahead of the worklet
+        t.mem.fill(0xa1, PTR, PTR + 10096);
+        t.mem.fill(0xb2, PTR + 10096, PTR + SIZE);
+        t.call("writeToLaps", t.mem, 0, SIZE);
+        // [10096, SIZE) follows the shown cursor in its own lap: ring 10096..16384.
+        expect(t.span(10096, 16384)).toEqual(new Set([0xb2]));
+        // [0, 10096) is behind the cursor: the next lap, ring 16384..26480.
+        expect(t.span(16384, 26480)).toEqual(new Set([0xa1]));
+        // ...and the cursor's lap continues into it a lap on: ring 26480..RING is [10096, 16384).
+        expect(t.span(26480, RING)).toEqual(new Set([0xb2]));
+        // The host-latency queue between the worklet and the shown cursor is not rewritten.
+        expect(t.span(4096, 10096)).toEqual(new Set([0x11]));
+    });
+
     test("a span the worklet has already passed keeps only its part still ahead and its later laps", () => {
         const t = setup();
         t.setRaw(8000);
