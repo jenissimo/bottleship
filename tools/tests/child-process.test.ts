@@ -462,6 +462,7 @@ describe('child filesystem ownership', () => {
         const handle = { kind: 'file', path: 'C:\\System\\DeusEx.ini', access: 0x40000000, source: 'overlay', position: 0 };
         const vfs = {
             openSync: () => handle,
+            getFileSize: () => 0, // a new file: nothing to defer
             tell: () => 0,
             writeSync: (_h: unknown, data: Uint8Array) => { calls.push(`sync:${data.length}`); return syncAnswer; },
             write: async (_h: unknown, data: Uint8Array) => { calls.push(`async:${data.length}`); return data.length; },
