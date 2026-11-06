@@ -1886,6 +1886,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
+    // @transient(a back-buffer lock lives from LockRect to UnlockRect on a device that no savestate participant captures)
     const backBufferLocks = new Map<number, { shadow: number; readOnly: boolean }>();
     const D3DPRESENTFLAG_LOCKABLE_BACKBUFFER = 0x1;
     const BACKBUFFER_LOCK_READONLY = 0x10;
