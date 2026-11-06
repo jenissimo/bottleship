@@ -4029,13 +4029,16 @@ function registerFastPathMbsFunctions(dispatcher: HleDispatcher): void {
         return n < 0 ? null : ((p + n) >>> 0) | 0;
     };
     const mbsinc: FastPathImplementation = (esp, view, mem8) => {
-        if (esp + 8 > mem8.length) return null;
+        // Under a DBCS page a lead byte advances two: the slow handler knows the page.
+        if (esp + 8 > mem8.length || !sbcs()) return null;
         const p = arg(view, esp, 0);
         return p ? ((p + 1) >>> 0) | 0 : 0;
     };
     const mbscmp: FastPathImplementation = (esp, view, mem8) => {
         if (esp + 12 > mem8.length) return null;
         const a = arg(view, esp, 0), b = arg(view, esp, 1);
+        // NULL is the CRT's invalid-parameter path (_NLSCMPERROR, errno), not a read of page 0.
+        if (!a || !b) return null;
         for (let i = 0; ; i++) {
             if (a + i >= mem8.length || b + i >= mem8.length) return null;
             const ac = mem8[a + i]!, bc = mem8[b + i]!;

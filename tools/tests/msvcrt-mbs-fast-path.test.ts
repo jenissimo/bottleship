@@ -81,5 +81,12 @@ describe("msvcrt _mbs* fast paths (SBCS)", () => {
         expect(call("_mbslen", s)).toBeNull();
         expect(call("_mbsnbcnt", s, 2)).toBeNull();
         expect(call("_mbsninc", s, 2)).toBeNull();
+        expect(call("_mbsinc", s)).toBeNull();
+    });
+
+    test("_mbscmp leaves a NULL argument to the slow handler", () => {
+        const a = put(0x2100, "abc");
+        expect(call("_mbscmp", 0, a)).toBeNull();
+        expect(call("_mbscmp", a, 0)).toBeNull();
     });
 });
