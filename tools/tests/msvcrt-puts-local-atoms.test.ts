@@ -53,6 +53,9 @@ describe("kernel32 local atoms", () => {
         expect(call("GetAtomNameA", [a, 0x15000, 4])).toBe(3);
         expect(readAnsi(0x15000)).toBe("Tib");
         expect(call("GlobalFindAtomA", [ansi(0x16000, "Tiberium")])).toBe(0);
+        // Added twice, so it takes two deletes.
+        expect(call("DeleteAtom", [a])).toBe(0);
+        expect(call("FindAtomA", [ansi(0x11000, "Tiberium")])).toBe(a);
         expect(call("DeleteAtom", [a])).toBe(0);
         expect(call("FindAtomA", [ansi(0x11000, "Tiberium")])).toBe(0);
         expect(call("DeleteAtom", [a])).toBe(a);
@@ -63,7 +66,15 @@ describe("kernel32 local atoms", () => {
         expect(call("AddAtomA", [0x45])).toBe(0x45);
         expect(call("GetAtomNameA", [123, 0x14000, 16])).toBe(4);
         expect(readAnsi(0x14000)).toBe("#123");
-        expect(captureAtoms().localAtoms).toEqual([]);
+        expect(call("DeleteAtom", [123])).toBe(0);
+        expect(captureAtoms().local.entries).toEqual([]);
+    });
+
+    test("\"#n\" outside 1..0xBFFF is not an integer atom and fails", () => {
+        expect(call("AddAtomA", [ansi(0x11000, "#0")])).toBe(0);
+        expect(call("AddAtomA", [ansi(0x11000, "#49152")])).toBe(0);
+        expect(call("AddAtomA", [ansi(0x11000, "#70000")])).toBe(0);
+        expect(captureAtoms().local.entries).toEqual([]);
     });
 
     test("local atoms survive a savestate round trip, and a reset forgets them", () => {
@@ -74,5 +85,54 @@ describe("kernel32 local atoms", () => {
         restoreAtoms(saved);
         expect(call("FindAtomA", [ansi(0x11000, "IPX")])).toBe(a);
         expect(call("AddAtomA", [ansi(0x12000, "NEXT")])).toBe(a + 1);
+    });
+
+    test("reference counts survive a savestate round trip", () => {
+        const a = call("AddAtomA", [ansi(0x11000, "IPX")]);
+        call("AddAtomA", [ansi(0x11000, "IPX")]);
+        const saved = structuredClone(captureAtoms());
+        resetAtomTable();
+        restoreAtoms(saved);
+        expect(call("DeleteAtom", [a])).toBe(0);
+        expect(call("FindAtomA", [ansi(0x11000, "IPX")])).toBe(a);
+        expect(call("DeleteAtom", [a])).toBe(0);
+        expect(call("FindAtomA", [ansi(0x11000, "IPX")])).toBe(0);
+    });
+
+    test("after the last atom the table reuses freed atoms, and fails when full", () => {
+        const first = call("AddAtomA", [ansi(0x11000, "a0")]);
+        for (let i = 1; i <= 0xffff - 0xc000; i++) expect(call("AddAtomA", [ansi(0x11000, `a${i}`)])).toBe(first + i);
+        expect(call("AddAtomA", [ansi(0x11000, "full")])).toBe(0);
+        expect(call("DeleteAtom", [first + 5])).toBe(0);
+        expect(call("AddAtomA", [ansi(0x11000, "reused")])).toBe(first + 5);
+    });
+});
+
+describe("kernel32 global atoms", () => {
+    test("names compare case-insensitively and each add takes one delete", () => {
+        const a = call("GlobalAddAtomA", [ansi(0x11000, "BottleShip")]);
+        expect(a).toBeGreaterThanOrEqual(0xc000);
+        expect(call("GlobalAddAtomW", [wide(0x12000, "BOTTLESHIP")])).toBe(a);
+        expect(call("GlobalFindAtomA", [ansi(0x13000, "bottleship")])).toBe(a);
+        expect(call("FindAtomA", [ansi(0x13000, "bottleship")])).toBe(0);
+        expect(call("GlobalDeleteAtom", [a])).toBe(0);
+        expect(call("GlobalFindAtomW", [wide(0x13000, "BottleShip")])).toBe(a);
+        expect(call("GlobalDeleteAtom", [a])).toBe(0);
+        expect(call("GlobalFindAtomA", [ansi(0x13000, "BottleShip")])).toBe(0);
+        expect(call("GlobalDeleteAtom", [a])).toBe(a);
+    });
+
+    test("integer atoms and GlobalGetAtomName in both character sets", () => {
+        expect(call("GlobalAddAtomA", [0x45])).toBe(0x45);
+        expect(call("GlobalAddAtomW", [wide(0x11000, "#7")])).toBe(7);
+        expect(call("GlobalFindAtomA", [0x45])).toBe(0x45);
+        expect(call("GlobalDeleteAtom", [0x45])).toBe(0);
+        expect(arity(kernel32Module as never, "GlobalGetAtomNameW")).toBe(3);
+        const a = call("GlobalAddAtomA", [ansi(0x11000, "Name")]);
+        expect(call("GlobalGetAtomNameW", [a, 0x14000, 16])).toBe(4);
+        expect(String.fromCharCode(...new Uint16Array(mem.buffer, 0x14000, 4))).toBe("Name");
+        expect(call("GlobalGetAtomNameA", [0x45, 0x15000, 16])).toBe(3);
+        expect(readAnsi(0x15000)).toBe("#69");
+        expect(captureAtoms().global.entries).toEqual([[a, "Name", 1]]);
     });
 });
