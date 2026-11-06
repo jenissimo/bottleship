@@ -3979,6 +3979,16 @@ export function registerFastPathMsvcrtFunctions(dispatcher: HleDispatcher): void
         return (v >>> 0) | 0;                // EAX = low 32
     };
 
+    const fastPathAbs: FastPathImplementation = (esp, view, mem8) => {
+        if (esp + 8 > mem8.length) return null;
+        const v = view.getInt32(esp + 4, true);
+        return v < 0 ? (-v | 0) : v;
+    };
+    for (const dll of ['msvcrt', 'crtdll', 'msvcr90']) {
+        dispatcher.registerFastPath(dll, 'abs', fastPathAbs, { trivial: true });
+        dispatcher.registerFastPath(dll, 'labs', fastPathAbs, { trivial: true });
+    }
+
     dispatcher.registerFastPath('msvcrt', '_ftol', fastPathFtol);
     dispatcher.registerFastPath('crtdll', '_ftol', fastPathFtol);
     dispatcher.registerFastPath('msvcr90', '_ftol', fastPathFtol);
