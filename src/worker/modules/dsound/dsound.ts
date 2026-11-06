@@ -2994,6 +2994,12 @@ export class DSound implements IModule {
      * leads the worklet by the host latency, so the span's own lap is where that cursor's
      * lap puts it, not the worklet's. Later laps get it too: until the app writes them, a
      * lap's best content is the newest the app has written (what a one-lap ring would hold).
+     *
+     * A span that covers the shown cursor is two spans: its bytes from the cursor on belong to
+     * the cursor's lap, the bytes before it (behind the cursor in the buffer) to the next one.
+     * Placed whole from its start, everything the app just wrote ahead of the cursor lands a
+     * lap late. Quake II locks and rewrites its entire buffer every frame, and with the span
+     * kept whole every sound it mixed played a 64 KB lap (~1.5 s) after it was due.
      */
     private writeToLaps(buffer: SoundBuffer, mem: Uint8Array, pos: number, len: number): void {
         const sab = buffer.sab!;
@@ -3001,6 +3007,15 @@ export class DSound implements IModule {
         const ring = this.ringSize(buffer);
         if (ring === size) {
             writeRingData(sab, pos, mem.subarray(buffer.ptr + pos, buffer.ptr + pos + len), len);
+            return;
+        }
+        // Split exactly where the placement below measures from (the shown cursor, not
+        // block-aligned), or the head of the first part reads as a whole lap away.
+        const split = buffer.isPlaying && buffer.stepLastCursor !== undefined
+            ? Math.floor(buffer.stepLastCursor) % size : -1;
+        if (split > pos && split < pos + len) {
+            this.writeToLaps(buffer, mem, split, pos + len - split);
+            this.writeToLaps(buffer, mem, pos, split - pos);
             return;
         }
         const raw = getCtrl(sab, CTRL_PLAY_CURSOR) % ring;
