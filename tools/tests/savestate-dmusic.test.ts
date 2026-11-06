@@ -153,6 +153,15 @@ describe("dmusic module", () => {
         expect(Object.keys(new DMusic()).sort()).toEqual(Object.keys(DMUSIC_MODULE_FIELDS).sort());
     });
 
+    test("a new loader's default collection and a restored one come from the same reader", () => {
+        const d = new DMusic() as DMusic & Fields;
+        d.readSystemFile = () => null;
+        const fresh = (d.defaultCollection as (l: LoaderObject) => CollectionObject).call(d, new LoaderObject());
+        const restored = (d.defaultGmCollection as () => unknown).call(d);
+        expect(restored).toEqual(fresh.collection);
+        expect(fresh.identity.objectId).toBe(GUID_DEFAULT_GM_COLLECTION);
+    });
+
     test("an idle module saves; a performance, port, loading object, message or running pump refuses", () => {
         const d = new DMusic() as DMusic & Fields;
         expect(d.savestateRefusal()).toBeNull();
