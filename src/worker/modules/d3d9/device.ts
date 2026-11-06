@@ -1424,14 +1424,19 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // display mode; a WINDOWED one is a guest of the desktop mode. Answering the
         // bundle's configured resolution either way tells a mode-setting app the screen is
         // a size it is not rendering at.
+        // The desktop side is the CURRENT mode (a ChangeDisplaySettings may have moved it
+        // off the manifest's boot resolution), the same one GetAdapterDisplayMode reports.
         const cfg = EmulatorConfig.getInstance().screenResolution;
+        const current = System.getInstance().emulatedDisplayMode;
+        const desktopWidth = current?.width || cfg.width;
+        const desktopHeight = current?.height || cfg.height;
         const bb = resolveBackBufferGeometry(pDevice);
         const useDeviceMode = !bb.windowed && bb.width > 0 && bb.height > 0;
         const ok =
-            Mem.writeUint32(pMode + 0, (useDeviceMode ? bb.width : cfg.width) >>> 0) &&
-            Mem.writeUint32(pMode + 4, (useDeviceMode ? bb.height : cfg.height) >>> 0) &&
-            Mem.writeUint32(pMode + 8, cfg.refreshRate || 60) &&
-            Mem.writeUint32(pMode + 12, useDeviceMode ? bb.format : formatForBpp(cfg.bpp));
+            Mem.writeUint32(pMode + 0, (useDeviceMode ? bb.width : desktopWidth) >>> 0) &&
+            Mem.writeUint32(pMode + 4, (useDeviceMode ? bb.height : desktopHeight) >>> 0) &&
+            Mem.writeUint32(pMode + 8, current?.refreshRate || cfg.refreshRate || 60) &&
+            Mem.writeUint32(pMode + 12, useDeviceMode ? bb.format : formatForBpp(current?.bpp || cfg.bpp));
         return ok ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
