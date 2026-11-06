@@ -2385,7 +2385,6 @@ export class DSound implements IModule {
         this.exports["idirectsoundbuffer8_restore"] = (ctx, mem, args) => {
             const buffer = this.getBuffer(args[0]);
             if (!buffer) return DSERR_INVALIDPARAM;
-            if (!buffer.bufferLost) return DSERR_BUFFERLOST_HR;
             buffer.bufferLost = false;
             return DS_OK;
         };
