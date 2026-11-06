@@ -1114,19 +1114,6 @@
   "src/worker/modules/dbghelp-stackwalk.ts": [
     "walks"
   ],
-  "src/worker/modules/dinput/device-presence.ts": [
-    "devices"
-  ],
-  "src/worker/modules/dinput/dinput-initialize.ts": [
-    "RELEASED_LEGACY_VERSIONS"
-  ],
-  "src/worker/modules/dinput/dinput.ts": [
-    "DEVICE_QI_IIDS",
-    "DIRECTINPUT_QI_IIDS",
-    "dinputTraffic",
-    "liveDInputDevices",
-    "notifyRegistry"
-  ],
   "src/worker/modules/dplayx/dplayx.ts": [
     "DPAID_SERVICE_PROVIDER_GUID",
     "DPAID_TOTAL_SIZE"
@@ -1334,16 +1321,6 @@
   "src/worker/modules/win32-text.ts": [
     "gdiMetricsCache",
     "metricProbeCtx"
-  ],
-  "src/worker/modules/winmm-joystick.ts": [
-    "captures",
-    "thresholds"
-  ],
-  "src/worker/modules/winmm-mci.ts": [
-    "MCI_SIMPLE_DEVICE_TYPES"
-  ],
-  "src/worker/modules/winmm.ts": [
-    "EMPTY_BYTES"
   ],
   "src/worker/modules/wsa-actor-kernel.ts": [
     "cached",

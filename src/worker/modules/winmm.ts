@@ -1,7 +1,7 @@
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
 import { type HleDispatcher, ThunkImplementation } from "../core/thunking/thunk-dispatcher";
-import { registerWinmmJoystickExports, resetWinmmJoystick } from "./winmm-joystick";
+import { captureWinmmJoystick, registerWinmmJoystickExports, resetWinmmJoystick, restoreWinmmJoystick, type JoyCapture, type JoystickState } from "./winmm-joystick";
 import { registerWinmmCapsExports } from "./winmm-caps";
 import { registerWinmmMciExports } from "./winmm-mci";
 import type { WinmmMci } from "./winmm-mci";
@@ -12,6 +12,9 @@ import { Mem } from "../core/memory/mem-accessor";
 import { Marshaler } from "../core/memory/marshaler";
 import { TimerKind } from "../core/scheduler/types";
 import { setTimerHandler } from "../core/scheduler/timer-wheel";
+import { pickDefined, savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
+import { CaptureRefusal } from "../savestate/object-codecs";
+import type { SaveValue } from "../savestate/value-codec";
 import { findResourceInPE } from "./kernel32/resource";
 import { probeAudioAt } from "@bottleship/formats/audio";
 import {
@@ -136,6 +139,7 @@ export interface MmioByteSource {
     read(offset: number, length: number): Uint8Array | null;
 }
 
+// @transient(constant empty buffer)
 const EMPTY_BYTES = new Uint8Array(0);
 
 export function mmioArraySource(data: Uint8Array): MmioByteSource {
@@ -332,7 +336,7 @@ interface MMIOHandle {
 
 type TimerCallbackMode = "function" | "event_set" | "event_pulse";
 
-interface WinMMTimer {
+export interface WinMMTimer {
     wTimerID: number;       // Wine-style slot-based ID
     wheelId: number;        // TimerWheel timer ID for cancellation
     /** Guest TIME_PERIODIC flag. Collapsed self-rearm timers stay false here:
@@ -348,6 +352,45 @@ interface WinMMTimer {
     /** Set by timeSetEvent inside the currently executing callback; consumed on fire. */
     rearmArmed?: boolean;
 }
+
+export const WINMM_TIMER_FIELDS = {
+    wTimerID: 'save', wheelId: 'save', isPeriodic: 'save', mode: 'save', callbackOrEvent: 'save', dwUser: 'save',
+    delayMs: 'save', collapsedSelfRearm: 'save', rearmArmed: 'save',
+} as const satisfies Record<keyof WinMMTimer, FieldPolicy>;
+
+export interface WinMMState {
+    timers: WinMMTimer[];
+    nextTimerId: number;
+    periodRefCounts: Array<[number, number]>;
+    nextWaveOutId: number;
+    nextMMIOHandle: number;
+    nextPlaySoundId: number;
+    timerThreadId: number;
+    timerThreadHandle: number;
+    timerWakeEvent: number;
+    joystick: JoystickState;
+}
+
+export const WINMM_FIELDS = {
+    name: 'transient', exports: 'host', timers: 'save', timersByWheel: 'derive', nextTimerId: 'save', mmioHandles: 'transient',
+    dbgLastMmioInfo: 'transient', dbgMmioInfoCount: 'transient', nextMMIOHandle: 'save', mci: 'transient', periodRefCounts: 'save',
+    waveOutDevices: 'transient', nextWaveOutId: 'save', playSoundId: 'transient', nextPlaySoundId: 'save', playSoundSab: 'transient',
+    timerThreadId: 'save', timerThreadHandle: 'save', timerWakeEvent: 'save', pendingTimerCallbacks: 'transient',
+    dispatchingPosted: 'transient', pendingTimerHead: 'transient', dispatchingTimerCallback: 'transient', dbgTimerStats: 'transient',
+    timerCallbackDrainCount: 'transient',
+} as const satisfies Record<string, FieldPolicy>;
+
+export const WINMM_SCHEMA = {
+    module: WINMM_FIELDS,
+    periodRow: ['periodMs', 'refCount'],
+    state: stateKeys<WinMMState>({
+        timers: true, nextTimerId: true, periodRefCounts: true, nextWaveOutId: true, nextMMIOHandle: true,
+        nextPlaySoundId: true, timerThreadId: true, timerThreadHandle: true, timerWakeEvent: true, joystick: true,
+    }),
+    joystick: stateKeys<JoystickState>({ thresholds: true, captures: true }),
+    joyCapture: stateKeys<JoyCapture>({ hwnd: true, changedOnly: true, timerId: true, x: true, y: true, z: true, buttons: true, primed: true }),
+    timer: WINMM_TIMER_FIELDS,
+} as const;
 
 export interface PendingTimerCallback {
     callbackAddr: number;
@@ -428,6 +471,49 @@ export class WinMM implements IModule {
     /** MCI subsystem (device registry + AVI playback) — see winmm-mci.ts. Created in initialize(). */
     private mci: WinmmMci | null = null;
     private periodRefCounts: Map<number, number> = new Map();
+
+    captureSavestate(): WinMMState {
+        if (this.waveOutDevices.size > 0) throw new Error('winmm: open waveOut devices are not part of a v1 savestate');
+        if (this.mmioHandles.size > 0) throw new Error('winmm: open MMIO handles are not part of a v1 savestate');
+        if ((this.mci?.openDeviceCount() ?? 0) > 0) throw new Error('winmm: open MCI devices are not part of a v1 savestate');
+        if (this.playSoundSab) throw new Error('winmm: a PlaySound sound is playing');
+        if (this.pendingTimerCallbacks.length > this.pendingTimerHead || this.dispatchingTimerCallback || this.dispatchingPosted) {
+            throw new Error('winmm: a multimedia timer callback is queued or running; try saving again');
+        }
+        for (const [wheelId, t] of this.timersByWheel) {
+            if (t.wheelId !== wheelId || this.timers.get(t.wTimerID) !== t) throw new Error(`winmm: timer ${t.wTimerID} is not indexed by its wheel id`);
+        }
+        return {
+            timers: [...this.timers.values()].map(t => pickDefined(t, WINMM_TIMER_FIELDS)),
+            nextTimerId: this.nextTimerId,
+            periodRefCounts: [...this.periodRefCounts],
+            nextWaveOutId: this.nextWaveOutId,
+            nextMMIOHandle: this.nextMMIOHandle,
+            nextPlaySoundId: this.nextPlaySoundId,
+            timerThreadId: this.timerThreadId,
+            timerThreadHandle: this.timerThreadHandle,
+            timerWakeEvent: this.timerWakeEvent,
+            joystick: captureWinmmJoystick(),
+        };
+    }
+
+    restoreSavestate(s: WinMMState): void {
+        this.timers = new Map(s.timers.map(t => [t.wTimerID, { ...t }]));
+        this.timersByWheel = new Map([...this.timers.values()].filter(t => t.wheelId).map(t => [t.wheelId, t]));
+        this.nextTimerId = s.nextTimerId;
+        this.periodRefCounts = new Map(s.periodRefCounts);
+        this.publishTimerResolution();
+        this.nextWaveOutId = s.nextWaveOutId;
+        this.nextMMIOHandle = s.nextMMIOHandle;
+        this.nextPlaySoundId = s.nextPlaySoundId;
+        this.timerThreadId = s.timerThreadId;
+        this.timerThreadHandle = s.timerThreadHandle;
+        this.timerWakeEvent = s.timerWakeEvent;
+        restoreWinmmJoystick(s.joystick);
+        this.pendingTimerCallbacks = [];
+        this.pendingTimerHead = 0;
+        System.getInstance().scheduler?.notifyWinmmTimerThread(this.timerThreadId, this.timerWakeEvent);
+    }
 
     private publishTimerResolution(): void {
         let finest: number | null = null;
@@ -1325,7 +1411,22 @@ export class WinMM implements IModule {
         return 1; // TRUE
     }
 
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'winmm', version: 1, order: 63, covers: ['winmm'], schema: WINMM_SCHEMA as unknown as SaveValue,
+            capture: () => {
+                try {
+                    return this.captureSavestate() as unknown as SaveValue;
+                } catch (e) {
+                    throw e instanceof CaptureRefusal ? e : new CaptureRefusal(e instanceof Error ? e.message : String(e));
+                }
+            },
+            restore: (saved) => this.restoreSavestate(saved as unknown as WinMMState),
+        });
+    }
+
     initialize(process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
 
         this.exports["timeGetTime"] = () => {
             return TimeService.getInstance().guestTickMs() | 0;
