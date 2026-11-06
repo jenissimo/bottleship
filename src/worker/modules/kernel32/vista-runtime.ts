@@ -12,7 +12,7 @@ import {
 } from '../../core/scheduler/types';
 import { resolveHleExportAddress } from '../../core/thunking/export-resolver';
 import { resetSrwLock } from './srw-lock';
-import { exports as moduleExports } from './module/module';
+import { freeLibraryWithoutDetach } from './module/module';
 import { setTimerHandler, TIMER_PHASE_DUE, TIMER_PHASE_EVERY } from '../../core/scheduler/timer-wheel';
 import { setWaitCompletionHandler } from '../../core/scheduler/wait-completion';
 
@@ -188,7 +188,7 @@ function endInstance(id: number): void {
     const inst = tpInstances.get(id);
     tpInstances.delete(id);
     if (inst?.freeLibrary) {
-        moduleExports['FreeLibrary']({} as X86Context, Mem.getView() ?? new Uint8Array(0), [inst.freeLibrary]);
+        freeLibraryWithoutDetach(inst.freeLibrary);
     }
 }
 

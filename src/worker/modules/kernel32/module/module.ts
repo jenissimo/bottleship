@@ -1,7 +1,7 @@
 // Module management functions for kernel32
 // GetModuleHandle*, LoadLibrary*, GetProcAddress, FreeLibrary, GetModuleFileName*
 
-import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, ThunkResult, type X86Context } from '../../../core/thunking/thunk-dispatcher';
 import type { FastPathImplementation } from '../../../core/thunking/thunk-dispatcher';
 import { System } from '../../../core/system';
 import { Marshaler } from '../../../core/memory/marshaler';
@@ -21,6 +21,11 @@ import { isSuspectSilentStub } from '../../../core/diagnostics/api-census';
 import { resolveHleExportAddress } from '../../../core/thunking/export-resolver';
 import { shippedExportNames } from '../../../core/pe-export-names';
 import { processCrtBinding } from '../../../core/crt-binding';
+
+const DLL_PROCESS_DETACH = 0;
+
+// @transient(installed once when the kernel32 exports are built; holds no session data)
+export let freeLibraryWithoutDetach: (hModule: number) => void = () => undefined;
 
 export const exports: Record<string, ThunkImplementation> = {};
 
@@ -1221,8 +1226,7 @@ function initModuleFunctions(): void {
         return notFound();
     };
 
-    exports['FreeLibrary'] = (ctx, mem, args) => {
-        const hModule = args[0] >>> 0;
+    const freeLibrary = (ctx: X86Context | null, hModule: number): ThunkResult => {
         ensureProcessLocalCaches();
         pinUntrackedModules();
 
@@ -1263,23 +1267,49 @@ function initModuleFunctions(): void {
         // whose static object lists must not survive into the next menu session). The
         // old image bytes stay mapped: safer than a real unmap, and any straggler
         // pointer into the old code keeps working instead of faulting.
-        registry!.unregister(mod.name);
-        for (const [k, v] of loadLibraryHandleCache) {
-            if (v === hModule) loadLibraryHandleCache.delete(k);
+        const unload = (): void => {
+            registry!.unregister(mod.name);
+            for (const [k, v] of loadLibraryHandleCache) {
+                if (v === hModule) loadLibraryHandleCache.delete(k);
+            }
+            handleToPathCache.delete(hModule);
+            const prefix = `${hModule}:`;
+            const ordPrefix = `${hModule}#`;
+            for (const k of getProcAddressCache.keys()) {
+                if (k.startsWith(prefix) || k.startsWith(ordPrefix)) getProcAddressCache.delete(k);
+            }
+            for (const k of getProcAddressPointerCache.keys()) {
+                if (k.startsWith(prefix) || k.startsWith(ordPrefix)) getProcAddressPointerCache.delete(k);
+            }
+            Logger.log(LogCategory.KERNEL32,
+                `FreeLibrary(0x${hModule.toString(16)}): unloaded "${mod.name}" (image left mapped; next LoadLibrary maps fresh)`);
+        };
+        const system = System.getInstance();
+        const callbackManager = system.process?.dispatcher?.callbackManager;
+        if (!ctx || !mod.isRealDll || !mod.initialized || !mod.entryPoint || !callbackManager || system.isExiting) {
+            unload();
+            return { value: 1, stackCleanup: 4 };
         }
-        handleToPathCache.delete(hModule);
-        const prefix = `${hModule}:`;
-        const ordPrefix = `${hModule}#`;
-        for (const k of getProcAddressCache.keys()) {
-            if (k.startsWith(prefix) || k.startsWith(ordPrefix)) getProcAddressCache.delete(k);
+        mod.initialized = false;
+        const frameId = callbackManager.saveSuspendedThunkContext(ctx as never, 4, 'FreeLibrary DllMain');
+        if (!frameId) {
+            unload();
+            return { value: 1, stackCleanup: 4 };
         }
-        for (const k of getProcAddressPointerCache.keys()) {
-            if (k.startsWith(prefix) || k.startsWith(ordPrefix)) getProcAddressPointerCache.delete(k);
+        const { callbackId } = callbackManager.invokeCallback(
+            (hModule + mod.entryPoint) >>> 0, [hModule, DLL_PROCESS_DETACH, 0], 0, () => { unload(); return 1; },
+            false, 'FreeLibrary DllMain', frameId,
+        );
+        if (!callbackId) {
+            callbackManager.abandonSuspendedFrame(frameId);
+            unload();
+            return { value: 1, stackCleanup: 4 };
         }
-        Logger.log(LogCategory.KERNEL32,
-            `FreeLibrary(0x${hModule.toString(16)}): unloaded "${mod.name}" (image left mapped; next LoadLibrary maps fresh)`);
-        return { value: 1, stackCleanup: 4 };
+        return { value: 1, suspendedForCallback: true, callbackId, stackCleanup: 4 };
     };
+
+    exports['FreeLibrary'] = (ctx, mem, args) => freeLibrary(ctx, args[0] >>> 0);
+    freeLibraryWithoutDetach = (hModule: number) => { freeLibrary(null, hModule >>> 0); };
 
     exports['FreeLibraryAndExitThread'] = (ctx, mem, args) => {
         const hModule = args[0];
