@@ -22,13 +22,14 @@ import { test, expect, beforeEach } from "bun:test";
 import { OpenAL } from "../../src/worker/modules/openal/openal";
 import {
     getCtrl, setCtrl, CTRL_PLAY_CURSOR, CTRL_WRITE_CURSOR, CTRL_BLOCK_BYTES,
-    CTRL_FLAGS, FLAG_STREAMING,
+    CTRL_FLAGS, FLAG_STREAMING, CTRL_LOOP_MODE,
 } from "../../src/audio/audio-ring-buffer";
 
 const AL_SOURCE_STATE = 0x1010;
 const AL_BUFFERS_QUEUED = 0x1015;
 const AL_BUFFERS_PROCESSED = 0x1016;
 const AL_BUFFER = 0x1009;
+const AL_INITIAL = 0x1011;
 const AL_PLAYING = 0x1012;
 const AL_STOPPED = 0x1014;
 const AL_FORMAT_MONO16 = 0x1101;
@@ -157,4 +158,58 @@ test("a streaming source stops only when its queue is exhausted", () => {
     setCtrl(sab, CTRL_PLAY_CURSOR, 4096);
     expect(getSourcei(src, AL_BUFFERS_PROCESSED)).toBe(1);
     expect(getSourcei(src, AL_SOURCE_STATE)).toBe(AL_STOPPED);
+});
+
+function queueTwo(src: number): void {
+    const a = gen("alGenBuffers");
+    const b = gen("alGenBuffers");
+    fillBuffer(a, 4096);
+    fillBuffer(b, 4096);
+    dv.setUint32(SCRATCH, a, true);
+    dv.setUint32(SCRATCH + 4, b, true);
+    call("alSourceQueueBuffers", src, 2, SCRATCH);
+}
+
+test("Stop and Rewind on a freshly queued source keep the queue: Play starts at the first buffer", () => {
+    // HP2's ALAudio PlaySound for a streamed sound: Queue(pre-filled chunks), Stop, Rewind,
+    // Play. Spec: Stop/Rewind on AL_INITIAL are NOPs, so playback starts at chunk 0.
+    const src = gen("alGenSources");
+    queueTwo(src);
+
+    call("alSourceStop", src);
+    expect(getSourcei(src, AL_SOURCE_STATE)).toBe(AL_INITIAL);
+    expect(getSourcei(src, AL_BUFFERS_PROCESSED)).toBe(0);
+    call("alSourceRewind", src);
+    expect(getSourcei(src, AL_SOURCE_STATE)).toBe(AL_INITIAL);
+
+    call("alSourcePlay", src);
+    expect(getSourcei(src, AL_SOURCE_STATE)).toBe(AL_PLAYING);
+    expect(getSourcei(src, AL_BUFFERS_PROCESSED)).toBe(0);
+    expect(getCtrl(streamSab(src), CTRL_WRITE_CURSOR)).toBe(8192);
+});
+
+test("Rewind after a real Stop re-arms the whole queue", () => {
+    const src = gen("alGenSources");
+    queueTwo(src);
+    call("alSourcePlay", src);
+
+    call("alSourceStop", src);
+    expect(getSourcei(src, AL_SOURCE_STATE)).toBe(AL_STOPPED);
+    expect(getSourcei(src, AL_BUFFERS_PROCESSED)).toBe(2);
+
+    call("alSourceRewind", src);
+    expect(getSourcei(src, AL_SOURCE_STATE)).toBe(AL_INITIAL);
+    expect(getSourcei(src, AL_BUFFERS_PROCESSED)).toBe(0);
+    expect(getSourcei(src, AL_BUFFERS_QUEUED)).toBe(2);
+
+    call("alSourcePlay", src);
+    expect(getCtrl(streamSab(src), CTRL_WRITE_CURSOR)).toBe(8192);
+});
+
+test("the streaming ring holds at the write cursor instead of looping onto stale PCM", () => {
+    const src = gen("alGenSources");
+    queueTwo(src);
+    call("alSourcePlay", src);
+    // The worklet's hold is gated on loopMode !== -1 (bottleship-audio-worklet streamingHold).
+    expect(getCtrl(streamSab(src), CTRL_LOOP_MODE)).not.toBe(-1);
 });

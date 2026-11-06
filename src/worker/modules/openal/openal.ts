@@ -607,7 +607,7 @@ export class OpenAL implements IModule {
         };
 
         this.exports["alSourceStop"] = (_ctx, _mem, args) => {
-            this.stopSource(args[0]);
+            this.stopRequest(args[0]);
             return 0;
         };
 
@@ -617,9 +617,7 @@ export class OpenAL implements IModule {
         };
 
         this.exports["alSourceRewind"] = (_ctx, _mem, args) => {
-            this.stopSource(args[0]);
-            const src = this.sources.get(args[0]);
-            if (src) src.state = AL_INITIAL;
+            this.rewindSource(args[0]);
             return 0;
         };
 
@@ -633,7 +631,7 @@ export class OpenAL implements IModule {
         this.exports["alSourceStopv"] = (_ctx, mem, args) => {
             const [n, ptr] = args;
             const dv = new DataView(mem.buffer, mem.byteOffset);
-            for (let i = 0; i < n; i++) this.stopSource(dv.getUint32(ptr + i * 4, true));
+            for (let i = 0; i < n; i++) this.stopRequest(dv.getUint32(ptr + i * 4, true));
             return 0;
         };
 
@@ -647,12 +645,7 @@ export class OpenAL implements IModule {
         this.exports["alSourceRewindv"] = (_ctx, mem, args) => {
             const [n, ptr] = args;
             const dv = new DataView(mem.buffer, mem.byteOffset);
-            for (let i = 0; i < n; i++) {
-                const id = dv.getUint32(ptr + i * 4, true);
-                this.stopSource(id);
-                const src = this.sources.get(id);
-                if (src) src.state = AL_INITIAL;
-            }
+            for (let i = 0; i < n; i++) this.rewindSource(dv.getUint32(ptr + i * 4, true));
             return 0;
         };
 
@@ -1037,6 +1030,42 @@ export class OpenAL implements IModule {
         }
     }
 
+    /**
+     * alSourceStop as the app sees it. Spec (OpenAL 1.1, 4.3.6): stopping an AL_INITIAL
+     * source is a legal NOP — it stays INITIAL and its queue stays pending. Only a source
+     * that has actually been played goes to AL_STOPPED with its queue marked processed.
+     *
+     * UE1-derived ALAudio (HP2's PlaySound) starts every streamed sound with
+     * Queue(N pre-filled chunks) → Stop → Rewind → Play. Treating that Stop as a real
+     * stop retired all N opening chunks before a sample was heard: Play found an empty
+     * queue, the engine's underrun path then refilled those buffers with chunk N+, and
+     * every voice-over line began N chunks in.
+     */
+    private stopRequest(sourceId: number): void {
+        const src = this.sources.get(sourceId);
+        if (!src || src.state === AL_INITIAL) return;
+        this.stopSource(sourceId);
+    }
+
+    /**
+     * alSourceRewind: back to AL_INITIAL with the WHOLE queue pending again — buffers
+     * already processed but not unqueued play once more from the head, as in OpenAL Soft,
+     * and AL_BUFFERS_PROCESSED reads 0. Rewinding an AL_INITIAL source is a NOP.
+     */
+    private rewindSource(sourceId: number): void {
+        const src = this.sources.get(sourceId);
+        if (!src || src.state === AL_INITIAL) return;
+        if (src.sab) setCtrl(src.sab, CTRL_STOP_REQUESTED, 1);
+        this.unregisterAudio(src);
+        this.releaseStream(src);
+        const pending = src.processedBuffers.map((bufId) => ({
+            bufId, bytes: this.buffers.get(bufId)?.data.byteLength ?? 0, appended: 0, end: -1,
+        }));
+        src.queue = pending.concat(src.queue);
+        src.processedBuffers.length = 0;
+        src.state = AL_INITIAL;
+    }
+
     private pauseSource(sourceId: number): void {
         const src = this.sources.get(sourceId);
         if (!src || src.state !== AL_PLAYING) return;
@@ -1096,8 +1125,13 @@ export class OpenAL implements IModule {
         setCtrl(sab, CTRL_PLAY_CURSOR, 0);
         setCtrl(sab, CTRL_WRITE_CURSOR, 0);
         setCtrl(sab, CTRL_RESERVED, 1);
-        // The queue, not the ring extent, decides when the source is exhausted.
-        setCtrl(sab, CTRL_LOOP_MODE, -1);
+        // Play-once on a circular streaming ring: the worklet wraps the ring (FLAG_STREAMING
+        // never ends at the ring extent) but HOLDS at the write cursor. -1 (looping) turns
+        // the hold off — since 39271b58 that is deliberate for DirectSound loops — and then
+        // a late refill lets the head run past the frontier onto the previous lap's PCM
+        // (audible repeats), while streamPlayed's modulo unwrap reads that overrun as a
+        // nearly full backlog, so buffers stop retiring and the app cannot refill.
+        setCtrl(sab, CTRL_LOOP_MODE, 1);
         setCtrl(sab, CTRL_VOLUME, gainToCentibels(src.gain));
         setCtrl(sab, CTRL_FREQUENCY, Math.round(buf.sampleRate * src.pitch));
         writeSourceSpatial(sab, src.spatial, buf.channels === 1);
