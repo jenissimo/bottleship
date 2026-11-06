@@ -219,9 +219,16 @@ export class Performance {
     private events: PendingEvent[] = [];
     private readonly transpose = new Map<number, number>();
     private readonly drumChannels = new Set<number>();
+    private readonly installed = new Map<number, { collection: DlsCollection | null; patch: number }>();
 
     constructor(synth: DlsSynth) {
         this.synth = synth;
+    }
+
+    reinstallInstruments(collection: DlsCollection): void {
+        for (const [channel, entry] of this.installed) {
+            if (entry.collection === collection) this.synth.setInstrument(channel, collection, entry.patch);
+        }
     }
 
     /** Current music time in ticks (768 per quarter note). */
@@ -486,6 +493,7 @@ export class Performance {
             if (inst.flags & DMUS_IO_INST_PATCH) {
                 const collection = loaded.collections[index] ?? this.defaultCollection;
                 this.synth.setInstrument(channel, collection, inst.patch);
+                this.installed.set(channel, { collection, patch: inst.patch });
                 if (inst.patch & F_INSTRUMENT_DRUMS) this.drumChannels.add(channel);
                 else this.drumChannels.delete(channel);
             }

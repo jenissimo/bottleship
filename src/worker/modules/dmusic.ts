@@ -29,6 +29,7 @@ import {
     DMUS_SEGF_SECONDARY, type LoadedBand, PerfSegment, type PerfSegmentState, Performance,
 } from "../core/audio/directmusic/performance";
 import { DlsSynth } from "../core/audio/directmusic/synth";
+import { gmBankAvailable, loadGmBank, onGmBank } from "../core/audio/gm-bank";
 import { allocateComObject } from "../core/com/com-memory";
 import { InterfaceRegistry } from "../core/com/interface-registry";
 import { Logger, LogCategory } from "../core/logger";
@@ -663,8 +664,19 @@ export class DMusic implements IModule {
         const bytes = this.readSystemFile(DEFAULT_COLLECTION_PATHS);
         const parsed = bytes ? parseDls(bytes) : null;
         if (parsed) return parsed;
+        const empty: DlsCollection = { identity: { objectId: GUID_DefaultGMCollection, name: "GM", versionMS: 0, versionLS: 0, hasVersion: false }, instruments: [], waves: [] };
+        if (!bytes && gmBankAvailable()) {
+            onGmBank((bank) => {
+                empty.instruments = bank.instruments;
+                empty.waves = bank.waves;
+                Logger.log(LogCategory.COM, `[DMusic] default GM collection from the General MIDI bank (${bank.instruments.length} instruments)`);
+                for (const performance of this.performances) performance.engine?.reinstallInstruments(empty);
+            });
+            void loadGmBank();
+            return empty;
+        }
         if (!bytes) Logger.log(LogCategory.COM, "[DMusic] no gm.dls in the bundle: instruments from the default GM collection are silent");
-        return { identity: { objectId: GUID_DefaultGMCollection, name: "GM", versionMS: 0, versionLS: 0, hasVersion: false }, instruments: [], waves: [] };
+        return empty;
     }
 
     private createLoader(): LoaderObject {
