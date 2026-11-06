@@ -53,6 +53,7 @@ import { pathToFileURL } from "url";
 import { spawnSync } from "child_process";
 import { parsePeImports, isPeImage } from "../packages/formats/src/pe";
 import { resolveThunkedDllAlias } from "../src/worker/core/dll-aliases";
+import { trapsUnknownImport } from "../src/worker/core/pe-import-binding";
 import { ApiCoverageIndex } from "../src/worker/tools/api-coverage";
 import { deriveStackCleanupFromMangledName } from "../src/worker/core/thunking/msvc-mangling";
 
@@ -64,6 +65,7 @@ interface Finding {
     importers: Set<string>;
     /** Set when the name binds, but to a DIFFERENT @N than the import carries. */
     wrongArity?: string;
+    trap?: boolean;
 }
 
 /** A name that BINDS but has no handler behind it — question 2 in the header. */
@@ -518,6 +520,7 @@ async function main(): Promise<void> {
                     findings.set(key, (f = {
                         dll: importedMod, func, importers: new Set(),
                         wrongArity: mismatch ?? undefined,
+                        trap: !mismatch && trapsUnknownImport(entry, mod !== importedMod),
                     }));
                 }
                 f.importers.add(name);
@@ -534,7 +537,7 @@ async function main(): Promise<void> {
         console.log(JSON.stringify({
             scanned,
             missing: rows.map(r => ({
-                dll: r.dll, func: r.func, wrongArity: r.wrongArity ?? null,
+                dll: r.dll, func: r.func, wrongArity: r.wrongArity ?? null, trap: r.trap ?? false,
                 importers: [...r.importers].sort(),
             })),
             unimplemented: unimplRows.map(r => ({
@@ -554,13 +557,17 @@ async function main(): Promise<void> {
                     current = r.dll;
                     console.log(`\n${current}:`);
                 }
-                const why = r.wrongArity ? `WRONG ARITY: binds to ${r.wrongArity}` : "unbindable";
+                const why = r.wrongArity ? `WRONG ARITY: binds to ${r.wrongArity}` : r.trap ? "trap stub: loads, fails if called" : "unbindable";
                 console.log(`  ${r.func.padEnd(38)} ${why.padEnd(36)} <- ${[...r.importers].sort().join(", ")}`);
             }
-            const unbindable = rows.filter(r => !r.wrongArity).length;
-            const skewed = rows.length - unbindable;
+            const unbindable = rows.filter(r => !r.wrongArity && !r.trap).length;
+            const trapped = rows.filter(r => r.trap).length;
+            const skewed = rows.length - unbindable - trapped;
             if (unbindable) {
                 console.log(`\n${unbindable} unbindable import(s) — each one fails the importing PE's load.`);
+            }
+            if (trapped) {
+                console.log(`${trapped} import(s) get a trap stub: the image loads, and a call names the import.`);
             }
             if (skewed) {
                 console.log(`${skewed} arity mismatch(es) — these DO bind, with the wrong RET N. The`
@@ -595,7 +602,7 @@ ${uncertain} of these sit in a module whose export table this scan could not`
             }
         }
     }
-    process.exit(rows.length === 0 ? 0 : 1);
+    process.exit(rows.every(r => r.trap) ? 0 : 1);
 }
 
 main().catch((error) => {

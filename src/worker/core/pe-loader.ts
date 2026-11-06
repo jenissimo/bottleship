@@ -30,7 +30,7 @@ import { loadDiagnostics } from './diagnostics/load-diagnostics';
 import { writeGuestCode, invalidateGuestCode } from './memory/guest-code';
 import { markGuestPagesDirty, zeroGuestRange } from './memory/guest-page-dirty';
 import {
-    resolveImportBinding, isD3dx9VersionedDll, uncoveredHleImports,
+    resolveImportBinding, isD3dx9VersionedDll, trapsUnknownImport, uncoveredHleImports,
     type ImportBindingDeps, type ImportFn,
 } from './pe-import-binding';
 import { planProcessCrt, processCrtBinding, type CrtScanImport } from './crt-binding';
@@ -1577,8 +1577,7 @@ export class PELoader {
                     if (argCount === undefined) {
                         Logger.warn(LogCategory.SYSTEM, `[PE] Unknown arg count for ${dllName}:${name}${aliasTarget ? ` (aliased from ${dllNameRaw})` : ''}`);
                         loadDiagnostics.noteUnknownArgCount(dllName, name, aliasTarget ? dllNameRaw : null);
-                        if (aliasTarget) {
-                            // For aliased DLLs, unknown functions get trap stubs instead of throwing
+                        if (trapsUnknownImport(f, aliasTarget !== null)) {
                             unknownFunctions.add(name.toLowerCase());
                             continue;
                         }
@@ -1797,7 +1796,7 @@ export class PELoader {
                         // Unknown function from aliased DLL — use trap stub
                         this.thunkGenerator.writeTrapStub(this.memory);
                         this.view.setUint32(iatAddr, this.thunkGenerator.getTrapStubAddress(), true);
-                        Logger.warn(LogCategory.SYSTEM, `[PE] Trap stub for unknown ${dllName}:${this.resolveImportName(dllName, func)} (from alias ${dllNameRaw})`);
+                        Logger.warn(LogCategory.SYSTEM, `[PE] Trap stub for unknown ${dllName}:${this.resolveImportName(dllName, func)}${aliasTarget ? ` (from alias ${dllNameRaw})` : ' (ordinal import with no table entry)'}`);
                     } else {
                         // Heap slab fast path: override IAT with inline x86 stub when available.
                         // Inline stub's fallback JMPs to the original OUT-trap stub. HEAP_ZERO
