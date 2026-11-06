@@ -994,6 +994,10 @@ export class WindowManager {
     }
 
     // Legacy compatibility
+    hasPendingMoveSetCursor(msgMin = 0, msgMax = 0, callerThreadId = 0): boolean {
+        return this.messageQueue.hasPendingMoveSetCursor(msgMin, msgMax, callerThreadId);
+    }
+
     peekMessage(remove: boolean, msgMin = 0, msgMax = 0, callerThreadId = 0): Message | undefined {
         if (remove) {
             return this.messageQueue.dequeue(msgMin, msgMax, callerThreadId) ?? undefined;

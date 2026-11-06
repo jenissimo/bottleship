@@ -711,6 +711,17 @@ export class MessageQueue {
         };
     }
 
+    hasPendingMoveSetCursor(msgMin = 0, msgMax = 0, callerThreadId = 0): boolean {
+        if (this.moveSetCursor.size === 0) return false;
+        if (!(msgMin === 0 && msgMax === 0) && !(WM_MOUSEMOVE >= msgMin && WM_MOUSEMOVE <= msgMax)) return false;
+        for (const [hwnd, pending] of this.moveSetCursor) {
+            if (!this.lastMouseMove.has(hwnd)) continue;
+            if (callerThreadId > 0 && pending.targetThreadId > 0 && pending.targetThreadId !== callerThreadId) continue;
+            return true;
+        }
+        return false;
+    }
+
     dequeue(msgMin = 0, msgMax = 0, callerThreadId = 0): Message | null {
         const noFilter = msgMin === 0 && msgMax === 0;
 
