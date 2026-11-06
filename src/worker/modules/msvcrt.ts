@@ -564,6 +564,8 @@ export class Msvcrt implements IModule {
         exports["fgets"] = (ctx, mem, args) => this.fgets(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
         exports["fputs"] = (ctx, mem, args) => this.fputs(args[0] ?? 0, args[1] ?? 0);
         exports["puts"] = (ctx, mem, args) => this.puts(args[0] ?? 0);
+        exports["putchar"] = (ctx, mem, args) => (args[0] ?? 0) & 0xff;
+        exports["_getdrives"] = () => 0x0C;
         exports["fseek"] = (ctx, mem, args) => this.fseek(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
         exports["ftell"] = (ctx, mem, args) => this.ftell(args[0] ?? 0);
         exports["fflush"] = () => 0;
