@@ -101,6 +101,17 @@ export class AllocTable<B> {
         return rows.map(({ addr, size, bucket }) => ({ addr, size, bucket }));
     }
 
+    firstOverlapping(start: number, end: number, skip: (addr: number) => boolean): { addr: number; size: number } | null {
+        for (let i = 0; i < this.keys.length; i++) {
+            if (this.used[i] === 0 || this.hasSize[i] === 0 || this.buckets[i] === 0) continue;
+            const addr = this.keys[i];
+            const size = this.sizes[i];
+            if (addr >= end || addr + size <= start || skip(addr)) continue;
+            return { addr, size };
+        }
+        return null;
+    }
+
     clear(): void {
         this.used.fill(0);
         this.hasSize.fill(0);

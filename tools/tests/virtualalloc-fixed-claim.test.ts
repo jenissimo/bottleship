@@ -86,4 +86,47 @@ describe("VirtualAlloc at a fixed address claims the range from the anonymous al
         expect(alloc(MB)).toBe(upper);
         expect(view.getUint32(upper + MB, true)).toBe(0xC0FFEE);
     });
+
+    test("a fixed reserve over a live heap block fails with ERROR_INVALID_ADDRESS and leaves it mapped", () => {
+        let lastError = 0;
+        (System.getInstance() as any).scheduler.setLastError = (e: number) => { lastError = e; };
+        const pool = alloc(MB, RESERVE);
+        expect(alloc(MB, COMMIT, pool)).toBe(pool);
+        const block = call("LocalAlloc", [0, 0x644]) >>> 0;
+        expect(block).toBe(pool + MB);
+        view.setUint32(block + 0x274, 0xD5C, true);
+
+        expect(alloc(MB, RESERVE, pool + MB)).toBe(0);
+        expect(lastError).toBe(487);
+        expect(state(block)).toBe(0x1000);
+        expect(view.getUint32(block + 0x274, true)).toBe(0xD5C);
+
+        const elsewhere = alloc(MB, RESERVE);
+        expect(elsewhere).not.toBe(0);
+        expect(elsewhere >= block + 0x644 || elsewhere + MB <= block).toBe(true);
+    });
+
+    test("a fixed reserve next to a heap block it does not cover still succeeds", () => {
+        const pool = alloc(MB, RESERVE);
+        const block = call("LocalAlloc", [0, 0x644]) >>> 0;
+        const after = (block + 0x644 + 0xffff) & ~0xffff;
+        expect(alloc(MB, RESERVE, after)).toBe(after);
+        expect(pool).not.toBe(0);
+    });
+
+    test("with the free cache on, a released block re-reserved at its address is evicted from the cache, not aliased", () => {
+        (globalThis as any).vaCacheEnable(true);
+        const block = alloc(0x10000);
+        expect(block).not.toBe(0);
+        expect(call("VirtualFree", [block, 0, RELEASE])).toBe(1);
+        expect((globalThis as any).vaCacheReport().parkedBytes).toBe(0x10000);
+        expect(alloc(0x10000, RESERVE | COMMIT, block)).toBe(block);
+        expect((globalThis as any).vaCacheReport().parkedBytes).toBe(0);
+        view.setUint32(block, 0x5348, true);
+        const next = alloc(0x10000);
+        expect(next).not.toBe(0);
+        expect(next).not.toBe(block);
+        expect(view.getUint32(block, true)).toBe(0x5348);
+        expect(memory.getSize(block)).toBe(0x10000);
+    });
 });

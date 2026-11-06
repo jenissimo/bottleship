@@ -515,6 +515,10 @@ export class MemoryManager {
         return this.alloc(size, 'HEAP', perms, alignment);
     }
 
+    liveBlockOverlapping(addr: number, size: number, skip: (base: number) => boolean): { addr: number; size: number } | null {
+        return this.allocs.firstOverlapping(addr >>> 0, (addr >>> 0) + size, skip);
+    }
+
     allocAt(addr: number, size: number, kind?: RegionKind, perms?: RegionPerms): number {
         const aligned = this.alignUp(size, 8);
         const finalKind = kind ?? 'HEAP';
