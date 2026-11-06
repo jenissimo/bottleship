@@ -51,6 +51,8 @@ import {
     LoaderObject, PerformanceObject, PortObject, SegmentObject, SegmentStateObject, StyleObject, TrackObject,
 } from "./dmusic-objects";
 import { createSinkBuffer, DirectSoundSink, sinkBufferBytes, soundReference, writeWaveFormat } from "./dmusic-sink";
+import { registerDMusicParticipant } from "./dmusic-savestate";
+import { savestatesEnabled } from "../savestate/participant";
 
 const S_OK = 0;
 const S_FALSE = 1;
@@ -181,6 +183,7 @@ export class DMusic implements IModule {
 
     initialize(process: Process): void {
         this.process = process;
+        if (savestatesEnabled()) this.registerSavestate();
         InterfaceRegistry.getInstance().registerFromModuleDescriptor(dmusicModule);
         this.vtables = createVTablesFromDescriptor(this.process, dmusicModule);
 
@@ -628,6 +631,29 @@ export class DMusic implements IModule {
      * The default GM collection: Windows' gm.dls when the bundle has one, else an empty
      * collection. The loader keeps it, as its cache would, for as long as the loader lives.
      */
+    registerSavestate(): () => void {
+        return registerDMusicParticipant({
+            idleRefusal: () => this.savestateRefusal(),
+            defaultGmCollection: () => this.defaultGmCollection(),
+            releaseDirectSound: (dm) => this.setDirectSound(dm, 0),
+            wireLoader: (loader) => this.wireLoader(loader),
+        });
+    }
+
+    savestateRefusal(): string | null {
+        if (this.performances.size > 0 || this.ports.size > 0) return 'dmusic: a DirectMusic performance or port is not part of a v1 savestate';
+        if (this.loading.size > 0) return 'dmusic: an object is still loading';
+        if (this.messages.size > 0) return 'dmusic: performance messages are still allocated';
+        if (this.pumpTimer !== null) return 'dmusic: the synth pump is running';
+        return null;
+    }
+
+    private defaultGmCollection(): DlsCollection {
+        const bytes = this.readSystemFile(DEFAULT_COLLECTION_PATHS);
+        return (bytes ? parseDls(bytes) : null)
+            ?? { identity: { objectId: GUID_DefaultGMCollection, name: "GM", versionMS: 0, versionLS: 0, hasVersion: false }, instruments: [], waves: [] };
+    }
+
     private defaultCollection(loader: LoaderObject): CollectionObject {
         if (loader.defaultCollection) return loader.defaultCollection;
         const obj = new CollectionObject();
@@ -645,7 +671,10 @@ export class DMusic implements IModule {
     }
 
     private createLoader(): LoaderObject {
-        const loader = new LoaderObject();
+        return this.wireLoader(new LoaderObject());
+    }
+
+    private wireLoader(loader: LoaderObject): LoaderObject {
         loader.onDestroy = () => {
             this.clearLoaderCache(loader, GUID_DirectMusicAllTypes);
             loader.defaultCollection?.release();

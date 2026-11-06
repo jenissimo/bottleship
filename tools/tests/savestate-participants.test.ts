@@ -47,6 +47,7 @@ import { registerDDrawParticipant } from "../../src/worker/modules/ddraw/savesta
 import { WinMM } from "../../src/worker/modules/winmm";
 import { DSound } from "../../src/worker/modules/dsound/dsound";
 import { DInput } from "../../src/worker/modules/dinput/dinput";
+import { DMusic } from "../../src/worker/modules/dmusic";
 import { clearTimerHandler } from "../../src/worker/core/scheduler/timer-wheel";
 import { exports as vistaRuntimeExports } from "../../src/worker/modules/kernel32/vista-runtime";
 import { exports as processExports } from "../../src/worker/modules/kernel32/process/process";
@@ -336,7 +337,7 @@ describe("participant schemas", () => {
 describe("schema pin and mutation", () => {
     test("participant versions and schema hashes are pinned; a change here needs a version bump", () => {
         registerAllParticipants();
-        const undo = [new WinMM(), new DSound(), new DInput()].map(m => m.registerSavestate());
+        const undo = [new WinMM(), new DSound(), new DInput(), new DMusic()].map(m => m.registerSavestate());
         const schemas = savestateParticipants.schemas();
         for (const u of undo) u();
         expect(schemas).toEqual({
@@ -365,6 +366,7 @@ describe("schema pin and mutation", () => {
             "dsound": { version: 2, schemaHash: "af7b6bdbc3a44ecb" },
             "dinput": { version: 1, schemaHash: "d7eaf2cafce58a42" },
             "winmm": { version: 1, schemaHash: "c409a6582f9b8004" },
+            "dmusic": { version: 1, schemaHash: "b95b1a92960ba3cc" },
         });
     });
 
