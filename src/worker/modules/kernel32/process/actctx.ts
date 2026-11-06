@@ -563,7 +563,8 @@ function findActCtxSectionString(
 async function createActivationContext(
     mem: Uint8Array,
     pActCtx: number,
-    wide: boolean
+    wide: boolean,
+    externalManifest?: string,
 ): Promise<number> {
     const cbSize = readU32(pActCtx);
     if (cbSize < 28) {
@@ -575,7 +576,7 @@ async function createActivationContext(
     const moduleBase = resolveModuleBaseFromActCtx(mem, wide, pActCtx);
     const resourceId = readActCtxResourceId(mem, wide, pActCtx);
 
-    let manifestXml = readManifestFromModule(mem, moduleBase, resourceId);
+    let manifestXml = readManifestFromModule(mem, moduleBase, resourceId) ?? externalManifest ?? null;
     if (!manifestXml) {
         Logger.warn(
             LogCategory.KERNEL32,
@@ -638,7 +639,9 @@ export async function ensureProcessDefaultActivationContext(
 ): Promise<void> {
     if (processDefaultActCtx && contextsByHandle.has(processDefaultActCtx)) return;
 
-    const manifestXml = readManifestFromModule(mem, exeBase);
+    const embedded = readManifestFromModule(mem, exeBase);
+    const external = embedded ? undefined : await readExternalManifest(exeBase);
+    const manifestXml = embedded ?? external;
     if (!manifestXml) return;
 
     const assemblies = parseManifestDependencies(manifestXml);
@@ -650,7 +653,25 @@ export async function ensureProcessDefaultActivationContext(
     Mem.writeUint32(fakeActCtx + 4, ACTCTX_FLAG_HMODULE_VALID | ACTCTX_FLAG_SET_PROCESS_DEFAULT);
     Mem.writeUint32(fakeActCtx + 28, exeBase);
 
-    await createActivationContext(mem, fakeActCtx, false);
+    await createActivationContext(mem, fakeActCtx, false, external);
+}
+
+export async function readExternalManifest(exeBase: number): Promise<string | undefined> {
+    const system = System.getInstance();
+    const path = system.process?.moduleRegistry?.getByBase?.(exeBase)?.path;
+    const fs = system.fileSystem as unknown as {
+        open(path: string, access: number, disposition: number): Promise<unknown>;
+        getFileSize(path: string): number;
+        read(handle: unknown, size: number): Promise<Uint8Array | null>;
+    } | undefined;
+    if (!path || !fs) return undefined;
+    const manifestPath = `${path}.manifest`.replace(/\\/g, '/');
+    const handle = await fs.open(manifestPath, 0x80000000, 3);
+    if (!handle) return undefined;
+    const size = fs.getFileSize(manifestPath);
+    const bytes = size > 0 ? await fs.read(handle, size) : null;
+    if (!bytes || bytes.length === 0) return undefined;
+    return new TextDecoder('utf-8').decode(bytes).replace(/^\uFEFF/, '');
 }
 
 export function createActCtxExports(): Record<string, ThunkImplementation> {
