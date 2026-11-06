@@ -423,6 +423,7 @@ export const enum TimerKind {
     THREADPOOL_TIMER = 12,
     THREADPOOL_WAIT = 13,
     MSS_HEARTBEAT = 14,
+    MIDI_SYNTH = 15,
 }
 
 // ─── Scheduler Configuration ────────────────────────────────────────────────────

@@ -26,7 +26,7 @@ export interface TimerEntry {
 
 /** Minimum timer resolution — prevents timer storms */
 const COALESCE_MS = 1;
-const TIMER_KIND_COUNT = TimerKind.MSS_HEARTBEAT + 1;
+const TIMER_KIND_COUNT = TimerKind.MIDI_SYNTH + 1;
 
 export const TIMER_PHASE_EVERY = 0;
 export const TIMER_PHASE_DUE = 1;

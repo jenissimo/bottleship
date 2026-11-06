@@ -365,7 +365,7 @@ describe("schema pin and mutation", () => {
             "ddraw": { version: 1, schemaHash: "844462508bc4ae1e" },
             "dsound": { version: 2, schemaHash: "af7b6bdbc3a44ecb" },
             "dinput": { version: 1, schemaHash: "d7eaf2cafce58a42" },
-            "winmm": { version: 1, schemaHash: "c409a6582f9b8004" },
+            "winmm": { version: 2, schemaHash: "a2be1a35b30acb29" },
             "dmusic": { version: 1, schemaHash: "b95b1a92960ba3cc" },
         });
     });

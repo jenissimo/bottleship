@@ -3,6 +3,8 @@ import { Process } from "../core/process";
 import { type HleDispatcher, ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { captureWinmmJoystick, registerWinmmJoystickExports, resetWinmmJoystick, restoreWinmmJoystick, type JoyCapture, type JoystickState } from "./winmm-joystick";
 import { registerWinmmCapsExports } from "./winmm-caps";
+import { registerWinmmMidiOutExports, WinmmMidiOut } from "./winmm-midi";
+import { prefetchGmBankSources } from "../core/audio/gm-bank";
 import { registerWinmmMciExports } from "./winmm-mci";
 import type { WinmmMci } from "./winmm-mci";
 import { TimeService } from "../runtime/time";
@@ -373,7 +375,7 @@ export interface WinMMState {
 
 export const WINMM_FIELDS = {
     name: 'transient', exports: 'host', timers: 'save', timersByWheel: 'derive', nextTimerId: 'save', mmioHandles: 'transient',
-    dbgLastMmioInfo: 'transient', dbgMmioInfoCount: 'transient', nextMMIOHandle: 'save', mci: 'transient', periodRefCounts: 'save',
+    dbgLastMmioInfo: 'transient', dbgMmioInfoCount: 'transient', nextMMIOHandle: 'save', mci: 'transient', midiOut: 'transient', periodRefCounts: 'save',
     waveOutDevices: 'transient', nextWaveOutId: 'save', playSoundId: 'transient', nextPlaySoundId: 'save', playSoundSab: 'transient',
     timerThreadId: 'save', timerThreadHandle: 'save', timerWakeEvent: 'save', pendingTimerCallbacks: 'transient',
     dispatchingPosted: 'transient', pendingTimerHead: 'transient', dispatchingTimerCallback: 'transient', dbgTimerStats: 'transient',
@@ -470,12 +472,14 @@ export class WinMM implements IModule {
     private nextMMIOHandle = 1;
     /** MCI subsystem (device registry + AVI playback) — see winmm-mci.ts. Created in initialize(). */
     private mci: WinmmMci | null = null;
+    private midiOut: WinmmMidiOut | null = null;
     private periodRefCounts: Map<number, number> = new Map();
 
     captureSavestate(): WinMMState {
         if (this.waveOutDevices.size > 0) throw new Error('winmm: open waveOut devices are not part of a v1 savestate');
         if (this.mmioHandles.size > 0) throw new Error('winmm: open MMIO handles are not part of a v1 savestate');
         if ((this.mci?.openDeviceCount() ?? 0) > 0) throw new Error('winmm: open MCI devices are not part of a v1 savestate');
+        if ((this.midiOut?.openCount() ?? 0) > 0) throw new Error('winmm: open MIDI output handles are not part of a v1 savestate');
         if (this.playSoundSab) throw new Error('winmm: a PlaySound sound is playing');
         if (this.pendingTimerCallbacks.length > this.pendingTimerHead || this.dispatchingTimerCallback || this.dispatchingPosted) {
             throw new Error('winmm: a multimedia timer callback is queued or running; try saving again');
@@ -1413,7 +1417,7 @@ export class WinMM implements IModule {
 
     registerSavestate(): () => void {
         return savestateParticipants.add({
-            id: 'winmm', version: 1, order: 63, covers: ['winmm'], schema: WINMM_SCHEMA as unknown as SaveValue,
+            id: 'winmm', version: 2, order: 63, covers: ['winmm'], schema: WINMM_SCHEMA as unknown as SaveValue,
             capture: () => {
                 try {
                     return this.captureSavestate() as unknown as SaveValue;
@@ -1962,6 +1966,14 @@ export class WinMM implements IModule {
         // waveIn / midiIn / mixer / aux device-caps and stub handlers live in
         // winmm-caps.ts (same wiring pattern as winmm-joystick).
         registerWinmmCapsExports(this.exports);
+        this.midiOut = new WinmmMidiOut({
+            callFunction: (callbackAddr, args) => {
+                this.ensureTimerThread();
+                this.enqueueTimerCallback({ callbackAddr, timerId: 0, dwUser: args[2] ?? 0, args });
+            },
+        });
+        registerWinmmMidiOutExports(this.exports, this.midiOut);
+        void prefetchGmBankSources();
 
         registerWinmmJoystickExports(this.exports);
 
