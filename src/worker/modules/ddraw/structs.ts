@@ -248,7 +248,11 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
     const flags = hasField(DDSURFACEDESC2_OFFSETS.flags) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.flags, true) : 0;
     const height = hasField(DDSURFACEDESC2_OFFSETS.height) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.height, true) : 0;
     const width = hasField(DDSURFACEDESC2_OFFSETS.width) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.width, true) : 0;
-    const pitch = hasField(DDSURFACEDESC2_OFFSETS.pitch) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.pitch, true) : 0;
+    // lPitch is only valid under DDSD_PITCH, like every member. Half-Life's sw.dll creates a
+    // 320x240 SYSTEMMEMORY offscreen surface with DDSD_CAPS|HEIGHT|WIDTH and stack garbage
+    // (a code pointer) in lPitch; honoring it asked for a 135 GB surface, CreateSurface
+    // failed, and the engine derailed right after New Game → difficulty.
+    const pitch = (flags & DDSD_PITCH) && hasField(DDSURFACEDESC2_OFFSETS.pitch) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.pitch, true) : 0;
     // Like every member, dwBackBufferCount is only valid under its DDSD_ flag; callers that
     // set just DDSD_CAPS often leave stack garbage there.
     const backBufferCount = (flags & DDSD_BACKBUFFERCOUNT) && hasField(DDSURFACEDESC2_OFFSETS.backBufferCount) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.backBufferCount, true) : 0;
@@ -472,7 +476,7 @@ export const readSurfaceDescV1 = (mem: Uint8Array, address: number): SurfaceDesc
     const flags = hasField(DDSURFACEDESC_OFFSETS.flags) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.flags, true) : 0;
     const height = hasField(DDSURFACEDESC_OFFSETS.height) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.height, true) : 0;
     const width = hasField(DDSURFACEDESC_OFFSETS.width) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.width, true) : 0;
-    const pitch = hasField(DDSURFACEDESC_OFFSETS.pitch) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.pitch, true) : 0;
+    const pitch = (flags & DDSD_PITCH) && hasField(DDSURFACEDESC_OFFSETS.pitch) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.pitch, true) : 0;
     const backBufferCount = (flags & DDSD_BACKBUFFERCOUNT) && hasField(DDSURFACEDESC_OFFSETS.backBufferCount) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.backBufferCount, true) : 0;
     // Only read lpSurface if DDSD_LPSURFACE flag is set AND field exists
     const surfacePtr = (flags & DDSD_LPSURFACE) && hasField(DDSURFACEDESC_OFFSETS.lpSurface)
