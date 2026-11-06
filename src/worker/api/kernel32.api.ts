@@ -433,6 +433,7 @@ export const kernel32Module: ModuleDescriptor = {
         makeFunc("GlobalFindAtomA", 1),
         makeFunc("GlobalFindAtomW", 1),
         makeFunc("GlobalGetAtomNameA", 3),
+        makeFunc("GlobalGetAtomNameW", 3),
         makeFunc("GlobalDeleteAtom", 1),
         makeFunc("AddAtomA", 1),
         makeFunc("AddAtomW", 1),
