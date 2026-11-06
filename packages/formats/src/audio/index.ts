@@ -97,5 +97,20 @@ export function sniffAudioContainer(src: RandomAccessSource): AudioContainer | n
         return tagAt(body, 0, "fLaC") ? "flac" : "mp3";
     }
     if (head[0] === 0xff && (head[1]! & 0xe0) === 0xe0) return "mp3";
+    // The padded-frame search below must not claim a video container: an MPEG-1/2
+    // program stream (pack header 00 00 01 BA), a bare video sequence (00 00 01 B3)
+    // or an AVI carries MPEG audio packets whose frames chain just like a padded MP3,
+    // and calling the whole file "mp3" hands a movie to the audio path (Max Payne's
+    // movies\intro.mpg: no picture, and the browser cannot demux it as audio either).
+    if (isVideoContainer(head)) return null;
     return hasMpegFrames(src) ? "mp3" : null;
+}
+
+/** Magic of a container that carries video: MPEG PS/system or video ES, RIFF AVI. */
+function isVideoContainer(head: Uint8Array): boolean {
+    if (head[0] === 0x00 && head[1] === 0x00 && head[2] === 0x01) {
+        const id = head[3]!;
+        return id === 0xba || id === 0xbb || id === 0xb3;
+    }
+    return head.length >= 12 && tagAt(head, 0, "RIFF") && tagAt(head, 8, "AVI ");
 }
