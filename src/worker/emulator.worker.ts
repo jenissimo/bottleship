@@ -626,18 +626,24 @@ const gdiPresentOnce = () => {
 
     if (shouldComposite) {
       let composedAny = false;
+      // The video plane goes ABOVE the window plane. On Windows the movie is a window of its
+      // own (DirectShow's renderer after put_Owner, an MCI child) on top of the app window
+      // that owns it, and the plane is transparent outside its dest rect, so only the rect
+      // the movie covers is taken. Drawn the other way round, an app window with a painted
+      // background hides the whole movie (Max Payne's movies\intro.mpg: black screen).
+      const videoWillComposite = videoPlan.onScreen && (videoDirty || gdiDirty);
 
-      if (videoPlan.onScreen && (videoDirty || gdiDirty)) {
-        backend.composite(videoPlan.canvas!, shouldClear);
-        notifyVideoPlaneComposited(videoPlan);
-        composedAny = true;
-      }
-
-      if (gdiCanvas && (gdiDirty || composedAny)) {
-        backend.composite(gdiCanvas, shouldClear && !composedAny);
+      if (gdiCanvas && (gdiDirty || videoWillComposite)) {
+        backend.composite(gdiCanvas, shouldClear);
         if (gdiDirty) {
           gdi.clearOverlayDirty();
         }
+        composedAny = true;
+      }
+
+      if (videoWillComposite) {
+        backend.composite(videoPlan.canvas!, shouldClear && !composedAny);
+        notifyVideoPlaneComposited(videoPlan);
         composedAny = true;
       }
 
