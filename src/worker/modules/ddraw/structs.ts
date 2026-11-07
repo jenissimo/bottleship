@@ -8,6 +8,7 @@ import {
     DDSD_BACKBUFFERCOUNT,
     DDSD_CAPS,
     DDSD_HEIGHT,
+    DDSD_LINEARSIZE,
     DDSD_LPSURFACE,
     DDSD_CKSRCBLT,
     DDSD_CKDESTBLT,
@@ -347,6 +348,21 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
     };
 };
 
+/**
+ * lPitch and dwLinearSize are a union. A block-compressed surface has no row stride to report,
+ * so the union carries the level's total bytes and DDSD_LINEARSIZE says so — callers branch on
+ * that flag, and a loader that falls through to `width * dwRGBBitCount / 8` computes 0 for a
+ * DDPF_FOURCC format and copies nothing.
+ */
+const pitchFieldOf = (desc: SurfaceDesc): { value: number; flag: number } => {
+    const format = desc.pixelFormat;
+    if (format) {
+        const layout = getSurfaceFormatLayout(format, desc.width, desc.height);
+        if (layout.compressed) return { value: layout.bytes, flag: DDSD_LINEARSIZE };
+    }
+    return { value: desc.pitch, flag: DDSD_PITCH };
+};
+
 export const writeSurfaceDesc = (
     mem: Uint8Array,
     address: number,
@@ -390,9 +406,10 @@ export const writeSurfaceDesc = (
     let flags = desc.flags ?? 0;
     
     // We always write these fields — flags must be set
+    const pitchField = pitchFieldOf(desc);
     if (desc.width) flags |= DDSD_WIDTH;
     if (desc.height) flags |= DDSD_HEIGHT;
-    if (desc.pitch) flags |= DDSD_PITCH;
+    if (pitchField.value) flags |= pitchField.flag;
     
     // We always write pixelFormat — flag is mandatory
     flags |= DDSD_PIXELFORMAT;
@@ -405,7 +422,7 @@ export const writeSurfaceDesc = (
     // would otherwise ask for user memory aliasing the surface it came from.
     flags &= ~DDSD_LPSURFACE;
     if (desc.surfacePtr && desc.surfacePtr > 0) {
-        flags |= DDSD_PITCH;
+        flags |= pitchField.flag;
         if (desc.caps) flags |= DDSD_CAPS;
     }
     if (canWrite(DDSURFACEDESC2_OFFSETS.flags)) {
@@ -418,7 +435,7 @@ export const writeSurfaceDesc = (
         view.setUint32(address + DDSURFACEDESC2_OFFSETS.width, desc.width, true);
     }
     if (canWrite(DDSURFACEDESC2_OFFSETS.pitch)) {
-        view.setUint32(address + DDSURFACEDESC2_OFFSETS.pitch, desc.pitch, true);
+        view.setUint32(address + DDSURFACEDESC2_OFFSETS.pitch, pitchField.value, true);
     }
     if (canWrite(DDSURFACEDESC2_OFFSETS.backBufferCount)) {
         view.setUint32(address + DDSURFACEDESC2_OFFSETS.backBufferCount, desc.backBufferCount, true);
@@ -533,15 +550,16 @@ export const writeSurfaceDescV1 = (
     
     // Build flags based on what we actually write (same logic as v2)
     let flags = desc.flags ?? 0;
+    const pitchField = pitchFieldOf(desc);
     if (desc.width) flags |= DDSD_WIDTH;
     if (desc.height) flags |= DDSD_HEIGHT;
-    if (desc.pitch) flags |= DDSD_PITCH;
+    if (pitchField.value) flags |= pitchField.flag;
     flags |= DDSD_PIXELFORMAT;
     if (desc.caps) flags |= DDSD_CAPS;
     
     flags &= ~DDSD_LPSURFACE;
     if (desc.surfacePtr && desc.surfacePtr > 0) {
-        flags |= DDSD_PITCH;
+        flags |= pitchField.flag;
         if (desc.caps) flags |= DDSD_CAPS;
     }
     
@@ -555,7 +573,7 @@ export const writeSurfaceDescV1 = (
         view.setUint32(address + DDSURFACEDESC_OFFSETS.width, desc.width, true);
     }
     if (canWrite(DDSURFACEDESC_OFFSETS.pitch)) {
-        view.setUint32(address + DDSURFACEDESC_OFFSETS.pitch, desc.pitch, true);
+        view.setUint32(address + DDSURFACEDESC_OFFSETS.pitch, pitchField.value, true);
     }
     if (canWrite(DDSURFACEDESC_OFFSETS.backBufferCount)) {
         view.setUint32(address + DDSURFACEDESC_OFFSETS.backBufferCount, desc.backBufferCount, true);
@@ -665,9 +683,11 @@ export const normalizeSurfaceDesc = (
     const height = isPrimary ? fallbackHeight : (input.height || fallbackHeight);
     const layout = getSurfaceFormatLayout(pixelFormat, width, height);
     const computedPitch = layout.compressed ? layout.pitch : computePitch(width, pixelFormat.bpp);
+    // The union holds dwLinearSize on a compressed desc (often copied straight from a texture
+    // file's header), so it is never a stride there.
     const pitch = isPrimary
         ? computePitch(fallbackWidth, pixelFormat.bpp)
-        : (input.pitch || computedPitch);
+        : layout.compressed ? computedPitch : (input.pitch || computedPitch);
     let flags =
         input.flags ||
         (DDSD_WIDTH | DDSD_HEIGHT | DDSD_PITCH | DDSD_PIXELFORMAT);
