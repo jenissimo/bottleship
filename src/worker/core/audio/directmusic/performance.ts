@@ -403,6 +403,11 @@ export class Performance {
         }
     }
 
+    hasWaveOn(output: object): boolean {
+        for (const s of this.states) if (s.output === output && s.segment.wave && !s.ended) return true;
+        return false;
+    }
+
     renderWaves(output: object, left: Float32Array, right: Float32Array, frames: number, rate: number): void {
         this.mixWaves(left, right, 0, frames, this.now, output, rate);
     }

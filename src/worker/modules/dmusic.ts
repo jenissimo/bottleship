@@ -1960,8 +1960,12 @@ export class DMusic implements IModule {
             if (!port.active || !port.sink) continue;
             port.sink.pump((pcm, frames) => this.render(port, pcm, frames));
         }
+        const skipIdle = (globalThis as { __dmusicIdlePathSkip?: boolean }).__dmusicIdlePathSkip !== false;
         for (const path of this.pathOutputs) {
-            path.sink?.pump((pcm, frames) => this.renderPath(path, pcm, frames));
+            const sink = path.sink;
+            if (!sink) continue;
+            if (skipIdle && sink.isSilent() && !path.performance?.engine?.hasWaveOn(path)) continue;
+            sink.pump((pcm, frames) => this.renderPath(path, pcm, frames));
         }
     }
 
