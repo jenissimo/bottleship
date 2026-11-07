@@ -13,6 +13,7 @@ import { convertRGBAToSurface } from "./gpu-texture-utils";
 import {
     decodeSurfaceFormatToRgba8,
     getSurfaceFormatLayout,
+    blockCompressedBlockBytes,
     isBlockCompressedFormat,
 } from "../../backends/webgpu/shared/texture-formats";
 
@@ -29,9 +30,8 @@ export const isCompressedSurface = (s: DirectDrawSurfaceState): boolean => {
 /**
  * Blt leg for a block-compressed SOURCE into a linear destination.
  *
- * We advertise no compressed formats from EnumTextureFormats, so a game holding DXT data
- * (the on-disk form) creates its video-memory texture in one of the RGB formats we DO offer
- * and relies on DirectDraw's documented behaviour: a Blt between different pixel formats
+ * A game holding DXT data (the on-disk form) may create its video-memory texture in an RGB
+ * format and rely on DirectDraw's documented behaviour: a Blt between different pixel formats
  * CONVERTS. The linear copy paths address source pixels as `x * bpp/8`, which for 4x4 block
  * storage reads two block endpoint colours followed by four bytes of block indices — the
  * indices land in the destination as pixels and the result is periodic noise that still
@@ -118,6 +118,62 @@ export const copyCompressedSurfaceRegion = (
     return true;
 };
 
+/**
+ * Copy leg for a block-compressed DESTINATION.
+ *
+ * Same-format, unscaled copies move whole blocks; `pitch` is a block-row stride there, so the
+ * row count and byte count are in blocks, not pixels. Everything else would need a block
+ * encoder we do not have: it is refused rather than laying linear pixels over block storage.
+ *
+ * Returns false when the destination is linear, so the caller keeps its normal path.
+ */
+export const copyBlockCompressedRegion = (
+    memory: Uint8Array,
+    src: DirectDrawSurfaceState,
+    dst: DirectDrawSurfaceState,
+    srcRectInput: Rect,
+    dstRectInput: Rect
+): boolean => {
+    if (!isCompressedSurface(dst)) return false;
+
+    const srcRect = clipRect(srcRectInput, src.width, src.height);
+    const dstRect = clipRect(dstRectInput, dst.width, dst.height);
+    if (!srcRect || !dstRect) return true; // fully clipped — nothing to copy, but handled
+
+    const w = srcRect.right - srcRect.left;
+    const h = srcRect.bottom - srcRect.top;
+    const onBlockGrid = (r: Rect, s: DirectDrawSurfaceState): boolean =>
+        (r.left & 3) === 0 && (r.top & 3) === 0 &&
+        ((r.right & 3) === 0 || r.right === s.width) &&
+        ((r.bottom & 3) === 0 || r.bottom === s.height);
+    if (src.format.fourCC !== dst.format.fourCC ||
+        w !== dstRect.right - dstRect.left || h !== dstRect.bottom - dstRect.top ||
+        !onBlockGrid(srcRect, src) || !onBlockGrid(dstRect, dst)) {
+        Logger.warn(LogCategory.DDRAW,
+            `Blt: cannot copy into block-compressed dest 0x${dst.surfacePtr.toString(16)} ` +
+            `(fourCC=0x${dst.format.fourCC!.toString(16)}) from fourCC=0x${(src.format.fourCC ?? 0).toString(16)} ` +
+            `${w}x${h} — leaving dest unchanged`);
+        return true;
+    }
+
+    const mem = toPlainGuestMemory(memory);
+    const blockBytes = blockCompressedBlockBytes(dst.format.fourCC!);
+    const rowBytes = ((w + 3) >> 2) * blockBytes;
+    const rows = (h + 3) >> 2;
+    const srcBase = src.surfacePtr + (srcRect.top >> 2) * src.pitch + (srcRect.left >> 2) * blockBytes;
+    const dstBase = dst.surfacePtr + (dstRect.top >> 2) * dst.pitch + (dstRect.left >> 2) * blockBytes;
+    const bottomUp = src.surfacePtr === dst.surfacePtr && dstBase > srcBase;
+    for (let i = 0; i < rows; i++) {
+        const row = bottomUp ? rows - 1 - i : i;
+        const srcAbs = srcBase + row * src.pitch;
+        const dstAbs = dstBase + row * dst.pitch;
+        if (!isValidAddress(mem, srcAbs, rowBytes) || !isValidAddress(mem, dstAbs, rowBytes)) continue;
+        const srcRel = absToRel(mem, srcAbs);
+        mem.copyWithin(absToRel(mem, dstAbs), srcRel, srcRel + rowBytes);
+    }
+    return true;
+};
+
 export const clipRect = (rect: Rect, width: number, height: number): Rect | null => {
     const left = Math.max(0, rect.left);
     const top = Math.max(0, rect.top);
@@ -145,6 +201,7 @@ export const copySurfaceRegion = (
     // (IDirectDrawSurface7_Blt spike: ~154ms/call → single-digit ms). Same pattern as the
     // colour-key readback fix; the always-live Proxy stays for views held across re-entry.
     mem = toPlainGuestMemory(mem);
+    if (copyBlockCompressedRegion(mem, src, dst, srcRectInput, dstRectInput)) return;
 
     // First take copies we can mutate for coordinated clipping (using pool to reduce allocations)
     const srcRect = rectPool.acquireCopy(srcRectInput);

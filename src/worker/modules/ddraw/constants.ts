@@ -101,6 +101,7 @@ export const DDSD_CKSRCOVERLAY = 0x00008000;  // ddckCKSrcOverlay is valid
 export const DDSD_CKSRCBLT = 0x00010000;      // ddckCKSrcBlt is valid
 export const DDSD_MIPMAPCOUNT = 0x00020000;   // dwMipMapCount is valid
 export const DDSD_REFRESHRATE = 0x00040000;   // dwRefreshRate is valid
+export const DDSD_LINEARSIZE = 0x00080000;    // dwLinearSize is valid (the lPitch union)
 
 // DDLOCK flags for Lock/Unlock
 export const DDLOCK_SURFACEMEMORYPTR = 0x00000000;

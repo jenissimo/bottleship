@@ -4,6 +4,7 @@ import {
     mmioFillGuestWindow,
     mmioWriteInfoStruct,
     mmioCommitInfoCursor,
+    mmioReplaceBuffer,
     mmioSelectsMemoryIoProc,
     mmioResolveSource,
     mmioArraySource,
@@ -263,5 +264,95 @@ describe("VfsMmioSource — a disk file is read by range, whatever its size", ()
         const src = new VfsMmioSource(handle, HUGE, vfs);
         expect(src.read((1 << 20) - 8, 64)).toBeNull();
         expect(src.read(0, 64)!.length).toBe(64);
+    });
+});
+
+describe("mmioSetBuffer", () => {
+    const DWFLAGS = 0;
+    const MMIO_ALLOCBUF = 0x00010000;
+    const OLD = 0x3000;
+    const NEW = 0x4000;
+    const CALLER = 0x5000;
+
+    function heap(result = NEW) {
+        const freed: number[] = [];
+        const asked: number[] = [];
+        return { freed, asked, alloc: (size: number) => { asked.push(size); return result; }, free: (p: number) => { freed.push(p); } };
+    }
+    const owned = (position = 100): MmioBufState => ({
+        source: mmioArraySource(new Uint8Array(4096)), position,
+        guestBuffer: OLD, guestBufferSize: 64, bufFileOffset: 0, bufFilled: 64,
+    });
+
+    test("NULL with a size swaps in an internal buffer of that size", () => {
+        const state = owned();
+        const memory = heap();
+        expect(mmioReplaceBuffer(state, 0, 0x4000, memory)).toBe(0);
+        expect(memory.asked).toEqual([0x4000]);
+        expect(memory.freed).toEqual([OLD]);
+        expect(state.guestBuffer).toBe(NEW);
+        expect(state.guestBufferSize).toBe(0x4000);
+        expect(state.callerBuffer).toBe(false);
+    });
+
+    test("the window restarts at the file position, losing nothing", () => {
+        const state = owned(100);
+        mmioReplaceBuffer(state, 0, 0x4000, heap());
+        expect(state.position).toBe(100);
+        expect(state.bufFileOffset).toBe(100);
+        expect(state.bufFilled).toBe(0);
+    });
+
+    test("a caller's buffer is used directly and reported without ALLOCBUF", () => {
+        const state = owned();
+        const memory = heap();
+        expect(mmioReplaceBuffer(state, CALLER, 128, memory)).toBe(0);
+        expect(memory.asked).toEqual([]);
+        expect(state.guestBuffer).toBe(CALLER);
+        expect(state.callerBuffer).toBe(true);
+        mmioWriteInfoStruct(INFO, HANDLE, state);
+        expect(readU32(INFO + DWFLAGS) & MMIO_ALLOCBUF).toBe(0);
+        expect(readU32(INFO + CCHBUFFER)).toBe(128);
+    });
+
+    test("replacing a caller's buffer does not free it", () => {
+        const state = owned();
+        mmioReplaceBuffer(state, CALLER, 128, heap());
+        const memory = heap();
+        mmioReplaceBuffer(state, 0, 0x4000, memory);
+        expect(memory.freed).toEqual([]);
+        expect(state.callerBuffer).toBe(false);
+    });
+
+    test("size 0 makes the handle unbuffered", () => {
+        const state = owned();
+        const memory = heap();
+        expect(mmioReplaceBuffer(state, 0, 0, memory)).toBe(0);
+        expect(memory.freed).toEqual([OLD]);
+        expect(state.guestBuffer).toBe(0);
+        expect(state.unbuffered).toBe(true);
+    });
+
+    test("a failed allocation keeps the old buffer", () => {
+        const state = owned();
+        const memory = heap(0);
+        expect(mmioReplaceBuffer(state, 0, 0x4000, memory)).toBe(258); // MMIOERR_OUTOFMEMORY
+        expect(memory.freed).toEqual([]);
+        expect(state.guestBuffer).toBe(OLD);
+    });
+
+    test("a memory file keeps its block, which is the file itself", () => {
+        const state: MmioBufState = { source: null, position: 0, guestBuffer: OLD, guestBufferSize: 64, memoryBase: OLD };
+        const memory = heap();
+        expect(mmioReplaceBuffer(state, 0, 0x4000, memory)).toBe(0);
+        expect(memory.asked).toEqual([]);
+        expect(state.guestBuffer).toBe(OLD);
+    });
+
+    test("a refill honors the requested window size", () => {
+        const bytes = new Uint8Array(BUFCAP * 2).fill(5);
+        const state: MmioBufState = { source: mmioArraySource(bytes), position: 0 };
+        mmioReplaceBuffer(state, 0, 16, heap(GUEST_BUF));
+        expect(mmioFillGuestWindow(state)).toBe(16);
     });
 });

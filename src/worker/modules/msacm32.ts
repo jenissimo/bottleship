@@ -573,10 +573,14 @@ export class Msacm32 implements IModule {
             const uMetric = args[1] >>> 0;
             const pMetric = args[2] >>> 0;
 
-            // The counts and sizes are global (hao NULL); the per-driver metrics need one.
+            // Counts are global (hao NULL) and the DRIVER_* metrics need a driver. The size
+            // metrics take either: a caller sizing its WAVEFORMATEX for one driver passes that
+            // driver, and failing it leaves the caller's buffer too small for every ADPCM format.
+            const isDriver = hao === PCM_DRIVER_ID || hao === PCM_DRIVER_HANDLE;
             const perDriver = uMetric === ACM_METRIC_DRIVER_SUPPORT || uMetric === ACM_METRIC_DRIVER_PRIORITY;
-            if (perDriver && hao !== PCM_DRIVER_ID && hao !== PCM_DRIVER_HANDLE) return MMSYSERR_INVALHANDLE;
-            if (!perDriver && hao !== 0) return MMSYSERR_INVALHANDLE;
+            const sizeMetric = uMetric === ACM_METRIC_MAX_SIZE_FORMAT || uMetric === ACM_METRIC_MAX_SIZE_FILTER;
+            if (perDriver && !isDriver) return MMSYSERR_INVALHANDLE;
+            if (!perDriver && hao !== 0 && !(sizeMetric && isDriver)) return MMSYSERR_INVALHANDLE;
             if (!pMetric || !isValidAddress(mem, pMetric, 4, "rw")) return MMSYSERR_INVALPARAM;
 
             const values: Record<number, number> = {
