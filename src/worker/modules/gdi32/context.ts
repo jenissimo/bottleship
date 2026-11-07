@@ -51,7 +51,7 @@ import {
 // A paint DC's clip IS the window's update region (Win32: BeginPaint hands back a DC
 // clipped to it, and rcPaint is that region's bounding box). The region is USER state,
 // so it is read from there rather than duplicated here.
-import { getWindowUpdateRects } from '../user32/paint-region';
+import { getWindowUpdateQuads } from '../user32/paint-region';
 
 export interface GDIObject {
     handle: number;
@@ -1012,12 +1012,10 @@ export class GDIContext {
         state.paintDc = true;
         const hwnd = state.hwnd;
         if (!hwnd) return;
-        const update = getWindowUpdateRects(hwnd);
+        const quads = getWindowUpdateQuads(hwnd);
         // No update region is our own artifact (a directly posted WM_PAINT); it means
         // "repaint everything", which is an unbounded clip, not an empty one.
-        if (update.length === 0) return;
-        const quads: number[] = [];
-        for (const r of update) quads.push(r.left, r.top, r.right, r.bottom);
+        if (quads.length === 0) return;
         this.setClipRegion(hdc, makeClipRegion(quads));
     }
 

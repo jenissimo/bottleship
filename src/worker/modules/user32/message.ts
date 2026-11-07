@@ -20,6 +20,7 @@ import { installHook, uninstallHook, getHooksOfType, getNextHookInChain, hasHook
 import { isSentinelWndProc } from './dialog';
 import { applyDefaultSetText, handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
 import type { Message } from '../../runtime/windowing/message-queue';
+import { WM_DISPLAYCHANGE } from '../../runtime/windowing/window-manager';
 import { getDefDlgProcAddress, getDefWindowProcAddress } from './system-classes';
 import { tryRichEditStreamMessage } from './rich-edit-stream';
 import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
@@ -92,17 +93,9 @@ export function invokeGuestWndProcSync(
     const callbackManager = system.process?.dispatcher?.callbackManager;
     if (!callbackManager) return null;
 
-    const msgView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-    const thunkReturnAddr = msgView.getUint32(ctx.esp, true);
-    const stubRange = callbackManager.getStubPoolRange();
-    const reusedFrame = thunkReturnAddr >= stubRange.base && thunkReturnAddr < stubRange.end;
-    const frameId = reusedFrame
-        ? callbackManager.getActiveSuspendedFrameId()
-        : callbackManager.saveSuspendedThunkContext(
-            { ...ctx, returnAddr: thunkReturnAddr },
-            stackCleanup,
-            tag,
-        );
+    const thunkReturnAddr = new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(ctx.esp, true);
+    const reusedFrame = isCallbackStub(thunkReturnAddr, callbackManager);
+    const frameId = suspendCaller(ctx, thunkReturnAddr, callbackManager, reusedFrame, stackCleanup, tag);
     if (frameId === 0) {
         Logger.error(LogCategory.USER32,
             `${tag}: failed to save suspended context for msg=0x${message.toString(16)} hwnd=0x${hwnd.toString(16)}`);
@@ -134,6 +127,122 @@ export function invokeGuestWndProcSync(
     };
 }
 
+type CallbackManager = NonNullable<NonNullable<System['process']>['dispatcher']>['callbackManager'];
+
+/** The calling thunk returns into a callback stub, so its frame is already suspended. */
+function isCallbackStub(thunkReturnAddr: number, callbackManager: CallbackManager): boolean {
+    const stubRange = callbackManager.getStubPoolRange();
+    return thunkReturnAddr >= stubRange.base && thunkReturnAddr < stubRange.end;
+}
+
+/** The suspended frame guest callbacks run under for this thunk call; 0 on failure. */
+function suspendCaller(
+    ctx: X86Context,
+    thunkReturnAddr: number,
+    callbackManager: CallbackManager,
+    reusedFrame: boolean,
+    stackCleanup: number,
+    tag: string,
+): number {
+    if (reusedFrame) return callbackManager.getActiveSuspendedFrameId();
+    return callbackManager.saveSuspendedThunkContext({ ...ctx, returnAddr: thunkReturnAddr }, stackCleanup, tag);
+}
+
+/** The guest WndProc a sent message would run for hwnd, or 0 when only our own handling would. */
+function guestWndProcOf(hwnd: number): number {
+    const win = windows.get(hwnd);
+    if (!win?.wndProc || isSentinelWndProc(win.wndProc)) return 0;
+    if (win.isSystemControl && !win.wndProcSubclassed) return 0;
+    return win.wndProc;
+}
+
+/**
+ * A message the system SENDS to every top-level window from inside an API call (an
+ * HWND_BROADCAST send): the calling thread's windows have handled it before the call returns
+ * `value`; windows of other threads, and windows no guest procedure serves, get it posted.
+ * Each procedure is looked up when its turn comes — an earlier handler may have subclassed
+ * or destroyed the next window.
+ */
+export function sendToTopLevelSync(
+    ctx: X86Context,
+    mem: Uint8Array,
+    message: number,
+    wParam: number,
+    lParam: number,
+    stackCleanup: number,
+    tag: string,
+    value: number,
+): ThunkResult | number {
+    const system = System.getInstance();
+    const wm = system.windowManager;
+    const callbackManager = system.process?.dispatcher?.callbackManager;
+    const threadId = system.scheduler.getCurrentThreadId();
+    const own: number[] = [];
+    wm.forEachTopLevel((win) => {
+        if (callbackManager && win.creatorThreadId === threadId && guestWndProcOf(win.hwnd)) own.push(win.hwnd);
+        else wm.postMessage(win.hwnd, message, wParam, lParam);
+    });
+    if (!callbackManager || own.length === 0) return value;
+
+    const thunkReturnAddr = new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(ctx.esp, true);
+    const reusedFrame = isCallbackStub(thunkReturnAddr, callbackManager);
+    const frameId = suspendCaller(ctx, thunkReturnAddr, callbackManager, reusedFrame, stackCleanup, tag);
+    if (frameId === 0) {
+        Logger.error(LogCategory.USER32, `${tag}: failed to save suspended context for msg=0x${message.toString(16)}`);
+        return { value, stackCleanup };
+    }
+
+    let next = 0;
+    const sendNext = (): number => {
+        while (next < own.length) {
+            const hwnd = own[next++];
+            const wndProc = guestWndProcOf(hwnd);
+            if (!wndProc) continue;
+            const id = callbackManager.invokeCallback(
+                wndProc, [hwnd, message, wParam, lParam], 0, onReturn, false, tag, frameId).callbackId;
+            if (id !== 0) return id;
+        }
+        return 0;
+    };
+    const onReturn = (): number | null => (sendNext() !== 0 ? null : value);
+
+    // A frame saved for this call pins the thread until released; a reused one is the outer callback's.
+    let firstId: number;
+    try {
+        firstId = sendNext();
+    } catch (error) {
+        if (!reusedFrame) callbackManager.abandonSuspendedFrame(frameId);
+        throw error;
+    }
+    if (firstId === 0) {
+        if (!reusedFrame) callbackManager.abandonSuspendedFrame(frameId);
+        return { value, stackCleanup };
+    }
+    return {
+        value: 0,
+        suspendedForCallback: true,
+        callbackId: firstId,
+        stackCleanup,
+        skipStackCheck: true,
+        preserveCallbackReturnAddress: reusedFrame,
+    };
+}
+
+/** WM_DISPLAYCHANGE after a mode set (wParam = bpp, lParam = MAKELPARAM(width, height)): Windows
+ *  sends it (Wine: ChangeDisplaySettingsExW → SendMessageTimeout(HWND_BROADCAST)). */
+export function sendDisplayChange(
+    ctx: X86Context,
+    mem: Uint8Array,
+    mode: { width: number; height: number; bpp: number },
+    stackCleanup: number,
+    tag: string,
+    value: number,
+): ThunkResult | number {
+    const lParam = (((mode.height & 0xFFFF) << 16) | (mode.width & 0xFFFF)) >>> 0;
+    Logger.log(LogCategory.USER32, `${tag}: WM_DISPLAYCHANGE ${mode.width}x${mode.height}x${mode.bpp}`);
+    return sendToTopLevelSync(ctx, mem, WM_DISPLAYCHANGE, mode.bpp >>> 0, lParam, stackCleanup, tag, value);
+}
+
 /** Send a message synchronously when hwnd has a guest-visible WndProc. */
 export function invokeWindowMessageSync(
     ctx: X86Context,
@@ -146,11 +255,10 @@ export function invokeWindowMessageSync(
     tag: string,
     onReturn: (wndRet: number) => number | null,
 ): ThunkResult | null {
-    const win = windows.get(hwnd);
-    if (!win?.wndProc || isSentinelWndProc(win.wndProc)) return null;
-    if (win.isSystemControl && !win.wndProcSubclassed) return null;
+    const wndProc = guestWndProcOf(hwnd);
+    if (!wndProc) return null;
     return invokeGuestWndProcSync(
-        ctx, mem, win.wndProc, hwnd, message, wParam, lParam,
+        ctx, mem, wndProc, hwnd, message, wParam, lParam,
         stackCleanup, tag, onReturn,
     );
 }
