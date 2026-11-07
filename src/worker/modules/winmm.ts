@@ -88,9 +88,11 @@ const MMIO_READWRITE = 0x00000002;
 const MMIO_ALLOCBUF = 0x00010000;
 const MMIO_CREATE = 0x00001000;
 const MMIOERR_FILENOTFOUND = 257;
+const MMIOERR_OUTOFMEMORY = 258;
 const MMIOERR_CANNOTOPEN = 259;
-const MMIOERR_CANNOTREAD = 260;
-const MMIOERR_CHUNKNOTFOUND = 266;
+const MMIOERR_CANNOTREAD = 261;
+const MMIOERR_CHUNKNOTFOUND = 265;
+const MMIOERR_UNBUFFERED = 266;
 const SEEK_SET = 0;
 const SEEK_CUR = 1;
 const SEEK_END = 2;
@@ -207,6 +209,39 @@ export interface MmioBufState {
     bufFilled?: number;
     /** Memory file: guestBuffer aliases the caller's own block (see MMIOHandle). */
     memoryBase?: number;
+    /** guestBuffer came from mmioSetBuffer's pchBuffer: the caller owns it, never freed here. */
+    callerBuffer?: boolean;
+    /** mmioSetBuffer(NULL, 0) asked for no buffer: mmioAdvance must refuse, not lazily make one. */
+    unbuffered?: boolean;
+}
+
+/**
+ * mmioSetBuffer: replace the handle's I/O buffer. A caller's pchBuffer is used as-is; NULL with a
+ * size allocates one we own; NULL with size 0 makes the handle unbuffered. The window restarts at
+ * the file position, so nothing already consumed is lost and mmioRead is unaffected.
+ *
+ * A memory file's buffer IS the file, so swapping it would swap the data: left alone.
+ */
+export function mmioReplaceBuffer(
+    state: MmioBufState,
+    pchBuffer: number,
+    cchBuffer: number,
+    memory: { alloc(size: number): number; free(ptr: number): void },
+): number {
+    if ((cchBuffer | 0) < 0) return MMSYSERR_INVALPARAM;
+    if (state.memoryBase) return MMSYSERR_NOERROR;
+
+    const next = !cchBuffer ? 0 : pchBuffer || memory.alloc(cchBuffer);
+    if (cchBuffer && !next) return MMIOERR_OUTOFMEMORY;
+
+    if (state.guestBuffer && !state.callerBuffer) memory.free(state.guestBuffer);
+    state.guestBuffer = next;
+    state.guestBufferSize = cchBuffer;
+    state.callerBuffer = !!pchBuffer && !!cchBuffer;
+    state.unbuffered = !cchBuffer;
+    state.bufFileOffset = state.position;
+    state.bufFilled = 0;
+    return MMSYSERR_NOERROR;
 }
 
 /**
@@ -253,7 +288,8 @@ export function mmioWriteInfoStruct(lpmmioinfo: number, hmmio: number, state: Mm
     const bufOff = state.bufFileOffset ?? 0;
     // A memory file's buffer is the caller's, so neither ALLOCBUF nor the disk IOProc apply.
     const isMem = !!state.memoryBase;
-    Mem.writeUint32(lpmmioinfo + MMIOINFO_DWFLAGS,    isMem ? MMIO_READ : (MMIO_READ | MMIO_ALLOCBUF));
+    const ownsBuffer = !isMem && !state.callerBuffer && !state.unbuffered;
+    Mem.writeUint32(lpmmioinfo + MMIOINFO_DWFLAGS,    ownsBuffer ? (MMIO_READ | MMIO_ALLOCBUF) : MMIO_READ);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_FCCIOPROC,  isMem ? FCC_MEM : FCC_DOS);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_PIOPROC,    0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_WERRORRET,  0);
@@ -334,6 +370,9 @@ interface MMIOHandle {
     /** Set for a MEMORY file (mmioOpen with a NULL name): the caller's own buffer IS the
      *  file, so guestBuffer aliases it and must never be freed or refilled by us. */
     memoryBase?: number;
+    /** See MmioBufState. */
+    callerBuffer?: boolean;
+    unbuffered?: boolean;
 }
 
 type TimerCallbackMode = "function" | "event_set" | "event_pulse";
@@ -618,6 +657,7 @@ export class WinMM implements IModule {
         // A memory file has no window to slide: the caller's whole block is already the file,
         // and copying it over itself would be both pointless and destructive of guest writes.
         if (mmio.memoryBase) return Math.max(0, source.size - mmio.position);
+        if (mmio.unbuffered) return 0;
         if (!mmio.guestBuffer) {
             const mem = System.getInstance().process?.memory;
             const cap = MMIO_GUEST_BUFSIZE;
@@ -2161,7 +2201,7 @@ export class WinMM implements IModule {
             if (!mmio) return MMIOERR_CANNOTOPEN;
 
             // Only free a window WE allocated — a memory file's buffer belongs to the guest.
-            if (mmio.guestBuffer && !mmio.memoryBase) {
+            if (mmio.guestBuffer && !mmio.memoryBase && !mmio.callerBuffer) {
                 System.getInstance().process?.memory?.free(mmio.guestBuffer);
                 mmio.guestBuffer = 0;
             }
@@ -2376,6 +2416,18 @@ export class WinMM implements IModule {
             return MMSYSERR_NOERROR;
         };
 
+        this.exports["mmioSetBuffer"] = (_ctx, _mem, args) => {
+            const [hmmio, pchBuffer, cchBuffer] = args;
+            const mmio = this.mmioHandles.get(hmmio);
+            if (!mmio) return MMSYSERR_INVALHANDLE;
+            const memory = System.getInstance().process?.memory;
+            if (!memory) return MMIOERR_OUTOFMEMORY;
+            return mmioReplaceBuffer(mmio, pchBuffer, cchBuffer, {
+                alloc: (size) => memory.alloc(size, "HEAP", "rw") ?? 0,
+                free: (ptr) => memory.free(ptr),
+            });
+        };
+
         this.exports["mmioAdvance"] = (ctx, mem, args) => {
             const hmmio = args[0];
             const lpmmioinfo = args[1];
@@ -2386,6 +2438,7 @@ export class WinMM implements IModule {
             const mmio = this.mmioHandles.get(hmmio);
             if (!mmio) return MMSYSERR_INVALPARAM;
             if (!lpmmioinfo) return MMSYSERR_INVALPARAM;
+            if (mmio.unbuffered) return MMIOERR_UNBUFFERED;
 
             // Commit how far the guest consumed the current window (pchNext), then refill
             // the guest buffer from the new position and rewrite the MMIOINFO pointers.

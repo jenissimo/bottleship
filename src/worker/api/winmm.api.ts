@@ -99,6 +99,7 @@ export const winmmModule: ModuleDescriptor = {
         makeFunc("mmioDescend", 4),
         makeFunc("mmioAscend", 3),
         makeFunc("mmioAdvance", 3),
+        makeFunc("mmioSetBuffer", 4, { onUnimplemented: "mmresult" }),
         makeFunc("mmioStringToFOURCCA", 2),
         // Mixer functions
         makeFunc("mixerGetNumDevs", 0),
