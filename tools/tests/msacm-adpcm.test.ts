@@ -250,3 +250,38 @@ describe("msacm32 ADPCM decode does not pay per-nibble costs", () => {
         expect(call("acmStreamClose", has, 0)).toBe(MMSYSERR_NOERROR);
     });
 });
+
+describe("acmMetrics size queries", () => {
+    const ACM_METRIC_COUNT_DRIVERS = 1;
+    const ACM_METRIC_MAX_SIZE_FORMAT = 50;
+    const MS_ADPCM_FORMAT_BYTES = 50;
+    const DRIVER_ID = 0xacd10001;
+    const OUT = 0x1500;
+
+    function maxFormatSize(hao: number): { result: number; size: number } {
+        view.setUint32(OUT, 0, true);
+        const result = call("acmMetrics", hao, ACM_METRIC_MAX_SIZE_FORMAT, OUT);
+        return { result, size: view.getUint32(OUT, true) };
+    }
+
+    test("an open driver handle answers, so a caller can size a buffer for that driver", () => {
+        const PHAD = 0x1510;
+        expect(call("acmDriverOpen", PHAD, DRIVER_ID, 0)).toBe(MMSYSERR_NOERROR);
+        const { result, size } = maxFormatSize(view.getUint32(PHAD, true));
+        expect(result).toBe(MMSYSERR_NOERROR);
+        expect(size).toBeGreaterThanOrEqual(MS_ADPCM_FORMAT_BYTES);
+    });
+
+    test("a driver id and NULL answer too", () => {
+        expect(maxFormatSize(DRIVER_ID).size).toBeGreaterThanOrEqual(MS_ADPCM_FORMAT_BYTES);
+        expect(maxFormatSize(0).size).toBeGreaterThanOrEqual(MS_ADPCM_FORMAT_BYTES);
+    });
+
+    test("an unknown handle is still refused", () => {
+        expect(maxFormatSize(0x1234).result).not.toBe(MMSYSERR_NOERROR);
+    });
+
+    test("global counts still refuse a driver handle", () => {
+        expect(call("acmMetrics", DRIVER_ID, ACM_METRIC_COUNT_DRIVERS, OUT)).not.toBe(MMSYSERR_NOERROR);
+    });
+});
