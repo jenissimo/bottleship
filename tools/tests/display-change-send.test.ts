@@ -28,6 +28,7 @@ let created: number[] = [];
 let mem: Uint8Array;
 let savedProcess: unknown;
 let savedPost: unknown;
+let savedForEachTopLevel: unknown;
 
 const wm = () => System.getInstance().windowManager;
 
@@ -65,6 +66,12 @@ beforeEach(() => {
     const w = system.windowManager as unknown as Record<string, unknown>;
     savedPost = w.postMessage;
     w.postMessage = (hwnd: number, msg: number, wParam: number, lParam: number) => { posted.push({ hwnd, msg, wParam, lParam }); };
+    // The WindowManager is a process-wide singleton: in a full `bun test` run it still holds
+    // top-level windows other files created. Only this file's windows take part here.
+    savedForEachTopLevel = w.forEachTopLevel;
+    const forEachTopLevel = savedForEachTopLevel as (visit: (win: { hwnd: number }) => void) => number;
+    w.forEachTopLevel = (visit: (win: { hwnd: number }) => void) =>
+        forEachTopLevel.call(system.windowManager, (win) => { if (created.includes(win.hwnd)) visit(win); });
     savedProcess = system.process;
     system.process = {
         dispatcher: {
@@ -87,6 +94,7 @@ beforeEach(() => {
 afterEach(() => {
     const system = System.getInstance();
     (system.windowManager as unknown as Record<string, unknown>).postMessage = savedPost;
+    (system.windowManager as unknown as Record<string, unknown>).forEachTopLevel = savedForEachTopLevel;
     system.process = savedProcess as never;
     for (const hwnd of created) { wm().destroyWindow(hwnd); windows.delete(hwnd); }
 });
