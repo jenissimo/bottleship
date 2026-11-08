@@ -99,6 +99,18 @@ GOG extraction does not establish gameplay coverage for that installer edition.
 | Painkiller Black Edition | playable | ✓ |
 | Empire Earth (2.00, single player) | playable‡ | |
 | Empire Earth: The Art of Conquest (1.00, single player) | playable‡ | |
+| Command & Conquer (Tiberian Dawn, Win95 edition) | playable | |
+| Command & Conquer: Red Alert (Win95 edition) | playable | |
+| Heart of Empty (Delphi, OpenGL) | playable | |
+| Bigfoot 4x4 Challenge | playable | |
+| Stabilo Boss Mania | playable | |
+| Amore | playable | |
+| Beavis and Butt-Head in Hock-A-Loogie | playable | |
+| T-32K (freeware) | playable | |
+| I'm OK (freeware) | playable | |
+| Zep's Dreamland (freeware, Allegro 4) | playable | |
+| Echoes (freeware, DarkBASIC Pro) | playable | |
+| Gravity Bone (freeware) | boots; in game at about 17 fps | |
 
 \* retail has an intermittent mode-switch hiccup; the demo does not.
 
@@ -229,6 +241,29 @@ Fixes since 0.7 for titles already listed:
   the bundle is packed with `make-wgb --sdb` for the game's own registry shims (#50).
 - **Red Alert 3**: the cold load no longer spends about 41 s hashing the bundle (#120).
 - **Hitman: Codename 47 demo**: touch controls can map movement to the numpad on phones (#63).
+
+## Contributor bring-ups (freeware and late-90s titles)
+
+These titles were brought up by a contributor who mainly targets games from the late 1990s
+and early 2000s, especially ones that are awkward or impossible to install and start on
+Windows 10/11 today, plus newer freeware titles up to a modest download size. The stage is
+what the contributor observed in the browser; none is claimed finished, and more titles will
+be added in later updates.
+
+- **Command & Conquer** (Tiberian Dawn) and **Command & Conquer: Red Alert**, Win95 editions:
+  missions played (#74, #139).
+- **Heart of Empty** (Delphi, OpenGL): several levels played, shooting and level loads work;
+  the game itself caps at about 30 fps (#106–#110).
+- **Bigfoot 4x4 Challenge**: reaches races; sound effects since #168.
+- **Stabilo Boss Mania** and **Amore**: in game and played.
+- **Beavis and Butt-Head in Hock-A-Loogie**: character selection and in game.
+- **T-32K** (freeware): start, movement and shooting (shot-heavy scenes sped up by #167).
+- **I'm OK** (freeware): level 1, walking, jumping and hitting.
+- **Zep's Dreamland** (freeware, Allegro 4): playable with its MIDI soundtrack through the
+  General MIDI synth (#151–#155).
+- **Echoes** (freeware, DarkBASIC Pro): reaches the playfield at about 115 fps (#150, #169).
+- **Gravity Bone** (freeware): in game, but limited to about 17 fps; performance work is
+  ongoing.
 
 ## Demo coverage
 
