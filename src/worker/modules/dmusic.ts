@@ -756,9 +756,12 @@ export class DMusic implements IModule {
         if (!data || length < 12 || length > MAX_OBJECT_BYTES || !validPointer(data, length, "r")) return null;
         const bytes = Mem.readBytes(data, length);
         if (!bytes || !isRiffWave(bytes)) return null;
-        let h = 0x811c9dc5;
-        for (let i = 0; i < bytes.length; i += Math.max(1, bytes.length >> 12)) h = Math.imul(h ^ bytes[i]!, 0x01000193);
-        return this.waveSegment(bytes, `${length}:${h >>> 0}`, "");
+        let h1 = 0x811c9dc5, h2 = 0x9e3779b9;
+        for (let i = 0; i < bytes.length; i++) {
+            h1 = Math.imul(h1 ^ bytes[i]!, 0x01000193);
+            h2 = Math.imul(h2 ^ bytes[i]!, 0x85ebca6b) ^ (h2 >>> 13);
+        }
+        return this.waveSegment(bytes, `${length}:${h1 >>> 0}:${h2 >>> 0}`, "");
     }
 
     private objectFromFile(loader: LoaderObject, bytes: Uint8Array, fileName: string): LoadableObject | null {
@@ -1918,7 +1921,7 @@ export class DMusic implements IModule {
             port.active = false;
             port.sink?.stop();
             port.synth.silence();
-            if (![...this.ports].some((p) => p.active)) this.stopPump();
+            if (![...this.ports].some((p) => p.active) && this.pathOutputs.size === 0) this.stopPump();
             return true;
         }
         if (!port.sink) {
@@ -1990,7 +1993,13 @@ export class DMusic implements IModule {
         path.channels = channels;
         this.pathOutputs.add(path);
         path.onDestroy = () => {
+            const perf = path.performance;
+            if (perf?.engine) {
+                perf.engine.endWavesOn(path);
+                this.releaseEndedStates(perf);
+            }
             this.pathOutputs.delete(path);
+            if (![...this.ports].some((p) => p.active) && this.pathOutputs.size === 0) this.stopPump();
             path.sink?.release();
             path.sink = null;
             if (path.buffer) soundReference(this.process, path.buffer, true, false);

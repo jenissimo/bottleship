@@ -408,6 +408,16 @@ export class Performance {
         return false;
     }
 
+    endWavesOn(output: object): void {
+        let ended = false;
+        for (const s of this.states) {
+            if (s.output !== output || !s.segment.wave || s.ended) continue;
+            this.finish(s, DMUS_NOTIFICATION_SEGEND, this.now);
+            ended = true;
+        }
+        if (ended) this.states = this.states.filter((s) => !s.ended);
+    }
+
     renderWaves(output: object, left: Float32Array, right: Float32Array, frames: number, rate: number): void {
         this.mixWaves(left, right, 0, frames, this.now, output, rate);
     }
@@ -417,7 +427,12 @@ export class Performance {
         let ended = false;
         for (const s of this.states) {
             const wave = s.segment.wave;
-            if (!wave || !s.started || s.ended || wave.frames === 0 || s.output !== output) continue;
+            if (!wave || !s.started || s.ended || s.output !== output) continue;
+            if (wave.frames === 0) {
+                this.finish(s, DMUS_NOTIFICATION_SEGEND, sliceEnd);
+                ended = true;
+                continue;
+            }
             const step = wave.rate / rate;
             let pos = s.wavePosition;
             for (let i = 0; i < count; i++) {

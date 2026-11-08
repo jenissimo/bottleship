@@ -45,10 +45,11 @@ function clamp16(v: number): number {
 function decodeMsAdpcm(data: Uint8Array, f: Format, out: Float32Array[]): number {
     const ch = f.channels;
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const perBlock = ((f.blockAlign - 7 * ch) * 2) / ch + 2;
     let frame = 0;
     const pred = new Int32Array(ch), delta = new Int32Array(ch), s1 = new Int32Array(ch), s2 = new Int32Array(ch);
-    for (let off = 0; off + f.blockAlign <= data.length; off += f.blockAlign) {
+    for (let off = 0; off + 7 * ch <= data.length; off += f.blockAlign) {
+        const blockEnd = Math.min(off + f.blockAlign, data.length);
+        const perBlock = Math.floor(((blockEnd - off - 7 * ch) * 2) / ch) + 2;
         let p = off;
         for (let c = 0; c < ch; c++) pred[c] = Math.min(data[p++]!, f.coefs.length - 1);
         for (let c = 0; c < ch; c++) { delta[c] = view.getInt16(p, true); p += 2; }
@@ -57,7 +58,7 @@ function decodeMsAdpcm(data: Uint8Array, f: Format, out: Float32Array[]): number
         for (let c = 0; c < ch; c++) out[c]![frame] = s2[c]! / 32768;
         for (let c = 0; c < ch; c++) out[c]![frame + 1] = s1[c]! / 32768;
         let n = 0;
-        const end = off + f.blockAlign;
+        const end = blockEnd;
         for (; p < end; p++) {
             const byte = data[p]!;
             for (const nibble of [byte >> 4, byte & 0x0f]) {
@@ -80,9 +81,10 @@ function decodeMsAdpcm(data: Uint8Array, f: Format, out: Float32Array[]): number
 function decodeImaAdpcm(data: Uint8Array, f: Format, out: Float32Array[]): number {
     const ch = f.channels;
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const perBlock = ((f.blockAlign - 4 * ch) * 8) / (4 * ch) + 1;
     let frame = 0;
-    for (let off = 0; off + f.blockAlign <= data.length; off += f.blockAlign) {
+    for (let off = 0; off + 4 * ch <= data.length; off += f.blockAlign) {
+        const blockEnd = Math.min(off + f.blockAlign, data.length);
+        const perBlock = Math.floor(((blockEnd - off - 4 * ch) * 8) / (4 * ch)) + 1;
         const sample = new Int32Array(ch), index = new Int32Array(ch);
         for (let c = 0; c < ch; c++) {
             sample[c] = view.getInt16(off + c * 4, true);
@@ -91,7 +93,7 @@ function decodeImaAdpcm(data: Uint8Array, f: Format, out: Float32Array[]): numbe
         }
         const pos = new Int32Array(ch).fill(1);
         let p = off + 4 * ch;
-        const end = off + f.blockAlign;
+        const end = blockEnd;
         while (p < end) {
             for (let c = 0; c < ch && p < end; c++) {
                 for (let k = 0; k < 4 && p < end; k++, p++) {
@@ -136,8 +138,9 @@ export function decodeWave(bytes: Uint8Array): WaveData | null {
                     for (let i = 0; i < count; i++) coefs.push([view.getInt16(body + 22 + i * 4, true), view.getInt16(body + 24 + i * 4, true)]);
                 }
             }
+            const subFormat = tag === WAVE_FORMAT_EXTENSIBLE && end - body >= 40 ? view.getUint16(body + 24, true) : tag;
             format = {
-                tag, channels: view.getUint16(body + 2, true), rate: view.getUint32(body + 4, true),
+                tag: subFormat, channels: view.getUint16(body + 2, true), rate: view.getUint32(body + 4, true),
                 blockAlign: view.getUint16(body + 12, true), bits: view.getUint16(body + 14, true), coefs,
             };
         } else if (id === "data") {
@@ -148,15 +151,21 @@ export function decodeWave(bytes: Uint8Array): WaveData | null {
     if (!format || !data || format.channels < 1 || format.channels > 2 || format.rate <= 0) return null;
     const ch = format.channels;
     let tag = format.tag;
-    if (tag === WAVE_FORMAT_EXTENSIBLE) tag = format.bits === 32 ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
+    if (tag === WAVE_FORMAT_EXTENSIBLE) return null;
     let capacity: number;
     if (tag === WAVE_FORMAT_ADPCM || tag === WAVE_FORMAT_IMA_ADPCM) {
         if (format.blockAlign <= (tag === WAVE_FORMAT_ADPCM ? 7 : 4) * ch) return null;
         const per = tag === WAVE_FORMAT_ADPCM
             ? ((format.blockAlign - 7 * ch) * 2) / ch + 2
             : ((format.blockAlign - 4 * ch) * 8) / (4 * ch) + 1;
-        capacity = Math.floor(data.length / format.blockAlign) * per;
-    } else if ((tag === WAVE_FORMAT_PCM && (format.bits === 8 || format.bits === 16))
+        const whole = Math.floor(data.length / format.blockAlign);
+        const rest = data.length - whole * format.blockAlign;
+        const header = (tag === WAVE_FORMAT_ADPCM ? 7 : 4) * ch;
+        const partial = rest < header ? 0 : tag === WAVE_FORMAT_ADPCM
+            ? Math.floor(((rest - header) * 2) / ch) + 2
+            : Math.floor(((rest - header) * 8) / (4 * ch)) + 1;
+        capacity = whole * per + partial;
+    } else if ((tag === WAVE_FORMAT_PCM && (format.bits === 8 || format.bits === 16 || format.bits === 24 || format.bits === 32))
         || (tag === WAVE_FORMAT_IEEE_FLOAT && format.bits === 32)) {
         capacity = Math.floor(data.length / ((format.bits >> 3) * ch));
     } else {
@@ -172,7 +181,9 @@ export function decodeWave(bytes: Uint8Array): WaveData | null {
             for (let c = 0; c < ch; c++) {
                 const i = f * ch + c;
                 channels[c]![f] = format.bits === 8 ? (data[i]! - 128) / 128
-                    : format.bits === 16 ? dv.getInt16(i * 2, true) / 32768 : dv.getFloat32(i * 4, true);
+                    : format.bits === 16 ? dv.getInt16(i * 2, true) / 32768
+                    : format.bits === 24 ? (((data[i * 3 + 2]! << 24) | (data[i * 3 + 1]! << 16) | (data[i * 3]! << 8)) >> 8) / 8388608
+                    : tag === WAVE_FORMAT_PCM ? dv.getInt32(i * 4, true) / 2147483648 : dv.getFloat32(i * 4, true);
             }
         }
     }
