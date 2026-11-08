@@ -214,7 +214,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
             const uJoyID = args[0];
             const pjc = args[1];
             const cbjc = args[2];
-            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (uJoyID >= JOY_PORTS) return JOYERR_PARMS;
             if (!pjc || cbjc < JOYCAPS_MIN_SIZE || pjc + cbjc > mem.length) {
                 return MMSYSERR_INVALPARAM;
             }
@@ -266,7 +266,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
         exports["joyGetPos"] = (ctx, mem, args) => {
             const uJoyID = args[0];
             const pji = args[1];
-            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (uJoyID >= JOY_PORTS) return JOYERR_PARMS;
             if (!pji || pji + JOYINFO_SIZE > mem.length) {
                 return MMSYSERR_INVALPARAM;
             }
@@ -284,7 +284,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
         exports["joyGetPosEx"] = (ctx, mem, args) => {
             const uJoyID = args[0];
             const pji = args[1];
-            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (uJoyID >= JOY_PORTS) return JOYERR_PARMS;
             if (!pji || pji + JOYINFOEX_SIZE > mem.length) {
                 return MMSYSERR_INVALPARAM;
             }
@@ -317,7 +317,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
         exports["joyGetThreshold"] = (ctx, mem, args) => {
             const uJoyID = args[0];
             const puThreshold = args[1];
-            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (uJoyID >= JOY_PORTS) return JOYERR_PARMS;
             if (!puThreshold || puThreshold + 4 > mem.length) return MMSYSERR_INVALPARAM;
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             view.setUint32(puThreshold, thresholds[uJoyID]!, true);
