@@ -17,6 +17,7 @@ import {
     writeRingData,
     setCtrl,
     getCtrl,
+    ctrlView,
     CTRL_PLAY_CURSOR,
     CTRL_WRITE_CURSOR,
     CTRL_SAMPLE_RATE,
@@ -246,6 +247,40 @@ function medianOf(values: Float64Array, n: number, scratch: Float64Array): numbe
         scratch[j + 1] = v;
     }
     return scratch[n >> 1];
+}
+
+type ApiCursorCache = {
+    sab: SharedArrayBuffer;
+    ctrl: Int32Array;
+    now: number;
+    raw: number;
+    ctrlFlags: number;
+    frequency: number;
+    isLooping: boolean;
+    streamed: boolean | undefined;
+    ring: number;
+    bytes: number;
+    format: SoundFormat;
+    premixAdvancedAtMs: number | undefined;
+    reportedLeadBytes: number | undefined;
+    smoothRawCursor: number | undefined;
+    stepLastCursor: number | undefined;
+    trailRaw: number | undefined;
+    debugFlags: number;
+    playCursor: number;
+    writeCursor: number;
+};
+
+// @transient(the last GetCurrentPosition answer per live buffer, answered again from the ring after a load)
+const apiCursorCaches = new WeakMap<object, ApiCursorCache>();
+
+function apiDebugFlags(): number {
+    const g = globalThis as {
+        __noFrontierHold?: boolean; __noHostLatency?: boolean; __noCursorSmoothing?: boolean;
+        __noCursorCatchup?: boolean; __noCursorStepCap?: boolean; __detAudio?: unknown;
+    };
+    return (g.__noFrontierHold ? 1 : 0) | (g.__noHostLatency ? 2 : 0) | (g.__noCursorSmoothing ? 4 : 0)
+        | (g.__noCursorCatchup ? 8 : 0) | (g.__noCursorStepCap ? 16 : 0) | (g.__detAudio === true ? 32 : 0);
 }
 
 type SoundBuffer = {
@@ -2385,7 +2420,6 @@ export class DSound implements IModule {
         this.exports["idirectsoundbuffer8_restore"] = (ctx, mem, args) => {
             const buffer = this.getBuffer(args[0]);
             if (!buffer) return DSERR_INVALIDPARAM;
-            if (!buffer.bufferLost) return DSERR_BUFFERLOST_HR;
             buffer.bufferLost = false;
             return DS_OK;
         };
@@ -2946,7 +2980,7 @@ export class DSound implements IModule {
         buffer.premixAdvancedAtMs = undefined;
     }
 
-    private dsoundLeadBytes(buffer: SoundBuffer): number {
+    private dsoundLeadBytes(buffer: SoundBuffer, now: number = performance.now()): number {
         // All our buffers report DSBSTATUS_LOCSOFTWARE, so the write cursor is the software
         // mixer's premix frontier, NOT the ~15 ms figure of the hardware-buffer path we
         // never take. Streaming pumps are calibrated against that frontier: at a 12 ms lead
@@ -2954,7 +2988,7 @@ export class DSound implements IModule {
         // time (audible ~19 Hz crackle), and a pump slower than the ceiling crackles no
         // matter what it does — which is why the ceiling has to be the real 200 ms.
         const blockAlign = Math.max(1, buffer.format.blockAlign);
-        const premixMs = this.advancePremix(buffer, performance.now());
+        const premixMs = this.advancePremix(buffer, now);
         const leadFrames = Math.max(64, Math.round((buffer.format.sampleRate * premixMs) / 1000));
         // A ring too short for the premix cannot hold it: the frontier takes at most half the
         // ring and leaves the other half to the app. More starves the app's own half — a
@@ -3051,14 +3085,14 @@ export class DSound implements IModule {
      * the buffer's current bytes, so a lap the app never rewrites still plays what the app
      * last wrote there, not what it held a ring's length ago.
      */
-    private trailRing(buffer: SoundBuffer): void {
+    private trailRing(buffer: SoundBuffer, rawAt?: number): void {
         const size = buffer.bytes;
         const ring = this.ringSize(buffer);
         if (ring === size || !buffer.isPlaying || !buffer.sab || !buffer.ptr) {
             buffer.trailRaw = undefined;
             return;
         }
-        const raw = getCtrl(buffer.sab, CTRL_PLAY_CURSOR) % ring;
+        const raw = rawAt ?? getCtrl(buffer.sab, CTRL_PLAY_CURSOR) % ring;
         const prev = buffer.trailRaw;
         buffer.trailRaw = raw;
         if (prev === undefined) return;
@@ -3118,7 +3152,8 @@ export class DSound implements IModule {
      * not yet consumed; the lag is capped at the write-cursor lead so the write cursor never
      * falls behind what was consumed.
      */
-    private smoothedPlayCursor(buffer: SoundBuffer, raw: number, leadBytes: number, latencyBytes: number): number {
+    private smoothedPlayCursor(buffer: SoundBuffer, raw: number, leadBytes: number, latencyBytes: number,
+        now: number = performance.now()): number {
         // Works in host-ring coordinates; the caller reduces the result to the buffer.
         if ((globalThis as { __noCursorSmoothing?: boolean }).__noCursorSmoothing) {
             buffer.smoothRawCursor = undefined;
@@ -3131,19 +3166,6 @@ export class DSound implements IModule {
         // A touch faster than nominal so the lag cannot random-walk up to the snap bound;
         // the ramp still never passes the raw cursor.
         const bytesPerMs = (hz * blockAlign * SMOOTH_RAMP_SPEEDUP) / 1000;
-        const now = performance.now();
-        const ramp = (): number => {
-            const from = buffer.smoothFromCursor!;
-            const gap = (buffer.smoothRawCursor! - from + size) % size;
-            // Lag left behind by a held-back step (capCursorStep) drains at twice the rate,
-            // so a second host pause does not stack on the first. capCursorStep still bounds
-            // each query's advance, so draining faster cannot become a jump.
-            const speed = gap > leadBytes / 2
-                && !(globalThis as { __noCursorCatchup?: boolean }).__noCursorCatchup
-                ? SMOOTH_CATCHUP_SPEEDUP : 1;
-            const moved = Math.min(gap, (now - buffer.smoothRawAtMs!) * bytesPerMs * speed);
-            return (from + moved) % size;
-        };
         let cursor: number;
         if (buffer.smoothRawCursor === undefined || bytesPerMs <= 0) {
             // A starting stream opens its output latency by ramping, not by a jump.
@@ -3152,7 +3174,7 @@ export class DSound implements IModule {
             buffer.smoothRawAtMs = now;
             cursor = buffer.smoothFromCursor;
         } else if (raw !== buffer.smoothRawCursor) {
-            let from = ramp();
+            let from = this.rampCursor(buffer, now, size, leadBytes, bytesPerMs);
             // The raw cursor only moves forward (a seek or a restart resets this state), so
             // the modular distance is always a lag, however large; never read it as a seek.
             // Past lead + latency the write cursor is behind the worklet: data is lost anyway.
@@ -3164,10 +3186,23 @@ export class DSound implements IModule {
             buffer.smoothRawAtMs = now;
             cursor = from;
         } else {
-            cursor = ramp();
+            cursor = this.rampCursor(buffer, now, size, leadBytes, bytesPerMs);
         }
         cursor = this.capCursorStep(buffer, cursor, now, (hz * blockAlign) / 1000);
         return cursor - (cursor % blockAlign);
+    }
+
+    private rampCursor(buffer: SoundBuffer, now: number, size: number, leadBytes: number, bytesPerMs: number): number {
+        const from = buffer.smoothFromCursor!;
+        const gap = (buffer.smoothRawCursor! - from + size) % size;
+        // Lag left behind by a held-back step (capCursorStep) drains at twice the rate,
+        // so a second host pause does not stack on the first. capCursorStep still bounds
+        // each query's advance, so draining faster cannot become a jump.
+        const speed = gap > leadBytes / 2
+            && !(globalThis as { __noCursorCatchup?: boolean }).__noCursorCatchup
+            ? SMOOTH_CATCHUP_SPEEDUP : 1;
+        const moved = Math.min(gap, (now - buffer.smoothRawAtMs!) * bytesPerMs * speed);
+        return (from + moved) % size;
     }
 
     /**
@@ -3292,20 +3327,44 @@ export class DSound implements IModule {
     }
 
     private getApiCursors(buffer: SoundBuffer): { playCursor: number; writeCursor: number } {
-        if (!buffer.sab || buffer.bytes <= 0) {
+        const sab = buffer.sab;
+        if (!sab || buffer.bytes <= 0) {
             return { playCursor: 0, writeCursor: 0 };
         }
 
         if (buffer.isPlaying) {
-            const leadTarget = this.dsoundLeadBytes(buffer);
-            const latency = this.hostLatencyBytes(buffer);
+            const now = performance.now();
             const ring = this.ringSize(buffer);
-            this.trailRing(buffer);
+            let cache = apiCursorCaches.get(buffer);
+            if (cache === undefined || cache.sab !== sab) {
+                cache = {
+                    sab, ctrl: ctrlView(sab), now: NaN, raw: 0, ctrlFlags: 0, frequency: 0, isLooping: false,
+                    streamed: undefined, ring: 0, bytes: 0, format: buffer.format, premixAdvancedAtMs: undefined,
+                    reportedLeadBytes: undefined, smoothRawCursor: undefined, stepLastCursor: undefined,
+                    trailRaw: undefined, debugFlags: 0, playCursor: 0, writeCursor: 0,
+                };
+                apiCursorCaches.set(buffer, cache);
+            }
+            const ctrl = cache.ctrl;
+            const raw = Atomics.load(ctrl, CTRL_PLAY_CURSOR) % ring;
+            const debugFlags = apiDebugFlags();
+            if (now === cache.now && raw === cache.raw && debugFlags === cache.debugFlags
+                && ring === cache.ring && buffer.bytes === cache.bytes && buffer.frequency === cache.frequency
+                && buffer.isLooping === cache.isLooping && buffer.streamed === cache.streamed
+                && buffer.format === cache.format && buffer.premixAdvancedAtMs === cache.premixAdvancedAtMs
+                && buffer.reportedLeadBytes === cache.reportedLeadBytes
+                && buffer.smoothRawCursor === cache.smoothRawCursor && buffer.stepLastCursor === cache.stepLastCursor
+                && buffer.trailRaw === cache.trailRaw
+                && Atomics.load(ctrl, CTRL_FLAGS) === cache.ctrlFlags) {
+                return { playCursor: cache.playCursor, writeCursor: cache.writeCursor };
+            }
+            const leadTarget = this.dsoundLeadBytes(buffer, now);
+            const latency = this.hostLatencyBytes(buffer);
+            this.trailRing(buffer, raw);
             this.syncFrontierHold(buffer);
-            const playCursor = this.isDeterministicAudio()
+            const playCursor = (debugFlags & 32) !== 0
                 ? this.deterministicPlayCursor(buffer) % buffer.bytes
-                : this.smoothedPlayCursor(buffer,
-                    ((getCtrl(buffer.sab, CTRL_PLAY_CURSOR) % ring) + latency) % ring, leadTarget, latency) % buffer.bytes;
+                : this.smoothedPlayCursor(buffer, (raw + latency) % ring, leadTarget, latency, now) % buffer.bytes;
             // Faithful DSound: the write cursor LEADS the play cursor by the software
             // mixer's premixed region (45 ms ramping to 200 ms; see dsoundLeadBytes).
             // The span [play, write) is committed to the mixer and unsafe to
@@ -3320,7 +3379,25 @@ export class DSound implements IModule {
             // this lead choice is a no-op for that title and exists for correctness
             // toward the clients that DO read it.
             const leadBytes = this.monotonicLeadBytes(buffer, playCursor, leadTarget);
-            return { playCursor, writeCursor: (playCursor + leadBytes) % buffer.bytes };
+            const writeCursor = (playCursor + leadBytes) % buffer.bytes;
+            cache.now = (debugFlags & 32) !== 0 ? NaN : now;
+            cache.raw = raw;
+            cache.ctrlFlags = Atomics.load(ctrl, CTRL_FLAGS);
+            cache.frequency = buffer.frequency;
+            cache.isLooping = buffer.isLooping;
+            cache.streamed = buffer.streamed;
+            cache.ring = ring;
+            cache.bytes = buffer.bytes;
+            cache.format = buffer.format;
+            cache.premixAdvancedAtMs = buffer.premixAdvancedAtMs;
+            cache.reportedLeadBytes = buffer.reportedLeadBytes;
+            cache.smoothRawCursor = buffer.smoothRawCursor;
+            cache.stepLastCursor = buffer.stepLastCursor;
+            cache.trailRaw = buffer.trailRaw;
+            cache.debugFlags = debugFlags;
+            cache.playCursor = playCursor;
+            cache.writeCursor = writeCursor;
+            return { playCursor, writeCursor };
         }
 
         buffer.reportedLeadBytes = undefined;
