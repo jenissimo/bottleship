@@ -12,6 +12,7 @@ import { resolveBitmapRgba, resolveIconRgba, resolveDib32RawAlphaRgba } from '..
 import { desktopBackground } from '../../runtime/desktop-background';
 import { getSystemColorBrush } from './system';
 import { asArrayBufferView } from '../../../dom-buffer';
+import { composeIconFromBits, iconBitsLength } from './icon-bits';
 
 const DT_CALCRECT = 0x00000400;
 /** cbSize, iTabLength, iLeftMargin, iRightMargin, uiLengthDrawn. */
@@ -412,6 +413,33 @@ export function registerWindowDrawingExports(exports: Record<string, ThunkImplem
             }
             return `CreateIconIndirect(${fIcon ? 'icon' : 'cursor'}, ${width}x${height}, color=0x${hbmColor.toString(16)}, mask=0x${hbmMask.toString(16)}, hot=${xHotspot},${yHotspot}, composed=${!!composed}, opaque=${opaque}, lit=${lit}) -> 0x${handle.toString(16)}`;
         });
+        return handle;
+    };
+
+    exports['CreateIcon'] = (ctx, mem, args) => {
+        const width = args[1] | 0;
+        const height = args[2] | 0;
+        const bitsPerPixel = (args[3] & 0xff) * (args[4] & 0xff);
+        const lpbAndBits = args[5] >>> 0;
+        const lpbXorBits = args[6] >>> 0;
+        const andLength = iconBitsLength(width, height, 1);
+        const xorLength = iconBitsLength(width, height, bitsPerPixel);
+        if (width <= 0 || height <= 0 || ![1, 4, 8, 16, 24, 32].includes(bitsPerPixel)
+            || !lpbAndBits || lpbAndBits + andLength > mem.length
+            || !lpbXorBits || lpbXorBits + xorLength > mem.length) {
+            System.getInstance().scheduler.setLastError(87);
+            return 0;
+        }
+        const pixels = composeIconFromBits(
+            mem.subarray(lpbAndBits, lpbAndBits + andLength),
+            mem.subarray(lpbXorBits, lpbXorBits + xorLength),
+            width, height, bitsPerPixel,
+        );
+        const handle = System.getInstance().resourceProvider.registerUserObject({
+            type: 'ICON', width, height, pixels, loading: false,
+        });
+        Logger.verbose(LogCategory.USER32,
+            `CreateIcon(${width}x${height}, ${bitsPerPixel}bpp) -> 0x${handle.toString(16)}`);
         return handle;
     };
 

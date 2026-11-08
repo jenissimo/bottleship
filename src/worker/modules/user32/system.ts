@@ -5,6 +5,7 @@
  */
 
 import { ThunkImplementation, type ThunkResult, type X86Context } from '../../core/thunking/thunk-dispatcher';
+import { loadResourceCursor } from './resource-cursor';
 import { parseBMPHeader, parseBMPPixels } from '../gdi32/gdi-raster';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
@@ -1028,18 +1029,22 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return { value: prev, stackCleanup: 4 };
     };
 
-    const loadCursorCommon = (apiName: string, hInstance: number, lpCursorName: number): number => {
-        // Ordinal ids resolve to the system cursor theme (system-cursors.ts).
-        // App PE-resource cursors (hInstance != 0 or a name string) are not
-        // decoded yet — they share the arrow shape so the pointer stays visible.
+    const loadCursorCommon = (apiName: string, hInstance: number, lpCursorName: number, mem?: Uint8Array, isWide = false): number => {
+        if (hInstance && mem && lpCursorName) {
+            const name = lpCursorName < 0x10000
+                ? lpCursorName
+                : (isWide ? Marshaler.readWideString(mem, lpCursorName) : Marshaler.readString(mem, lpCursorName));
+            const own = name ? loadResourceCursor(mem, hInstance, name) : 0;
+            if (own) return own;
+        }
         const handle = getSystemCursorHandle(lpCursorName < 0x10000 ? lpCursorName : 0);
         Logger.verbose(LogCategory.USER32, `${apiName}(0x${hInstance.toString(16)}, ${lpCursorName}) -> 0x${handle.toString(16)}`);
         return handle;
     };
 
-    exports['LoadCursorA'] = (ctx, mem, args) => loadCursorCommon('LoadCursorA', args[0], args[1] >>> 0);
+    exports['LoadCursorA'] = (ctx, mem, args) => loadCursorCommon('LoadCursorA', args[0], args[1] >>> 0, mem);
 
-    exports['LoadCursorW'] = (ctx, mem, args) => loadCursorCommon('LoadCursorW', args[0], args[1] >>> 0);
+    exports['LoadCursorW'] = (ctx, mem, args) => loadCursorCommon('LoadCursorW', args[0], args[1] >>> 0, mem, true);
 
     /**
      * LoadCursorFromFile: a game that ships its own .cur/.ani asks for one per pointer shape and
