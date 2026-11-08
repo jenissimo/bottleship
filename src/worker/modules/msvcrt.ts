@@ -564,6 +564,8 @@ export class Msvcrt implements IModule {
         exports["fgets"] = (ctx, mem, args) => this.fgets(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
         exports["fputs"] = (ctx, mem, args) => this.fputs(args[0] ?? 0, args[1] ?? 0);
         exports["puts"] = (ctx, mem, args) => this.puts(args[0] ?? 0);
+        exports["putchar"] = (ctx, mem, args) => (args[0] ?? 0) & 0xff;
+        exports["_getdrives"] = () => 0x0C;
         exports["fseek"] = (ctx, mem, args) => this.fseek(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
         exports["ftell"] = (ctx, mem, args) => this.ftell(args[0] ?? 0);
         exports["fflush"] = () => 0;
@@ -3978,6 +3980,16 @@ export function registerFastPathMsvcrtFunctions(dispatcher: HleDispatcher): void
         if (reg) reg[2] = hi | 0;            // EDX = high 32
         return (v >>> 0) | 0;                // EAX = low 32
     };
+
+    const fastPathAbs: FastPathImplementation = (esp, view, mem8) => {
+        if (esp + 8 > mem8.length) return null;
+        const v = view.getInt32(esp + 4, true);
+        return v < 0 ? (-v | 0) : v;
+    };
+    for (const dll of ['msvcrt', 'crtdll', 'msvcr90']) {
+        dispatcher.registerFastPath(dll, 'abs', fastPathAbs, { trivial: true });
+        dispatcher.registerFastPath(dll, 'labs', fastPathAbs, { trivial: true });
+    }
 
     dispatcher.registerFastPath('msvcrt', '_ftol', fastPathFtol);
     dispatcher.registerFastPath('crtdll', '_ftol', fastPathFtol);

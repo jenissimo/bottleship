@@ -30,7 +30,7 @@ import { loadDiagnostics } from './diagnostics/load-diagnostics';
 import { writeGuestCode, invalidateGuestCode } from './memory/guest-code';
 import { markGuestPagesDirty, zeroGuestRange } from './memory/guest-page-dirty';
 import {
-    resolveImportBinding, isD3dx9VersionedDll, trapsUnknownImport, uncoveredHleImports,
+    resolveImportBinding, isD3dx9VersionedDll, trapsUnknownImport, bindTimeCallingConvention, uncoveredHleImports,
     type ImportBindingDeps, type ImportFn,
 } from './pe-import-binding';
 import { planProcessCrt, processCrtBinding, type CrtScanImport } from './crt-binding';
@@ -1574,6 +1574,7 @@ export class PELoader {
                         continue;
                     }
 
+                    if (f.name) callingConvention = bindTimeCallingConvention(dllName, callingConvention, argCount);
                     if (argCount === undefined) {
                         Logger.warn(LogCategory.SYSTEM, `[PE] Unknown arg count for ${dllName}:${name}${aliasTarget ? ` (aliased from ${dllNameRaw})` : ''}`);
                         loadDiagnostics.noteUnknownArgCount(dllName, name, aliasTarget ? dllNameRaw : null);
@@ -2093,6 +2094,7 @@ export class PELoader {
                 argCount = this.apiRegistry.getArgCountByOrdinal(dllName, f.ordinal);
             }
 
+            if (f.name) callingConvention = bindTimeCallingConvention(dllName, callingConvention, argCount);
             if (argCount === undefined) {
                 Logger.warn(LogCategory.SYSTEM, `[PE] Unknown arg count for ${dllName}:${name}`);
                 loadDiagnostics.noteUnknownArgCount(dllName, name);
