@@ -71,6 +71,7 @@ export class DirectSoundSink {
         }
         this.bufferBytes = Mem.readUint32(this.scratch + 8) ?? 0;
         if (this.bufferBytes < this.blockAlign * 64) return false;
+        this.silentBytes = this.bufferBytes;
         this.writeOffset = -1;
         this.playing = this.call("play", [0, 0, DSBPLAY_LOOPING]) === 0;
         return this.playing;
@@ -86,6 +87,12 @@ export class DirectSoundSink {
         this.stop();
         if (this.scratch) this.process.memory.free(this.scratch);
         this.scratch = 0;
+    }
+
+    silentBytes = 0;
+
+    isSilent(): boolean {
+        return this.bufferBytes > 0 && this.silentBytes >= this.bufferBytes;
     }
 
     /** Top the buffer up to the lead beyond its write cursor, rendering what is missing. */
@@ -122,6 +129,9 @@ export class DirectSoundSink {
         if (this.pcm.length < samples) this.pcm = new Int16Array(samples);
         try {
             render(this.pcm, frames);
+            let silent = true;
+            for (let i = 0; i < samples; i++) if (this.pcm[i] !== 0) { silent = false; break; }
+            this.silentBytes = silent ? this.silentBytes + len1 + len2 : 0;
             const bytes = new Uint8Array(this.pcm.buffer, 0, samples * 2);
             if (ptr1 && len1) Mem.writeBytes(ptr1, bytes.subarray(0, len1));
             if (ptr2 && len2) Mem.writeBytes(ptr2, bytes.subarray(len1, len1 + len2));
@@ -137,7 +147,7 @@ export class DirectSoundSink {
  * DirectSound object when it passed one to the performance, else on a new one.
  * Returns the buffer's guest address, or 0.
  */
-export function createSinkBuffer(process: Process, directSound: number, channels: number, sampleRate: number): number {
+export function createSinkBuffer(process: Process, directSound: number, channels: number, sampleRate: number, flags?: number): number {
     const dsound = process.getModule("dsound");
     const mem = Mem.getView();
     if (!dsound || !mem) return 0;
@@ -164,7 +174,7 @@ export function createSinkBuffer(process: Process, directSound: number, channels
         const out = format + 18;
         Mem.writeBytes(scratch, new Uint8Array(DSBUFFERDESC_SIZE + 18 + 8));
         Mem.writeUint32(scratch, DSBUFFERDESC_SIZE);
-        Mem.writeUint32(scratch + 4, DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLPAN | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS);
+        Mem.writeUint32(scratch + 4, flags ?? (DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLPAN | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS));
         Mem.writeUint32(scratch + 8, sinkBufferBytes(channels, sampleRate));
         Mem.writeUint32(scratch + 16, format);
         writeWaveFormat(format, channels, sampleRate);

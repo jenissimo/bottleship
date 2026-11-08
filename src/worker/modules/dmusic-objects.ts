@@ -159,6 +159,11 @@ export class SegmentStateObject extends DMusicObject {
 export class AudioPathObject extends DMusicObject {
     readonly primaryVtable = "IDirectMusicAudioPath";
     readonly interfaces = { [IID_IDirectMusicAudioPath]: "IDirectMusicAudioPath" };
+    performance: PerformanceObject | null = null;
+    pathType = 0;
+    buffer = 0;
+    sink: DirectSoundSink | null = null;
+    channels = 2;
 }
 
 export class ComposerObject extends DMusicObject {

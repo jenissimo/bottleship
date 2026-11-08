@@ -27,6 +27,7 @@ import {
     type ChordContext, DEFAULT_CHORD, DMUS_PLAYMODE_NONE, musicValueToMidi, variationMatchesChord,
 } from "./music-value";
 import type { DlsSynth } from "./synth";
+import type { WaveData } from "./wave";
 
 export const DMUS_SEGF_REFTIME = 1 << 6;
 export const DMUS_SEGF_SECONDARY = 1 << 7;
@@ -95,6 +96,7 @@ export class PerfSegment {
     curves: SeqCurve[] = [];
     /** A motif or transition plays this one pattern instead of choosing by groove level. */
     fixedPattern: { style: Style; pattern: StylePattern } | null = null;
+    wave: WaveData | null = null;
 
     /** The time signature the segment is counted in: its style's. */
     timeSig(): TimeSignature {
@@ -137,6 +139,13 @@ export class PerfSegment {
             segment.loopEnd = settings.loopEnd;
             segment.resolution = settings.resolution;
         }
+        return segment;
+    }
+
+    static fromWave(wave: WaveData): PerfSegment {
+        const segment = new PerfSegment();
+        segment.wave = wave;
+        segment.length = Math.max(1, Math.ceil((wave.frames / wave.rate) * (120 * DMUS_PPQ / 60)));
         return segment;
     }
 
@@ -184,6 +193,8 @@ export class PerfSegmentState {
     /** Per part: the variation last played, for parts that take them in sequence. */
     readonly sequentialVariation = new Map<string, number>();
     grooveLevel = 0;
+    wavePosition = 0;
+    output: object | null = null;
 
     constructor(segment: PerfSegment, primary: boolean, startTime: number) {
         this.segment = segment;
@@ -385,10 +396,53 @@ export class Performance {
             }
             if (taken > 0) this.events.splice(0, taken);
             if (cursor < count) this.synth.render(left, right, done + cursor, count - cursor);
+            this.mixWaves(left, right, done, count, t1);
 
             this.now = t1;
             done += count;
         }
+    }
+
+    hasWaveOn(output: object): boolean {
+        for (const s of this.states) if (s.output === output && s.segment.wave && !s.ended) return true;
+        return false;
+    }
+
+    renderWaves(output: object, left: Float32Array, right: Float32Array, frames: number, rate: number): void {
+        this.mixWaves(left, right, 0, frames, this.now, output, rate);
+    }
+
+    private mixWaves(left: Float32Array, right: Float32Array, offset: number, count: number, sliceEnd: number,
+        output: object | null = null, rate = this.synth.sampleRate): void {
+        let ended = false;
+        for (const s of this.states) {
+            const wave = s.segment.wave;
+            if (!wave || !s.started || s.ended || wave.frames === 0 || s.output !== output) continue;
+            const step = wave.rate / rate;
+            let pos = s.wavePosition;
+            for (let i = 0; i < count; i++) {
+                let idx = pos | 0;
+                if (idx >= wave.frames) {
+                    if (s.repeatsLeft > 0) {
+                        s.repeatsLeft--;
+                        pos -= wave.frames;
+                        idx = pos | 0;
+                        this.onNotification?.(DMUS_NOTIFICATION_SEGLOOP, s, sliceEnd);
+                    } else {
+                        this.finish(s, DMUS_NOTIFICATION_SEGEND, sliceEnd);
+                        ended = true;
+                        break;
+                    }
+                }
+                const frac = pos - idx;
+                const next = idx + 1 < wave.frames ? idx + 1 : idx;
+                left[offset + i] = left[offset + i]! + wave.left[idx]! + (wave.left[next]! - wave.left[idx]!) * frac;
+                right[offset + i] = right[offset + i]! + wave.right[idx]! + (wave.right[next]! - wave.right[idx]!) * frac;
+                pos += step;
+            }
+            s.wavePosition = pos;
+        }
+        if (ended) this.states = this.states.filter((s) => !s.ended);
     }
 
     private dispatch(e: PendingEvent): void {
@@ -454,6 +508,7 @@ export class Performance {
      */
     private playState(s: PerfSegmentState, from: number, until: number): number {
         const seg = s.segment;
+        if (seg.wave) return until;
         const loopEnd = seg.loopEnd > 0 ? seg.loopEnd : seg.length;
         const looping = s.repeatsLeft > 0 && loopEnd > seg.loopStart;
         const boundary = s.base + (looping ? loopEnd : seg.length);
