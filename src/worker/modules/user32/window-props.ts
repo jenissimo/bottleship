@@ -96,10 +96,17 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
                 prev = window.controlId ?? 0;
                 window.controlId = dwNewLong >>> 0;
                 break;
-            case GWL_STYLE:
+            case GWL_STYLE: {
                 prev = window.style >>> 0;
                 window.style = dwNewLong >>> 0;
+                const visible = (window.style & 0x10000000) !== 0;
+                if (((prev ^ window.style) & 0x10000000) !== 0 && window.visible !== visible) {
+                    window.visible = visible;
+                    const wmWin = System.getInstance().windowManager.getWindow(hWnd);
+                    if (wmWin) wmWin.visible = visible;
+                }
                 break;
+            }
             case GWL_EXSTYLE:
                 prev = window.exStyle ?? 0;
                 window.exStyle = dwNewLong >>> 0;
@@ -134,6 +141,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         const GWL_STYLE = -16;
         const GWL_EXSTYLE = -20;
         const GWL_USERDATA = -21;
+        const GWL_HWNDPARENT = -8;
 
         const idx = nIndex | 0;
         if (idx >= 0) {
@@ -155,6 +163,8 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
                 return (window.exStyle ?? 0) >>> 0;
             case GWL_USERDATA:
                 return (window.userData ?? 0) >>> 0;
+            case GWL_HWNDPARENT:
+                return (window.parent ?? 0) >>> 0;
             default:
                 return 0;
         }

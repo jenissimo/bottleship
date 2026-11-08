@@ -5,6 +5,7 @@
  */
 
 import { type HleDispatcher, FastPathImplementation, ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
+import { syncWindowDCsToGeometry } from './window-dc-geometry';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
@@ -73,6 +74,7 @@ import {
     tryEndPaintOwnerDrawChain,
     tryRepaintOwnerDrawButton,
     requestOwnerDrawButtonPaint,
+    requestSubclassedControlPaint,
     isOwnerDrawButton,
     isGuestPaintedControl,
     type OwnerDrawDeps,
@@ -346,6 +348,8 @@ function applyWindowPosGeometry(
     if (!(uFlags & 0x0008 /* SWP_NOREDRAW */)) {
         repaintParentDialogIfSystemControlGeometryChanged(window, moving, resizing);
     }
+
+    if (moving || resizing) syncWindowDCsToGeometry(hWnd);
 
     if (!options?.skipDialogOverlayRepaint && !(uFlags & 0x0008 /* SWP_NOREDRAW */)
         && window.visible && window.nativeClassName === '#32770'
@@ -2340,7 +2344,9 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (isWindowUpdateLocked(hWnd)) return 1;
 
         const win = windows.get(hWnd);
-        if (win?.isSystemControl && win.parent) {
+        if (win?.isSystemControl && win.parent && requestSubclassedControlPaint(win)) {
+            invalidateControlColors(hWnd);
+        } else if (win?.isSystemControl && win.parent) {
             invalidateControlColors(hWnd); // next EndPaint chain re-queries WM_CTLCOLOR*
             // An owner-draw button's pixels exist only as the parent's WM_DRAWITEM, so the
             // chrome restamp below draws nothing for it — Win32 gets them back by handing
@@ -2574,6 +2580,12 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                     Logger.error(LogCategory.USER32,
                         `CallWindowProc owner-draw paint failed hwnd=0x${hWnd.toString(16)}: ${err}`);
                 }
+            }
+            if (Msg === WM_PAINT && subclassed?.isSystemControl && subclassed.wndProcSubclassed
+                && !isOwnerDrawButton(subclassed)) {
+                clearWindowUpdate(hWnd);
+                handleSystemControlMessage(subclassed, WM_PAINT, wParam, 0, mem);
+                return { value: 0, stackCleanup };
             }
             Logger.verbose(LogCategory.USER32,
                 `CallWindowProcA: sentinel WndProc 0x${lpPrevWndFunc.toString(16)}, returning 0`);
