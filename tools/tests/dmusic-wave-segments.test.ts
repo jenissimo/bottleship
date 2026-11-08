@@ -155,4 +155,83 @@ describe("loader: a WAVE in memory becomes a wave segment", () => {
         expect(seg.segment?.wave?.frames).toBe(3);
         expect(seg.segment!.length).toBeGreaterThan(0);
     });
+
+    test("two same-length WAVEs that differ only between sampled bytes decode separately", () => {
+        expect(module.coCreateInstance(CLSID_DirectMusicLoader, IID_IUnknown, OUT)).toBe(0);
+        const loaderPtr = Mem.readUint32(OUT)!;
+        created.push(SystemResourceProvider.getInstance().getComObjectByAddress(loaderPtr) as DMusicObject);
+        const dv = new DataView(mem.buffer);
+        const load = (samples: number[]): SegmentObject => {
+            const bytes = wav(1, 1, 22050, 2, 16, pcm16(...samples));
+            mem.set(bytes, WAV_AT);
+            dv.setUint32(DESC_AT, 0x350, true);
+            dv.setUint32(DESC_AT + 4, (1 << 1) | (1 << 10), true);
+            mem.set(mem.subarray(CLASS_AT, CLASS_AT + 16), DESC_AT + 0x18);
+            dv.setUint32(DESC_AT + 0x340, bytes.length, true);
+            dv.setUint32(DESC_AT + 0x348, WAV_AT, true);
+            expect(module.exports["IDirectMusicLoader8_GetObject"]!({} as never, mem, [loaderPtr, DESC_AT, RIID, OUT]) as number).toBe(0);
+            const seg = SystemResourceProvider.getInstance().getComObjectByAddress(Mem.readUint32(OUT)!) as SegmentObject;
+            created.push(seg);
+            return seg;
+        };
+        const samples = Array.from({ length: 20000 }, (_, i) => i & 0x7fff);
+        const a = load(samples);
+        samples[1] = 2001;
+        const b = load(samples);
+        expect(Math.round(a.segment!.wave!.left[1]! * 32768)).toBe(1);
+        expect(Math.round(b.segment!.wave!.left[1]! * 32768)).toBe(2001);
+    });
+});
+
+describe("wave segment follow-ups", () => {
+    const rate = 22050;
+
+    test("an empty WAVE ends its state at once", () => {
+        const perf = new Performance(new DlsSynth(rate, 8));
+        const ends: number[] = [];
+        perf.onNotification = (type) => { ends.push(type); };
+        const state = perf.playSegment(PerfSegment.fromWave({ left: new Float32Array(0), right: new Float32Array(0), rate, frames: 0 }), DMUS_SEGF_SECONDARY);
+        const l = new Float32Array(4), r = new Float32Array(4);
+        perf.render(l, r, 4);
+        expect(perf.isPlaying(null, state)).toBe(false);
+        expect(ends.length).toBeGreaterThanOrEqual(2);
+    });
+
+    test("ending the waves on a released path finishes its states with SEGEND", () => {
+        const perf = new Performance(new DlsSynth(rate, 8));
+        const wave = { left: new Float32Array(1000).fill(0.1), right: new Float32Array(1000).fill(0.1), rate, frames: 1000 };
+        const path = {};
+        const state = perf.playSegment(PerfSegment.fromWave(wave), DMUS_SEGF_SECONDARY);
+        state.output = path;
+        const l = new Float32Array(4), r = new Float32Array(4);
+        perf.render(l, r, 4);
+        expect(perf.hasWaveOn(path)).toBe(true);
+        const seen: number[] = [];
+        perf.onNotification = (type) => { seen.push(type); };
+        perf.endWavesOn(path);
+        expect(perf.hasWaveOn(path)).toBe(false);
+        expect(perf.isPlaying(null, state)).toBe(false);
+        expect(seen.length).toBe(1);
+    });
+
+    test("a partial last ADPCM block is decoded, not dropped", () => {
+        const block = [...le16(100), 0, 0, 0, 0, 0, 0];
+        const partial = [...le16(200), 0, 0, 0, 0];
+        const w = decodeWave(wav(0x11, 1, 22050, block.length, 4, [...block, ...partial]))!;
+        expect(w.frames).toBe(9 + 5);
+        expect(Math.round(w.left[9]! * 32768)).toBe(200);
+    });
+
+    test("WAVE_FORMAT_EXTENSIBLE 32-bit integer PCM decodes as integers, float as float", () => {
+        const sub = (tag: number) => [...le16(22), ...le16(32), ...le32(3), ...le16(tag), ...le16(0), 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71];
+        const ints = decodeWave(wav(0xfffe, 1, 22050, 4, 32, le32(0x40000000), sub(1)))!;
+        expect(ints.left[0]).toBe(0.5);
+        const floats = decodeWave(wav(0xfffe, 1, 22050, 4, 32, Array.from(new Uint8Array(Float32Array.from([0.25]).buffer)), sub(3)))!;
+        expect(floats.left[0]).toBe(0.25);
+    });
+
+    test("24-bit PCM", () => {
+        const w = decodeWave(wav(1, 1, 22050, 3, 24, [0x00, 0x00, 0xc0]))!;
+        expect(w.left[0]).toBe(-0.5);
+    });
 });

@@ -37,6 +37,13 @@ export const DEFAULT_COLLECTION_FIELDS = {
     fileName: 'derive', loaded: 'derive', references: 'transient', collection: 'derive',
 } as const satisfies Record<string, FieldPolicy>;
 
+export interface SavedAudioPath extends SavedDMusicBase { pathType: number }
+
+export const AUDIO_PATH_FIELDS = {
+    ...DMUSIC_OBJECT_FIELDS, primaryVtable: 'derive', interfaces: 'derive', pathType: 'save', performance: 'transient',
+    buffer: 'transient', sink: 'transient', channels: 'derive',
+} as const satisfies Record<string, FieldPolicy>;
+
 export const DMUSIC_MODULE_FIELDS = {
     name: 'transient', exports: 'host', vtables: 'derive', process: 'host', ports: 'transient', performances: 'transient',
     loading: 'transient', pumpTimer: 'transient', mixLeft: 'transient', mixRight: 'transient', messages: 'transient',
@@ -49,6 +56,7 @@ export const DMUSIC_SCHEMA = {
     loader: LOADER_FIELDS,
     directMusic: DIRECTMUSIC_FIELDS,
     defaultCollection: DEFAULT_COLLECTION_FIELDS,
+    audioPath: AUDIO_PATH_FIELDS,
     base: stateKeys<SavedDMusicBase>({ base: true, addresses: true }),
     addressRow: ['vtableName', 'guestAddress'],
     cacheRow: ['fullPathLowerCase', 'object'],
@@ -143,8 +151,12 @@ export function registerDMusicCodecs(host: DMusicHost): void {
     objectCodecs.add<AudioPathObject>({
         tag: 'dmusic-audiopath',
         matches: (o): o is AudioPathObject => o instanceof AudioPathObject,
-        capture: (o) => base(o),
-        restore: (d: SavedDMusicBase) => rebuild(() => new AudioPathObject(), d),
+        capture: (o): SavedAudioPath => ({ ...base(o), pathType: o.pathType }),
+        restore: (d: SavedAudioPath) => {
+            const path = rebuild(() => new AudioPathObject(), d);
+            path.pathType = d.pathType ?? 0;
+            return path;
+        },
     });
     for (const [tag, type, what] of REFUSED) {
         objectCodecs.add<DMusicObject>({
@@ -159,7 +171,7 @@ export function registerDMusicCodecs(host: DMusicHost): void {
 export function registerDMusicParticipant(host: DMusicHost): () => void {
     registerDMusicCodecs(host);
     return savestateParticipants.add({
-        id: 'dmusic', version: 2, order: 64, covers: ['dmusic'], schema: DMUSIC_SCHEMA as unknown as SaveValue,
+        id: 'dmusic', version: 3, order: 64, covers: ['dmusic'], schema: DMUSIC_SCHEMA as unknown as SaveValue,
         capture: () => {
             const refusal = host.idleRefusal();
             if (refusal) throw new CaptureRefusal(refusal);
