@@ -56,8 +56,39 @@ export function invalidateIniCache(filePath: string): void {
  *   Key=Value
  *   ; comments
  */
+/**
+ * The file's text as the profile API sees it. `raw` holds one char per byte; a file that
+ * starts with a byte-order mark is read in that encoding (UTF-16LE/BE, UTF-8) — the way
+ * Windows reads a Unicode profile — everything else stays in the ANSI view.
+ */
+function decodeProfileText(raw: string): string {
+    const b0 = raw.charCodeAt(0), b1 = raw.charCodeAt(1), b2 = raw.charCodeAt(2);
+    const bytes = () => latin1ViewToBytes(raw);
+    if (b0 === 0xFF && b1 === 0xFE) return new TextDecoder('utf-16le').decode(bytes().subarray(2));
+    if (b0 === 0xFE && b1 === 0xFF) return new TextDecoder('utf-16be').decode(bytes().subarray(2));
+    if (b0 === 0xEF && b1 === 0xBB && b2 === 0xBF) return new TextDecoder('utf-8').decode(bytes().subarray(3));
+    return raw;
+}
+
+/** The "latin1" TextDecoder is windows-1252, so 0x80-0x9F come back as other code points. */
+// @transient(constant lookup table)
+const CP1252_TO_BYTE: Map<number, number> = (() => {
+    const all = new TextDecoder('latin1').decode(Uint8Array.from({ length: 256 }, (_, i) => i));
+    return new Map([...all].map((ch, i) => [ch.charCodeAt(0), i]));
+})();
+
+function latin1ViewToBytes(text: string): Uint8Array {
+    return Uint8Array.from(text, (ch) => CP1252_TO_BYTE.get(ch.charCodeAt(0)) ?? (ch.charCodeAt(0) & 0xff));
+}
+
+/** Each section's entries as written ("Key=Value", original case), for GetPrivateProfileSection. */
+// @transient(derived from the parsed INI data it is keyed by)
+const sectionLines = new WeakMap<IniData, Map<string, string[]>>();
+
 function parseIniContent(content: string): IniData {
     const data: IniData = new Map();
+    const lines = new Map<string, string[]>();
+    sectionLines.set(data, lines);
     let currentSection = ""; // keys before any section header go in empty-string section
 
     const stripOuterQuotes = (value: string): string => {
@@ -81,8 +112,12 @@ function parseIniContent(content: string): IniData {
             if (!data.has(currentSection)) {
                 data.set(currentSection, new Map());
             }
+            if (!lines.has(currentSection)) lines.set(currentSection, []);
             continue;
         }
+        if (!lines.has(currentSection)) lines.set(currentSection, []);
+        const eq = line.indexOf('=');
+        lines.get(currentSection)!.push(eq === -1 ? line : `${line.substring(0, eq).trim()}=${line.substring(eq + 1).trim()}`);
 
         // Key=Value
         const eqIdx = line.indexOf('=');
@@ -149,7 +184,7 @@ function lookupIniData(fileName: string): IniLookup {
 
 function cacheParsedIni(cacheKey: string, fileName: string, data: Uint8Array): IniData {
     const text = new TextDecoder('latin1').decode(data);
-    const parsed = parseIniContent(text);
+    const parsed = parseIniContent(decodeProfileText(text));
     Logger.log(LogCategory.KERNEL32, `INI: parsed "${fileName}" -> ${parsed.size} sections`);
     iniCache.set(cacheKey, parsed);
     iniText.set(cacheKey, text);
@@ -266,14 +301,14 @@ function writeIniValue(
     // a cp1251 value round-trips through encodeAnsi's '?' substitution.
     const updated = applyIniEdit(text, toLatin1(section), key === null ? null : toLatin1(key), value === null ? null : toLatin1(value));
     iniText.set(cacheKey, updated);
-    iniCache.set(cacheKey, parseIniContent(updated));
+    iniCache.set(cacheKey, parseIniContent(decodeProfileText(updated)));
 
     const out = vfs.openSync(fileName, 0x40000000 /* GENERIC_WRITE */, 2 /* CREATE_ALWAYS */);
     if (!out) {
         Logger.warn(LogCategory.KERNEL32, `${who}: cannot open "${resolved}" for write`);
         return 0;
     }
-    const bytes = Uint8Array.from(updated, (ch) => ch.charCodeAt(0) & 0xff);
+    const bytes = latin1ViewToBytes(updated);
     const written = vfs.writeSync(out, bytes);
     if (written < 0) {
         Logger.warn(LogCategory.KERNEL32, `${who}: write to "${resolved}" failed`);
@@ -494,6 +529,26 @@ function enumerateSectionsWide(addr: number, bufSizeChars: number, ini: IniData)
     }
 
     Mem.writeUint16(addr + pos * 2, 0);
+    return pos;
+}
+
+/** Write entries as a double-NUL-terminated list of at most `size` units (Win32 truncation rules). */
+function writeMultiString(entries: readonly string[], size: number, put: (index: number, unit: number) => unknown,
+    encode: (s: string) => ArrayLike<number>): number {
+    let pos = 0;
+    for (const entry of entries) {
+        const units = encode(entry);
+        if (pos + units.length + 2 > size) {
+            put(size - 2, 0);
+            put(size - 1, 0);
+            return size - 2;
+        }
+        for (let i = 0; i < units.length; i++) put(pos + i, units[i]!);
+        pos += units.length;
+        put(pos++, 0);
+    }
+    put(pos, 0);
+    if (pos === 0 && size > 1) put(1, 0);
     return pos;
 }
 
@@ -749,6 +804,38 @@ export const exports: Record<string, ThunkImplementation> = {
         return withIniData(fileName, 12, (ini) => {
             if (!ini) { Mem.writeUint8(lpszReturnBuffer, 0); return 0; }
             return enumerateSections(mem, lpszReturnBuffer, nSize, ini);
+        });
+    },
+
+    /**
+     * GetPrivateProfileSection[A|W](lpAppName, lpReturnedString, nSize, lpFileName)
+     *
+     * Every entry of one section as "key=value", NUL-separated, closed by a second NUL.
+     * Returns the characters written without the final terminator, nSize-2 when the
+     * buffer was too small (Windows truncates at a whole entry and still double-terminates).
+     */
+    'GetPrivateProfileSectionA': (ctx, mem, args) => {
+        const section = args[0] ? Marshaler.readString(mem, args[0]) : '';
+        const buf = args[1];
+        const nSize = args[2] >>> 0;
+        const fileName = args[3] ? Marshaler.readString(mem, args[3]) : '';
+        if (!buf || nSize < 2) return 0;
+        return withIniData(fileName, 16, (ini) => {
+            const entries = ini ? sectionLines.get(ini)?.get(section.trim().toLowerCase()) ?? [] : [];
+            return writeMultiString(entries, nSize, (i, ch) => Mem.writeUint8(buf + i, ch), (s) => encodeAnsi(s));
+        });
+    },
+
+    'GetPrivateProfileSectionW': (ctx, mem, args) => {
+        const section = args[0] ? Marshaler.readWideString(mem, args[0]) : '';
+        const buf = args[1];
+        const nSize = args[2] >>> 0;
+        const fileName = args[3] ? Marshaler.readWideString(mem, args[3]) : '';
+        if (!buf || nSize < 2) return 0;
+        return withIniData(fileName, 16, (ini) => {
+            const entries = ini ? sectionLines.get(ini)?.get(section.trim().toLowerCase()) ?? [] : [];
+            return writeMultiString(entries, nSize, (i, ch) => Mem.writeUint16(buf + i * 2, ch),
+                (s) => Uint16Array.from(s, (c) => c.charCodeAt(0)));
         });
     },
 
