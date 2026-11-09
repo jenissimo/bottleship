@@ -67,6 +67,14 @@ const DEFAULT_DISPLAY_MODE_SPECS: Array<Omit<DisplayModeConfig, "refreshRate">> 
     { width: 640, height: 400, bpp: 8 },
     { width: 640, height: 480, bpp: 8 },
     { width: 800, height: 600, bpp: 8 },
+    // An 8bpp title falls back when the larger mode it offers is not enumerated
+    // (RollerCoaster Tycoon turns 1024x768 into 800x600).
+    { width: 512, height: 384, bpp: 8 },
+    { width: 1024, height: 768, bpp: 8 },
+    { width: 1152, height: 864, bpp: 8 },
+    { width: 1280, height: 960, bpp: 8 },
+    { width: 1280, height: 1024, bpp: 8 },
+    { width: 1600, height: 1200, bpp: 8 },
     // 16bpp modes — the sweet spot for most late-90s 3D games
     { width: 320, height: 200, bpp: 16 },
     { width: 320, height: 240, bpp: 16 },
