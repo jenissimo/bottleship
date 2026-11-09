@@ -105,6 +105,43 @@ const ALC_DEFAULT_DEVICE_SPECIFIER    = 0x1004;
 const ALC_DEVICE_SPECIFIER            = 0x1005;
 const ALC_EXTENSIONS                  = 0x1006;
 const ALC_ALL_DEVICES_SPECIFIER       = 0x1013;
+const ALC_DEFAULT_ALL_DEVICES_SPECIFIER = 0x1012;
+
+// ALC integer queries (ALC 1.1) and the attributes a device reports.
+const ALC_MAJOR_VERSION   = 0x1000;
+const ALC_MINOR_VERSION   = 0x1001;
+const ALC_ATTRIBUTES_SIZE = 0x1002;
+const ALC_ALL_ATTRIBUTES  = 0x1003;
+const ALC_FREQUENCY       = 0x1007;
+const ALC_REFRESH         = 0x1008;
+const ALC_SYNC            = 0x1009;
+const ALC_MONO_SOURCES    = 0x1010;
+const ALC_STEREO_SOURCES  = 0x1011;
+const ALC_CAPTURE_SAMPLES = 0x312;
+const ALC_INVALID_ENUM    = 0xA003;
+const ALC_INVALID_VALUE   = 0xA004;
+
+/** What a device advertises: the mixer runs at 44.1 kHz, and sources are only bounded by memory. */
+const ALC_DEVICE_ATTRIBUTES: readonly number[] = [
+    ALC_FREQUENCY, 44100,
+    ALC_REFRESH, 50,
+    ALC_SYNC, ALC_FALSE,
+    ALC_MONO_SOURCES, 255,
+    ALC_STEREO_SOURCES, 1,
+];
+
+/** Extensions answered truthfully: device enumeration works through alcGetString(NULL, …). */
+const ALC_EXTENSION_LIST: readonly string[] = ["ALC_ENUMERATION_EXT", "ALC_ENUMERATE_ALL_EXT"];
+
+const ALC_ENUMS: Record<string, number> = {
+    ALC_MAJOR_VERSION, ALC_MINOR_VERSION, ALC_ATTRIBUTES_SIZE, ALC_ALL_ATTRIBUTES,
+    ALC_FREQUENCY, ALC_REFRESH, ALC_SYNC, ALC_MONO_SOURCES, ALC_STEREO_SOURCES,
+    ALC_DEFAULT_DEVICE_SPECIFIER, ALC_DEVICE_SPECIFIER, ALC_EXTENSIONS,
+    ALC_DEFAULT_ALL_DEVICES_SPECIFIER, ALC_ALL_DEVICES_SPECIFIER,
+    ALC_INVALID_ENUM, ALC_INVALID_VALUE, ALC_NO_ERROR,
+};
+
+const ALC_DEVICE_NAME = "BottleShip OpenAL";
 
 // AL string queries
 const AL_VENDOR     = 0xB001;
@@ -205,6 +242,13 @@ function writeString(process: Process, str: string): number {
     return ptr;
 }
 
+function readCString(mem: Uint8Array, ptr: number): string {
+    if (!ptr) return "";
+    let end = ptr;
+    while (end < mem.length && mem[end] !== 0 && end - ptr < 256) end++;
+    return String.fromCharCode(...mem.subarray(ptr, end));
+}
+
 function formatChannels(format: number): number {
     return (format === AL_FORMAT_STEREO8 || format === AL_FORMAT_STEREO16) ? 2 : 1;
 }
@@ -249,6 +293,7 @@ export class OpenAL implements IModule {
     private stringPtrs = new Map<number, number>();
 
     private lastPumpAllMs = 0;
+    private alcError = ALC_NO_ERROR;
 
     // 3D state. One listener per context, exactly as in AL.
     private listener: ALListenerState = createListenerState();
@@ -286,19 +331,27 @@ export class OpenAL implements IModule {
         this.exports["alcGetContextsDevice"] = () => this.currentDevice;
         this.exports["alcProcessContext"] = () => 0;
         this.exports["alcSuspendContext"] = () => 0;
-        this.exports["alcGetError"] = () => ALC_NO_ERROR;
-        this.exports["alcGetString"] = (_ctx, _mem, args) => this.getAlcString(args[1]);
+        this.exports["alcGetError"] = () => {
+            const err = this.alcError;
+            this.alcError = ALC_NO_ERROR;
+            return err;
+        };
+        this.exports["alcGetString"] = (_ctx, _mem, args) => this.getAlcString(args[0], args[1]);
         this.exports["alcGetIntegerv"] = (_ctx, mem, args) => {
-            const [_device, _param, size, dataPtr] = args;
-            if (dataPtr && size > 0) {
-                const dv = new DataView(mem.buffer, mem.byteOffset);
-                for (let i = 0; i < size; i++) dv.setInt32(dataPtr + i * 4, 0, true);
-            }
+            const [device, param, size, dataPtr] = args;
+            const values = this.alcIntegers(device, param);
+            if (!values) { this.alcError = ALC_INVALID_ENUM; return 0; }
+            if (!dataPtr || size <= 0 || size < values.length) { this.alcError = ALC_INVALID_VALUE; return 0; }
+            const dv = new DataView(mem.buffer, mem.byteOffset);
+            for (let i = 0; i < values.length; i++) dv.setInt32(dataPtr + i * 4, values[i], true);
             return 0;
         };
-        this.exports["alcIsExtensionPresent"] = () => ALC_FALSE;
+        this.exports["alcIsExtensionPresent"] = (_ctx, mem, args) => {
+            const name = readCString(mem, args[1]).toUpperCase();
+            return ALC_EXTENSION_LIST.includes(name) ? ALC_TRUE : ALC_FALSE;
+        };
         this.exports["alcGetProcAddress"] = () => 0;
-        this.exports["alcGetEnumValue"] = () => 0;
+        this.exports["alcGetEnumValue"] = (_ctx, mem, args) => ALC_ENUMS[readCString(mem, args[1])] ?? 0;
         this.exports["alcCaptureOpenDevice"] = () => 0;
         this.exports["alcCaptureCloseDevice"] = () => ALC_TRUE;
         this.exports["alcCaptureStart"] = () => 0;
@@ -1247,16 +1300,43 @@ export class OpenAL implements IModule {
         return ptr;
     }
 
-    private getAlcString(param: number): number {
+    private getAlcString(device: number, param: number): number {
         switch (param) {
             case ALC_DEFAULT_DEVICE_SPECIFIER:
+            case ALC_DEFAULT_ALL_DEVICES_SPECIFIER:
+                return this.getOrAllocString(param, ALC_DEVICE_NAME);
             case ALC_DEVICE_SPECIFIER:
             case ALC_ALL_DEVICES_SPECIFIER:
-                return this.getOrAllocString(param, "BottleShip OpenAL");
+                // Without a device this is the enumeration list: names separated by NUL and
+                // closed by a second NUL. With one it is that device's name; the extra NUL is inert.
+                return this.getOrAllocString(param, ALC_DEVICE_NAME + "\0");
             case ALC_EXTENSIONS:
-                return this.getOrAllocString(param, "");
+                return this.getOrAllocString(param, device ? ALC_EXTENSION_LIST.join(" ") : "");
+            case ALC_NO_ERROR:
+                return this.getOrAllocString(0xFD00, "No Error");
+            case ALC_INVALID_ENUM:
+                return this.getOrAllocString(0xFD03, "Invalid Enum");
+            case ALC_INVALID_VALUE:
+                return this.getOrAllocString(0xFD04, "Invalid Value");
             default:
                 return this.getOrAllocString(0xFF00 | param, "");
+        }
+    }
+
+    /** The values alcGetIntegerv writes for `param`, or null for an enum ALC does not define. */
+    private alcIntegers(device: number, param: number): readonly number[] | null {
+        switch (param) {
+            case ALC_MAJOR_VERSION: return [1];
+            case ALC_MINOR_VERSION: return [1];
+            case ALC_ATTRIBUTES_SIZE: return [ALC_DEVICE_ATTRIBUTES.length + 1];
+            case ALC_ALL_ATTRIBUTES: return [...ALC_DEVICE_ATTRIBUTES, 0];
+            case ALC_FREQUENCY: return [44100];
+            case ALC_REFRESH: return [50];
+            case ALC_SYNC: return [ALC_FALSE];
+            case ALC_MONO_SOURCES: return [255];
+            case ALC_STEREO_SOURCES: return [1];
+            case ALC_CAPTURE_SAMPLES: return device ? [0] : null;
+            default: return null;
         }
     }
 
