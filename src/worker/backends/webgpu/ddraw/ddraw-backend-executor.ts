@@ -1384,7 +1384,7 @@ export class DDrawWebGPUExecutor {
             this.depthManager.markUsedThisFrame(target);
             this.depthManager.markExplicitClearDone(target);
         }
-        setAuthorityGpu(target, true);
+        if (hasColorClear) setAuthorityGpu(target, true);
     }
 
     // ===== Surface Sync =====
