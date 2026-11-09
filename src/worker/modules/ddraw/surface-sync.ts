@@ -1204,6 +1204,9 @@ export class SurfaceSyncManager {
             // below belong to this version even if another writer advances the state
             // while mapAsync is pending.
             const readbackVersion = state.version;
+            const readbackPtr = state.surfacePtr;
+            const guestMemoryStillThisVersion = (): boolean =>
+                state.version === readbackVersion && state.surfacePtr === readbackPtr;
 
             // The Lock's rect, or the whole surface. A PARTIAL download must never record
             // cpuSyncedVersion: the memo claims every byte of this version is in guest
@@ -1275,6 +1278,7 @@ export class SurfaceSyncManager {
                                 `(bounds=${inBounds}, thunk=${overlapsThunkCode(regionPtr, writeSpan)})`);
                             return false;
                         }
+                        if (!guestMemoryStillThisVersion()) return true;
                         compareStaleServe(state, readbackVersion, memNow, regionPtr, pitch,
                             mapped, rowBytes, rows, bytesPerPixel);
                         landRegionRows(mapped, rowBytes, rows, memNow, regionPtr, pitch);
@@ -1342,6 +1346,10 @@ export class SurfaceSyncManager {
             Logger.log(LogCategory.DDRAW,
                 `syncToCPU: mapAsync completed in ${(afterMap - beforeWait).toFixed(2)}ms`
             );
+            if (!guestMemoryStillThisVersion()) {
+                releaseReadback();
+                return false;
+            }
             const mapped = new Uint8Array(readback.getMappedRange());
 
             const copyConvertToken = profiler.startToken("syncToCPU:copyConvert");
