@@ -72,3 +72,12 @@ test("unregister keys the same way, so FreeLibrary cannot drop the EXE", () => {
     expect(r.getByName("xiii")).toBeUndefined();
     expect(r.getExecutableModule()?.baseAddress).toBe(EXE_BASE);
 });
+
+test("a dotted version in the basename is not an extension", () => {
+    const r = new ModuleRegistry();
+    r.register(mod("lua5.1", 0x12100000));
+
+    for (const spelling of ["lua5.1", "lua5.1.dll", "LUA5.1.DLL", "c:\\game\\lua5.1.dll"]) {
+        expect(r.getByName(spelling)?.baseAddress).toBe(0x12100000);
+    }
+});
