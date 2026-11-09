@@ -91,6 +91,7 @@ const DSBLOCK_ENTIREBUFFER = 0x2;
 const DSBPN_OFFSETSTOP = 0xFFFFFFFF;
 const DSBCAPS_PRIMARYBUFFER = 0x00000001;
 const DSBCAPS_LOCHARDWARE = 0x00000004;
+const DSBCAPS_LOCDEFER = 0x00040000;
 const DSBCAPS_LOCSOFTWARE = 0x00000008;
 const DSBCAPS_CTRL3D = 0x00000010;
 const DSBCAPS_CTRLFREQUENCY = 0x00000020;
@@ -2236,7 +2237,7 @@ export class DSound implements IModule {
                     if (buffer.bufferLost) status |= DSBSTATUS_BUFFERLOST;
                     if (buffer.isPlaying) status |= DSBSTATUS_PLAYING;
                     if (buffer.isLooping) status |= DSBSTATUS_LOOPING;
-                    if (!(buffer.flags & DSBCAPS_LOCHARDWARE)) {
+                    if ((buffer.flags & DSBCAPS_LOCDEFER) && !(buffer.flags & DSBCAPS_LOCHARDWARE)) {
                         status |= DSBSTATUS_LOCSOFTWARE;
                     }
                 }
@@ -2290,7 +2291,7 @@ export class DSound implements IModule {
                                 if (buffer.bufferLost) status |= DSBSTATUS_BUFFERLOST;
                                 if (buffer.isPlaying) status |= DSBSTATUS_PLAYING;
                                 if (buffer.isLooping) status |= DSBSTATUS_LOOPING;
-                                if (!(buffer.flags & DSBCAPS_LOCHARDWARE)) {
+                                if ((buffer.flags & DSBCAPS_LOCDEFER) && !(buffer.flags & DSBCAPS_LOCHARDWARE)) {
                                     status |= DSBSTATUS_LOCSOFTWARE;
                                 }
                             }
