@@ -16,6 +16,7 @@ import { d3dxFilterTexture, uploadDdsCubeFaces, uploadDdsLevels, uploadRgbaToTex
 import { createGuestVolumeTexture } from '../d3d9/volume';
 import { createGuestCubeTexture } from '../d3d9/resources';
 import { getVolumeLevel } from '../d3d9/volume-resources';
+import { resourceToDevice } from '../d3d9/shared-state';
 import { decodeImageBytes, imageFileFormatOf, loadImageFromVfs, readDdsInfo, ImageFileFormat } from './image-decode';
 import { isBlockCompressedFormat, isD3DFloatFormat } from '../../backends/webgpu/shared/texture-formats';
 
@@ -479,6 +480,10 @@ export function createTextureExports(): Record<string, ThunkImplementation> {
             if (available > 0) Mem.writeBytes(dst.ptr, data.subarray(at, at + available));
             at += dst.bytes;
         }
+        // The levels were written straight into guest RAM, which the GPU side does not watch:
+        // only a dirty mark (what UnlockBox sends) republishes them. Without it a split
+        // renderer keeps the zero snapshot taken at creation and every tex3D reads black.
+        resourceToDevice.get(texPtr)?.markVolumeTextureDirty(texPtr);
         if (pSrcInfo) {
             writeImageInfo(pSrcInfo, info.width, info.height, fileLevels, info.format,
                 ImageFileFormat.Dds, info.depth, info.resourceType);
