@@ -5559,6 +5559,12 @@ export class Scheduler {
         return this.process.v86?.cpu || this.process.v86?.v86?.cpu;
     }
 
+    /** Guest address that ends the calling thread with EAX as exit code (a start routine's return address). */
+    getThreadExitStubAddress(): number {
+        this.writeThreadExitStub();
+        return this.threadExitStubAddr >>> 0;
+    }
+
     private writeThreadExitStub(): void {
         if (!this.process) return;
         const mem = this.process.getCurrentMemory();
