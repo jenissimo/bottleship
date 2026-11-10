@@ -44,7 +44,21 @@ export interface QueryManagerDevice {
 
 export interface QueryManagerQueue {
     submit(commandBuffers: GPUCommandBuffer[]): void;
-    onSubmittedWorkDone(): Promise<void>;
+    /** Not consulted: a readback's own mapAsync is its fence (see completeBatch). */
+    onSubmittedWorkDone?(): Promise<void>;
+}
+
+const batchSettledObservers = new Set<() => void>();
+
+/**
+ * Called after EVERY resolve batch settles (values written or failure recorded), on any manager
+ * in this realm. A consumer that ships results elsewhere reacts per batch instead of waiting
+ * for all in-flight readbacks, which never drain while each frame adds one. Returns the
+ * unsubscribe.
+ */
+export function observeQueryBatchSettled(observer: () => void): () => void {
+    batchSettledObservers.add(observer);
+    return () => { batchSettledObservers.delete(observer); };
 }
 
 export type QueryPassEncoder = Pick<GPURenderPassEncoder, 'beginOcclusionQuery' | 'endOcclusionQuery'>;
@@ -1013,17 +1027,26 @@ export class D3D9QueryManager {
         if (!resolveBuffer || !readbackBuffer) return;
         let failureReason = 'query-readback-failed';
         try {
-            const validationError = await (batch.validation ?? Promise.resolve(null));
-            if (validationError) {
-                failureReason = validationError;
-                throw new Error(validationError);
-            }
             // One fence per resolve BATCH, not per GetData: GetData itself is a synchronous
             // spin-polled thunk and never parks the guest.
             d3d9NoteFence("queryBatch");
             d3d9NoteFenceQueriesServed(batch.entries.length);
-            await this.queue.onSubmittedWorkDone();
-            await readbackBuffer.mapAsync(MAP_MODE_READ, 0, batch.entries.length * RESULT_BYTES);
+            // mapAsync is itself the fence: it resolves only once the queue has finished every
+            // submitted use of this per-batch buffer, and it is issued after the submit that
+            // writes it. The validation verdict is awaited alongside, but still decides first:
+            // an invalid submit leaves the buffer mappable with bytes nobody measured.
+            const [validation, map] = await Promise.allSettled([
+                batch.validation ?? Promise.resolve(null),
+                readbackBuffer.mapAsync(MAP_MODE_READ, 0, batch.entries.length * RESULT_BYTES),
+            ]);
+            const validationError = validation.status === 'fulfilled'
+                ? validation.value : 'query-resolve-validation-scope-failed';
+            if (validationError) {
+                failureReason = validationError;
+                if (map.status === 'fulfilled') readbackBuffer.unmap();
+                throw new Error(validationError);
+            }
+            if (map.status === 'rejected') throw map.reason;
             const mapped = readbackBuffer.getMappedRange(0, batch.entries.length * RESULT_BYTES);
             const view = new DataView(mapped);
             for (const entry of batch.entries) {
@@ -1050,6 +1073,9 @@ export class D3D9QueryManager {
             batch.status = 'completed';
             destroyGpuObject(resolveBuffer);
             destroyGpuObject(readbackBuffer);
+            for (const observer of batchSettledObservers) {
+                try { observer(); } catch { /* an observer cannot fail the batch */ }
+            }
         }
     }
 

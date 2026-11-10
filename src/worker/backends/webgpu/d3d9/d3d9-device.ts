@@ -4556,11 +4556,6 @@ export class D3D9Device {
         return this.splitQueryHost?.collect() ?? [];
     }
 
-    /** Resolves true once in-flight query readbacks settled; false when none were in flight. */
-    splitQueriesInflight(): Promise<boolean> {
-        return this.splitQueryHost?.inflight() ?? Promise.resolve(false);
-    }
-
     splitQueryHostCounters(): Record<string, unknown> | null {
         return this.splitQueryHost ? {
             ...JSON.parse(JSON.stringify(this.splitQueryHost.counters)),
