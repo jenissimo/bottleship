@@ -199,6 +199,10 @@ const MAP_MODE_READ = 0x0001;
 const RESULT_BYTES = 8;
 const RESOLVE_ALIGNMENT = 256;
 const MAX_QUERY_SET_CAPACITY = 4096;
+/** Settled resolve/readback buffers kept per (kind, size) for the next batch. A readback settles
+ *  a frame or more after its submit and a title can resolve dozens of batches a frame, so the
+ *  steady state needs that many in flight plus spares; each is a few bytes. */
+const SPARE_BUFFERS_PER_SIZE = 64;
 
 /** Demotions caused by slot pressure rather than by a missing capability: a later re-arm
  *  may put the query back on the GPU path once its pool has free slots again. */
@@ -257,6 +261,14 @@ export class D3D9QueryManager {
         displacedGenerations: 0, displacedLost: 0,
     };
     private readonly inflight = new Set<Promise<void>>();
+    /**
+     * Resolve/readback buffers of settled batches, by kind and size. A batch used to create and
+     * destroy its own pair; at dozens of batches a frame that churn is GPU-process work for
+     * buffers that hold 8 bytes per query. Only a pair whose batch completed cleanly (mapped,
+     * read, unmapped) comes back here; any failure path still destroys it.
+     */
+    private readonly spareBuffers = new Map<string, GPUBuffer[]>();
+    private disposed = false;
     private submittedSerial = 0;
     private reservedSerial = 0;
     private deviceLost = false;
@@ -669,12 +681,13 @@ export class D3D9QueryManager {
                 push.call(this.device, 'validation');
                 scopePushed = true;
             }
-            resolveBuffer = this.device.createBuffer({
+            const resolveSize = (entries.length - 1) * RESOLVE_ALIGNMENT + RESULT_BYTES;
+            resolveBuffer = this.takeSpareBuffer('resolve', resolveSize) ?? this.device.createBuffer({
                 label: 'D3D9 query resolve',
-                size: (entries.length - 1) * RESOLVE_ALIGNMENT + RESULT_BYTES,
+                size: resolveSize,
                 usage: QUERY_MANAGER_BUFFER_USAGE.QUERY_RESOLVE | QUERY_MANAGER_BUFFER_USAGE.COPY_SRC,
             });
-            readbackBuffer = this.device.createBuffer({
+            readbackBuffer = this.takeSpareBuffer('readback', byteLength) ?? this.device.createBuffer({
                 label: 'D3D9 query readback',
                 size: byteLength,
                 usage: QUERY_MANAGER_BUFFER_USAGE.COPY_DST | QUERY_MANAGER_BUFFER_USAGE.MAP_READ,
@@ -864,12 +877,14 @@ export class D3D9QueryManager {
     }
 
     destroy(): void {
+        this.disposed = true;
         this.activeOcclusionPass = null;
         this.activeOcclusionState = null;
         for (const pools of this.pools.values()) {
             for (const pool of pools) destroyGpuObject(pool.querySet);
         }
         this.pools.clear();
+        this.destroySpareBuffers();
         for (const state of this.records.values()) state.error = 'query-manager-destroyed';
         for (const state of this.displaced) {
             state.error = 'query-manager-destroyed';
@@ -1022,11 +1037,35 @@ export class D3D9QueryManager {
         if (!state.encoded && !state.submitted && state.releaseRequested) this.reclaim(state);
     }
 
+    private takeSpareBuffer(kind: 'resolve' | 'readback', size: number): GPUBuffer | null {
+        return this.spareBuffers.get(`${kind}:${size}`)?.pop() ?? null;
+    }
+
+    /** Back to the spare pool, or destroyed when the manager can no longer use it. */
+    private recycleBuffer(kind: 'resolve' | 'readback', buffer: GPUBuffer): void {
+        const size = (buffer as { size?: number }).size;
+        if (this.deviceLost || this.disposed || typeof size !== 'number') {
+            destroyGpuObject(buffer);
+            return;
+        }
+        const key = `${kind}:${size}`;
+        let spare = this.spareBuffers.get(key);
+        if (!spare) this.spareBuffers.set(key, spare = []);
+        if (spare.length >= SPARE_BUFFERS_PER_SIZE) destroyGpuObject(buffer);
+        else spare.push(buffer);
+    }
+
+    private destroySpareBuffers(): void {
+        for (const spare of this.spareBuffers.values()) for (const buffer of spare) destroyGpuObject(buffer);
+        this.spareBuffers.clear();
+    }
+
     private async completeBatch(batch: QueryResolveBatch): Promise<void> {
         const resolveBuffer = batch.resolveBuffer;
         const readbackBuffer = batch.readbackBuffer;
         if (!resolveBuffer || !readbackBuffer) return;
         let failureReason = 'query-readback-failed';
+        let reusable = false;
         try {
             // One fence per resolve BATCH, not per GetData: GetData itself is a synchronous
             // spin-polled thunk and never parks the guest.
@@ -1063,6 +1102,7 @@ export class D3D9QueryManager {
                 if (entry.state.releaseRequested) this.reclaim(entry.state);
             }
             readbackBuffer.unmap();
+            reusable = true;
         } catch {
             for (const entry of batch.entries) {
                 entry.state.encoded = false;
@@ -1072,8 +1112,13 @@ export class D3D9QueryManager {
             }
         } finally {
             batch.status = 'completed';
-            destroyGpuObject(resolveBuffer);
-            destroyGpuObject(readbackBuffer);
+            if (reusable) {
+                this.recycleBuffer('resolve', resolveBuffer);
+                this.recycleBuffer('readback', readbackBuffer);
+            } else {
+                destroyGpuObject(resolveBuffer);
+                destroyGpuObject(readbackBuffer);
+            }
             for (const observer of batchSettledObservers) {
                 try { observer(); } catch { /* an observer cannot fail the batch */ }
             }
@@ -1105,6 +1150,7 @@ export class D3D9QueryManager {
             for (const pool of pools) destroyGpuObject(pool.querySet);
         }
         this.pools.clear();
+        this.destroySpareBuffers();
     }
 
     /** Idempotent: the state stays reachable from an in-flight batch, so a late

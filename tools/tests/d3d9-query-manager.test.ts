@@ -357,8 +357,35 @@ describe("D3D9 WebGPU query manager", () => {
         expect(manager.poll(7)).toEqual({
             state: "ready", submissionSerial: 7, value: 0x1234_5678_9abcn,
         });
+        // Settled cleanly: the pair is kept for the next batch of its size, not destroyed.
+        expect(readback.destroyed).toBe(false);
+        expect(readback.mapped).toBe(false);
+        expect(device.buffers[0]!.destroyed).toBe(false);
+        manager.destroy();
         expect(readback.destroyed).toBe(true);
         expect(device.buffers[0]!.destroyed).toBe(true);
+    });
+
+    test("settled resolve/readback buffers are reused by the next batch of the same size", async () => {
+        const device = new FakeDevice(["timestamp-query"]);
+        const queue = new FakeQueue();
+        const { manager } = makeManager(device, queue);
+        const record = { type: D3D9_QUERYTYPE_TIMESTAMP, begun: false, issued: true, issueSerial: 1 };
+        manager.acquire(7, record);
+        for (let serial = 1; serial <= 3; serial++) {
+            const encoder = new FakeCommandEncoder();
+            record.issueSerial = serial;
+            expect(manager.writeTimestamp(7, encoder as unknown as QueryCommandEncoder, record).ok).toBe(true);
+            const batch = manager.encodeResolves(encoder as unknown as QueryCommandEncoder, [7], serial);
+            expect(batch.status).toBe("encoded");
+            manager.submit(encoder as unknown as QueryCommandEncoder, batch);
+            queue.complete();
+            await manager.waitForBatch(batch);
+            expect(manager.poll(7).state).toBe("ready");
+            if (serial < 3) manager.rearm(7, record);
+        }
+        expect(device.buffers).toHaveLength(2);
+        expect(device.buffers.every((buffer) => !buffer.destroyed)).toBe(true);
     });
 
     test("abandon retires an encoded batch that never reaches markSubmitted", () => {
