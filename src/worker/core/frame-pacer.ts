@@ -65,6 +65,18 @@ const IMMEDIATE_PRESENTS_PER_REFRESH = 8;
  */
 const STALL_RELEASE_MS = 250;
 
+/**
+ * Short watchdog, used ONLY for the first stall after frames were flowing (a live display
+ * whose rAF is merely late: main thread busy, compositor hiccup). Two measured refresh
+ * periods, clamped. It is never used on consecutive stalls: once a release happens with no
+ * rAF in between, the display has stopped (hidden tab, occlusion) and the full
+ * STALL_RELEASE_MS applies again, so a dead display costs one short release, not a ~30 Hz
+ * busy loop. Unknown period (no measured rAF interval yet) also uses STALL_RELEASE_MS.
+ */
+const STALL_RELEASE_MIN_MS = 33;
+const STALL_RELEASE_MAX_MS = 100;
+const STALL_RELEASE_PERIODS = 2;
+
 export type FramePacerStats = {
     enabled: boolean;
     frameSlotBusy: boolean;
@@ -94,6 +106,9 @@ class FramePacerImpl {
     private waiterWatchdog: ReturnType<typeof setTimeout> | null = null;
     /** Permits released by the watchdog because no frame arrived (reported in stats). */
     private stalledReleases = 0;
+    /** True once a rAF interval was measured and no watchdog release has happened since the
+     *  last rAF: the display is demonstrably alive, so the short watchdog is safe. */
+    private rafAliveSinceStall = false;
 
     // Per-frame callbacks: fired once per rAF, synchronized with display refresh.
     // Used by THRASH auto-presenter and other subsystems that need frame-boundary events.
@@ -374,12 +389,17 @@ class FramePacerImpl {
         return new Promise<void>((resolve) => {
             this.waiters.push(resolve);
             if (this.waiterWatchdog === null) {
+                const timeoutMs = this.rafAliveSinceStall
+                    ? Math.min(STALL_RELEASE_MAX_MS,
+                        Math.max(STALL_RELEASE_MIN_MS, this.rAfInterval * STALL_RELEASE_PERIODS))
+                    : STALL_RELEASE_MS;
                 this.waiterWatchdog = setTimeout(() => {
                     this.waiterWatchdog = null;
                     if (!this.waiters.length) return;
                     this.stalledReleases++;
+                    this.rafAliveSinceStall = false;
                     this.releaseWaiters();
-                }, STALL_RELEASE_MS);
+                }, timeoutMs);
             }
         });
     }
@@ -532,6 +552,7 @@ class FramePacerImpl {
             // Only incorporate reasonable intervals (3ms-50ms) to filter outliers
             if (measured > 3 && measured < 50) {
                 this.rAfInterval = this.rAfInterval * 0.9 + measured * 0.1;
+                this.rafAliveSinceStall = true;
 
                 // Record rAF interval for diagnostics
                 if (frameVarianceDiagnostics.isEnabled()) {
