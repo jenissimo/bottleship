@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, beforeEach, describe, expect, test } from 'bun:test';
 import { activeDialogs, resetDialogPumps } from '../../src/worker/modules/user32/modal-dialog-state';
 import { windows } from '../../src/worker/modules/user32/shared-state';
 import { createDialogExports } from '../../src/worker/modules/user32/dialog';
@@ -12,6 +12,11 @@ const OWNER = 0x7f001;
 const OWNER_PROC = 0x405000;
 
 interface Invocation { wndProc: number; args: number[]; complete?: (ret: number) => number | null }
+
+// runOwnedDialog installs a stand-in process; later test files must not inherit it.
+const systemSlot = System.getInstance() as unknown as { process: unknown };
+const realProcess = systemSlot.process;
+afterAll(() => { systemSlot.process = realProcess; });
 
 function runOwnedDialog(withOwner: boolean) {
     const invocations: Invocation[] = [];

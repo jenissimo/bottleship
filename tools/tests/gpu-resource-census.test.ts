@@ -5,7 +5,7 @@
  * postMessage transfer retire, and a creation site names the caller.
  */
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 
 class FakeBuffer { constructor(readonly size: number) {} destroy(): void {} }
 class FakeTexture { destroy(): void {} }
@@ -17,7 +17,11 @@ const g = globalThis as unknown as Record<string, unknown>;
 g.GPUDevice ??= FakeDevice;
 g.GPUBuffer ??= FakeBuffer;
 g.GPUTexture ??= FakeTexture;
-g.GPUBufferUsage ??= { MAP_READ: 1, MAP_WRITE: 2, COPY_SRC: 4, COPY_DST: 8, INDEX: 16, VERTEX: 32, UNIFORM: 64, STORAGE: 128 };
+// The tags asserted below name WebGPU's real usage bits; an earlier test file may have left a
+// table with other values on globalThis, so install the real one for this file and put theirs back.
+const inheritedUsage = g.GPUBufferUsage;
+g.GPUBufferUsage = { MAP_READ: 1, MAP_WRITE: 2, COPY_SRC: 4, COPY_DST: 8, INDEX: 16, VERTEX: 32, UNIFORM: 64, STORAGE: 128 };
+afterAll(() => { if (inheritedUsage === undefined) delete g.GPUBufferUsage; else g.GPUBufferUsage = inheritedUsage; });
 
 const { armGpuResourceCensus, gpuResourceCensus } = await import("../../src/worker/core/gpu/gpu-resource-census");
 
