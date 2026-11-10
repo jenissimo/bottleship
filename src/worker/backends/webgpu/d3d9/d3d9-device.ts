@@ -6720,43 +6720,51 @@ export class D3D9Device {
     /** Pre-transformed (XYZRHW / POSITIONT) vertices are already in render-target pixels: D3D
      *  skips the viewport transform for them and only clips to the viewport rectangle. The RHW
      *  shader maps against the whole target, so such a draw needs the whole-target viewport and
-     *  the guest viewport as a clip rectangle instead. */
+     *  the guest viewport as a clip rectangle instead. The layout test goes first: it is two
+     *  memoized integer compares and settles every ordinary draw. */
     private preTransformedViewportClips(w: number, h: number): boolean {
+        if (!this.activeDeclIsPreTransformed()) return false;
         const v = this.viewport;
-        if (v.x === 0 && v.y === 0 && v.width === w && v.height === h) return false;
-        return this.activeDeclIsPreTransformed();
+        return !(v.x === 0 && v.y === 0 && v.width === w && v.height === h);
     }
 
     private rhwDrawViewport = { x: 0, y: 0, width: 0, height: 0, minZ: 0, maxZ: 1 };
+    private drawRects: { scissorRect: { left: number; top: number; width: number; height: number }; viewport: D3D9ViewportValues }
+        = { scissorRect: this.scissorDrawRect, viewport: this.viewport };
 
-    private getViewportForDraw(): { x: number; y: number; width: number; height: number; minZ: number; maxZ: number } {
-        const { w, h } = this.getCurrentTargetSize();
-        if (!this.preTransformedViewportClips(w, h)) return this.viewport;
-        const r = this.rhwDrawViewport;
-        r.width = w; r.height = h;
-        return r;
-    }
-
-    /** Snapshot the effective D3D scissor for a draw. WebGPU keeps scissor state on the pass,
-     * so disabled draws explicitly receive the full target rectangle to prevent state leakage
-     * from a preceding enabled draw. */
-    getScissorRectForDraw(): { left: number; top: number; width: number; height: number } {
+    /** Resolve the scissor rectangle and the viewport a draw records, deciding the
+     *  pre-transformed sub-viewport case once for both. WebGPU keeps scissor state on the pass,
+     *  so disabled draws explicitly receive the full target rectangle to prevent state leakage
+     *  from a preceding enabled draw. The depth range always stays the guest's. */
+    private resolveDrawRects(): { scissorRect: { left: number; top: number; width: number; height: number }; viewport: D3D9ViewportValues } {
         const { w, h } = this.getCurrentTargetSize();
         const vpClip = this.preTransformedViewportClips(w, h);
-        if (this.getRS(D3DRS_SCISSORTESTENABLE) === 0 && !vpClip) {
-            this.scissorDrawRect.left = 0;
-            this.scissorDrawRect.top = 0;
-            this.scissorDrawRect.width = Math.max(0, w);
-            this.scissorDrawRect.height = Math.max(0, h);
-            return this.scissorDrawRect;
+        const out = this.drawRects;
+        const rect = this.scissorDrawRect;
+        const v = this.viewport;
+        out.scissorRect = rect;
+        if (vpClip) {
+            const full = this.rhwDrawViewport;
+            full.width = w; full.height = h;
+            full.minZ = v.minZ; full.maxZ = v.maxZ;
+            out.viewport = full;
+        } else {
+            out.viewport = v;
+        }
+        const scissorOn = this.getRS(D3DRS_SCISSORTESTENABLE) !== 0;
+        if (!scissorOn && !vpClip) {
+            rect.left = 0;
+            rect.top = 0;
+            rect.width = Math.max(0, w);
+            rect.height = Math.max(0, h);
+            return out;
         }
         let sl = 0, st = 0, sr = w, sb = h;
-        if (this.getRS(D3DRS_SCISSORTESTENABLE) !== 0) {
+        if (scissorOn) {
             const scissor = this.effectiveScissorRect();
             sl = scissor.left | 0; st = scissor.top | 0; sr = scissor.right | 0; sb = scissor.bottom | 0;
         }
         if (vpClip) {
-            const v = this.viewport;
             sl = Math.max(sl, Math.floor(v.x));
             st = Math.max(st, Math.floor(v.y));
             sr = Math.min(sr, Math.ceil(v.x + v.width));
@@ -6766,11 +6774,19 @@ export class D3D9Device {
         const top = Math.max(0, Math.min(h, st));
         const right = Math.max(left, Math.min(w, sr));
         const bottom = Math.max(top, Math.min(h, sb));
-        this.scissorDrawRect.left = left;
-        this.scissorDrawRect.top = top;
-        this.scissorDrawRect.width = right - left;
-        this.scissorDrawRect.height = bottom - top;
-        return this.scissorDrawRect;
+        rect.left = left;
+        rect.top = top;
+        rect.width = right - left;
+        rect.height = bottom - top;
+        return out;
+    }
+
+    getScissorRectForDraw(): { left: number; top: number; width: number; height: number } {
+        return this.resolveDrawRects().scissorRect;
+    }
+
+    getViewportForDraw(): D3D9ViewportValues {
+        return this.resolveDrawRects().viewport;
     }
 
     /** Harness CaptureBus producer for D3D9. D3D9's programmable path has
@@ -7574,8 +7590,7 @@ export class D3D9Device {
             pipelineId, streams: this.streamPlan,
             vertexCount: outVerts, startVertex: 0,
             ffpStateIndex,
-            scissorRect: this.getScissorRectForDraw(),
-            viewport: this.getViewportForDraw(),
+            ...this.resolveDrawRects(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -7833,8 +7848,7 @@ export class D3D9Device {
             guestStride: streamSource.stride,
             bindStateIndex,
             ffpStateIndex,
-            scissorRect: this.getScissorRectForDraw(),
-            viewport: this.getViewportForDraw(),
+            ...this.resolveDrawRects(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -8156,8 +8170,7 @@ export class D3D9Device {
             startVertex: 0,
             bindStateIndex,
             ffpStateIndex,
-            scissorRect: this.getScissorRectForDraw(),
-            viewport: this.getViewportForDraw(),
+            ...this.resolveDrawRects(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -8533,8 +8546,7 @@ export class D3D9Device {
             startVertex: 0,
             bindStateIndex,
             ffpStateIndex,
-            scissorRect: this.getScissorRectForDraw(),
-            viewport: this.getViewportForDraw(),
+            ...this.resolveDrawRects(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -8837,8 +8849,9 @@ export class D3D9Device {
         cmd.instanceCount = instancing.instanceCount;
         cmd.bindStateIndex = bindStateIndex;
         cmd.ffpStateIndex = ffpStateIndex;
-        cmd.scissorRect = this.getScissorRectForDraw();
-        cmd.viewport = this.getViewportForDraw();
+        const rects = this.resolveDrawRects();
+        cmd.scissorRect = rects.scissorRect;
+        cmd.viewport = rects.viewport;
         cmd.stencilReference = this.getRS(D3DRS_STENCILREF) & 0xff;
         cmd.blendConstant = this.getRS(D3DRS_BLENDFACTOR) >>> 0;
         this.commandRecorder.recordDrawIndexed(cmd);
@@ -9164,8 +9177,7 @@ export class D3D9Device {
             compactDescriptorOffset,
             prefixVsBits,
             prefixStartFloat: startRegister * 4,
-            scissorRect: this.getScissorRectForDraw(),
-            viewport: this.getViewportForDraw(),
+            ...this.resolveDrawRects(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -10029,10 +10041,11 @@ export class D3D9Device {
         const streamHash = this.streamHash(slotMask, stride ?? 0);
         const streamKey = this.streamKey(slotMask, stride ?? 0);
         const ptSize = this.getCurrentTargetSize();
+        const ptWholeTarget = this.preTransformedViewportClips(ptSize.w, ptSize.h);
         const preTransformed = this.activeDeclIsPreTransformed()
             ? {
-                viewportWidth: this.preTransformedViewportClips(ptSize.w, ptSize.h) ? ptSize.w : this.viewport.width || ptSize.w,
-                viewportHeight: this.preTransformedViewportClips(ptSize.w, ptSize.h) ? ptSize.h : this.viewport.height || ptSize.h,
+                viewportWidth: ptWholeTarget ? ptSize.w : this.viewport.width || ptSize.w,
+                viewportHeight: ptWholeTarget ? ptSize.h : this.viewport.height || ptSize.h,
                 pixelCenterOffset: pixelCenterOffsetPx(this.activeRenderScale()),
             }
             : null;
@@ -10796,10 +10809,11 @@ export class D3D9Device {
         // into the generated vertex entry, so it is part of the pipeline identity — and both
         // fast paths below key on state that does not carry it, so those are skipped.
         const ptSize = this.getCurrentTargetSize();
+        const ptWholeTarget = this.preTransformedViewportClips(ptSize.w, ptSize.h);
         const preTransformed = this.activeDeclIsPreTransformed()
             ? {
-                viewportWidth: this.preTransformedViewportClips(ptSize.w, ptSize.h) ? ptSize.w : this.viewport.width || ptSize.w,
-                viewportHeight: this.preTransformedViewportClips(ptSize.w, ptSize.h) ? ptSize.h : this.viewport.height || ptSize.h,
+                viewportWidth: ptWholeTarget ? ptSize.w : this.viewport.width || ptSize.w,
+                viewportHeight: ptWholeTarget ? ptSize.h : this.viewport.height || ptSize.h,
                 pixelCenterOffset: pixelCenterOffsetPx(this.activeRenderScale()),
             }
             : null;
@@ -11447,8 +11461,9 @@ export class D3D9Device {
     private captureFfpDrawState(slotMask: number = this.activeSlotMask()): number {
         this.declDrawCounts.set(this.activeVertexDecl, (this.declDrawCounts.get(this.activeVertexDecl) ?? 0) + 1);
         const targetSize = this.getCurrentTargetSize();
-        // FFP RHW coordinates and the pixel-centre correction are expressed in the
-        // active D3D9 viewport; the executor applies the same viewport to the pass.
+        // FFP RHW coordinates and the pixel-centre correction are expressed in the viewport
+        // the executor applies to the pass: the active D3D9 viewport, or the whole target for
+        // a pre-transformed draw in a sub-viewport (resolveDrawRects makes the same choice).
         // Falling back to the target dimensions only covers a not-yet-initialized state.
         const rhwFull = this.preTransformedViewportClips(targetSize.w, targetSize.h);
         const w = rhwFull ? targetSize.w : this.viewport.width || targetSize.w;
