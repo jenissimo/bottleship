@@ -379,6 +379,15 @@ export class D3D9MultisampleTargetCache {
         target: D3D9MultisampleTarget;
     }>();
     private garbage: GPUTexture[] = [];
+    /**
+     * The owned depth a target held before an EXTERNAL depth surface replaced it, kept for the
+     * moment the target goes back to it. The executor re-keys the backbuffer target between the
+     * internal and the guest's depth several times per frame (ensureOffscreenTarget, then the
+     * pass's own depth format); retiring the owned texture on each switch created and destroyed
+     * a full-size MSAA depth texture per submit, which costs the GPU process ~1 ms of blocked
+     * time each. Kept, its contents persist like a D3D9 auto depth-stencil surface's do.
+     */
+    private readonly spareDepth = new Map<string, { fingerprint: string; texture: GPUTexture; view: GPUTextureView }>();
     private readonly adapterProbe: D3D9MsaaAdapterProbe;
 
     constructor(
@@ -410,7 +419,28 @@ export class D3D9MultisampleTargetCache {
                 this.garbage.push(existing.target.colorTexture);
                 if (existing.target.ownsResolveTexture) this.garbage.push(existing.target.resolveTexture);
             }
-            if (!depth && existing.target.ownsDepthTexture) this.garbage.push(existing.target.depthTexture);
+            if (!depth && existing.target.ownsDepthTexture) {
+                if (desc.depthTexture) {
+                    const prior = this.spareDepth.get(targetKey);
+                    if (prior) this.garbage.push(prior.texture);
+                    this.spareDepth.set(targetKey, {
+                        fingerprint: existing.depthFingerprint,
+                        texture: existing.target.depthTexture,
+                        view: existing.target.depthView,
+                    });
+                } else {
+                    this.garbage.push(existing.target.depthTexture);
+                }
+            }
+        }
+        let spare: { texture: GPUTexture; view: GPUTextureView } | null = null;
+        if (!depth && !desc.depthTexture) {
+            const kept = this.spareDepth.get(targetKey);
+            if (kept) {
+                this.spareDepth.delete(targetKey);
+                if (kept.fingerprint === depthKey) spare = kept;
+                else this.garbage.push(kept.texture);
+            }
         }
 
         const size = { width: desc.width, height: desc.height, depthOrArrayLayers: 1 };
@@ -430,7 +460,7 @@ export class D3D9MultisampleTargetCache {
             usage: colorResolveUsage(),
         });
         const ownsDepthTexture = !desc.depthTexture;
-        const depthTexture = depth?.depthTexture ?? desc.depthTexture ?? this.device.createTexture({
+        const depthTexture = depth?.depthTexture ?? desc.depthTexture ?? spare?.texture ?? this.device.createTexture({
             size,
             format: desc.depthFormat,
             sampleCount,
@@ -449,7 +479,7 @@ export class D3D9MultisampleTargetCache {
             resolveView: desc.resolveView ?? color?.resolveView ?? resolveTexture.createView(),
             ownsResolveTexture,
             depthTexture,
-            depthView: desc.depthView ?? depth?.depthView ?? depthTexture.createView(),
+            depthView: desc.depthView ?? depth?.depthView ?? spare?.view ?? depthTexture.createView(),
             ownsDepthTexture,
         };
         this.byTarget.set(targetKey, { fingerprint, colorFingerprint: colorKey, depthFingerprint: depthKey, target });
@@ -459,6 +489,11 @@ export class D3D9MultisampleTargetCache {
     remove(key: D3D9MsaaTargetKey): boolean {
         const targetKey = normalizedKey(key);
         const existing = this.byTarget.get(targetKey);
+        const kept = this.spareDepth.get(targetKey);
+        if (kept) {
+            this.garbage.push(kept.texture);
+            this.spareDepth.delete(targetKey);
+        }
         if (!existing) return false;
         this.retire(existing.target);
         this.byTarget.delete(targetKey);
@@ -478,6 +513,8 @@ export class D3D9MultisampleTargetCache {
     destroy(): void {
         for (const entry of this.byTarget.values()) this.retire(entry.target);
         this.byTarget.clear();
+        for (const kept of this.spareDepth.values()) this.garbage.push(kept.texture);
+        this.spareDepth.clear();
         this.flushGarbage();
     }
 
