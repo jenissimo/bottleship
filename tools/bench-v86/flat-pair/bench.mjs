@@ -31,7 +31,11 @@ export const PLAN = {
 
 // `@tier` suffix: V8 flags for the arm's process, to see how much of a gap is V8's own tiering.
 // (Measured: in Node 22 "--liftoff --no-wasm-tier-up" still tiers up; --liftoff-only does not.)
-export const V8_TIERS = { tf: ["--no-liftoff"], liftoff: ["--liftoff-only"] };
+export const V8_TIERS = { tf: ["--no-liftoff"], liftoff: ["--liftoff-only"],
+    // func-ceiling (additive): Node 22 / V8 12.4 has wasm branch hints and wasm inlining OFF by
+    // default; current Chrome has both on.
+    hint: ["--experimental-wasm-branch-hinting"], hintinl: ["--experimental-wasm-branch-hinting", "--experimental-wasm-inlining"],
+    tfhint: ["--no-liftoff", "--experimental-wasm-branch-hinting"] };
 
 export function parseArm(spec) {
     const m = /^([a-z0-9-]+)(?:\[([^\]]*)\])?(?:\{([^}]*)\})?(?:@(\w+))?(?:#(\S+))?$/.exec(spec);
