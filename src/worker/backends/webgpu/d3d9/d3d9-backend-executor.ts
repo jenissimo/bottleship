@@ -3363,11 +3363,17 @@ export class D3D9BackendExecutor {
             && arenaIdentityMatches(binding);
 
         try {
-            // WebGPU validation is asynchronous and does not throw from queue.submit. Keep one
-            // frame-level scope around uploads, pass encoding and submit so a failure that is not
-            // attributable to a pipeline scope still names this frame and its last command.
-            device.pushErrorScope("validation");
-            validationScopePushed = true;
+            // WebGPU validation is asynchronous and does not throw from queue.submit. A frame-level
+            // scope around uploads, pass encoding and submit names the frame and its last command
+            // of a failure that no pipeline scope catches. It is opened only where its verdict
+            // decides something — the render-bundle fallback — or on request
+            // (__d3d9FrameErrorScopes): one push/pop pair per submit is GPU-process round trips
+            // dozens of times a frame, and without it the same error still reaches
+            // onuncapturederror (counted in the gpuErrors census, logged), only unattributed.
+            if (renderBundlesAttempted || (globalThis as { __d3d9FrameErrorScopes?: boolean }).__d3d9FrameErrorScopes) {
+                device.pushErrorScope("validation");
+                validationScopePushed = true;
+            }
 
             // Upload queued data
             for (let i = 0; i < frame.uploadBuffers.length; i++) {
@@ -4389,7 +4395,7 @@ export class D3D9BackendExecutor {
             const submitT0 = performance.now();
             queue.submit([encoder.finish()]);
             if (countingTexture) {
-                countingTexture.destroy();
+                // The counting attachment is PreciseOcclusion's to keep (cleared by every pass).
                 for (const id of countingIds) if(!this.preciseOcclusion!.active.has(id)) this.preciseOcclusion!.retire(id);
             }
             this.submitMs += performance.now() - submitT0;
