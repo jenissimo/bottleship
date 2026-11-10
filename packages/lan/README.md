@@ -73,10 +73,11 @@ endpoint. The handshake auth object is:
 { version: 1, room: string, clientId: string, node: number[6] }
 ```
 
-A locally generated node has the form `02:00:00:a:b:c`, corresponding to IPv4
-`10.a.b.c`. The relay verifies and reserves this address without changing it after
-game sockets have bound. A reconnect by the same identity retains its lease for
-60 seconds; a fresh identity cannot take an existing lease. The server emits
+A locally generated node has the form `02:00:00:01:b:c` (`c` in 1-254),
+corresponding to IPv4 `10.1.b.c`, so every default guest shares one /16. The
+relay verifies and reserves this address without changing it after game sockets
+have bound. A reconnect by the same identity retains its lease for 60 seconds; a
+fresh identity cannot take an existing lease. The server emits
 `ready { version, node, ipv4, gatewayIpv4, gatewayIpv6 }` after accepting the participant.
 
 `frame(bytes, bindingGeneration?)` carries an optional nonzero uint32 generation
