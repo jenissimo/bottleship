@@ -78,3 +78,40 @@ describe("FramePacer without frames", () => {
         pacer.stop();
     });
 });
+
+describe("FramePacer watchdog length", () => {
+    /** Deliver two real frames ~10 ms apart so the pacer has a measured refresh period. */
+    async function primeWithFrames(pacer: { stop(): void }) {
+        for (let i = 0; i < 3; i++) {
+            for (const cb of rafCallbacks.splice(0)) cb(performance.now());
+            await new Promise((r) => setTimeout(r, 10));
+        }
+    }
+
+    test("first stall after live frames releases after ~2 periods, not 250 ms", async () => {
+        const pacer = await freshPacer();
+        await primeWithFrames(pacer);
+        // Drain the pre-queued permit so the next wait really parks.
+        await pacer.waitForFrameSlot();
+        const t0 = performance.now();
+        await pacer.waitForFrameSlot();
+        const elapsed = performance.now() - t0;
+        expect(elapsed).toBeGreaterThan(25);
+        expect(elapsed).toBeLessThan(180);
+        expect(pacer.getStats().stalledReleases).toBe(1);
+        pacer.stop();
+    });
+
+    test("consecutive stalls with no frame in between fall back to the full 250 ms guard", async () => {
+        const pacer = await freshPacer();
+        await primeWithFrames(pacer);
+        await pacer.waitForFrameSlot();
+        await pacer.waitForFrameSlot();           // short stall; display now presumed dead
+        const t0 = performance.now();
+        await pacer.waitForFrameSlot();           // no rAF since: hidden-tab case
+        const elapsed = performance.now() - t0;
+        expect(elapsed).toBeGreaterThan(200);
+        expect(pacer.getStats().stalledReleases).toBe(2);
+        pacer.stop();
+    });
+});

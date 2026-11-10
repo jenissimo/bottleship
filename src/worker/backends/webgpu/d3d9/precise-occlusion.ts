@@ -32,9 +32,18 @@ return out;
 }`;
 }
 
+// @transient(read-only zeros written to a recycled totals buffer; never mutated)
+const ZERO_TOTAL = new Uint32Array(2);
+
 export class PreciseOcclusion {
     private pipelines = new Map<number, GPUComputePipeline>();
     private totals = new Map<number, GPUBuffer>();
+    /** The counting attachment, reused by every counted pass of its extent: each pass clears it
+     *  (loadOp "clear"), so nothing carries over, while a fresh full-size MSAA texture per pass
+     *  costs the GPU process ~1 ms of allocation each. */
+    private counting: GPUTexture | null = null;
+    /** Retired 8-byte counters, re-zeroed on reuse: one per occlusion interval otherwise. */
+    private spareTotals: GPUBuffer[] = [];
     readonly active = new Set<number>();
     constructor(private device: GPUDevice) {}
     private pipeline(sampleCount: number): GPUComputePipeline {
@@ -65,15 +74,30 @@ if(count != 0u) { atomicAdd(&total[0], count); }
         return pipeline;
     }
     begin(id: number): void {
-        this.totals.get(id)?.destroy();
-        this.totals.set(id, this.device.createBuffer({
-            size: 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-        }));
+        this.recycle(this.totals.get(id));
+        let total = this.spareTotals.pop();
+        // Queue-ordered: the zeroes land after every submitted use of the buffer and before
+        // the submit that counts into it again.
+        if (total) this.device.queue.writeBuffer(total, 0, ZERO_TOTAL);
+        else total = this.device.createBuffer({
+            size: 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        });
+        this.totals.set(id, total);
         this.active.add(id);
     }
+    private recycle(buffer: GPUBuffer | undefined): void {
+        if (!buffer) return;
+        if (this.spareTotals.length < 64) this.spareTotals.push(buffer);
+        else buffer.destroy();
+    }
     target(width: number, height: number, sampleCount = 1): GPUTexture {
-        return this.device.createTexture({size: [width,height],format:"r32float",sampleCount,
+        const cached = this.counting;
+        if (cached && cached.width === width && cached.height === height && cached.sampleCount === sampleCount) return cached;
+        // Earlier uses are all in submitted command buffers: destroy() waits for them.
+        cached?.destroy();
+        this.counting = this.device.createTexture({size: [width,height],format:"r32float",sampleCount,
             usage:GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING});
+        return this.counting;
     }
     reduce(encoder: GPUCommandEncoder, texture: GPUTexture, id: number): void {
         const total = this.totals.get(id);
@@ -88,11 +112,15 @@ if(count != 0u) { atomicAdd(&total[0], count); }
     }
     results(): ReadonlyMap<number,GPUBuffer> { return this.totals; }
     retire(id: number): void {
-        this.totals.get(id)?.destroy();
+        this.recycle(this.totals.get(id));
         this.totals.delete(id);
     }
     destroy(): void {
         for (const buffer of this.totals.values()) buffer.destroy();
         this.totals.clear(); this.active.clear();
+        for (const buffer of this.spareTotals) buffer.destroy();
+        this.spareTotals = [];
+        this.counting?.destroy();
+        this.counting = null;
     }
 }

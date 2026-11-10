@@ -919,6 +919,7 @@ export class Scheduler {
         this.unhandledFaultFired = false;
         this.tlsSlots.clear();
         this.nextTlsIndex = 0;
+        hypercallDataManager.clearTlsSlotsAllocated();
         this.switchRequested = false;
         this.bootstrapUntilFirstWait.clear();
         this.idleAnchorWallMs = 0;
@@ -3756,19 +3757,30 @@ export class Scheduler {
         const index = this.nextTlsIndex;
         this.tlsSlots.add(index);
         this.nextTlsIndex = index + 1;
+        hypercallDataManager.setTlsSlotAllocated(index, true);
         return index;
     }
 
     tlsFree(index: number): boolean {
         if (!this.tlsSlots.has(index)) return false;
         this.tlsSlots.delete(index);
+        hypercallDataManager.setTlsSlotAllocated(index, false);
         for (const t of this.threads.values()) t.tlsValues.delete(index);
+        this.tebManager.clearTlsSlotAllThreads(index);
         return true;
     }
 
     tlsGetValue(index: number): number {
         const t = this.getCurrentThread();
-        return t ? (t.tlsValues.get(index) ?? 0) : 0;
+        if (!t) return 0;
+        return this.tebManager.readTlsSlot(t.id, index) ?? t.tlsValues.get(index) ?? 0;
+    }
+
+    /** Slots 0..63 are stored in the TEB TLS array (shared with the WASM fast paths);
+     *  only what the array cannot hold goes to the thread's map. */
+    private storeTlsValue(threadId: number, thread: Thread, index: number, value: number): void {
+        if (this.tebManager.syncTlsSlot(threadId, index, value)) thread.tlsValues.delete(index);
+        else thread.tlsValues.set(index, value);
     }
 
     tlsIsAllocated(index: number): boolean {
@@ -3778,8 +3790,7 @@ export class Scheduler {
     tlsSetValue(index: number, value: number): boolean {
         const t = this.getCurrentThread();
         if (!t || !this.tlsSlots.has(index)) return false;
-        t.tlsValues.set(index, value >>> 0);
-        this.tebManager.syncTlsSlot(t.id, index, value >>> 0);
+        this.storeTlsValue(t.id, t, index, value >>> 0);
         return true;
     }
 
@@ -3807,9 +3818,7 @@ export class Scheduler {
             memory.fill(0, tlsDataAddr + entry.templateSize, tlsDataAddr + totalSize);
         }
 
-        // Store in thread's TLS values and sync to guest memory
-        thread.tlsValues.set(entry.tlsIndex, tlsDataAddr >>> 0);
-        this.tebManager.syncTlsSlot(threadId, entry.tlsIndex, tlsDataAddr >>> 0);
+        this.storeTlsValue(threadId, thread, entry.tlsIndex, tlsDataAddr >>> 0);
 
         Logger.log(LogCategory.THREAD,
             `  TLS slot ${entry.tlsIndex} (${entry.moduleName}): data=0x${tlsDataAddr.toString(16)} ` +
@@ -3831,7 +3840,9 @@ export class Scheduler {
         const memory = System.getInstance().process?.getCurrentMemory?.();
         if (!memManager || !memory) return;
         for (const [threadId, thread] of this.threads) {
-            if (thread.tlsValues.has(entry.tlsIndex)) continue;
+            // A materialized block is never at 0, so a nonzero array slot means "already has it".
+            const held = this.tebManager.readTlsSlot(threadId, entry.tlsIndex);
+            if (held !== undefined ? held !== 0 : thread.tlsValues.has(entry.tlsIndex)) continue;
             this.materializeTlsEntry(threadId, thread, entry, memory, memManager);
         }
     }

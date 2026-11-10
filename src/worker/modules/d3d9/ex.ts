@@ -38,6 +38,7 @@ import {
     validatePresentExFlags,
 } from './swapchain';
 import { notifyDeviceSubmission } from './query';
+import { registerD3D9ExInheritedFastPaths } from './fast-path';
 import { releaseBindingRef } from './com-refs';
 import { isDxDisplayFormat } from '../../backends/webgpu/shared/dx-format-support';
 import { parsePresentationParameters9, validatePresentationParameters9 } from '../../backends/webgpu/d3d9/presentation';
@@ -91,6 +92,10 @@ function promoteDeviceToEx(devicePtr: number): boolean {
     if (device) device.isExtended = true;
     if (device?.renderTwin) device.renderTwin.isExtended = true;
     extendedDevices.add(key);
+    // The Ex vtable's inherited methods are distinct stubs: bind the base fast paths and WBUF
+    // trampolines to them now that a device actually dispatches through them (once per
+    // dispatcher; see fast-path.ts). Only pure forwarders below are covered.
+    registerD3D9ExInheritedFastPaths(System.getInstance().process?.dispatcher);
     return true;
 }
 
@@ -288,6 +293,11 @@ export function createExExports(base: Record<string, ThunkImplementation> = {}):
     // are genuinely implemented; the descriptor still emits a correctly sized
     // stub for every method, and unimplemented methods retain the global COM
     // E_NOTIMPL behavior.
+    // These pure forwarders are what lets fast-path.ts bind the base fast paths and
+    // WBUF trampolines to the Ex stubs (registerD3D9ExInheritedFastPaths). Overriding
+    // one of the methods it registers (setters, draws, caps queries) below must also
+    // drop it from that inherited pass — tools/tests/d3d9-ex-fast-path.test.ts fails
+    // until it is.
     for (const method of IDirect3D9.methods) {
         const name = `IDirect3D9_${method.name}`;
         const exName = `IDirect3D9Ex_${method.name}`;

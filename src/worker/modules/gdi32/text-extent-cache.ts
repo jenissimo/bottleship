@@ -15,7 +15,7 @@
 /** The slice of the canvas API this needs; a structural type so tests can supply their own. */
 export interface TextMeasurer {
     font: string;
-    measureText(text: string): { width: number; fontBoundingBoxAscent?: number; fontBoundingBoxDescent?: number };
+    measureText(text: string): { width: number; fontBoundingBoxAscent?: number; fontBoundingBoxDescent?: number; actualBoundingBoxLeft: number; actualBoundingBoxRight: number };
 }
 
 interface FontCache {
@@ -23,6 +23,7 @@ interface FontCache {
     /** measure(ab) - advance(a) - advance(b), keyed a * 0x10000 + b. */
     kern: Map<number, number>;
     cellHeight: number | undefined;
+    metrics: MeasuredTextMetrics | undefined;
 }
 
 // @transient(text metrics measured again on demand)
@@ -35,7 +36,7 @@ export function invalidateTextExtentCache(): void {
 function cacheFor(font: string): FontCache {
     let c = caches.get(font);
     if (!c) {
-        c = { advance: new Map(), kern: new Map(), cellHeight: undefined };
+        c = { advance: new Map(), kern: new Map(), cellHeight: undefined, metrics: undefined };
         caches.set(font, c);
     }
     return c;
@@ -84,4 +85,37 @@ export function fontCellHeight(ctx: TextMeasurer): number | undefined {
         c.cellHeight = Math.ceil(m.fontBoundingBoxAscent + m.fontBoundingBoxDescent);
     }
     return c.cellHeight;
+}
+
+/** What GetTextMetrics derives from measuring a font (the rest of TEXTMETRIC is constant). */
+export interface MeasuredTextMetrics { ascent: number; descent: number; aveWidth: number; maxWidth: number }
+
+/**
+ * GetTextMetrics measurement, once per canvas font string. The measurement reads nothing but
+ * the canvas font (its only input), and ~226 measureText calls per GetTextMetrics call made it
+ * the dominant cost of a game that queries metrics per control. `defaults` are returned (and
+ * not cached) when the canvas cannot measure.
+ */
+export function measureTextMetricsCached(ctx: TextMeasurer, defaults: MeasuredTextMetrics): MeasuredTextMetrics {
+    const c = cacheFor(ctx.font);
+    if (c.metrics) return c.metrics;
+    let { ascent, descent, aveWidth, maxWidth } = defaults;
+    try {
+        const m = ctx.measureText('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz');
+        if (m.fontBoundingBoxAscent !== undefined) {
+            ascent = Math.ceil(m.fontBoundingBoxAscent);
+            descent = Math.ceil(m.fontBoundingBoxDescent!);
+        }
+        aveWidth = Math.round(ctx.measureText('x').width);
+        maxWidth = 0;
+        for (let code = 32; code <= 255; code++) {
+            const glyph = ctx.measureText(String.fromCharCode(code));
+            maxWidth = Math.max(maxWidth, Math.ceil(glyph.width),
+                Math.ceil(glyph.actualBoundingBoxLeft + glyph.actualBoundingBoxRight));
+        }
+    } catch {
+        return defaults;
+    }
+    c.metrics = { ascent, descent, aveWidth, maxWidth };
+    return c.metrics;
 }

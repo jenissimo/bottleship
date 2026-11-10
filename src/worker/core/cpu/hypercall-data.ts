@@ -69,6 +69,9 @@ const OFF_HC_RAND_SEED = 0x0B0;
 // authoritative at all times: published at init, on every capture mutation, and on
 // buffer-change resync (rewriteState).
 const OFF_HC_CAPTURE_HWND = 0x0B4;
+/** One byte per TEB TLS-array slot: the scheduler's TlsAlloc set, read by TlsSetValue. */
+const OFF_HC_TLS_ALLOCATED = 0x0B8;
+const HC_TLS_SLOT_COUNT = 64;
 const OFF_HC_DISPATCH_TABLE = 0x100;
 const OFF_HC_DISPATCH_TABLE_EXT = 0x4000;
 const HC_DISPATCH_LIMIT = 0x10000;
@@ -144,6 +147,7 @@ const HANDLER_MEMCMP = 62;
 // the matching ABI (see BULK_MEMORY_HANDLERS below).
 const HANDLER_MEMMOVE = 84;
 const HANDLER_MEMCHR = 85;
+const HANDLER_TLS_SET_VALUE = 86;
 const BULK_MEMORY_HANDLERS = new Set([HANDLER_MEMMOVE, HANDLER_MEMCHR]);
 /** Must match `get_bulk_memory_abi()` in vendor/v86/src/rust/cpu/bulk_memory.rs. */
 const BULK_MEMORY_ABI = 1;
@@ -266,6 +270,9 @@ const HANDLER_MAP: Record<string, number> = {
     // skipped onThunkComplete the same as GetLastError. Hot via the CRT's _getptd().
     'kernel32.getcurrentthreadid': HANDLER_GET_CURRENT_THREAD_ID,
     'kernel32.tlsgetvalue': HANDLER_TLS_GET_VALUE,
+    // TlsSetValue — stores into the TEB TLS array (the scheduler's storage for slots
+    // 0..63). Unallocated and expansion indices fall through to the scheduler.
+    'kernel32.tlssetvalue': HANDLER_TLS_SET_VALUE,
     'kernel32.flsgetvalue': HANDLER_FLS_GET_VALUE,
     // Pointer validation via page probe (EA titles call these per-pointer in hot loops).
     // Read-only probe; falls back to JS on any probe fault (decommit/CoW disambiguation).
@@ -541,6 +548,8 @@ export class HypercallDataManager {
     // that v86.restart() zeroes: without a shadow, a buffer change would silently drop a
     // held capture to 0 and the WASM handler would keep answering 0 forever.
     private captureHwndShadow = 0;
+    // Scheduler's TlsAlloc set, kept so a restart (which zeroes the page) can republish it.
+    private readonly tlsAllocatedShadow = new Uint8Array(HC_TLS_SLOT_COUNT);
 
     private flsValuesFor(tid: number): Uint32Array {
         let v = this.flsValuesByThread.get(tid);
@@ -589,6 +598,7 @@ export class HypercallDataManager {
 
         this.view.setUint32(this.hpBase + OFF_HC_CAPTURE_HWND, this.captureHwndShadow, true);
 
+        this.writeTlsAllocatedState();
         this.writeFlsSharedState();
         this.writeEventMirrorState();
 
@@ -734,6 +744,7 @@ export class HypercallDataManager {
         // Capture owner — JS-owned, WASM never writes it, so the shadow is authoritative.
         this.view.setUint32(this.hpBase + OFF_HC_CAPTURE_HWND, this.captureHwndShadow, true);
 
+        this.writeTlsAllocatedState();
         this.writeFlsSharedState();
         this.writeEventMirrorState(true); // preserve WASM-set signal bits across buffer-change resync
         this.resyncPublishedClockAfterBufferChange();
@@ -748,6 +759,30 @@ export class HypercallDataManager {
                 `[HYPERCALL] Re-synced state after buffer change ` +
                 `(${this.registeredEntries.size} handlers, enabled=true)`);
         }
+    }
+
+    private writeTlsAllocatedState(): void {
+        if (!this.view) return;
+        for (let i = 0; i < HC_TLS_SLOT_COUNT; i++) {
+            this.view.setUint8(this.hpBase + OFF_HC_TLS_ALLOCATED + i, this.tlsAllocatedShadow[i]!);
+        }
+    }
+
+    /** Mirror one scheduler TlsAlloc/TlsFree. Indices past the TEB array are never published,
+     *  so the WASM TlsSetValue declines them. */
+    setTlsSlotAllocated(index: number, allocated: boolean): void {
+        if (index < 0 || index >= HC_TLS_SLOT_COUNT) return;
+        this.tlsAllocatedShadow[index] = allocated ? 1 : 0;
+        this.refreshViews();
+        if (!this.view || this.hpBase === 0) return;
+        this.view.setUint8(this.hpBase + OFF_HC_TLS_ALLOCATED + index, this.tlsAllocatedShadow[index]!);
+    }
+
+    clearTlsSlotsAllocated(): void {
+        this.tlsAllocatedShadow.fill(0);
+        this.refreshViews();
+        if (!this.view || this.hpBase === 0) return;
+        this.writeTlsAllocatedState();
     }
 
     private writeFlsSharedState(): void {

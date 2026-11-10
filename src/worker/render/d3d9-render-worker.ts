@@ -54,7 +54,7 @@ function applyFlags(flags: Record<string, unknown>): void {
 
 async function init(msg: InitMessage): Promise<void> {
     applyFlags(msg.flags);
-    const [{ SplitReplayer }, shared, fastPath, { D3D9Device }, { WebGPUBackend }, { System }, gpuErrors, lifecycle] = await Promise.all([
+    const [{ SplitReplayer }, shared, fastPath, { D3D9Device }, { WebGPUBackend }, { System }, gpuErrors, lifecycle, queryManager] = await Promise.all([
         import("../backends/webgpu/d3d9/split-replay"),
         import("../modules/d3d9/shared-state"),
         import("../modules/d3d9/fast-path"),
@@ -63,7 +63,9 @@ async function init(msg: InitMessage): Promise<void> {
         import("../core/system"),
         import("../core/gpu-error-log"),
         import("../core/gpu/gpu-device-lifecycle"),
+        import("../modules/d3d9/query-manager"),
     ]);
+    queryManager.observeQueryBatchSettled(scheduleQueryResults);
     gpuErrors.setGpuErrorForwarder((kind, site, message) => {
         const key = `${kind}|${site}|${message}`;
         const seen = pendingGpuErrors.get(key);
@@ -182,27 +184,34 @@ function collectQueryResults(): import("./d3d9-remote-state").SplitQueryResult[]
     return out;
 }
 
+// @transient(coalescing flag: true only between a settled batch and the post it queued in the same turn)
+let queryPostScheduled = false;
+
+/** Occlusion/timestamp values land when their readback maps, after the batch retired: each
+ *  settled batch sends what became answerable on its own, off the message chain so replay is
+ *  not held up. Batches settling in one turn share a message; collect() reports a generation
+ *  once, so this and `retired` cannot both carry it. */
+function scheduleQueryResults(): void {
+    if (queryPostScheduled) return;
+    queryPostScheduled = true;
+    queueMicrotask(() => {
+        queryPostScheduled = false;
+        const results = collectQueryResults();
+        if (results.length) post({ type: "queryResults", queryResults: results });
+    });
+}
+
 let queryDrainScheduled = false;
 
-/** Occlusion/timestamp values land when their readback maps, after the batch retired: they go
- *  out on their own as soon as they do, off the message chain so replay is not held up. */
+/** A submit made by an async replay (a twin Present awaiting its frame) can make a generation
+ *  answerable without a readback: collect once those replays settle. */
 function drainQueryReadbacks(): void {
     if (queryDrainScheduled || !replayer) return;
     queryDrainScheduled = true;
-    const twins = [...replayer.twins.values()];
-    void (async () => {
-        let waited = false;
-        try {
-            await replayer!.settled();
-            const flags = await Promise.all(twins.map((t) => t.splitQueriesInflight()));
-            waited = flags.some(Boolean);
-        } finally {
-            queryDrainScheduled = false;
-        }
-        const results = collectQueryResults();
-        if (results.length) post({ type: "queryResults", queryResults: results });
-        if (waited) drainQueryReadbacks();
-    })();
+    void replayer.settled().finally(() => {
+        queryDrainScheduled = false;
+        scheduleQueryResults();
+    });
 }
 
 async function answer(msg: RequestMessage): Promise<void> {

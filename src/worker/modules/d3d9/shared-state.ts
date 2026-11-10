@@ -86,6 +86,20 @@ class DeviceRegistry extends Map<number, D3D9Device> {
 export const devices = new DeviceRegistry();
 
 /**
+ * The setters registered with a guest-side value shadow (fast-path.ts), base name -> the
+ * IDirect3DDevice9Ex spelling. The Ex stubs get their own shadow trampolines and tables; every
+ * owner bind, re-sentinel and tracker write-back that names the base table must name the Ex one
+ * too, or an Ex guest call compares against a stale slot and wrongly skips a needed set.
+ */
+export const D3D9EX_SHADOWED_SETTERS: Readonly<Record<string, string>> = Object.freeze({
+    IDirect3DDevice9_SetRenderState: 'IDirect3DDevice9Ex_SetRenderState',
+    IDirect3DDevice9_SetSamplerState: 'IDirect3DDevice9Ex_SetSamplerState',
+    IDirect3DDevice9_SetTexture: 'IDirect3DDevice9Ex_SetTexture',
+    IDirect3DDevice9_SetVertexShader: 'IDirect3DDevice9Ex_SetVertexShader',
+    IDirect3DDevice9_SetPixelShader: 'IDirect3DDevice9Ex_SetPixelShader',
+});
+
+/**
  * Split D3D9 (modules/d3d9/split.ts): while the render twin replays the call stream, the
  * registries the ring handlers read answer with the twin's objects — the same handler code
  * then drives the twin. Outside a replay they are the front's, as always.

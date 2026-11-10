@@ -218,7 +218,8 @@ export interface Thread {
     // Exit
     exitCode: number | null;
 
-    // TLS
+    // TLS values NOT backed by the TEB TLS array (index >= 64, or no array yet). Slots
+    // 0..63 live in guest memory, where the WASM TlsGetValue/TlsSetValue serve them.
     tlsValues: Map<number, number>;
 
     // Per-thread error
