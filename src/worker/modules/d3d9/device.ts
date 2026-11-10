@@ -44,7 +44,7 @@ const resetRefusalLogged = new Map<string, number>();
 import {
     addComRef, getVTables, devices, createComObject, registerComFinalizer,
     releaseComRef, resourceToDevice, deviceToD3D9, deviceCreationParams,
-    deviceBackBufferInfo,
+    deviceBackBufferInfo, D3D9EX_SHADOWED_SETTERS,
 } from './shared-state';
 import { addBindingRef, adoptBindingRef, releaseBindingRef } from './com-refs';
 import {
@@ -715,11 +715,12 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
                     resetShadow?: (dll: string, fn: string) => void;
                 } | undefined;
                 disp?.setShadowOwner?.(devicePtr);
-                disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetRenderState');
-                disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetSamplerState');
-                disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetTexture');
-                disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetVertexShader');
-                disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetPixelShader');
+                // Base and IDirect3DDevice9Ex tables alike (the Ex ones exist once an Ex
+                // device was created; resetShadow is a no-op for a table that does not).
+                for (const [fn, exFn] of Object.entries(D3D9EX_SHADOWED_SETTERS)) {
+                    disp?.resetShadow?.('d3d9', fn);
+                    disp?.resetShadow?.('d3d9', exFn);
+                }
             } catch { /* non-fatal */ }
 
             // Return device interface pointer

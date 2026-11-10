@@ -107,7 +107,7 @@ import {
 } from "./shader";
 import type { CensusSummary } from "./shader/census";
 import { AlphaTest, alphaTestSnippet } from "./shader/sm-wgsl";
-import { devices as d3d9Devices, noteD3D9TextureUpload, twinStateBlocks } from "../../../modules/d3d9/shared-state";
+import { D3D9EX_SHADOWED_SETTERS, devices as d3d9Devices, noteD3D9TextureUpload, twinStateBlocks } from "../../../modules/d3d9/shared-state";
 import { pixelShaderComObjects, vertexDeclComObjects, vertexShaderComObjects } from "./d3d9-com-objects";
 // renderSpace only: the windowed regime is exactly where the guest picture space and the
 // guest POINTER space stop coinciding, so the verb has to be able to print both.
@@ -2053,10 +2053,9 @@ export class D3D9Device {
             d = (System.getInstance().process?.dispatcher as typeof this.shadowSyncDispatcher) ?? null;
             this.shadowSyncDispatcher = d;
         }
-        for (const fn of ['IDirect3DDevice9_SetRenderState', 'IDirect3DDevice9_SetSamplerState',
-            'IDirect3DDevice9_SetTexture', 'IDirect3DDevice9_SetVertexShader',
-            'IDirect3DDevice9_SetPixelShader']) {
+        for (const [fn, exFn] of Object.entries(D3D9EX_SHADOWED_SETTERS)) {
             d?.resetShadow?.('d3d9', fn);
+            d?.resetShadow?.('d3d9', exFn);
         }
     }
 
@@ -2355,6 +2354,12 @@ export class D3D9Device {
             this.shadowSyncDispatcher = d;
         }
         d?.writeShadowSlot?.('d3d9', funcName, slot, value);
+        // The IDirect3DDevice9Ex setter stubs carry their own shadow tables (bound when the
+        // first Ex device is created, modules/d3d9/fast-path.ts). They get exactly the writes
+        // the base table gets, so either one can be the table a guest call compares against.
+        // A no-op until they exist.
+        const exName = D3D9EX_SHADOWED_SETTERS[funcName];
+        if (exName !== undefined) d?.writeShadowSlot?.('d3d9', exName, slot, value);
     }
 
     private samplerSpecForStage(stage: number): SamplerSpec {
