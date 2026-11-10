@@ -100,6 +100,7 @@ const D3D9_EX_NAMES: D3D9PathNames = { device: 'IDirect3DDevice9Ex', factory: 'I
 
 /** Dispatchers whose Ex stubs already carry the inherited pass (it survives Process.reset()
  *  through the dispatcher's own pending-registration maps, so once per dispatcher is enough). */
+// @transient(keyed by dispatcher identity: a new session's dispatcher is a new key, and a dead one is collected)
 const exInheritedBound = new WeakSet<object>();
 
 export function registerFastPathD3D9Functions(dispatcher: HleDispatcher): void {

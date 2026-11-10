@@ -48,6 +48,7 @@ export interface QueryManagerQueue {
     onSubmittedWorkDone?(): Promise<void>;
 }
 
+// @transient(observers are registered once by the render worker at startup and hold no session data)
 const batchSettledObservers = new Set<() => void>();
 
 /**

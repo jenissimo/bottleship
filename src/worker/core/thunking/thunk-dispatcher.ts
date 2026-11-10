@@ -1783,7 +1783,7 @@ export class ThunkDispatcher {
             out.push({
                 threadId: info.threadId ?? 0, functionId: info.functionId, functionName: info.functionName ?? `#${info.functionId}`,
                 generation: info.asyncParkGeneration ?? 0, esp: info.esp, returnAddr: info.returnAddr,
-                argBytes: this.resolveThunkCleanup(info.functionId, 0, `rewind:${info.functionName ?? ''}`),
+                argBytes: this.resolveThunkCleanup(info.functionId, 0),
                 args: info.stackSnapshot.slice(4),
                 spinAddr: info.spinAddr ?? this.spinLoopAddress, spinBytes: info.originalSpinBytes ?? [0, 0] as [number, number],
             });
@@ -3564,7 +3564,7 @@ export class ThunkDispatcher {
                 Logger.error(LogCategory.THUNK,
                     `SUSPICIOUS: Async thunk ${name} returnAddr 0x${returnAddr.toString(16)} inside THUNK region! ESP=0x${esp.toString(16)}`);
             }
-            const argBytes = this.resolveThunkCleanup(id, 0, `park:${name}`);
+            const argBytes = this.resolveThunkCleanup(id, 0);
             stackSnapshot = mem.slice(esp, Math.min(esp + Math.max(16, 4 + argBytes), mem.length));
         }
 

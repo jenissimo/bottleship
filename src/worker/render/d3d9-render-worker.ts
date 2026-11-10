@@ -184,6 +184,7 @@ function collectQueryResults(): import("./d3d9-remote-state").SplitQueryResult[]
     return out;
 }
 
+// @transient(coalescing flag: true only between a settled batch and the post it queued in the same turn)
 let queryPostScheduled = false;
 
 /** Occlusion/timestamp values land when their readback maps, after the batch retired: each
