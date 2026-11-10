@@ -366,15 +366,36 @@ export class TebManager {
     }
 
     /**
-     * Sync a TLS slot value to guest memory.
+     * Store a TLS slot value in the thread's guest TLS array — the storage for slots
+     * 0..63, shared with the WASM TlsGetValue/TlsSetValue hypercalls. Returns false when
+     * the slot is not array-backed (expansion index, or no array for the thread).
      */
-    syncTlsSlot(threadId: number, index: number, value: number): void {
-        if (index < 0 || index >= TLS_MINIMUM_AVAILABLE) return;
+    syncTlsSlot(threadId: number, index: number, value: number): boolean {
+        if (index < 0 || index >= TLS_MINIMUM_AVAILABLE) return false;
         const tlsAddr = this.tlsArrayMap.get(threadId);
-        if (tlsAddr === undefined) return;
+        if (tlsAddr === undefined) return false;
+        const view = this.getView();
+        if (!view) return false;
+        view.setUint32(tlsAddr + index * 4, value >>> 0, true);
+        return true;
+    }
+
+    /** A TLS slot value from the thread's guest TLS array; undefined when not array-backed. */
+    readTlsSlot(threadId: number, index: number): number | undefined {
+        if (index < 0 || index >= TLS_MINIMUM_AVAILABLE) return undefined;
+        const tlsAddr = this.tlsArrayMap.get(threadId);
+        if (tlsAddr === undefined) return undefined;
+        const view = this.getView();
+        if (!view) return undefined;
+        return view.getUint32(tlsAddr + index * 4, true);
+    }
+
+    /** TlsFree: the slot reads as 0 in every thread when the index is handed out again. */
+    clearTlsSlotAllThreads(index: number): void {
+        if (index < 0 || index >= TLS_MINIMUM_AVAILABLE) return;
         const view = this.getView();
         if (!view) return;
-        view.setUint32(tlsAddr + index * 4, value >>> 0, true);
+        for (const tlsAddr of this.tlsArrayMap.values()) view.setUint32(tlsAddr + index * 4, 0, true);
     }
 
     /**
