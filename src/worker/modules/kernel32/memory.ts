@@ -2487,6 +2487,23 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     address = process.memory.alloc(alignedSize, 'HEAP', perms, ALLOC_GRANULARITY);
                 }
             } else {
+                const claimEnd = address + alignedSize;
+                for (const [size, bases] of vaFreeCache) {
+                    for (let i = bases.length - 1; i >= 0; i--) {
+                        const base = bases[i]!;
+                        if (base >= claimEnd || base + size <= address) continue;
+                        bases.splice(i, 1);
+                        vaCacheBytes -= size;
+                        if (process.memory.getSize(base) === size) freeHeapBlock(process, base);
+                    }
+                }
+                const blocker = process.memory.liveBlockOverlapping?.(address, alignedSize,
+                    (base) => virtualAllocRegions.has(base));
+                if (blocker) {
+                    profiler.end("VirtualAlloc:alloc");
+                    System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
+                    return fail(`range holds the heap block 0x${blocker.addr.toString(16)}+0x${blocker.size.toString(16)}`);
+                }
                 process.memory.allocAt(address, alignedSize, 'HEAP', perms);
             }
         } catch (error) {

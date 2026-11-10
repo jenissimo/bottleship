@@ -886,6 +886,7 @@ export class PELoader {
             // Queue DllMain for bootloader trampoline (runs as x86 code before EXE entry).
             // Runtime LoadLibrary* path can defer this to thunk-dispatcher callback flow.
             if (invokeDllMain && entryPointRVA !== 0) {
+                module.initialized = true;
                 this.pendingDllInits.push({
                     baseAddress,
                     entryPoint: baseAddress + entryPointRVA,
