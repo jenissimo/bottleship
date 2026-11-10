@@ -15,7 +15,7 @@ import { LOGPEN_OFFSETS, LOGPEN_SIZE } from './gdi-objects';
 import { writeBackDibSectionRect, readDibSectionRgbaGeneric } from './bitmap-resolve';
 import { patBlt } from './gdi-blit';
 import { extTextOut } from './ext-text-out';
-import { fontCellHeight, prefixWidths } from './text-extent-cache';
+import { fontCellHeight, measureTextMetricsCached, prefixWidths } from './text-extent-cache';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
 // Track GetPixel HDC usage for profiling
@@ -640,30 +640,12 @@ function writeTextMetrics(hdc: number, lptm: number, mem: Uint8Array): void {
     const dcCtx = gdi.getMeasureContext(hdc);
 
     // Defaults (fallback when no DC / measureText unavailable)
-    let ascent = 13;
-    let descent = 3;
-    let aveWidth = 8;
-    let maxWidth = 12;
+    let { ascent, descent, aveWidth, maxWidth } = { ascent: 13, descent: 3, aveWidth: 8, maxWidth: 12 };
 
     if (dcCtx) {
-        try {
-            const m = dcCtx.measureText('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz');
-            if (m.fontBoundingBoxAscent !== undefined) {
-                ascent   = Math.ceil(m.fontBoundingBoxAscent);
-                descent  = Math.ceil(m.fontBoundingBoxDescent);
-            }
-            aveWidth = Math.round(dcCtx.measureText('x').width);
-            maxWidth = 0;
-            for (let code = 32; code <= 255; code++) {
-                const glyph = dcCtx.measureText(String.fromCharCode(code));
-                maxWidth = Math.max(maxWidth, Math.ceil(glyph.width),
-                    Math.ceil(glyph.actualBoundingBoxLeft + glyph.actualBoundingBoxRight));
-            }
-        } catch (_) {
-            // keep defaults
-        }
+        ({ ascent, descent, aveWidth, maxWidth } = measureTextMetricsCached(
+            dcCtx, { ascent, descent, aveWidth, maxWidth }));
     }
-
     const height = ascent + descent;
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
