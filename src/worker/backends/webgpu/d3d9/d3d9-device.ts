@@ -6717,23 +6717,55 @@ export class D3D9Device {
         return this.scissorRect;
     }
 
+    /** Pre-transformed (XYZRHW / POSITIONT) vertices are already in render-target pixels: D3D
+     *  skips the viewport transform for them and only clips to the viewport rectangle. The RHW
+     *  shader maps against the whole target, so such a draw needs the whole-target viewport and
+     *  the guest viewport as a clip rectangle instead. */
+    private preTransformedViewportClips(w: number, h: number): boolean {
+        const v = this.viewport;
+        if (v.x === 0 && v.y === 0 && v.width === w && v.height === h) return false;
+        return this.activeDeclIsPreTransformed();
+    }
+
+    private rhwDrawViewport = { x: 0, y: 0, width: 0, height: 0, minZ: 0, maxZ: 1 };
+
+    private getViewportForDraw(): { x: number; y: number; width: number; height: number; minZ: number; maxZ: number } {
+        const { w, h } = this.getCurrentTargetSize();
+        if (!this.preTransformedViewportClips(w, h)) return this.viewport;
+        const r = this.rhwDrawViewport;
+        r.width = w; r.height = h;
+        return r;
+    }
+
     /** Snapshot the effective D3D scissor for a draw. WebGPU keeps scissor state on the pass,
      * so disabled draws explicitly receive the full target rectangle to prevent state leakage
      * from a preceding enabled draw. */
     getScissorRectForDraw(): { left: number; top: number; width: number; height: number } {
         const { w, h } = this.getCurrentTargetSize();
-        if (this.getRS(D3DRS_SCISSORTESTENABLE) === 0) {
+        const vpClip = this.preTransformedViewportClips(w, h);
+        if (this.getRS(D3DRS_SCISSORTESTENABLE) === 0 && !vpClip) {
             this.scissorDrawRect.left = 0;
             this.scissorDrawRect.top = 0;
             this.scissorDrawRect.width = Math.max(0, w);
             this.scissorDrawRect.height = Math.max(0, h);
             return this.scissorDrawRect;
         }
-        const scissor = this.effectiveScissorRect();
-        const left = Math.max(0, Math.min(w, scissor.left | 0));
-        const top = Math.max(0, Math.min(h, scissor.top | 0));
-        const right = Math.max(left, Math.min(w, scissor.right | 0));
-        const bottom = Math.max(top, Math.min(h, scissor.bottom | 0));
+        let sl = 0, st = 0, sr = w, sb = h;
+        if (this.getRS(D3DRS_SCISSORTESTENABLE) !== 0) {
+            const scissor = this.effectiveScissorRect();
+            sl = scissor.left | 0; st = scissor.top | 0; sr = scissor.right | 0; sb = scissor.bottom | 0;
+        }
+        if (vpClip) {
+            const v = this.viewport;
+            sl = Math.max(sl, Math.floor(v.x));
+            st = Math.max(st, Math.floor(v.y));
+            sr = Math.min(sr, Math.ceil(v.x + v.width));
+            sb = Math.min(sb, Math.ceil(v.y + v.height));
+        }
+        const left = Math.max(0, Math.min(w, sl));
+        const top = Math.max(0, Math.min(h, st));
+        const right = Math.max(left, Math.min(w, sr));
+        const bottom = Math.max(top, Math.min(h, sb));
         this.scissorDrawRect.left = left;
         this.scissorDrawRect.top = top;
         this.scissorDrawRect.width = right - left;
@@ -7543,7 +7575,7 @@ export class D3D9Device {
             vertexCount: outVerts, startVertex: 0,
             ffpStateIndex,
             scissorRect: this.getScissorRectForDraw(),
-            viewport: this.viewport,
+            viewport: this.getViewportForDraw(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -7802,7 +7834,7 @@ export class D3D9Device {
             bindStateIndex,
             ffpStateIndex,
             scissorRect: this.getScissorRectForDraw(),
-            viewport: this.viewport,
+            viewport: this.getViewportForDraw(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -8125,7 +8157,7 @@ export class D3D9Device {
             bindStateIndex,
             ffpStateIndex,
             scissorRect: this.getScissorRectForDraw(),
-            viewport: this.viewport,
+            viewport: this.getViewportForDraw(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -8502,7 +8534,7 @@ export class D3D9Device {
             bindStateIndex,
             ffpStateIndex,
             scissorRect: this.getScissorRectForDraw(),
-            viewport: this.viewport,
+            viewport: this.getViewportForDraw(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -8806,7 +8838,7 @@ export class D3D9Device {
         cmd.bindStateIndex = bindStateIndex;
         cmd.ffpStateIndex = ffpStateIndex;
         cmd.scissorRect = this.getScissorRectForDraw();
-        cmd.viewport = this.viewport;
+        cmd.viewport = this.getViewportForDraw();
         cmd.stencilReference = this.getRS(D3DRS_STENCILREF) & 0xff;
         cmd.blendConstant = this.getRS(D3DRS_BLENDFACTOR) >>> 0;
         this.commandRecorder.recordDrawIndexed(cmd);
@@ -9133,7 +9165,7 @@ export class D3D9Device {
             prefixVsBits,
             prefixStartFloat: startRegister * 4,
             scissorRect: this.getScissorRectForDraw(),
-            viewport: this.viewport,
+            viewport: this.getViewportForDraw(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -9999,8 +10031,8 @@ export class D3D9Device {
         const ptSize = this.getCurrentTargetSize();
         const preTransformed = this.activeDeclIsPreTransformed()
             ? {
-                viewportWidth: this.viewport.width || ptSize.w,
-                viewportHeight: this.viewport.height || ptSize.h,
+                viewportWidth: this.preTransformedViewportClips(ptSize.w, ptSize.h) ? ptSize.w : this.viewport.width || ptSize.w,
+                viewportHeight: this.preTransformedViewportClips(ptSize.w, ptSize.h) ? ptSize.h : this.viewport.height || ptSize.h,
                 pixelCenterOffset: pixelCenterOffsetPx(this.activeRenderScale()),
             }
             : null;
@@ -10766,8 +10798,8 @@ export class D3D9Device {
         const ptSize = this.getCurrentTargetSize();
         const preTransformed = this.activeDeclIsPreTransformed()
             ? {
-                viewportWidth: this.viewport.width || ptSize.w,
-                viewportHeight: this.viewport.height || ptSize.h,
+                viewportWidth: this.preTransformedViewportClips(ptSize.w, ptSize.h) ? ptSize.w : this.viewport.width || ptSize.w,
+                viewportHeight: this.preTransformedViewportClips(ptSize.w, ptSize.h) ? ptSize.h : this.viewport.height || ptSize.h,
                 pixelCenterOffset: pixelCenterOffsetPx(this.activeRenderScale()),
             }
             : null;
@@ -11418,8 +11450,9 @@ export class D3D9Device {
         // FFP RHW coordinates and the pixel-centre correction are expressed in the
         // active D3D9 viewport; the executor applies the same viewport to the pass.
         // Falling back to the target dimensions only covers a not-yet-initialized state.
-        const w = this.viewport.width || targetSize.w;
-        const h = this.viewport.height || targetSize.h;
+        const rhwFull = this.preTransformedViewportClips(targetSize.w, targetSize.h);
+        const w = rhwFull ? targetSize.w : this.viewport.width || targetSize.w;
+        const h = rhwFull ? targetSize.h : this.viewport.height || targetSize.h;
         // Resolved once and shared: the uniform the shader reads and the census that reports
         // what it could not honor must be looking at the same stages.
         const stageCount = this.activeStageCount();
@@ -11672,8 +11705,9 @@ export class D3D9Device {
             state.psVersion = this.copyConstantPrefixWithKey(state.psBits, state.psBits, psLen);
         } else {
             const targetSize = this.getCurrentTargetSize();
-            const w = this.viewport.width || targetSize.w;
-            const h = this.viewport.height || targetSize.h;
+            const rhwFull = this.preTransformedViewportClips(targetSize.w, targetSize.h);
+            const w = rhwFull ? targetSize.w : this.viewport.width || targetSize.w;
+            const h = rhwFull ? targetSize.h : this.viewport.height || targetSize.h;
             const ffp = this.buildFfpUniformBlock(w, h);
             const stageCount = this.activeStageCount();
             for (let stage = 0; stage < stageCount; stage++) {
