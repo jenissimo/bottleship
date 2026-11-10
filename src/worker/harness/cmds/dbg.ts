@@ -25,6 +25,7 @@ import { d3d9BindingRefStats, d3d9RefcountStorageStats } from "../../modules/d3d
 import { d3d9GuestAddRefStats } from "../../modules/d3d9/guest-addref-stub";
 import { d3d9StateBlockShadowStats } from "../../modules/d3d9/state-block-shadow-window";
 import { d3d9GuestReleaseStats } from "../../modules/d3d9/guest-release-stub";
+import { d3d9StreamRingEnabled } from "../../modules/d3d9/stream-ring";
 import { d3d9PipelineMemoProfileStats, d3d9PipelineMemoStats } from "../../backends/webgpu/d3d9/d3d9-pipeline-memo";
 import type { RegionKind } from "../../core/memory/address-space";
 
@@ -524,7 +525,7 @@ export function registerDbgCommands(svc: HarnessService): void {
             requestedOn: !g.__d3d9NoGuestComStubs,
             requestedVerify: !!g.__d3d9ReleaseStubVerify,
             guestRefcount: !g.__d3d9MirrorRefcount,
-            streamRing: !!g.__d3d9StreamRing,
+            streamRing: d3d9StreamRingEnabled(),
             appliesAt: "next boot (the stub patch has no unpatch path)",
         };
     });
@@ -552,7 +553,7 @@ export function registerDbgCommands(svc: HarnessService): void {
         let ringDisabled = false;
         if (opts.on !== undefined) {
             const on = !!opts.on;
-            if (on && g.__d3d9StreamRing) { g.__d3d9StreamRing = false; ringDisabled = true; }
+            if (on && d3d9StreamRingEnabled()) { g.__d3d9StreamRing = false; ringDisabled = true; }
             g.__d3d9MirrorRefcount = !on;
             g.__d3d9NoGuestComStubs = !on || !!opts.verify;
             g.__d3d9AddRefStubVerify = on && !!opts.verify;
@@ -570,7 +571,7 @@ export function registerDbgCommands(svc: HarnessService): void {
                 addRefStub: !g.__d3d9NoGuestComStubs,
                 releaseStub: !g.__d3d9NoGuestComStubs,
                 verify: !!g.__d3d9AddRefStubVerify || !!g.__d3d9ReleaseStubVerify,
-                streamRing: !!g.__d3d9StreamRing,
+                streamRing: d3d9StreamRingEnabled(),
             },
             ringDisabled,
             appliesAt: "next boot (a patched stub has no unpatch path)",

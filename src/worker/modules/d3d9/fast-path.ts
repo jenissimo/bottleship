@@ -32,6 +32,7 @@ import type { HleDispatcher } from '../../core/thunking/thunk-dispatcher';
 import { isValidAddress } from '../../core/memory/address-guard';
 import { Mem } from '../../core/memory/mem-accessor';
 import { devices, stateBlocks, resourceToDevice, addComRef, isD3D9SplitReplay } from './shared-state';
+import { d3d9StreamRingEnabled } from './stream-ring';
 import { addD3D9ComRef, releaseD3D9ComRef } from './state';
 import { readComRefGuestWord } from './com-refs';
 import { tryFastGetData } from './query';
@@ -716,7 +717,7 @@ function registerD3D9Paths(dispatcher: HleDispatcher, names: D3D9PathNames, inhe
         }, true, 0x1);
 
     // ── SetStreamSource / SetIndices on the ring ─────────────────────────────
-    // OPT-IN: globalThis.__d3d9StreamRing (default off). Registration patches a guest
+    // OPT-OUT: globalThis.__d3d9StreamRing = false (default on). Registration patches a guest
     // stub, so unlike the storage flags this one is read once, at boot — there is no
     // unpatch path, which is why every WBUF kill-switch in this file is boot-time.
     //
@@ -739,7 +740,7 @@ function registerD3D9Paths(dispatcher: HleDispatcher, names: D3D9PathNames, inhe
     // Cost: a deferred setter answers D3D_OK unconditionally, so a guest that checks
     // the HRESULT no longer sees D3DERR_INVALIDCALL for an unknown buffer pointer —
     // the same trade already accepted for SetTexture and SetVertexDeclaration.
-    if ((globalThis as { __d3d9StreamRing?: boolean }).__d3d9StreamRing) {
+    if (d3d9StreamRingEnabled()) {
         // SetStreamSource(this, StreamNumber, pStreamData, OffsetInBytes, Stride)
         dispatcher.registerWriteBufferFunction('d3d9', dev('SetStreamSource'), 5,
             setStreamSourceEntry, true, 0x3);

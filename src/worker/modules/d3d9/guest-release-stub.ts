@@ -46,6 +46,7 @@
 
 import { Logger, LogCategory } from '../../core/logger';
 import { D3D9_COM_REFCOUNT_OFFSET, pinGuestRefcountStore } from './com-refs';
+import { d3d9StreamRingEnabled } from './stream-ring';
 
 const DEFAULT_IFACE = 'IDirect3DTexture9';
 
@@ -63,8 +64,6 @@ interface ReleaseStubFlags {
     __d3d9ReleaseStubVerify?: boolean;
     /** Opt out of the guest block being the count of record — also disables this stub. */
     __d3d9MirrorRefcount?: boolean;
-    /** SetStreamSource/SetIndices deferred onto the WBUF ring. */
-    __d3d9StreamRing?: boolean;
 }
 const flags = globalThis as ReleaseStubFlags;
 
@@ -120,7 +119,7 @@ export function registerGuestReleaseStub(dispatcher: unknown, iface: string = DE
             'so the stub would decrement a word nobody reads');
         return;
     }
-    if (RING_BARRIER_INTERFACES.has(iface) && flags.__d3d9StreamRing) {
+    if (RING_BARRIER_INTERFACES.has(iface) && d3d9StreamRingEnabled()) {
         Logger.error(LogCategory.D3D9,
             `guest Release stub REFUSED for ${iface}: __d3d9StreamRing defers SetStreamSource/` +
             'SetIndices and relies on this Release being the OUT trap that drains the ring first');
