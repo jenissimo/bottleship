@@ -61,12 +61,20 @@ const DEFAULT_SCREEN_BACKGROUND = { r: 0, g: 0, b: 0, a: 1 };
 // Standard display modes reported by EnumDisplayModes.
 // Covers common Win95/98-era resolutions at 8, 16, and 32 bpp.
 const DEFAULT_DISPLAY_MODE_SPECS: Array<Omit<DisplayModeConfig, "refreshRate">> = [
-    // 8bpp (256 color) modes — required by many DOS-era ports and older DDraw games
+    // 8bpp (256 color) modes — required by many DOS-era ports and older DDraw games.
+    // Every 16bpp size is here too: an 8bpp title falls back when the larger mode it
+    // offers is not enumerated (RollerCoaster Tycoon turns 1024x768 into 800x600).
     { width: 320, height: 200, bpp: 8 },
     { width: 320, height: 240, bpp: 8 },
+    { width: 512, height: 384, bpp: 8 },
     { width: 640, height: 400, bpp: 8 },
     { width: 640, height: 480, bpp: 8 },
     { width: 800, height: 600, bpp: 8 },
+    { width: 1024, height: 768, bpp: 8 },
+    { width: 1152, height: 864, bpp: 8 },
+    { width: 1280, height: 960, bpp: 8 },
+    { width: 1280, height: 1024, bpp: 8 },
+    { width: 1600, height: 1200, bpp: 8 },
     // 16bpp modes — the sweet spot for most late-90s 3D games
     { width: 320, height: 200, bpp: 16 },
     { width: 320, height: 240, bpp: 16 },
