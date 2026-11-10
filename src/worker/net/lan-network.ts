@@ -61,9 +61,11 @@ export interface LanState {
     tcpHostListenV1?: TcpHostListenCapability;
 }
 const EPHEMERAL = [[0x4000, 0x7fff], [49152, 65535], [49152, 65535], [49152, 65535], [49152, 65535], [49152, 65535], [1, 256], [1, 256]];
+/** Guests draw their address from one /24 (10.1.0.1-254): some LAN lobbies compare the host's address with their
+ *  own and refuse a peer outside the same /24, and a home LAN presents exactly that. */
 function randomNode(): Uint8Array {
-    const node = new Uint8Array([2, 0, 0, 0, 0, 0]);
-    do { crypto.getRandomValues(node.subarray(3)); } while (!isLanNode(node));
+    const node = new Uint8Array([2, 0, 0, 1, 0, 0]);
+    do { crypto.getRandomValues(node.subarray(5)); } while (node[5] === 0 || node[5] === 255);
     return node;
 }
 export class LanNetwork {
