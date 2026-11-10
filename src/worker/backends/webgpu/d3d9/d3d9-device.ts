@@ -5741,7 +5741,7 @@ export class D3D9Device {
             for (let row = 0; row < 4; row++) {
                 for (let col = 0; col < 4; col++) {
                     let v = 0;
-                    for (let k = 0; k < 4; k++) v += current[row * 4 + k]! * matrix[k * 4 + col]!;
+                    for (let k = 0; k < 4; k++) v += matrix[row * 4 + k]! * current[k * 4 + col]!;
                     result[row * 4 + col] = v;
                 }
             }
