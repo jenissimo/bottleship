@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, it, expect } from 'bun:test';
 import { ThunkDispatcher } from '../../src/worker/core/thunking/thunk-dispatcher';
 import { Logger } from '../../src/worker/core/logger';
+import { stubRegistry } from '../../src/worker/core/diagnostics/stub-registry';
 import { preemptionManager } from '../../src/worker/core/cpu/preemption-manager';
 import { System } from '../../src/worker/core/system';
 import { ThunkBoundaryKind } from '../../src/worker/core/scheduler/types';
@@ -347,7 +348,7 @@ describe('ThunkDispatcher.resolveThunkCleanup (sync + async cleanup)', () => {
     it('returns the cached stackCleanupTable value when present (authoritative)', () => {
         const d = mkDispatcher();
         d.stackCleanupTable[42] = 16;
-        expect(d.resolveThunkCleanup(42, 99, 'test')).toBe(16);
+        expect(d.resolveThunkCleanup(42, 99)).toBe(16);
     });
 
     it('treats cleanup 0 (cdecl / RET) as a valid cached value, not a miss', () => {
@@ -355,29 +356,29 @@ describe('ThunkDispatcher.resolveThunkCleanup (sync + async cleanup)', () => {
         d.stackCleanupTable[7] = 0;
         // Stub decode so a miss would be detectable; it must NOT be consulted.
         d.decodeThunkStubCleanupById = () => 0xbad;
-        expect(d.resolveThunkCleanup(7, 4, 'test')).toBe(0);
+        expect(d.resolveThunkCleanup(7, 4)).toBe(0);
     });
 
     it('falls back to argCount*4 when neither cache nor stub decode resolves', () => {
         const d = mkDispatcher();
         d.stackCleanupTable[100] = -1;       // cache miss
         d.decodeThunkStubCleanupById = () => -1; // decode miss
-        expect(d.resolveThunkCleanup(100, 5, 'test')).toBe(20);
-        expect(d.resolveThunkCleanup(100, -1, 'test')).toBe(0); // unknown argCount -> 0
+        expect(d.resolveThunkCleanup(100, 5)).toBe(20);
+        expect(d.resolveThunkCleanup(100, -1)).toBe(0); // unknown argCount -> 0
     });
 
     it('prefers stub decode over the argCount fallback on a cache miss', () => {
         const d = mkDispatcher();
         d.stackCleanupTable[101] = -1;
         d.decodeThunkStubCleanupById = () => 12;
-        expect(d.resolveThunkCleanup(101, 99, 'test')).toBe(12);
+        expect(d.resolveThunkCleanup(101, 99)).toBe(12);
     });
 
     it('skips the cache for out-of-range function ids', () => {
         const d = mkDispatcher();
         d.decodeThunkStubCleanupById = () => -1;
-        expect(d.resolveThunkCleanup(0, 3, 'test')).toBe(12);   // id 0 -> no cache, fallback 3*4
-        expect(d.resolveThunkCleanup(MAX, 2, 'test')).toBe(8);  // id >= MAX -> no cache, fallback 2*4
+        expect(d.resolveThunkCleanup(0, 3)).toBe(12);   // id 0 -> no cache, fallback 3*4
+        expect(d.resolveThunkCleanup(MAX, 2)).toBe(8);  // id >= MAX -> no cache, fallback 2*4
     });
 });
 
@@ -933,5 +934,67 @@ describe('ThunkDispatcher — a fast path that grows guest memory is caught, not
         expect(errors.some(e => e.includes('FAST PATH GREW GUEST MEMORY') && e.includes('test:GrowsMemory'))).toBe(true);
         // And the cache is re-derived, so the NEXT dispatch is not handed the dead view.
         expect(d.cachedMem8!.length).toBe(replacement.length);
+    });
+});
+
+describe('ThunkDispatcher - implementation-lookup miss cache', () => {
+    function mkMissFixture(stubName: string) {
+        const d = mkDispatcher();
+        const { dv } = bindMemory(d);
+        const id = 0x1000;
+        const cpu = { reg32: d.cachedReg32Raw, instruction_pointer: d.cachedIpRaw, flags: d.cachedFlagsRaw };
+        cpu.reg32[4] = 0x1000;
+        dv.setUint32(0x1000, 0x00401000, true);
+        d.cachedCpu = cpu;
+        d.namesTable[id] = 'kernel32:' + stubName;
+        d.argCountsTable[id] = 0;
+        d.stackCleanupTable[id] = 0;
+        const stub = { dllName: 'kernel32', functionName: stubName, functionId: id, argCount: 0, stackCleanupBytes: 0 };
+        let scans = 0;
+        d.thunkGenerator = {
+            getStubById: () => stub,
+            getAllStubs: () => { scans++; return [stub]; },
+            findStubsByName: () => [],
+        };
+        d.markHleRegistrationComplete();
+        d.validateReturnAddrFast = () => true;
+        d.ensureScheduler = () => ({
+            isThreadExitId: () => false, getCurrentThreadId: () => 1, getCurrentThread: () => null,
+            setLastError: () => {}, onThunkBoundary: () => {},
+        });
+        return { d, id, cpu, getScans: () => scans };
+    }
+
+    let originalProcess: typeof System.prototype.process;
+    beforeEach(() => { originalProcess = System.getInstance().process; System.getInstance().process = null; stubRegistry.clear(); });
+    afterEach(() => { System.getInstance().process = originalProcess; });
+
+    it('skips the full stub scan on repeat misses, still counts each call, and sees a late registration', () => {
+        const { d, id, cpu, getScans } = mkMissFixture('LateImpl');
+        d._handlePortWriteSlow(id, true);
+        const scansAfterFirst = getScans();
+        expect(scansAfterFirst).toBeGreaterThan(0);
+        d._handlePortWriteSlow(id, true);
+        expect(getScans()).toBe(scansAfterFirst);
+        expect(stubRegistry.list().find((h: any) => h.func === 'LateImpl' || h.functionName === 'LateImpl')?.count).toBe(2);
+
+        // Late registration of the same name (deferred: register() finds no stub).
+        d.register('kernel32', 'LateImpl', () => 0x1234);
+        cpu.reg32[4] = 0x1000;
+        d._handlePortWriteSlow(id, true);
+        expect(cpu.reg32[0] >>> 0).toBe(0x1234);
+        expect(stubRegistry.list().find((h: any) => h.func === 'LateImpl' || h.functionName === 'LateImpl')?.count).toBe(2);
+    });
+
+    it('throttles the full UNIMPLEMENTED log to 8 calls per id but keeps accounting', () => {
+        const { d, id } = mkMissFixture('NoisyImpl');
+        let unimpl = 0;
+        const orig = Logger.unimplemented;
+        (Logger as any).unimplemented = () => { unimpl++; };
+        try {
+            for (let i = 0; i < 20; i++) d._handlePortWriteSlow(id, true);
+        } finally { (Logger as any).unimplemented = orig; }
+        expect(unimpl).toBe(8);
+        expect(stubRegistry.list().find((h: any) => h.func === 'NoisyImpl' || h.functionName === 'NoisyImpl')?.count).toBe(20);
     });
 });
