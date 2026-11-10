@@ -39,8 +39,10 @@ function harness() {
     const dispatcher = {
         registerQueuePayloadHandler: () => -2,
         enqueuePayloadById: (_id: number, h0: number, h1: number, _h2: number, _h3: number,
-            src: Uint8Array, off: number, len: number) => {
-            const bytes = src.slice(off, off + len);
+            src: Uint8Array, off: number, len: number, tail: Uint8Array | null = null) => {
+            const bytes = new Uint8Array(len + (tail ? tail.length : 0));
+            bytes.set(src.subarray(off, off + len));
+            if (tail) bytes.set(tail, len);
             const d = new SplitDecoder(bytes, 0, bytes.length, noRefs);
             const result = d.value();
             const argc = d.value() as number;
