@@ -887,7 +887,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const lpString = args[3];
         const c = args[4];
 
-        const text = Marshaler.readString(mem, lpString).substring(0, c);
+        const text = Marshaler.readStringN(mem, lpString, c);
         Logger.verbose(LogCategory.GDI32, `TextOutA: '${text}' at (${x},${y})`);
 
         const success = System.getInstance().gdiContext.textOut(hdc, x, y, text);
@@ -2031,7 +2031,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const lpString = args[1];
         const c = args[2];
         const lpsz = args[3];
-        const text = Marshaler.readString(mem, lpString).substring(0, c);
+        const text = Marshaler.readStringN(mem, lpString, c);
         Logger.verbose(LogCategory.GDI32, `GetTextExtentPointA: '${text}'`);
         if (lpsz) {
             measureTextExtent(hdc, text, lpsz, mem);
@@ -2044,7 +2044,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const lpString = args[1];
         const c = args[2];
         const lpSize = args[3];
-        const text = Marshaler.readString(mem, lpString).substring(0, c);
+        const text = Marshaler.readStringN(mem, lpString, c);
         Logger.verbose(LogCategory.GDI32, `GetTextExtentPoint32A: hdc=0x${hdc.toString(16)}, '${text}', len=${c}`);
         if (lpSize) {
             measureTextExtent(hdc, text, lpSize, mem);
@@ -2073,7 +2073,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const lpnFit = args[4];
         const lpDx = args[5];
         const lpSize = args[6];
-        const text = Marshaler.readString(mem, lpString).substring(0, cchString);
+        const text = Marshaler.readStringN(mem, lpString, cchString);
         const gdi = System.getInstance().gdiContext;
         const dcCtx = gdi.getMeasureContext(hdc);
 
