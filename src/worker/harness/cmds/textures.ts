@@ -147,7 +147,8 @@ export function registerTextureCommands(svc: HarnessService): void {
                 surfacePtr: "0x" + ((s.surfacePtr ?? 0) >>> 0).toString(16),
             });
         }
-        return { ddraw: ddrawSurfaces, d3d9, d3d8 };
+        const ddrawHandles = ddraw()?.getGpuTexturesInfo?.() ?? [];
+        return { ddraw: ddrawSurfaces, ddrawHandles, d3d9, d3d8 };
     });
 
     /** surfaceOps({arm}) — arm the DDraw composition-op ring for the next `arm` ops;

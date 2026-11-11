@@ -427,6 +427,7 @@ export type RecordDrawCallParams = {
     vertexSourceValid?: boolean;
     rtState: DirectDrawSurfaceState;
     texStateObj: DirectDrawSurfaceState | null;
+    textureHandle?: number;
     texStateObj1: DirectDrawSurfaceState | null;
     stageTextures?: readonly (DirectDrawSurfaceState | null)[] | null;
     renderStates: Int32Array | Uint32Array | number[];
@@ -583,6 +584,7 @@ export function recordDrawCall(p: RecordDrawCallParams): void {
 
     // Build tex0 info
     const tex0 = p.texStateObj ? {
+        handle: p.textureHandle,
         surfacePtr: p.texStateObj.surfacePtr,
         width: p.texStateObj.width,
         height: p.texStateObj.height,
