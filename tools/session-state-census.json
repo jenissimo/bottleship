@@ -223,9 +223,6 @@
     "methods",
     "pathMethods"
   ],
-  "src/worker/core/com/apartment.ts": [
-    "comApartments"
-  ],
   "src/worker/core/com/base-com-object.ts": [
     "static ComObjectFactory.registry"
   ],
@@ -1197,10 +1194,6 @@
   ],
   "src/worker/modules/msvfw32.ts": [
     "nextDrawDibHandle"
-  ],
-  "src/worker/modules/ole32.ts": [
-    "BF_P_INIT",
-    "BF_S_INIT"
   ],
   "src/worker/modules/oleaut32-safearray.ts": [
     "createSafeArrayExports.owned"

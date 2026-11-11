@@ -20,6 +20,7 @@ export const PARTICIPANT_IDS = [
     'comctl32',
     'gdi32',
     'gdi32-palettes',
+    'ole32',
     'ddraw',
     'winmm',
     'dplayx',
