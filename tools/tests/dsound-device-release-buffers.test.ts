@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { DSound } from "../../src/worker/modules/dsound/dsound";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
+import { createSinkBuffer, soundReference } from "../../src/worker/modules/dmusic-sink";
 
 // Need for Speed: Underground restarts its sound system on every mode change (boot ->
 // menu -> race -> results): its mixer thread exits, it Releases its IDirectSound object
@@ -158,7 +159,7 @@ function rig() {
         expect(call("idirectsoundbuffer8_play", mix, 0, 0, DSBPLAY_LOOPING)).toBe(DS_OK);
         return { device, primary, mix };
     };
-    return { ds, call, render, pump, startSoundSystem };
+    return { ds, call, render, pump, startSoundSystem, process };
 }
 
 describe("DirectSound buffers die with the device object that created them", () => {
@@ -204,6 +205,25 @@ describe("DirectSound buffers die with the device object that created them", () 
         expect(t.render(100)).toBeGreaterThan(0.3);
         expect(t.call("IDirectSound8_Release", race.device)).toBe(0);
         expect(t.render(200)).toBe(0);
+    });
+
+    // Empires: Dawn of the Modern World calls IDirectMusicPerformance8::InitAudio without a
+    // DirectSound object, so DirectMusic makes a private device for its sink buffer. That
+    // device used to be released right after the buffer was created; once a device's last
+    // Release destroyed its buffers, the sink's GetCaps failed, InitAudio returned E_FAIL
+    // and the game called abort().
+    test("a DirectMusic sink buffer on a private device lives until its own last release", () => {
+        const t = rig();
+        const proc = { ...t.process, getModule: (name: string) => (name === "dsound" ? t.ds : undefined) } as any;
+        const buf = createSinkBuffer(proc, 0, 2, 22050);
+        expect(buf).not.toBe(0);
+        expect(t.call("idirectsoundbuffer8_getcaps", buf, OUT + 32)).toBe(DS_OK);
+        expect(t.call("idirectsoundbuffer8_play", buf, 0, 0, DSBPLAY_LOOPING)).toBe(DS_OK);
+        // The buffer's last release takes the private device with it.
+        const devices = () => (t.ds as any).objects.size as number;
+        const before = devices();
+        soundReference(proc, buf, true, false);
+        expect(devices()).toBeLessThan(before - 1);
     });
 
     test("a device that still has references keeps its buffers", () => {
