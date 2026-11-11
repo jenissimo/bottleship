@@ -102,7 +102,6 @@ export class Ole32 implements IModule {
     private objectAddressMap: Map<number, BaseComObject> = new Map();
 
     captureSavestate(): Ole32State {
-        if (this.objectAddressMap.size > 0) throw new Error('ole32: an object-address mapping is not part of a v1 savestate');
         const sizes = new Uint32Array(this.taskMemSizes.size * 2);
         let i = 0;
         for (const [address, bytes] of this.taskMemSizes) { sizes[i++] = address; sizes[i++] = bytes; }
@@ -124,13 +123,13 @@ export class Ole32 implements IModule {
     restoreSavestate(s: Ole32State): void {
         this.mallocObjAddr = 0;
         if (s.mallocObjAddr) {
-            if (!this.installTaskMalloc()) throw new Error('ole32: the IMalloc handlers could not be installed');
+            const vtableAddr = Mem.readUint32(s.mallocObjAddr) ?? 0;
+            if (!vtableAddr || !this.installTaskMalloc(vtableAddr)) throw new Error('ole32: the IMalloc handlers could not be installed');
             this.mallocObjAddr = s.mallocObjAddr;
         }
         this.blowfishVtableAddr = 0;
         if (s.blowfishVtableAddr) {
-            if (!this.installBlowfishVtable()) throw new Error('ole32: the Blowfish handlers could not be installed');
-            this.blowfishVtableAddr = s.blowfishVtableAddr;
+            if (!this.installBlowfishVtable(s.blowfishVtableAddr)) throw new Error('ole32: the Blowfish handlers could not be installed');
         }
         this.guidState = s.guidState;
         this.guidCounter = s.guidCounter;
@@ -798,7 +797,7 @@ export class Ole32 implements IModule {
         return this.mallocObjAddr;
     }
 
-    private installTaskMalloc(): InstalledComVtable | null {
+    private installTaskMalloc(existingVtableAddr?: number): InstalledComVtable | null {
         const handlers: Record<string, ThunkImplementation> = {
             Malloc_QueryInterface: (ctx, mem, args) => {
                 const riid = args[1] >>> 0;
@@ -871,6 +870,7 @@ export class Ole32 implements IModule {
             methods,
             handlers,
             logLabel: "IMalloc",
+            existingVtableAddr,
         });
     }
 
@@ -1348,7 +1348,7 @@ export class Ole32 implements IModule {
         return bytes;
     }
 
-    private installBlowfishVtable(): boolean {
+    private installBlowfishVtable(existingVtableAddr?: number): boolean {
         // Register Blowfish thunk implementations
         this.exports["BF_QueryInterface"] = (ctx, m, args) => {
             const thisPtr = args[0];
@@ -1461,6 +1461,7 @@ export class Ole32 implements IModule {
             methods: bfMethods,
             handlers: bfHandlers,
             logLabel: "Blowfish",
+            existingVtableAddr,
         });
         if (!installed) return false;
         this.blowfishVtableAddr = installed.vtableAddr;

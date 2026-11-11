@@ -4,9 +4,9 @@ import { Ole32, OLE32_FIELDS, type Ole32State } from "../../src/worker/modules/o
 import { comApartments } from "../../src/worker/core/com/apartment";
 import { ThunkGenerator, type ThunkGeneratorState } from "../../src/worker/core/thunking/thunk-generator";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
-import { CaptureRefusal } from "../../src/worker/savestate/object-codecs";
 import { savestateParticipants } from "../../src/worker/savestate/participant";
 import { System } from "../../src/worker/core/system";
+import { comVtableOwner, registerComVtableOwner } from "../../src/worker/core/com/com-memory";
 
 const bytes = (v: unknown) => {
     const e = encodeValue(v as SaveValue);
@@ -18,7 +18,7 @@ type Internals = Record<string, unknown> & { exports: Record<string, Handler> };
 
 let memory: Uint8Array;
 
-interface Booted { ole: Ole32 & Internals; handlers: Map<string, Record<string, Handler>>; generator: ThunkGenerator }
+interface Booted { ole: Ole32 & Internals; handlers: Map<string, Record<string, Handler>>; generator: ThunkGenerator; allocs: () => number }
 
 function boot(thunks?: ThunkGeneratorState, heapStart = 0x100000): Booted {
     let next = heapStart;
@@ -26,7 +26,8 @@ function boot(thunks?: ThunkGeneratorState, heapStart = 0x100000): Booted {
     generator.setBaseAddress(0x1000);
     if (thunks) generator.restoreState(thunks);
     const handlers = new Map<string, Record<string, Handler>>();
-    const alloc = (size: number) => { const p = next; next += (Math.max(4, size) + 3) & ~3; return p; };
+    let allocs = 0;
+    const alloc = (size: number) => { allocs++; const p = next; next += (Math.max(4, size) + 3) & ~3; return p; };
     const ole = new Ole32() as Ole32 & Internals;
     ole.process = {
         memory: { alloc, allocAt: () => undefined, allocSystemBlock: alloc, freeSystemBlock: () => undefined },
@@ -34,7 +35,7 @@ function boot(thunks?: ThunkGeneratorState, heapStart = 0x100000): Booted {
         thunkGenerator: generator,
         getCurrentMemory: () => memory,
     };
-    return { ole, handlers, generator };
+    return { ole, handlers, generator, allocs: () => allocs };
 }
 
 function used(): Booted {
@@ -153,20 +154,58 @@ describe("ole32 participant", () => {
         expect((b.ole.blowfishInstances as Map<number, unknown>).size).toBe(0);
     });
 
+    test("a restore binds the saved IMalloc and Blowfish vtables without allocating", () => {
+        const a = used();
+        const malloc = (a.ole.ensureTaskMalloc as (m: Uint8Array) => number)(memory);
+        const blowfish = (a.ole.createBlowfishObject as (m: Uint8Array, v: DataView, ppv: number) => number)(memory, new DataView(memory.buffer), 0);
+        const mallocVtable = Mem.readUint32(malloc)!;
+        const blowfishVtable = Mem.readUint32(blowfish)!;
+        const saved = structuredClone(a.ole.captureSavestate());
+        const thunks = structuredClone(a.generator.captureState());
+        expect(saved.blowfishVtableAddr).toBe(blowfishVtable);
+        registerComVtableOwner(mallocVtable, "stale");
+        registerComVtableOwner(blowfishVtable, "stale");
+        const image = memory.slice();
+
+        for (let load = 0; load < 2; load++) {
+            comApartments.reset();
+            const b = boot(thunks, 0x200000);
+            b.ole.restoreSavestate(structuredClone(saved));
+            expect(b.allocs()).toBe(0);
+            expect(b.handlers.has("ole32_imalloc")).toBe(true);
+            expect(b.handlers.has("ole32_blowfish")).toBe(true);
+            expect(comVtableOwner(mallocVtable)).toBe("ole32_imalloc");
+            expect(comVtableOwner(blowfishVtable)).toBe("ole32_blowfish");
+            expect(comVtableOwner(0x200000)).toBe("unknown");
+            expect(b.ole.blowfishVtableAddr).toBe(blowfishVtable);
+            expect(bytes(b.ole.captureSavestate())).toBe(bytes(saved));
+            expect(memory).toEqual(image);
+            registerComVtableOwner(mallocVtable, "stale");
+            registerComVtableOwner(blowfishVtable, "stale");
+        }
+    });
+
+    test("a saved vtable that does not hold the restored stubs is not bound", () => {
+        const a = used();
+        const malloc = (a.ole.ensureTaskMalloc as (m: Uint8Array) => number)(memory);
+        const saved = structuredClone(a.ole.captureSavestate());
+        const thunks = structuredClone(a.generator.captureState());
+        Mem.writeUint32(Mem.readUint32(malloc)! + 12, 0xdead0000);
+        expect(() => boot(thunks, 0x200000).ole.restoreSavestate(saved)).toThrow("IMalloc handlers could not be installed");
+    });
+
     test("a Blowfish state of the wrong size is not restored", () => {
         const saved = used().ole.captureSavestate();
         saved.blowfishInstances = [[0x700000, 1, new Uint32Array(4)]];
         expect(() => boot().ole.restoreSavestate(saved)).toThrow("Blowfish state of 4 words");
     });
 
-    test("the registered participant covers ole32, refuses with a CaptureRefusal and has a pinned schema", () => {
+    test("the registered participant covers ole32 and has a pinned schema", () => {
         const { ole } = used();
         const undo = ole.registerSavestate();
         try {
             expect(savestateParticipants.coveredModules().has("ole32")).toBe(true);
             expect(savestateParticipants.schemas().ole32).toEqual({ version: 1, schemaHash: "4e3faea6b65bd84e" });
-            (ole.objectAddressMap as Map<number, unknown>).set(1, {});
-            expect(() => savestateParticipants.all().find(p => p.id === "ole32")!.capture({} as never)).toThrow(CaptureRefusal);
         } finally {
             undo();
         }

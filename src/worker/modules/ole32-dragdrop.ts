@@ -69,6 +69,12 @@ export class DragDropRegistry {
      * re-enter OLE32, and reset must not leave registrations reachable after a
      * process reset even if that happens.
      */
+    reset(): void {
+        const targets = [...this.registrations.values()];
+        this.registrations.clear();
+        for (const dropTarget of targets) this.options.release(dropTarget);
+    }
+
     captureState(): Array<[number, number]> {
         return [...this.registrations];
     }
@@ -76,11 +82,5 @@ export class DragDropRegistry {
     restoreState(rows: ReadonlyArray<readonly [number, number]>): void {
         this.registrations.clear();
         for (const [hwnd, dropTarget] of rows) this.registrations.set(hwnd, dropTarget);
-    }
-
-    reset(): void {
-        const targets = [...this.registrations.values()];
-        this.registrations.clear();
-        for (const dropTarget of targets) this.options.release(dropTarget);
     }
 }
