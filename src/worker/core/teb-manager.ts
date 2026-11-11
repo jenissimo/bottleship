@@ -99,6 +99,10 @@ interface MemoryManager {
     alloc(size: number, kind?: string, perms?: string): number;
 }
 
+interface MemoryReleaser {
+    free(ptr: number): void;
+}
+
 export class TebManager {
     private pebAddress: number = 0;
     private processParametersAddress: number = 0;           // RTL_USER_PROCESS_PARAMETERS
@@ -405,11 +409,19 @@ export class TebManager {
     }
 
     /**
-     * Free a thread's TEB (just removes from tracking; memory freed by process cleanup).
+     * Give a reaped thread's TEB and TLS array back to the allocator. The entries leave both
+     * maps first, so the walks over them (clearTlsSlotAllThreads, syncLastError, …) can never
+     * reach a block the allocator may already have handed to someone else, and a second call
+     * for the same thread frees nothing. Returns whether anything was released.
      */
-    freeTeb(threadId: number): void {
+    releaseTeb(threadId: number, memory: MemoryReleaser): boolean {
+        const teb = this.tebMap.get(threadId);
+        const tls = this.tlsArrayMap.get(threadId);
         this.tebMap.delete(threadId);
         this.tlsArrayMap.delete(threadId);
+        if (tls !== undefined) memory.free(tls);
+        if (teb !== undefined) memory.free(teb);
+        return teb !== undefined || tls !== undefined;
     }
 
     /**

@@ -2447,8 +2447,37 @@ export class Scheduler {
         // and the gate walks the live threads for a foreign ESP in this span.
         this.releaseStack(thread);
         if (this.ownedStackBases.has(thread.stackBase >>> 0)) return false;
+        if (!this.releaseTeb(thread)) return false;
         this.threads.delete(threadId);
         this.stackSpanIndex = null;
+        return true;
+    }
+
+    /**
+     * Give a reaped thread's TEB and TLS array back, at the same point and behind the same
+     * gates as its stack (tryReap runs this only once the stack is out): NT frees the TEB at
+     * thread teardown too. Still held (false = retry on a later pass) while FS or the
+     * hypercall page still name this TEB — the guest has not left the context. Kept for
+     * good: the main thread's, and every TEB once the process is exiting, so the exit report
+     * and post-mortem diagnostics read what they always did.
+     * Nothing runs in a dead thread after terminateThread (no DLL_THREAD_DETACH or FLS
+     * callbacks are delivered) and its SEH state keyed by TEB address is cleared there. The
+     * kernel object outlives the record for GetExitCodeThread/waits, which need no TEB; its
+     * ThreadBasicInformation TebBaseAddress becomes 0 here, as NT clears Tcb.Teb when it
+     * deletes the TEB — the freed address may already be another thread's TEB.
+     */
+    private releaseTeb(thread: Thread): boolean {
+        const teb = thread.tebAddress >>> 0;
+        if (teb === 0 || thread.id === this.mainThreadId || System.getInstance().isExiting) return true;
+        const cpu = this.getCpu();
+        const fsBase = cpu ? (cpuViews(cpu).segmentOffsets[4] ?? 0) >>> 0 : 0;
+        if (fsBase === teb || hypercallDataManager.readTebBase() === teb) return false;
+        const memory = this.process?.memory;
+        if (!memory) return true;
+        if (this.tebManager.releaseTeb(thread.id, memory)) {
+            const kobj = thread.kernelObject ?? this.resourceProvider.getKernelObject(thread.handle) as KernelThreadObject | null;
+            if (kobj?.kind === 'thread' && kobj.basicInformation) kobj.basicInformation = { ...kobj.basicInformation, tebAddress: 0 };
+        }
         return true;
     }
 

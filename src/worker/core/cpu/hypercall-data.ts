@@ -1607,6 +1607,14 @@ export class HypercallDataManager {
         }
     }
 
+    /** The TEB the WASM fast paths currently resolve TLS/LastError through (0 = none). */
+    readTebBase(): number {
+        if (!this.initialized || !this.view) return 0;
+        this.refreshViews();
+        if (!this.view) return 0;
+        return this.view.getUint32(this.hpBase + OFF_HC_TEB_BASE, true);
+    }
+
     /** Read lastError back from WASM (WASM may have modified via SetLastError) */
     readLastError(): number {
         if (!this.initialized || !this.view) return 0;
