@@ -773,9 +773,6 @@
     "sharedBsearchCodeAddr",
     "sharedBsearchGeneration"
   ],
-  "src/worker/modules/crt-conv.ts": [
-    "cvtBuffers"
-  ],
   "src/worker/modules/crt-file-codec.ts": [
     "fileDecoders",
     "reversePages"
@@ -786,17 +783,6 @@
   ],
   "src/worker/modules/crt-scanf.ts": [
     "warnedUnsupported"
-  ],
-  "src/worker/modules/crt-time.ts": [
-    "ctimeBuf",
-    "gmtimeBuf",
-    "localtimeBuf"
-  ],
-  "src/worker/modules/crt-vc9-io.ts": [
-    "asctimeBuf",
-    "findHandles",
-    "localtime64Buf",
-    "nextFindHandle"
   ],
   "src/worker/modules/d3d8/device-lifecycle.ts": [
     "deviceInScene"
@@ -1231,11 +1217,6 @@
   ],
   "src/worker/modules/mss32/stream-engine.ts": [
     "refillChainInFlight"
-  ],
-  "src/worker/modules/msvcrt.ts": [
-    "EMPTY_BYTES",
-    "static Msvcrt.DBCS_CODE_PAGES",
-    "static Msvcrt.VALID_MB_CODE_PAGES"
   ],
   "src/worker/modules/msvfw32-mciwnd.ts": [
     "states"

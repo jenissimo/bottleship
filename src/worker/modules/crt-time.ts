@@ -56,9 +56,24 @@ export function formatAsctime(
  * whatever now owns those bytes. Cleared via resetCrtTimeStatics from msvcrt's
  * reregisterExports, since registration itself does not run again.
  */
+// @participant(msvcrt)
 let gmtimeBuf = 0;
+// @participant(msvcrt)
 let localtimeBuf = 0;
+// @participant(msvcrt)
 let ctimeBuf = 0;
+
+export interface CrtTimeStatics { gmtimeBuf: number; localtimeBuf: number; ctimeBuf: number }
+
+export function captureCrtTimeStatics(): CrtTimeStatics {
+    return { gmtimeBuf, localtimeBuf, ctimeBuf };
+}
+
+export function restoreCrtTimeStatics(s: CrtTimeStatics): void {
+    gmtimeBuf = s.gmtimeBuf;
+    localtimeBuf = s.localtimeBuf;
+    ctimeBuf = s.ctimeBuf;
+}
 
 export function resetCrtTimeStatics(): void {
     gmtimeBuf = 0;

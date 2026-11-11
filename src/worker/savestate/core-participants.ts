@@ -1,5 +1,6 @@
 import { System } from '../core/system';
 import { loadedHleModules } from '../core/hle-module-images';
+import { resolveThunkedDllAlias } from '../core/dll-aliases';
 import { TimeService, type ClockState } from '../runtime/time';
 import type { AddressSpace, RegionEntry } from '../core/memory/address-space';
 import type { TimerWheel } from '../core/scheduler/timer-wheel';
@@ -263,4 +264,8 @@ export function checkLoadedModules(saved: readonly string[], now: readonly strin
 
 export function touchedModules(loaded: () => ReadonlyArray<{ name: string }> = loadedHleModules): string[] {
     return [...new Set(loaded().map(m => m.name))];
+}
+
+export function coverageModules(loaded: () => ReadonlyArray<{ name: string }> = loadedHleModules): string[] {
+    return [...new Set(loaded().map(m => resolveThunkedDllAlias(m.name)))];
 }
