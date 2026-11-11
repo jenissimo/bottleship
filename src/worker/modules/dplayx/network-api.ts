@@ -180,7 +180,6 @@ export class DirectPlayNetworkApi {
             ...[...this.lobbyInterfaces.keys()].map(h => `DirectPlayLobby object ${hex(h)}`),
             ...[...this.lobbyEvents.keys()].map(h => `lobby event registration of ${hex(h)}`),
             ...[...this.lobbyOwnedEvents].map(h => `lobby event ${hex(h)}`),
-            ...(this.lobbyEndpoint ? ['the lobby endpoint'] : []),
         ];
     }
     constructor(private process: Process, private tables: () => Record<string, VTableInfo>, private network: LanNetwork = lanNetwork,

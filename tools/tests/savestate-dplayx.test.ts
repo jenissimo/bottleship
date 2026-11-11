@@ -38,7 +38,6 @@ describe("dplayx idle participant", () => {
             ["lobbyInterfaces", () => (api.lobbyInterfaces as Map<number, unknown>).set(0x1044, new Map()), () => (api.lobbyInterfaces as Map<number, unknown>).clear(), "DirectPlayLobby object 0x1044"],
             ["lobbyEvents", () => (api.lobbyEvents as Map<number, unknown>).set(0x1048, new Map()), () => (api.lobbyEvents as Map<number, unknown>).clear(), "lobby event registration of 0x1048"],
             ["lobbyOwnedEvents", () => (api.lobbyOwnedEvents as Set<number>).add(0x204), () => (api.lobbyOwnedEvents as Set<number>).clear(), "lobby event 0x204"],
-            ["lobbyEndpoint", () => { api.lobbyEndpoint = {}; }, () => { api.lobbyEndpoint = undefined; }, "the lobby endpoint"],
         ];
         for (const [field, open, close, name] of cases) {
             open();
@@ -46,6 +45,14 @@ describe("dplayx idle participant", () => {
             close();
             expect({ field, idle: module.captureSavestate() }).toEqual({ field, idle: {} });
         }
+    });
+
+    test("the lobby endpoint alone does not refuse the save", () => {
+        const { module, api } = idle();
+        api.lobbyEndpoint = {};
+        expect(module.captureSavestate()).toEqual({});
+        (api.lobbyInterfaces as Map<number, unknown>).set(0x1044, new Map());
+        expect(() => module.captureSavestate()).toThrow("dplayx: not idle, 1 thing(s) open: DirectPlayLobby object 0x1044");
     });
 
     test("more than four open things are counted and the list is cut", () => {
