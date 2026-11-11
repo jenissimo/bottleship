@@ -140,6 +140,14 @@ export const kernel32Module: ModuleDescriptor = {
         makeFunc("TlsFree", 1),
         makeFunc("TlsGetValue", 1),
         makeFunc("TlsSetValue", 2),
+        makeFunc("ConvertThreadToFiber", 1),
+        makeFunc("ConvertThreadToFiberEx", 2),
+        makeFunc("CreateFiber", 3),
+        makeFunc("CreateFiberEx", 5),
+        makeFunc("SwitchToFiber", 1),
+        makeFunc("DeleteFiber", 1),
+        makeFunc("ConvertFiberToThread", 0),
+        makeFunc("IsThreadAFiber", 0),
         makeFunc("FlsAlloc", 1),
         makeFunc("FlsGetValue", 1),
         makeFunc("FlsSetValue", 2),
@@ -550,6 +558,7 @@ export const kernel32Module: ModuleDescriptor = {
         makeFunc("GetFileInformationByHandleEx", 4),
         // Profile/INI functions (additional)
         makeFunc("GetPrivateProfileSectionA", 4),
+        makeFunc("GetPrivateProfileSectionW", 4),
         // The section LIST — how a config-driven engine discovers what its INI contains.
         makeFunc("GetPrivateProfileSectionNamesA", 3),
         makeFunc("GetPrivateProfileSectionNamesW", 3),
