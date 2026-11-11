@@ -14,6 +14,7 @@ import { exports as error } from './error';
 import { exports as exception, resetPointerCookie } from './exception';
 import { exports as file_io, resetFileIoState } from './file-io';
 import { exports as fls, resetFlsState } from './fls';
+import { exports as fiber, resetFiberState } from './fiber';
 import { exports as locale } from './locale';
 import { exports as locale_ex } from './locale-ex';
 import { exports as memory } from './memory';
@@ -55,6 +56,8 @@ export class Kernel32 implements IModule {
         Object.assign(this.exports, file_io);
         // fls functions
         Object.assign(this.exports, fls);
+        // fiber functions
+        Object.assign(this.exports, fiber);
         // locale functions
         Object.assign(this.exports, locale);
         // locale-name (*Ex) functions and the date/time formatters
@@ -91,6 +94,7 @@ export class Kernel32 implements IModule {
         resetPointerCookie();
         resetFileIoState();
         resetFlsState();
+        resetFiberState();
         resetProcessApiState();
         resetIniCache();
         resetResourceCache();

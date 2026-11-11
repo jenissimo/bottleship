@@ -2167,6 +2167,10 @@ export class Scheduler {
         this.imageStackReserve = Math.max(0, bytes | 0);
     }
 
+    getImageStackReserve(): number {
+        return this.imageStackReserve;
+    }
+
     createThread(
         startAddress: number, parameter: number, stackSize: number,
         creationFlags: number, outThreadId: number, memory: Uint8Array
@@ -5557,6 +5561,12 @@ export class Scheduler {
     private getCpu(): V86Cpu | null {
         if (!this.process) return null;
         return this.process.v86?.cpu || this.process.v86?.v86?.cpu;
+    }
+
+    /** Guest address that ends the calling thread with EAX as exit code (a start routine's return address). */
+    getThreadExitStubAddress(): number {
+        this.writeThreadExitStub();
+        return this.threadExitStubAddr >>> 0;
     }
 
     private writeThreadExitStub(): void {
