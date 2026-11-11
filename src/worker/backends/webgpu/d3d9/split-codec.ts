@@ -59,13 +59,16 @@ export class SplitEncoder {
     private pos = 0;
     private readonly text = new TextEncoder();
     private pendingTail: Uint8Array | null = null;
+    private pendingTailLength = 0;
 
     constructor(private readonly refs: SplitRefTable) {}
 
-    reset(): void { this.pos = 0; this.pendingTail = null; }
+    reset(): void { this.pos = 0; this.pendingTail = null; this.pendingTailLength = 0; }
     /** The bytes that follow `bytes[0..length)` in the encoded record, when the last value
      *  was encoded with `tail`. A view of the caller's array: consume it before returning. */
     get tail(): Uint8Array | null { return this.pendingTail; }
+    /** The length the tail was encoded with: a view that no longer has it was detached. */
+    get tailLength(): number { return this.pendingTailLength; }
     get length(): number { return this.pos; }
     get bytes(): Uint8Array { return this.u8; }
 
@@ -128,6 +131,7 @@ export class SplitEncoder {
             this.u32(view.byteLength);
             if (tail && view.byteLength >= SPLIT_TAIL_MIN_BYTES) {
                 this.pendingTail = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+                this.pendingTailLength = view.byteLength;
                 return;
             }
             this.reserve(view.byteLength);
