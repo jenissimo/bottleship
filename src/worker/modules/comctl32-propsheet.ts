@@ -254,6 +254,7 @@ interface SheetInfo {
  * per-sheet) so it survives the sheet's teardown, which is exactly when a
  * regression wants to read it.
  */
+// @transient(diagnostic trace of delivered notifications)
 const notifyTrace: string[] = [];
 const NOTIFY_TRACE_MAX = 200;
 
@@ -271,12 +272,31 @@ export function resetPropSheetNotifyTrace(): void {
     notifyTrace.length = 0;
 }
 
+// @refuse(an open property sheet is a dialog with host-side page state)
 const sheetsById = new Map<number, SheetInfo>();
+// @refuse(an open property sheet is a dialog with host-side page state)
 const sheetsByFrame = new Map<number, SheetInfo>();
+// @participant(comctl32)
 let nextSheetId = 1;
+
+export function openPropSheetCount(): number {
+    return Math.max(sheetsById.size, sheetsByFrame.size);
+}
+
+export function capturePropSheetCounter(): number {
+    return nextSheetId;
+}
+
+export function restorePropSheetState(next: number): void {
+    sheetsById.clear();
+    sheetsByFrame.clear();
+    nextSheetId = next;
+    cachedDlgProcAddr = 0;
+}
 
 // The modal manager deliberately does NOT deliver WM_DESTROY to a dialog's own
 // root DLGPROC, so the sheet's teardown hangs off window finalization instead.
+// @transient(whether this worker installed the window-finalization hook; installed again on first use)
 let purgerRegistered = false;
 function ensureSheetPurger(): void {
     if (purgerRegistered) return;
@@ -303,6 +323,7 @@ export function resetPropSheetState(): void {
 // The frame's DLGPROC address
 // ---------------------------------------------------------------------------
 
+// @transient(cache of a thunk stub address, resolved again on first use)
 let cachedDlgProcAddr = 0;
 
 /**

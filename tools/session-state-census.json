@@ -769,18 +769,6 @@
     "nextAviFileHandle",
     "nextAviHandle"
   ],
-  "src/worker/modules/comctl32-flatsb.ts": [
-    "flatSbProps",
-    "flatSbWindows"
-  ],
-  "src/worker/modules/comctl32-propsheet.ts": [
-    "cachedDlgProcAddr",
-    "nextSheetId",
-    "notifyTrace",
-    "purgerRegistered",
-    "sheetsByFrame",
-    "sheetsById"
-  ],
   "src/worker/modules/crt-cbsearch.ts": [
     "sharedBsearchCodeAddr",
     "sharedBsearchGeneration"
