@@ -14,7 +14,7 @@ const noGuestMemory=new Uint8Array(0);
 export class ShaderPreshader {
     private ranges: OutputRange[]=[];
 
-    constructor(private pres: Preshader) {
+    constructor(readonly pres: Preshader) {
         for(const table of [PresTable.OConst,PresTable.OIConst,PresTable.OBConst]) {
             const width=table===PresTable.OBConst?1:4;
             const registers=[...new Set(pres.instructions.filter(i=>i.output.table===table)

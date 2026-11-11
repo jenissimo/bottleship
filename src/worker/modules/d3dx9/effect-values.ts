@@ -12,7 +12,9 @@
  * rather than writing something plausible.
  */
 
-import { EffectParamClass, EffectParamType, noteSetTextureOutcome, type EffectParameter } from "./effect-state";
+import {
+    EffectParamClass, EffectParamType, markEffectParamWritten, noteSetTextureOutcome, type EffectParameter,
+} from "./effect-state";
 import { addComRef, releaseComRef } from "../d3d9/shared-state";
 import { propagateSharedObject } from "./effect-pool";
 
@@ -72,6 +74,7 @@ export function noteSourcePointer(ptr: number, caller = 0): void {
 
 function noteWrite(param: EffectParameter, source?: ArrayLike<number>): true {
     writtenParams.add(param);
+    markEffectParamWritten(param);
     let row = paramWriteCensus.get(param.name);
     if (!row) {
         if (paramWriteCensus.size >= 1024) return true;
@@ -159,6 +162,7 @@ export function setObjectParam(param: EffectParameter, next: number): void {
     if (ptr === prev) return;
     if (ptr) addComRef(ptr);
     param.objectPtr = ptr;
+    markEffectParamWritten(param);
     propagateSharedObject(param);
     if (prev) releaseComRef(prev);
 }
@@ -169,6 +173,15 @@ export function retainReturnedObject(ptr: number): number {
     const p = ptr >>> 0;
     if (p) addComRef(p);
     return p;
+}
+
+/** SetRawValue on a numeric parameter: bytes copied into the value block at `offset`, clipped
+ *  to the block. Stamps the write like every other setter, or CommitChanges would skip it. */
+export function setRawBytesAt(param: EffectParameter, bytes: Uint8Array, offset: number): boolean {
+    const block = param.value;
+    if (!block.length || offset >= block.length) return false;
+    block.set(bytes.subarray(0, Math.min(bytes.length, block.length - offset)), offset);
+    return noteWrite(param);
 }
 
 /** SetValue: raw bytes, refused unless the caller offers at least the whole block. */

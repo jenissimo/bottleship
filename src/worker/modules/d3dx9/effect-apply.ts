@@ -31,11 +31,16 @@ import {
     EffectAssignmentKind,
     EffectParamClass,
     EffectParamType,
+    effectParamStamp,
+    effectWriteStampOf,
     findParameterIndex,
+    nextEffectStamp,
     type EffectInstance,
     type EffectPass,
+    type EffectModel,
     type EffectParameter,
     type EffectStateAssignment,
+    type EffectWriteStamp,
 } from "./effect-state";
 
 const D3D_OK = 0;
@@ -68,6 +73,7 @@ interface ShaderBinding {
     pairs?: ReturnType<typeof bindConstants>;
     /** Constants that COULD have been bound, for the shortfall warning. */
     bindable?: number;
+    pairStamps?: Array<{ value: Uint8Array; stamp: EffectWriteStamp }>;
 }
 
 export interface EffectApplyDeps {
@@ -91,6 +97,8 @@ interface DeferredState {
     lightsTouched: number;
     material: Uint8Array;
     materialTouched: boolean;
+    boundShaders: Map<EffectStateAssignment, number>;
+    passAppliedAt: Map<EffectPass, number>;
 }
 
 const deferredByInstance = new WeakMap<EffectInstance, DeferredState>();
@@ -103,6 +111,8 @@ function deferredFor(inst: EffectInstance): DeferredState {
             lightsTouched: 0,
             material: new Uint8Array(D3DMATERIAL9_SIZE),
             materialTouched: false,
+            boundShaders: new Map(),
+            passAppliedAt: new Map(),
         };
         deferredByInstance.set(inst, state);
     }
@@ -136,9 +146,49 @@ export function effectApplyWarnings(): string[] {
     return [...warnedOnce];
 }
 
+const parametersByName = new WeakMap<EffectModel, Map<string, EffectParameter | null>>();
+const APPLY_ALL = -1;
+
 function parameterOf(inst: EffectInstance, name: string): EffectParameter | null {
+    let byName = parametersByName.get(inst.model);
+    if (!byName) {
+        byName = new Map();
+        parametersByName.set(inst.model, byName);
+    }
+    const known = byName.get(name);
+    if (known !== undefined) return known;
     const index = findParameterIndex(inst.model, name);
-    return index >= 0 ? inst.model.parameters[index]! : null;
+    const param = index >= 0 ? inst.model.parameters[index]! : null;
+    byName.set(name, param);
+    return param;
+}
+
+function preshaderInputsWrittenSince(inst: EffectInstance, pres: Preshader, since: number): boolean {
+    if (since === APPLY_ALL) return true;
+    for (const input of pres.inputs) {
+        const param = parameterOf(inst, input.name);
+        if (!param || effectParamStamp(param) > since) return true;
+    }
+    return false;
+}
+
+function assignmentWrittenSince(inst: EffectInstance, a: EffectStateAssignment, since: number): boolean {
+    if (since === APPLY_ALL) return true;
+    switch (a.kind) {
+        case EffectAssignmentKind.Constant:
+            return false;
+        case EffectAssignmentKind.ParameterRef: {
+            const param = a.parameterName ? parameterOf(inst, a.parameterName) : null;
+            return !param || effectParamStamp(param) > since;
+        }
+        case EffectAssignmentKind.Expression: {
+            const data = a.objectIndex >= 0 ? inst.model.objects[a.objectIndex]?.data : undefined;
+            const pres = data ? preshaderFor(a, data) : null;
+            return !pres || preshaderInputsWrittenSince(inst, pres, since);
+        }
+        default:
+            return true;
+    }
 }
 
 /** An object parameter's "value" is the interface pointer the app set, not a number block. */
@@ -300,8 +350,15 @@ function expressionBytes(inst: EffectInstance, a: EffectStateAssignment): Uint8A
  * SHADER's CTAB, not from anything the block says. That indirection is how `Texture = <tex>`
  * inside a sampler_state reaches the right stage.
  */
-function applySamplerBlock(deps: EffectApplyDeps, inst: EffectInstance, param: EffectParameter, unit: number): void {
+function applySamplerBlock(
+    deps: EffectApplyDeps,
+    inst: EffectInstance,
+    param: EffectParameter,
+    unit: number,
+    since: number,
+): void {
     for (const st of param.samplerStates ?? []) {
+        if (!assignmentWrittenSince(inst, st, since)) continue;
         const info = effectStateInfo(st.state);
         if (!info) continue;
         const bytes = valueBytes(inst, st);
@@ -434,7 +491,13 @@ function noteConstantUpload(
  * constant with no matching parameter is skipped — that is d3dx's own behaviour, and the
  * shortfall is what the census counts.
  */
-function uploadShaderConstants(deps: EffectApplyDeps, inst: EffectInstance, binding: ShaderBinding, vertex: boolean): void {
+function uploadShaderConstants(
+    deps: EffectApplyDeps,
+    inst: EffectInstance,
+    binding: ShaderBinding,
+    vertex: boolean,
+    since: number,
+): void {
     const table = binding.table;
     if (!table) return;
     const skip = inst.skipConstants;
@@ -453,7 +516,17 @@ function uploadShaderConstants(deps: EffectApplyDeps, inst: EffectInstance, bind
         );
     }
     const device = deps.device;
-    for (const { constant, param } of pairs) {
+    const pairStamps = binding.pairStamps ?? (binding.pairStamps = []);
+    for (let i = 0; i < pairs.length; i++) {
+        const { constant, param } = pairs[i]!;
+        if (since !== APPLY_ALL) {
+            let seen = pairStamps[i];
+            if (!seen || seen.value !== param.value) {
+                seen = { value: param.value, stamp: effectWriteStampOf(param) };
+                pairStamps[i] = seen;
+            }
+            if (seen.stamp.at <= since) continue;
+        }
         const upload = packParameter(param, constant);
         if (!upload) {
             warnOnce(`pack:${constant.name}`, `cannot pack parameter "${param.name}" for constant "${constant.name}"`);
@@ -486,7 +559,7 @@ function uploadShaderConstants(deps: EffectApplyDeps, inst: EffectInstance, bind
         const count = Math.max(1, Math.min(Math.max(1, constant.type.elements), constant.registerCount || 1));
         for (let i = 0; i < count; i++) {
             const element = param.members[i] ?? param;
-            applySamplerBlock(deps, inst, element, base + i);
+            applySamplerBlock(deps, inst, element, base + i, since);
         }
     }
 }
@@ -569,10 +642,17 @@ function applyMaterial(state: DeferredState, op: number, bytes: Uint8Array): voi
  * The loop never aborts early: d3dx records the last failure and keeps going, so one
  * unresolvable state does not cost the pass every state after it.
  */
-export function applyPassStates(deps: EffectApplyDeps, inst: EffectInstance, pass: EffectPass): number {
+export function applyPassStates(
+    deps: EffectApplyDeps,
+    inst: EffectInstance,
+    pass: EffectPass,
+    changedOnly = false,
+): number {
     const device = deps.device;
     const deferred = deferredFor(inst);
     let result = D3D_OK;
+    const since = changedOnly ? deferred.passAppliedAt.get(pass) ?? APPLY_ALL : APPLY_ALL;
+    const appliedAt = nextEffectStamp();
 
     for (const a of pass.assignments) {
         const info = effectStateInfo(a.state);
@@ -587,11 +667,18 @@ export function applyPassStates(deps: EffectApplyDeps, inst: EffectInstance, pas
             const objectIndex = shaderObjectIndex(inst, a);
             const binding = objectIndex >= 0 ? shaderFor(deps, inst, objectIndex, vertex) : null;
             const handle = binding && !binding.failed ? binding.handle : 0;
-            if (vertex) device.setVertexShader(handle);
-            else device.setPixelShader(handle);
+            let constantsSince = since;
+            if (since === APPLY_ALL || deferred.boundShaders.get(a) !== handle) {
+                if (vertex) device.setVertexShader(handle);
+                else device.setPixelShader(handle);
+                deferred.boundShaders.set(a, handle);
+                constantsSince = APPLY_ALL;
+            }
             if (binding && !binding.failed) {
-                uploadShaderConstants(deps, inst, binding, vertex);
-                if (binding.preshader && !binding.preshader.apply(device, inst.model.parameters, vertex)) {
+                uploadShaderConstants(deps, inst, binding, vertex, constantsSince);
+                if (binding.preshader
+                    && preshaderInputsWrittenSince(inst, binding.preshader.pres, constantsSince)
+                    && !binding.preshader.apply(device, inst.model.parameters, vertex)) {
                     warnOnce(`shader-pres:${objectIndex}`, lastPreshaderError() ?? "shader preshader failed");
                     result = D3DERR_INVALIDCALL;
                 }
@@ -603,6 +690,8 @@ export function applyPassStates(deps: EffectApplyDeps, inst: EffectInstance, pas
             warnOnce("setsampler", "a pass assigns a sampler state block, which the parser does not model");
             continue;
         }
+
+        if (!assignmentWrittenSince(inst, a, since)) continue;
 
         const bytes = valueBytes(inst, a);
         if (!bytes) {
@@ -663,5 +752,6 @@ export function applyPassStates(deps: EffectApplyDeps, inst: EffectInstance, pas
         device.setMaterial(deferred.material);
         deferred.materialTouched = false;
     }
+    deferred.passAppliedAt.set(pass, appliedAt);
     return result;
 }
