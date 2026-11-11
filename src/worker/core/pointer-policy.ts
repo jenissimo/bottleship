@@ -70,7 +70,7 @@ export interface PointerOutputs {
 export function derivePointerOutputs(f: PointerFacts): PointerOutputs {
     const pointerShown = f.deviceCursor === "software"
         ? true
-        : f.exclusiveMouse
+        : f.exclusiveMouse || f.warping
             ? false
             : f.deviceCursor === "hardware" || f.win32Visible;
     return {

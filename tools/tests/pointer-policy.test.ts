@@ -37,6 +37,20 @@ describe("pointer policy derivation", () => {
         expect(out.captured).toBe(true);
     });
 
+    test("a pointer the guest keeps warping back is not drawn", () => {
+        const out = derivePointerOutputs({ ...BASE, warping: true });
+        expect(out.pointerShown).toBe(false);
+        expect(out.warping).toBe(true);
+    });
+
+    test("negative control: the same visible pointer without warping stays drawn", () => {
+        expect(derivePointerOutputs({ ...BASE, warping: false }).pointerShown).toBe(true);
+    });
+
+    test("a SOFTWARE device cursor stays drawn while the guest warps", () => {
+        expect(derivePointerOutputs({ ...BASE, deviceCursor: "software", warping: true }).pointerShown).toBe(true);
+    });
+
     test("a SOFTWARE device cursor is a sprite, so DI suppression does not hide it", () => {
         expect(derivePointerOutputs({ ...BASE, deviceCursor: "software", exclusiveMouse: true }).pointerShown)
             .toBe(true);
