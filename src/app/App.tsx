@@ -1,5 +1,6 @@
 import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SessionWorker } from './session-worker';
+import { AudioPauseSync } from "../audio/pause-sync";
 import { ChildSessionSurface } from './child-session-surface';
 import { hardwareKeyVk } from "./hardware-key-vk";
 import { cx } from "../ui/cx";
@@ -197,6 +198,8 @@ let capturePending: { resolve: (blob: Blob) => void; reject: (err: Error) => voi
 let statsPending: { resolve: (stats: Record<string, number>) => void; reject: (err: Error) => void } | null = null;
 let verboseLogPending: { resolve: (text: string) => void; reject: (err: Error) => void } | null = null;
 let audioEngine: AudioEngine | null = null;
+/** Single writer of the engine's pause state: the UI button and the worker's guest_pause_state both go through it. */
+let audioPauseSync: AudioPauseSync | null = null;
 let isRecording = false;
 let recordStart = 0;
 let recordedInputs: InputSample[] = [];
@@ -1248,6 +1251,7 @@ export default function App() {
     assertVirtualPad();
     if (!audioEngine) {
       audioEngine = new AudioEngine();
+      audioPauseSync = new AudioPauseSync(audioEngine);
       // Apply the persisted output prefs to the fresh engine (volume/mute are stored
       // and take effect when ensureReady() builds the master gain).
       audioEngine.setMasterVolume(uiSettingsRef.current.masterVolume);
@@ -1338,6 +1342,14 @@ export default function App() {
           audioEngine?.stopAll();
           setExitInfo(null); exitInfoRef.current = null;
         }
+        return;
+      }
+      if (event.data?.type === 'guest_pause_state') {
+        // The guest was paused/resumed from inside the worker (harness, fault, park) or by our
+        // own button echoing back. The guest's real state drives both the indicator and audio.
+        const paused = event.data.paused === true;
+        setIsPaused(paused);
+        void audioPauseSync?.set(paused);
         return;
       }
       //console.log('BottleShip: Worker message received:', event.data?.type);
@@ -2823,14 +2835,8 @@ export default function App() {
     setIsPaused(newPausedState);
     globalWorker.postMessage({ type: newPausedState ? "pause" : "resume" });
     
-    // Also pause/resume audio engine
-    if (audioEngine) {
-      if (newPausedState) {
-        await audioEngine.pause();
-      } else {
-        await audioEngine.resume();
-      }
-    }
+    // Silence/restore audio at once instead of waiting for the worker's echo.
+    await audioPauseSync?.set(newPausedState);
   }, [isPaused]);
 
   // A running game is not user activity as far as the OS is concerned, so the screen

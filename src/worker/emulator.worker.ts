@@ -3439,11 +3439,22 @@ const initV86 = async (canvas: OffscreenCanvas) => {
  */
 let pendingStop: Promise<void> | null = null;
 
+/**
+ * Tell the host the guest stopped/started. A stopped guest stops feeding the streaming audio
+ * ring while the worklet keeps looping it, so the host silences audio on every pause, not just
+ * the ones its own button caused (harness pause, __pauseOnFault, tickFrames park, breakpoints).
+ * Posted on every call, not only on change: the host dedups, and a repeat is cheap.
+ */
+function announceGuestPauseState(paused: boolean): void {
+  self.postMessage({ type: "guest_pause_state", paused });
+}
+
 function pauseEmulator(): void {
   const system = System.getInstance();
   if (!system.process?.v86) return;
   isPaused = true;
   system.isPaused = true;
+  announceGuestPauseState(true);
   if (gdiPresentRafId !== null) { cancelAnimationFrame(gdiPresentRafId); gdiPresentRafId = null; }
   system.windowManager.wakeWaiters();
   const v86 = system.process.v86;
@@ -3461,6 +3472,7 @@ function resumeEmulator(): void {
   if (!system.process?.v86) return;
   isPaused = false;
   system.isPaused = false;
+  announceGuestPauseState(false);
   if (gdiPresentRafId === null) gdiPresentRafId = requestAnimationFrame(gdiPresentLoop);
   TimeService.getInstance().notifyPauseResume();
   hypercallDataManager.resetInsnBaseline();
