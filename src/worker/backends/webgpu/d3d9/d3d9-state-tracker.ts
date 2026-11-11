@@ -298,7 +298,8 @@ export class D3D9StateTracker {
             current = this.getTextureMatrix(type);
         }
         if (!current || matrix.length < 16) return false;
-        return this.setTransform(type, multiplyMatrices(matrix, current));
+        this.setTransform(type, multiplyMatrices(matrix, current));
+        return true;
     }
 
     getWorldMatrix(): Float32Array { return this.worldMatrix; }

@@ -40,6 +40,15 @@ describe("D3D9StateTracker world-matrix palette", () => {
         expect(tracker.getWorldMatrixPalette(0)![12]).toBe(0);
     });
 
+    test("multiplyTransform by identity succeeds although nothing changes", () => {
+        const tracker = new D3D9StateTracker(new StreamBindingTable());
+        expect(tracker.multiplyTransform(0x100, translation(0))).toBe(true);
+        tracker.setTransform(0x100, translation(5));
+        expect(tracker.multiplyTransform(0x100, translation(0))).toBe(true);
+        expect(tracker.getWorldMatrix()[12]).toBe(5);
+        expect(tracker.multiplyTransform(0x400, translation(0))).toBe(false);
+    });
+
     test("seeds D3D9 multisample defaults as all-sample, single-sample-safe state", () => {
         const tracker = new D3D9StateTracker(new StreamBindingTable());
         expect(tracker.getRenderState(161)).toBe(1);
