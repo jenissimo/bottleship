@@ -28,7 +28,9 @@ interface FindState {
     index: number;
 }
 
+// @participant(msvcrt)
 let nextFindHandle = 0x4000;
+// @refuse(an open _findfirst search holds a directory listing)
 const findHandles = new Map<number, FindState>();
 
 /** Drop trailing fraction zeros but KEEP the decimal point (CRT _cropzeros stops on it). */
@@ -237,8 +239,27 @@ function fillStat32(structPtr: number, size: number, isDir: boolean, host: Vc9Io
  * in the real CRT: asctime(localtime(t)) is a legal call, and one shared buffer
  * has the formatted text land on top of the tm being read.
  */
+// @participant(msvcrt)
 let asctimeBuf = 0;
+// @participant(msvcrt)
 let localtime64Buf = 0;
+
+export interface Vc9IoStatics { nextFindHandle: number; asctimeBuf: number; localtime64Buf: number }
+
+export function openFindHandleCount(): number {
+    return findHandles.size;
+}
+
+export function captureVc9IoStatics(): Vc9IoStatics {
+    return { nextFindHandle, asctimeBuf, localtime64Buf };
+}
+
+export function restoreVc9IoStatics(s: Vc9IoStatics): void {
+    findHandles.clear();
+    nextFindHandle = s.nextFindHandle;
+    asctimeBuf = s.asctimeBuf;
+    localtime64Buf = s.localtime64Buf;
+}
 
 /** Both live in memory Process.reset() rewinds — forget them with it (see crt-time). */
 export function resetVc9TimeStatics(): void {

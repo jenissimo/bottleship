@@ -10,6 +10,14 @@ export interface CrtEnvironmentHost {
 
 type EnvironmentBlock = { ptr: number; values: Map<string, number> };
 
+export interface SavedEnvironmentBlock { ptr: number; values: Array<[string, number]> }
+
+export interface CrtEnvironmentState {
+    entries: Array<[string, string]>;
+    narrow: SavedEnvironmentBlock | null;
+    wide: SavedEnvironmentBlock | null;
+}
+
 /** CRT environment is a snapshot: Win32 setters do not refresh it, while CRT
  * setters update both the snapshot and the process environment. */
 export class CrtEnvironment {
@@ -62,6 +70,18 @@ export class CrtEnvironment {
         if (previousNarrow) this.host.free(previousNarrow.ptr);
         if (previousWide) this.host.free(previousWide.ptr);
         return 0;
+    }
+
+    captureState(): CrtEnvironmentState {
+        const block = (b: EnvironmentBlock | null): SavedEnvironmentBlock | null => (b ? { ptr: b.ptr, values: [...b.values] } : null);
+        return { entries: [...this.entries], narrow: block(this.narrow), wide: block(this.wide) };
+    }
+
+    restoreState(s: CrtEnvironmentState): void {
+        const block = (b: SavedEnvironmentBlock | null): EnvironmentBlock | null => (b ? { ptr: b.ptr, values: new Map(b.values) } : null);
+        this.entries = new Map(s.entries);
+        this.narrow = block(s.narrow);
+        this.wide = block(s.wide);
     }
 
     private build(entries: Map<string, string>, wide: boolean): EnvironmentBlock | null {

@@ -285,7 +285,17 @@ export function registerCrtConvExports(exports: Record<string, ThunkImplementati
 const CVTBUFSIZE = 349;
 
 /** Per-thread _cvtbuf addresses. Guest memory that Process.reset() rewinds — see resetCrtConvStatics. */
+// @participant(msvcrt)
 const cvtBuffers = new Map<number, number>();
+
+export function captureCrtConvStatics(): Array<[number, number]> {
+    return [...cvtBuffers];
+}
+
+export function restoreCrtConvStatics(rows: ReadonlyArray<readonly [number, number]>): void {
+    cvtBuffers.clear();
+    for (const [thread, addr] of rows) cvtBuffers.set(thread, addr);
+}
 
 export function resetCrtConvStatics(): void {
     cvtBuffers.clear();

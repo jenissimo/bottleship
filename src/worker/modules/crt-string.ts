@@ -11,7 +11,12 @@ export interface CrtStringHost {
     compareCString(aPtr: number, bPtr: number, ignoreCase: boolean, max: number): number;
 }
 
-export function registerCrtStringExports(exports: Record<string, ThunkImplementation>, host: CrtStringHost): void {
+export interface CrtStringState {
+    strtok(): number;
+    restoreStrtok(ptr: number): void;
+}
+
+export function registerCrtStringExports(exports: Record<string, ThunkImplementation>, host: CrtStringHost): CrtStringState {
     let strtokPtr = 0; // static state for strtok
 
     exports["strstr"] = (_c, _m, a) => {
@@ -114,4 +119,6 @@ export function registerCrtStringExports(exports: Record<string, ThunkImplementa
         return 0;
     };
     exports["_memicmp_l"] = exports["_memicmp"];
+
+    return { strtok: () => strtokPtr, restoreStrtok: (ptr) => { strtokPtr = ptr >>> 0; } };
 }

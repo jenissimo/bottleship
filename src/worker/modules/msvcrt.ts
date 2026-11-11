@@ -33,20 +33,20 @@ import { getSlabSizeForPtr, freeHeapBlock, maybeGrowHeapSlab, HEAP_SMALL_ALLOC_M
 import { ensureNativeQsort } from "./crt-qsort";
 import { ensureNativeCBsearch } from "./crt-cbsearch";
 import { LARGE_IO_TRACE_ENABLED, traceLargeRead } from "../core/diagnostics/large-io-trace";
-import { registerVc9AbiExports } from "./crt-vc9-abi";
-import { registerVc9IoExports, resetVc9TimeStatics, fillStatStruct, STAT32_OFFSETS } from "./crt-vc9-io";
+import { registerVc9AbiExports, type Vc9AbiState } from "./crt-vc9-abi";
+import { captureVc9IoStatics, openFindHandleCount, registerVc9IoExports, resetVc9TimeStatics, restoreVc9IoStatics, fillStatStruct, STAT32_OFFSETS, type Vc9IoStatics } from "./crt-vc9-io";
 import { unixTimeOf } from "../runtime/filesystem/file-time";
 import { registerVc9SetjmpExports } from "./crt-vc9-setjmp";
 import { registerCrtMathExports } from "./crt-math";
-import { registerCrtTimeExports, resetCrtTimeStatics } from "./crt-time";
-import { registerCrtStringExports } from "./crt-string";
+import { captureCrtTimeStatics, registerCrtTimeExports, resetCrtTimeStatics, restoreCrtTimeStatics, type CrtTimeStatics } from "./crt-time";
+import { registerCrtStringExports, type CrtStringState } from "./crt-string";
 import { registerCrtMbExports } from "./crt-mb";
 import { registerLegacyCrtStringExports } from "./crt-legacy-strings";
 import { registerMsvcrtTimeLocaleExports } from "./msvcrt-time-locale";
 import { MsvcrtTimezoneState } from "./msvcrt-timezone";
 import { readWindowsTimezoneSnapshot } from "../runtime/windows-timezone";
 import { crtFileCharBytes, decodeCrtFileChar, encodeCrtFileChar } from "./crt-file-codec";
-import { registerCrtConvExports, resetCrtConvStatics } from "./crt-conv";
+import { captureCrtConvStatics, registerCrtConvExports, resetCrtConvStatics, restoreCrtConvStatics } from "./crt-conv";
 import { registerCrtPathExports } from "./crt-path";
 import { registerCrtSeh3Exports } from "./crt-seh3";
 import { registerCrtVc8Exports } from "./crt-vc8";
@@ -54,9 +54,13 @@ import { ensureNativeEHProlog } from "./crt-eh-prolog";
 import { registerRttiExports, demangleTypeInfoName } from "./crt-rtti";
 import { registerUcrtExports } from "./crt-ucrt";
 import { invokeGuestVoidChain, readFunctionPointerTable } from "./crt-callback-chain";
-import { CrtEnvironment, readWideEnvironmentString } from "./crt-environment";
+import { CrtEnvironment, readWideEnvironmentString, type CrtEnvironmentState } from "./crt-environment";
+import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
+import { CaptureRefusal } from "../savestate/object-codecs";
+import type { SaveValue } from "../savestate/value-codec";
 
 /** Priming value for fgetsLoop — a generator's first next() discards its argument. */
+// @transient(empty constant)
 const EMPTY_BYTES = new Uint8Array(0);
 
 /** State behind one FILE* token (see fileStreams). */
@@ -74,6 +78,75 @@ interface MsvcrtFileStream {
     structPtr?: number;
     bufPtr?: number;
 }
+
+export const MSVCRT_BOOT_ADDRESSES = [
+    'errnoAddr', 'pctypeVarAddr', 'pctypeTableAddr', 'caseLowerTableAddr', 'caseUpperTableAddr', 'mbCurMaxAddr', 'fmodeAddr',
+    'commodeAddr', 'acmdlnAddr', 'arg0Addr', 'argvVectorAddr', 'argcAddr', 'argvPtrVarAddr', 'dosErrnoAddr', 'mbctypeAddr',
+    'ehPrologAddr', 'environVarAddr', 'iobAddr', 'pioinfoAddr', 'badioinfoAddr', 'lcCodepageAddr', 'osVerVarsAddr',
+    'acmdlnVarAddr', 'adjustFdivAddr', 'encodedNullAddr', 'hugeValAddr', 'qsortCodeAddr', 'bsearchCodeAddr',
+] as const;
+
+export const MSVCRT_FIELDS = {
+    name: 'transient', exports: 'host', process: 'host', randSeed: 'save',
+    errnoAddr: 'derive', pctypeVarAddr: 'derive', pctypeTableAddr: 'derive', caseLowerTableAddr: 'derive', caseUpperTableAddr: 'derive',
+    mbCurMaxAddr: 'derive', fmodeAddr: 'derive', commodeAddr: 'derive', acmdlnAddr: 'derive', arg0Addr: 'derive', argvVectorAddr: 'derive',
+    argcAddr: 'derive', argvPtrVarAddr: 'derive', dosErrnoAddr: 'derive', mbctypeAddr: 'derive', ehPrologAddr: 'derive',
+    envpVectorAddr: 'save', environVarAddr: 'derive', crtEnvironment: 'save', iobAddr: 'derive', tmpnamBuf: 'save', pioinfoAddr: 'derive',
+    badioinfoAddr: 'derive', lcCodepageAddr: 'derive', osVerVarsAddr: 'derive', appType: 'save', userMathErrHandler: 'save',
+    newHandlerPtr: 'save', newMode: 'save', strerrorBuf: 'save', timezoneState: 'derive', temporaryFiles: 'transient', crtDbgFlag: 'save',
+    controlFpDnBits: 'save', tempnamCounter: 'save', exitHandlers: 'save', exitChainRunning: 'transient', fdNext: 'save', fds: 'transient',
+    fdHandles: 'transient', handleFds: 'transient', dbgStrCap: 'transient', acmdlnVarAddr: 'derive', adjustFdivAddr: 'derive',
+    encodedNullAddr: 'derive', hugeValAddr: 'derive', qsortCodeAddr: 'derive', bsearchCodeAddr: 'derive', crtAllocations: 'save',
+    localeAddr: 'save', currentLocale: 'save', lconvAddr: 'save', fileStreams: 'transient', nextFilePtr: 'save', useRealFileStructs: 'save',
+    stringState: 'host', vc9AbiState: 'host',
+} as const satisfies Record<string, FieldPolicy>;
+
+export interface MsvcrtState {
+    randSeed: number;
+    envpVectorAddr: number;
+    tmpnamBuf: number;
+    appType: number;
+    userMathErrHandler: number;
+    newHandlerPtr: number;
+    newMode: number;
+    strerrorBuf: number;
+    crtDbgFlag: number;
+    controlFpDnBits: number;
+    tempnamCounter: number;
+    exitHandlers: number[];
+    fdNext: number;
+    crtAllocations: Uint32Array;
+    localeAddr: number;
+    currentLocale: string;
+    lconvAddr: number;
+    nextFilePtr: number;
+    useRealFileStructs: boolean;
+    environment: CrtEnvironmentState | null;
+    strtok: number;
+    umask: number;
+    time: CrtTimeStatics;
+    cvtBuffers: Array<[number, number]>;
+    vc9Io: Vc9IoStatics;
+    bootAddresses: Array<[string, number]>;
+}
+
+export const MSVCRT_SCHEMA = {
+    module: MSVCRT_FIELDS,
+    bootAddresses: MSVCRT_BOOT_ADDRESSES,
+    allocationRow: ['address', 'bytes'],
+    cvtBufferRow: ['threadId', 'address'],
+    environment: stateKeys<CrtEnvironmentState>({ entries: true, narrow: true, wide: true }),
+    environmentBlock: ['ptr', 'values'],
+    time: stateKeys<CrtTimeStatics>({ gmtimeBuf: true, localtimeBuf: true, ctimeBuf: true }),
+    vc9Io: stateKeys<Vc9IoStatics>({ nextFindHandle: true, asctimeBuf: true, localtime64Buf: true }),
+    state: stateKeys<MsvcrtState>({
+        randSeed: true, envpVectorAddr: true, tmpnamBuf: true, appType: true, userMathErrHandler: true, newHandlerPtr: true,
+        newMode: true, strerrorBuf: true, crtDbgFlag: true, controlFpDnBits: true, tempnamCounter: true, exitHandlers: true,
+        fdNext: true, crtAllocations: true, localeAddr: true, currentLocale: true, lconvAddr: true, nextFilePtr: true,
+        useRealFileStructs: true, environment: true, strtok: true, umask: true, time: true, cvtBuffers: true, vc9Io: true,
+        bootAddresses: true,
+    }),
+};
 
 export class Msvcrt implements IModule {
     name = "msvcrt";
@@ -213,8 +286,116 @@ export class Msvcrt implements IModule {
     private qsortCodeAddr = 0;
     private bsearchCodeAddr = 0;
     private readonly crtAllocations = new Map<number, number>();
+    private stringState: CrtStringState | null = null;
+    private vc9AbiState: Vc9AbiState | null = null;
+
+    captureSavestate(): MsvcrtState {
+        if (this.fds.size > 0 || this.fileStreams.size > 0) {
+            const open = [...this.fds.values()].map(h => h.path).filter(Boolean);
+            throw new Error(`msvcrt: ${Math.max(this.fds.size, this.fileStreams.size)} open file(s) are not part of a v1 savestate${open.length ? ` (${open.slice(0, 3).join(', ')})` : ''}`);
+        }
+        if (this.temporaryFiles.size > 0) throw new Error('msvcrt: a tmpfile() stream is open');
+        if (this.fdHandles.size > 0 || this.handleFds.size > 0) throw new Error('msvcrt: a file descriptor is bound to a Win32 handle');
+        if (openFindHandleCount() > 0) throw new Error('msvcrt: a _findfirst search is open');
+        if (this.exitChainRunning) throw new Error('msvcrt: the exit handlers are running');
+        const allocations = new Uint32Array(this.crtAllocations.size * 2);
+        let i = 0;
+        for (const [address, bytes] of this.crtAllocations) { allocations[i++] = address; allocations[i++] = bytes; }
+        return {
+            randSeed: this.randSeed,
+            envpVectorAddr: this.envpVectorAddr,
+            tmpnamBuf: this.tmpnamBuf,
+            appType: this.appType,
+            userMathErrHandler: this.userMathErrHandler,
+            newHandlerPtr: this.newHandlerPtr,
+            newMode: this.newMode,
+            strerrorBuf: this.strerrorBuf,
+            crtDbgFlag: this.crtDbgFlag,
+            controlFpDnBits: this.controlFpDnBits,
+            tempnamCounter: this.tempnamCounter,
+            exitHandlers: [...this.exitHandlers],
+            fdNext: this.fdNext,
+            crtAllocations: allocations,
+            localeAddr: this.localeAddr,
+            currentLocale: this.currentLocale,
+            lconvAddr: this.lconvAddr,
+            nextFilePtr: this.nextFilePtr,
+            useRealFileStructs: this.useRealFileStructs,
+            environment: this.crtEnvironment?.captureState() ?? null,
+            strtok: this.stringState?.strtok() ?? 0,
+            umask: this.vc9AbiState?.umask() ?? 0,
+            time: captureCrtTimeStatics(),
+            cvtBuffers: captureCrtConvStatics(),
+            vc9Io: captureVc9IoStatics(),
+            bootAddresses: this.bootAddresses(),
+        };
+    }
+
+    restoreSavestate(s: MsvcrtState): void {
+        const booted = new Map(this.bootAddresses());
+        for (const [name, address] of s.bootAddresses) {
+            if (booted.get(name) !== address) {
+                throw new Error(`msvcrt: ${name} booted at 0x${(booted.get(name) ?? 0).toString(16)}, the snapshot has it at 0x${address.toString(16)}`);
+            }
+        }
+        if (s.environment && !this.crtEnvironment) throw new Error('msvcrt: no CRT environment to restore into');
+        this.randSeed = s.randSeed;
+        this.envpVectorAddr = s.envpVectorAddr;
+        this.tmpnamBuf = s.tmpnamBuf;
+        this.appType = s.appType;
+        this.userMathErrHandler = s.userMathErrHandler;
+        this.newHandlerPtr = s.newHandlerPtr;
+        this.newMode = s.newMode;
+        this.strerrorBuf = s.strerrorBuf;
+        this.crtDbgFlag = s.crtDbgFlag;
+        this.controlFpDnBits = s.controlFpDnBits;
+        this.tempnamCounter = s.tempnamCounter;
+        this.exitHandlers = [...s.exitHandlers];
+        this.exitChainRunning = false;
+        this.fdNext = s.fdNext;
+        this.fds.clear();
+        this.fdHandles.clear();
+        this.handleFds.clear();
+        this.fileStreams.clear();
+        this.temporaryFiles.clear();
+        this.crtAllocations.clear();
+        for (let i = 0; i + 1 < s.crtAllocations.length; i += 2) this.crtAllocations.set(s.crtAllocations[i]!, s.crtAllocations[i + 1]!);
+        this.localeAddr = s.localeAddr;
+        this.currentLocale = s.currentLocale;
+        this.lconvAddr = s.lconvAddr;
+        this.nextFilePtr = s.nextFilePtr;
+        this.useRealFileStructs = s.useRealFileStructs;
+        if (s.environment) this.crtEnvironment!.restoreState(s.environment);
+        this.stringState?.restoreStrtok(s.strtok);
+        this.vc9AbiState?.restoreUmask(s.umask);
+        restoreCrtTimeStatics(s.time);
+        restoreCrtConvStatics(s.cvtBuffers);
+        restoreVc9IoStatics(s.vc9Io);
+    }
+
+    private bootAddresses(): Array<[string, number]> {
+        const self = this as unknown as Record<string, number>;
+        const rows: Array<[string, number]> = MSVCRT_BOOT_ADDRESSES.map(name => [name, self[name] ?? 0]);
+        rows.push(['timezone', this.timezoneState?.timezone ?? 0]);
+        return rows;
+    }
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'msvcrt', version: 1, order: 7, covers: ['msvcrt'], schema: MSVCRT_SCHEMA as unknown as SaveValue,
+            capture: () => {
+                try {
+                    return this.captureSavestate() as unknown as SaveValue;
+                } catch (e) {
+                    throw e instanceof CaptureRefusal ? e : new CaptureRefusal(e instanceof Error ? e.message : String(e));
+                }
+            },
+            restore: (saved) => this.restoreSavestate(saved as unknown as MsvcrtState),
+        });
+    }
 
     initialize(process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         this.process = process;
         this.ensureRuntimeStorage();
         this.registerDataExports();
@@ -424,7 +605,7 @@ export class Msvcrt implements IModule {
         });
 
         // --- String functions (see crt-string.ts) ---
-        registerCrtStringExports(exports, {
+        this.stringState = registerCrtStringExports(exports, {
             readCString: (p, max) => this.readCString(p, max),
             compareCString: (a, b, ci, n) => this.compareCString(a, b, ci, n),
         });
@@ -719,7 +900,7 @@ export class Msvcrt implements IModule {
         };
         exports["?terminate@@YAXXZ"]   = () => this.terminateProcess(3, "msvcrt: terminate() called");
 
-        registerVc9AbiExports(exports, {
+        this.vc9AbiState = registerVc9AbiExports(exports, {
             process: this.process,
             initterm: (a, b) => this.initterm(a, b),
             malloc: (n) => this.malloc(n),
@@ -1164,9 +1345,11 @@ export class Msvcrt implements IModule {
     private static readonly MB_CP_LOCALE = -1;
     private static readonly MB_CP_OEM = -2;
     private static readonly MB_CP_ANSI = -3;
+    // @transient(constant code page table)
     private static readonly DBCS_CODE_PAGES = new Set([
         932, 936, 949, 950, 1361, 50225, 50227, 50229, 51932, 51936, 51949, 52936, 54936,
     ]);
+    // @transient(constant code page table)
     private static readonly VALID_MB_CODE_PAGES = new Set([
         437, 850, 874, 932, 936, 949, 950, 1250, 1251, 1252, 1253, 1254, 1255, 1256, 1257, 1258,
         28591, 65001, 1361,

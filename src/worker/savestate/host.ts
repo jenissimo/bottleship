@@ -7,7 +7,7 @@ import { CaptureRefusal } from './object-codecs';
 import type { ChunkStore } from './chunk-store';
 import type { SafePoint } from './halt';
 import { savestateParticipants, savestatesEnabled, type ParticipantRegistry } from './participant';
-import { touchedModules } from './core-participants';
+import { coverageModules } from './core-participants';
 import { incompatibilities, type CompatibilityKey } from './container';
 import { OpfsDir, SlotStore, type Dir, type SlotInfo } from './slots';
 import { gameIdToContainerDir } from '@bottleship/formats/wgb/container-id';
@@ -90,7 +90,7 @@ function target(overlay: string): SavestateTarget {
         }),
         overlayState: () => overlay,
         gameId: () => identity.gameId,
-        touchedModules: () => touchedModules(),
+        touchedModules: () => coverageModules(),
     };
 }
 
@@ -245,7 +245,7 @@ export interface SaveReport {
 export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, permanentBlockers: () => string[] = () => []): Promise<SaveReport> {
     checkSlotName(name);
     const game = gameDir();
-    const early = coverageRefusal({ touchedModules }) ?? permanentBlockers().map(b => `savestate: ${b}`)[0] ?? null;
+    const early = coverageRefusal({ touchedModules: coverageModules }) ?? permanentBlockers().map(b => `savestate: ${b}`)[0] ?? null;
     if (early) throw new CaptureRefusal(early);
     return withGameLock(game, async () => {
         const store = await gameStore(game);
