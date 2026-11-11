@@ -515,7 +515,7 @@ export class DSound implements IModule {
 
     registerSavestate(): () => void {
         return savestateParticipants.add({
-            id: 'dsound', version: 2, order: 61, covers: ['dsound'], schema: DSOUND_SCHEMA as unknown as SaveValue,
+            id: 'dsound', version: 3, order: 61, covers: ['dsound'], schema: DSOUND_SCHEMA as unknown as SaveValue,
             capture: () => {
                 try {
                     return this.captureSavestate() as unknown as SaveValue;
