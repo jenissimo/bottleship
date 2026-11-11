@@ -184,11 +184,10 @@ describe('guest Release stub — installation refuses what it cannot make safe',
         expect(d3d9GuestReleaseStats().mode).toBe('off');
     });
 
-    it('REFUSES a buffer interface while __d3d9StreamRing defers stream bindings', () => {
+    it('REFUSES a buffer interface while the stream ring defers stream bindings (the default)', () => {
         // The ring is safe only because Buffer9::Release is the OUT trap that drains it first.
         g.__d3d9MirrorRefcount = false;
         g.__d3d9NoGuestComStubs = false;
-        g.__d3d9StreamRing = true;
         const d = fakeDispatcher();
         registerGuestReleaseStub(d, 'IDirect3DVertexBuffer9');
         expect(d.calls.length).toBe(0);
@@ -198,6 +197,7 @@ describe('guest Release stub — installation refuses what it cannot make safe',
     it('…and installs that same interface once the ring is off — the guard is the ring, not the name', () => {
         g.__d3d9MirrorRefcount = false;
         g.__d3d9NoGuestComStubs = false;
+        g.__d3d9StreamRing = false;
         const d = fakeDispatcher();
         registerGuestReleaseStub(d, 'IDirect3DVertexBuffer9');
         expect(d.calls.length).toBe(1);
