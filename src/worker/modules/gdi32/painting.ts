@@ -2161,6 +2161,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
 
     // Bitmap creation
     exports['CreateDIBitmap'] = (ctx, mem, args): number => {
+        mem = toPlainGuestMemory(mem);
         const hdc = args[0];
         const pbmih = args[1];
         const flInit = args[2];
