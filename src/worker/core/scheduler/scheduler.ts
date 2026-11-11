@@ -2094,14 +2094,21 @@ export class Scheduler {
         // A surviving thread parked on the dead thread's stack must keep it. The RUNNING
         // thread's ESP is in the register file, not in its saved context (which is stale
         // while it runs), so it is read live rather than from the loop below.
-        const liveEsp = cpu ? readEsp(cpu) : 0;
-        if (liveEsp >= base && liveEsp < top) { s.heldForeignEsp++; return false; }
-        for (const other of this.threads.values()) {
-            if (other.id === thread.id || other.state === ThreadState.TERMINATED) continue;
-            const esp = (other.context?.esp ?? 0) >>> 0;
-            if (esp >= base && esp < top) { s.heldForeignEsp++; return false; }
-        }
+        if (this.espInStackSpan(base, top, thread.id)) { s.heldForeignEsp++; return false; }
         return true;
+    }
+
+    /** Does the live ESP, or the saved ESP of any other live thread, point into [base, top)? */
+    private espInStackSpan(base: number, top: number, exceptThreadId: number): boolean {
+        const cpu = this.getCpu();
+        const liveEsp = cpu ? readEsp(cpu) : 0;
+        if (liveEsp >= base && liveEsp < top) return true;
+        for (const other of this.threads.values()) {
+            if (other.id === exceptThreadId || other.state === ThreadState.TERMINATED) continue;
+            const esp = (other.context?.esp ?? 0) >>> 0;
+            if (esp >= base && esp < top) return true;
+        }
+        return false;
     }
 
     /**
@@ -2115,7 +2122,11 @@ export class Scheduler {
         const base = thread.stackBase >>> 0;
         if (size === 0 || !this.ownedStackBases.has(base)) return;
         if (!this.canReleaseStack(thread)) return;
+        this.returnStackBlock(base, size);
+    }
 
+    /** Pool (or, past the pool ceiling, free) an owned stack whose release gates passed. */
+    private returnStackBlock(base: number, size: number): void {
         this.ownedStackBases.delete(base);
         const allocBase = base - Scheduler.STACK_GUARD;
         const total = size + Scheduler.STACK_GUARD;
@@ -2136,6 +2147,52 @@ export class Scheduler {
         free.push(allocBase);
         this.stackBytesPooled += total;
         this.stackPoolStats.pooled++;
+    }
+
+    /**
+     * A stack of `size` bytes outside any thread record (kernel32 fiber stacks), from the
+     * same guarded pool as thread stacks. Returns its lowest usable byte — the NOACCESS
+     * guard page sits just below — or 0 when the VA is exhausted.
+     */
+    allocateStack(size: number): number {
+        let acquired: { allocBase: number; reused: boolean };
+        try {
+            acquired = this.acquireStack(size);
+        } catch {
+            // A burst of spawns inside one reap-throttle window can pin released-eligible
+            // dead stacks past heap exhaustion; reap now (failure path — no throttle) and
+            // retry once before reporting the guest-visible failure.
+            this.reapTerminatedThreads();
+            try { acquired = this.acquireStack(size); } catch { return 0; }
+        }
+        const stackBase = (acquired.allocBase + Scheduler.STACK_GUARD) >>> 0;
+        // A fresh stack comes from MemoryManager.alloc, which hands out zeroed memory (and
+        // writes only pages something dirtied — guest-page-dirty.ts). Re-zeroing it would
+        // make the whole reserve resident on creation, where Windows commits a stack lazily
+        // behind its guard page. A pooled stack still carries its previous tenant's frames.
+        // Guests run code on their own stacks (the SEH trampoline this dispatcher writes
+        // into the dead zone below ESP is ours), so a recycled stack can still carry v86
+        // blocks compiled from its previous tenant. The zero-fill is a JS write and is
+        // invisible to the JIT — same turn, no await between (see §3.1 coherence).
+        if (acquired.reused) {
+            this.process!.getCurrentMemory().fill(0, stackBase, stackBase + size);
+            invalidateGuestCode(stackBase, size);
+        }
+        return stackBase;
+    }
+
+    /**
+     * Give back a stack from allocateStack. Refused (false, the block stays owned) while
+     * the live ESP or another thread's saved ESP still points into it. The current
+     * thread's saved context is stale while it runs, so only its live ESP counts.
+     */
+    releaseStackBlock(stackBase: number, size: number): boolean {
+        const base = stackBase >>> 0;
+        size >>>= 0;
+        if (size === 0 || !this.ownedStackBases.has(base)) return false;
+        if (this.espInStackSpan(base, base + size, this.currentThreadId ?? -1)) { this.stackPoolStats.heldForeignEsp++; return false; }
+        this.returnStackBlock(base, size);
+        return true;
     }
 
     /** Stack footprint + lifecycle ledger (harness `threads` state, CreateThread failures).
@@ -2183,43 +2240,17 @@ export class Scheduler {
         // STATUS_STACK_OVERFLOW at the moment it happens. Without one the overflow is
         // silent and lands in whatever the allocator placed underneath — the corruption
         // then detonates in an unrelated subsystem with nothing pointing back here.
-        let stackBase: number;
-        let reusedStack: boolean;
-        try {
-            const acquired = this.acquireStack(size);
-            stackBase = acquired.allocBase + Scheduler.STACK_GUARD;
-            reusedStack = acquired.reused;
-        } catch {
-            // A burst of spawns inside one reap-throttle window can pin released-eligible
-            // dead stacks past heap exhaustion; reap now (failure path — no throttle) and
-            // retry once before reporting the guest-visible failure.
-            this.reapTerminatedThreads();
-            try {
-                const acquired = this.acquireStack(size);
-                stackBase = acquired.allocBase + Scheduler.STACK_GUARD;
-                reusedStack = acquired.reused;
-            } catch (e) {
-                const f = this.getStackFootprint();
-                Logger.error(LogCategory.THREAD,
-                    `CreateThread failed: ${e} (wanted ${size} bytes; dwStackSize=${stackSize}, ` +
-                    `image reserve=${this.imageStackReserve}, ${this.threads.size} thread(s) hold ` +
-                    `${f.liveBytes} of ${f.reservedBytes} bytes of stack, ${f.pooledBytes} idle in ` +
-                    `the stack pool, ${f.heldBytes} leaked by a refused release)`);
-                return 0;
-            }
+        const stackBase = this.allocateStack(size);
+        if (!stackBase) {
+            const f = this.getStackFootprint();
+            Logger.error(LogCategory.THREAD,
+                `CreateThread failed: out of VA (wanted ${size} bytes; dwStackSize=${stackSize}, ` +
+                `image reserve=${this.imageStackReserve}, ${this.threads.size} thread(s) hold ` +
+                `${f.liveBytes} of ${f.reservedBytes} bytes of stack, ${f.pooledBytes} idle in ` +
+                `the stack pool, ${f.heldBytes} leaked by a refused release)`);
+            return 0;
         }
-
         const stackTop = stackBase + size;
-        // A fresh stack comes from MemoryManager.alloc, which hands out zeroed memory (and
-        // writes only pages something dirtied — guest-page-dirty.ts). Re-zeroing it would
-        // make the whole reserve resident on creation, where Windows commits a stack lazily
-        // behind its guard page. A pooled stack still carries its previous tenant's frames.
-        if (reusedStack) memory.fill(0, stackBase, stackTop);
-        // Guests run code on their own stacks (the SEH trampoline this dispatcher writes
-        // into the dead zone below ESP is ours), so a recycled stack can still carry v86
-        // blocks compiled from its previous tenant. The zero-fill above is a JS write and
-        // is invisible to the JIT — same turn, no await between (see §3.1 coherence).
-        if (reusedStack) invalidateGuestCode(stackBase, size);
 
         // Set up stack: [parameter, exitStubAddr]
         const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);

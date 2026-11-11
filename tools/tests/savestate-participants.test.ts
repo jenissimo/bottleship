@@ -345,7 +345,7 @@ describe("schema pin and mutation", () => {
             "time": { version: 1, schemaHash: "728d1b2522148901" },
             "address-space": { version: 1, schemaHash: "a1c4ce059654c36f" },
             "memory-manager": { version: 1, schemaHash: "4a5dbc8ebbd40e94" },
-            "kernel32-memory": { version: 1, schemaHash: "1fbf402fadbc144f" },
+            "kernel32-memory": { version: 2, schemaHash: "4e2a2400e2517640" },
             "thunk-generator": { version: 1, schemaHash: "2673e673145253a5" },
             "resources": { version: 1, schemaHash: "de537d8b445269ef" },
             "hypercall-page": { version: 1, schemaHash: "5ea73324ac1a4cda" },

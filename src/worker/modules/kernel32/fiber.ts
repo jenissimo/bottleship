@@ -44,8 +44,9 @@ const F_EDI = 0x18;
 const F_EBP = 0x1C;
 const F_ESP = 0x20;
 const F_MAGIC = 0x24;
-const F_STACK_ALLOC = 0x28;    // allocation holding the stack; 0 for a fiber made from a thread
+const F_STACK_ALLOC = 0x28;    // scheduler stack block (allocateStack); 0 for a fiber made from a thread
 const F_FLAGS = 0x2C;
+const F_STACK_SIZE = 0x30;     // size passed to allocateStack, needed to give the block back
 const FIBER_SIZE = 0x40;
 
 const FIBER_MAGIC = 0x52424946;
@@ -153,13 +154,12 @@ function createFiber(stackCommit: number, stackReserve: number, start: number, p
     if (!process || !start) { setLastError(ERROR_INVALID_PARAMETER); return 0; }
     const reserve = (stackReserve >>> 0) || system.scheduler.getImageStackReserve();
     const size = threadStackReserve(stackCommit >>> 0, 0, reserve, DEFAULT_STACK_RESERVE);
-    let stack = 0;
-    if (size <= MAX_STACK) {
-        try { stack = process.memory.alloc(size, undefined, undefined, 0x1000) >>> 0; } catch { stack = 0; }
-    }
+    // The scheduler's thread-stack path: NOACCESS guard page below, so an overflow faults
+    // instead of landing in the neighbouring allocation, and a pooled block is re-zeroed.
+    const stack = size <= MAX_STACK ? system.scheduler.allocateStack(size) >>> 0 : 0;
     if (!stack) { setLastError(ERROR_NOT_ENOUGH_MEMORY); return 0; }
     const fiber = newFiberObject(param);
-    if (!fiber) { process.memory.free(stack); setLastError(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+    if (!fiber) { system.scheduler.releaseStackBlock(stack, size); setLastError(ERROR_NOT_ENOUGH_MEMORY); return 0; }
 
     const top = (stack + size) >>> 0;
     // [esp]   start routine     ← popped by SwitchToFiber's RET 4
@@ -178,6 +178,7 @@ function createFiber(stackCommit: number, stackReserve: number, start: number, p
     Mem.writeUint32(fiber + F_STACK_LIMIT, stack);
     Mem.writeUint32(fiber + F_ESP, esp);
     Mem.writeUint32(fiber + F_STACK_ALLOC, stack);
+    Mem.writeUint32(fiber + F_STACK_SIZE, size);
     Logger.log(LogCategory.KERNEL32,
         `CreateFiber(stack=0x${size.toString(16)}, start=0x${start.toString(16)}, param=0x${param.toString(16)}) -> 0x${fiber.toString(16)}`);
     return fiber;
@@ -256,7 +257,7 @@ export const exports: Record<string, ThunkImplementation> = {
             return { value: 1, skipStackCheck: true };
         }
         Mem.writeUint32(fiber + F_MAGIC, 0);
-        if (stackAlloc) process?.memory.free(stackAlloc);
+        if (stackAlloc) system.scheduler.releaseStackBlock(stackAlloc, rd(fiber + F_STACK_SIZE));
         process?.memory.free(fiber);
         return 0;
     },

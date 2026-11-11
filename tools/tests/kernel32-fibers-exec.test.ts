@@ -130,6 +130,8 @@ async function run(scenario: 'A' | 'B'): Promise<Run> {
         system.scheduler = {
             setLastError: (code: number) => { lastError = code; },
             getImageStackReserve: () => 0x40000,
+            allocateStack: (size: number) => memory.alloc(size, undefined, undefined, 0x1000),
+            releaseStackBlock: (a: number) => { freed.push(a); return true; },
             getThreadExitStubAddress: () => {
                 if (!exitStub) {
                     exitStub = memory.alloc(16);
