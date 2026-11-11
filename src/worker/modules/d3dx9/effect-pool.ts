@@ -22,7 +22,7 @@ import { InterfaceDescriptor, IUnknown, ModuleDescriptor } from "../../api/types
 import { addComRef, createComObject, registerComFinalizer, releaseComRef } from "../d3d9/shared-state";
 import { Mem } from "../../core/memory/mem-accessor";
 import { normalizeGuid, readGuidFromMem } from "../../core/com/typelib/typelib-types";
-import type { EffectModel, EffectParameter } from "./effect-state";
+import { markEffectParamWritten, type EffectModel, type EffectParameter } from "./effect-state";
 
 const S_OK = 0;
 const E_POINTER = 0x80004003;
@@ -149,6 +149,7 @@ export function propagateSharedObject(param: EffectParameter): void {
         if (other === param) continue;
         other.objectPtr = param.objectPtr;
         other.objectIndex = param.objectIndex;
+        markEffectParamWritten(other);
     }
 }
 
