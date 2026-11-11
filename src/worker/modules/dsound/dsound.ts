@@ -384,7 +384,7 @@ function pickSoundBuffer(b: SoundBuffer) {
 }
 
 export interface DSoundState {
-    objects: Array<{ ptr: number; type: string; refCount: number; isDs8: boolean; duplex: { ds: number; dsc: number } | null; buffer: SavedSoundBuffer | null; ring: boolean }>;
+    objects: Array<{ ptr: number; type: string; refCount: number; isDs8: boolean; duplex: { ds: number; dsc: number } | null; buffer: SavedSoundBuffer | null; ring: boolean; device?: number }>;
     nextBufferId: number;
     notifyTimerId: number | null;
     primaryByDevice: Array<[number, number]>;
@@ -402,7 +402,7 @@ export const DSOUND_FIELDS = {
 export const DSOUND_SCHEMA = {
     module: DSOUND_FIELDS,
     primaryRow: ['deviceObject', 'primaryBuffer'],
-    object: stateKeys<DSoundState['objects'][number]>({ ptr: true, type: true, refCount: true, isDs8: true, duplex: true, buffer: true, ring: true }),
+    object: stateKeys<DSoundState['objects'][number]>({ ptr: true, type: true, refCount: true, isDs8: true, duplex: true, buffer: true, ring: true, device: true }),
     listener: stateKeys<DSound['listenerState']>({
         posX: true, posY: true, posZ: true, velX: true, velY: true, velZ: true, frontX: true, frontY: true, frontZ: true,
         topX: true, topY: true, topZ: true, distanceFactor: true, rolloffFactor: true, dopplerFactor: true,
@@ -436,6 +436,9 @@ type DSoundObject = {
     isDs8?: boolean;
     /** IDirectSoundFullDuplex: the render and capture devices it owns once initialized. */
     duplex?: { ds: number; dsc: number };
+    /** For an IDirectSoundBuffer8 interface: the IDirectSound device object that created
+     *  it. The device's last Release destroys every buffer it created (releaseDevice). */
+    device?: number;
 };
 
 export class DSound implements IModule {
@@ -871,6 +874,7 @@ export class DSound implements IModule {
                 if (obj.buffer) {
                     this.destroySoundBuffer(obj.buffer);
                 }
+                this.releaseDeviceBuffers(ptr >>> 0);
                 this.objects.delete(ptr);
                 freeComObject(this.process.memory, ptr);
             }
@@ -1722,6 +1726,7 @@ export class DSound implements IModule {
 
             const objStart = performance.now();
             const bufPtr = this.createObject("IDirectSoundBuffer8", this.vtables.IDirectSoundBuffer8.address, buffer);
+            this.objects.get(bufPtr)!.device = args[0] >>> 0;
             const objTime = performance.now() - objStart;
 
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -1886,6 +1891,7 @@ export class DSound implements IModule {
             }
 
             const bufPtr = this.createObject("IDirectSoundBuffer8", this.vtables.IDirectSoundBuffer8.address, newBuffer);
+            this.objects.get(bufPtr)!.device = args[0] >>> 0;
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             view.setUint32(ppBuffer, bufPtr, true);
 
@@ -2843,7 +2849,10 @@ export class DSound implements IModule {
                     ...(b.notifications ? { notifications: b.notifications.map(n => ({ ...n })) } : {}),
                 };
             }
-            objects.push({ ptr, type: o.type, refCount: o.refCount, isDs8: o.isDs8 ?? false, duplex: o.duplex ? { ...o.duplex } : null, buffer, ring: !!b?.sab });
+            objects.push({
+                ptr, type: o.type, refCount: o.refCount, isDs8: o.isDs8 ?? false, duplex: o.duplex ? { ...o.duplex } : null, buffer, ring: !!b?.sab,
+                ...(o.device !== undefined ? { device: o.device } : {}),
+            });
         }
         return {
             objects, nextBufferId: this.nextBufferId, notifyTimerId: this.notifyTimerId, primaryByDevice: [...this.primaryByDevice],
@@ -2896,7 +2905,10 @@ export class DSound implements IModule {
                     }
                 }
             }
-            this.objects.set(o.ptr, { type: o.type as DSoundObjectType, refCount: o.refCount, buffer, isDs8: o.isDs8 || undefined, duplex: o.duplex ?? undefined });
+            this.objects.set(o.ptr, {
+                type: o.type as DSoundObjectType, refCount: o.refCount, buffer, isDs8: o.isDs8 || undefined, duplex: o.duplex ?? undefined,
+                device: o.device,
+            });
         }
         this.nextBufferId = s.nextBufferId;
         this.notifyTimerId = s.notifyTimerId;
@@ -3432,6 +3444,37 @@ export class DSound implements IModule {
         const objPtr = allocateComObject(this.process.memory, mem, vtablePtr);
         this.objects.set(objPtr, { type, refCount: 1, buffer, capture, isDs8 });
         return objPtr;
+    }
+
+    /**
+     * A DirectSound device object owns the buffers it created: when its last reference goes,
+     * they go with it, Released by the app or not (Wine's DirectSoundDevice_Release destroys
+     * every secondary buffer still on the device, then the primary). Games lean on this to
+     * switch tracks: Need for Speed: Underground restarts its sound system on each mode
+     * change by Releasing only its IDirectSound object, then creates and plays a new
+     * looping mix buffer; the old one, never Stopped or Released, kept looping its last
+     * half second here — the drone after a race.
+     *
+     * The buffer interfaces stay allocated as dead objects rather than being freed: an app
+     * that Releases its device before its buffers (a common shutdown order) then gets a
+     * harmless Release and a failing call, and the guest address is never handed to a new
+     * object that a late call would then hit.
+     */
+    private releaseDeviceBuffers(device: number): void {
+        this.primaryByDevice.delete(device);
+        const dead = new Set<SoundBuffer>();
+        for (const obj of this.objects.values()) {
+            if (obj.device !== device) continue;
+            obj.device = undefined;
+            if (obj.buffer) dead.add(obj.buffer);
+        }
+        if (dead.size === 0) return;
+        for (const obj of this.objects.values()) {
+            if (obj.buffer && dead.has(obj.buffer)) obj.buffer = undefined;
+        }
+        for (const buffer of dead) {
+            if (buffer.sab || buffer.ptr || buffer.registered) this.destroySoundBuffer(buffer);
+        }
     }
 
     private isPrimaryBuffer(ptr: number): boolean {
