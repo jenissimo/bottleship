@@ -670,6 +670,11 @@ function isTransformState(state: number): boolean {
         || (state >= D3DTS_TEXTURE0 && state < D3DTS_TEXTURE0 + FFP_TEXTURE_TRANSFORM_COUNT);
 }
 
+export function d3d9BufferAlignment(): number {
+    const v = (globalThis as { __d3d9BufferAlign?: number }).__d3d9BufferAlign;
+    return v === 8 || v === 32 ? v : 16;
+}
+
 export class D3D9Device {
     /** Set when the parent interface is IDirect3D9Ex; Ex reset/pool rules follow the parent. */
     public isExtended = false;
@@ -767,14 +772,14 @@ export class D3D9Device {
 
     /** Guest heap belongs to the front: the render twin takes the address the front's call
      *  returned (a bare pointer, or the `ptr` of a lock result) and allocates nothing. */
-    private guestAlloc(bytes: number): number {
+    private guestAlloc(bytes: number, alignment?: number): number {
         if (this.role === "render") {
             const r = this.splitFrontResult;
             const ptr = typeof r === "number" ? r : (r as { ptr?: unknown } | null | undefined)?.ptr;
             if (typeof ptr !== "number" || ptr <= 0) throw new Error("split twin: no front allocation to adopt");
             return ptr;
         }
-        return System.getInstance().process!.memory.alloc(bytes, "HEAP");
+        return System.getInstance().process!.memory.alloc(bytes, "HEAP", undefined, alignment);
     }
 
     private guestFree(ptr: number): void {
@@ -3944,7 +3949,7 @@ export class D3D9Device {
         if (this.role !== "render" && !System.getInstance().process) return 0;
         try {
             // +16: tail canary (see BUF_CANARY) — kept outside the size the store/game sees.
-            const guestPtr = this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES);
+            const guestPtr = this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES, d3d9BufferAlignment());
             const index = this.vertexBuffers.create(vbPtr, size, fvf, guestPtr, pool);
             this.dropBufferVersions(index, "vb");
             if (this.role !== "render") this.writeCanary(null, guestPtr, size);
@@ -4336,7 +4341,7 @@ export class D3D9Device {
         if (this.role !== "render" && !System.getInstance().process) return 0;
         try {
             // +16: tail canary, same scheme as createVertexBuffer.
-            const guestPtr = this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES);
+            const guestPtr = this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES, d3d9BufferAlignment());
             const index = this.indexBuffers.create(ibPtr, size, format, guestPtr, pool);
             this.dropBufferVersions(index, "ib");
             if (this.role !== "render") this.writeCanary(null, guestPtr, size);
