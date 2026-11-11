@@ -21,6 +21,11 @@ export function effectLostDevice(inst: EffectInstance): void {
     inst.activePass = -1;
 }
 
+export function selectEffectTechnique(inst: EffectInstance, index: number): void {
+    if (index !== inst.currentTechnique) inst.activePass = -1;
+    inst.currentTechnique = index;
+}
+
 export function disposeEffectParameters(inst: EffectInstance): void {
     // Departing shared parameters relinquish their alias before private references are freed.
     if (inst.poolPtr) unbindSharedParameters(inst.poolPtr, inst.model);
