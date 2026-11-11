@@ -1,5 +1,5 @@
 // Native x86 micro-thunks for the pure-compute CRT math imports (floor/ceil/fabs/
-// sqrt/_ftol). Codegen pinned by tools/tests/crt-math-stubs.test.ts.
+// sqrt/_ftol/_finite/_isnan). Codegen pinned by tools/tests/crt-math-stubs.test.ts.
 // Caller: pe-loader (CRT-module import), via ThunkMemoryManager.stubAllocator.
 
 import { Logger, LogCategory } from '../core/logger';
@@ -7,7 +7,7 @@ import type { StubAllocator } from '../core/thunking/thunk-memory-manager';
 import { FTOL_TRUNCATE_BODY } from '../core/hle-lib/native-leaves';
 
 /** Micro-thunk entry points, as named on {@link CrtMathStubs}. */
-export type CrtMathStubName = 'floorStub' | 'ceilStub' | 'fabsStub' | 'sqrtStub' | 'ftolStub';
+export type CrtMathStubName = 'floorStub' | 'ceilStub' | 'fabsStub' | 'sqrtStub' | 'ftolStub' | 'finiteStub' | 'isnanStub';
 
 export interface CrtMathStubs {
     floorStub: number;
@@ -15,6 +15,8 @@ export interface CrtMathStubs {
     fabsStub: number;
     sqrtStub: number;
     ftolStub: number;
+    finiteStub: number;
+    isnanStub: number;
     regionBase: number;
     regionEnd: number;
 }
@@ -24,7 +26,7 @@ const RC_MASK = 0x0C00;
 const RC_DOWN = 0x0400;   // toward -inf  (floor)
 const RC_UP = 0x0800;     // toward +inf  (ceil)
 
-/** 5 stubs, largest 37 bytes; one 256-byte block keeps them on one page. */
+/** 7 stubs, largest 37 bytes; one 256-byte block keeps them on one page. */
 const REGION_SIZE = 256;
 
 /**
@@ -35,7 +37,7 @@ const REGION_SIZE = 256;
  * and floor alone is tens of thousands of calls per second. Emitted as guest x86
  * the JIT compiles them like any other block and the boundary disappears.
  *
- * All five are __cdecl (see msvcrt.api.ts): the CALLER cleans the stack, so every
+ * All of them are __cdecl (see msvcrt.api.ts): the CALLER cleans the stack, so every
  * stub ends in RET (0xC3), never RET N. floor/ceil/fabs/sqrt take the double at
  * [ESP+4]; _ftol takes its operand in ST(0) and returns the full __int64 in EDX:EAX.
  * The double-returning ones leave the result in ST(0) — the x87 return register —
@@ -124,6 +126,46 @@ export function writeCrtMathStubs(
     const ftolStub = off;
     w(...FTOL_TRUNCATE_BODY);
 
+    // int _finite(double): 1 unless the exponent field is all ones (Inf/NaN). Integer-only,
+    // so no x87 state is touched and the control word is irrelevant.
+    //   8B 44 24 08       mov   eax, [esp+8]       ; high dword of the double
+    //   25 00 00 F0 7F    and   eax, 0x7FF00000
+    //   3D 00 00 F0 7F    cmp   eax, 0x7FF00000
+    //   0F 95 C0          setne al
+    //   0F B6 C0          movzx eax, al
+    //   C3                ret
+    const finiteStub = off;
+    w(0x8B, 0x44, 0x24, 0x08);
+    w(0x25, 0x00, 0x00, 0xF0, 0x7F);
+    w(0x3D, 0x00, 0x00, 0xF0, 0x7F);
+    w(0x0F, 0x95, 0xC0);
+    w(0x0F, 0xB6, 0xC0);
+    w(0xC3);
+
+    // int _isnan(double): NaN iff (hi & 0x7FFFFFFF) + (lo != 0) > 0x7FF00000 unsigned — the
+    // sum cannot carry out of 31 bits, so one compare covers both "exponent all ones with a
+    // non-zero high mantissa" and "high mantissa zero but low mantissa non-zero". ECX is
+    // caller-saved in cdecl.
+    //   8B 44 24 08       mov   eax, [esp+8]
+    //   25 FF FF FF 7F    and   eax, 0x7FFFFFFF
+    //   8B 4C 24 04       mov   ecx, [esp+4]       ; low dword
+    //   F7 D9             neg   ecx                ; CF = (lo != 0)
+    //   83 D0 00          adc   eax, 0
+    //   3D 00 00 F0 7F    cmp   eax, 0x7FF00000
+    //   0F 97 C0          seta  al
+    //   0F B6 C0          movzx eax, al
+    //   C3                ret
+    const isnanStub = off;
+    w(0x8B, 0x44, 0x24, 0x08);
+    w(0x25, 0xFF, 0xFF, 0xFF, 0x7F);
+    w(0x8B, 0x4C, 0x24, 0x04);
+    w(0xF7, 0xD9);
+    w(0x83, 0xD0, 0x00);
+    w(0x3D, 0x00, 0x00, 0xF0, 0x7F);
+    w(0x0F, 0x97, 0xC0);
+    w(0x0F, 0xB6, 0xC0);
+    w(0xC3);
+
     if (off > base + REGION_SIZE) {
         // A silent overrun would corrupt whatever the allocator handed out next.
         throw new Error(`[crt-math-stubs] emitted ${off - base}B into a ${REGION_SIZE}B region`);
@@ -132,7 +174,8 @@ export function writeCrtMathStubs(
     Logger.log(LogCategory.SYSTEM,
         `CRT math micro-thunks emitted (${off - base}B): floor=0x${floorStub.toString(16)} ` +
         `ceil=0x${ceilStub.toString(16)} fabs=0x${fabsStub.toString(16)} ` +
-        `sqrt=0x${sqrtStub.toString(16)} _ftol=0x${ftolStub.toString(16)}`);
+        `sqrt=0x${sqrtStub.toString(16)} _ftol=0x${ftolStub.toString(16)} ` +
+        `_finite=0x${finiteStub.toString(16)} _isnan=0x${isnanStub.toString(16)}`);
 
-    return { floorStub, ceilStub, fabsStub, sqrtStub, ftolStub, regionBase: base, regionEnd: base + REGION_SIZE };
+    return { floorStub, ceilStub, fabsStub, sqrtStub, ftolStub, finiteStub, isnanStub, regionBase: base, regionEnd: base + REGION_SIZE };
 }
