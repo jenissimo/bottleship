@@ -347,7 +347,7 @@ const IDX5: IndexSetup = {
 };
 const IDX0: IndexSetup = { name: 'key 0, the first TlsAlloc', expectIndex: 0, alloc: s => s.tlsAlloc() };
 const CHURN: IndexSetup = {
-    name: 'key from TlsAlloc after 64 TlsAlloc/TlsFree pairs (one live slot)', expectIndex: 64,
+    name: 'key from TlsAlloc after 64 TlsAlloc/TlsFree pairs (one live slot)', expectIndex: 0,
     alloc: s => { for (let i = 0; i < 64; i++) s.tlsFree(s.tlsAlloc()); return s.tlsAlloc(); },
 };
 const LIVE65: IndexSetup = {
@@ -377,7 +377,7 @@ describe('libgcc SjLj splice: fixture', () => {
 });
 
 describe.skipIf(!HAVE_V86)('libgcc SjLj splice, executed in v86', () => {
-    for (const setup of [IDX5, IDX0]) {
+    for (const setup of [IDX5, IDX0, CHURN]) {
         test(`original (JS kernel32), original (WASM fast paths) and splice all follow the frame chain — ${setup.name}`, async () => {
             const origJs = await runArm({ splice: false, wasmApis: false, setup });
             const origHc = await runArm({ splice: false, wasmApis: true, setup });
@@ -452,18 +452,30 @@ describe('TlsAlloc and the splice\'s key < 64 assumption', () => {
         expect(s.tlsAlloc()).toBe(64);
     });
 
-    test('KNOWN BUG: with ONE live slot, TlsAlloc returns 64 after 64 TlsAlloc/TlsFree pairs', () => {
-        // tlsAlloc() resumes from nextTlsIndex and never goes back to a freed low index unless
-        // the next one is taken, so churn alone walks the key out of the TEB array. NT returns
-        // the lowest free index (0 here).
+    test('TlsAlloc returns the lowest free index: churn alone never leaves the TEB array', () => {
+        // Before the fix tlsAlloc() resumed after the last index, so 64 TlsAlloc/TlsFree pairs
+        // with ONE live slot produced key 64. NT returns the lowest free index.
         const s = new Scheduler();
         for (let i = 0; i < 64; i++) s.tlsFree(s.tlsAlloc());
-        expect(s.tlsAlloc()).toBe(64);
+        expect(s.tlsAlloc()).toBe(0);
+        expect([s.tlsAlloc(), s.tlsAlloc()]).toEqual([1, 2]);
+        s.tlsFree(1);
+        expect(s.tlsAlloc()).toBe(1);
+        for (let i = 3; i < 64; i++) expect(s.tlsAlloc()).toBeLessThan(64);
+        expect(s.tlsAlloc()).toBe(64);                 // only a 65th LIVE slot leaves the array
+    });
+
+    test('TlsAlloc stops at NT\'s 1088 indices (64 + 1024 expansion) with TLS_OUT_OF_INDEXES', () => {
+        const s = new Scheduler();
+        for (let i = 0; i < 1088; i++) expect(s.tlsAlloc()).toBe(i);
+        expect(s.tlsAlloc()).toBe(0xffffffff);
+        s.tlsFree(700);
+        expect(s.tlsAlloc()).toBe(700);
     });
 });
 
 describe.skipIf(!HAVE_V86)('libgcc SjLj splice with an expansion key, executed in v86', () => {
-    for (const setup of [CHURN, LIVE65]) {
+    for (const setup of [LIVE65]) {
         test(`KNOWN BUG: the splice writes past the TEB TLS array and TlsGetValue never sees the frame — ${setup.name}`, async () => {
             const orig = await runArm({ splice: false, wasmApis: true, setup });
             const spliced = await runArm({ splice: true, wasmApis: true, setup });

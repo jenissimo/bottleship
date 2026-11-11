@@ -84,6 +84,9 @@ import type { WinMM, PendingTimerCallback as PostedTimerCallback } from '../../m
 // idle anchor is stale after a pause / background-throttle gap. See pollTimeouts().
 const IDLE_PUMP_MAX_MS = 250;
 
+/** TLS_MINIMUM_AVAILABLE (64, the TEB array) + TLS_EXPANSION_SLOTS (1024), as on NT. */
+const TLS_INDEX_LIMIT = 64 + 1024;
+
 /** Sole-runnable Sleep(ms): credit+yield only for short pump sleeps; longer → blockThread. */
 const SOLE_RUNNABLE_SLEEP_CREDIT_MAX_MS = 50;
 
@@ -3746,19 +3749,21 @@ export class Scheduler {
     // TLS
     // ═══════════════════════════════════════════════════════════════════════
 
+    /** NT hands out the LOWEST free index (RtlFindClearBitsAndSet over the TLS bitmap): 0..63,
+     *  the TEB array, and the expansion range only while all 64 are live. Resuming after the
+     *  last index instead walked an allocator that only churns (TlsAlloc/TlsFree pairs) out of
+     *  the array with one live slot — past the WASM TLS fast paths and the fs:[2Ch] SjLj splice
+     *  (hle-lib/native-leaves.ts). nextTlsIndex is no longer consulted; it stays in the
+     *  savestate shape. */
     tlsAlloc(): number {
-        while (this.tlsSlots.has(this.nextTlsIndex)) {
-            this.nextTlsIndex++;
-            if (this.nextTlsIndex >= 64) {
-                this.nextTlsIndex = 0;
-                if (this.tlsSlots.size >= 64) return 0xFFFFFFFF;
-            }
+        for (let index = 0; index < TLS_INDEX_LIMIT; index++) {
+            if (this.tlsSlots.has(index)) continue;
+            this.tlsSlots.add(index);
+            this.nextTlsIndex = index + 1;
+            hypercallDataManager.setTlsSlotAllocated(index, true);
+            return index;
         }
-        const index = this.nextTlsIndex;
-        this.tlsSlots.add(index);
-        this.nextTlsIndex = index + 1;
-        hypercallDataManager.setTlsSlotAllocated(index, true);
-        return index;
+        return 0xFFFFFFFF;   // TLS_OUT_OF_INDEXES
     }
 
     tlsFree(index: number): boolean {
