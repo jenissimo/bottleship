@@ -532,13 +532,20 @@ function enumerateSectionsWide(addr: number, bufSizeChars: number, ini: IniData)
     return pos;
 }
 
-/** Write entries as a double-NUL-terminated list of at most `size` units (Win32 truncation rules). */
+/**
+ * Write entries as a double-NUL-terminated list of at most `size` units. On overflow the
+ * last entry is cut at `size - 2` and the list is closed there (Wine PROFILE_GetSection;
+ * documented return value `size - 2`), so no stale unit survives between the last whole
+ * entry and the terminator.
+ */
 function writeMultiString(entries: readonly string[], size: number, put: (index: number, unit: number) => unknown,
     encode: (s: string) => ArrayLike<number>): number {
     let pos = 0;
     for (const entry of entries) {
         const units = encode(entry);
         if (pos + units.length + 2 > size) {
+            const room = size - 2 - pos;
+            for (let i = 0; i < room; i++) put(pos + i, units[i]!);
             put(size - 2, 0);
             put(size - 1, 0);
             return size - 2;
@@ -819,7 +826,8 @@ export const exports: Record<string, ThunkImplementation> = {
         const buf = args[1];
         const nSize = args[2] >>> 0;
         const fileName = args[3] ? Marshaler.readString(mem, args[3]) : '';
-        if (!buf || nSize < 2) return 0;
+        if (!buf || nSize === 0) return 0;
+        if (nSize === 1) { Mem.writeUint8(buf, 0); return 0; }
         return withIniData(fileName, 16, (ini) => {
             const entries = ini ? sectionLines.get(ini)?.get(section.trim().toLowerCase()) ?? [] : [];
             return writeMultiString(entries, nSize, (i, ch) => Mem.writeUint8(buf + i, ch), (s) => encodeAnsi(s));
@@ -831,7 +839,8 @@ export const exports: Record<string, ThunkImplementation> = {
         const buf = args[1];
         const nSize = args[2] >>> 0;
         const fileName = args[3] ? Marshaler.readWideString(mem, args[3]) : '';
-        if (!buf || nSize < 2) return 0;
+        if (!buf || nSize === 0) return 0;
+        if (nSize === 1) { Mem.writeUint16(buf, 0); return 0; }
         return withIniData(fileName, 16, (ini) => {
             const entries = ini ? sectionLines.get(ini)?.get(section.trim().toLowerCase()) ?? [] : [];
             return writeMultiString(entries, nSize, (i, ch) => Mem.writeUint16(buf + i * 2, ch),
