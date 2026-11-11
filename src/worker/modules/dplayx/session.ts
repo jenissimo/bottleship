@@ -22,9 +22,13 @@ const DISCOVERY_PORT = 47624;
 const MAX_STATE = 1024 * 1024;
 const CHUNK = 60000;
 const MAGIC = 0x314c5044;
+// @transient(constant address)
 const BROADCAST = new Uint8Array(6).fill(255);
+// @transient(stateless text encoder)
 const encoder = new TextEncoder();
+// @transient(stateless text decoder)
 const decoder = new TextDecoder("utf-8", { fatal: true });
+// @transient(empty constant)
 const EMPTY: Uint8Array = new Uint8Array();
 
 export interface SessionDesc {
@@ -114,6 +118,7 @@ class DiscoveryHub implements LanEndpoint {
         for (const session of this.sessions) session.discoveryPacket(dg);
     }
 }
+// @transient(discovery hub per network; it lists only the sessions of live DirectPlay objects, and the dplayx participant refuses while one exists)
 const hubs = new WeakMap<LanNetwork, DiscoveryHub>();
 
 /** Owned initialization bytes; interpretation belongs to the selected provider. */

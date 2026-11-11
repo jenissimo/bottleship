@@ -149,6 +149,7 @@ export class DirectPlayLobbyBroker {
         }
     }
 }
+// @transient(host-side lobby broker of the root process; it records only lobbied child processes, and a child process refuses the save in kernel32)
 const brokers = new WeakMap<ProcessIpc, DirectPlayLobbyBroker>();
 export function ensureLobbyBroker(ipc = getProcessIpc()): void {
     if (ipc.pid === ipc.rootPid && !brokers.has(ipc)) brokers.set(ipc, new DirectPlayLobbyBroker(ipc));

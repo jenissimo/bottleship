@@ -22,6 +22,7 @@ export const PARTICIPANT_IDS = [
     'gdi32-palettes',
     'ddraw',
     'winmm',
+    'dplayx',
     'dmusic',
     'binkw32',
     'dsound',

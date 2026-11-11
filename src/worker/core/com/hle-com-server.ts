@@ -38,6 +38,8 @@ export class HleComServer {
         registerHleComServer(process, this, classes);
     }
     reset(): void { this.locks = 0; this.releaseLoaderReference(); }
+    get lockCount(): number { return this.locks; }
+    get holdsLoaderReference(): boolean { return this.loaderReference !== undefined; }
     /** COM loads the registered server before asking it to accept the requested IID. */
     acquireLoaderReference(): boolean {
         if (isBlockedByDisabledDlls(this.descriptor.name)) return false;
