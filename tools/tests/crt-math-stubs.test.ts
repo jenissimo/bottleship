@@ -77,6 +77,29 @@ describe('crt-math-stubs encodings', () => {
             'c3');               // ret                    (cdecl: no args on the stack)
     });
 
+    it('_finite tests the exponent field of the high dword', () => {
+        expect(hex(mem, stubs.finiteStub, 21)).toBe(
+            '8b 44 24 08 ' +     // mov   eax, [esp+8]
+            '25 00 00 f0 7f ' +  // and   eax, 0x7ff00000
+            '3d 00 00 f0 7f ' +  // cmp   eax, 0x7ff00000
+            '0f 95 c0 ' +        // setne al
+            '0f b6 c0 ' +        // movzx eax, al
+            'c3');
+    });
+
+    it('_isnan folds the low mantissa into the high dword with NEG/ADC', () => {
+        expect(hex(mem, stubs.isnanStub, 30)).toBe(
+            '8b 44 24 08 ' +     // mov   eax, [esp+8]
+            '25 ff ff ff 7f ' +  // and   eax, 0x7fffffff
+            '8b 4c 24 04 ' +     // mov   ecx, [esp+4]
+            'f7 d9 ' +           // neg   ecx           (CF = lo != 0)
+            '83 d0 00 ' +        // adc   eax, 0
+            '3d 00 00 f0 7f ' +  // cmp   eax, 0x7ff00000
+            '0f 97 c0 ' +        // seta  al
+            '0f b6 c0 ' +        // movzx eax, al
+            'c3');
+    });
+
     it('every stub ends in RET (cdecl — the caller cleans, never RET N)', () => {
         for (const [name, addr] of Object.entries(stubs)) {
             if (!name.endsWith('Stub')) continue;
@@ -90,6 +113,7 @@ describe('crt-math-stubs encodings', () => {
     it('the whole emission fits its region', () => {
         expect(stubs.regionEnd - stubs.regionBase).toBe(256);
         expect(stubs.ftolStub + 9).toBeLessThanOrEqual(stubs.regionEnd);
+        expect(stubs.isnanStub + 30).toBeLessThanOrEqual(stubs.regionEnd);
     });
 });
 
@@ -130,16 +154,18 @@ interface RunResult {
  * Execute one emitted stub. Strict decoder: anything outside the instruction set the
  * emitter is allowed to produce throws, naming the offending bytes.
  */
-function runStub(mem: Uint8Array, entry: number, arg?: number, st0In?: number, cwIn = CW_DEFAULT): RunResult {
+function runStub(mem: Uint8Array, entry: number, arg?: number, st0In?: number, cwIn = CW_DEFAULT, argBits?: [number, number]): RunResult {
     const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     const fpu: number[] = st0In === undefined ? [] : [st0In]; // fpu[0] === ST(0)
     let eip = entry;
     let esp = STACK_TOP;
     let eax = 0xDEADBEEF, edx = 0xDEADBEEF;
     let cw = cwIn;
+    let ecx = 0xDEADBEEF, cf = false, zf = false;
 
     dv.setUint32(esp, 0xC0FFEE, true);                     // return address
     if (arg !== undefined) dv.setFloat64(esp + 4, arg, true); // the cdecl double argument
+    if (argBits) { dv.setUint32(esp + 4, argBits[0] >>> 0, true); dv.setUint32(esp + 8, argBits[1] >>> 0, true); }
 
     const at = (i: number, ...bytes: number[]) => bytes.every((b, k) => mem[i + k] === b);
 
@@ -165,6 +191,18 @@ function runStub(mem: Uint8Array, entry: number, arg?: number, st0In?: number, c
         else if (at(eip, 0x66, 0x25)) { eax = (eax & ~0xFFFF) | ((eax & dv.getUint16(eip + 2, true)) & 0xFFFF); eip += 4; }
         else if (at(eip, 0x66, 0x0D)) { eax = (eax & ~0xFFFF) | ((eax | dv.getUint16(eip + 2, true)) & 0xFFFF); eip += 4; }
         else if (at(eip, 0x83, 0xEC)) { esp -= mem[eip + 2]; eip += 3; }
+        else if (at(eip, 0x8B, 0x44, 0x24)) { eax = dv.getUint32(esp + mem[eip + 3], true); eip += 4; }
+        else if (at(eip, 0x8B, 0x4C, 0x24)) { ecx = dv.getUint32(esp + mem[eip + 3], true); eip += 4; }
+        else if (at(eip, 0x25)) { eax = (eax & dv.getUint32(eip + 1, true)) >>> 0; eip += 5; }
+        else if (at(eip, 0x3D)) {
+            const imm = dv.getUint32(eip + 1, true);
+            cf = (eax >>> 0) < imm; zf = (eax >>> 0) === imm; eip += 5;
+        }
+        else if (at(eip, 0xF7, 0xD9)) { cf = ecx !== 0; ecx = (-ecx) >>> 0; eip += 2; }
+        else if (at(eip, 0x83, 0xD0, 0x00)) { eax = (eax + (cf ? 1 : 0)) >>> 0; eip += 3; }
+        else if (at(eip, 0x0F, 0x95, 0xC0)) { eax = ((eax & ~0xFF) | (zf ? 0 : 1)) >>> 0; eip += 3; }
+        else if (at(eip, 0x0F, 0x97, 0xC0)) { eax = ((eax & ~0xFF) | (!cf && !zf ? 1 : 0)) >>> 0; eip += 3; }
+        else if (at(eip, 0x0F, 0xB6, 0xC0)) { eax = eax & 0xFF; eip += 3; }
         else throw new Error(`unexpected opcode at +0x${(eip - entry).toString(16)}: ${hex(mem, eip, 6)}`);
     }
     throw new Error('stub did not return');
@@ -266,4 +304,29 @@ describe('crt-math-stubs semantics', () => {
         expect(BigInt.asIntN(64, (BigInt(r.edx) << 32n) | BigInt(r.eax))).toBe(-2n);
         expect(r.cw).toBe(CW_UP);
     });
+});
+
+describe('crt-math-stubs _finite/_isnan', () => {
+    const { mem, stubs } = mkStubs();
+    const bitsCall = (entry: number, lo: number, hi: number) =>
+        runStub(mem, entry, undefined, undefined, CW_DEFAULT, [lo, hi]);
+    const cases: Array<[string, number, number]> = [
+        ['+0', 0, 0], ['-0', 0, 0x80000000], ['1.0', 0, 0x3FF00000], ['-max', 0xFFFFFFFF, 0xFFEFFFFF],
+        ['min subnormal', 1, 0], ['+inf', 0, 0x7FF00000], ['-inf', 0, 0xFFF00000],
+        ['qnan', 0, 0x7FF80000], ['snan low-only', 1, 0x7FF00000], ['-nan', 0x12345678, 0xFFF00001],
+        ['nan all ones', 0xFFFFFFFF, 0x7FFFFFFF],
+    ];
+    for (const [name, lo, hi] of cases) {
+        it(`${name}: matches the CRT contract`, () => {
+            const expFull = ((hi >>> 20) & 0x7FF) === 0x7FF;
+            const mantNonZero = (hi & 0xFFFFF) !== 0 || lo !== 0;
+            const fin = bitsCall(stubs.finiteStub, lo, hi);
+            const nan = bitsCall(stubs.isnanStub, lo, hi);
+            expect(fin.eax).toBe(expFull ? 0 : 1);
+            expect(nan.eax).toBe(expFull && mantNonZero ? 1 : 0);
+            expect(fin.depth).toBe(0);
+            expect(nan.depth).toBe(0);
+            expect(nan.esp).toBe(STACK_TOP);
+        });
+    }
 });

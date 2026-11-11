@@ -292,6 +292,8 @@ export class PELoader {
         'sqrt': 'sqrtStub',
         '_ftol': 'ftolStub',
         '__ftol': 'ftolStub',
+        '_finite': 'finiteStub',
+        '_isnan': 'isnanStub',
     };
 
     /**
