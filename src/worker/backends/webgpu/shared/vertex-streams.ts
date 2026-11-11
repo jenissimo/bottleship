@@ -295,6 +295,16 @@ export function zeroStreamBuffer(device: GPUDevice, minSize: number): GPUBuffer 
 export const D3DSTREAMSOURCE_INDEXEDDATA = 0x40000000;
 export const D3DSTREAMSOURCE_INSTANCEDATA = 0x80000000;
 
+/** The argument check SetStreamSourceFreq can fail on: a stream in range, the two flags never
+ *  together, and a divider that is never 0. Shared by the device and the deferred fast path. */
+export function streamSourceFreqArgsValid(streamNumber: number, setting: number): boolean {
+    if (streamNumber < 0 || streamNumber >= MAX_VERTEX_STREAMS) return false;
+    const value = setting >>> 0;
+    const indexed = (value & D3DSTREAMSOURCE_INDEXEDDATA) !== 0;
+    const instance = (value & D3DSTREAMSOURCE_INSTANCEDATA) !== 0;
+    return !((indexed && instance) || ((value & ~(D3DSTREAMSOURCE_INDEXEDDATA | D3DSTREAMSOURCE_INSTANCEDATA)) === 0));
+}
+
 /**
  * The step mode one slot's divider asks for.
  *

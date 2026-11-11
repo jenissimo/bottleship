@@ -191,7 +191,7 @@ import {
     MAX_VERTEX_BUFFER_SLOTS, MAX_VERTEX_STREAMS, StreamBindingPlan, StreamBindingTable,
     applyStepModes, bindingSize, declStreamMask, layoutAttributeEnds, layoutStrides, planInstancing,
     isWebGpuArrayStrideAligned, slotArrayStride, slotMaskExceedsLimit, slotsInMask, stepModeFromFreq, zeroStreamBuffer,
-    streamInstanceDivisor, expandInstanceRateData,
+    streamInstanceDivisor, expandInstanceRateData, streamSourceFreqArgsValid,
 } from "../shared/vertex-streams";
 import {
     parseFvf, planFvf, makeFvfDeclaration,
@@ -283,9 +283,6 @@ const D3D9_MAX_RENDER_TARGETS = 4;
 const D3DCULL_NONE = 1;
 const D3DCULL_CW = 2;
 const D3DCULL_CCW = 3;
-/** SetStreamSourceFreq dividers (d3d9types.h): the flag half of the setting word. */
-const D3DSTREAMSOURCE_INDEXEDDATA = 0x40000000;
-const D3DSTREAMSOURCE_INSTANCEDATA = 0x80000000;
 
 type ShaderDiagnosticStage = "vs" | "ps";
 type ShaderDiagnosticBuild = "pending" | "linked" | "built" | "failed";
@@ -3875,14 +3872,8 @@ export class D3D9Device {
         // A/B: bring back the E_NOTIMPL this replaced, so the failure it causes can be
         // reproduced on demand instead of argued about.
         if ((globalThis as { __noStreamSourceFreq?: boolean }).__noStreamSourceFreq) return 0x80004001;
-        if (streamNumber < 0 || streamNumber >= D3D9Device.MAX_STREAMS) return D3DERR_INVALIDCALL;
+        if (!streamSourceFreqArgsValid(streamNumber, setting)) return D3DERR_INVALIDCALL;
         const value = setting >>> 0;
-        const indexed = (value & D3DSTREAMSOURCE_INDEXEDDATA) !== 0;
-        const instance = (value & D3DSTREAMSOURCE_INSTANCEDATA) !== 0;
-        // The two flags are mutually exclusive, and the divider itself is never 0.
-        if ((indexed && instance) || ((value & ~(D3DSTREAMSOURCE_INDEXEDDATA | D3DSTREAMSOURCE_INSTANCEDATA)) === 0)) {
-            return D3DERR_INVALIDCALL;
-        }
         if (this.recordingStateBlock) {
             this.recordStateBlock({ op: "streamSourceFreq", stream: streamNumber, setting: value });
             return D3D_OK;
