@@ -3258,15 +3258,34 @@ export class DSound implements IModule {
             // An app that writes one Lock's worth per wake loses a whole block when the cursor
             // moves a Lock's worth or more between two of its queries, so that is the bound;
             // the query cadence only bounds apps whose Lock size is not yet known.
-            // Floored at one typical gap of playback: below that the bound caps the RATE, not
-            // a pause's jump, and a pump that sizes each Lock from the cursor delta feeds its
-            // shrinking Locks back into the bound until it streams a fraction of real time.
+            // Floored at one typical gap of playback at the ramp's catch-up speed: below that
+            // the bound caps the RATE, not a pause's jump. A pump that sizes each Lock from the
+            // cursor delta feeds its shrinking Locks back into the bound until it streams a
+            // fraction of real time; and a floor of exactly one gap at the nominal rate still
+            // caps it, because every gap longer than the typical one (a timer callback a host
+            // frame late) loses ground no later query may win back. The reported cursor then
+            // drifts behind the worklet for good, never opens the host latency, and a pump
+            // writing a fixed lead past it lands its writes a lap late (UE1 Galaxy: Harry
+            // Potter 1 music and voice turn robotic, then drop out). The headroom is the
+            // drain speed the ramp itself allows, so the bound never holds tighter than it.
+            // Only a pump whose Lock sizes vary gets it: a delta pump's Locks follow the
+            // cursor, a chunked pump Locks the same chunk every time. For the latter the
+            // headroom only loosens the bound past its chunk whenever its query gaps stretch
+            // (SDL2 polls back to back while it catches up after a pause): Chains of Satinav
+            // then skips chunks and crackles. Its Lock size never depends on the cursor, so
+            // the bound there cannot ratchet the rate and needs no catch-up speed.
             const lockCount = buffer.stepLockCount ?? 0;
-            const limit = lockCount > 0
-                ? Math.max(typical * nominalBytesPerMs,
-                    medianOf(buffer.stepLockSizes!, Math.min(lockCount, CURSOR_LOCK_WINDOW), this.stepGapScratch)
-                        - Math.max(1, buffer.format.blockAlign))
-                : Math.max(1, typical * CURSOR_STEP_TYPICAL_GAPS) * nominalBytesPerMs;
+            let limit: number;
+            if (lockCount > 0) {
+                const n = Math.min(lockCount, CURSOR_LOCK_WINDOW);
+                const locks = buffer.stepLockSizes!;
+                let fixedLock = true;
+                for (let i = 1; i < n && fixedLock; i++) fixedLock = locks[i] === locks[0];
+                limit = Math.max(typical * nominalBytesPerMs * (fixedLock ? 1 : SMOOTH_CATCHUP_SPEEDUP),
+                    medianOf(locks, n, this.stepGapScratch) - Math.max(1, buffer.format.blockAlign));
+            } else {
+                limit = Math.max(1, typical * CURSOR_STEP_TYPICAL_GAPS) * nominalBytesPerMs;
+            }
             if (advance > limit) {
                 cursor = (last + Math.floor(limit)) % size;
                 buffer.smoothFromCursor = cursor;
