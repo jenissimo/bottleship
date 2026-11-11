@@ -118,8 +118,11 @@ const ALC_SYNC            = 0x1009;
 const ALC_MONO_SOURCES    = 0x1010;
 const ALC_STEREO_SOURCES  = 0x1011;
 const ALC_CAPTURE_SAMPLES = 0x312;
+const ALC_INVALID_DEVICE  = 0xA001;
+const ALC_INVALID_CONTEXT = 0xA002;
 const ALC_INVALID_ENUM    = 0xA003;
 const ALC_INVALID_VALUE   = 0xA004;
+const ALC_OUT_OF_MEMORY   = 0xA005;
 
 /** What a device advertises: the mixer runs at 44.1 kHz, and sources are only bounded by memory. */
 const ALC_DEVICE_ATTRIBUTES: readonly number[] = [
@@ -138,7 +141,7 @@ const ALC_ENUMS: Record<string, number> = {
     ALC_FREQUENCY, ALC_REFRESH, ALC_SYNC, ALC_MONO_SOURCES, ALC_STEREO_SOURCES,
     ALC_DEFAULT_DEVICE_SPECIFIER, ALC_DEVICE_SPECIFIER, ALC_EXTENSIONS,
     ALC_DEFAULT_ALL_DEVICES_SPECIFIER, ALC_ALL_DEVICES_SPECIFIER,
-    ALC_INVALID_ENUM, ALC_INVALID_VALUE, ALC_NO_ERROR,
+    ALC_INVALID_DEVICE, ALC_INVALID_CONTEXT, ALC_INVALID_ENUM, ALC_INVALID_VALUE, ALC_OUT_OF_MEMORY, ALC_NO_ERROR,
 };
 
 const ALC_DEVICE_NAME = "BottleShip OpenAL";
@@ -290,7 +293,7 @@ export class OpenAL implements IModule {
     private sources = new Map<number, ALSource>();
 
     // Pre-allocated string pointers
-    private stringPtrs = new Map<number, number>();
+    private stringPtrs = new Map<string, number>();
 
     private lastPumpAllMs = 0;
     private alcError = ALC_NO_ERROR;
@@ -342,8 +345,12 @@ export class OpenAL implements IModule {
             const values = this.alcIntegers(device, param);
             if (!values) { this.alcError = ALC_INVALID_ENUM; return 0; }
             if (!dataPtr || size <= 0 || size < values.length) { this.alcError = ALC_INVALID_VALUE; return 0; }
-            const dv = new DataView(mem.buffer, mem.byteOffset);
-            for (let i = 0; i < values.length; i++) dv.setInt32(dataPtr + i * 4, values[i], true);
+            // One validated write over the whole extent: a pointer near the end of memory
+            // fails as a unit instead of leaving a partial result behind.
+            const out = new Uint8Array(values.length * 4);
+            const outView = new DataView(out.buffer);
+            for (let i = 0; i < values.length; i++) outView.setInt32(i * 4, values[i], true);
+            if (Mem.writeBytes(dataPtr, out) !== out.length) this.alcError = ALC_INVALID_VALUE;
             return 0;
         };
         this.exports["alcIsExtensionPresent"] = (_ctx, mem, args) => {
@@ -1291,7 +1298,7 @@ export class OpenAL implements IModule {
 
     // ── String helpers ───────────────────────────────────────────────────
 
-    private getOrAllocString(key: number, value: string): number {
+    private getOrAllocString(key: string, value: string): number {
         let ptr = this.stringPtrs.get(key);
         if (!ptr) {
             ptr = writeString(this.process, value);
@@ -1304,22 +1311,31 @@ export class OpenAL implements IModule {
         switch (param) {
             case ALC_DEFAULT_DEVICE_SPECIFIER:
             case ALC_DEFAULT_ALL_DEVICES_SPECIFIER:
-                return this.getOrAllocString(param, ALC_DEVICE_NAME);
+                return this.getOrAllocString(`alc:${param}`, ALC_DEVICE_NAME);
             case ALC_DEVICE_SPECIFIER:
             case ALC_ALL_DEVICES_SPECIFIER:
                 // Without a device this is the enumeration list: names separated by NUL and
                 // closed by a second NUL. With one it is that device's name; the extra NUL is inert.
-                return this.getOrAllocString(param, ALC_DEVICE_NAME + "\0");
+                return this.getOrAllocString(`alc:${param}`, ALC_DEVICE_NAME + "\0");
             case ALC_EXTENSIONS:
-                return this.getOrAllocString(param, device ? ALC_EXTENSION_LIST.join(" ") : "");
+                // The answer depends on `device`, so the cache key must too.
+                return device
+                    ? this.getOrAllocString(`alc:${param}:device`, ALC_EXTENSION_LIST.join(" "))
+                    : this.getOrAllocString(`alc:${param}:null`, "");
             case ALC_NO_ERROR:
-                return this.getOrAllocString(0xFD00, "No Error");
+                return this.getOrAllocString(`alc:${param}`, "No Error");
+            case ALC_INVALID_DEVICE:
+                return this.getOrAllocString(`alc:${param}`, "Invalid Device");
+            case ALC_INVALID_CONTEXT:
+                return this.getOrAllocString(`alc:${param}`, "Invalid Context");
             case ALC_INVALID_ENUM:
-                return this.getOrAllocString(0xFD03, "Invalid Enum");
+                return this.getOrAllocString(`alc:${param}`, "Invalid Enum");
             case ALC_INVALID_VALUE:
-                return this.getOrAllocString(0xFD04, "Invalid Value");
+                return this.getOrAllocString(`alc:${param}`, "Invalid Value");
+            case ALC_OUT_OF_MEMORY:
+                return this.getOrAllocString(`alc:${param}`, "Out of Memory");
             default:
-                return this.getOrAllocString(0xFF00 | param, "");
+                return this.getOrAllocString("alc:unknown", "");
         }
     }
 
@@ -1342,11 +1358,11 @@ export class OpenAL implements IModule {
 
     private getAlString(param: number): number {
         switch (param) {
-            case AL_VENDOR:     return this.getOrAllocString(param, "BottleShip");
-            case AL_VERSION:    return this.getOrAllocString(param, "1.1");
-            case AL_RENDERER:   return this.getOrAllocString(param, "BottleShip WebAudio");
-            case AL_EXTENSIONS: return this.getOrAllocString(param, "");
-            default:            return this.getOrAllocString(0xFE00 | param, "");
+            case AL_VENDOR:     return this.getOrAllocString(`al:${param}`, "BottleShip");
+            case AL_VERSION:    return this.getOrAllocString(`al:${param}`, "1.1");
+            case AL_RENDERER:   return this.getOrAllocString(`al:${param}`, "BottleShip WebAudio");
+            case AL_EXTENSIONS: return this.getOrAllocString(`al:${param}`, "");
+            default:            return this.getOrAllocString("al:unknown", "");
         }
     }
 }

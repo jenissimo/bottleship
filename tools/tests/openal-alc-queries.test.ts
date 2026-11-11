@@ -7,6 +7,7 @@
 
 import { test, expect, beforeEach } from "bun:test";
 import { OpenAL } from "../../src/worker/modules/openal/openal";
+import { Mem } from "../../src/worker/core/memory/mem-accessor";
 
 const MEM_BYTES = 1 << 20;
 const OUT = 0x1000;
@@ -34,6 +35,7 @@ beforeEach(() => {
     (globalThis as any).postMessage = () => { /* sink */ };
     mem = new Uint8Array(MEM_BYTES);
     dv = new DataView(mem.buffer);
+    Mem.bind(() => mem, (a, s) => a >= 0 && a + s <= mem.length);
     let next = 0x80000;
     al = new OpenAL();
     al.initialize({ memory: { alloc: (n: number) => { const p = next; next += n + 16; return p; } }, getCurrentMemory: () => mem } as any);
@@ -86,4 +88,40 @@ test("enumeration is advertised and the NULL-device specifier is a double-NUL li
     expect(mem[p + name.length + 1]).toBe(0);
     expect(cstr(call("alcGetString", 0, 0x1004))).toBe(name);
     expect(call("alcGetEnumValue", 0, put("ALC_MONO_SOURCES"))).toBe(0x1010);
+});
+
+test("ALC_EXTENSIONS is cached per device-ness, in either query order", () => {
+    const dev = call("alcOpenDevice", 0);
+    expect(cstr(call("alcGetString", 0, 0x1006))).toBe("");
+    const withDev = cstr(call("alcGetString", dev, 0x1006));
+    expect(withDev).toContain("ALC_ENUMERATION_EXT");
+    expect(cstr(call("alcGetString", 0, 0x1006))).toBe("");
+    expect(cstr(call("alcGetString", dev, 0x1006))).toBe(withDev);
+});
+
+test("ALC_EXTENSIONS: device first, then NULL", () => {
+    const dev = call("alcOpenDevice", 0);
+    const withDev = cstr(call("alcGetString", dev, 0x1006));
+    expect(withDev).toContain("ALC_ENUMERATION_EXT");
+    expect(cstr(call("alcGetString", 0, 0x1006))).toBe("");
+});
+
+test("alcGetString answers the ALC error enums with their spec strings", () => {
+    const expected: Record<number, string> = {
+        0: "No Error", 0xA001: "Invalid Device", 0xA002: "Invalid Context",
+        0xA003: "Invalid Enum", 0xA004: "Invalid Value", 0xA005: "Out of Memory",
+    };
+    for (const [code, text] of Object.entries(expected)) {
+        expect(cstr(call("alcGetString", 0, Number(code)))).toBe(text);
+    }
+});
+
+test("alcGetIntegerv with an out-buffer at the end of memory raises INVALID_VALUE instead of throwing", () => {
+    const dev = call("alcOpenDevice", 0);
+    dv.setInt32(MEM_BYTES - 4, 0x5A5A5A5A, true);
+    expect(() => call("alcGetIntegerv", dev, 0x1000, 1, MEM_BYTES - 2)).not.toThrow();
+    expect(dv.getInt32(MEM_BYTES - 4, true)).toBe(0x5A5A5A5A);
+    expect(call("alcGetError", dev)).toBe(0xA004);
+    call("alcGetIntegerv", dev, 0x1000, 1, MEM_BYTES - 4);
+    expect(dv.getInt32(MEM_BYTES - 4, true)).toBe(1);
 });
