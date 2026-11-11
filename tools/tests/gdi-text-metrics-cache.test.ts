@@ -77,3 +77,44 @@ describe("GetTextMetrics measurement cache", () => {
         void broken;
     });
 });
+describe("GetTextMetrics measures from the alphabetic baseline", () => {
+    beforeEach(() => invalidateTextExtentCache());
+
+    /** fontBoundingBoxAscent/Descent depend on the context's textBaseline, as on a real canvas. */
+    function baselineCtx(font: string, textBaseline: string): TextMeasurer & { seen: string[] } {
+        const px = Number(/(\d+)px/.exec(font)![1]);
+        const ctx = {
+            font,
+            textBaseline,
+            seen: [] as string[],
+            measureText(text: string) {
+                ctx.seen.push(ctx.textBaseline);
+                const top = ctx.textBaseline === "top";
+                return {
+                    width: text.length * px / 2,
+                    fontBoundingBoxAscent: top ? 0 : px * 0.8,
+                    fontBoundingBoxDescent: top ? px : px * 0.2,
+                    actualBoundingBoxLeft: 0,
+                    actualBoundingBoxRight: px / 2,
+                };
+            },
+        };
+        return ctx;
+    }
+
+    test("a context drawing with 'top' still reports ascent and descent around the baseline", () => {
+        const ctx = baselineCtx("20px Arial", "top");
+        const m = measureTextMetricsCached(ctx, DEFAULTS);
+        expect(m.ascent).toBe(16);
+        expect(m.descent).toBe(4);
+        expect(new Set(ctx.seen)).toEqual(new Set(["alphabetic"]));
+        expect(ctx.textBaseline).toBe("top");
+    });
+
+    test("the baseline is restored when the measurement throws", () => {
+        const ctx = baselineCtx("21px Arial", "top");
+        ctx.measureText = () => { throw new Error("no metrics"); };
+        expect(measureTextMetricsCached(ctx, DEFAULTS)).toEqual(DEFAULTS);
+        expect(ctx.textBaseline).toBe("top");
+    });
+});

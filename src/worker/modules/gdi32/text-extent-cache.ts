@@ -15,6 +15,7 @@
 /** The slice of the canvas API this needs; a structural type so tests can supply their own. */
 export interface TextMeasurer {
     font: string;
+    textBaseline?: string;
     measureText(text: string): { width: number; fontBoundingBoxAscent?: number; fontBoundingBoxDescent?: number; actualBoundingBoxLeft: number; actualBoundingBoxRight: number };
 }
 
@@ -100,7 +101,9 @@ export function measureTextMetricsCached(ctx: TextMeasurer, defaults: MeasuredTe
     const c = cacheFor(ctx.font);
     if (c.metrics) return c.metrics;
     let { ascent, descent, aveWidth, maxWidth } = defaults;
+    const baseline = ctx.textBaseline;
     try {
+        if (baseline !== undefined) ctx.textBaseline = 'alphabetic';
         const m = ctx.measureText('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz');
         if (m.fontBoundingBoxAscent !== undefined) {
             ascent = Math.ceil(m.fontBoundingBoxAscent);
@@ -115,6 +118,8 @@ export function measureTextMetricsCached(ctx: TextMeasurer, defaults: MeasuredTe
         }
     } catch {
         return defaults;
+    } finally {
+        if (baseline !== undefined) ctx.textBaseline = baseline;
     }
     c.metrics = { ascent, descent, aveWidth, maxWidth };
     return c.metrics;
