@@ -2167,6 +2167,10 @@ export class Scheduler {
         this.imageStackReserve = Math.max(0, bytes | 0);
     }
 
+    getImageStackReserve(): number {
+        return this.imageStackReserve;
+    }
+
     createThread(
         startAddress: number, parameter: number, stackSize: number,
         creationFlags: number, outThreadId: number, memory: Uint8Array

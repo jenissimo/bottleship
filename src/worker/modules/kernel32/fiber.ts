@@ -26,6 +26,7 @@ import { System } from '../../core/system';
 import { getCPU } from '../../core/thunking/thunk-utils';
 import { cpuViews } from '../../core/cpu/cpu-views';
 import { invalidateGuestCode } from '../../core/memory/guest-code';
+import { threadStackReserve } from '../../core/scheduler/types';
 
 const ERROR_ALREADY_FIBER = 1280;
 const ERROR_ALREADY_THREAD = 1281;
@@ -42,7 +43,13 @@ const F_ESI = 0x14;
 const F_EDI = 0x18;
 const F_EBP = 0x1C;
 const F_ESP = 0x20;
+const F_MAGIC = 0x24;
+const F_STACK_ALLOC = 0x28;    // allocation holding the stack; 0 for a fiber made from a thread
+const F_FLAGS = 0x2C;
 const FIBER_SIZE = 0x40;
+
+const FIBER_MAGIC = 0x52424946;
+const FLAG_THREAD_FIBER = 1;
 
 // TEB (NT_TIB) fields a fiber owns.
 const TEB_EXCEPTION_LIST = 0x00;
@@ -50,35 +57,28 @@ const TEB_STACK_BASE = 0x04;
 const TEB_STACK_LIMIT = 0x08;
 const TEB_FIBER_DATA = 0x10;
 
-const DEFAULT_STACK = 0x100000;
-const MIN_STACK = 0x10000;
+const DEFAULT_STACK_RESERVE = 0x100000;
+const MAX_STACK = 0x40000000;
 
-interface FiberRecord {
-    /** Allocation holding the stack; 0 for a fiber made from a thread (its stack is the thread's). */
-    stackAlloc: number;
-    /** The thread whose stack a converted fiber runs on, for ConvertFiberToThread. */
-    threadFiber: boolean;
-}
-
-// @transient(fiber objects belong to a running guest; a reset drops them with the process)
-const fibers = new Map<number, FiberRecord>();
 // @transient(identity of the owning process object)
 let fiberOwner: unknown = null;
+// @transient(identity of the owning process object)
+let fiberOwnerResetGeneration = -1;
 // @transient(guest code allocated per process)
 let retStub = 0;
 
 function ensureProcessLocal(): void {
     const process = System.getInstance().process;
-    if (process !== fiberOwner) {
-        fiberOwner = process;
-        fibers.clear();
-        retStub = 0;
-    }
+    const gen = process?.resetGeneration ?? 0;
+    if (process === fiberOwner && gen === fiberOwnerResetGeneration) return;
+    fiberOwner = process;
+    fiberOwnerResetGeneration = gen;
+    retStub = 0;
 }
 
 export function resetFiberState(): void {
-    fibers.clear();
     fiberOwner = null;
+    fiberOwnerResetGeneration = -1;
     retStub = 0;
 }
 
@@ -88,7 +88,7 @@ export function resetFiberState(): void {
  * continues at the new EIP or runs the thunk stub's own `RET 4` first.
  */
 function ensureRetStub(): number {
-    if (retStub) return retStub;
+    if (retStub && Mem.readUint8(retStub) === 0xC2 && Mem.readUint8(retStub + 1) === 0x04 && Mem.readUint8(retStub + 2) === 0x00) return retStub;
     const process = System.getInstance().process;
     if (!process) return 0;
     try { retStub = process.memory.alloc(16, 'THUNK_DATA') >>> 0; } catch { return 0; }
@@ -107,6 +107,10 @@ function setLastError(code: number): void {
     System.getInstance().scheduler.setLastError(code);
 }
 
+function isFiber(fiber: number): boolean {
+    return fiber !== 0 && rd(fiber + F_MAGIC) === FIBER_MAGIC;
+}
+
 function tebAddress(cpu: any): number {
     return (cpuViews(cpu).segmentOffsets[4] ?? 0) >>> 0;
 }
@@ -118,6 +122,7 @@ function newFiberObject(param: number): number {
     try { fiber = process.memory.alloc(FIBER_SIZE) >>> 0; } catch { return 0; }
     for (let off = 0; off < FIBER_SIZE; off += 4) Mem.writeUint32(fiber + off, 0);
     Mem.writeUint32(fiber + F_DATA, param >>> 0);
+    Mem.writeUint32(fiber + F_MAGIC, FIBER_MAGIC);
     return fiber;
 }
 
@@ -127,7 +132,7 @@ function convertThreadToFiber(param: number): number {
     const teb = cpu ? tebAddress(cpu) : 0;
     if (!teb) return 0;
     const current = rd(teb + TEB_FIBER_DATA);
-    if (fibers.has(current)) {
+    if (isFiber(current)) {
         setLastError(ERROR_ALREADY_FIBER);
         return 0;
     }
@@ -135,20 +140,23 @@ function convertThreadToFiber(param: number): number {
     if (!fiber) { setLastError(ERROR_NOT_ENOUGH_MEMORY); return 0; }
     Mem.writeUint32(fiber + F_STACK_BASE, rd(teb + TEB_STACK_BASE));
     Mem.writeUint32(fiber + F_STACK_LIMIT, rd(teb + TEB_STACK_LIMIT));
-    fibers.set(fiber, { stackAlloc: 0, threadFiber: true });
+    Mem.writeUint32(fiber + F_FLAGS, FLAG_THREAD_FIBER);
     Mem.writeUint32(teb + TEB_FIBER_DATA, fiber);
     Logger.log(LogCategory.KERNEL32, `ConvertThreadToFiber(param=0x${param.toString(16)}) -> 0x${fiber.toString(16)}`);
     return fiber;
 }
 
-function createFiber(stackReserve: number, start: number, param: number): number {
+function createFiber(stackCommit: number, stackReserve: number, start: number, param: number): number {
     ensureProcessLocal();
     const system = System.getInstance();
     const process = system.process;
     if (!process || !start) { setLastError(ERROR_INVALID_PARAMETER); return 0; }
-    const size = Math.max(MIN_STACK, ((stackReserve >>> 0) || DEFAULT_STACK) + 0xFFFF & ~0xFFFF) >>> 0;
-    let stack: number;
-    try { stack = process.memory.alloc(size, undefined, undefined, 0x1000) >>> 0; } catch { stack = 0; }
+    const reserve = (stackReserve >>> 0) || system.scheduler.getImageStackReserve();
+    const size = threadStackReserve(stackCommit >>> 0, 0, reserve, DEFAULT_STACK_RESERVE);
+    let stack = 0;
+    if (size <= MAX_STACK) {
+        try { stack = process.memory.alloc(size, undefined, undefined, 0x1000) >>> 0; } catch { stack = 0; }
+    }
     if (!stack) { setLastError(ERROR_NOT_ENOUGH_MEMORY); return 0; }
     const fiber = newFiberObject(param);
     if (!fiber) { process.memory.free(stack); setLastError(ERROR_NOT_ENOUGH_MEMORY); return 0; }
@@ -169,7 +177,7 @@ function createFiber(stackReserve: number, start: number, param: number): number
     Mem.writeUint32(fiber + F_STACK_BASE, top);
     Mem.writeUint32(fiber + F_STACK_LIMIT, stack);
     Mem.writeUint32(fiber + F_ESP, esp);
-    fibers.set(fiber, { stackAlloc: stack, threadFiber: false });
+    Mem.writeUint32(fiber + F_STACK_ALLOC, stack);
     Logger.log(LogCategory.KERNEL32,
         `CreateFiber(stack=0x${size.toString(16)}, start=0x${start.toString(16)}, param=0x${param.toString(16)}) -> 0x${fiber.toString(16)}`);
     return fiber;
@@ -179,10 +187,10 @@ export const exports: Record<string, ThunkImplementation> = {
     'ConvertThreadToFiber': (_ctx, _mem, args) => convertThreadToFiber(args[0] ?? 0),
     'ConvertThreadToFiberEx': (_ctx, _mem, args) => convertThreadToFiber(args[0] ?? 0),
 
-    'CreateFiber': (_ctx, _mem, args) => createFiber(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0),
+    'CreateFiber': (_ctx, _mem, args) => createFiber(args[0] ?? 0, 0, args[1] ?? 0, args[2] ?? 0),
     // CreateFiberEx(dwStackCommitSize, dwStackReserveSize, dwFlags, lpStartAddress, lpParameter)
     'CreateFiberEx': (_ctx, _mem, args) =>
-        createFiber(Math.max(args[0] >>> 0, args[1] >>> 0), args[3] ?? 0, args[4] ?? 0),
+        createFiber(args[0] ?? 0, args[1] ?? 0, args[3] ?? 0, args[4] ?? 0),
 
     'SwitchToFiber': (_ctx, _mem, args): ThunkResult | number => {
         ensureProcessLocal();
@@ -190,7 +198,7 @@ export const exports: Record<string, ThunkImplementation> = {
         const cpu = getCPU(System.getInstance().process?.v86);
         if (!cpu?.reg32) return 0;
         const teb = tebAddress(cpu);
-        if (!teb || !fibers.has(target)) {
+        if (!teb || !isFiber(target)) {
             Logger.warn(LogCategory.KERNEL32, `SwitchToFiber(0x${target.toString(16)}): not a fiber`);
             return 0;
         }
@@ -200,7 +208,7 @@ export const exports: Record<string, ThunkImplementation> = {
         if (!stub) return 0;
         const views = cpuViews(cpu);
         const reg = views.reg32;
-        if (fibers.has(current)) {
+        if (isFiber(current)) {
             Mem.writeUint32(current + F_EBX, reg[3] >>> 0);
             Mem.writeUint32(current + F_ESI, reg[6] >>> 0);
             Mem.writeUint32(current + F_EDI, reg[7] >>> 0);
@@ -224,21 +232,31 @@ export const exports: Record<string, ThunkImplementation> = {
         return { value: 0, skipStackCheck: true };
     },
 
-    'DeleteFiber': (_ctx, _mem, args) => {
+    'DeleteFiber': (_ctx, _mem, args): ThunkResult | number => {
         ensureProcessLocal();
         const fiber = (args[0] ?? 0) >>> 0;
-        const rec = fibers.get(fiber);
-        if (!rec) return 0;
-        const process = System.getInstance().process;
+        if (!isFiber(fiber)) return 0;
+        const system = System.getInstance();
+        const process = system.process;
         const cpu = getCPU(process?.v86);
         const teb = cpu ? tebAddress(cpu) : 0;
-        if (teb && rd(teb + TEB_FIBER_DATA) === fiber) {
-            // Deleting the running fiber ends the thread on Windows; keep its stack alive.
-            Logger.warn(LogCategory.KERNEL32, `DeleteFiber(0x${fiber.toString(16)}) on the running fiber — left in place`);
-            return 0;
+        const stackAlloc = rd(fiber + F_STACK_ALLOC);
+        if (cpu && teb && rd(teb + TEB_FIBER_DATA) === fiber) {
+            // Deleting the running fiber ends the thread with exit code 1 (RtlExitUserThread(1)).
+            // The thread is still on this fiber's stack, so the stack is left allocated.
+            const stub = ensureRetStub();
+            const exitStub = system.scheduler.getThreadExitStubAddress();
+            if (!stub || !exitStub) return 0;
+            const views = cpuViews(cpu);
+            Mem.writeUint32(fiber + F_MAGIC, 0);
+            Mem.writeUint32(teb + TEB_FIBER_DATA, 0);
+            process?.memory.free(fiber);
+            Mem.writeUint32(views.reg32[4] >>> 0, exitStub >>> 0);
+            views.instructionPointer[0] = stub;
+            return { value: 1, skipStackCheck: true };
         }
-        fibers.delete(fiber);
-        if (rec.stackAlloc) process?.memory.free(rec.stackAlloc);
+        Mem.writeUint32(fiber + F_MAGIC, 0);
+        if (stackAlloc) process?.memory.free(stackAlloc);
         process?.memory.free(fiber);
         return 0;
     },
@@ -250,9 +268,8 @@ export const exports: Record<string, ThunkImplementation> = {
         const teb = cpu ? tebAddress(cpu) : 0;
         if (!teb) return 0;
         const fiber = rd(teb + TEB_FIBER_DATA);
-        const rec = fibers.get(fiber);
-        if (!rec?.threadFiber) { setLastError(ERROR_ALREADY_THREAD); return 0; }
-        fibers.delete(fiber);
+        if (!isFiber(fiber) || (rd(fiber + F_FLAGS) & FLAG_THREAD_FIBER) === 0) { setLastError(ERROR_ALREADY_THREAD); return 0; }
+        Mem.writeUint32(fiber + F_MAGIC, 0);
         Mem.writeUint32(teb + TEB_FIBER_DATA, 0);
         process?.memory.free(fiber);
         return 1;
@@ -262,6 +279,6 @@ export const exports: Record<string, ThunkImplementation> = {
         ensureProcessLocal();
         const cpu = getCPU(System.getInstance().process?.v86);
         const teb = cpu ? tebAddress(cpu) : 0;
-        return teb && fibers.has(rd(teb + TEB_FIBER_DATA)) ? 1 : 0;
+        return teb && isFiber(rd(teb + TEB_FIBER_DATA)) ? 1 : 0;
     },
 };
