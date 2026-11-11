@@ -97,3 +97,84 @@ export function applyNativeLeaves(mem: Uint8Array, module: LoadedPEModule): Nati
     }
     return replaced;
 }
+
+export interface NativeSplice {
+    name: string;
+    toolchain: string;
+    body: Uint8Array;
+    mask: Uint8Array;
+    same: readonly number[];
+    offset: number;
+    code: Uint8Array;
+}
+
+export const NATIVE_SPLICES: readonly NativeSplice[] = [
+    {
+        name: '_Unwind_SjLj_Register', toolchain: 'mingw-gcc3', same: [11, 59, 77, 121], offset: 0x58,
+        code: hex('8b4a3064a12c0000008b14888917893c88ebc1'),
+        body: hex('5589e557565383ec0c8b15000000008b7d0885d2741e8b422c85c078298b722c85f675348b42288907897a28'
+            + '8d65f45b5e5f5dc3e8000000008b15000000008b422c85c079d7e8000000008b15000000008b722c85f674cc8b'
+            + '5a30e80000000083ec0c89c653e80000000089c356e800000000891f893c24a1000000008b583053e800000000'
+            + '5a85c05975a08d65f45b5e5f5de900000000'),
+        mask: hex('ffffffffffffffffffffff00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+            + 'ffffffffffffffff00000000ffff00000000ffffffffffffffff00000000ffff00000000ffffffffffffffffff'
+            + 'ffff00000000ffffffffffffff00000000ffffffff00000000ffffffffffff00000000ffffffffff00000000ff'
+            + 'ffffffffffffffffffffffffff00000000'),
+    },
+    {
+        name: '_Unwind_SjLj_Unregister', toolchain: 'mingw-gcc3', same: [11, 54, 71], offset: 0x52,
+        code: hex('8b483064a12c000000891c88ebc4'),
+        body: hex('5589e553518b45088b18a10000000085c0741d8b502c85d278278b482c85c975318958288b5dfcc9c38db426'
+            + '00000000e800000000a1000000008b502c85d279d9e800000000a1000000008b482c85c974cf5252538b583053'
+            + 'e8000000005a85c05975c08b5dfcc9e900000000'),
+        mask: hex('ffffffffffffffffffffff00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+            + 'ffffffffff00000000ff00000000ffffffffffffffff00000000ff00000000ffffffffffffffffffffffffffff'
+            + 'ff00000000ffffffffffffffffffffff00000000'),
+    },
+];
+
+export function nativeSplicesEnabled(): boolean {
+    return (globalThis as { __noNativeSplices?: boolean }).__noNativeSplices !== true;
+}
+
+const u32At = (b: Uint8Array, i: number): number => (b[i]! | (b[i + 1]! << 8) | (b[i + 2]! << 16) | (b[i + 3]! << 24)) >>> 0;
+
+export function findNativeSplices(
+    mem: Uint8Array, module: LoadedPEModule, splices: readonly NativeSplice[] = NATIVE_SPLICES,
+): Array<NativeLeafSite & { splice: NativeSplice }> {
+    const out: Array<NativeLeafSite & { splice: NativeSplice }> = [];
+    const imageEnd = Math.min(module.baseAddress + module.size, mem.length);
+    for (const s of module.sections ?? []) {
+        if ((s.characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE)) === 0) continue;
+        const start = module.baseAddress + s.virtualAddress;
+        const end = Math.min(start + s.virtualSize, imageEnd);
+        if (end <= start) continue;
+        const sec = mem.subarray(start, end);
+        for (const splice of splices) {
+            const { body, mask, same } = splice;
+            const n = body.length, b0 = body[0]!, b1 = body[1]!, b2 = body[2]!;
+            for (let i = sec.indexOf(b0); i !== -1 && i + n <= sec.length; i = sec.indexOf(b0, i + 1)) {
+                if (sec[i + 1] !== b1 || sec[i + 2] !== b2) continue;
+                let k = 3;
+                while (k < n && (sec[i + k]! & mask[k]!) === body[k]) k++;
+                if (k !== n) continue;
+                const shared = u32At(sec, i + same[0]!);
+                if (!same.every(o => u32At(sec, i + o) === shared)) continue;
+                out.push({ module: module.name, name: splice.name, crt: splice.toolchain, address: start + i, splice });
+            }
+        }
+    }
+    return out;
+}
+
+export function applyNativeSplices(mem: Uint8Array, module: LoadedPEModule): NativeLeafSite[] {
+    const replaced: NativeLeafSite[] = [];
+    if (!nativeSplicesEnabled()) return replaced;
+    for (const { splice, ...site } of findNativeSplices(mem, module)) {
+        if (!writeGuestCode(mem, splice.code, site.address + splice.offset)) continue;
+        replaced.push(site);
+        Logger.log(LogCategory.SYSTEM,
+            `[HLE-lib] native splice ${site.crt} ${site.name} @ ${site.module}+0x${(site.address - module.baseAddress).toString(16)} applied`);
+    }
+    return replaced;
+}
