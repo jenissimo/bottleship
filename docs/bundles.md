@@ -110,9 +110,9 @@ bun tools/wgb-compress.ts game.wgb game.packed.wgb --block-kib 64
   available"; the async path then reports the failure to the caller as an I/O error.
 - There is no per-block checksum: like a STORED member, a flipped literal can decode to
   wrong bytes. Structural damage (a block that does not decode to its length) is caught.
-- Savestates are bound to the bundle's members including their compressed sizes, so a
-  savestate made with the store-only build of a game does not load into its packed build,
-  and vice versa.
+- Savestates are bound to the bundle's members by name, uncompressed size and CRC-32, not
+  by how they are packed: repacking a bundle with the same manifest and member contents
+  keeps its savestates loadable.
 - The packer holds one member and its compressed blocks in RAM at a time; members of
   2 GiB or more are not supported.
 

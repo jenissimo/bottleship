@@ -37,7 +37,7 @@ const safeJson = (v: unknown): string => {
     try { return JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? x.toString() : x)) ?? ''; } catch { return ''; }
 };
 
-export interface BundleEntryKey { name: string; size: number; compressedSize: number; crc32?: number }
+export interface BundleEntryKey { name: string; size: number; crc32?: number }
 
 const HOST_ONLY_CONFIG = ['quality', 'qualityUserPref', 'network'];
 
@@ -51,7 +51,7 @@ export async function noteBootIdentity(input: {
     gameId: string; manifest: unknown; entries: BundleEntryKey[]; config: Record<string, unknown>; layout: unknown;
 }): Promise<BootIdentity> {
     const entries = [...input.entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
-        .map(e => [e.name, e.size, e.compressedSize, e.crc32 ?? null]);
+        .map(e => [e.name, e.size, e.crc32 ?? null]);
     boot = {
         gameId: input.gameId,
         contentHash: await sha256Hex(text(safeJson([input.manifest, entries]))),
