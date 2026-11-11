@@ -99,7 +99,8 @@ export class ModuleRegistry {
         const base = cut >= 0 ? lower.slice(cut + 1) : lower;
         // A trailing "." is Win32's "this name has no extension, do not append one".
         if (base.endsWith('.')) return base.slice(0, -1);
-        return /\.\w+$/.test(base) ? base : `${base}.dll`;
+        // A numeric-only suffix ("lua5.1") is a version number left after ".dll" was stripped.
+        return /\.\w*[a-z_]\w*$/.test(base) ? base : `${base}.dll`;
     }
 
     /**

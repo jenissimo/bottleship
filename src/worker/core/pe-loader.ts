@@ -1303,7 +1303,9 @@ export class PELoader {
         const dllNameLower = dllName.toLowerCase();
         // Only append .dll if the name has no extension at all (e.g. "kernel32" → "kernel32.dll").
         // Preserve non-.dll extensions like .lng, .drv, etc. — Windows LoadLibrary handles any extension.
-        const hasExtension = /\.\w+$/.test(dllNameLower);
+        // A numeric-only suffix is a version, not an extension: callers key modules by the
+        // name with ".dll" stripped, so "lua5.1.dll" arrives here as "lua5.1".
+        const hasExtension = /\.\w*[a-z_]\w*$/.test(dllNameLower);
         const dllFileName = hasExtension ? dllNameLower : `${dllNameLower}.dll`;
 
         // Handle explicitly absolute inputs only (e.g. "C:\foo.dll" or "\foo.dll").
@@ -1312,7 +1314,7 @@ export class PELoader {
         const normalizedInput = dllName.trim().replace(/\//g, "\\");
         const isAbsoluteInput = /^[A-Za-z]:\\/.test(normalizedInput) || normalizedInput.startsWith("\\");
         if (isAbsoluteInput) {
-            const candidateInput = /\.\w+$/i.test(normalizedInput)
+            const candidateInput = /\.\w*[a-z_]\w*$/i.test(normalizedInput)
                 ? normalizedInput
                 : `${normalizedInput}.dll`;
             const candidatePath = this.vfs.resolvePath(candidateInput);
