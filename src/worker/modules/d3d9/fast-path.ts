@@ -33,6 +33,7 @@ import { isValidAddress } from '../../core/memory/address-guard';
 import { Mem } from '../../core/memory/mem-accessor';
 import { devices, stateBlocks, resourceToDevice, addComRef, isD3D9SplitReplay } from './shared-state';
 import { d3d9StreamRingEnabled } from './stream-ring';
+import { streamSourceFreqArgsValid } from '../../backends/webgpu/shared/vertex-streams';
 import { addD3D9ComRef, releaseD3D9ComRef } from './state';
 import { readComRefGuestWord } from './com-refs';
 import { tryFastGetData } from './query';
@@ -68,8 +69,8 @@ function validGuestRange(mem: Uint8Array, ptr: number, size: number): boolean {
     return ptr !== 0 && size >= 0 && ptr <= mem.length - size;
 }
 
-// SetStreamSource(this, StreamNumber, pStreamData, OffsetInBytes, Stride) and SetIndices(this,
-// pIndexData) as ring entries: the stream ring registers them on patched stubs, the deferred
+// SetStreamSource(this, StreamNumber, pStreamData, OffsetInBytes, Stride), SetIndices(this,
+// pIndexData) and SetStreamSourceFreq(this, StreamNumber, Setting) as ring entries: the stream ring registers them on patched stubs, the deferred
 // queue (`__wbufDefer`) on the fast paths below.
 const setStreamSourceEntry = (_mem8: Uint8Array, mem32: Uint32Array, ptr: number): void => {
     const device = devices.lookup(mem32[ptr >> 2]);
@@ -79,6 +80,10 @@ const setStreamSourceEntry = (_mem8: Uint8Array, mem32: Uint32Array, ptr: number
 const setIndicesEntry = (_mem8: Uint8Array, mem32: Uint32Array, ptr: number): void => {
     const device = devices.lookup(mem32[ptr >> 2]);
     if (device) device.setIndices(mem32[(ptr + 4) >> 2]);
+};
+const setStreamSourceFreqEntry = (_mem8: Uint8Array, mem32: Uint32Array, ptr: number): void => {
+    const device = devices.lookup(mem32[ptr >> 2]);
+    if (device) device.setStreamSourceFreq(mem32[(ptr + 4) >> 2], mem32[(ptr + 8) >> 2]);
 };
 const D3D9_MAX_STREAMS = 16;
 
@@ -142,6 +147,7 @@ function registerD3D9Paths(dispatcher: HleDispatcher, names: D3D9PathNames, inhe
     if (!inherited) {
         dispatcher.registerDeferredWriteBufHandler?.('d3d9', 'IDirect3DDevice9_SetStreamSource', 5, setStreamSourceEntry);
         dispatcher.registerDeferredWriteBufHandler?.('d3d9', 'IDirect3DDevice9_SetIndices', 2, setIndicesEntry);
+        dispatcher.registerDeferredWriteBufHandler?.('d3d9', 'IDirect3DDevice9_SetStreamSourceFreq', 3, setStreamSourceFreqEntry);
 
         // Before any setter can be reached: the pointer->id table refuses to mint an id for a
         // pointer no registry vouches for, so it must know the registries first.
@@ -339,6 +345,19 @@ function registerD3D9Paths(dispatcher: HleDispatcher, names: D3D9PathNames, inhe
         const device = devices.lookup(view.getUint32(esp + 4, true));
         if (!device) return D3DERR_INVALIDCALL;
         return device.setIndices(view.getUint32(esp + 8, true));
+    }, { trivial: true });
+
+    // IDirect3DDevice9_SetStreamSourceFreq(thisPtr, StreamNumber, Setting)
+    dispatcher.registerFastPath('d3d9', dev('SetStreamSourceFreq'), (esp: number, view: DataView): number => {
+        // Deferred mode: the divider applies later, in order with the ring. An invalid argument
+        // pair changes nothing, so it is answered here without touching the queue.
+        if (dispatcher.wbufDeferring?.()) {
+            if (!streamSourceFreqArgsValid(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true))) return D3DERR_INVALIDCALL;
+            if (dispatcher.enqueueWriteBufCall('d3d9', 'IDirect3DDevice9_SetStreamSourceFreq', view, esp + 4)) return D3D_OK;
+        }
+        const device = devices.lookup(view.getUint32(esp + 4, true));
+        if (!device) return D3DERR_INVALIDCALL;
+        return device.setStreamSourceFreq(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetVertexShader(thisPtr, pShader) — resolve COM ptr → internal handle.
@@ -756,7 +775,7 @@ function registerD3D9Paths(dispatcher: HleDispatcher, names: D3D9PathNames, inhe
             if (meta) device.setVertexDeclaration(meta.internalHandle, pDecl);
         }, true, 0x1);
 
-    // ── SetStreamSource / SetIndices on the ring ─────────────────────────────
+    // ── SetStreamSource / SetIndices / SetStreamSourceFreq on the ring ─────────────────────────────
     // OPT-OUT: globalThis.__d3d9StreamRing = false (default on). Registration patches a guest
     // stub, so unlike the storage flags this one is read once, at boot — there is no
     // unpatch path, which is why every WBUF kill-switch in this file is boot-time.
@@ -788,6 +807,11 @@ function registerD3D9Paths(dispatcher: HleDispatcher, names: D3D9PathNames, inhe
         // SetIndices(this, pIndexData)
         dispatcher.registerWriteBufferFunction('d3d9', dev('SetIndices'), 2,
             setIndicesEntry, true, 0x1);
+
+        // SetStreamSourceFreq(this, StreamNumber, Setting) — scalar args, same key as SetStreamSource.
+        // The divider only feeds the step mode of the next draw, and draws are barrier entries.
+        dispatcher.registerWriteBufferFunction('d3d9', dev('SetStreamSourceFreq'), 3,
+            setStreamSourceFreqEntry, true, 0x3);
     }
 
     // ── Draw calls on the ring (kill the per-draw OUT trap) ──────────────────

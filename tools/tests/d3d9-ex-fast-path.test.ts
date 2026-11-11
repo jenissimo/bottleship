@@ -92,11 +92,11 @@ describe('the Ex inherited pass mirrors the base registrations', () => {
         const has = (method: string, name: string) => ex.some((c) => c.method === method && c.name === name);
         for (const m of ['SetStreamSource', 'SetTexture', 'SetVertexShaderConstantF', 'SetPixelShaderConstantF',
             'DrawIndexedPrimitive', 'SetRenderState', 'SetSamplerState', 'SetIndices', 'SetPixelShader',
-            'SetVertexShader', 'SetVertexDeclaration']) {
+            'SetVertexShader', 'SetVertexDeclaration', 'SetStreamSourceFreq']) {
             expect(has('registerFastPath', `IDirect3DDevice9Ex_${m}`)).toBe(true);
         }
         for (const m of ['SetTexture', 'DrawIndexedPrimitive', 'SetVertexDeclaration', 'SetPixelShader', 'SetVertexShader',
-            'SetStreamSource', 'SetIndices']) {
+            'SetStreamSource', 'SetIndices', 'SetStreamSourceFreq']) {
             expect(has('registerWriteBufferFunction', `IDirect3DDevice9Ex_${m}`)).toBe(true);
         }
         expect(has('registerShadowedWriteBufferFunction', 'IDirect3DDevice9Ex_SetRenderState')).toBe(true);
