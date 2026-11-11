@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
+import { forgetLossTrackedDevice } from "../../src/worker/core/gpu/gpu-device-loss-contract";
 import { createExExports } from "../../src/worker/modules/d3d9/ex";
 import { createDeviceExports } from "../../src/worker/modules/d3d9/device";
 import { devices, resourceToDevice } from "../../src/worker/modules/d3d9/shared-state";
@@ -28,6 +29,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+    // Reset acknowledges the device in the process-wide loss contract. Left behind, DEVICE (0x100,
+    // shared with the query tests) reads "notreset" as soon as any later file bumps the GPU
+    // lifecycle generation, and every CreateQuery on it answers DEVICELOST.
+    forgetLossTrackedDevice(DEVICE);
     devices.clear();
     resourceToDevice.clear();
     surfaceMeta.clear();
