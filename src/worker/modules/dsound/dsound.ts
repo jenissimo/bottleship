@@ -2864,9 +2864,10 @@ export class DSound implements IModule {
     restoreSavestate(s: DSoundState): void {
         this.objects.clear();
         const mem = this.getMemory();
+        const rebuilt = new Map<number, SoundBuffer>();
         for (const o of s.objects) {
-            let buffer: SoundBuffer | undefined;
-            if (o.buffer) {
+            let buffer: SoundBuffer | undefined = o.buffer ? rebuilt.get(o.buffer.id) : undefined;
+            if (o.buffer && !buffer) {
                 const b = o.buffer;
                 const ringBytes = b.ringBytes ?? b.bytes;
                 buffer = {
@@ -2904,6 +2905,7 @@ export class DSound implements IModule {
                         this.syncFrontierHold(buffer);
                     }
                 }
+                rebuilt.set(b.id, buffer);
             }
             this.objects.set(o.ptr, {
                 type: o.type as DSoundObjectType, refCount: o.refCount, buffer, isDs8: o.isDs8 || undefined, duplex: o.duplex ?? undefined,

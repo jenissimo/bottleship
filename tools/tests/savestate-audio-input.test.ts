@@ -163,6 +163,32 @@ describe("dsound", () => {
         }
     });
 
+    test("interfaces of one buffer share it again after a restore, and its ring is registered once", () => {
+        const posted: Array<{ type: string; payload: { id: number; sab: SharedArrayBuffer } }> = [];
+        const prev = g.self;
+        g.self = { postMessage: (m: never) => posted.push(m) };
+        try {
+            const d = dsound();
+            const objects = d.objects as Map<number, { type: string; refCount: number; buffer?: Record<string, unknown> }>;
+            const buffer = objects.get(0x5100)!.buffer!;
+            buffer.sab = createAudioRingBuffer(64, { channels: 1, sampleRate: 22050, bitsPerSample: 8 }, true);
+            buffer.isPlaying = true;
+            buffer.isLooping = true;
+            objects.set(0x5200, { type: "IDirectSoundNotify", refCount: 1, buffer });
+            const saved = structuredClone(d.captureSavestate()) as DSoundState;
+            const fresh = dsound();
+            (fresh.objects as Map<number, unknown>).clear();
+            fresh.restoreSavestate(saved);
+            const restored = fresh.objects as Map<number, { buffer?: { sab: SharedArrayBuffer | null; isPlaying: boolean } }>;
+            expect(restored.get(0x5200)!.buffer).toBe(restored.get(0x5100)!.buffer!);
+            const registers = posted.filter(m => m.type === "audio_register");
+            expect(registers.map(m => m.payload.id)).toEqual([42]);
+            expect(registers[0]!.payload.sab).toBe(restored.get(0x5100)!.buffer!.sab!);
+        } finally {
+            g.self = prev;
+        }
+    });
+
     test("every instance field has a policy", () => {
         expect(Object.keys(new DSound()).sort()).toEqual(Object.keys(DSOUND_FIELDS).sort());
     });
