@@ -1118,32 +1118,6 @@
   "src/worker/modules/dbghelp-stackwalk.ts": [
     "walks"
   ],
-  "src/worker/modules/dplayx/dplayx.ts": [
-    "DPAID_SERVICE_PROVIDER_GUID",
-    "DPAID_TOTAL_SIZE"
-  ],
-  "src/worker/modules/dplayx/lobby-broker.ts": [
-    "brokers"
-  ],
-  "src/worker/modules/dplayx/native-wire/join-pending.ts": [
-    "creates",
-    "replies",
-    "unsupported"
-  ],
-  "src/worker/modules/dplayx/native-wire/roster-projection.ts": [
-    "installing"
-  ],
-  "src/worker/modules/dplayx/network-api.ts": [
-    "EMPTY",
-    "currentDirectPlayApi"
-  ],
-  "src/worker/modules/dplayx/session.ts": [
-    "BROADCAST",
-    "EMPTY",
-    "decoder",
-    "encoder",
-    "hubs"
-  ],
   "src/worker/modules/dpnet/executor.ts": [
     "executors"
   ],

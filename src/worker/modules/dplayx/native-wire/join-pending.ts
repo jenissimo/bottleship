@@ -18,12 +18,15 @@ export type DirectPlay4PendingResult =
     | {kind:"queued"} | {kind:"not-handled"} | {kind:"unsupported"};
 type Entry = {message:DirectPlay4PendingMessage; command:number | null; size:number};
 type Expected = typeof DPSP_MSG.ENUMPLAYERSREPLY | typeof DPSP_MSG.REQUESTPLAYERREPLY | typeof DPSP_MSG.SUPERENUMPLAYERSREPLY;
+// @transient(constant message-id set)
 const replies = new Set<number>([DPSP_MSG.ENUMPLAYERSREPLY,DPSP_MSG.REQUESTPLAYERREPLY,DPSP_MSG.ADDFORWARDREPLY,DPSP_MSG.SUPERENUMPLAYERSREPLY]);
 // Packetized (2.2.39-2.2.41) and secure-session (2.2.16-2.2.17, 2.2.29-2.2.30
 // logon, 2.2.35) messages need reassembly or authentication that this engine
 // does not implement; they are reported as unsupported for the caller to reject.
+// @transient(constant message-id set)
 const unsupported = new Set<number>([DPSP_MSG.PACKET,DPSP_MSG.CHALLENGE,DPSP_MSG.ACCESSGRANTED,DPSP_MSG.LOGONDENIED,
     DPSP_MSG.AUTHERROR,DPSP_MSG.KEYEXCHANGEREPLY,DPSP_MSG.PACKET2_DATA,DPSP_MSG.PACKET2_ACK]);
+// @transient(constant message-id set)
 const creates = new Set<number>([DPSP_MSG.CREATEPLAYER,DPSP_MSG.CREATEGROUP,DPSP_MSG.CREATEPLAYERVERIFY]);
 const uint=(n:number)=>Number.isInteger(n)&&n>=0&&n<=0xffffffff;
 

@@ -42,6 +42,7 @@ const iidHex = (iid: string): string => {
     return [s.slice(0, 8).match(/../g)!.reverse().join(""), s.slice(8, 12).match(/../g)!.reverse().join(""),
         s.slice(12, 16).match(/../g)!.reverse().join(""), s.slice(16)].join("");
 };
+// @transient(empty constant)
 const EMPTY: Uint8Array = new Uint8Array();
 
 function encodeText(text: string, wide = false): Uint8Array {
@@ -156,6 +157,7 @@ interface GuestState {
 type Frame = { esp: number; returnAddr?: number };
 type EnumerationEntry = { args: (base: number) => number[]; pack: (base: number) => Uint8Array };
 /** The process's API instance, for the `dplayState` harness verb. */
+// @transient(the module's API instance for the dplayState harness verb; rebuilt at boot)
 let currentDirectPlayApi: DirectPlayNetworkApi | null = null;
 export function describeDirectPlay(): ReturnType<DirectPlayNetworkApi["describe"]> { return currentDirectPlayApi?.describe() ?? []; }
 
@@ -171,6 +173,16 @@ export class DirectPlayNetworkApi {
     private lobbyEndpoint?: DirectPlayLobbyEndpoint;
     private lobbyEvents = new Map<number, Map<number, number>>();
     private lobbyOwnedEvents = new Set<number>();
+    openForSavestate(): string[] {
+        const hex = (n: number) => `0x${(n >>> 0).toString(16)}`;
+        return [
+            ...[...this.states.keys()].map(h => `DirectPlay object ${hex(h)}`),
+            ...[...this.lobbyInterfaces.keys()].map(h => `DirectPlayLobby object ${hex(h)}`),
+            ...[...this.lobbyEvents.keys()].map(h => `lobby event registration of ${hex(h)}`),
+            ...[...this.lobbyOwnedEvents].map(h => `lobby event ${hex(h)}`),
+            ...(this.lobbyEndpoint ? ['the lobby endpoint'] : []),
+        ];
+    }
     constructor(private process: Process, private tables: () => Record<string, VTableInfo>, private network: LanNetwork = lanNetwork,
         private nativeSockets: () => WsaSocketTable = () => getWsaProcessState(process).table) { currentDirectPlayApi = this; }
     private valid(ptr: number, size: number, perms: "r" | "rw" | "rx" = "r"): boolean {
