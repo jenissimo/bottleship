@@ -1,5 +1,9 @@
 # tools/aot — the AOT compiler (product B), slice 1: **integer-core**
 
+The separate [semantic optimization laboratory](opt/stack-browser.md) exercises opt-in
+stack-load forwarding through the live engine dispatcher and compares it with the shipping
+JIT, an identical-byte control and reconstructed Emscripten computation.
+
 **Slice contents (2026-07-29).** 32-bit and **8-bit** mov / ALU / shift / rotate / test /
 inc-dec-not-neg, `adc`/`sbb` at both sizes, `lea`, `movzx`/`movsx`, `setcc`, `cmovcc`,
 `push`/`pop` in the register, immediate and r/m forms, `xchg`, `leave`, `cwde`/`cdq`, moffs
