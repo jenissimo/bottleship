@@ -26,7 +26,7 @@ import { IUnknown } from '../../api/types';
 import { InterfaceDescriptor, ModuleDescriptor } from '../../api/types';
 import { createComObject, devices } from '../d3d9/shared-state';
 import { bindSharedParameters } from './effect-pool';
-import { disposeEffectParameters, effectLostDevice } from './effect-lifetime';
+import { disposeEffectParameters, effectLostDevice, selectEffectTechnique } from './effect-lifetime';
 import { addComRef, registerComFinalizer, releaseComRef } from '../d3d9/com-refs';
 import { normalizeGuid, readGuidFromMem } from '../../core/com/typelib/typelib-types';
 import { Mem } from '../../core/memory/mem-accessor';
@@ -95,7 +95,7 @@ const E_FAIL = 0x80004005;
 const FAKE_HANDLE = 1;
 
 /** [name, argCount] in vtable order; argCount INCLUDES the pushed `this` (COM stdcall). */
-const EFFECT_METHODS: ReadonlyArray<readonly [string, number]> = [
+export const EFFECT_METHODS: ReadonlyArray<readonly [string, number]> = [
     // --- ID3DXBaseEffect ---
     ['GetDesc', 2],
     ['GetParameterDesc', 3],
@@ -428,7 +428,7 @@ export function createEffectExports(process: Process): Record<string, ThunkImple
         if (!handle || !isTechniqueHandle(handle) || handle.index >= inst.model.techniques.length) {
             return D3DERR_INVALIDCALL;
         }
-        inst.currentTechnique = handle.index;
+        selectEffectTechnique(inst, handle.index);
         return D3D_OK;
     };
 
@@ -1267,7 +1267,7 @@ export function createEffectExports(process: Process): Record<string, ThunkImple
     return exports;
 }
 
-const FAST_SETTERS: ReadonlyArray<readonly [string, number]> = [
+export const FAST_SETTERS: ReadonlyArray<readonly [string, number]> = [
     ['SetBool', 3], ['SetInt', 3], ['SetFloat', 3],
     ['SetBoolArray', 4], ['SetIntArray', 4], ['SetFloatArray', 4],
     ['SetVector', 3], ['SetVectorArray', 4],

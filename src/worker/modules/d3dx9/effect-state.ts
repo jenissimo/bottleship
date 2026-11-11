@@ -194,8 +194,7 @@ export function markEffectParamWritten(param: EffectParameter): void {
 }
 
 export function effectParamStamp(param: EffectParameter): number {
-    if (param.value.length) return valueBlockStamps.get(param.value.buffer)?.at ?? 0;
-    let stamp = objectParamStamps.get(param)?.at ?? 0;
+    let stamp = (param.value.length ? valueBlockStamps.get(param.value.buffer)?.at : objectParamStamps.get(param)?.at) ?? 0;
     for (const member of param.members) {
         const s = effectParamStamp(member);
         if (s > stamp) stamp = s;
