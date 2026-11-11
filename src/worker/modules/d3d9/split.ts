@@ -127,7 +127,10 @@ const READBACK_FENCES = new Set<string>([
 
 type Args = unknown[];
 /** Rewrites a call whose arguments point into guest memory into one that carries the bytes.
- *  Runs BEFORE the front executes (lock state it reads is cleared by the call). */
+ *  Runs BEFORE the front executes (lock state it reads is cleared by the call). A large
+ *  typed array in the result may be a VIEW of guest memory (unlock captures): it is read only
+ *  after the front's call, which must not write the locked range (commitUnlock/checkCanary
+ *  only read it), and is copied into the queue before record() returns. */
 type Transform = (front: D3D9Device, args: Args) => [string, Args] | null;
 
 const f32 = (mem: Uint8Array, ptr: number, count: number): Float32Array =>
@@ -193,6 +196,11 @@ const POST_RECORDS: Record<string, PostRecord> = {
     processVertices: (front, args, result) => result !== 0 ? null
         : ["twinWriteVertexBufferData", [args[3], front.captureVertexBufferData(args[3] as number)]],
 };
+
+function lastViewBytes(args: Args): number {
+    const last = args.length > 0 ? args[args.length - 1] : undefined;
+    return ArrayBuffer.isView(last) ? last.byteLength : 0;
+}
 
 const blockPointers = new WeakMap<object, number>();
 function blockByPointer(name: string, data: unknown): [string, Args] | null {
@@ -363,12 +371,20 @@ class SplitStream {
             if (t === null) record = false;
             else { recName = t[0]; recArgs = t[1]; }
         }
+        const viewBytes = record && site.transform ? lastViewBytes(recArgs) : 0;
         this.depth++;
         let result: unknown;
         try {
             result = orig.apply(device, args);
         } finally {
             this.depth--;
+        }
+        if (viewBytes !== 0 && lastViewBytes(recArgs) !== viewBytes) {
+            this.stats.encodeErrors[name] = (this.stats.encodeErrors[name] ?? 0) + 1;
+            if (this.stats.encodeErrors[name] === 1) {
+                Logger.error(LogCategory.D3D9, `[split] ${name}: captured view lost its ${viewBytes} bytes during the call (detached guest memory?)`);
+            }
+            record = false;
         }
         if (name === "registerVolumeTexture") {
             const descriptor = device.captureVolumeTextureDescriptor(a0 as number);
@@ -421,6 +437,13 @@ class SplitStream {
             return;
         }
         const tail = enc.tail;
+        if (tail !== null && tail.byteLength !== enc.tailLength) {
+            this.stats.encodeErrors[name] = (this.stats.encodeErrors[name] ?? 0) + 1;
+            if (this.stats.encodeErrors[name] === 1) {
+                Logger.error(LogCategory.D3D9, `[split] ${name}: payload view is ${tail.byteLength} bytes, encoded ${enc.tailLength} (detached guest memory?)`);
+            }
+            return;
+        }
         const bytes = enc.length + (tail === null ? 0 : tail.length);
         if (!this.dispatcher.enqueuePayloadById(this.queueId, this.methodId(name), slot, 0, 0, enc.bytes, 0, enc.length, tail)) {
             this.stats.encodeErrors[name] = (this.stats.encodeErrors[name] ?? 0) + 1;

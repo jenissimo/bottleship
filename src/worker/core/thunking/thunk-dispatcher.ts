@@ -1603,10 +1603,12 @@ export class ThunkDispatcher {
         src: Uint8Array, srcOffset: number, byteCount: number, tail: Uint8Array | null = null,
     ): boolean {
         const headBytes = byteCount;
-        if (tail !== null) byteCount += tail.length;
+        const tailBytes = tail === null ? 0 : tail.length;
+        byteCount += tailBytes;
         if (headBytes < 0 || byteCount > WBUF_PAYLOAD_MAX_BYTES) return false;
         const stride = 24 + ((byteCount + 3) & ~3);
         this.ensureWbufQueue(this.wbufQueueEnd + stride);
+        if (tail !== null && tail.length !== tailBytes) return false;
         const q32 = this.wbufQueueU32!;
         const w = this.wbufQueueEnd >> 2;
         q32[w] = id;

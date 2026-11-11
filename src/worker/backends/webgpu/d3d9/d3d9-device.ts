@@ -4377,7 +4377,12 @@ export class D3D9Device {
         return ptr >= 0 ? ptr : 0;
     }
 
-    // ── Split D3D9: the front captures guest bytes at the call; the twin applies them ──
+    // ── Split D3D9: the front hands the split recorder the locked bytes; the twin applies them ──
+    // The capture* methods return VIEWS of guest memory, not copies. That is sound because the
+    // recorder runs TRANSFORMS (capture) before the front's own unlock, and encodes the view
+    // into the queue only after that unlock returned: commitUnlock/checkCanary read just the
+    // locked range and never write guest bytes, so the view still holds exactly what the guest
+    // wrote. The queue entry is the only copy, made synchronously, before the guest runs again.
 
     captureLockedVertexBytes(vbPtr: number): Uint8Array | null {
         const index = this.vertexBuffers.getIndex(vbPtr);
