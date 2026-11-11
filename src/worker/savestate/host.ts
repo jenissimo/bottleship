@@ -11,6 +11,7 @@ import { touchedModules } from './core-participants';
 import { incompatibilities, type CompatibilityKey } from './container';
 import { OpfsDir, SlotStore, type Dir, type SlotInfo } from './slots';
 import { gameIdToContainerDir } from '@bottleship/formats/wgb/container-id';
+import { WGB_BLOCK_INDEX_ENTRY } from '@bottleship/formats/zip';
 
 declare const __BUILD_SHA__: string;
 
@@ -47,14 +48,25 @@ export function guestConfig(config: Record<string, unknown>): Record<string, unk
     return out;
 }
 
+function isPackingOnlyEntry(name: string): boolean {
+    const lower = name.toLowerCase();
+    return lower === 'manifest.json' || lower === WGB_BLOCK_INDEX_ENTRY;
+}
+
+function withoutBlockIndex(manifest: unknown): unknown {
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) return manifest;
+    const { blockIndex: _blockIndex, ...rest } = manifest as Record<string, unknown>;
+    return rest;
+}
+
 export async function noteBootIdentity(input: {
     gameId: string; manifest: unknown; entries: BundleEntryKey[]; config: Record<string, unknown>; layout: unknown;
 }): Promise<BootIdentity> {
-    const entries = [...input.entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    const entries = input.entries.filter(e => !isPackingOnlyEntry(e.name)).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
         .map(e => [e.name, e.size, e.crc32 ?? null]);
     boot = {
         gameId: input.gameId,
-        contentHash: await sha256Hex(text(safeJson([input.manifest, entries]))),
+        contentHash: await sha256Hex(text(safeJson([withoutBlockIndex(input.manifest), entries]))),
         configHash: await sha256Hex(text(safeJson(guestConfig(input.config)))),
         bootLayout: await sha256Hex(text(safeJson(input.layout))),
     };
