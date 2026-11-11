@@ -3794,7 +3794,21 @@ function readSyncAccessHandle(
     return got;
 }
 
-function normalizePath(path: string): string {
+// @transient(pure path normalization memo)
+const normalizedPathMemo = new Map<string, string>();
+
+export function normalizePath(path: string): string {
+    if ((globalThis as { __vfsPathMemo?: boolean }).__vfsPathMemo === false) return normalizePathUncached(path);
+    let n = normalizedPathMemo.get(path);
+    if (n === undefined) {
+        n = normalizePathUncached(path);
+        if (normalizedPathMemo.size >= 4096) normalizedPathMemo.clear();
+        normalizedPathMemo.set(path, n);
+    }
+    return n;
+}
+
+function normalizePathUncached(path: string): string {
     const cleaned = path.replace(/\//g, "\\");
     const driveMatch = cleaned.match(/^([A-Za-z]):/);
     const drive = driveMatch ? driveMatch[1].toUpperCase() : "C";
