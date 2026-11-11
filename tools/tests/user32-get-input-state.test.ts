@@ -1,6 +1,6 @@
 /**
- * GetInputState reports keyboard or mouse input waiting for the calling thread, and only
- * that: a pending timer, paint or posted application message is not input.
+ * GetInputState reports keyboard or mouse-button input waiting for the calling thread, and
+ * only that: a pending mouse move, timer, paint or posted application message is not input.
  */
 import { afterEach, expect, test } from "bun:test";
 import { System } from "../../src/worker/core/system";
@@ -40,8 +40,8 @@ test("empty queue -> FALSE, after polling the host input", () => {
     expect(seen.threads.every((t) => t === system.scheduler.getCurrentThreadId())).toBe(true);
 });
 
-test("a key or mouse message -> TRUE", () => {
-    for (const msg of [0x0100, 0x0101, 0x0104, 0x0109, 0x0200, 0x0201, 0x020a, 0x020e]) {
+test("a key or mouse-button message -> TRUE", () => {
+    for (const msg of [0x0100, 0x0101, 0x0104, 0x0109, 0x0201, 0x0202, 0x0204, 0x020a, 0x020e]) {
         withQueue([msg]);
         expect(call()).toBe(1);
     }
@@ -50,4 +50,15 @@ test("a key or mouse message -> TRUE", () => {
 test("timer, paint and application messages are not input", () => {
     withQueue([0x0113, 0x000f, 0x0400, 0x0010]);
     expect(call()).toBe(0);
+});
+
+test("a mouse move alone -> FALSE; a move with a key or button behind it -> TRUE", () => {
+    withQueue([0x0200]);
+    expect(call()).toBe(0);
+    withQueue([0x0200, 0x0200, 0x0113]);
+    expect(call()).toBe(0);
+    withQueue([0x0200, 0x0100]);
+    expect(call()).toBe(1);
+    withQueue([0x0200, 0x0201]);
+    expect(call()).toBe(1);
 });
