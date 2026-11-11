@@ -11,8 +11,23 @@ import {
     setScrollRange,
 } from "./user32/scroll-state";
 
+// @participant(comctl32)
 const flatSbWindows = new Set<number>();
+// @participant(comctl32)
 const flatSbProps = new Map<number, Map<number, number>>();
+
+export interface FlatSbState { windows: number[]; props: Array<[number, Array<[number, number]>]> }
+
+export function captureFlatSbState(): FlatSbState {
+    return { windows: [...flatSbWindows], props: [...flatSbProps].map(([hwnd, m]) => [hwnd, [...m]]) };
+}
+
+export function restoreFlatSbState(s: FlatSbState): void {
+    flatSbWindows.clear();
+    flatSbProps.clear();
+    for (const hwnd of s.windows) flatSbWindows.add(hwnd);
+    for (const [hwnd, rows] of s.props) flatSbProps.set(hwnd, new Map(rows));
+}
 
 function propsFor(hwnd: number): Map<number, number> {
     let m = flatSbProps.get(hwnd);
