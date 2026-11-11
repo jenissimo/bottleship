@@ -176,11 +176,13 @@ test("pause during pending encoded play re-pauses it and retains remaining sourc
     assert.equal(pausedIds.size, 0);
 });
 
-test("App automatic calls use guarded unlock; explicit toggle retains resume", () => {
+test("App automatic calls use guarded unlock; explicit pause/resume goes only through AudioPauseSync", () => {
     const app = fs.readFileSync(new URL("../../src/app/App.tsx", import.meta.url), "utf8");
     assert.equal(app.match(/audioEngine\?\.resumeIfNotPaused\(\)/g)?.length, 4);
     assert.equal(app.match(/audioEngine\?\.resume\(\)/g)?.length ?? 0, 0);
-    assert.equal(app.match(/await audioEngine\.resume\(\)/g)?.length, 1);
+    assert.equal(app.match(/audioEngine\??\.(pause|resume)\(\)/g)?.length ?? 0, 0);
+    // UI button + the worker's guest_pause_state: one writer, so no double suspend/resume race.
+    assert.equal(app.match(/audioPauseSync\?\.set\(/g)?.length, 2);
 });
 
 test("automatic unlock during pending suspend cannot clear pause intent", async () => {
