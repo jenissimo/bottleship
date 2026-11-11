@@ -32,7 +32,11 @@ beforeEach(() => {
         },
     };
     imageReserve = 0; freed = []; lastError = 0;
-    system.scheduler = { setLastError: (e: number) => { lastError = e; }, getThreadExitStubAddress: () => EXIT_STUB, getImageStackReserve: () => imageReserve };
+    system.scheduler = {
+        setLastError: (e: number) => { lastError = e; }, getThreadExitStubAddress: () => EXIT_STUB, getImageStackReserve: () => imageReserve,
+        allocateStack: (n: number) => system.process.memory.alloc(n, undefined, undefined, 0x1000),
+        releaseStackBlock: (p: number) => { freed.push(p); return true; },
+    };
     resetFiberState();
     dv.setUint32(TEB + 0, 0x5000, true);      // ExceptionList
     dv.setUint32(TEB + 4, 0x40000, true);     // StackBase
