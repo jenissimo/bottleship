@@ -175,6 +175,15 @@ export function retainReturnedObject(ptr: number): number {
     return p;
 }
 
+/** SetRawValue on a numeric parameter: bytes copied into the value block at `offset`, clipped
+ *  to the block. Stamps the write like every other setter, or CommitChanges would skip it. */
+export function setRawBytesAt(param: EffectParameter, bytes: Uint8Array, offset: number): boolean {
+    const block = param.value;
+    if (!block.length || offset >= block.length) return false;
+    block.set(bytes.subarray(0, Math.min(bytes.length, block.length - offset)), offset);
+    return noteWrite(param);
+}
+
 /** SetValue: raw bytes, refused unless the caller offers at least the whole block. */
 export function setRawValue(param: EffectParameter, bytes: Uint8Array): boolean {
     // SetValue is the generic setter and d3dx accepts it for a TEXTURE parameter too — the

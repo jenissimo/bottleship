@@ -72,6 +72,7 @@ import {
     setMatrixArray,
     setNumberArray,
     setObjectParam,
+    setRawBytesAt,
     setRawValue,
     setScalarBool,
     setScalarFloat,
@@ -721,10 +722,7 @@ export function createEffectExports(process: Process): Record<string, ThunkImple
             noteSetTextureOutcome(found.param.objectPtr ? "setRaw" : "setRawNull");
             return D3D_OK;
         }
-        const block = found.param.value;
-        if (!block.length || offset >= block.length) return D3DERR_INVALIDCALL;
-        block.set(bytes.subarray(0, Math.min(bytes.length, block.length - offset)), offset);
-        return D3D_OK;
+        return setRawBytesAt(found.param, bytes, offset) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
     exports['ID3DXEffect_SetValue'] = (_ctx, _mem, args) => {

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { applyPassStates } from "../../src/worker/modules/d3dx9/effect-apply";
 import { EFFECT_STATE_TABLE, EffectStateClass } from "../../src/worker/modules/d3dx9/effect-state-table";
-import { setMatrix, setObjectParam, setVector } from "../../src/worker/modules/d3dx9/effect-values";
+import { setMatrix, setObjectParam, setRawBytesAt, setRawValue, setVector } from "../../src/worker/modules/d3dx9/effect-values";
 import {
     EffectAssignmentKind, EffectParamClass, EffectParamType, markEffectParamWritten,
     type EffectInstance, type EffectParameter, type EffectPass,
@@ -133,6 +133,29 @@ test("CommitChanges sends only the parameters written since the pass was applied
 
     applyPassStates(s.deps, s.instance, s.pass, true);
     expect(s.take()).toEqual([]);
+});
+
+test("CommitChanges sends a numeric parameter written through SetRawValue or SetValue", () => {
+    const s = scene();
+    applyPassStates(s.deps, s.instance, s.pass);
+    s.take();
+
+    // SetRawValue: bytes at an offset inside the block (here the whole vector, then one float).
+    expect(setRawBytesAt(s.tint, new Uint8Array(new Float32Array([0.75, 0, 0, 1]).buffer), 0)).toBe(true);
+    applyPassStates(s.deps, s.instance, s.pass, true);
+    expect(s.take()).toEqual(["c5x1 0.75"]);
+    expect(setRawBytesAt(s.tint, new Uint8Array(new Float32Array([0.125]).buffer), 0)).toBe(true);
+    applyPassStates(s.deps, s.instance, s.pass, true);
+    expect(s.take()).toEqual(["c5x1 0.125"]);
+    // Past the block: refused, nothing written, nothing sent.
+    expect(setRawBytesAt(s.tint, new Uint8Array(4), 16)).toBe(false);
+    applyPassStates(s.deps, s.instance, s.pass, true);
+    expect(s.take()).toEqual([]);
+
+    // SetValue: the whole block.
+    expect(setRawValue(s.tint, new Uint8Array(new Float32Array([0.5, 0, 0, 1]).buffer))).toBe(true);
+    applyPassStates(s.deps, s.instance, s.pass, true);
+    expect(s.take()).toEqual(["c5x1 0.5"]);
 });
 
 test("CommitChanges rebinds a sampler's texture when the texture parameter changes", () => {
