@@ -28,7 +28,7 @@ const CALLS: Array<[number, number, number, boolean]> = [
     [3, 0x11223344, 1, true],
     [PRESET, 0xdeadbeef, 1, true],
     [FREED, 0x55, 0, false],          // not TlsAlloc'd: JS answers FALSE
-    [EXPANSION, 0x6464, 1, false],    // allocated past the TEB array: JS map
+    [EXPANSION, 0x6464, 1, false],    // expansion index: WASM declines, JS stores it in the TEB array
     [70, 0x70, 0, false],
     [0xffffffff, 1, 0, false],
     [3, 0, 1, true],                  // NULL is a legitimate value
@@ -134,7 +134,7 @@ async function runArm(routed: boolean): Promise<ArmResult> {
         const values: Record<number, number> = {};
         for (const i of [3, PRESET, FREED, 9, EXPANSION]) values[i] = s.tlsGetValue(i);
         const array = teb.getTlsArrayAddress(1)!;
-        const arrayWords = Array.from({ length: 64 }, (_, i) => guest().getUint32(array + i * 4, true));
+        const arrayWords = Array.from({ length: EXPANSION + 1 }, (_, i) => guest().getUint32(array + i * 4, true));
         const served = page().getUint32(OFF_HC_HANDLER_CALLS + HANDLER * 4, true);
         const fellBack = page().getUint32(OFF_HC_HANDLER_FALLBACKS + HANDLER * 4, true);
         expect(s.tlsFree(9)).toBe(true);
@@ -167,6 +167,7 @@ describe.skipIf(!existsSync(lib) || !existsSync(wasm))('TlsSetValue hypercall, e
         expect(js.values).toEqual({ 3: 0, [PRESET]: 0xdeadbeef, [FREED]: 0, 9: 0x99, [EXPANSION]: 0x6464 });
         expect(js.arrayWords[9]).toBe(0x99);
         expect(js.arrayWords[PRESET]).toBe(0xdeadbeef);
+        expect(js.arrayWords[EXPANSION]).toBe(0x6464);   // one storage for every index
         expect(js.jsCalls).toBe(CALLS.length);
         expect(js.served + js.fellBack).toBe(0);
 

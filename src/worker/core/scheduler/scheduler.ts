@@ -25,7 +25,7 @@ import { cpuViews, readEip, readEsp, readRetiredInsns, PROXY_BASELINE } from '..
 import { Mem } from '../memory/mem-accessor';
 import { ERROR_INVALID_HANDLE } from '../thunking/thunk-errors';
 import { setParkedStackProvider, guardStackWrite } from '../memory/stack-write-guard';
-import { TebManager } from '../teb-manager';
+import { TebManager, TLS_INDEX_LIMIT } from '../teb-manager';
 import {
     clearFpuSimdDirty,
     createDefaultFpuSnapshot,
@@ -83,6 +83,7 @@ import type { WinMM, PendingTimerCallback as PostedTimerCallback } from '../../m
 // Max virtual-time advance per idle pollTimeouts() pump. Bounds the jump when the
 // idle anchor is stale after a pause / background-throttle gap. See pollTimeouts().
 const IDLE_PUMP_MAX_MS = 250;
+
 
 /** Sole-runnable Sleep(ms): credit+yield only for short pump sleeps; longer → blockThread. */
 const SOLE_RUNNABLE_SLEEP_CREDIT_MAX_MS = 50;
@@ -2446,8 +2447,37 @@ export class Scheduler {
         // and the gate walks the live threads for a foreign ESP in this span.
         this.releaseStack(thread);
         if (this.ownedStackBases.has(thread.stackBase >>> 0)) return false;
+        if (!this.releaseTeb(thread)) return false;
         this.threads.delete(threadId);
         this.stackSpanIndex = null;
+        return true;
+    }
+
+    /**
+     * Give a reaped thread's TEB and TLS array back, at the same point and behind the same
+     * gates as its stack (tryReap runs this only once the stack is out): NT frees the TEB at
+     * thread teardown too. Still held (false = retry on a later pass) while FS or the
+     * hypercall page still name this TEB — the guest has not left the context. Kept for
+     * good: the main thread's, and every TEB once the process is exiting, so the exit report
+     * and post-mortem diagnostics read what they always did.
+     * Nothing runs in a dead thread after terminateThread (no DLL_THREAD_DETACH or FLS
+     * callbacks are delivered) and its SEH state keyed by TEB address is cleared there. The
+     * kernel object outlives the record for GetExitCodeThread/waits, which need no TEB; its
+     * ThreadBasicInformation TebBaseAddress becomes 0 here, as NT clears Tcb.Teb when it
+     * deletes the TEB — the freed address may already be another thread's TEB.
+     */
+    private releaseTeb(thread: Thread): boolean {
+        const teb = thread.tebAddress >>> 0;
+        if (teb === 0 || thread.id === this.mainThreadId || System.getInstance().isExiting) return true;
+        const cpu = this.getCpu();
+        const fsBase = cpu ? (cpuViews(cpu).segmentOffsets[4] ?? 0) >>> 0 : 0;
+        if (fsBase === teb || hypercallDataManager.readTebBase() === teb) return false;
+        const memory = this.process?.memory;
+        if (!memory) return true;
+        if (this.tebManager.releaseTeb(thread.id, memory)) {
+            const kobj = thread.kernelObject ?? this.resourceProvider.getKernelObject(thread.handle) as KernelThreadObject | null;
+            if (kobj?.kind === 'thread' && kobj.basicInformation) kobj.basicInformation = { ...kobj.basicInformation, tebAddress: 0 };
+        }
         return true;
     }
 
@@ -3746,19 +3776,21 @@ export class Scheduler {
     // TLS
     // ═══════════════════════════════════════════════════════════════════════
 
+    /** NT hands out the LOWEST free index (RtlFindClearBitsAndSet over the TLS bitmap): 0..63,
+     *  the WASM-served range, and the expansion range only while all 64 are live. Resuming
+     *  after the last index instead walked an allocator that only churns (TlsAlloc/TlsFree
+     *  pairs) out of that range with one live slot. Every index below TLS_INDEX_LIMIT is held
+     *  by the thread's TEB+0x2C array (teb-manager.ts). nextTlsIndex is no longer consulted;
+     *  it stays in the savestate shape. */
     tlsAlloc(): number {
-        while (this.tlsSlots.has(this.nextTlsIndex)) {
-            this.nextTlsIndex++;
-            if (this.nextTlsIndex >= 64) {
-                this.nextTlsIndex = 0;
-                if (this.tlsSlots.size >= 64) return 0xFFFFFFFF;
-            }
+        for (let index = 0; index < TLS_INDEX_LIMIT; index++) {
+            if (this.tlsSlots.has(index)) continue;
+            this.tlsSlots.add(index);
+            this.nextTlsIndex = index + 1;
+            hypercallDataManager.setTlsSlotAllocated(index, true);
+            return index;
         }
-        const index = this.nextTlsIndex;
-        this.tlsSlots.add(index);
-        this.nextTlsIndex = index + 1;
-        hypercallDataManager.setTlsSlotAllocated(index, true);
-        return index;
+        return 0xFFFFFFFF;   // TLS_OUT_OF_INDEXES
     }
 
     tlsFree(index: number): boolean {
@@ -3776,8 +3808,8 @@ export class Scheduler {
         return this.tebManager.readTlsSlot(t.id, index) ?? t.tlsValues.get(index) ?? 0;
     }
 
-    /** Slots 0..63 are stored in the TEB TLS array (shared with the WASM fast paths);
-     *  only what the array cannot hold goes to the thread's map. */
+    /** Every slot is stored in the thread's TEB TLS array (shared with the WASM fast paths and
+     *  with guest code indexing fs:[2Ch]); the map only serves a thread that has no array. */
     private storeTlsValue(threadId: number, thread: Thread, index: number, value: number): void {
         if (this.tebManager.syncTlsSlot(threadId, index, value)) thread.tlsValues.delete(index);
         else thread.tlsValues.set(index, value);

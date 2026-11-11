@@ -22,7 +22,7 @@ import { EmulatorConfig } from '../emulator-config-manager';
 import { runDetector } from './lib-detector';
 import { libRegistry } from './lib-registry';
 import { applyPatch, PatchContext } from './lib-patcher';
-import { applyNativeLeaves, findNativeLeaves, type NativeLeafSite } from './native-leaves';
+import { applyNativeLeaves, findNativeLeaves, type NativeLeafSite, applyNativeSplices } from './native-leaves';
 import {
     LiveShadowView,
     ScratchShadowView,
@@ -227,6 +227,7 @@ class LibHleManager {
             return;
         }
         this.nativeLeafSites.push(...applyNativeLeaves(image, module));
+        this.nativeLeafSites.push(...applyNativeSplices(image, module));
     }
 
     getNativeLeafSites(): NativeLeafSite[] {
