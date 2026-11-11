@@ -47,7 +47,7 @@ import { deliverPendingApcs } from '../kernel32/sync';
 // Input message ranges (GetInputState).
 const WM_KEYFIRST = 0x0100;
 const WM_KEYLAST = 0x0109;
-const WM_MOUSEFIRST = 0x0200;
+const WM_MOUSEBUTTONFIRST = 0x0201;
 const WM_MOUSELAST = 0x020e;
 
 // MsgWaitForMultipleObjectsEx flags + the shared wait vocabulary.
@@ -1142,8 +1142,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     };
 
     /**
-     * BOOL GetInputState(void): whether keyboard or mouse input is waiting in the calling
-     * thread's queue. Games poll it to decide whether to pump messages this frame; without
+     * BOOL GetInputState(void): whether keyboard or mouse-button input (QS_KEY | QS_MOUSEBUTTON) is
+     * waiting in the calling thread's queue; a pending WM_MOUSEMOVE alone answers 0. Games poll it to decide whether to pump messages this frame; without
      * an implementation it failed with 0 and such a loop never saw its key presses.
      */
     exports['GetInputState'] = () => {
@@ -1152,7 +1152,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         system.inputManager.poll(true);
         const wm = system.windowManager;
         return wm.hasMessages(WM_KEYFIRST, WM_KEYLAST, currentThreadId)
-            || wm.hasMessages(WM_MOUSEFIRST, WM_MOUSELAST, currentThreadId) ? 1 : 0;
+            || wm.hasMessages(WM_MOUSEBUTTONFIRST, WM_MOUSELAST, currentThreadId) ? 1 : 0;
     };
 
     exports['WaitMessage'] = (ctx, mem, args) => {
