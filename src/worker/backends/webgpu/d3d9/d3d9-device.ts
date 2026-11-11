@@ -13298,6 +13298,16 @@ export class D3D9Device {
         return out;
     }
 
+    copyHardwareVertexShaderConstantsToGuest(start: number, vector4fCount: number, pData: number, view: DataView): boolean {
+        if (this.softwareVertexProcessing) return false;
+        const bits = this.vsConstantBits;
+        const baseIdx = start * 4;
+        const count = vector4fCount * 4;
+        if (baseIdx > bits.length || count > bits.length - baseIdx) return false;
+        for (let i = 0; i < count; i++) view.setUint32(pData + i * 4, bits[baseIdx + i]!, true);
+        return true;
+    }
+
     getPixelShaderConstants(start: number, vector4fCount: number): Float32Array {
         const baseIdx = start * 4;
         const count = vector4fCount * 4;
