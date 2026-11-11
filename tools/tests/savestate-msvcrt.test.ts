@@ -71,6 +71,9 @@ beforeEach(() => {
 afterEach(() => {
     System.getInstance().scheduler = oldScheduler as never;
     System.getInstance().fileSystem.reset();
+    resetCrtTimeStatics();
+    resetCrtConvStatics();
+    restoreVc9IoStatics({ nextFindHandle: 0x4000, asctimeBuf: 0, localtime64Buf: 0 });
 });
 
 describe("msvcrt participant", () => {
