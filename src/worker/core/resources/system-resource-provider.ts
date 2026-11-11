@@ -13,7 +13,7 @@ import { BaseComObject } from '../com/base-com-object';
 import { Logger, LogCategory } from '../logger';
 // Import from core directly: routing this through ddraw/constants would re-enter the
 // constants module while COM memory is initializing.
-import { checkComGuard, freeComObject } from '../com/com-memory';
+import { checkComGuard, comVtableLabel, comVtableOwner, freeComObject } from '../com/com-memory';
 import { System } from '../system';
 
 export enum ResourceType {
@@ -62,6 +62,13 @@ export interface ResourceHandle {
 /**
  * System Resource Provider - центральный менеджер всех системных ресурсов
  */
+export function describeComObject(obj: unknown): string {
+    const o = obj as { iid?: unknown; vtableAddress?: unknown } | null;
+    const iid = typeof o?.iid === 'string' && o.iid ? o.iid : 'unknown iid';
+    const vtable = typeof o?.vtableAddress === 'number' ? o.vtableAddress >>> 0 : 0;
+    return vtable ? `[${comVtableLabel(vtable)} of ${comVtableOwner(vtable)}, iid ${iid}]` : `[iid ${iid}]`;
+}
+
 export class SystemResourceProvider {
     private static instance: SystemResourceProvider;
 
@@ -690,8 +697,9 @@ export class SystemResourceProvider {
     captureState(ref: (obj: unknown, where: string) => number): ResourceProviderState {
         const table = <T>(name: string, t: ResourceTable<T>) =>
             t.entries().map(([handle, obj]) => [handle, ref(obj, `${name} 0x${handle.toString(16)}`)]);
+        const comTable = this.comObjects.entries().map(([handle, obj]) => [handle, ref(obj, `com 0x${handle.toString(16)} ${describeComObject(obj)}`)]);
         return {
-            com: table('com', this.comObjects),
+            com: comTable,
             gdi: table('gdi', this.gdiObjects),
             kernel: table('kernel', this.kernelObjects),
             user: table('user', this.userObjects),
