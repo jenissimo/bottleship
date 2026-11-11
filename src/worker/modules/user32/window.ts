@@ -87,6 +87,7 @@ import {
     setForegroundWithFocus,
     resolveForegroundTargets,
     reactivateOwnerIfNeeded,
+    deactivateWithoutSuccessor,
     buildPendingActivationSteps,
     buildInitialActivationSteps,
     markPendingActivation,
@@ -1556,6 +1557,11 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         };
         markSubtree(hWnd);
 
+        // The active window going with nothing to take over is deactivated first, while it
+        // still exists — the app hears WM_ACTIVATEAPP(FALSE) before WM_DESTROY (Wine
+        // send_destroy_message → activate_other_window; see deactivateWithoutSuccessor).
+        const deactivation = deactivateWithoutSuccessor(hWnd);
+
         // Erase the dialog's pixels from the GDI overlay BEFORE teardown, while its
         // rect is still known — otherwise a closed dialog lingers as a ghost over the
         // game (the overlay is a persistent screen-space canvas). Only #32770 dialogs
@@ -1570,6 +1576,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const sync = beginSyncDestroyDelivery(
             ctx, mem, hWnd, finalizeDestroy, stackCleanup,
             () => reactivateOwnerIfNeeded(hWnd, ownerHwnd),
+            deactivation,
         );
         if (sync) {
             return sync;
@@ -1903,7 +1910,14 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                                 && (next.style & 0x08000000 /* WS_DISABLED */) === 0;
                         }) ?? 0;
                         if (successor) activateTopLevelWindow(successor);
-                        else wm.clearActiveWindow(hWnd);
+                        else {
+                            // Nothing takes over: activation goes to no window, and the
+                            // app is told so (Wine show_window → activate_other_window).
+                            for (const s of deactivateWithoutSuccessor(hWnd)) {
+                                wm.postMessage(s.hwnd, s.msg, s.wParam, s.lParam);
+                            }
+                            wm.clearActiveWindow(hWnd);
+                        }
                     }
                 } else if (isEffectivelyVisible(live)) {
                     if (!noZOrder && !isChild) wm.setWindowZOrder(hWnd, 0 /* HWND_TOP */);
