@@ -34,6 +34,8 @@ export type TextureHandleEntry = {
     lastUploadVersion?: number;
     /** Source color key (DDCKEY_SRCBLT) for transparent texels; required for alpha color 0. */
     srcColorKey?: { low: number; high: number };
+    /** Cached GPU-only draw view for registry-only bindings. */
+    surfaceState?: DirectDrawSurfaceState;
 };
 
 export type DDrawContext = {

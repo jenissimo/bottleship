@@ -67,6 +67,16 @@ async function oneDrawFrame(record: () => void): Promise<import("../../src/worke
 }
 
 describe("indexed draw vertex sampling", () => {
+    test("registry textures retain their guest handle when they have no pixel pointer", async () => {
+        const texture = { surfacePtr: 0, width: 64, height: 64, pitch: 64,
+            format: { bpp: 8, aMask: 0, rMask: 0 }, surfaceType: "render_surface" } as DirectDrawSurfaceState;
+        const frame = await oneDrawFrame(() => recordDrawCall(baseParams({
+            backend: "d3d8", texStateObj: texture, textureHandle: 0x1234,
+        })));
+        expect(frame.drawCalls[0]!.tex0?.handle).toBe(0x1234);
+        expect(frame.drawCalls[0]!.tex0?.surfacePtr).toBe(0);
+    });
+
     test("a scratch-buffer indexed draw (lpVertices=0, vertexSourceValid=true) resolves indexedVertices", async () => {
         const { mem, stride, indicesOffset } = buildIndexedScratch(50, [10, 20, 30, 40]);
         const frame = await oneDrawFrame(() => {

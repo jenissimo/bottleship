@@ -157,6 +157,10 @@ far too much log output to grep. So the harness gives you structured views inste
   records the next complete frame, including draws executed by the separate render worker.
   Keep the guest running while capturing. `maxVerts` and `maxIndexedVerts` control vertex
   sample sizes; concurrent captures fail explicitly, and a timeout disarms the recording.
+- **Legacy texture handles.** `textures().ddrawHandles` lists the DDraw texture registry.
+  A captured draw's `tex0.handle` identifies its texture even when `surfacePtr` is zero.
+  Pass that handle to `dumpTexture(handle, {from: 'gpu'})` for the resident GPU copy;
+  `from: 'guest'` requires a live owner with readable pixel backing.
 - **Emitted JIT code.** `jitBytes` captures the wasm module bytes the JIT emits for a set of hot
   guest pages and diffs two captures — per-section sizes, declared locals, first differing
   offset. It is the decisive test for any codegen flag: if the bytes don't change, the flag is

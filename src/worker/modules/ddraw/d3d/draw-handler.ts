@@ -644,6 +644,7 @@ export const createDrawHandler = (context: DDrawContext, textureManager: Texture
                 mem, isIndexed,
                 rtState,
                 texStateObj: texStateObj ?? null,
+                textureHandle: texHandle,
                 texStateObj1: texStateObj1 ?? null,
                 stageTextures: stageTexturesScratch,
                 renderStates,
