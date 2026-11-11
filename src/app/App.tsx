@@ -1,6 +1,7 @@
 import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SessionWorker } from './session-worker';
 import { ChildSessionSurface } from './child-session-surface';
+import { hardwareKeyVk } from "./hardware-key-vk";
 import { cx } from "../ui/cx";
 import s from "./App.module.css";
 import OpfsTool from '../debug/OpfsTool';
@@ -2074,7 +2075,7 @@ export default function App() {
         void audioEngine?.resumeIfNotPaused();
       }
 
-      const vk = event.keyCode & 0xff;
+      const vk = hardwareKeyVk(event.code, event.keyCode);
       inputDevice.setKey(vk, state === 1, "hw-key");
       inputDevice.commit();
       recordSample(inputView, vk, state);
