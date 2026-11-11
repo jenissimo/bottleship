@@ -550,6 +550,7 @@ export const kernel32Module: ModuleDescriptor = {
         makeFunc("GetFileInformationByHandleEx", 4),
         // Profile/INI functions (additional)
         makeFunc("GetPrivateProfileSectionA", 4),
+        makeFunc("GetPrivateProfileSectionW", 4),
         // The section LIST — how a config-driven engine discovers what its INI contains.
         makeFunc("GetPrivateProfileSectionNamesA", 3),
         makeFunc("GetPrivateProfileSectionNamesW", 3),
