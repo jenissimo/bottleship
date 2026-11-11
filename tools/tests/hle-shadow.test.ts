@@ -37,6 +37,11 @@ describe('validatePrologueBytes', () => {
         const bytes = new Uint8Array([0x53, 0x56, 0x57, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00]);
         expect(validatePrologueBytes(bytes)).toBeNull();
     });
+    test('accepts a register load of an immediate', () => {
+        // push ebp; mov ecx, 0x100
+        const bytes = new Uint8Array([0x55, 0xB9, 0x00, 0x01, 0x00, 0x00]);
+        expect(validatePrologueBytes(bytes)).toBeNull();
+    });
     test('rejects relative call (E8) — position-dependent', () => {
         const bytes = new Uint8Array([0x55, 0x8B, 0xEC, 0xE8, 0x00, 0x00, 0x00, 0x00]);
         expect(validatePrologueBytes(bytes)).toContain('unsupported');
