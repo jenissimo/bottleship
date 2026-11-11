@@ -27,7 +27,7 @@ import type { RemoteGpuLifecycle, SplitQueryChannel, SplitQueryResultTable } fro
 interface SplitDispatcher {
     registerQueuePayloadHandler(handler: (mem8: Uint8Array, mem32: Uint32Array, ptr: number) => void): number;
     enqueuePayloadById(id: number, h0: number, h1: number, h2: number, h3: number,
-        src: Uint8Array, srcOffset: number, byteCount: number): boolean;
+        src: Uint8Array, srcOffset: number, byteCount: number, tail?: Uint8Array | null): boolean;
     executeWbufQueue(): void;
     setWbufSplitClient(client: WbufSplitClient | null): void;
 }
@@ -411,20 +411,24 @@ class SplitStream {
         try {
             enc.value(comparableAnswer(result), "result");
             enc.value(args.length, "argc");
-            for (arg = 0; arg < args.length; arg++) enc.value(args[arg], name);
+            const last = args.length - 1;
+            for (arg = 0; arg < last; arg++) enc.value(args[arg], name);
+            if (last >= 0) enc.value(args[last], name, true);
         } catch (e) {
             if (arg >= 0) e = new Error(`${name}(arg ${arg}): ${String(e)}`);
             this.stats.encodeErrors[name] = (this.stats.encodeErrors[name] ?? 0) + 1;
             if (this.stats.encodeErrors[name] === 1) Logger.error(LogCategory.D3D9, `[split] ${String(e)}`);
             return;
         }
-        if (!this.dispatcher.enqueuePayloadById(this.queueId, this.methodId(name), slot, 0, 0, enc.bytes, 0, enc.length)) {
+        const tail = enc.tail;
+        const bytes = enc.length + (tail === null ? 0 : tail.length);
+        if (!this.dispatcher.enqueuePayloadById(this.queueId, this.methodId(name), slot, 0, 0, enc.bytes, 0, enc.length, tail)) {
             this.stats.encodeErrors[name] = (this.stats.encodeErrors[name] ?? 0) + 1;
-            Logger.error(LogCategory.D3D9, `[split] queue rejected ${name} (${enc.length} bytes)`);
+            Logger.error(LogCategory.D3D9, `[split] queue rejected ${name} (${bytes} bytes)`);
             return;
         }
         this.stats.recorded++;
-        this.stats.recordedBytes += enc.length;
+        this.stats.recordedBytes += bytes;
     }
 
     /** Bring the twin current: run (or ship) everything queued. */

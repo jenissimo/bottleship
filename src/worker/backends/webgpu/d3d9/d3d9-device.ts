@@ -4384,7 +4384,7 @@ export class D3D9Device {
         const range = index === null ? null : this.vertexBuffers.lockedRange(index);
         if (index === null || !range) return null;
         const start = this.vertexBuffers.getGuestPtr(index) + range.offset;
-        return this.memory.slice(start, start + range.size);
+        return this.memory.subarray(start, start + range.size);
     }
 
     captureLockedIndexBytes(ibPtr: number): Uint8Array | null {
@@ -4392,7 +4392,7 @@ export class D3D9Device {
         const range = index === null ? null : this.indexBuffers.lockedRange(index);
         if (index === null || !range) return null;
         const start = this.indexBuffers.getGuestPtr(index) + range.offset;
-        return this.memory.slice(start, start + range.size);
+        return this.memory.subarray(start, start + range.size);
     }
 
     unlockVertexBufferBytes(vbPtr: number, bytes: Uint8Array | null): number {

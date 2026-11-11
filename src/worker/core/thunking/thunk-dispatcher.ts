@@ -1600,9 +1600,11 @@ export class ThunkDispatcher {
 
     enqueuePayloadById(
         id: number, h0: number, h1: number, h2: number, h3: number,
-        src: Uint8Array, srcOffset: number, byteCount: number,
+        src: Uint8Array, srcOffset: number, byteCount: number, tail: Uint8Array | null = null,
     ): boolean {
-        if (byteCount < 0 || byteCount > WBUF_PAYLOAD_MAX_BYTES) return false;
+        const headBytes = byteCount;
+        if (tail !== null) byteCount += tail.length;
+        if (headBytes < 0 || byteCount > WBUF_PAYLOAD_MAX_BYTES) return false;
         const stride = 24 + ((byteCount + 3) & ~3);
         this.ensureWbufQueue(this.wbufQueueEnd + stride);
         const q32 = this.wbufQueueU32!;
@@ -1613,7 +1615,8 @@ export class ThunkDispatcher {
         q32[w + 3] = h2 >>> 0;
         q32[w + 4] = h3 >>> 0;
         q32[w + 5] = byteCount >>> 0;
-        if (byteCount > 0) this.wbufQueueU8!.set(src.subarray(srcOffset, srcOffset + byteCount), this.wbufQueueEnd + 24);
+        if (headBytes > 0) this.wbufQueueU8!.set(src.subarray(srcOffset, srcOffset + headBytes), this.wbufQueueEnd + 24);
+        if (tail !== null) this.wbufQueueU8!.set(tail, this.wbufQueueEnd + 24 + headBytes);
         this.wbufQueueEnd += stride;
         this.wbufDeferStats.enqueuedCalls++;
         this.wbufDeferStats.payloadBytes += byteCount;
