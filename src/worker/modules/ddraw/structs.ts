@@ -208,8 +208,7 @@ export const writePixelFormat = (
     if (!isValidAddress(mem, address, Math.min(Math.max(targetSize, 4), 32))) return;
     const cappedSize = Math.max(0, Math.min(targetSize, 32));
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-    const canWrite = (offset: number, bytes: number = 4) =>
-        cappedSize >= offset + bytes && isValidAddress(mem, address + offset, bytes);
+    const canWrite = (offset: number, bytes: number = 4) => cappedSize >= offset + bytes;
     if (canWrite(DDPIXELFORMAT_OFFSETS.size)) {
         view.setUint32(address + DDPIXELFORMAT_OFFSETS.size, cappedSize, true);
     }
