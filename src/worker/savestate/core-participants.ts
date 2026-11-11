@@ -148,7 +148,7 @@ const SCHEMAS = {
         region: stateKeys<RegionEntry>({ id: true, base: true, size: true, perms: true, kind: true, owner: true, tag: true, allowOverlap: true, skipOverlapCheck: true, allocationId: true, allocationBase: true, allocationSize: true, allocationPerms: true, allocationProtect: true, protection: true }),
     },
     memoryManager: stateKeys<MemoryManagerState>({ allocs: true, totalAllocated: true, currentBytes: true, peakBytes: true, freeBlocks: true, largeFreeBlocks: true, bucketState: true, sysPoolArena: true, sysPoolFree: true, systemPoolGeneration: true }),
-    kernel32Memory: stateKeys<Kernel32MemoryState>({ createdHeaps: true, nextCreatedHeapHandle: true, heapCompatibility: true, terminationOnCorruption: true, slabRanges: true, totalSlabBytes: true, nextSlabSize: true, virtualAllocRegions: true, decommittedPages: true, freeVirtualPages: true }),
+    kernel32Memory: stateKeys<Kernel32MemoryState>({ createdHeaps: true, nextCreatedHeapHandle: true, heapCompatibility: true, terminationOnCorruption: true, slabRanges: true, totalSlabBytes: true, nextSlabSize: true, virtualAllocRegions: true, decommittedPages: true, freeVirtualPages: true, vaFreeCache: true, vaProtectionTouched: true }),
     thunkGenerator: {
         state: stateKeys<ThunkGeneratorState>({ currentAddress: true, nextFunctionId: true, stubs: true, aliases: true, names: true, dataExports: true }),
         stub: stateKeys<ThunkStub>({ address: true, dllName: true, functionName: true, functionId: true, argCount: true, stackCleanupBytes: true, absentDll: true, redirectedTo: true }),
@@ -195,8 +195,10 @@ export function registerCoreParticipants(): void {
         capture: () => save(process().memory.captureState()),
         restore: (s) => process().memory.restoreState(as<MemoryManagerState>(s)),
     });
+    // kernel32-memory v2: the VirtualAlloc recycler's parked blocks are live in a v1
+    // snapshot's MemoryManager state with nothing recording them as parked.
     savestateParticipants.add({
-        id: 'kernel32-memory', version: 1, order: 4, covers: ['kernel32'], schema: schema(SCHEMAS.kernel32Memory),
+        id: 'kernel32-memory', version: 2, order: 4, covers: ['kernel32'], schema: schema(SCHEMAS.kernel32Memory),
         capture: () => save(refusing('kernel32 memory', captureKernel32Memory)),
         restore: (s) => restoreKernel32Memory(as<Kernel32MemoryState>(s)),
     });

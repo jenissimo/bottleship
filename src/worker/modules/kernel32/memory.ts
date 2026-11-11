@@ -276,6 +276,16 @@ const decommittedPages = new IntervalMap();
 // Released backing and unused allocation-granularity tails, coalesced by page range.
 // @participant(kernel32-memory)
 const freeVirtualPages = new IntervalMap();
+// VirtualFree'd blocks parked for VirtualAlloc to recycle (size -> bases): still live in
+// MemoryManager, FREE to the guest. A snapshot must carry them, or the restored blocks
+// stay allocated with nothing able to hand them back or let a fixed-address claim in.
+// @participant(kernel32-memory)
+const vaFreeCache: Map<number, number[]> = new Map();
+// @participant(kernel32-memory)
+let vaCacheBytes = 0;
+/** Bases whose page state we can no longer vouch for (VirtualProtect / MEM_DECOMMIT). */
+// @participant(kernel32-memory)
+const vaProtectionTouched: Set<number> = new Set();
 // @transient(identity of the owning process object)
 let virtualMemoryOwner: object | undefined;
 function ensureVirtualMemoryOwner(): void {
@@ -512,6 +522,9 @@ export interface Kernel32MemoryState {
     virtualAllocRegions: number[][];
     decommittedPages: number[][];
     freeVirtualPages: number[][];
+    /** [size, ...bases] per recycler bucket. */
+    vaFreeCache: number[][];
+    vaProtectionTouched: number[];
 }
 
 export function captureKernel32Memory(): Kernel32MemoryState {
@@ -527,6 +540,8 @@ export function captureKernel32Memory(): Kernel32MemoryState {
         virtualAllocRegions: [...virtualAllocRegions],
         decommittedPages: [...decommittedPages],
         freeVirtualPages: [...freeVirtualPages],
+        vaFreeCache: [...vaFreeCache].filter(([, bases]) => bases.length > 0).map(([size, bases]) => [size, ...bases]),
+        vaProtectionTouched: [...vaProtectionTouched],
     };
 }
 
@@ -548,6 +563,16 @@ export function restoreKernel32Memory(state: Kernel32MemoryState): void {
         map.clear();
         for (const [base, size] of rows) map.set(base, size);
     }
+    // Replaces, never merges: what this process parked before the restore names blocks
+    // of the MemoryManager state the restore just discarded.
+    vaFreeCache.clear();
+    vaCacheBytes = 0;
+    for (const [size, ...bases] of state.vaFreeCache) {
+        vaFreeCache.set(size, [...bases]);
+        vaCacheBytes += size * bases.length;
+    }
+    vaProtectionTouched.clear();
+    for (const base of state.vaProtectionTouched) vaProtectionTouched.add(base);
 }
 
 export function resetHeapSlab(): void {
@@ -899,10 +924,6 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     const VA_CACHE_MAX_BLOCK = 0x100000;        // 1 MB — beyond this one flush is amortised
     const VA_CACHE_MAX_PER_SIZE = 8;
     const VA_CACHE_MAX_BYTES = 4 * 0x100000;    // total parked bytes
-    const vaFreeCache: Map<number, number[]> = new Map();
-    let vaCacheBytes = 0;
-    /** Bases whose page state we can no longer vouch for (VirtualProtect / MEM_DECOMMIT). */
-    const vaProtectionTouched: Set<number> = new Set();
     const vaCacheShapes: Map<string, number> = new Map();
     const vaCacheStats = { hits: 0, misses: 0, parked: 0, dropped: 0, refusedTouched: 0, refusedFull: 0, refusedShape: 0 };
     // Runtime switch so the A/B runs in ONE session on ONE scene: a frame-time
