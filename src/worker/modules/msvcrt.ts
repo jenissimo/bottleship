@@ -2100,12 +2100,20 @@ export class Msvcrt implements IModule {
 
     private close(fd: number): number {
         if (fd <= 2) return 0;
-        if (!this.fds.has(fd)) {
+        if (!this.fds.has(fd) && !this.fdHandles.has(fd)) {
             this.setErrno(9);
             return -1;
         }
-        this.fds.delete(fd);
+        this.dropFd(fd);
         return 0;
+    }
+
+    private dropFd(fd: number): void {
+        this.fds.delete(fd);
+        const h = this.fdHandles.get(fd);
+        if (h === undefined) return;
+        this.fdHandles.delete(fd);
+        if (this.handleFds.get(h) === fd) this.handleFds.delete(h);
     }
 
     private read(ctx: any, mem: Uint8Array, fd: number, buffer: number, count: number): number | Promise<ThunkResult> {
@@ -3197,7 +3205,7 @@ export class Msvcrt implements IModule {
         const mode = this.readCString(modePtr, 16);
         const existing = this.fileStreams.get(filePtr);
         if (existing) {
-            this.fds.delete(existing.fd);
+            this.dropFd(existing.fd);
             this.fileStreams.delete(filePtr);
             // Same teardown fclose does, minus the FILE* itself — that is the caller's
             // pointer and the new stream is about to be re-homed onto it.
@@ -3339,7 +3347,7 @@ export class Msvcrt implements IModule {
     private fclose(filePtr: number): number | Promise<ThunkResult> {
         const stream = this.fileStreams.get(filePtr);
         if (!stream) return -1;
-        this.fds.delete(stream.fd);
+        this.dropFd(stream.fd);
         this.fileStreams.delete(filePtr);
         if (stream.bufPtr) { try { this.free(stream.bufPtr); } catch { /* best-effort */ } }
         if (stream.structPtr) { try { this.free(stream.structPtr); } catch { /* best-effort */ } }

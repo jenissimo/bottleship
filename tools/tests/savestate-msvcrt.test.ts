@@ -164,6 +164,33 @@ describe("msvcrt participant", () => {
         expect(() => crt.captureSavestate()).not.toThrow();
     });
 
+    test("_close drops both _open_osfhandle mappings so the save and a reused handle value work again", () => {
+        const crt = played();
+        const fd = crt.exports["_open_osfhandle"]!({}, mem, [0x44, 0]);
+        expect(crt.exports["_get_osfhandle"]!({}, mem, [fd])).toBe(0x44);
+        expect(() => crt.captureSavestate()).toThrow("Win32 handle");
+        expect(crt.exports["_close"]!({}, mem, [fd])).toBe(0);
+        expect((crt.fdHandles as Map<number, number>).size).toBe(0);
+        expect((crt.handleFds as Map<number, number>).size).toBe(0);
+        expect(() => crt.captureSavestate()).not.toThrow();
+        expect(crt.exports["_close"]!({}, mem, [fd])).toBe(-1);
+        const again = crt.exports["_open_osfhandle"]!({}, mem, [0x44, 0]);
+        expect(again).not.toBe(fd);
+        expect(crt.exports["_get_osfhandle"]!({}, mem, [again])).toBe(0x44);
+        expect(crt.exports["_close"]!({}, mem, [again])).toBe(0);
+    });
+
+    test("fclose on an _fdopen stream drops the _open_osfhandle mappings", () => {
+        const crt = played();
+        const fd = crt.exports["_open_osfhandle"]!({}, mem, [0x48, 0]);
+        (crt.fds as Map<number, unknown>).set(fd, { path: "C:\\log.txt", position: 0 });
+        (crt.fileStreams as Map<number, unknown>).set(0x70000040, { fd, handle: { path: "C:\\log.txt" }, bufPtr: 0, structPtr: 0 });
+        crt.exports["fclose"]!({}, mem, [0x70000040]);
+        expect((crt.fdHandles as Map<number, number>).size).toBe(0);
+        expect((crt.handleFds as Map<number, number>).size).toBe(0);
+        expect(() => crt.captureSavestate()).not.toThrow();
+    });
+
     test("refuses while a _findfirst search is open and saves again once it is closed", () => {
         const crt = played();
         const vfs = System.getInstance().fileSystem;
