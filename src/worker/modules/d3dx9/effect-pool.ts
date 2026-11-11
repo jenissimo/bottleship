@@ -74,6 +74,20 @@ export function effectPoolCount(): number {
     return pools.size;
 }
 
+function rebaseChildBlocks(param: EffectParameter, from: Uint8Array, to: Uint8Array): void {
+    const children = param.elementsList ? [...param.members, ...param.elementsList] : param.members;
+    for (const child of children) {
+        const block = child.value;
+        if (block.byteLength > 0 && block.buffer === from.buffer) {
+            const offset = block.byteOffset - from.byteOffset;
+            if (offset >= 0 && offset + block.byteLength <= to.byteLength) {
+                child.value = to.subarray(offset, offset + block.byteLength);
+            }
+        }
+        rebaseChildBlocks(child, from, to);
+    }
+}
+
 /**
  * Bind every `shared` parameter of `model` to `poolPtr`'s storage.
  *
@@ -98,6 +112,7 @@ export function bindSharedParameters(poolPtr: number, model: EffectModel): numbe
             if (!existing) {
                 pool.values.set(param.name, param.value);
             } else if (existing.byteLength === param.value.byteLength) {
+                rebaseChildBlocks(param, param.value, existing);
                 param.value = existing;
             } else {
                 continue; // shape disagreement: keep the private block rather than corrupt both
