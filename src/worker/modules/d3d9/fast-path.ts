@@ -270,6 +270,33 @@ function registerD3D9Paths(dispatcher: HleDispatcher, names: D3D9PathNames, inhe
         return device.setTransform(view.getUint32(esp + 8, true), matrix);
     }, { trivial: true });
 
+    // IDirect3DDevice9_GetTransform(thisPtr, State, pMatrix)
+    // A read of the tracked matrix; anything the full thunk would reject takes the full thunk.
+    dispatcher.registerFastPath('d3d9', dev('GetTransform'), (esp: number, view: DataView, mem: Uint8Array): number | null => {
+        const device = devices.lookup(view.getUint32(esp + 4, true));
+        if (!device) return null;
+        const pMatrix = view.getUint32(esp + 12, true);
+        if (!validGuestRange(mem, pMatrix, D3DMATRIX_SIZE) || !isValidAddress(mem, pMatrix, D3DMATRIX_SIZE, "rw")) return null;
+        const matrix = device.getTransform(view.getUint32(esp + 8, true));
+        if (!matrix || matrix.length < 16) return null;
+        for (let i = 0; i < 16; i++) view.setFloat32(pMatrix + i * 4, matrix[i]!, true);
+        return D3D_OK;
+    }, { trivial: true });
+
+    // IDirect3DDevice9_MultiplyTransform(thisPtr, State, pMatrix)
+    // CAPTURE-AT-CALL like SetTransform: the operand is copied out of guest memory here.
+    dispatcher.registerFastPath('d3d9', dev('MultiplyTransform'), (esp: number, view: DataView, mem: Uint8Array): number => {
+        const device = devices.lookup(view.getUint32(esp + 4, true));
+        if (!device) return D3DERR_INVALIDCALL;
+        const pMatrix = view.getUint32(esp + 12, true);
+        if (!validGuestRange(mem, pMatrix, D3DMATRIX_SIZE)) return D3DERR_INVALIDCALL;
+        const matrix = new Float32Array(16);
+        for (let i = 0; i < 16; i++) {
+            matrix[i] = view.getFloat32(pMatrix + i * 4, true);
+        }
+        return device.multiplyTransform(view.getUint32(esp + 8, true), matrix);
+    }, { trivial: true });
+
     // IDirect3DDevice9_SetFVF(thisPtr, FVF)
     dispatcher.registerFastPath('d3d9', dev('SetFVF'), (esp: number, view: DataView): number => {
         const device = devices.lookup(view.getUint32(esp + 4, true));
@@ -341,6 +368,19 @@ function registerD3D9Paths(dispatcher: HleDispatcher, names: D3D9PathNames, inhe
         const device = devices.lookup(view.getUint32(esp + 4, true));
         if (device) device.setVertexShaderConstantF(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true), mem);
         return D3D_OK;
+    }, { trivial: true });
+
+    // IDirect3DDevice9_GetVertexShaderConstantF(thisPtr, StartRegister, pConstantData, Vector4fCount)
+    // A read of the hardware bank straight into guest memory; anything unusual (SWVP, a range
+    // or pointer the full thunk would reject) returns null and takes the full thunk.
+    dispatcher.registerFastPath('d3d9', dev('GetVertexShaderConstantF'), (esp: number, view: DataView, mem: Uint8Array): number | null => {
+        const device = devices.lookup(view.getUint32(esp + 4, true));
+        if (!device) return null;
+        const start = view.getUint32(esp + 8, true);
+        const pData = view.getUint32(esp + 12, true);
+        const count = view.getUint32(esp + 16, true);
+        if (count === 0 || count > 256 || start > 256 || !isValidAddress(mem, pData, count * 16, "rw")) return null;
+        return device.copyHardwareVertexShaderConstantsToGuest(start, count, pData, view) ? D3D_OK : null;
     }, { trivial: true });
 
     // IDirect3DDevice9_SetPixelShaderConstantF(thisPtr, StartRegister, pConstantData, Vector4fCount)
