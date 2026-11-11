@@ -45,6 +45,7 @@ export function isContainerImage(data: Uint8Array, typeDeclared = true): boolean
 /** DIG_PCM_SIGN (AIL_set_sample_type flags): the data is signed. */
 export const DIG_PCM_SIGN = 0x0001;
 
+// @transient(log-once flag)
 let adpcmRawWarned = false;
 
 /**

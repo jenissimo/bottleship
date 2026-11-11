@@ -29,9 +29,13 @@ interface ImageEntry {
 }
 
 const CACHE_LIMIT_BYTES = 96 << 20;
+// @transient(decode cache; every hit compares the image bytes, a miss decodes again)
 const images = new Map<string, ImageEntry>();
+// @transient(size of the decode cache)
 let cachedBytes = 0;
+// @transient(diagnostic counter)
 let hits = 0;
+// @transient(diagnostic counter)
 let misses = 0;
 
 /**

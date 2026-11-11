@@ -26,6 +26,12 @@ function withdrawPendingTicks(ctx: MSSContext, timer: MSSTimer): void {
     }
 }
 
+export function armTimerPump(timer: MSSTimer): void {
+    const onReturn = () => { if (timer.pumpOnReturn === onReturn) timer.inFlight = false; };
+    timer.pumpOnReturn = onReturn;
+    timer.inFlight = false;
+}
+
 export function createTimerExports(ctx: MSSContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -105,9 +111,7 @@ export function createTimerExports(ctx: MSSContext): Record<string, ThunkImpleme
             scheduler.ensureTimerPumpThread();
             // A tick posted by an earlier start (still running after a stop) must not clear
             // this start's coalescing flag, hence the identity check.
-            const onReturn = () => { if (timer.pumpOnReturn === onReturn) timer.inFlight = false; };
-            timer.pumpOnReturn = onReturn;
-            timer.inFlight = false;
+            armTimerPump(timer);
             timer.timerId = scheduler.timerWheel.add(
                 periodMs, true, TimerKind.MSS_TIMER, handle,
                 TimeService.getInstance().nowMs(),
