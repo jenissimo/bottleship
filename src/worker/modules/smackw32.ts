@@ -30,6 +30,9 @@ import { Mem } from "../core/memory/mem-accessor";
 import { overlapsThunkCode } from "../core/memory/address-guard";
 import { Glide2x } from "./glide2x";
 import { VideoFrameViews } from "../video/video-routing-types";
+import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
+import { CaptureRefusal } from "../savestate/object-codecs";
+import type { SaveValue } from "../savestate/value-codec";
 
 // HSMACK guest struct: Storm reads dirty rects @0x380..0x38c, palette @0x6c,
 // NewPalette @0x68, internal buf @0x3c; SmackBuffer path also touches +0x448.
@@ -170,6 +173,21 @@ interface SmackSession {
     explicitDdrawSurface: DirectDrawSurfaceState | null;
     explicitGlideSurfacePtr: number;
 }
+
+export const SMACKW32_FIELDS = {
+    name: 'transient', exports: 'host', process: 'host', fakeHandle: 'derive', soundDriverSet: 'save', sessions: 'transient',
+    smackBuffers: 'transient', loggedUnknownHandles: 'transient', _reconstructedPalette: 'transient',
+} as const satisfies Record<string, FieldPolicy>;
+
+export interface SmackW32State {
+    soundDriverSet: boolean;
+    fakeHandle: number;
+}
+
+export const SMACKW32_SCHEMA = {
+    module: SMACKW32_FIELDS,
+    state: stateKeys<SmackW32State>({ soundDriverSet: true, fakeHandle: true }),
+};
 
 export class SmackW32 implements IModule {
     name = "smackw32";
@@ -713,7 +731,37 @@ export class SmackW32 implements IModule {
         }
     }
 
+    captureSavestate(): SmackW32State {
+        if (this.sessions.size > 0) throw new Error(`smackw32: ${this.sessions.size} open Smacker file(s) are not part of a v1 savestate`);
+        if (this.smackBuffers.size > 0) throw new Error(`smackw32: ${this.smackBuffers.size} open SmackBuffer(s) are not part of a v1 savestate`);
+        return { soundDriverSet: this.soundDriverSet, fakeHandle: this.fakeHandle };
+    }
+
+    restoreSavestate(s: SmackW32State): void {
+        if (s.fakeHandle !== this.fakeHandle) {
+            throw new Error(`smackw32: the fallback handle booted at 0x${this.fakeHandle.toString(16)}, the snapshot has it at 0x${s.fakeHandle.toString(16)}`);
+        }
+        this.sessions.clear();
+        this.smackBuffers.clear();
+        this.soundDriverSet = s.soundDriverSet;
+    }
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'smackw32', version: 1, order: 72, covers: ['smackw32'], schema: SMACKW32_SCHEMA as unknown as SaveValue,
+            capture: () => {
+                try {
+                    return this.captureSavestate() as unknown as SaveValue;
+                } catch (e) {
+                    throw e instanceof CaptureRefusal ? e : new CaptureRefusal(e instanceof Error ? e.message : String(e));
+                }
+            },
+            restore: (saved) => this.restoreSavestate(saved as unknown as SmackW32State),
+        });
+    }
+
     initialize(process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         this.process = process;
 
         // Allocate fallback SmackHandle — Frames=1 at +12 so game's loop guard exits cleanly
