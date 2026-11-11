@@ -18,6 +18,7 @@ const MODULES: Record<string, () => Promise<object>> = {
     winspool: async () => new (await import("../../src/worker/modules/winspool")).Winspool(),
     hid: async () => new (await import("../../src/worker/modules/hid")).Hid(),
     oledlg: async () => new (await import("../../src/worker/modules/oledlg")).Oledlg(),
+    shell32: async () => new (await import("../../src/worker/modules/shell32")).Shell32(),
     advapi32: async () => new (await import("../../src/worker/modules/advapi32")).Advapi32(),
 };
 

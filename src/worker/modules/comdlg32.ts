@@ -10,6 +10,22 @@ import { Process } from "../core/process";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../core/logger";
 import { Marshaler } from "../core/memory/marshaler";
+import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
+import { CaptureRefusal } from "../savestate/object-codecs";
+import type { SaveValue } from "../savestate/value-codec";
+
+export const COMDLG32_FIELDS = {
+    name: 'transient', exports: 'host', lastError: 'save',
+} as const satisfies Record<string, FieldPolicy>;
+
+export interface Comdlg32State {
+    lastError: number;
+}
+
+export const COMDLG32_SCHEMA = {
+    module: COMDLG32_FIELDS,
+    state: stateKeys<Comdlg32State>({ lastError: true }),
+};
 
 export class Comdlg32 implements IModule {
     name = "comdlg32";
@@ -17,7 +33,30 @@ export class Comdlg32 implements IModule {
 
     private lastError: number = 0;  // 0 = no error
 
+    captureSavestate(): Comdlg32State {
+        return { lastError: this.lastError };
+    }
+
+    restoreSavestate(s: Comdlg32State): void {
+        this.lastError = s.lastError;
+    }
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'comdlg32', version: 1, order: 71, covers: ['comdlg32'], schema: COMDLG32_SCHEMA as unknown as SaveValue,
+            capture: () => {
+                try {
+                    return this.captureSavestate() as unknown as SaveValue;
+                } catch (e) {
+                    throw e instanceof CaptureRefusal ? e : new CaptureRefusal(e instanceof Error ? e.message : String(e));
+                }
+            },
+            restore: (saved) => this.restoreSavestate(saved as unknown as Comdlg32State),
+        });
+    }
+
     initialize(_process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         // File open/save dialogs - return FALSE (user cancelled)
         this.exports["GetOpenFileNameA"] = this.stubDialog("GetOpenFileNameA");
         this.exports["GetOpenFileNameW"] = this.stubDialog("GetOpenFileNameW");
