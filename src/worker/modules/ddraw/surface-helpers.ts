@@ -185,6 +185,9 @@ export const clipRect = (rect: Rect, width: number, height: number): Rect | null
     return { left, top, right, bottom };
 };
 
+const rowSpanValid = (mem: Uint8Array, base: number, pitch: number, rows: number, rowBytes: number): boolean =>
+    rows > 0 && rowBytes > 0 && pitch >= rowBytes && isValidAddress(mem, base, (rows - 1) * pitch + rowBytes);
+
 /**
  * Copy pixel data between two DirectDraw surfaces.
  */
@@ -262,14 +265,17 @@ export const copySurfaceRegion = (
             const dstBpp = Math.max(1, Math.floor(dst.format.bpp / 8));
             const copyBpp = Math.min(srcBpp, dstBpp);
             const memSize = mem.length;
+            const stretchSpansValid =
+                rowSpanValid(mem, src.surfacePtr + srcRect.top * src.pitch + srcRect.left * srcBpp, src.pitch, srcH, srcW * srcBpp) &&
+                rowSpanValid(mem, dst.surfacePtr + dstRect.top * dst.pitch + dstRect.left * dstBpp, dst.pitch, dstH, dstW * dstBpp);
 
             for (let dy = 0; dy < dstH; dy++) {
                 const sy = (dy * srcH / dstH) | 0;
                 const srcRowBase = src.surfacePtr + (srcRect.top + sy) * src.pitch + srcRect.left * srcBpp;
                 const dstRowBase = dst.surfacePtr + (dstRect.top + dy) * dst.pitch + dstRect.left * dstBpp;
 
-                if (!isValidAddress(mem, srcRowBase, srcW * srcBpp) ||
-                    !isValidAddress(mem, dstRowBase, dstW * dstBpp)) continue;
+                if (!stretchSpansValid && (!isValidAddress(mem, srcRowBase, srcW * srcBpp) ||
+                    !isValidAddress(mem, dstRowBase, dstW * dstBpp))) continue;
 
                 const srcRowRel = absToRel(mem, srcRowBase);
                 const dstRowRel = absToRel(mem, dstRowBase);
@@ -340,6 +346,9 @@ export const copySurfaceRegion = (
 
     const rowBytes = width * bytesPerPixel;
     const memSize = mem.length;
+    const spansValid =
+        rowSpanValid(mem, src.surfacePtr + srcRect.top * src.pitch + srcRect.left * bytesPerPixel, src.pitch, height, rowBytes) &&
+        rowSpanValid(mem, dst.surfacePtr + dstRect.top * dst.pitch + dstRect.left * bytesPerPixel, dst.pitch, height, rowBytes);
 
     // Detect same-surface overlap and choose copy direction
     const isSameSurface = src.surfacePtr === dst.surfacePtr;
@@ -355,7 +364,7 @@ export const copySurfaceRegion = (
             const srcAbsOffset = src.surfacePtr + (srcRect.top + y) * src.pitch + srcRect.left * bytesPerPixel;
             const dstAbsOffset = dst.surfacePtr + (dstRect.top + y) * dst.pitch + dstRect.left * bytesPerPixel;
 
-            if (!isValidAddress(mem, srcAbsOffset, rowBytes) || !isValidAddress(mem, dstAbsOffset, rowBytes)) {
+            if (!spansValid && (!isValidAddress(mem, srcAbsOffset, rowBytes) || !isValidAddress(mem, dstAbsOffset, rowBytes))) {
                 continue;
             }
 
@@ -379,7 +388,7 @@ export const copySurfaceRegion = (
             const srcAbsOffset = src.surfacePtr + (srcRect.top + y) * src.pitch + srcRect.left * bytesPerPixel;
             const dstAbsOffset = dst.surfacePtr + (dstRect.top + y) * dst.pitch + dstRect.left * bytesPerPixel;
 
-            if (!isValidAddress(mem, srcAbsOffset, rowBytes) || !isValidAddress(mem, dstAbsOffset, rowBytes)) {
+            if (!spansValid && (!isValidAddress(mem, srcAbsOffset, rowBytes) || !isValidAddress(mem, dstAbsOffset, rowBytes))) {
                 continue;
             }
 
@@ -478,6 +487,12 @@ export const copySurfaceRegionWithColorKey = (
     const ckLow = ((colorKey.low >>> 0) & ckMask) >>> 0;
     const ckHigh = ((colorKey.high >>> 0) & ckMask) >>> 0;
 
+    const byteBase = mem.byteOffset;
+    const view16 = bytesPerPixel === 2 && (byteBase & 1) === 0
+        ? new Uint16Array(mem.buffer, byteBase, mem.length >>> 1) : null;
+    const view32 = bytesPerPixel === 4 && (byteBase & 3) === 0
+        ? new Uint32Array(mem.buffer, byteBase, mem.length >>> 2) : null;
+
     for (let y = 0; y < height; y++) {
         const srcAbsOffset = src.surfacePtr + (srcRect.top + y) * src.pitch + srcRect.left * bytesPerPixel;
         const dstAbsOffset = dst.surfacePtr + (dstRect.top + y) * dst.pitch + dstRect.left * bytesPerPixel;
@@ -489,6 +504,35 @@ export const copySurfaceRegionWithColorKey = (
         if (srcRelOffset + width * bytesPerPixel > memSize) continue;
         if (dstRelOffset + width * bytesPerPixel > memSize) continue;
 
+        if (bytesPerPixel === 1) {
+            for (let x = 0; x < width; x++) {
+                const pixel = mem[srcRelOffset + x]!;
+                const pixelKeyBits = (pixel & ckMask) >>> 0;
+                if (pixelKeyBits >= ckLow && pixelKeyBits <= ckHigh) continue;
+                mem[dstRelOffset + x] = pixel;
+            }
+            continue;
+        }
+        if (view16 && ((srcRelOffset | dstRelOffset) & 1) === 0) {
+            const s16 = srcRelOffset >>> 1, d16 = dstRelOffset >>> 1;
+            for (let x = 0; x < width; x++) {
+                const pixel = view16[s16 + x]!;
+                const pixelKeyBits = (pixel & ckMask) >>> 0;
+                if (pixelKeyBits >= ckLow && pixelKeyBits <= ckHigh) continue;
+                view16[d16 + x] = pixel;
+            }
+            continue;
+        }
+        if (view32 && ((srcRelOffset | dstRelOffset) & 3) === 0) {
+            const s32 = srcRelOffset >>> 2, d32 = dstRelOffset >>> 2;
+            for (let x = 0; x < width; x++) {
+                const pixel = view32[s32 + x]! >>> 0;
+                const pixelKeyBits = (pixel & ckMask) >>> 0;
+                if (pixelKeyBits >= ckLow && pixelKeyBits <= ckHigh) continue;
+                view32[d32 + x] = pixel;
+            }
+            continue;
+        }
         for (let x = 0; x < width; x++) {
             const srcPixelOffset = srcRelOffset + x * bytesPerPixel;
             const dstPixelOffset = dstRelOffset + x * bytesPerPixel;
