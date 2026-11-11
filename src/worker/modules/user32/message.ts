@@ -44,6 +44,12 @@ import { isValidGuestEip } from '../../core/scheduler/scheduler-context';
 import { WAIT_FAILED, WAIT_BLOCKED_NO_SWITCH } from '../../core/scheduler/types';
 import { deliverPendingApcs } from '../kernel32/sync';
 
+// Input message ranges (GetInputState).
+const WM_KEYFIRST = 0x0100;
+const WM_KEYLAST = 0x0109;
+const WM_MOUSEFIRST = 0x0200;
+const WM_MOUSELAST = 0x020e;
+
 // MsgWaitForMultipleObjectsEx flags + the shared wait vocabulary.
 const MWMO_WAITALL = 0x0001;
 const MWMO_ALERTABLE = 0x0002;
@@ -1133,6 +1139,20 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
         const present = system.windowManager.hasMessages(0, 0, currentThreadId) ? flags & 0xffff : 0;
         return ((present << 16) | present) >>> 0;
+    };
+
+    /**
+     * BOOL GetInputState(void): whether keyboard or mouse input is waiting in the calling
+     * thread's queue. Games poll it to decide whether to pump messages this frame; without
+     * an implementation it failed with 0 and such a loop never saw its key presses.
+     */
+    exports['GetInputState'] = () => {
+        const system = System.getInstance();
+        const currentThreadId = system.scheduler.getCurrentThreadId();
+        system.inputManager.poll(true);
+        const wm = system.windowManager;
+        return wm.hasMessages(WM_KEYFIRST, WM_KEYLAST, currentThreadId)
+            || wm.hasMessages(WM_MOUSEFIRST, WM_MOUSELAST, currentThreadId) ? 1 : 0;
     };
 
     exports['WaitMessage'] = (ctx, mem, args) => {
