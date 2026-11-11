@@ -20,6 +20,15 @@ const NO_CONTEXT = { eax: 0, ecx: 0, edx: 0, ebx: 0, esp: 0, ebp: 0, esi: 0, edi
 /** Renders `frames` of interleaved 16-bit PCM into `out`. */
 export type RenderPcm = (out: Int16Array, frames: number) => void;
 
+/**
+ * The DirectSound object createSinkBuffer made for a buffer when the application supplied
+ * none, keyed by the buffer. It is released when the buffer's last reference goes: a
+ * device's last Release destroys the buffers it created (as on Windows), so releasing it
+ * right after creating the buffer would leave DirectMusic writing into a dead buffer.
+ */
+// @transient(after a restore an entry is missing and its private device simply stays alive; the buffer it backs keeps working)
+const privateDevices = new Map<number, number>();
+
 export function soundReference(process: Process, ptr: number, buffer: boolean, retain: boolean): void {
     if (!ptr) return;
     const iface = buffer ? "IDirectSoundBuffer8" : "IDirectSound8";
@@ -27,7 +36,13 @@ export function soundReference(process: Process, ptr: number, buffer: boolean, r
     const exports = process.getModule("dsound")?.exports;
     const fn = exports?.[`${iface}_${method}`] ?? exports?.[`${iface}_${method}`.toLowerCase()];
     const mem = Mem.getView();
-    if (fn && mem) fn(NO_CONTEXT, mem, [ptr]);
+    if (!fn || !mem) return;
+    const left = fn(NO_CONTEXT, mem, [ptr]);
+    if (buffer && !retain && left === 0) {
+        const device = privateDevices.get(ptr >>> 0);
+        privateDevices.delete(ptr >>> 0);
+        if (device) soundReference(process, device, false, false);
+    }
 }
 
 export class DirectSoundSink {
@@ -181,8 +196,15 @@ export function createSinkBuffer(process: Process, directSound: number, channels
         const createBuffer = dsound.exports["idirectsound8_createsoundbuffer"] as ThunkImplementation | undefined;
         const fresh = Mem.getView();
         if (!createBuffer || !fresh || createBuffer(NO_CONTEXT, fresh, [ds, scratch, out, 0]) !== 0) return 0;
-        return Mem.readUint32(out) ?? 0;
+        const buffer = Mem.readUint32(out) ?? 0;
+        if (buffer && createdDevice) {
+            // The device must outlive the buffer: hand it to the buffer's last release.
+            privateDevices.set(buffer >>> 0, createdDevice);
+            createdDevice = 0;
+        }
+        return buffer;
     } finally {
+        // Only a device that ended up backing no buffer is released here.
         soundReference(process, createdDevice, false, false);
         process.memory.free(scratch);
     }
