@@ -25,7 +25,7 @@ import { cpuViews, readEip, readEsp, readRetiredInsns, PROXY_BASELINE } from '..
 import { Mem } from '../memory/mem-accessor';
 import { ERROR_INVALID_HANDLE } from '../thunking/thunk-errors';
 import { setParkedStackProvider, guardStackWrite } from '../memory/stack-write-guard';
-import { TebManager } from '../teb-manager';
+import { TebManager, TLS_INDEX_LIMIT } from '../teb-manager';
 import {
     clearFpuSimdDirty,
     createDefaultFpuSnapshot,
@@ -84,8 +84,6 @@ import type { WinMM, PendingTimerCallback as PostedTimerCallback } from '../../m
 // idle anchor is stale after a pause / background-throttle gap. See pollTimeouts().
 const IDLE_PUMP_MAX_MS = 250;
 
-/** TLS_MINIMUM_AVAILABLE (64, the TEB array) + TLS_EXPANSION_SLOTS (1024), as on NT. */
-const TLS_INDEX_LIMIT = 64 + 1024;
 
 /** Sole-runnable Sleep(ms): credit+yield only for short pump sleeps; longer → blockThread. */
 const SOLE_RUNNABLE_SLEEP_CREDIT_MAX_MS = 50;
@@ -3750,11 +3748,11 @@ export class Scheduler {
     // ═══════════════════════════════════════════════════════════════════════
 
     /** NT hands out the LOWEST free index (RtlFindClearBitsAndSet over the TLS bitmap): 0..63,
-     *  the TEB array, and the expansion range only while all 64 are live. Resuming after the
-     *  last index instead walked an allocator that only churns (TlsAlloc/TlsFree pairs) out of
-     *  the array with one live slot — past the WASM TLS fast paths and the fs:[2Ch] SjLj splice
-     *  (hle-lib/native-leaves.ts). nextTlsIndex is no longer consulted; it stays in the
-     *  savestate shape. */
+     *  the WASM-served range, and the expansion range only while all 64 are live. Resuming
+     *  after the last index instead walked an allocator that only churns (TlsAlloc/TlsFree
+     *  pairs) out of that range with one live slot. Every index below TLS_INDEX_LIMIT is held
+     *  by the thread's TEB+0x2C array (teb-manager.ts). nextTlsIndex is no longer consulted;
+     *  it stays in the savestate shape. */
     tlsAlloc(): number {
         for (let index = 0; index < TLS_INDEX_LIMIT; index++) {
             if (this.tlsSlots.has(index)) continue;
@@ -3781,8 +3779,8 @@ export class Scheduler {
         return this.tebManager.readTlsSlot(t.id, index) ?? t.tlsValues.get(index) ?? 0;
     }
 
-    /** Slots 0..63 are stored in the TEB TLS array (shared with the WASM fast paths);
-     *  only what the array cannot hold goes to the thread's map. */
+    /** Every slot is stored in the thread's TEB TLS array (shared with the WASM fast paths and
+     *  with guest code indexing fs:[2Ch]); the map only serves a thread that has no array. */
     private storeTlsValue(threadId: number, thread: Thread, index: number, value: number): void {
         if (this.tebManager.syncTlsSlot(threadId, index, value)) thread.tlsValues.delete(index);
         else thread.tlsValues.set(index, value);

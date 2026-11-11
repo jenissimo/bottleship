@@ -215,8 +215,11 @@ export function registerCoreParticipants(): void {
         capture: () => save(hypercallDataManager.captureState()),
         restore: (s) => hypercallDataManager.restoreState(as<HypercallState>(s)),
     });
+    // scheduler v2: TEB TLS arrays hold all 1088 TlsAlloc indices (teb-manager.ts). A v1
+    // snapshot's arrays are 64 slots in guest RAM, so restoring one would let a key >= 64 be
+    // written past its end.
     savestateParticipants.add({
-        id: 'scheduler', version: 1, order: 20, schema: schema(SCHEMAS.scheduler),
+        id: 'scheduler', version: 2, order: 20, schema: schema(SCHEMAS.scheduler),
         capture: (ctx) => {
             const state = refusing('scheduler', () => System.getInstance().scheduler.captureState((o, w) => ctx.ref(o, w)));
             refusing('scheduler', () => rewindRestartableParks(state, ctx));
