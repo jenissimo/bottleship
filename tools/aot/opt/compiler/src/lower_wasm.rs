@@ -11,6 +11,7 @@
 
 use crate::flag_liveness::FlagFacts;
 use crate::scoped_memory::Scope;
+use crate::stack_forwarding::{FrameReadSlot, StackForwarding};
 use crate::ir::*;
 use crate::wasm::{op, EmitError, ModuleBuilder, Unit, T_I32};
 
@@ -101,6 +102,15 @@ struct Locals {
     /// branch; keeping a shadow computed from the same values costs a local and cannot disagree
     /// with what was stored, since both come from the same operands.
     flags: u32,
+    frame_reads: Vec<FrameReadLocals>,
+}
+
+struct FrameReadLocals {
+    slot: FrameReadSlot,
+    valid: u32,
+    linear: u32,
+    physical: u32,
+    value: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,6 +180,8 @@ pub struct Passes {
     /// again inside it. The mechanism, not an ablation: it removes work by discharging the same
     /// obligations earlier, and it keeps a guarded copy of the loop for when it cannot.
     pub scoped_memory: bool,
+    /// Forward repeated reads of stable frame cells, invalidating on aliasing stores or helpers.
+    pub stack_load_forwarding: bool,
     /// Drop a lazy-flag publication that nothing can observe before it is overwritten.
     ///
     /// The tuple is guest-visible at exactly two places: an exit, and a fault inside the region.
@@ -215,6 +227,7 @@ impl Passes {
             match name {
                 "flag-liveness" => passes.flag_liveness = true,
                 "scoped-memory" => passes.scoped_memory = true,
+                "stack-load-forwarding" => passes.stack_load_forwarding = true,
                 "unguarded-memory-diagnostic" => passes.unguarded_memory_diagnostic = true,
                 "unguarded-flags-diagnostic" => passes.unguarded_flags_diagnostic = true,
                 "dead-flag-stores" => passes.dead_flag_stores = true,
@@ -232,6 +245,9 @@ impl Passes {
         }
         if self.scoped_memory {
             names.push("scoped-memory");
+        }
+        if self.stack_load_forwarding {
+            names.push("stack-load-forwarding");
         }
         if self.unguarded_memory_diagnostic {
             names.push("unguarded-memory-diagnostic");
@@ -423,6 +439,13 @@ pub fn lower_region_with(
 
     let mut b = ModuleBuilder::new();
 
+    let frame_reads = if passes.stack_load_forwarding {
+        StackForwarding::of(region).map_or(Vec::new(), |plan| plan.slots.into_iter().map(|slot| {
+            FrameReadLocals { slot, valid: b.local(T_I32), linear: b.local(T_I32),
+                physical: b.local(T_I32), value: b.local(T_I32) }
+        }).collect())
+    } else { Vec::new() };
+
     let locals = Locals {
         gpr: std::array::from_fn(|_| b.local(T_I32)),
         counter: b.local(T_I32),
@@ -438,6 +461,7 @@ pub fn lower_region_with(
         scope_last: b.local(T_I32),
         tuple: std::array::from_fn(|_| b.local(T_I32)),
         flags: b.local(T_I32),
+        frame_reads,
     };
 
     // ── prologue (N12/N24): the ONLY place locals are seeded, unconditional, before any label ──
@@ -1357,6 +1381,7 @@ fn emit_unchecked_translation(
     b.const_i32(0);
     b.u8(op::I32_NE);
     b.br_if_to(L_CONT)?;
+    invalidate_frame_reads(b, locals);
     b.local_get(locals.addr);
     b.const_i32(page_offset as i32);
     b.call(helper);
@@ -1372,6 +1397,74 @@ fn emit_unchecked_translation(
 /// The safe-read shape of `codegen.rs::gen_safe_read`: probe the TLB, fall back to the slow
 /// helper, and run the SAME inline access on both paths (contract N49).
 fn emit_safe_read(
+    b: &mut ModuleBuilder,
+    locals: &Locals,
+    bits: u8,
+    page_offset: u32,
+    cpl3: bool,
+    form: AccessForm,
+) -> Result<(), LowerError> {
+    let at = AT.with(|a| a.get());
+    if let Some(cache) = locals.frame_reads.iter().find(|c| bits == 32 && c.slot.reads.contains(&at)) {
+        const L_CACHED: &str = "frame_read_cached";
+        b.block(L_CACHED);
+        b.local_get(cache.valid);
+        b.local_get(locals.addr);
+        b.local_get(cache.linear);
+        b.u8(op::I32_EQ);
+        b.u8(op::I32_AND);
+        b.br_if_to(L_CACHED)?;
+        emit_raw_read(b, locals, bits, page_offset, cpl3, form)?;
+        b.local_set(cache.value);
+        b.local_get(locals.addr);
+        b.local_set(cache.linear);
+        emit_tlb_entry(b, locals);
+        b.const_i32(tlb_read_mask(cpl3));
+        b.u8(op::I32_AND);
+        b.const_i32(tlb::VALID);
+        b.u8(op::I32_EQ);
+        b.local_get(locals.addr);
+        b.const_i32(0xfff);
+        b.u8(op::I32_AND);
+        b.const_i32(4092);
+        b.u8(op::I32_LE_U);
+        b.u8(op::I32_AND);
+        b.local_set(cache.valid);
+        emit_physical_address(b, locals);
+        b.local_set(cache.physical);
+        b.end()?;
+        b.local_get(cache.value);
+        return Ok(());
+    }
+    emit_raw_read(b, locals, bits, page_offset, cpl3, form)
+}
+
+fn invalidate_frame_reads(b: &mut ModuleBuilder, locals: &Locals) {
+    // Helpers can replace translations or perform crossing/MMIO writes before returning.
+    for cache in &locals.frame_reads {
+        b.const_i32(0).local_set(cache.valid);
+    }
+}
+
+fn invalidate_frame_store_aliases(b: &mut ModuleBuilder, locals: &Locals) {
+    // Physical pages cover virtual aliases; frame offset disjointness is proved statically.
+    let at = AT.with(|a| a.get());
+    for cache in &locals.frame_reads {
+        if cache.slot.disjoint_stores.contains(&at) { continue; }
+        b.local_get(cache.valid);
+        emit_physical_address(b, locals);
+        b.local_get(cache.physical);
+        b.u8(op::I32_XOR);
+        b.const_i32(!0xfff);
+        b.u8(op::I32_AND);
+        b.const_i32(0);
+        b.u8(op::I32_NE);
+        b.u8(op::I32_AND);
+        b.local_set(cache.valid);
+    }
+}
+
+fn emit_raw_read(
     b: &mut ModuleBuilder,
     locals: &Locals,
     bits: u8,
@@ -1427,6 +1520,7 @@ fn emit_safe_read(
         b.u8(op::I32_AND);
     }
     b.br_if_to(L_CONT)?;
+    invalidate_frame_reads(b, locals);
     b.local_get(locals.addr);
     b.const_i32(page_offset as i32);
     b.call(helper);
@@ -1466,6 +1560,7 @@ fn emit_safe_write(
         emit_physical_address(b, locals);
         b.local_get(locals.value);
         b.body_store_u32();
+        invalidate_frame_store_aliases(b, locals);
         return Ok(());
     }
     if form == AccessForm::UncheckedDiagnostic {
@@ -1478,6 +1573,7 @@ fn emit_safe_write(
         b.const_i32(0);
         b.u8(op::I32_NE);
         b.br_if_to(L_CONT)?;
+        invalidate_frame_reads(b, locals);
         b.local_get(locals.addr);
         b.local_get(locals.value);
         b.const_i32(page_offset as i32);
@@ -1490,6 +1586,7 @@ fn emit_safe_write(
         emit_physical_address(b, locals);
         b.local_get(locals.value);
         b.body_store_u32();
+        invalidate_frame_store_aliases(b, locals);
         return Ok(());
     }
     let helper = b.import("safe_write32_slow_jit", "iii_i")?;
@@ -1513,6 +1610,7 @@ fn emit_safe_write(
     b.u8(op::I32_LE_S);
     b.u8(op::I32_AND);
     b.br_if_to(L_CONT)?;
+    invalidate_frame_reads(b, locals);
     b.local_get(locals.addr);
     b.local_get(locals.value);
     b.const_i32(page_offset as i32);
@@ -1531,6 +1629,7 @@ fn emit_safe_write(
     b.u8(op::I32_XOR);
     b.local_get(locals.value);
     b.body_store_u32();
+    invalidate_frame_store_aliases(b, locals);
     Ok(())
 }
 
@@ -1548,6 +1647,17 @@ fn lower_instruction(
     guard_index: usize,
 ) -> Result<(), LowerError> {
     let page_offset = instruction.guest_eip & 0xfff;
+    let written = crate::scoped_memory::writes_register(&instruction.opcode);
+    let writes_esp = matches!(instruction.opcode, Opcode::Push32 { .. }
+        | Opcode::Push32Immediate { .. } | Opcode::Pop32 { .. }
+        | Opcode::CallRelative { .. } | Opcode::Return { .. });
+    for cache in &locals.frame_reads {
+        if cache.slot.address.base == written
+            || (writes_esp && cache.slot.address.base == Some(Gpr::Esp))
+        {
+            b.const_i32(0).local_set(cache.valid);
+        }
+    }
     match &instruction.opcode {
         Opcode::Move32Immediate { dst, value } => {
             b.const_i32(*value as i32);
