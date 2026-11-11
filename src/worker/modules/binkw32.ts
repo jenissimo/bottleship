@@ -36,6 +36,9 @@ import { VideoFrameViews } from "../video/video-routing-types";
 import { readPeVersionString, readPeFixedFileVersion } from "../core/pe-version";
 import { readStdcallRetBytes } from "@bottleship/formats/pe";
 import { APIRegistry } from "../core/api-registry";
+import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
+import { CaptureRefusal } from "../savestate/object-codecs";
+import type { SaveValue } from "../savestate/value-codec";
 import {
     BinkStructLayout, BINK_LAYOUT_DEFAULT, BINK_SET_VOLUME_DECORATED_POPS,
     binkBuildFor, selectBinkBuild,
@@ -466,6 +469,22 @@ interface BinkBufferSession {
     destX: number;
     destY: number;
 }
+
+export const BINKW32_FIELDS = {
+    name: 'transient', exports: 'host', process: 'host', sessions: 'transient', lastSurfaceBpp: 'save', layout: 'derive',
+    buildResolution: 'derive', binkBuffers: 'transient', ddPrimary: 'save', pendingIoSize: 'save', apiCallLog: 'transient',
+} as const satisfies Record<string, FieldPolicy>;
+
+export interface BinkW32State {
+    lastSurfaceBpp: number;
+    ddPrimary: number;
+    pendingIoSize: number;
+}
+
+export const BINKW32_SCHEMA = {
+    module: BINKW32_FIELDS,
+    state: stateKeys<BinkW32State>({ lastSurfaceBpp: true, ddPrimary: true, pendingIoSize: true }),
+};
 
 export class BinkW32 implements IModule {
     name = "binkw32";
@@ -1197,7 +1216,39 @@ export class BinkW32 implements IModule {
             `${BINK_SET_VOLUME_DECORATED_POPS}), per ${source} — stub cleanup overridden`);
     }
 
+    captureSavestate(): BinkW32State {
+        if (this.sessions.size > 0) throw new Error(`binkw32: ${this.sessions.size} open Bink file(s) are not part of a v1 savestate`);
+        if (this.binkBuffers.size > 0) throw new Error(`binkw32: ${this.binkBuffers.size} open BinkBuffer(s) are not part of a v1 savestate`);
+        return { lastSurfaceBpp: this.lastSurfaceBpp, ddPrimary: this.ddPrimary, pendingIoSize: this.pendingIoSize };
+    }
+
+    restoreSavestate(s: BinkW32State): void {
+        this.sessions.clear();
+        this.binkBuffers.clear();
+        this.apiCallLog.clear();
+        this.layout = BINK_LAYOUT_DEFAULT;
+        this.buildResolution = null;
+        this.lastSurfaceBpp = s.lastSurfaceBpp;
+        this.ddPrimary = s.ddPrimary;
+        this.pendingIoSize = s.pendingIoSize;
+    }
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'binkw32', version: 1, order: 73, covers: ['binkw32'], schema: BINKW32_SCHEMA as unknown as SaveValue,
+            capture: () => {
+                try {
+                    return this.captureSavestate() as unknown as SaveValue;
+                } catch (e) {
+                    throw e instanceof CaptureRefusal ? e : new CaptureRefusal(e instanceof Error ? e.message : String(e));
+                }
+            },
+            restore: (saved) => this.restoreSavestate(saved as unknown as BinkW32State),
+        });
+    }
+
     initialize(process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         this.process = process;
 
         // BinkSetSoundSystem — no-op (we handle audio directly via SAB)

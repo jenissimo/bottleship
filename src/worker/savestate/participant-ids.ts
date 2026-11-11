@@ -21,6 +21,7 @@ export const PARTICIPANT_IDS = [
     'ddraw',
     'winmm',
     'dmusic',
+    'binkw32',
     'dsound',
     'dinput',
     'dispatcher',
