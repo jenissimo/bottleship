@@ -38,6 +38,7 @@ export interface JoinRequest {
     version: number;
     room: string;
     clientId: string;
+    invite?: string;
     node: number[];
 }
 export * from "./udp-host-protocol";

@@ -2,7 +2,7 @@ import { createSocket } from "node:dgram";
 import { createHash } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
-import { createLanServer } from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import { LanNetwork } from "../../src/worker/net/lan-network";
 import { RelayLink } from "../../src/worker/net/relay-link";
 import { NativeDirectPlayDiscovery } from "../../src/worker/modules/dpnet/native-wire/discovery";

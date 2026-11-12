@@ -16,7 +16,7 @@ From this directory:
 
 ```sh
 bun install
-bun run start --host 127.0.0.1 --port 9001
+bun run start --host 127.0.0.1 --port 9001 --public-rooms
 bun test
 bun run typecheck
 ```
@@ -51,7 +51,7 @@ The default listener is loopback. To listen on a LAN interface and restrict brow
 origins, run:
 
 ```sh
-bun run start --host 0.0.0.0 --port 9001 --origin https://bottleship.example
+bun run start --host 0.0.0.0 --port 9001 --public-rooms --origin https://bottleship.example
 ```
 
 Multiple origins can be comma-separated. An HTTPS emulator page requires an HTTPS
@@ -59,8 +59,11 @@ relay URL: terminate TLS at a reverse proxy and forward both normal HTTP request
 and WebSocket upgrades under `/socket.io/`. The root path `/health` returns the
 service name and protocol version. The relay does not host game files.
 
-Rooms currently use knowledge of the room name as admission. There is no account
-service or public room directory; use unguessable room names for private sessions.
+Rooms default to private and require a signing key supplied through the environment.
+The quick starts explicitly enable public name-only rooms. Public/private policies,
+signed invitations and separate native gateway permissions are described in
+[Multiplayer access and security](../../docs/multiplayer-security.md). There is no
+account service or public room directory.
 The resume identity is random, lives in worker memory and only protects an
 address lease from being claimed by another participant.
 

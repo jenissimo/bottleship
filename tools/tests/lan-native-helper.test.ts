@@ -2,7 +2,7 @@ import { beforeAll, expect, test } from "bun:test";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createServer, type Socket as NativeSocket } from "node:net";
-import { createLanServer } from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import { LanNetwork } from "../../src/worker/net/lan-network";
 import { RelayLink } from "../../src/worker/net/relay-link";
 import { buildNativeForTests } from "../../packages/lan/native/testing";

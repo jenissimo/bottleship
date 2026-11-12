@@ -5,11 +5,13 @@ Standalone LAN relay and configured native game-server gateway for BottleShip. I
 Rust 1.94 or newer is required. Dependencies are pinned in Cargo.lock.
 
 ```sh
-cargo run --release --locked -- --host 127.0.0.1 --port 9001
+cargo run --release --locked -- --host 127.0.0.1 --port 9001 --public-rooms
 cargo run --release --locked -- --config server.json
 ```
 
 Set the emulator network configuration to the server URL and the same room for each participant. GET /health returns {"service":"bottleship-lan","version":1}. Stop the production CLI with Ctrl-C; shutdown waits for transport and native socket retirement. No publication or deployment is performed by this package.
+
+Rooms default to private and require a signing key supplied through the environment. The quick start above explicitly enables public rooms. Room membership grants no native access by itself. See [room policies, signed invitations and gateway permissions](../../docs/multiplayer-security.md).
 
 ## Configuration
 
@@ -94,7 +96,7 @@ For example, add this inside `gateway`:
 }
 ```
 
-Select the listener in the emulator's network configuration with `"winsock": {"provider": "native", "hostListener": "game-tcp"}`. The server advertises `tcpHostListenV1` only when TCP listeners are configured; an actual listener still requires a successful bind and READY. Its source ACL, participant, binding generation and lease govern incoming connections. The source ACL controls connecting native IP addresses; any participant admitted to the server can request a configured listener ID, subject to its owner limit. Closing the listener leaves already accepted connections alive.
+Select the listener in the emulator's network configuration with `"winsock": {"provider": "native", "hostListener": "game-tcp"}`. The server advertises `tcpHostListenV1` only when TCP listeners are configured; an actual listener still requires a successful bind and READY. Its source ACL, participant, binding generation and lease govern incoming connections. The source ACL controls connecting native IP addresses; only participants whose room policy or signed invitation grants that listener ID can request it, subject to its owner limit. Closing the listener leaves already accepted connections alive.
 
 The Rust accepted-socket path supports ordinary TCP streams. Native urgent/OOB data and `SO_OOBINLINE` on accepted sockets are not yet fully supported, even when a native outbound helper is configured. Configuring a listener does not imply complete Winsock or DirectPlay compatibility.
 

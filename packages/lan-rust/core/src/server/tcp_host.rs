@@ -53,7 +53,7 @@ impl Core {
     pub(super) fn tcp_host_open(&mut self, c: ConnId, id: u32, request: TcpHostRequest, now: u64, effects: &mut Vec<Effect>) {
         if !self.tcp_host_admit(c,id,now,effects) { return; }
         let binding = BindingToken { proto: request.proto, local_port: request.local_port, generation: Some(request.binding_generation) };
-        let Some(config) = self.routes.config.tcp_listeners.iter().find(|v| v.id == request.listener_id).cloned() else {
+        let Some(config) = self.routes.config.tcp_listeners.iter().find(|v| v.id == request.listener_id && self.participants[&c].gateway.tcp_listeners.contains(&v.id)).cloned() else {
             effects.push(reply(c,id,10013)); return;
         };
         if binding.proto != 2 || binding.local_port == 0 || binding.generation == Some(0) {

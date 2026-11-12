@@ -411,6 +411,7 @@ async fn malformed_sid_never_allocates_a_replacement_session() {
 }
 #[tokio::test]
 async fn authorization_rejection_is_connect_error_before_physical_close() {
+    for _ in 0..8 {
     let mut server = bind("127.0.0.1:0".parse().unwrap(), Config::default())
         .await
         .unwrap();
@@ -445,6 +446,7 @@ async fn authorization_rejection_is_connect_error_before_physical_close() {
     let closed = item(&mut server).await;
     assert!(matches!(closed.kind, IncomingKind::Closed { .. }));
     server.shutdown().await;
+    }
 }
 
 #[tokio::test]

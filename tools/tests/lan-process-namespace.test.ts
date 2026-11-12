@@ -5,7 +5,7 @@ import { RootNetworkNamespace, ChildProcessNetworkNamespace } from "../../src/wo
 import { LanNetwork } from "../../src/worker/net/lan-network";
 import { WsaSocketTable, WsaFailure, WSA, ipv4Address, ipv6Address } from "../../src/worker/modules/wsa-network";
 import { DirectPlaySession, DP, type SessionDesc } from "../../src/worker/modules/dplayx/session";
-import { createLanServer } from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import { parseIpv6 } from "../../packages/lan/src/ip-address";
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));

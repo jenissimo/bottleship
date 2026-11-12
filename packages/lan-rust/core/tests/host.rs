@@ -1,3 +1,4 @@
+mod common;
 use bottleship_lan_core::{config::*, gateway::*, routes::*, wire::*, *};
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -5,7 +6,7 @@ fn config() -> GatewayConfig {
     serde_json::from_value(json!({"udpListeners":[{"id":"native","bindHost":"127.0.0.1","advertisedHost":"127.0.0.1","port":0,"allowedHosts":["127.0.0.1"]}]})).unwrap()
 }
 fn core() -> Core {
-    let mut c = Core::new(Limits::default(), Routes::new(config()).unwrap()).unwrap();
+    let mut c = common::core(Limits::default(), Routes::new(config()).unwrap()).unwrap();
     c.join(1, &auth(1), 0).unwrap();
     c
 }
@@ -90,7 +91,7 @@ fn capability_exposes_only_configured_acl_and_defaults() {
     let cfg = config();
     assert_eq!(cfg.udp_listeners[0].max_owners, 1);
     assert_eq!(cfg.udp_listeners[0].max_peers, 64);
-    let mut c = Core::new(Limits::default(), Routes::new(cfg).unwrap()).unwrap();
+    let mut c = common::core(Limits::default(), Routes::new(cfg).unwrap()).unwrap();
     let e = c.join(1, &auth(1), 0).unwrap();
     let r = named(&e, "ready");
     assert_eq!(

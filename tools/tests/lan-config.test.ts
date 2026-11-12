@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { networkConfigFromLocation, networkInviteUrl, normalizeNetworkConfig } from "../../src/network-config";
+import { networkConfigFromLocation, networkInviteUrl, networkConfigForStorage, normalizeNetworkConfig } from "../../src/network-config";
 import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
 
 describe("LAN connection configuration", () => {
@@ -90,6 +90,19 @@ describe("LAN connection configuration", () => {
       {provider:"native",tcpHostListener:"another",udpHostListener:"udp-game"}])
       expect(()=>normalizeNetworkConfig({...selected,directPlay4})).toThrow();
     expect(()=>normalizeNetworkConfig({...selected,winsock:undefined})).toThrow();
+  });
+
+  test("private invitations stay in URL fragments and out of persisted preferences", () => {
+    const invite="bs1."+ "a".repeat(20)+"."+ "b".repeat(43);
+    const selected={serverUrl:"https://lan.example.org",room:"locked",invite};
+    const url=new URL(networkInviteUrl("https://bottleship.example/?game=dev",selected));
+    expect(url.search).not.toContain(invite);
+    expect(new URLSearchParams(url.hash.slice(1)).get("lanInvite")).toBe(invite);
+    expect(networkConfigFromLocation(url.search,null,url.hash)).toEqual(selected);
+    expect(networkConfigForStorage(selected)).toEqual({serverUrl:selected.serverUrl,room:"locked"});
+    expect(selected.invite).toBe(invite);
+    expect(networkConfigFromLocation("?room=other",selected).invite).toBeUndefined();
+    expect(new URL(networkInviteUrl(url.href,null)).hash).toBe("");
   });
 
   test("invalid settings leave the previous valid configuration intact", () => {

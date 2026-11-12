@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessPolicy, GatewayPermissions},
     ConnId,
     config::{ConfigError, Limits},
     gateway::{BindingRegistry, BindingToken},
@@ -230,6 +231,8 @@ struct Active {
 }
 struct Participant {
     join: JoinRequest,
+    gateway: GatewayPermissions,
+    access_expires_at: u64,
     bindings: BindingRegistry,
     multicast_bindings: BindingRegistry,
     window_start: u64,
@@ -249,6 +252,8 @@ pub struct Core {
     rooms: HashMap<String, HashMap<Node, Peer>>,
     participants: HashMap<ConnId, Participant>,
     next_operation: u64,
+    access: AccessPolicy,
+    epoch_unix_ms: u64,
 }
 fn emit(to: ConnId, event: ServerEvent, reliable: bool, source: Option<ConnId>) -> Effect {
     let retained_bytes = event.retained_bytes();
@@ -278,7 +283,7 @@ fn lease_reply(to: ConnId, id: u32, code: u32) -> Effect {
     )
 }
 impl Core {
-    pub fn new(limits: Limits, routes: Routes) -> Result<Self, ConfigError> {
+    pub fn new(limits: Limits, routes: Routes, access: AccessPolicy, epoch_unix_ms: u64) -> Result<Self, ConfigError> {
         limits.validate()?;
         Ok(Self {
             limits,
@@ -286,6 +291,8 @@ impl Core {
             rooms: HashMap::new(),
             participants: HashMap::new(),
             next_operation: 0,
+            access,
+            epoch_unix_ms,
         })
     }
     /// Authenticated identity for trusted gateway construction; unknown/retired
@@ -306,6 +313,8 @@ impl Core {
         now_ms: u64,
     ) -> Result<Vec<Effect>, CoreError> {
         let join = JoinRequest::decode(auth).map_err(|e| CoreError(e.to_string()))?;
+        let admission = self.access.authorize(&join.room, auth.get("invite"), self.epoch_unix_ms.saturating_add(now_ms) / 1000)
+            .map_err(|_| CoreError("LAN access denied".into()))?;
         self.prune(now_ms);
         if connection == 0 || self.participants.contains_key(&connection) {
             return Err(CoreError("Connection identity is already used".into()));
@@ -342,10 +351,10 @@ impl Core {
                 expires_at: u64::MAX,
             },
         );
-        let mut ready = json!({"version":1,"node":join.node,"ipv4":wire::node_ipv4(&join.node),"gatewayIpv4":self.routes.advertised_ipv4(),"gatewayIpv6":[],"udpMulticast4V1":true});
+        let mut ready = json!({"version":1,"node":join.node,"ipv4":wire::node_ipv4(&join.node),"gatewayIpv4":self.routes.advertised_ipv4_for(&admission.gateway.routes),"gatewayIpv6":[],"udpMulticast4V1":true});
         ready["gatewayIpv6"] = Value::Array(
             self.routes
-                .advertised_ipv6()
+                .advertised_ipv6_for(&admission.gateway.routes)
                 .into_iter()
                 .map(|a| {
                     let ip = a
@@ -361,11 +370,11 @@ impl Core {
                 })
                 .collect(),
         );
-        if !self.routes.config.udp_listeners.is_empty() {
-            ready["udpHostListenV1"] = json!({"listeners":self.routes.config.udp_listeners.iter().map(|l|json!({"id":l.id,"allowedNodes":l.allowed_nodes()})).collect::<Vec<_>>()});
+        if self.routes.config.udp_listeners.iter().any(|l|admission.gateway.udp_listeners.contains(&l.id)) {
+            ready["udpHostListenV1"] = json!({"listeners":self.routes.config.udp_listeners.iter().filter(|l|admission.gateway.udp_listeners.contains(&l.id)).map(|l|json!({"id":l.id,"allowedNodes":l.allowed_nodes()})).collect::<Vec<_>>()});
         }
-        if !self.routes.config.tcp_listeners.is_empty() {
-            ready["tcpHostListenV1"] = json!({"listeners":self.routes.config.tcp_listeners.iter().map(|l| {
+        if self.routes.config.tcp_listeners.iter().any(|l|admission.gateway.tcp_listeners.contains(&l.id)) {
+            ready["tcpHostListenV1"] = json!({"listeners":self.routes.config.tcp_listeners.iter().filter(|l|admission.gateway.tcp_listeners.contains(&l.id)).map(|l| {
                 let nodes: Vec<Node> = l.allowed_hosts.iter().map(|host| {
                     let b = host.parse::<std::net::Ipv4Addr>().expect("validated TCP listener ACL").octets();
                     [2, 1, b[0], b[1], b[2], b[3]]
@@ -377,6 +386,8 @@ impl Core {
             connection,
             Participant {
                 join,
+                gateway: admission.gateway,
+                access_expires_at: admission.expires_at.map(|s|s.saturating_mul(1000).saturating_sub(self.epoch_unix_ms)).unwrap_or(u64::MAX),
                 bindings: BindingRegistry::default(),
                 multicast_bindings: BindingRegistry::default(),
                 window_start: now_ms,
@@ -401,6 +412,14 @@ impl Core {
     }
     pub fn apply(&mut self, command: Command) -> Vec<Effect> {
         let mut effects = vec![];
+        let expired: Vec<_> = match &command {
+            Command::Wire {connection,now_ms,..} | Command::Input {connection,now_ms,..} =>
+                self.participants.get(connection).filter(|p|p.access_expires_at<=*now_ms).map(|_|vec![(*connection,*now_ms)]).unwrap_or_default(),
+            Command::Tick {now_ms} =>
+                self.participants.iter().filter_map(|(id,p)|(p.access_expires_at<=*now_ms).then_some((*id,*now_ms))).collect(),
+            _ => vec![],
+        };
+        for (id,now) in expired { self.disconnect(id, now, "LAN invitation expired", &mut effects); }
         match command {
             Command::Wire {
                 connection,
@@ -467,6 +486,13 @@ impl Core {
             Command::Tick { now_ms } => self.prune(now_ms),
         }
         effects
+    }
+    fn authorized_target(&self, connection: ConnId, datagram: &Datagram) -> Result<Target, ResolveError> {
+        let target = self.routes.target(datagram)?;
+        if !self.participants[&connection].gateway.routes.contains(&self.routes.route_id(target.route_id)) {
+            return Err(ResolveError::new(ResolveCode::AccessDenied, "Native route access denied"));
+        }
+        Ok(target)
     }
     fn rate(
         &mut self,
@@ -585,7 +611,7 @@ impl Core {
                     if self.host_outbound(connection, binding, &datagram, effects) {
                         return;
                     }
-                    match self.routes.target(&datagram) {
+                    match self.authorized_target(connection, &datagram) {
                         Ok(target) => effects.push(Effect::NativeOperation {
                             connection,
                             input: GatewayInput::Frame {
@@ -692,7 +718,7 @@ impl Core {
                     );
                     return;
                 }
-                let route_ids = match self.routes.selected_route_ids(&request) {
+                let route_ids = match self.routes.selected_route_ids_for(&request, &p.gateway.routes) {
                     Ok(ids) => ids,
                     Err(error) => {
                         self.resolve_error(connection, id, error, effects);
@@ -794,7 +820,7 @@ impl Core {
                     dst_port: request.remote_port,
                     payload: bytes::Bytes::new(),
                 };
-                let target = match self.routes.target(&d) {
+                let target = match self.authorized_target(connection, &d) {
                     Ok(t) => t,
                     Err(_) => {
                         effects.push(lease_reply(connection, id, 10013));
@@ -1148,7 +1174,7 @@ impl Core {
                 return;
             }
         }
-        let reply = match self.routes.resolve(&pending.request) {
+        let reply = match self.routes.resolve_for(&pending.request, &self.participants[&connection].gateway.routes) {
             Ok(result) => json!({"result":result}),
             Err(error) => json!({"error":error}),
         };

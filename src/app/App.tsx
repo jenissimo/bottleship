@@ -35,7 +35,7 @@ import { installHarnessFacade } from "../harness/facade";
 import { getCachedGamepadMeta, initGamepadCache, readLiveGamepad, rescanGamepads } from "../gamepad-cache";
 import GameSelectScreen, { type GameEntry } from "../library/GameSelectScreen";
 import SettingsDrawer from "../settings/SettingsDrawer";
-import { loadNetworkConfig, networkInviteUrl, NETWORK_SETTINGS_KEY, type NetworkConfig, type NetworkStatus } from "../network-config";
+import { loadNetworkConfig, networkInviteUrl, networkConfigForStorage, NETWORK_SETTINGS_KEY, type NetworkConfig, type NetworkStatus } from "../network-config";
 import DevPanel from "./DevPanel";
 import ExitOverlay from "./ExitOverlay";
 import MessageBoxModal, { type MessageBoxRequest } from "../debug/MessageBoxModal";
@@ -414,7 +414,7 @@ export default function App() {
     window.history.replaceState(null, "", networkInviteUrl(window.location.href, config));
     setNetwork(config);
     setNetworkStatus({ state: config ? "connecting" : "offline" });
-    try { localStorage.setItem(NETWORK_SETTINGS_KEY, JSON.stringify(config)); } catch { /* Storage may be unavailable. */ }
+    try { localStorage.setItem(NETWORK_SETTINGS_KEY, JSON.stringify(networkConfigForStorage(config))); } catch { /* Storage may be unavailable. */ }
     globalWorker?.postMessage({ type: "set_network", network: config });
   }, []);
   const [quality, setQuality] = useState<QualityConfig>(() => loadQuality());

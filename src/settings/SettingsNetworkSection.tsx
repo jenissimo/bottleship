@@ -8,15 +8,17 @@ export default function SettingsNetworkSection({
 }: SettingsDrawerProps): React.ReactElement {
   const [serverUrl, setServerUrl] = React.useState(network?.serverUrl ?? "");
   const [room, setRoom] = React.useState(network?.room ?? "");
+  const [invite, setInvite] = React.useState(network?.invite ?? "");
   const [error, setError] = React.useState("");
   React.useEffect(() => {
     setServerUrl(network?.serverUrl ?? "");
     setRoom(network?.room ?? "");
+    setInvite(network?.invite ?? "");
   }, [network]);
   const connect = (event: React.FormEvent) => {
     event.preventDefault();
     try {
-      const config = normalizeNetworkConfig({ serverUrl, room, directPlay4: network?.directPlay4, directPlay8: network?.directPlay8, winsock: network?.winsock });
+      const config = normalizeNetworkConfig({ serverUrl, room, ...(invite.trim() ? {invite: invite.trim()} : {}), directPlay4: network?.directPlay4, directPlay8: network?.directPlay8, winsock: network?.winsock });
       if (config && window.location.protocol === "https:" && new URL(config.serverUrl).protocol !== "https:") {
         throw new Error("Use an HTTPS LAN server from this page.");
       }
@@ -49,6 +51,11 @@ export default function SettingsNetworkSection({
         <SettingsRow title="Room">
           <input aria-label="Room" required maxLength={64} pattern="[A-Za-z0-9_-]+"
             value={room} onChange={event => setRoom(event.target.value)}
+            style={{ width: 260, maxWidth: "100%", padding: 8 }} />
+        </SettingsRow>
+        <SettingsRow title="Invitation (private rooms)">
+          <input aria-label="Room invitation" type="password" autoComplete="off" maxLength={4096}
+            value={invite} onChange={event => setInvite(event.target.value)}
             style={{ width: 260, maxWidth: "100%", padding: 8 }} />
         </SettingsRow>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>

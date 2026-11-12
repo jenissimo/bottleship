@@ -1,8 +1,9 @@
 /// <reference types="bun" />
 import { describe, expect, test } from "bun:test";
-import { createLanServer } from "../../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../../packages/lan/test/public-server";
 import { LanNetwork, type LanDatagram } from "./lan-network";
 import { RelayLink, type RelayLinkOptions } from "./relay-link";
+import { RoomAccess } from "../../../packages/lan/src/access";
 import { PROTO_UDP, PROTO_TCP, UDP_MAX_PAYLOAD } from "./netplay-wire";
 
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -20,6 +21,18 @@ function link(url: string, room: string, net: LanNetwork, options: RelayLinkOpti
     return transport;
 }
 describe("worker LAN transport", () => {
+    test("private room invitation reaches server auth through RelayLink", async () => {
+        const env="BOTTLESHIP_LAN_RELAY_INVITE_REGRESSION_KEY";
+        const key=Uint8Array.from({length:32},(_,i)=>i);
+        process.env[env]=Buffer.from(key).toString("base64");
+        const server=createLanServer({port:0,roomAccess:{inviteKeyEnv:env}});
+        const port=await server.listen(),net=machine(1);
+        const invite=new RoomAccess({},key).sign("private",Math.floor(Date.now()/1000)+60);
+        const connection=link("http://127.0.0.1:"+port,"private",net,{invite});
+        try {await connection.ready;expect(net.connected).toBe(true);}
+        finally {net.attach(null);await server.close();delete process.env[env];}
+    });
+
     for (const transport of ["websocket", "polling"] as const) test(transport + " carries maximum UDP datagrams and ordered reliable bursts", async () => {
         const server = createLanServer({ port: 0 });
         const port = await server.listen(), url = "http://127.0.0.1:" + port;

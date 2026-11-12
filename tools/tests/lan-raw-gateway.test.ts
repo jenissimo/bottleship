@@ -1,5 +1,5 @@
 import { beforeAll, expect, test } from "bun:test";
-import { createLanServer } from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import { internetChecksum } from "../../packages/lan/src/icmp-nat";
 import { parseIpv6 } from "../../packages/lan/src/ip-address";
 import { buildNativeForTests, nativeTestHelper } from "../../packages/lan/native/testing";

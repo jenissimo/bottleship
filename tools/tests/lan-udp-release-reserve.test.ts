@@ -1,6 +1,6 @@
 import {expect,test} from "bun:test";
 import {createSocket} from "node:dgram";
-import {createLanServer} from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import {encodeTcpFrame,DATA} from "../../packages/lan/src/tcp-protocol";
 import {ipv4ToNode,PROTO_UDP,PROTO_TCP} from "../../packages/lan/src/protocol";
 import {LanNetwork} from "../../src/worker/net/lan-network";

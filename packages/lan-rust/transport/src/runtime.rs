@@ -87,6 +87,7 @@ struct State {
     phase: u8,
     sequence: u64,
     pending: Option<Pending>,
+    rejection_deadline: Option<Instant>,
 }
 #[derive(Debug)]
 struct Connection {
@@ -445,11 +446,19 @@ impl Handler {
                         .emit_tracked(message.into(), Default::default(), owner)
                         .is_ok()
                     {
-                        let _ = tokio::time::timeout(
+                        if tokio::time::timeout(
                             Duration::from_millis(500),
                             DeliveryTicket(ticket).released(),
-                        )
-                        .await;
+                        ).await.is_ok() {
+                            // A local flush is not a remote receipt. Give the peer a bounded
+                            // opportunity to read CONNECT_ERROR before fatal TCP retirement.
+                            let mut state = c.state.lock().unwrap();
+                            if c.live.load(Ordering::Acquire) {
+                                state.phase = 4;
+                                state.rejection_deadline = Some(Instant::now() + Duration::from_millis(500));
+                            }
+                            return;
+                        }
                     }
                 }
                 handler.fail(&c, "Authorization rejected or timed out");
@@ -500,6 +509,7 @@ impl EngineIoHandler for Handler {
                 phase: 1,
                 sequence: 0,
                 pending: None,
+                rejection_deadline: None,
             }),
             tcp: Mutex::new(vec![ctx.tcp.clone()]),
             reservation: Mutex::new(Some(reservation)),
@@ -533,7 +543,8 @@ impl EngineIoHandler for Handler {
                 tokio::select! {biased;_=watch.cancel.cancelled()=>break,_=interval.tick()=>{}}
                 let timed_out = {
                     let s = watch.state.lock().unwrap();
-                    (s.phase < 3 && start.elapsed() > handler.0.config.authorization_timeout)
+                    s.rejection_deadline.is_some_and(|deadline| Instant::now() > deadline)
+                        || (s.phase < 3 && start.elapsed() > handler.0.config.authorization_timeout)
                         || s.pending
                             .as_ref()
                             .is_some_and(|p| Instant::now() > p.deadline)
@@ -899,6 +910,7 @@ mod ordering_tests {
                 phase: 2,
                 sequence: 0,
                 pending: None,
+                rejection_deadline: None,
             }),
             tcp: Mutex::new(vec![]),
             reservation: Mutex::new(None),

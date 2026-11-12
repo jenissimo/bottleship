@@ -17,6 +17,7 @@ import {supportsBoundUdpHost,udpFailure} from "./udp-bound-protocol";
 import type {UdpPeerLeaseRequest} from "./protocol";
 
 export interface GatewayRoute {
+    id?: string;
     host: string;
     address?: string;
     /** Guest-visible IPv6 interface scope, independent of the native host's zone. */
@@ -46,7 +47,7 @@ export interface GatewayOptions {
 interface ResolvedRoute { config: GatewayRoute; addresses: string[]; nativeAddresses: string[] }
 const normalizeHost = (host: string) => host.toLowerCase().replace(/\.$/, "");
 function validateRoute(route: GatewayRoute): void {
-    if (!route || typeof route.host !== "string" || !route.host || route.host.length > 253
+    if (!route || route.id !== undefined && (typeof route.id !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(route.id)) || typeof route.host !== "string" || !route.host || route.host.length > 253
         || (route.address !== undefined && (!isIP(route.address)
             || (route.address.includes("%") && (!/^\d+$/.test(route.address.split("%")[1]) || Number(route.address.split("%")[1]) > 0xffffffff))))
         || (route.rawMode !== undefined && route.rawMode !== "exclusive")
@@ -126,6 +127,7 @@ export class GatewayRoutes {
         if(options.nativeUdpHelperPath!==undefined&&(typeof options.nativeUdpHelperPath!=="string"||!options.nativeUdpHelperPath||options.nativeUdpHelperPath.length>4096))throw new TypeError("Invalid bound UDP helper path");
         if(options.nativeTcpAcceptHelperPath!==undefined&&(typeof options.nativeTcpAcceptHelperPath!=="string"||!options.nativeTcpAcceptHelperPath||options.nativeTcpAcceptHelperPath.length>4096))throw new TypeError("Invalid TCP accept helper path");
         for (const route of options.routes) validateRoute(route);
+        if (new Set(options.routes.map((r,i)=>r.id ?? `route-${i}`)).size !== options.routes.length) throw new TypeError("Duplicate native route identity");
         if(options.tcpListeners!==undefined && (!Array.isArray(options.tcpListeners)||options.tcpListeners.length>32))
             throw new TypeError("Invalid TCP listener list");
         this.tcpCapacity=new TcpHostCapacity(options.maxTcpConnections??128);
@@ -182,12 +184,19 @@ export class GatewayRoutes {
     findRaw(ip: string, protocol: number): GatewayRoute | undefined {
         return this.routes.find(route => route.addresses.includes(ip) && route.config.protocols.includes("raw") && route.config.ipProtocols?.includes(protocol))?.config;
     }
-    async resolve(request: ResolveRequest): Promise<ResolveResult> {
+    routeId(route: GatewayRoute): string { return route.id ?? `route-${this.routes.findIndex(r => r.config === route)}`; }
+    advertisedIpv4For(allowed: ReadonlySet<string>): number[][] {
+        return [...new Set(this.routes.filter(r=>allowed.has(this.routeId(r.config))).flatMap(r=>r.addresses))].filter(ip=>isIP(ip)===4).map(ip=>ip.split(".").map(Number));
+    }
+    advertisedIpv6For(allowed: ReadonlySet<string>): {address:number[];node:number[];scopeId?:number}[] {
+        return this.advertisedIpv6.filter(a=>this.routes.some(r=>allowed.has(this.routeId(r.config)) && r.addresses.some(ip=>isIP(ip)===6 && this.ipv6Nodes.get(ip)?.every((n,i)=>n===a.node[i]))));
+    }
+    async resolve(request: ResolveRequest, allowed?: ReadonlySet<string>): Promise<ResolveResult> {
         if (!request || typeof request.host !== "string" || !request.host || request.host.length > 253
             || ![0, 4, 6].includes(request.family)) throw new NetResolveError("NO_RECOVERY", "Invalid DNS request");
         const host = isIP(request.host) ? this.normalize(request.host) : normalizeHost(request.host);
-        const selected = this.routes.filter(route => normalizeHost(route.config.host) === host
-            || route.config.names?.some(name => normalizeHost(name) === host) || route.addresses.includes(host));
+        const selected = this.routes.filter(route => (!allowed || allowed.has(this.routeId(route.config))) && (normalizeHost(route.config.host) === host
+            || route.config.names?.some(name => normalizeHost(name) === host) || route.addresses.includes(host)));
         if (!selected.length) throw new NetResolveError("ACCESS_DENIED", "Name is not a configured gateway destination");
         try { await Promise.all(selected.map(route => this.resolveRoute(route))); } catch (error) { throw resolveFailure(error); }
         const addresses = [...new Set(selected.flatMap(route => route.addresses))].filter(address => !request.family || isIP(address) === request.family);
@@ -246,7 +255,7 @@ export class NativeGateway {
     private sweep: ReturnType<typeof setInterval> | undefined;
     constructor(private readonly routes: GatewayRoutes, private readonly emit: (frame: Uint8Array<ArrayBuffer>, reliable: boolean, bindingGeneration?: number) => boolean,
         private readonly reportError: (error: { node: number[]; localPort: number; remotePort: number; proto: number; code: number; bindingGeneration?: number }) => void = () => {},
-        guestNode: Uint8Array = Uint8Array.of(2, 0, 0, 0, 0, 1)) {
+        guestNode: Uint8Array = Uint8Array.of(2, 0, 0, 0, 0, 1), private readonly allowedRoutes?: ReadonlySet<string>) {
         this.udpPorts = new NativeUdpPortPool(undefined, routes.options.maxUdpFlows ?? 128);
         if(routes.options.nativeUdpHelperPath){const path=routes.options.nativeUdpHelperPath;
             this.boundUdpPorts=new NativeUdpPortPool(undefined,routes.options.maxUdpFlows??128,(family,empty,limit)=>new NativeBoundUdpPort(path,family,empty,limit));}
@@ -263,6 +272,12 @@ export class NativeGateway {
     handle(datagram: DecodedDatagram): boolean {
         if (!isExternalNode(datagram.node)) return false;
         if (this.closed || !this.acceptBinding(datagram)) return true;
+        const ip = this.routes.addressForNode(datagram.node) ?? "";
+        const route = isRawProtocol(datagram.proto) ? this.routes.findRaw(ip, datagram.payload[0]) : this.routes.find(ip, datagram.dstPort, isTcpProtocol(datagram.proto) ? "tcp" : "udp");
+        if (route && this.allowedRoutes && !this.allowedRoutes.has(this.routes.routeId(route))) {
+            this.reportError({node:[...datagram.node],localPort:datagram.srcPort,remotePort:datagram.dstPort,proto:datagram.proto,code:10013,bindingGeneration:datagram.bindingGeneration});
+            return true;
+        }
         if (datagram.proto === PROTO_UDP || datagram.proto === PROTO_UDP6) this.sendUdp(datagram);
         else if (isTcpProtocol(datagram.proto)) this.sendTcp(datagram);
         else if (isRawProtocol(datagram.proto)) this.raw.handle(datagram);
@@ -330,7 +345,7 @@ export class NativeGateway {
     }
     private ensureUdp(datagram:DecodedDatagram):{key:string;flow:UdpFlow} {
         const ip=this.routes.addressForNode(datagram.node)??"",route=this.routes.find(ip,datagram.dstPort,"udp");
-        if(!route)throw udpFailure(10013,"UDP destination is not a configured route","control");
+        if(!route || this.allowedRoutes && !this.allowedRoutes.has(this.routes.routeId(route)))throw udpFailure(10013,"UDP destination is not an authorized route","control");
         const key=datagram.proto+":"+datagram.srcPort+":"+nodeKey(datagram.node)+":"+datagram.dstPort+":"+(datagram.bindingGeneration??"legacy");
         let flow=this.udp.get(key);
         if(flow)return {key,flow};

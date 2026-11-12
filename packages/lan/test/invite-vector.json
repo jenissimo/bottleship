@@ -1,0 +1,20 @@
+{
+  "keyBase64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "now": 1000,
+  "claims": {
+    "version": 1,
+    "audience": "bottleship-lan",
+    "room": "locked",
+    "expiresAt": 1060,
+    "gateway": {
+      "routes": [
+        "quake"
+      ],
+      "udpListeners": [
+        "host"
+      ],
+      "tcpListeners": []
+    }
+  },
+  "token": "bs1.eyJ2ZXJzaW9uIjoxLCJhdWRpZW5jZSI6ImJvdHRsZXNoaXAtbGFuIiwicm9vbSI6ImxvY2tlZCIsImV4cGlyZXNBdCI6MTA2MCwiZ2F0ZXdheSI6eyJyb3V0ZXMiOlsicXVha2UiXSwidWRwTGlzdGVuZXJzIjpbImhvc3QiXSwidGNwTGlzdGVuZXJzIjpbXX19.w35_By83YvuzVJ3t6_1aKXdav_KqkK2krNl6isGEZWM"
+}

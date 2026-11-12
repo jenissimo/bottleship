@@ -21,6 +21,7 @@ pub struct ServerConfig {
     #[serde(flatten)]
     pub limits: Limits,
     pub gateway: GatewayConfig,
+    pub room_access: bottleship_lan_core::access::RoomAccessConfig,
     /// Additional process-wide Rust resource limits, independent of per-room limits.
     pub max_connections: usize,
     pub max_native_participants: usize,
@@ -38,6 +39,7 @@ impl Default for ServerConfig {
             transports: vec!["polling".into(), "websocket".into()],
             limits: Limits::default(),
             gateway: GatewayConfig::default(),
+            room_access: Default::default(),
             max_connections: 256,
             max_native_participants: 256,
             max_dns_operations: 64,
@@ -50,6 +52,7 @@ impl ServerConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.limits.validate().map_err(|e| e.to_string())?;
         self.gateway.validate().map_err(|e| e.to_string())?;
+        self.room_access.validate().map_err(|e| e.to_string())?;
         if self.host.is_empty()
             || self.host.len() > 253
             || self.max_connections == 0

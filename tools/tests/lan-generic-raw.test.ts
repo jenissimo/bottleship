@@ -1,7 +1,7 @@
 import {beforeAll,expect,test} from "bun:test";
 import {createSocket} from "node:dgram";
 import {buildNativeForTests,nativeTestHelper} from "../../packages/lan/native/testing";
-import {createLanServer} from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import {parseIpv6} from "../../packages/lan/src/ip-address";
 import {internetChecksum as checksum,setIcmpv6Checksum} from "../../packages/lan/src/icmp-nat";
 import {LanNetwork} from "../../src/worker/net/lan-network";

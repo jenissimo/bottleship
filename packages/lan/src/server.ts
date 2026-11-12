@@ -2,6 +2,7 @@ import { createServer, type Server as HttpServer } from "node:http";
 import { Server, type Socket } from "socket.io";
 import { GatewayRoutes, NativeGateway, type GatewayOptions } from "./gateway";
 import { NetResolveError } from "./resolve";
+import { RoomAccess, type RoomAccessConfig, type Admission } from "./access";
 import {TcpHostOwner} from "./tcp-host-owner";
 import {TcpAcceptHostOwner} from "./tcp-accept-host-owner";
 import {
@@ -24,6 +25,7 @@ export interface LanServerOptions {
     maxBytesPerSecond?: number;
     reconnectGraceMs?: number;
     gateway?: GatewayOptions;
+    roomAccess?: RoomAccessConfig;
 }
 type PeerSocket = Socket<ClientEvents, ServerEvents>;
 interface Lease { clientId: string; node: Uint8Array; socket: PeerSocket | null; expiresAt: number }
@@ -39,6 +41,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
         maxRooms: 128, maxPeersPerRoom: 64, maxBufferedFrames: 64, maxBufferedBytes: 1024 * 1024,
         maxFramesPerSecond: 2000, maxBytesPerSecond: 4 * 1024 * 1024, reconnectGraceMs: 60_000, ...options,
     };
+    const access = new RoomAccess(options.roomAccess);
     const rooms = new Map<string, Room>();
     const gatewayRoutes = new GatewayRoutes(options.gateway);
     const http = createServer((request, response) => {
@@ -92,6 +95,9 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             || !validNode) { next(new Error("Invalid LAN handshake")); return; }
         const node = Uint8Array.from(request.node as number[]);
         if (!isLanNode(node)) { next(new Error("Invalid LAN address")); return; }
+        let admission: Admission;
+        try { admission = access.authorize(request.room, request.invite); }
+        catch { next(new Error("LAN access denied")); return; }
         let room = rooms.get(request.room);
         if (!room) {
             if (rooms.size >= limits.maxRooms) { next(new Error("LAN room limit reached")); return; }
@@ -109,12 +115,18 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
         lease.socket = socket;
         lease.expiresAt = Infinity;
         room.peers.set(key, lease);
-        socket.data = { room, lease };
+        socket.data = { room, lease, admission };
         next();
     });
     io.on("connection", socket => {
-        const { room, lease } = socket.data as { room: Room; lease: Lease };
-        socket.emit("ready", { version: PROTOCOL_VERSION, node: Array.from(lease.node), ipv4: Array.from(nodeToIpv4(lease.node)), gatewayIpv4: gatewayRoutes.advertisedIpv4, gatewayIpv6: gatewayRoutes.advertisedIpv6, udpMulticast4V1: true });
+        const { room, lease, admission } = socket.data as { room: Room; lease: Lease; admission: Admission };
+        const allowedRoutes = new Set(admission.gateway.routes);
+        const expiration = Number.isFinite(admission.expiresAt) ? setTimeout(() => socket.disconnect(true), Math.max(0, admission.expiresAt * 1000 - Date.now())) : undefined;
+        socket.use((_packet, next) => {
+            if (admission.expiresAt <= Math.floor(Date.now() / 1000)) { socket.disconnect(true); return; }
+            next();
+        });
+        socket.emit("ready", { version: PROTOCOL_VERSION, node: Array.from(lease.node), ipv4: Array.from(nodeToIpv4(lease.node)), gatewayIpv4: gatewayRoutes.advertisedIpv4For(allowedRoutes), gatewayIpv6: gatewayRoutes.advertisedIpv6For(allowedRoutes), udpMulticast4V1: true });
         const queue = { frames: 0, bytes: 0 };
         pending.set(socket, queue);
         socket.conn.on("drain", () => { queue.frames = 0; queue.bytes = 0; });
@@ -134,7 +146,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             if (congested(socket, 64)) { socket.disconnect(true); return; }
             queue.frames++; queue.bytes += 64;
             socket.emit("socketError", error);
-        }, lease.node);
+        }, lease.node, allowedRoutes);
         // TCP Host remains opt-in and unadvertised until end-to-end parity.
         type TcpOwner=TcpHostOwner|TcpAcceptHostOwner;
         type TcpPending={request:import("./protocol").TcpHostOpenRequest;controller:AbortController;owner:TcpOwner};
@@ -169,7 +181,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             lastTcpHostRequest=id;
             if(!validTcpHostOpenRequest(request)){tcpReply(id,{error:{code:10022,message:"Invalid TCP Host request"}});return;}
             const config=gatewayRoutes.tcpListeners.find(item=>item.id===request.listenerId);
-            if(!config){tcpReply(id,{error:{code:10013,message:"TCP listener is not configured"}});return;}
+            if(!config || !admission.gateway.tcpListeners.includes(config.id)){tcpReply(id,{error:{code:10013,message:"TCP listener is not configured"}});return;}
             if(tcpPending.size>=16||tcpOwners.size>=32){tcpReply(id,{error:{code:10055,message:"TCP listener capacity"}});return;}
             const previous=tcpBindings.get(request.localPort);
             if(previous&&(request.bindingGeneration<previous.generation||
@@ -293,7 +305,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             if (resolving.size >= 16) { resolveReply(id, { error: { code: "TRY_AGAIN", message: "Too many DNS requests" } }); return; }
             const entry = { cancelled: false };
             resolving.set(id, entry);
-            void gatewayRoutes.resolve(request).then(
+            void gatewayRoutes.resolve(request, allowedRoutes).then(
                 result => { if (!entry.cancelled) resolveReply(id, { result }); },
                 error => { if (!entry.cancelled) {
                     const failure = error instanceof NetResolveError ? error : new NetResolveError("NO_RECOVERY");
@@ -390,6 +402,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             else if (destination) deliver(destination);
         });
         socket.on("disconnect", () => {
+            if (expiration !== undefined) clearTimeout(expiration);
             for(const pending of tcpPending.values())pending.controller.abort();
             tcpPending.clear();tcpActive.clear();
             for(const owner of tcpOwners)closeTcpOwner(owner,true);

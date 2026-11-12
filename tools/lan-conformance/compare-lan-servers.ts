@@ -11,7 +11,8 @@ import {resolve,relative,join} from "node:path";
 import {createServer,type Socket as TcpSocket} from "node:net";
 import {createSocket} from "node:dgram";
 import {io,type Socket} from "socket.io-client";
-import {createLanServer,type LanServerOptions} from "../../packages/lan/src/server";
+import {type LanServerOptions} from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer, publicRoomAccess } from "../../packages/lan/test/public-server";
 import {encodeDatagram,decodeDatagram} from "../../packages/lan/src/protocol";
 import {encodeTcpFrame,decodeTcpFrame,SYN,SYNACK,DATA,CREDIT,FIN,RST,TCP_WINDOW,TCP_SEGMENT,SYN_WINDOW_MASK} from "../../packages/lan/src/tcp-protocol";
 import {runLanBlackBox} from "../../packages/lan-rust/core/tests/js/black-box";
@@ -245,6 +246,7 @@ try{
   {host:"127.0.0.1",address:"203.0.113.71",names:["whole-udp.test"],ports:[udpPort],protocols:["udp"]},
   {host:"127.0.0.1",address:"203.0.113.72",names:["whole-tcp.test"],ports:[tcpPort],protocols:["tcp"]},
  ]}};
+ config.roomAccess=publicRoomAccess(config.gateway);
  configPath=join(output,"config.json");save("config.json",config);copyFileSync(import.meta.filename,join(output,"runner.ts"));
  const configHash=sha(configPath);ts=createLanServer(config);tsPort=await ts.listen();
  const urls:[string,string][]=[["typescript","http://127.0.0.1:"+tsPort],["rust",await startRust(configPath)]];

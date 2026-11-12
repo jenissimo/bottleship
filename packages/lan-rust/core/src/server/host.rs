@@ -114,7 +114,7 @@ impl Core {
             .config
             .udp_listeners
             .iter()
-            .find(|l| l.id == request.listener_id)
+            .find(|l| l.id == request.listener_id && self.participants[&c].gateway.udp_listeners.contains(&l.id))
             .cloned()
         else {
             effects.push(reply(c, id, 10013));

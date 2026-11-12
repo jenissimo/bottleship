@@ -1,7 +1,7 @@
 import { beforeAll, expect, test } from "bun:test";
 import { createSocket } from "node:dgram";
 import { createServer, type Socket } from "node:net";
-import { createLanServer } from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import { buildNativeForTests, nativeTestHelper } from "../../packages/lan/native/testing";
 import { decodeDatagram, encodeDatagram, ipv4ToNode, PROTO_UDP, PROTO_TCP } from "../../packages/lan/src/protocol";
 import { LanNetwork } from "../../src/worker/net/lan-network";

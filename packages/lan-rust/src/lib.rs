@@ -47,6 +47,7 @@ impl LanServer {
         F: Fn(&str) -> Result<Vec<NativeAddress>, ResolveError> + Send + Sync + 'static,
     {
         config.validate().map_err(std::io::Error::other)?;
+        let access = bottleship_lan_core::access::AccessPolicy::from_environment(config.room_access.clone())?;
         let dns = Arc::new(Semaphore::new(config.max_dns_operations));
         let gateway = Arc::new(config.gateway.clone());
         let mut routes = Routes::new(config.gateway.clone())?;
@@ -105,7 +106,9 @@ impl LanServer {
             let (id, result) = result?;
             routes.pin(id, result)?;
         }
-        let core = Core::new(config.limits.clone(), routes)?;
+        let started = Instant::now();
+        let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis().min(u64::MAX as u128) as u64;
+        let core = Core::new(config.limits.clone(), routes, access, epoch)?;
         let mut wire = transport::Config::default();
         wire.max_connections = config.max_connections;
         wire.max_tcp_connections = config.max_connections.saturating_mul(4).max(64);
@@ -125,7 +128,7 @@ impl LanServer {
         let transport = transport::bind(address, wire).await?;
         let address = transport.address;
         let (stop, stopping) = watch::channel(false);
-        let task = tokio::spawn(run(transport, core, gateway, dns, config, stopping));
+        let task = tokio::spawn(run(transport, core, gateway, dns, config, stopping, started));
         Ok(Self {
             address,
             stop,
@@ -486,6 +489,7 @@ async fn run(
     dns: Arc<Semaphore>,
     config: ServerConfig,
     mut stopping: watch::Receiver<bool>,
+    started: Instant,
 ) -> Result<(), String> {
     let (events, mut incoming) = mpsc::channel(256);
     let mut dispatcher = Dispatcher {
@@ -502,7 +506,7 @@ async fn run(
         resolving: HashMap::new(),
         dns,
         native: Arc::new(Semaphore::new(config.max_native_participants)),
-        started: Instant::now(),
+        started,
         dns_timeout: Duration::from_millis(config.dns_timeout_ms),
         log_connections: config.log_connections,
     };

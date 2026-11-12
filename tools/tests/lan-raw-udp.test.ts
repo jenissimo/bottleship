@@ -3,7 +3,7 @@ import {createSocket} from "node:dgram";
 import {spawn} from "node:child_process";
 import {dirname,join} from "node:path";
 import {buildNativeForTests,nativeTestHelper} from "../../packages/lan/native/testing";
-import {createLanServer} from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import {parseIpv6} from "../../packages/lan/src/ip-address";
 import {internetChecksum} from "../../packages/lan/src/icmp-nat";
 import {rawUdpPorts} from "../../packages/lan/src/raw-udp";

@@ -44,6 +44,7 @@ impl Drop for ReleaseStartupResolver {
 fn startup_dns_config(host: &str, routes: &[&str]) -> ServerConfig {
     let mut config = ServerConfig {
         host: host.to_owned(),
+        room_access: bottleship_lan_core::access::RoomAccessConfig { default_visibility: bottleship_lan_core::access::Visibility::Public, ..Default::default() },
         port: 0,
         dns_timeout_ms: 20,
         max_dns_operations: 1,

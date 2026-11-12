@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { createLanServer } from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import { RootNetworkNamespace } from "../../src/worker/core/network-namespace";
 import { LanNetwork } from "../../src/worker/net/lan-network";
 import { createWsaActorTable } from "../../src/worker/modules/wsa-actor-table";

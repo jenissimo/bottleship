@@ -1,3 +1,4 @@
+mod common;
 use bottleship_lan_core::{config::*, gateway::*, routes::*, wire::*, *};
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -5,7 +6,7 @@ fn auth(node: u8, room: &str) -> Value {
     json!({"version":1,"room":room,"clientId":format!("participant-{node:08}"),"node":[2,0,0,0,0,node]})
 }
 fn plain() -> Core {
-    Core::new(
+    common::core(
         Limits::default(),
         Routes::new(GatewayConfig::default()).unwrap(),
     )
@@ -13,7 +14,7 @@ fn plain() -> Core {
 }
 fn routed() -> Core {
     let config:GatewayConfig=serde_json::from_value(json!({"routes":[{"host":"127.0.0.1","names":["echo.test"],"ports":[9000],"protocols":["udp","tcp"]}]})).unwrap();
-    Core::new(Limits::default(), Routes::new(config).unwrap()).unwrap()
+    common::core(Limits::default(), Routes::new(config).unwrap()).unwrap()
 }
 fn send(core: &mut Core, c: u64, event: InboundEvent) -> Vec<Effect> {
     core.apply(Command::Input {

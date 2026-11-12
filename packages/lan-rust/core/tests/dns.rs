@@ -1,8 +1,9 @@
+mod common;
 use bottleship_lan_core::{config::*, routes::*, wire::*, *};
 use serde_json::json;
 fn core() -> Core {
     let config:GatewayConfig=serde_json::from_value(json!({"routes":[{"host":"configured.test","names":["alias.test"],"ports":[9000],"protocols":["udp"]}]})).unwrap();
-    let mut c = Core::new(Limits::default(), Routes::new(config).unwrap()).unwrap();
+    let mut c = common::core(Limits::default(), Routes::new(config).unwrap()).unwrap();
     c.join(
         1,
         &json!({"version":1,"room":"room","clientId":"participant-00000001","node":[2,0,0,0,0,1]}),

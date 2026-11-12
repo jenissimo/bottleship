@@ -258,6 +258,9 @@ impl Routes {
         };
         Ok(())
     }
+    pub fn route_id(&self, index: usize) -> String {
+        self.config.routes[index].id.clone().unwrap_or_else(||format!("route-{index}"))
+    }
     pub fn address_for_node(&self, node: &Node) -> Option<NativeAddress> {
         if node[..2] == [2, 1] {
             Some(NativeAddress {
@@ -364,8 +367,16 @@ impl Routes {
         }
         Ok(selected)
     }
+    pub fn selected_route_ids_for(&self, request: &ResolveRequest, allowed: &[String]) -> Result<Vec<usize>, ResolveError> {
+        let ids: Vec<_> = self.selected_route_ids(request)?.into_iter().filter(|i|allowed.contains(&self.route_id(*i))).collect();
+        if ids.is_empty() { return Err(ResolveError::new(ResolveCode::AccessDenied,"Native route access denied")); }
+        Ok(ids)
+    }
     pub fn resolve(&self, request: &ResolveRequest) -> Result<ResolveResult, ResolveError> {
-        let selected = self.selected_route_ids(request)?;
+        self.resolve_for(request, &self.config.routes.iter().enumerate().map(|(i,_)|self.route_id(i)).collect::<Vec<_>>())
+    }
+    pub fn resolve_for(&self, request: &ResolveRequest, allowed: &[String]) -> Result<ResolveResult, ResolveError> {
+        let selected = self.selected_route_ids_for(request, allowed)?;
         let mut addresses = vec![];
         for id in &selected {
             let p = &self.pinned[*id];
@@ -401,8 +412,12 @@ impl Routes {
         })
     }
     pub fn advertised_ipv4(&self) -> Vec<[u8; 4]> {
+        self.advertised_ipv4_for(&self.config.routes.iter().enumerate().map(|(i,_)|self.route_id(i)).collect::<Vec<_>>())
+    }
+    pub fn advertised_ipv4_for(&self, allowed: &[String]) -> Vec<[u8; 4]> {
         let mut out = vec![];
-        for p in &self.pinned {
+        for (i,p) in self.pinned.iter().enumerate() {
+            if !allowed.contains(&self.route_id(i)) { continue; }
             for a in &p.guest {
                 if let IpAddr::V4(ip) = a.ip {
                     if !out.contains(&ip.octets()) {
@@ -414,8 +429,12 @@ impl Routes {
         out
     }
     pub fn advertised_ipv6(&self) -> Vec<ResolvedAddress> {
+        self.advertised_ipv6_for(&self.config.routes.iter().enumerate().map(|(i,_)|self.route_id(i)).collect::<Vec<_>>())
+    }
+    pub fn advertised_ipv6_for(&self, allowed: &[String]) -> Vec<ResolvedAddress> {
         let mut out = vec![];
-        for p in &self.pinned {
+        for (i,p) in self.pinned.iter().enumerate() {
+            if !allowed.contains(&self.route_id(i)) { continue; }
             for a in &p.guest {
                 if a.ip.is_ipv6() {
                     let v = ResolvedAddress {

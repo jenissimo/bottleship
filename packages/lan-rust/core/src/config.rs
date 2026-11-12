@@ -68,6 +68,8 @@ pub enum RawMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteConfig {
+    #[serde(default)]
+    pub id: Option<String>,
     pub host: String,
     #[serde(default)]
     pub address: Option<String>,
@@ -86,7 +88,8 @@ pub struct RouteConfig {
 impl RouteConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let len = |s: &str| s.encode_utf16().count();
-        if self.host.is_empty()
+        if self.id.as_ref().is_some_and(|s| !crate::access::valid_name(s))
+            || self.host.is_empty()
             || len(&self.host) > 253
             || self.protocols.is_empty()
             || self.ports.len() > 256
@@ -287,8 +290,12 @@ impl GatewayConfig {
         {
             return Err(err("Invalid gateway limits"));
         }
-        for r in &self.routes {
-            r.validate()?
+        let mut route_ids = std::collections::HashSet::new();
+        for (index, r) in self.routes.iter().enumerate() {
+            r.validate()?;
+            if !route_ids.insert(r.id.clone().unwrap_or_else(|| format!("route-{index}"))) {
+                return Err(err("Duplicate native route identity"));
+            }
         }
         let mut ids = std::collections::HashSet::new();
         for listener in &self.udp_listeners {

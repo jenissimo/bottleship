@@ -1,3 +1,4 @@
+mod common;
 use bottleship_lan_core::{config::*, gateway::*, routes::*, wire::*, *};
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -6,7 +7,7 @@ use std::net::SocketAddrV4;
 #[test]
 fn tcp_listener_capability_is_opt_in_and_describes_exact_acl() {
     let auth = json!({"version":1,"room":"capability","clientId":"capability-client-000001","node":[2,0,0,0,0,3]});
-    let mut empty = Core::new(Limits::default(), Routes::new(GatewayConfig::default()).unwrap()).unwrap();
+    let mut empty = common::core(Limits::default(), Routes::new(GatewayConfig::default()).unwrap()).unwrap();
     let ready = empty.join(1,&auth,0).unwrap();
     assert!(named(&ready,"ready")[0][0].get("tcpHostListenV1").is_none());
 
@@ -14,7 +15,7 @@ fn tcp_listener_capability_is_opt_in_and_describes_exact_acl() {
         {"id":"first","bindHost":"127.0.0.1","advertisedHost":"127.0.0.1","port":0,"allowedHosts":["127.0.0.1","192.0.2.7"]},
         {"id":"second","bindHost":"127.0.0.1","advertisedHost":"127.0.0.1","port":0,"allowedHosts":["198.51.100.8"]}
     ]})).unwrap();
-    let mut configured = Core::new(Limits::default(), Routes::new(config).unwrap()).unwrap();
+    let mut configured = common::core(Limits::default(), Routes::new(config).unwrap()).unwrap();
     let ready = configured.join(1,&auth,0).unwrap();
     assert_eq!(named(&ready,"ready")[0][0]["tcpHostListenV1"],json!({"listeners":[
         {"id":"first","allowedNodes":[[2,1,127,0,0,1],[2,1,192,0,2,7]]},
@@ -26,7 +27,7 @@ fn core() -> Core {
     let config:GatewayConfig = serde_json::from_value(json!({"tcpListeners":[{
         "id":"native","bindHost":"127.0.0.1","advertisedHost":"127.0.0.1",
         "port":0,"allowedHosts":["127.0.0.1"]}]})).unwrap();
-    let mut c=Core::new(Limits::default(),Routes::new(config).unwrap()).unwrap();
+    let mut c=common::core(Limits::default(),Routes::new(config).unwrap()).unwrap();
     let ready=c.join(1,&json!({"version":1,"room":"host","clientId":"host-participant-00000001","node":[2,0,0,0,0,1]}),0).unwrap();
     assert_eq!(named(&ready,"ready")[0][0]["tcpHostListenV1"], json!({"listeners":[{"id":"native","allowedNodes":[[2,1,127,0,0,1]]}]}));
     c
