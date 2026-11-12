@@ -258,6 +258,41 @@ export function clientSizeFromWindowSize(
     };
 }
 
+/**
+ * SetWindowPos speaks in WINDOW rectangles; WindowInfo holds the client origin and size.
+ * A child's stored rectangle is the one it was given (see clientSizeFromCreateWindow).
+ */
+export function clientRectFromWindowPos(
+    window: WindowInfo, x: number, y: number, cx: number, cy: number,
+): { x: number; y: number; width: number; height: number } {
+    const style = window.style >>> 0;
+    if ((style & 0x40000000) !== 0) return { x, y, width: cx, height: cy };
+    const frame = getWindowFrameMetrics(style, (window.exStyle ?? 0) >>> 0, !!window.hMenu);
+    return {
+        x: x + frame.padSide,
+        y: y + frame.padTop,
+        width: Math.max(0, cx - frame.padSide * 2),
+        height: Math.max(0, cy - frame.padTop - frame.padBottom),
+    };
+}
+
+/** Inverse of clientRectFromWindowPos: the window rectangle around a stored client rect. */
+export function windowRectFromClientRect(
+    window: WindowInfo, x: number, y: number,
+): { left: number; top: number; right: number; bottom: number } {
+    const style = window.style >>> 0;
+    if ((style & 0x40000000) !== 0) {
+        return { left: x, top: y, right: x + window.width, bottom: y + window.height };
+    }
+    const frame = getWindowFrameMetrics(style, (window.exStyle ?? 0) >>> 0, !!window.hMenu);
+    return {
+        left: x - frame.padSide,
+        top: y - frame.padTop,
+        right: x + window.width + frame.padSide,
+        bottom: y + window.height + frame.padBottom,
+    };
+}
+
 function getWindowScreenOrigin(window: WindowInfo): { x: number; y: number } {
     const WS_CHILD_STYLE = 0x40000000;
 
@@ -437,11 +472,11 @@ export function registerWindowGeometryExports(
                 // common GetWindowRect → ScreenToClient → MoveWindow re-centering idiom
                 // subtract the parent offset twice, shifting child controls off-position.
                 const { x: absX, y: absY } = getAbsoluteWindowPosition(window);
-                if (writeRectChecked(mem, lpRect,
-                    absX, absY, absX + window.width, absY + window.height)) {
+                const r = windowRectFromClientRect(window, absX, absY);
+                if (writeRectChecked(mem, lpRect, r.left, r.top, r.right, r.bottom)) {
                     Logger.verboseLazy(LogCategory.USER32, () =>
                         `GetWindowRect(0x${hWnd.toString(16)}) -> ` +
-                        `(${absX}, ${absY}, ${absX + window.width}, ${absY + window.height})`);
+                        `(${r.left}, ${r.top}, ${r.right}, ${r.bottom})`);
                     return 1; // TRUE
                 }
             }

@@ -30,7 +30,7 @@ import {
 } from './paint-region';
 import { WH_CBT, HCBT_CREATEWND, getHooksOfType } from './hooks';
 import { registerWindowDrawingExports, eraseWindowBackgroundWithClassBrush } from './window-drawing';
-import { registerWindowGeometryExports, removeWindowPlacement, clientSizeFromWindowSize } from './window-geometry';
+import { registerWindowGeometryExports, removeWindowPlacement, clientSizeFromWindowSize, clientRectFromWindowPos } from './window-geometry';
 import { registerWindowQueryExports } from './window-query';
 import { registerWindowPropExports } from './window-props';
 import { GDIContext } from '../gdi32/context';
@@ -298,7 +298,7 @@ function trySuspendForSyncWindowMessage(
     return { suspended: true, callbackId: first.callbackId, frameId, reusedFrame };
 }
 
-/** Shared SetWindowPos / DeferWindowPos geometry apply (Win32-faithful). */
+/** Shared SetWindowPos / DeferWindowPos geometry apply; the rectangle is the CLIENT one. */
 function applyWindowPosGeometry(
     hWnd: number,
     x: number,
@@ -2140,8 +2140,9 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 flags &= ~SWP_HIDEWINDOW;
                 if (!(flags & SWP_SHOWWINDOW)) flags |= SWP_NOREDRAW;
             }
-            if (!(flags & SWP_NOSIZE) && pos.cx === live.width && pos.cy === live.height) flags |= SWP_NOSIZE;
-            if (!(flags & SWP_NOMOVE) && pos.x === live.x && pos.y === live.y) flags |= SWP_NOMOVE;
+            const client = clientRectFromWindowPos(live, pos.x, pos.y, pos.cx, pos.cy);
+            if (!(flags & SWP_NOSIZE) && client.width === live.width && client.height === live.height) flags |= SWP_NOSIZE;
+            if (!(flags & SWP_NOMOVE) && client.x === live.x && client.y === live.y) flags |= SWP_NOMOVE;
 
             const oldRect = { x: live.x, y: live.y, w: live.width, h: live.height };
             const showing = (flags & SWP_SHOWWINDOW) !== 0;
@@ -2155,7 +2156,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             }
 
             const geom = applyWindowPosGeometry(
-                hWnd, pos.x, pos.y, pos.cx, pos.cy, flags,
+                hWnd, client.x, client.y, client.width, client.height, flags,
                 { skipDialogOverlayRepaint: true },
             );
             const moved = !!geom?.moved;

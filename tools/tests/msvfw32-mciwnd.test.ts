@@ -100,6 +100,13 @@ describe("MCIWnd", () => {
         expect(commands).toContain(`put mciwnd${HWND} destination at 1 1 320 240`);
     });
 
+    test("a top-level MCIWnd is sized around the movie and plays into its whole client area", () => {
+        makeWindow(WS_BORDER);
+        expect(openMciWndFile(ctx, mem, HWND, "logos.avi")).toBe(0);
+        expect(resized?.slice(4, 6)).toEqual([322, 242]);
+        expect(commands).toContain(`put mciwnd${HWND} destination at 0 0 320 240`);
+    });
+
     test("MCIWNDF_NOAUTOSIZEWINDOW leaves the window alone", () => {
         makeWindow(WS_CHILD | WS_BORDER | MCIWNDF_NOAUTOSIZEWINDOW);
         expect(openMciWndFile(ctx, mem, HWND, "logos.avi")).toBe(0);
