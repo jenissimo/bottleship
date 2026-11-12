@@ -11,7 +11,7 @@ publish = false
 [dependencies]
 bytes = "=1.12.1"
 socket2 = "=0.6.5"
-tokio = { version = "=1.53.2", features = ["rt", "macros", "sync", "time", "process", "io-util", "net"] }
+tokio = { version = "=1.53.3", features = ["rt", "macros", "sync", "time", "process", "io-util", "net"] }
 
 [dev-dependencies]
-tokio = { version = "=1.53.2", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net", "test-util"] }
+tokio = { version = "=1.53.3", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net", "test-util"] }

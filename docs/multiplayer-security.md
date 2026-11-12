@@ -122,4 +122,12 @@ Both servers cap Engine.IO sessions before room authentication (`maxConnections:
 
 Reliable relay congestion retires the sending participant. The recipient remains connected; UDP still drops at capacity. Departure notices have a separate bounded control reserve and identical notices coalesce only within the same source connection. Queued departures retain the departing session's admission credit until output drain, preventing reconnect churn from growing control state without bound. A slow recipient can therefore temporarily retain admission capacity; its normal transport heartbeat timeout eventually retires it.
 
+## Dependency audit and regression CI
+
+`bun run audit:lan` queries OSV for every registry package in the five deployed Cargo lockfiles (including the upstream identity of the vendored Engine.IO fork) and the locked production dependency trees of Socket.IO server and client. It fails on every reported advisory, HTTP/lookup failure, malformed or incomplete response. There is no advisory allowlist. This scope excludes unrelated frontend/build dependencies and the unused upstream vendor lockfile.
+
+The `LAN security` workflow runs the audit for pull requests, main/develop pushes and weekly. Its regression job builds native fixtures, runs all Rust LAN crates, TS security tests and the same real-client attack scenarios against both implementations over WebSocket and polling. Configure its status checks as required in repository branch protection when the workflow is published.
+
+Tokio is pinned to 1.53.3 in the server, native, gateway and transport manifests and their lockfiles. The audit regression contains the actual pre-fix OSV response for `RUSTSEC-2026-0386`: Tokio 1.53.2 is reported; 1.53.3 is clean.
+
 TLS terminates at the deployment's HTTPS/WSS proxy; keep the cleartext backend inaccessible from the internet. Origin lists are additional browser restrictions, not authentication. The relay does not validate game coordinates, damage or resources: authoritative gameplay validation belongs to the game server.
