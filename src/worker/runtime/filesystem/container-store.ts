@@ -17,6 +17,10 @@ import { gameIdToContainerDir } from "@bottleship/formats/wgb/container-id";
 
 export const BOTTLESHIP_ROOT = "bottleship";
 export const GAMES_DIR = "games";
+/** CoW tombstones live beside overlay/ and travel with the persistent save layer. */
+export const SHADOW_INDEX_FILE = "overlay-shadow.json";
+/** Container-root files that belong to the persistent (exportable) layer, besides overlay/**. */
+export const PERSISTENT_ROOT_FILES: readonly string[] = ["registry.json", "meta.json", SHADOW_INDEX_FILE];
 
 /** Open (optionally create) the `bottleship/` OPFS root. Returns null if OPFS is unavailable. */
 export async function getBottleshipRoot(create: boolean): Promise<FileSystemDirectoryHandle | null> {

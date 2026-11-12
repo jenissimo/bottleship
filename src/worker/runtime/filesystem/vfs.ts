@@ -3,7 +3,7 @@ import { isRangeReadableEntry, ZipArchive, ZipEntry } from "@bottleship/formats/
 import { LruCache } from "../../core/collections/lru-cache";
 import { Logger, LogCategory } from "../../core/logger";
 import { harnessBus } from "../../harness/event-bus";
-import { getContainerDir } from "./container-store";
+import { getContainerDir, SHADOW_INDEX_FILE } from "./container-store";
 import { PathPolicy, DEFAULT_PATH_POLICY } from "./path-policy";
 import { isVirtualHleSystemFile, VIRTUAL_HLE_DLL_SIZE } from "../../core/hle-system-catalog";
 import { expandFileLookupPaths } from "./guest-path-resolver";
@@ -3770,12 +3770,6 @@ class OpfsOverlay {
         }
     }
 }
-
-/**
- * Sidecar (in the container dir, sibling of overlay/) that persists the CoW tombstone
- * set across sessions. Lives OUTSIDE overlay/ so it is never surfaced to the guest via C:\.
- */
-const SHADOW_INDEX_FILE = "overlay-shadow.json";
 
 /**
  * FileSystemSyncAccessHandle.read() is permitted to return fewer bytes than the buffer

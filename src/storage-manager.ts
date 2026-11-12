@@ -10,7 +10,7 @@
  *
  * The container layout is owned by container-store.ts (worker), imported here for one source of truth.
  */
-import { BOTTLESHIP_ROOT, GAMES_DIR } from "./worker/runtime/filesystem/container-store";
+import { BOTTLESHIP_ROOT, GAMES_DIR, PERSISTENT_ROOT_FILES, SHADOW_INDEX_FILE } from "./worker/runtime/filesystem/container-store";
 import { buildZip } from "@bottleship/formats/wgb/zip-build";
 import { ZipArchive, BufferSource } from "@bottleship/formats/zip";
 import { asWriteChunk } from "./dom-buffer";
@@ -38,9 +38,6 @@ export async function clearTemporaryImports(): Promise<void> {
         catch (err) { if ((err as DOMException).name !== "NotFoundError") throw err; }
     }
 }
-
-/** Container-root files that belong to the persistent (exportable) layer, besides overlay/**. */
-const ROOT_PERSIST_FILES = ["registry.json", "meta.json"];
 
 export interface StorageEstimate {
     usageBytes: number;
@@ -186,7 +183,7 @@ async function collectDir(dir: FileSystemDirectoryHandle, prefix: string, out: M
 }
 
 /**
- * Export a game's persistent save layer (overlay/** + registry.json + meta.json) as a store-only ZIP.
+ * Export a game's persistent save layer (overlay/** + registry.json + meta.json + CoW tombstones) as a store-only ZIP.
  * Returns null if the container is empty / missing. The ROM (.wgb) is deliberately excluded — saves
  * travel, game files don't. Mirrors the worker-side save-export.ts but works against the OPFS handle
  * directly so the library page can export without a running worker.
@@ -201,7 +198,7 @@ export async function exportGameContainer(containerDir: string): Promise<Uint8Ar
     } catch { return null; }
 
     const files = new Map<string, Uint8Array>();
-    for (const name of ROOT_PERSIST_FILES) {
+    for (const name of PERSISTENT_ROOT_FILES) {
         try {
             const f = await (await container.getFileHandle(name)).getFile();
             files.set(name, new Uint8Array(await f.arrayBuffer()));
@@ -239,11 +236,20 @@ export async function importGameContainer(containerDir: string, zipBytes: Uint8A
     const archive = new ZipArchive(new BufferSource(zipBytes));
     await archive.init();
     let written = 0;
+    let hasShadowIndex = false;
     for (const entry of archive.listEntries()) {
         if (entry.isDirectory) continue;
         const data = await archive.readEntry(entry);
-        await writeContainerFile(container, entry.name.replace(/\\/g, "/"), data);
+        const rel = entry.name.replace(/\\/g, "/").split("/").filter(Boolean).join("/");
+        await writeContainerFile(container, rel, data);
+        if (rel === SHADOW_INDEX_FILE) hasShadowIndex = true;
         written++;
+    }
+    // Older exports carry no shadow index: do not retain tombstones from the previous save.
+    // Remove it only after all archive entries have been restored successfully.
+    if (!hasShadowIndex) {
+        try { await container.removeEntry(SHADOW_INDEX_FILE); }
+        catch (err) { if ((err as DOMException).name !== "NotFoundError") throw err; }
     }
     return written;
 }
