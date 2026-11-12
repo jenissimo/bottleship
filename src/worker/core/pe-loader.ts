@@ -895,7 +895,8 @@ export class PELoader {
             };
             this.moduleRegistry.register(module);
             registered = true;
-            const stubCount = (): number => this.thunkGenerator.getAllStubs().length;
+            const watchHooks = runTime && savestatesEnabled();
+            const stubCount = (): number => watchHooks ? this.thunkGenerator.getAllStubs().length : 0;
             let hookStubs = -stubCount();
 
             // Static Library HLE detection for this DLL's image (same reason as EXE path).
