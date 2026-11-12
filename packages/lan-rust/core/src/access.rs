@@ -165,7 +165,7 @@ impl AccessPolicy {
                 .any(|p| p.visibility.unwrap_or(config.default_visibility) == Visibility::Private))
             && key.is_none()
         {
-            return Err(ConfigError("Private rooms require a base64 invite key in inviteKeyEnv (default BOTTLESHIP_LAN_INVITE_KEY)".into()));
+            return Err(ConfigError("Private rooms require a base64 invite key in inviteKeyEnv (default BOTTLESHIP_LAN_INVITE_KEY); pass --public-rooms or set roomAccess.defaultVisibility to \"public\" for name-only rooms".into()));
         }
         Ok(Self { config, key })
     }
@@ -197,14 +197,22 @@ impl AccessPolicy {
         gateway: GatewayPermissions,
         now: u64,
     ) -> Result<String, ConfigError> {
-        let key = self.key.as_ref().ok_or_else(denied)?;
+        let key = self
+            .key
+            .as_ref()
+            .ok_or_else(|| ConfigError("Signing an invitation requires the invite key".into()))?;
         gateway.validate()?;
-        if !valid_name(room)
-            || expires_at > 9007199254740991
+        if !valid_name(room) {
+            return Err(ConfigError("Invitation room must use 1-64 letters, digits, '_' or '-'".into()));
+        }
+        if expires_at > 9007199254740991
             || expires_at <= now
             || expires_at - now > self.config.max_invite_ttl_seconds
         {
-            return Err(denied());
+            return Err(ConfigError(format!(
+                "Invitation TTL must be 1..{} seconds (maxInviteTtlSeconds)",
+                self.config.max_invite_ttl_seconds
+            )));
         }
         let claims = InviteClaims {
             version: 1,

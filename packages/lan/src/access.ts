@@ -72,10 +72,13 @@ export class RoomAccess {
         }
         if (this.key && (this.key.length < 32 || this.key.length > 64)) throw new Error("Invite key must contain 32..64 random bytes");
         if ((this.visibility === "private" || [...this.rooms.values()].some(p => p.visibility === "private")) && !this.key)
-            throw new Error("Private rooms require a base64 invite key in inviteKeyEnv (default BOTTLESHIP_LAN_INVITE_KEY)");
+            throw new Error("Private rooms require a base64 invite key in inviteKeyEnv (default BOTTLESHIP_LAN_INVITE_KEY); pass --public-rooms or set roomAccess.defaultVisibility to \"public\" for name-only rooms");
     }
     sign(room: string, expiresAt: number, gateway: Partial<GatewayPermissions> = {}, now = Math.floor(Date.now() / 1000)): string {
-        if (!this.key || !name.test(room) || !Number.isSafeInteger(expiresAt) || expiresAt <= now || expiresAt - now > this.maxInviteTtlSeconds) return fail();
+        if (!this.key) throw new Error("Signing an invitation requires the invite key");
+        if (!name.test(room)) throw new Error("Invitation room must use 1-64 letters, digits, '_' or '-'");
+        if (!Number.isSafeInteger(expiresAt) || expiresAt <= now || expiresAt - now > this.maxInviteTtlSeconds)
+            throw new Error(`Invitation TTL must be 1..${this.maxInviteTtlSeconds} seconds (maxInviteTtlSeconds)`);
         const claims: InviteClaims = { version: 1, audience: this.audience, room, expiresAt, gateway: permissions(gateway, true) };
         const body = Buffer.from(JSON.stringify(claims)).toString("base64url");
         if (body.length > 3500) return fail();

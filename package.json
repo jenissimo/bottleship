@@ -12,7 +12,7 @@
     "dev:ssl": "VITE_SSL=1 bun run dev",
     "dev:sidecar": "bun run tools/dev-sidecar/dev-sidecar.ts",
     "dev:logs": "bun run tools/dev-sidecar/dev-sidecar.ts",
-    "dev:lan": "bun run packages/lan/src/cli.ts",
+    "dev:lan": "bun run packages/lan/src/cli.ts --public-rooms",
     "audit:lan": "bun tools/security/audit-lan-dependencies.ts",
     "test:lan": "bun test packages/lan/test src/worker/net tools/tests/lan-*.test.ts tools/tests/wsa-*.test.ts tools/tests/directplay*.test.ts",
     "dev:all": "concurrently -n \"sidecar,vite\" -c \"cyan,magenta\" \"bun run dev:sidecar\" \"bun run dev\"",

@@ -1,4 +1,5 @@
 import {test, expect} from "bun:test";
+import {join} from "node:path";
 import {RoomAccess} from "../src/access";
 import vector from "./invite-vector.json";
 
@@ -36,4 +37,23 @@ test("admission rejects excessive scopes, malformed names and lifetimes",()=>{
     expect(()=>access.sign("locked",1000+86401,{},1000)).toThrow();
     expect(()=>access.sign("locked",1060,{routes:["quake","quake"]},1000)).toThrow();
     expect(()=>access.sign("locked",1060,{udpListeners:Array.from({length:33},(_,i)=>"host"+i)},1000)).toThrow();
+    expect(()=>access.sign("locked",1000+86401,{},1000)).toThrow("Invitation TTL must be 1..86400 seconds");
+    expect(()=>new RoomAccess({defaultVisibility:"public"},undefined).sign("lobby",1060,{},1000)).toThrow("requires the invite key");
 });
+test("bun run dev:lan keeps keyless loopback development working with explicit public rooms",async()=>{
+    const root=join(import.meta.dir,"../../..");
+    const script:string=(await Bun.file(join(root,"package.json")).json()).scripts["dev:lan"];
+    expect(script).toBe("bun run packages/lan/src/cli.ts --public-rooms");
+    const env={...process.env};delete env.BOTTLESHIP_LAN_INVITE_KEY;
+    // Spawn the script's command directly so killing it cannot orphan a nested `bun run`.
+    const child=Bun.spawn([process.execPath,"packages/lan/src/cli.ts","--public-rooms","--port","0"],{cwd:root,env,stdout:"pipe",stderr:"pipe"});
+    try {
+        const reader=child.stdout.getReader();let text="";
+        const deadline=Date.now()+10_000;
+        while(!text.includes("listening on http://127.0.0.1:") && Date.now()<deadline){
+            const {value,done}=await Promise.race([reader.read(),Bun.sleep(deadline-Date.now()).then(()=>({value:undefined,done:true}))]);
+            if(done)break;text+=new TextDecoder().decode(value);
+        }
+        expect(text).toContain("listening on http://127.0.0.1:");
+    } finally { child.kill(); await child.exited; }
+},15_000);
