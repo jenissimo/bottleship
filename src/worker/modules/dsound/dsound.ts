@@ -34,6 +34,7 @@ import {
     CTRL_BLOCK_BYTES,
     FLAG_CIRCULAR,
     FLAG_STREAMING,
+    MIX_HISTORY_FRAMES,
     STATE_STOPPED,
     STATE_PLAYING,
     STATE_PAUSED,
@@ -274,6 +275,9 @@ type ApiCursorCache = {
 
 // @transient(the last GetCurrentPosition answer per live buffer, answered again from the ring after a load)
 const apiCursorCaches = new WeakMap<object, ApiCursorCache>();
+
+// @transient(writeSpanToLaps: the run of spans an app wrote back to back since its last cursor query -- its start, bytes so far, end, and that query's time; a load starts a new run)
+const spanChains = new WeakMap<object, { start: number; bytes: number; end: number; queryAt: number | undefined }>();
 
 function apiDebugFlags(): number {
     const g = globalThis as {
@@ -2036,8 +2040,8 @@ export class DSound implements IModule {
             // Lock handed out buffer.ptr + offset and buffer.ptr: the bytes are the buffer's own.
             if (buffer.sab && buffer.ptr) {
                 this.trailRing(buffer);
-                if (audioPtr1 && copyBytes1 > 0) this.writeToLaps(buffer, mem, offset, copyBytes1);
-                if (audioPtr2 && copyBytes2 > 0) this.writeToLaps(buffer, mem, 0, copyBytes2);
+                this.writeSpanToLaps(buffer, mem, offset,
+                    audioPtr1 ? copyBytes1 : 0, audioPtr2 ? copyBytes2 : 0);
             }
 
             buffer.lockOffset = undefined;
@@ -3042,6 +3046,69 @@ export class DSound implements IModule {
     }
 
     /**
+     * One Unlocked span -- both parts, if its Lock wrapped the buffer end -- into the host ring.
+     *
+     * A refill that starts behind the shown play cursor and runs on past it is one piece of
+     * the app's stream, written for the next lap: its head is behind the cursor, and the
+     * bytes after the head come later in the stream, not sooner. Its bytes just past the
+     * cursor fall in [play, write), the region DirectSound documents as committed to the
+     * mixer: a write there is not heard until the cursor comes round again. Split at the play
+     * cursor instead, they play now, a lap of stream early, and the lap after hears them
+     * again. Need for Speed: Porsche Unleashed refills [lastEnd, play + ~10 ms) every 50 ms in
+     * its main menu, and that splice of the future into every refill was a 20 Hz crackle on
+     * its music. Bytes past the write cursor are the app's to place and keep the split
+     * (writeToLaps); so does a span covering the whole buffer (Quake II rewrites it all every
+     * frame, and what it just mixed after the cursor is due now).
+     *
+     * The piece of stream is the app's, not one Lock's: NFS5 Locks the two sides of the
+     * buffer end separately when its refill wraps. Spans written back to back with no cursor
+     * query between them chain into one.
+     */
+    private writeSpanToLaps(buffer: SoundBuffer, mem: Uint8Array, pos: number, len1: number, len2: number): void {
+        const size = buffer.bytes;
+        if (len1 === 0) { pos = 0; len1 = len2; len2 = 0; }
+        const total = len1 + len2;
+        const contiguous = len2 === 0 || pos + len1 === size;
+        const queryAt = buffer.stepLastQueryAt;
+        let chain = spanChains.get(buffer);
+        const chained = contiguous && queryAt !== undefined && chain !== undefined
+            && chain.queryAt === queryAt && chain.end === pos;
+        // The chain's start and how much of it came before this span.
+        const start = chained ? chain!.start : pos;
+        const before = chained ? chain!.bytes : 0;
+        if (chain === undefined) spanChains.set(buffer, chain = { start, bytes: 0, end: 0, queryAt });
+        chain.start = start;
+        chain.bytes = before + total;
+        chain.end = (pos + total) % size;
+        chain.queryAt = queryAt;
+        const shown = buffer.isPlaying && buffer.stepLastCursor !== undefined
+            ? Math.floor(buffer.stepLastCursor) % size : -1;
+        // Bytes of the chain before the shown cursor; 0 when it does not cover the cursor.
+        const head = shown < 0 ? 0 : (shown - start + size) % size;
+        const lead = Math.max(0, Math.floor(buffer.reportedLeadBytes ?? 0));
+        const nextLapEnd = Math.min(before + total, head + lead);
+        if (this.ringSize(buffer) === size || !contiguous || before + total >= size
+            || head === 0 || head >= before + total || nextLapEnd <= before
+            || (globalThis as { __noCommittedSplit?: boolean }).__noCommittedSplit) {
+            if (len1 > 0) this.writeToLaps(buffer, mem, pos, len1);
+            if (len2 > 0) this.writeToLaps(buffer, mem, 0, len2);
+            return;
+        }
+        // Chain offset j sits at buffer offset (start + j) % size; a piece never crosses the end.
+        const piece = (a: number, b: number, nextLap: boolean) => {
+            const wrapAt = size - start;
+            for (const [lo, hi] of [[a, Math.min(b, wrapAt)], [Math.max(a, wrapAt), b]]) {
+                if (hi <= lo) continue;
+                const at = (start + lo) % size;
+                if (nextLap) this.writeToLaps(buffer, mem, at, hi - lo, size + lo - head);
+                else this.writeToLaps(buffer, mem, at, hi - lo);
+            }
+        };
+        piece(before, nextLapEnd, true);
+        piece(nextLapEnd, before + total, false);
+    }
+
+    /**
      * Copy an Unlocked span into the lap of the host ring it is meant for and every later
      * lap already queued. The app places it relative to the play cursor it was shown, which
      * leads the worklet by the host latency, so the span's own lap is where that cursor's
@@ -3053,8 +3120,12 @@ export class DSound implements IModule {
      * Placed whole from its start, everything the app just wrote ahead of the cursor lands a
      * lap late. Quake II locks and rewrites its entire buffer every frame, and with the span
      * kept whole every sound it mixed played a 64 KB lap (~1.5 s) after it was due.
+     *
+     * `fromShown`, when given, is how far past the shown cursor (in stream order, so a lap
+     * on is `size` more) the span's first byte belongs; writeSpanToLaps decides it for a
+     * refill that runs across the cursor.
      */
-    private writeToLaps(buffer: SoundBuffer, mem: Uint8Array, pos: number, len: number): void {
+    private writeToLaps(buffer: SoundBuffer, mem: Uint8Array, pos: number, len: number, fromShown?: number): void {
         const sab = buffer.sab!;
         const size = buffer.bytes;
         const ring = this.ringSize(buffer);
@@ -3066,7 +3137,7 @@ export class DSound implements IModule {
         // block-aligned), or the head of the first part reads as a whole lap away.
         const split = buffer.isPlaying && buffer.stepLastCursor !== undefined
             ? Math.floor(buffer.stepLastCursor) % size : -1;
-        if (split > pos && split < pos + len) {
+        if (fromShown === undefined && split > pos && split < pos + len) {
             this.writeToLaps(buffer, mem, split, pos + len - split);
             this.writeToLaps(buffer, mem, pos, split - pos);
             return;
@@ -3080,7 +3151,7 @@ export class DSound implements IModule {
             // ramps toward raw + latency, never past it), so a larger lead is a lag.
             let ahead = (Math.floor(shown) - raw + ring) % ring;
             if (ahead > this.hostLatencyBytes(buffer)) ahead -= ring;
-            start = ahead + ((pos - (Math.floor(shown) % size) + size) % size);
+            start = ahead + (fromShown ?? ((pos - (Math.floor(shown) % size) + size) % size));
         } else {
             start = (pos - (raw % size) + size) % size;
         }
@@ -3091,12 +3162,22 @@ export class DSound implements IModule {
             const cur = (getCtrl(sab, CTRL_WRITE_CURSOR) - raw + ring) % ring;
             if (end > cur) setCtrl(sab, CTRL_WRITE_CURSOR, (raw + end) % ring);
         }
+        // The farthest lap ends just behind the worklet's head, in the frames its interpolator
+        // still reads (see trailRing): those are filled once the head has passed them.
+        const limit = buffer.isPlaying ? ring - this.trailKeepBytes(buffer) : ring;
         for (let o = start; o < ring; o += size) {
-            const a = Math.max(0, o), b = Math.min(ring, o + len);
+            const a = Math.max(0, o), b = Math.min(limit, o + len);
             if (b <= a) continue;
             const src = buffer.ptr + pos + (a - o);
             writeRingData(sab, (raw + a) % ring, mem.subarray(src, src + (b - a)), b - a);
         }
+    }
+
+    /** Bytes behind the worklet's head a producer leaves alone (MIX_HISTORY_FRAMES, doubled
+     *  for the head's own block granularity). */
+    private trailKeepBytes(buffer: SoundBuffer): number {
+        return (globalThis as { __noTrailKeep?: boolean }).__noTrailKeep
+            ? 0 : 2 * MIX_HISTORY_FRAMES * Math.max(1, buffer.format.blockAlign);
     }
 
     /**
@@ -3111,7 +3192,12 @@ export class DSound implements IModule {
             buffer.trailRaw = undefined;
             return;
         }
-        const raw = rawAt ?? getCtrl(buffer.sab, CTRL_PLAY_CURSOR) % ring;
+        // Stop short of the head: the mixer's interpolator still reads the frames just behind
+        // it, and this lap's bytes there are not the ones the app has since written for the
+        // next. Refilled under it, every render quantum blended a few frames of the stream a
+        // lap on into its first output samples -- a click per ~10 ms burst whenever the app
+        // writes next-lap data right behind the cursor (NFS5's menu music).
+        const raw = ((rawAt ?? getCtrl(buffer.sab, CTRL_PLAY_CURSOR) % ring) - this.trailKeepBytes(buffer) + ring) % ring;
         const prev = buffer.trailRaw;
         buffer.trailRaw = raw;
         if (prev === undefined) return;
