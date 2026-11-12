@@ -604,6 +604,26 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         (kind === "vb" ? this.vbDirty : this.ibDirty).set(ptr, { start: 0, end: totalSize });
     }
 
+    /** Release the GPU allocation and bookkeeping of a retired vertex/index buffer. */
+    releaseBuffer(kind: "vb" | "ib", ptr: number): void {
+        // Submit recorded draws before destroying buffers they still reference.
+        this.flushProgrammablePending();
+
+        const gpuBuffers = kind === "vb" ? this.vbGpuBuffers : this.ibGpuBuffers;
+        gpuBuffers.get(ptr)?.destroy();
+        gpuBuffers.delete(ptr);
+        (kind === "vb" ? this.vbDirty : this.ibDirty).delete(ptr);
+
+        // Final release invalidates bindings to the retired object.
+        if (kind === "vb") {
+            for (const src of this.streamSources) {
+                if (src.vb === ptr) src.vb = 0;
+            }
+        } else if (this.indexIB === ptr) {
+            this.indexIB = 0;
+        }
+    }
+
     private ensureVbGpuBuffer(vbPtr: number, size: number): GPUBuffer | null {
         const device = this.getGpuDevice();
         if (!device) return null;
