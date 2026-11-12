@@ -15,6 +15,10 @@
 import { describe, expect, test, beforeEach } from "bun:test";
 import { HarnessService } from "../../src/worker/harness/service";
 import { HARNESS_RPC, HarnessErrorCode, type HarnessReply } from "../../src/worker/harness/rpc";
+import { preserveGlobals } from "./helpers/scoped-globals";
+
+// capture() swaps `self` (in bun, globalThis itself) for a stub; later files get the real one.
+preserveGlobals("self");
 
 /** Capture the replies the service posts (it posts via `self.postMessage`). */
 function capture(): HarnessReply[] {

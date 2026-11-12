@@ -40,6 +40,13 @@ export function registerNativeModulePatcher(entry: NativeModulePatcher): void {
     else patchers.push(entry);
 }
 
+/** Remove an entry by id. The registry is process-global, so a test that registers an entry
+ *  must take it out again — otherwise it keeps running for every later module load. */
+export function unregisterNativeModulePatcher(id: string): void {
+    const existing = patchers.findIndex((p) => p.id === id);
+    if (existing >= 0) patchers.splice(existing, 1);
+}
+
 export function nativeModulePatcherIds(): string[] {
     return patchers.map((p) => p.id);
 }

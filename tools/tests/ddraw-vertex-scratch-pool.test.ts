@@ -20,6 +20,9 @@ import {
     OUTPUT_VERTEX_BYTES,
 } from "../../src/worker/backends/webgpu/ddraw/compute/vertex-converter";
 import { D3DFVF_XYZRHW, D3DFVF_DIFFUSE } from "../../src/worker/modules/ddraw/constants";
+import { useWebGpuFlags } from "./helpers/scoped-globals";
+
+useWebGpuFlags("GPUShaderStage", "GPUBufferUsage");
 
 const KILL_SWITCH = "__noVertexScratchPool";
 afterEach(() => delete (globalThis as Record<string, unknown>)[KILL_SWITCH]);
@@ -44,11 +47,6 @@ interface Recorded {
 }
 
 function makeHarness(): { converter: VertexConverter; rec: Recorded; encoder: GPUCommandEncoder } {
-    (globalThis as Record<string, unknown>).GPUShaderStage ??= { COMPUTE: 4 };
-    (globalThis as Record<string, unknown>).GPUBufferUsage ??= {
-        VERTEX: 32, STORAGE: 128, UNIFORM: 64, COPY_DST: 8, COPY_SRC: 4, MAP_READ: 1,
-    };
-
     const rec: Recorded = { dispatches: [], writes: [], buffersCreated: 0, bindGroupsCreated: 0 };
     let nextBufferId = 1;
     let nextBindGroupId = 1;

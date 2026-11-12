@@ -6,7 +6,7 @@ import { msvcrtModule } from "../../src/worker/api/msvcrt.api";
 import { ModuleRegistry, type LoadedPEModule } from "../../src/worker/core/module-registry";
 import { System } from "../../src/worker/core/system";
 import { ThunkGenerator } from "../../src/worker/core/thunking/thunk-generator";
-import { registerNativeModulePatcher } from "../../src/worker/core/hooks/native-module-patchers";
+import { registerNativeModulePatcher, unregisterNativeModulePatcher } from "../../src/worker/core/hooks/native-module-patchers";
 import { libHleManager } from "../../src/worker/core/hle-lib/lib-hle-manager";
 import { NATIVE_LEAVES } from "../../src/worker/core/hle-lib/native-leaves";
 import type { VirtualFileSystem } from "../../src/worker/runtime/filesystem/vfs";
@@ -52,7 +52,7 @@ afterEach(() => {
     hookMode = "patches";
 });
 afterAll(() => {
-    registerNativeModulePatcher({ id: "savestate-module-images-test", matches: () => false, patch: () => false });
+    unregisterNativeModulePatcher("savestate-module-images-test");
 });
 
 const EXPORT_RVA = 0x1800, IAT_RVA = 0x1340, DATA_RVA = 0x1900;

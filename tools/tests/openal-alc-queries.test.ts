@@ -7,6 +7,7 @@
 
 import { test, expect, beforeEach } from "bun:test";
 import { OpenAL } from "../../src/worker/modules/openal/openal";
+import { preserveGlobals } from "./helpers/scoped-globals";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 
 const MEM_BYTES = 1 << 20;
@@ -31,6 +32,7 @@ function put(s: string): number {
     return STR;
 }
 
+preserveGlobals("postMessage");
 beforeEach(() => {
     (globalThis as any).postMessage = () => { /* sink */ };
     mem = new Uint8Array(MEM_BYTES);

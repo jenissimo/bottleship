@@ -10,6 +10,7 @@ import {
     resolveD3D9StretchRectMsaaPolicy,
     setD3D9MsaaCapabilityContract,
 } from "../../src/worker/backends/webgpu/d3d9/multisample";
+import { useWebGpuFlags } from "./helpers/scoped-globals";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -37,18 +38,10 @@ function makeMockDevice() {
     return { device, textures };
 }
 
-function installGpuTextureUsage(): void {
-    (globalThis as typeof globalThis & { GPUTextureUsage?: Record<string, number> }).GPUTextureUsage = {
-        COPY_SRC: 1,
-        COPY_DST: 2,
-        TEXTURE_BINDING: 4,
-        RENDER_ATTACHMENT: 16,
-    };
-}
+useWebGpuFlags("GPUTextureUsage");
 
 describe("D3D9 multisample resources", () => {
     test("depth rebinding preserves accumulated color and keeps the owned depth for the way back", () => {
-        installGpuTextureUsage();
         const { device, textures } = makeMockDevice();
         const cache = new D3D9MultisampleTargetCache(device as unknown as GPUDevice, {
             supportsSampleCount: () => true,
@@ -102,7 +95,6 @@ describe("D3D9 multisample resources", () => {
     });
 
     test("creates matching 2x color/depth attachments and a single-sample resolve target", () => {
-        installGpuTextureUsage();
         const { device, textures } = makeMockDevice();
         const cache = new D3D9MultisampleTargetCache(device as unknown as GPUDevice, {
             supportsSampleCount: (count) => count === 2 || count === 4,
@@ -127,7 +119,6 @@ describe("D3D9 multisample resources", () => {
     });
 
     test("declares color view formats so an sRGB MSAA view is legal", () => {
-        installGpuTextureUsage();
         const { device, textures } = makeMockDevice();
         const cache = new D3D9MultisampleTargetCache(device as unknown as GPUDevice, {
             supportsSampleCount: () => true,
@@ -145,7 +136,6 @@ describe("D3D9 multisample resources", () => {
     });
 
     test("reuses exact cache identity and retires old resources when descriptor changes", () => {
-        installGpuTextureUsage();
         const { device, textures } = makeMockDevice();
         const cache = new D3D9MultisampleTargetCache(device as unknown as GPUDevice, {
             supportsSampleCount: () => true,
@@ -172,7 +162,6 @@ describe("D3D9 multisample resources", () => {
     });
 
     test("rekeys an external resolve when its view format changes", () => {
-        installGpuTextureUsage();
         const { device, textures } = makeMockDevice();
         const resolveTexture = device.createTexture({ sampleCount: 1, usage: 23 });
         const firstView = resolveTexture.createView();
@@ -211,7 +200,6 @@ describe("D3D9 multisample resources", () => {
     });
 
     test("refuses unsupported adapter counts before creating any texture", () => {
-        installGpuTextureUsage();
         const { device, textures } = makeMockDevice();
         const cache = new D3D9MultisampleTargetCache(device as unknown as GPUDevice, {
             supportsSampleCount: (count) => count === 4,
@@ -230,7 +218,6 @@ describe("D3D9 multisample resources", () => {
     });
 
     test("render-pass descriptor uses resolveTarget and matching depth count", () => {
-        installGpuTextureUsage();
         const { device } = makeMockDevice();
         const cache = new D3D9MultisampleTargetCache(device as unknown as GPUDevice, {
             supportsSampleCount: () => true,
@@ -265,7 +252,6 @@ describe("D3D9 multisample resources", () => {
     });
 
     test("begin helper forwards the complete descriptor to the command encoder", () => {
-        installGpuTextureUsage();
         const { device } = makeMockDevice();
         const cache = new D3D9MultisampleTargetCache(device as unknown as GPUDevice, {
             supportsSampleCount: () => true,
@@ -293,7 +279,6 @@ describe("D3D9 multisample resources", () => {
     });
 
     test("defaults to safe refusal when no adapter probe is supplied", () => {
-        installGpuTextureUsage();
         const { device, textures } = makeMockDevice();
         const cache = new D3D9MultisampleTargetCache(device as unknown as GPUDevice);
         expect(cache.acquire({
@@ -308,7 +293,6 @@ describe("D3D9 multisample resources", () => {
     });
 
     test("uses an external D3D9 RT texture as resolve target without owning or destroying it", () => {
-        installGpuTextureUsage();
         const { device, textures } = makeMockDevice();
         const resolveTexture = device.createTexture({ sampleCount: 1, usage: 23 });
         const cache = new D3D9MultisampleTargetCache(device as unknown as GPUDevice, {
@@ -332,7 +316,6 @@ describe("D3D9 multisample resources", () => {
     });
 
     test("uses a standalone D3D9 depth surface for the MSAA attachment without owning it", () => {
-        installGpuTextureUsage();
         const { device, textures } = makeMockDevice();
         const depthTexture = device.createTexture({ sampleCount: 4, format: "depth24plus-stencil8", usage: 16 });
         const depthView = depthTexture.createView();

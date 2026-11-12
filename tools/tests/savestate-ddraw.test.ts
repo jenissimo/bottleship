@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { encodeValue, type SaveValue } from "../../src/worker/savestate/value-codec";
 import { CaptureRefusal, newObjectGraph, restoreObjectGraph } from "../../src/worker/savestate/object-codecs";
 import {
@@ -225,6 +225,13 @@ describe("DirectDraw COM objects", () => {
 });
 
 describe("ddraw participant", () => {
+    // restoreDDrawState publishes the restored mode through System.requestHostResize, which
+    // makes it THE emulated display mode for the whole process. Left behind, every later
+    // file that asks for the screen size (GetSystemMetrics, the ClipCursor clamp) reads 640x480.
+    let savedMode: System["emulatedDisplayMode"] = null;
+    beforeEach(() => { savedMode = System.getInstance().emulatedDisplayMode; });
+    afterEach(() => { System.getInstance().emulatedDisplayMode = savedMode; });
+
     function host(extra: Partial<DDrawContext> = {}, states: DirectDrawSurfaceState[] = []): DDrawHost & { ctx: DDrawContext } {
         const ctx = {
             display: { width: 640, height: 480, bpp: 16, refresh: 60 },
