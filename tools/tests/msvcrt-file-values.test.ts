@@ -40,7 +40,7 @@ beforeEach(async () => {
     let heap = 0x1000;
     errno = 0;
     crt = Object.create(Msvcrt.prototype);
-    Object.assign(crt, { fileStreams: new Map(), temporaryFiles: new Map(), fds: new Map(),
+    Object.assign(crt, { fileStreams: new Map(), temporaryFiles: new Map(), fds: new Map(), fdHandles: new Map(), handleFds: new Map(),
         useRealFileStructs: false, currentLocale: 'C', tempnamCounter: 0, fdNext: 3,
         malloc: (n: number) => { const p = heap; heap += n; return p; },
         free: () => {}, setErrno: (n: number) => { errno = n; return true; },
