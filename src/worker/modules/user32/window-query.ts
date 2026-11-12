@@ -7,7 +7,7 @@
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
-import { WindowInfo, windows, getChildZOrderSibling } from './shared-state';
+import { WindowInfo, windows, getChildZOrderSibling, getZOrderWindow } from './shared-state';
 import { getWindowClass } from './class';
 import { System } from '../../core/system';
 
@@ -244,14 +244,7 @@ export function registerWindowQueryExports(exports: Record<string, ThunkImplemen
             } else if (uCmd === 3 /* GW_HWNDPREV */) {
                 result = getChildZOrderSibling(hWnd, 'prev');
             } else if (uCmd === 0 /* GW_HWNDFIRST */ || uCmd === 1 /* GW_HWNDLAST */) {
-                // Owned popups have a parent field but share the desktop Z-order.
-                const wm = System.getInstance().windowManager;
-                const topmost = (wm.getWindow(hWnd)?.exStyle ?? window.exStyle ?? 0) & 0x8;
-                const siblings = (window.style & 0x40000000 /* WS_CHILD */) !== 0
-                    ? windows.get(window.parent ?? 0)?.children ?? []
-                    : wm.getZOrder().filter(hwnd =>
-                        ((wm.getWindow(hwnd)?.exStyle ?? 0) & 0x8 /* WS_EX_TOPMOST */) === topmost);
-                result = siblings.length > 0 ? (uCmd === 0 ? siblings[0]! : siblings[siblings.length - 1]!) : 0;
+                result = getZOrderWindow(hWnd, uCmd === 0 ? 'first' : 'last');
             }
         }
         Logger.verbose(LogCategory.USER32, `GetWindow(0x${hWnd.toString(16)}, ${uCmd}) -> 0x${result.toString(16)}`);

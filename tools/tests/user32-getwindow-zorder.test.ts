@@ -73,14 +73,58 @@ test("a sole sibling returns itself; invalid handles return NULL", () => {
     expect(get(0xdead, 1)).toBe(0);
 });
 
-test("desktop traversal keeps topmost and ordinary windows in their own groups", () => {
+function walk(start: number, command: number): number[] {
+    const found: number[] = [];
+    for (let hwnd = start; hwnd; hwnd = get(hwnd, command)) {
+        // Bound traversal so a regression reports a failure instead of hanging the suite.
+        expect(found).not.toContain(hwnd);
+        expect(found.length).toBeLessThan(windows.size);
+        found.push(hwnd);
+    }
+    return found;
+}
+
+test("desktop traversal crosses topmost/ordinary boundaries in both directions", () => {
     const ordinaryA = create(), ordinaryB = create();
     const topA = create(), topB = create();
-    for (const hwnd of [topA, topB]) {
-        wm.setWindowZOrder(hwnd, -1);
+    for (const hwnd of [topA, topB]) wm.setWindowZOrder(hwnd, -1);
+    const order = [topB, topA, ordinaryB, ordinaryA];
+    expect(wm.getZOrder()).toEqual(order);
+    for (const hwnd of order) {
+        expect(get(hwnd, 0)).toBe(topB);
+        expect(get(hwnd, 1)).toBe(ordinaryA);
+        expect(walk(get(hwnd, 0), 2)).toEqual(order);
+        expect(walk(get(hwnd, 1), 3)).toEqual([...order].reverse());
     }
-    expect(get(ordinaryA, 0)).toBe(ordinaryB);
-    expect(get(ordinaryB, 1)).toBe(ordinaryA);
-    expect(get(topA, 0)).toBe(topB);
-    expect(get(topB, 1)).toBe(topA);
+});
+
+test("owned popup NEXT/PREV use desktop siblings and follow reordering", () => {
+    const owner = create(), bottom = create(), popup = create(WS_POPUP, owner);
+    create(WS_CHILD, owner);
+    wm.setWindowZOrder(bottom, 1);
+    expect(walk(get(owner, 0), 2)).toEqual([popup, owner, bottom]);
+    expect(get(popup, 3)).toBe(0);
+    wm.setWindowZOrder(bottom, 0);
+    expect(walk(get(popup, 0), 2)).toEqual([bottom, popup, owner]);
+    expect(get(popup, 3)).toBe(bottom);
+    expect(get(owner, 2)).toBe(0);
+});
+
+test("child NEXT/PREV stay within the same parent and respect current order", () => {
+    const parent = create(), other = create();
+    const a = create(WS_CHILD, parent), b = create(WS_CHILD, parent), c = create(WS_CHILD, parent);
+    create(WS_CHILD, other);
+    windows.get(parent)!.children = [c, a, b];
+    expect(walk(get(a, 0), 2)).toEqual([c, a, b]);
+    expect(walk(get(c, 1), 3)).toEqual([b, a, c]);
+    windows.get(parent)!.children.reverse();
+    expect(walk(get(a, 0), 2)).toEqual([b, a, c]);
+});
+
+test("NEXT/PREV return NULL for sole siblings and invalid handles", () => {
+    const parent = create(), child = create(WS_CHILD, parent);
+    for (const hwnd of [parent, child, 0, 0xdead]) {
+        expect(get(hwnd, 2)).toBe(0);
+        expect(get(hwnd, 3)).toBe(0);
+    }
 });

@@ -290,18 +290,25 @@ export function reorderChildInParent(childHwnd: number, insertAfter: number): vo
     }
 }
 
-/** GW_HWNDNEXT / GW_HWNDPREV sibling in parent's child Z-order. */
-export function getChildZOrderSibling(hwnd: number, direction: 'next' | 'prev'): number {
+/** FIRST/LAST/NEXT/PREV use one complete sibling list, including owned desktop popups. */
+export function getZOrderWindow(hwnd: number, relation: 'first' | 'last' | 'next' | 'prev'): number {
     const win = windows.get(hwnd);
-    if (!win?.parent) return 0;
-    const parent = windows.get(win.parent);
-    if (!parent) return 0;
-    const idx = parent.children.indexOf(hwnd);
-    if (idx < 0) return 0;
-    if (direction === 'next') {
-        return idx + 1 < parent.children.length ? parent.children[idx + 1] : 0;
+    if (!win) return 0;
+    if ((win.style & 0x40000000 /* WS_CHILD */) === 0) {
+        return System.getInstance().windowManager.getZOrderWindow(hwnd, relation);
     }
-    return idx > 0 ? parent.children[idx - 1] : 0;
+    const siblings = windows.get(win.parent ?? 0)?.children;
+    if (!siblings) return 0;
+    const idx = siblings.indexOf(hwnd);
+    if (idx < 0) return 0;
+    const target = relation === 'first' ? 0 : relation === 'last' ? siblings.length - 1
+        : relation === 'next' ? idx + 1 : idx - 1;
+    return siblings[target] ?? 0;
+}
+
+/** GW_HWNDNEXT / GW_HWNDPREV in the window's child or desktop sibling list. */
+export function getChildZOrderSibling(hwnd: number, direction: 'next' | 'prev'): number {
+    return getZOrderWindow(hwnd, direction);
 }
 
 /**

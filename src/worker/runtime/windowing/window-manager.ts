@@ -811,6 +811,15 @@ export class WindowManager {
         this.zOrder.splice(idx + 1, 0, hwnd);
     }
 
+    /** Query the desktop sibling list without allocating a snapshot for each GetWindow call. */
+    getZOrderWindow(hwnd: number, relation: 'first' | 'last' | 'next' | 'prev'): number {
+        const idx = this.zOrder.indexOf(hwnd);
+        if (idx < 0) return 0;
+        const target = relation === 'first' ? 0 : relation === 'last' ? this.zOrder.length - 1
+            : relation === 'next' ? idx + 1 : idx - 1;
+        return this.zOrder[target] ?? 0;
+    }
+
     /** Top-level Z-order snapshot, front→back (diagnostics / tests). */
     getZOrder(): number[] {
         return this.zOrder.slice();
