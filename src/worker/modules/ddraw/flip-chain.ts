@@ -16,7 +16,7 @@
  */
 
 import type { DirectDrawSurfaceState } from "./com-objects";
-import { isRenderSurface } from "./com-objects";
+import { isRenderSurface, moveRestoredTextureDebt, restoredTextureDebt } from "./com-objects";
 import type { DirectDrawSurfaceObject } from "./com-objects";
 import type { Rect } from "./helpers";
 import { DDSCAPS_FLIP, DDSCAPS_ZBUFFER } from "./constants";
@@ -53,6 +53,7 @@ interface SurfaceStorage {
     rgbaScratch?: Uint8Array;
     rgbaScratchVersion?: number;
     cpuSyncedVersion?: number;
+    restoredTextureDebt?: boolean;
 }
 
 function takeStorage(s: DirectDrawSurfaceState): SurfaceStorage {
@@ -81,6 +82,7 @@ function takeStorage(s: DirectDrawSurfaceState): SurfaceStorage {
         st.rgbaScratch = s.rgbaScratch;
         st.rgbaScratchVersion = s.rgbaScratchVersion;
         st.cpuSyncedVersion = s.cpuSyncedVersion;
+        st.restoredTextureDebt = restoredTextureDebt(s);
     }
     return st;
 }
@@ -109,6 +111,7 @@ function putStorage(s: DirectDrawSurfaceState, st: SurfaceStorage): void {
         s.rgbaScratch = st.rgbaScratch;
         s.rgbaScratchVersion = st.rgbaScratchVersion;
         s.cpuSyncedVersion = st.cpuSyncedVersion;
+        moveRestoredTextureDebt(s, st.restoredTextureDebt);
     }
 }
 

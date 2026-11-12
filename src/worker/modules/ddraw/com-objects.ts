@@ -440,12 +440,29 @@ export function gpuHoldsLatest(st: DirectDrawSurfaceState): boolean {
 // @transient(restored render surfaces whose GPU texture the presenter creates on their first present; empty in a session that never loaded)
 const restoredWithoutTexture = new WeakSet<DirectDrawSurfaceState>();
 
+// @transient(true once a restore left a render surface without a texture; a session that never loaded pays nothing on Flip)
+let restoredSurfacesSeen = false;
+
 export function awaitsTextureAfterRestore(st: DirectDrawSurfaceState): boolean {
     return restoredWithoutTexture.has(st);
 }
 
 export function textureCreatedAfterRestore(st: DirectDrawSurfaceState): void {
     restoredWithoutTexture.delete(st);
+}
+
+/**
+ * "Has no texture since the restore" describes the image, not the surface: a Flip moves the
+ * image to another surface, and the presenter must still create its texture there.
+ */
+export function restoredTextureDebt(st: DirectDrawSurfaceState): boolean | undefined {
+    return restoredSurfacesSeen ? restoredWithoutTexture.has(st) : undefined;
+}
+
+export function moveRestoredTextureDebt(st: DirectDrawSurfaceState, owed: boolean | undefined): void {
+    if (owed === undefined) return;
+    if (owed) restoredWithoutTexture.add(st);
+    else restoredWithoutTexture.delete(st);
 }
 
 export type MipRef = (mip: DirectDrawSurfaceState) => number | null;
@@ -489,6 +506,7 @@ export function restoreSurfaceState(saved: Record<string, unknown>): DirectDrawS
         st.lastUploadVersion = -1;
         if (st.mode === 'GPU_ONLY') st.mode = 'CPU';
         restoredWithoutTexture.add(st as unknown as DirectDrawSurfaceState);
+        restoredSurfacesSeen = true;
     }
     return st as unknown as DirectDrawSurfaceState;
 }
