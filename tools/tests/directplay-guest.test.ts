@@ -587,6 +587,20 @@ test("a startup lobby-launch check leaves the module idle for a savestate once t
     expect((api as unknown as { lobbyEndpoint: unknown }).lobbyEndpoint).toBeDefined();
     expect(module.captureSavestate()).toEqual({});
 });
+test("connection settings set for this process keep refusing a savestate after the lobby object is released", () => {
+    const module = new DPlayX() as unknown as { networkApi: DirectPlayNetworkApi; captureSavestate(): unknown };
+    module.networkApi = api;
+    expect(exports["directplaylobbycreatea"]({ esp: 0x9000 } as X86Context, mem, [0, 0x2400, 0, 0, 0])).toBe(DP.OK);
+    primary = read(0x2400);
+    u32(0x3000, 80); u32(0x3028, 8); bytes(0x3018, "1".repeat(32));
+    u32(0x2300, 40); u32(0x2304, 2); u32(0x2308, 0x3000);
+    bytes(0x2310, "e05ee9367785cf11960c0080c7534e82");
+    expect(call("SetConnectionSettings", [0, 0, 0x2300], "IDirectPlayLobbyA")).toBe(DP.OK);
+    expect(call("Release", [], "IDirectPlayLobbyA")).toBe(0);
+    expect(() => module.captureSavestate()).toThrow("dplayx: not idle, 1 thing(s) open: the lobby record of this process");
+    api.reset();
+    expect(module.captureSavestate()).toEqual({});
+});
 test("synchronous discovery defers all guest callbacks until safe owner-thread continuation", async () => {
     initialize(); u32(0x3000, 80); bytes(0x3018, "1".repeat(32));
     const pending = call("EnumSessions", [0x3000, 1, 0x7000, 0x1234, 2]);
