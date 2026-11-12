@@ -66,6 +66,13 @@ export class TypeLibRuntime {
         this.typeInfoVtableAddr = 0;
     }
 
+    openForSavestate(): string[] {
+        return [
+            ...[...this.typeLibInstances].map(([address, state]) => `type library 0x${address.toString(16)} "${state.descriptor.name}"`),
+            ...[...this.typeInfoInstances].map(([address, state]) => `type info 0x${address.toString(16)} "${state.entry.name}"`),
+        ];
+    }
+
     recreateVTables(process?: Process): void {
         if (process) this.process = process;
         this.reset();

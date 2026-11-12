@@ -8,6 +8,9 @@ import { isValidAddress } from "../core/memory/address-guard";
 import { TypeLibRuntime } from "../core/com/typelib/typelib-objects";
 import { createSafeArrayExports } from "./oleaut32-safearray";
 import { createVariantOpExports } from "./oleaut32-variant-ops";
+import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
+import { CaptureRefusal } from "../savestate/object-codecs";
+import type { SaveValue } from "../savestate/value-codec";
 
 const S_OK = 0x00000000;
 const E_INVALIDARG = 0x80070057;
@@ -25,6 +28,20 @@ const VT_UI4 = 19;
 const VT_BYREF = 0x4000;
 const VT_TYPEMASK = 0x0fff;
 
+export const OLEAUT32_FIELDS = {
+    name: 'transient', exports: 'host', process: 'host', typeLibRuntime: 'derive', safeArray: 'save',
+} as const satisfies Record<string, FieldPolicy>;
+
+export interface Oleaut32State {
+    safeArrays: Uint32Array;
+}
+
+export const OLEAUT32_SCHEMA = {
+    module: OLEAUT32_FIELDS,
+    safeArrayRow: ['descriptor', 'data'],
+    state: stateKeys<Oleaut32State>({ safeArrays: true }),
+};
+
 export class Oleaut32 implements IModule {
     name = "oleaut32";
     exports: Record<string, ThunkImplementation> = {};
@@ -32,7 +49,36 @@ export class Oleaut32 implements IModule {
     private typeLibRuntime = new TypeLibRuntime();
     private safeArray = createSafeArrayExports();
 
+    captureSavestate(): Oleaut32State {
+        const open = this.typeLibRuntime.openForSavestate();
+        if (open.length > 0) {
+            throw new Error(`oleaut32: not idle, ${open.length} thing(s) open: ${open.slice(0, 4).join(', ')}${open.length > 4 ? ', …' : ''}`);
+        }
+        return { safeArrays: this.safeArray.captureState() };
+    }
+
+    restoreSavestate(s: Oleaut32State): void {
+        const open = this.typeLibRuntime.openForSavestate();
+        if (open.length > 0) throw new Error(`oleaut32: the fresh session is not idle: ${open.slice(0, 4).join(', ')}`);
+        this.safeArray.restoreState(s.safeArrays);
+    }
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'oleaut32', version: 1, order: 67, covers: ['oleaut32'], schema: OLEAUT32_SCHEMA as unknown as SaveValue,
+            capture: () => {
+                try {
+                    return this.captureSavestate() as unknown as SaveValue;
+                } catch (e) {
+                    throw e instanceof CaptureRefusal ? e : new CaptureRefusal(e instanceof Error ? e.message : String(e));
+                }
+            },
+            restore: (saved) => this.restoreSavestate(saved as unknown as Oleaut32State),
+        });
+    }
+
     initialize(process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         this.process = process;
         const alloc = (size: number) => System.getInstance().process?.memory?.alloc(size) ?? 0;
 

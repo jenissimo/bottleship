@@ -1086,9 +1086,6 @@
     "infoAnswersLogged",
     "substitutedFormats"
   ],
-  "src/worker/modules/dbghelp-stackwalk.ts": [
-    "walks"
-  ],
   "src/worker/modules/dpnet/executor.ts": [
     "executors"
   ],
@@ -1172,9 +1169,6 @@
   ],
   "src/worker/modules/msvfw32.ts": [
     "nextDrawDibHandle"
-  ],
-  "src/worker/modules/oleaut32-safearray.ts": [
-    "createSafeArrayExports.owned"
   ],
   "src/worker/modules/openal/openal.ts": [
     "audioIdCounter"
