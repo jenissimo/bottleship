@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { DirectPlayNetworkApi, packDirectPlayMessage } from "../../src/worker/modules/dplayx/network-api";
+import { DPlayX } from "../../src/worker/modules/dplayx/dplayx";
 import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
 import { DP, DirectPlaySession } from "../../src/worker/modules/dplayx/session";
 import { decodeDatagram, encodeDatagram, encodeTcpFrame, PROTO_TCP, PROTO_UDP, PROTO_DIRECTPLAY, SYN, DATA, TCP_WINDOW, isBroadcastNode } from "../../src/worker/net/netplay-wire";
@@ -573,6 +574,32 @@ test("Lobby connection settings use the native five-argument ABI and own copied 
     expect(read(0x2200)).toBe(160); expect([...mem.slice(0x10078, 0x10080)]).toEqual(new Array(8).fill(0xcc));
     expect(read(0x10000)).toBe(40); expect(read(0x10004)).toBe(2); expect(read(0x10008)).toBe(0x10028);
     expect(read(0x10028)).toBe(80); expect(read(0x10050)).toBe(8);
+});
+test("a startup lobby-launch check leaves the module idle for a savestate once the lobby object is released", async () => {
+    const module = new DPlayX() as unknown as { networkApi: DirectPlayNetworkApi; captureSavestate(): unknown };
+    module.networkApi = api;
+    expect(exports["directplaylobbycreatea"]({ esp: 0x9000 } as X86Context, mem, [0, 0x2400, 0, 0, 0])).toBe(DP.OK);
+    primary = read(0x2400); u32(0x2200, 0);
+    await call("GetConnectionSettings", [0, 0, 0x2200], "IDirectPlayLobbyA");
+    expect((api as unknown as { lobbyEndpoint: unknown }).lobbyEndpoint).toBeDefined();
+    expect(() => module.captureSavestate()).toThrow(/^dplayx: not idle, 1 thing\(s\) open: DirectPlayLobby object 0x[0-9a-f]+$/);
+    expect(call("Release", [], "IDirectPlayLobbyA")).toBe(0);
+    expect((api as unknown as { lobbyEndpoint: unknown }).lobbyEndpoint).toBeDefined();
+    expect(module.captureSavestate()).toEqual({});
+});
+test("connection settings set for this process keep refusing a savestate after the lobby object is released", () => {
+    const module = new DPlayX() as unknown as { networkApi: DirectPlayNetworkApi; captureSavestate(): unknown };
+    module.networkApi = api;
+    expect(exports["directplaylobbycreatea"]({ esp: 0x9000 } as X86Context, mem, [0, 0x2400, 0, 0, 0])).toBe(DP.OK);
+    primary = read(0x2400);
+    u32(0x3000, 80); u32(0x3028, 8); bytes(0x3018, "1".repeat(32));
+    u32(0x2300, 40); u32(0x2304, 2); u32(0x2308, 0x3000);
+    bytes(0x2310, "e05ee9367785cf11960c0080c7534e82");
+    expect(call("SetConnectionSettings", [0, 0, 0x2300], "IDirectPlayLobbyA")).toBe(DP.OK);
+    expect(call("Release", [], "IDirectPlayLobbyA")).toBe(0);
+    expect(() => module.captureSavestate()).toThrow("dplayx: not idle, 1 thing(s) open: the lobby record of this process");
+    api.reset();
+    expect(module.captureSavestate()).toEqual({});
 });
 test("synchronous discovery defers all guest callbacks until safe owner-thread continuation", async () => {
     initialize(); u32(0x3000, 80); bytes(0x3018, "1".repeat(32));
