@@ -2,6 +2,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { MemoryGuard } from "../../core/memory/mem-guard";
 import { BufferSource } from "@bottleship/formats/unpack/source";
 import { probeAudio, probeAudioAt, type AudioProbe } from "@bottleship/formats/audio";
+import { decodeMsAdpcmBlock, MS_STANDARD_COEFS } from "../msacm32";
 import { MSSContext } from "./context";
 import { MSSSample, MSSStream } from "./types";
 import { applyEncodedPcmLength, inspectEncodedAudio, isMp3, isOgg, refreshSampleLenDone, refreshStreamLenDone } from "./helpers";
@@ -372,76 +373,23 @@ export function decodeImaAdpcmToS16(data: Uint8Array, channels: number, blockAli
     return out;
 }
 
+/**
+ * MS ADPCM, block by block, through msacm32's decoder. Miles hands us no coefficient table,
+ * so the standard one every MS ADPCM encoder writes is used.
+ */
 function decodeMsAdpcmToS16(data: Uint8Array, channels: number, blockAlign: number): Int16Array {
-    const adapt = [
-        230, 230, 230, 230, 307, 409, 512, 614,
-        768, 614, 512, 409, 307, 230, 230, 230,
-    ];
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const samples: number[] = [];
-
-    const decodeNibble = (nibble: number, predictor: number, delta: number, sample1: number, sample2: number) => {
-        const signed = (nibble & 8) ? (nibble - 16) : nibble;
-        let v = ((sample1 * adapt[predictor]) + (sample2 * (64 - adapt[predictor]))) / 64;
-        v += signed * delta;
-        v = Math.max(-32768, Math.min(32767, Math.round(v)));
-        return v | 0;
-    };
-
-    if (channels === 1) {
-        for (let off = 0; off + blockAlign <= data.length; off += blockAlign) {
-            const predictor = data[off];
-            let delta = view.getInt16(off + 2, true);
-            let s1 = view.getInt16(off + 4, true);
-            let s2 = view.getInt16(off + 6, true);
-            samples.push(s2, s1);
-            let prev = s1;
-            let cur = s2;
-            for (let i = 8; i < blockAlign; i++) {
-                const byte = data[off + i];
-                for (const nibble of [byte & 0x0f, (byte >> 4) & 0x0f]) {
-                    const next = decodeNibble(nibble, predictor, delta, cur, prev);
-                    samples.push(next);
-                    prev = cur;
-                    cur = next;
-                    delta = Math.max(16, Math.min(32767, (adapt[nibble] * delta) >> 8));
-                }
-            }
-        }
-    } else {
-        // Stereo MS ADPCM: interleaved L/R blocks (7-byte header per channel)
-        for (let off = 0; off + blockAlign <= data.length; off += blockAlign) {
-            const lPred = data[off];
-            const rPred = data[off + 1];
-            let lDelta = view.getInt16(off + 2, true);
-            let rDelta = view.getInt16(off + 4, true);
-            let l1 = view.getInt16(off + 6, true);
-            let r1 = view.getInt16(off + 8, true);
-            let l2 = view.getInt16(off + 10, true);
-            let r2 = view.getInt16(off + 12, true);
-            samples.push(l2, r2, l1, r1);
-            let lPrev = l1;
-            let lCur = l2;
-            let rPrev = r1;
-            let rCur = r2;
-            for (let i = 14; i < blockAlign; i++) {
-                const byte = data[off + i];
-                const ln = byte & 0x0f;
-                const rn = (byte >> 4) & 0x0f;
-                const lNext = decodeNibble(ln, lPred, lDelta, lCur, lPrev);
-                const rNext = decodeNibble(rn, rPred, rDelta, rCur, rPrev);
-                samples.push(lNext, rNext);
-                lPrev = lCur;
-                lCur = lNext;
-                rPrev = rCur;
-                rCur = rNext;
-                lDelta = Math.max(16, Math.min(32767, (adapt[ln] * lDelta) >> 8));
-                rDelta = Math.max(16, Math.min(32767, (adapt[rn] * rDelta) >> 8));
-            }
-        }
+    if ((channels !== 1 && channels !== 2) || !Number.isInteger(blockAlign) || blockAlign < 7 * channels) return new Int16Array(0);
+    // 7 header bytes per channel, two samples per remaining byte, plus the header's two.
+    const perBlock = Math.floor(((blockAlign - 7 * channels) * 2) / channels) + 2;
+    const out = new Int16Array(Math.ceil(data.length / blockAlign) * perBlock * channels);
+    let frames = 0;
+    for (let at = 0; at < data.length; at += blockAlign) {
+        const got = decodeMsAdpcmBlock(data, at, Math.min(blockAlign, data.length - at), channels,
+            MS_STANDARD_COEFS, perBlock, out, frames * channels);
+        if (got <= 0) break;
+        frames += got;
     }
-
-    return Int16Array.from(samples);
+    return out.slice(0, frames * channels);
 }
 
 export function writeAilSoundInfo(
