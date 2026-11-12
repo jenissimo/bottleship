@@ -39,12 +39,13 @@ export class Galaxy implements IModule {
     }
 
     /** Called from pe-loader after native Galaxy.dll is registered. */
-    static onNativeModuleLoaded(process: Process, module: LoadedPEModule): void {
+    static onNativeModuleLoaded(process: Process, module: LoadedPEModule): boolean {
         const inst = process.getModule('galaxy') as Galaxy | undefined;
-        if (!inst) return;
+        if (!inst) return false;
         const ctx = inst.getContext();
-        if (!shouldPatchGalaxyNative(module)) return;
+        if (!shouldPatchGalaxyNative(module)) return false;
         patchGalaxyNativeModule(process, module, ctx, inst.exports);
+        return true;
     }
 
     handleAudioEnded(id: number): void {

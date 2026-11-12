@@ -893,21 +893,22 @@ export class PELoader {
                 initialized: false,
                 sections
             };
+            if (runTime) module.unsaved = 'has no content hash';
             this.moduleRegistry.register(module);
             registered = true;
-            const watchHooks = runTime && savestatesEnabled();
-            const stubCount = (): number => watchHooks ? this.thunkGenerator.getAllStubs().length : 0;
-            let hookStubs = -stubCount();
+            let hostPatched = false;
 
             // Static Library HLE detection for this DLL's image (same reason as EXE path).
             try {
-                libHleManager.onModuleLoaded(module);
+                if (libHleManager.onModuleLoaded(module)) hostPatched = true;
             } catch (e) {
+                hostPatched = true;
                 Logger.warn(LogCategory.SYSTEM, `[HLE-lib] onModuleLoaded threw on DLL ${dllName}: ${e}`);
             }
             try {
-                hookRegistry.onModuleLoaded(module);
+                if (hookRegistry.onModuleLoaded(module)) hostPatched = true;
             } catch (e) {
+                hostPatched = true;
                 Logger.warn(LogCategory.SYSTEM, `[hooks] onModuleLoaded threw on DLL ${dllName}: ${e}`);
             }
 
@@ -915,13 +916,11 @@ export class PELoader {
             // Native DLLs importing thunked modules (kernel32, user32, dinput, etc.)
             // get HLE thunk stubs patched into their IAT.
             const importDirRVA = peView.getUint32(optHeaderPtr + 104, true);
-            hookStubs += stubCount();
             if (importDirRVA !== 0) {
                 Logger.warn(LogCategory.SYSTEM,
                     `[PE] === Processing imports for NATIVE DLL "${dllNameLower}" (base=0x${baseAddress.toString(16)}) ===`);
                 await this.processImports(baseAddress, importDirRVA, dependencyDirectories);
             }
-            hookStubs -= stubCount();
 
             // Real-DLL export patchers (HLE replacements for a library the game ships), AFTER
             // imports: they patch function BODIES rather than the packed 5-byte export thunks,
@@ -929,13 +928,12 @@ export class PELoader {
             // is isolated by the registry, so one library's patcher cannot fail the DLL load.
             {
                 const system = System.getInstance();
-                if (system.process) runNativeModulePatchers(system.process, module);
+                if (system.process && runNativeModulePatchers(system.process, module)) hostPatched = true;
             }
-            hookStubs += stubCount();
             if (runTime) {
-                if (hookStubs !== 0) module.unsaved = 'is patched by host-side hooks';
-                else if (!savestatesEnabled()) module.unsaved = 'has no content hash';
-                else {
+                if (hostPatched) module.unsaved = 'is patched by host-side hooks';
+                else if (savestatesEnabled()) {
+                    delete module.unsaved;
                     module.contentHash = sha256HexSync(peData);
                     if (handle.source !== 'rom') module.imageBytes = peData.slice();
                 }

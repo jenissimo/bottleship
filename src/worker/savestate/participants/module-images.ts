@@ -94,7 +94,7 @@ export function restoreModuleImages(state: ModuleImagesState, files: ReadonlyMap
     loader.restoreInlineStubs(state.inlineStubs);
     registry.restoreLayout(state.nextDllBase, state.freeDllRanges);
     System.getInstance().implicitTlsEntries = state.implicitTls.map(e => ({ ...e }));
-    for (const name of state.hleBound) markHleModuleLoaded(name);
+    for (const name of state.hleBound) markHleModuleLoaded(name, false);
 }
 
 export function moduleImagesHooks(host: () => { registry: ModuleRegistry; loader: ImageLoader }): Required<Pick<Participant, 'capture' | 'verify' | 'restore'>> {

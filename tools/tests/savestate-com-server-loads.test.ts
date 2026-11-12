@@ -14,11 +14,12 @@ import { preemptionManager } from "../../src/worker/core/cpu/preemption-manager"
 import { resetGuestCodeInvalidationState } from "../../src/worker/core/memory/guest-code";
 import { MEM_HLE_IMAGE_BASE, MEM_HLE_IMAGE_SIZE } from "../../src/worker/core/cpu/emulator-config";
 import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
-import { hleImageBase, isHleModuleLoaded, materializeHleModuleImages, onHleModuleAttach, resetHleModuleImages } from "../../src/worker/core/hle-module-images";
+import { boundHleModules, hleImageBase, isHleModuleLoaded, markHleModuleLoaded, materializeHleModuleImages, onHleModuleAttach, resetHleModuleImages } from "../../src/worker/core/hle-module-images";
 import { exports as kernel32 } from "../../src/worker/modules/kernel32/module/module";
 import { kernel32Module } from "../../src/worker/api/kernel32.api";
 import { guidBytes } from "../../src/worker/modules/dpnet/constants";
 import { touchedModules } from "../../src/worker/savestate/core-participants";
+import { restoreModuleImages, type ModuleImagesState } from "../../src/worker/savestate/participants/module-images";
 import type { ModuleDescriptor } from "../../src/worker/api/types";
 import type { VTableInfo } from "../../src/worker/api/adapters/module-adapter";
 import type { Process } from "../../src/worker/core/process";
@@ -187,4 +188,27 @@ test("a held module the restoring session may not load fails the restore by name
     expect(() => restoreHleComServerLoads(session.owner, [DLL])).toThrow(
         "ole32: COM held user32 loaded for an activated class, but this session cannot load it");
     expect(isHleModuleLoaded(DLL)).toBe(false);
+});
+
+test("the module-images restore marks a bound HLE module loaded without running its attach hook", () => {
+    expect(isHleModuleLoaded(DLL)).toBe(false);
+    const state: ModuleImagesState = {
+        images: [], nextDllBase: 0, freeDllRanges: [], implicitTls: [], hleBound: [...boundHleModules(), DLL],
+        inlineStubs: { heap: null, crt: null, caseFold: null, locale: null, mbwc: null, mbwcDeclined: false, math: null },
+    };
+    const savedTls = system.implicitTlsEntries;
+    try {
+        restoreModuleImages(state, new Map(), { getByBase: () => undefined, restoreLayout: () => undefined } as never, { restoreInlineStubs: () => undefined } as never);
+    } finally {
+        system.implicitTlsEntries = savedTls;
+    }
+    expect(isHleModuleLoaded(DLL)).toBe(true);
+    expect(boundHleModules()).toContain(DLL);
+    expect(attached).toBe(0);
+
+    resetHleModuleImages();
+    boot();
+    expect(isHleModuleLoaded(DLL)).toBe(false);
+    markHleModuleLoaded(DLL);
+    expect(attached).toBe(1);
 });

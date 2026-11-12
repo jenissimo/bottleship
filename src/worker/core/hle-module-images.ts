@@ -89,10 +89,10 @@ function slotKeys(dllName: string): string[] {
  * Deliberately NOT inside hleImageBase — our own warmup
  * loops resolve every known module's base, and marking there would vouch for all of them.
  */
-export function markHleModuleLoaded(dllName: string): void {
+export function markHleModuleLoaded(dllName: string, attach = true): void {
     const attached = !isHleModuleLoaded(dllName);
     for (const key of slotKeys(dllName)) if (slotByName.has(key)) loadedNames.add(key);
-    if (attached && isHleModuleLoaded(dllName)) runAttach(dllName);
+    if (attach && attached && isHleModuleLoaded(dllName)) runAttach(dllName);
 }
 
 /**

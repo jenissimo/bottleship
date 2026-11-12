@@ -26,6 +26,7 @@ const system = System.getInstance();
 const flag = globalThis as { __savestates?: unknown };
 const original = { process: system.process, exe: system.executablePath, tls: system.implicitTlsEntries, flag: flag.__savestates };
 let hookedName = "";
+let hookMode: "patches" | "declines-after-a-stub" | "throws" = "patches";
 
 beforeAll(() => {
     APIRegistry.getInstance().registerModule(kernel32Module);
@@ -33,7 +34,11 @@ beforeAll(() => {
     registerNativeModulePatcher({
         id: "savestate-module-images-test",
         matches: (m) => m.name === hookedName,
-        patch: (process) => { process.thunkGenerator.allocateOneStub("test-hle", "Hooked", 0, "stdcall"); },
+        patch: (process) => {
+            if (hookMode === "throws") throw new Error("patcher failed half way");
+            if (hookMode === "declines-after-a-stub") { process.thunkGenerator.allocateOneStub("test-hle", "Probe", 0, "stdcall"); return false; }
+            return true;
+        },
     });
 });
 afterEach(() => {
@@ -42,9 +47,10 @@ afterEach(() => {
     system.implicitTlsEntries = original.tls;
     flag.__savestates = original.flag;
     hookedName = "";
+    hookMode = "patches";
 });
 afterAll(() => {
-    registerNativeModulePatcher({ id: "savestate-module-images-test", matches: () => false, patch: () => undefined });
+    registerNativeModulePatcher({ id: "savestate-module-images-test", matches: () => false, patch: () => false });
 });
 
 const EXPORT_RVA = 0x1800, IAT_RVA = 0x1340, DATA_RVA = 0x1900;
@@ -144,7 +150,7 @@ function session(files: Record<string, Uint8Array>): Session {
         getFileSize: (path: string) => entries.get(path.toLowerCase())!.length,
         read: async (entry: { path: string }) => { beforeRead.run?.(entry.path); return entries.get(entry.path)!; },
     } as unknown as VirtualFileSystem);
-    const process = { moduleRegistry: registry, loader, thunkGenerator: generator, resetGeneration: 0, lastError: 0 };
+    const process = { moduleRegistry: registry, loader, thunkGenerator: generator, resetGeneration: 0, lastError: 0, getModule: () => undefined };
     return { loader, registry, memory, view: new DataView(memory.buffer), generator, files: entries, process, beforeRead, write, remove };
 }
 
@@ -528,6 +534,40 @@ describe("what a savestate still cannot carry is refused by name at capture", ()
         expect(() => capture(a)).toThrow(`module images: plugin (0x${plugin.baseAddress.toString(16)}) was loaded at run time and is patched by host-side hooks`);
         a.registry.unregister("plugin.dll");
         expect(() => capture(a)).not.toThrow();
+    });
+
+    test("the patcher's own answer decides, not the stub count: no new stub still refuses, a new stub without a patch does not", async () => {
+        const a = await booted(FILES());
+        system.process = a.process as never;
+        hookedName = "plugin";
+        const stubs = a.generator.getAllStubs().length;
+        const plugin = (await a.loader.loadDll("plugin.dll"))!;
+        expect(a.generator.getAllStubs().filter(x => x.dllName === "test-hle").length).toBe(0);
+        expect(a.generator.getAllStubs().length).toBeGreaterThan(stubs);
+        expect(plugin.unsaved).toBe("is patched by host-side hooks");
+
+        hookedName = "other";
+        hookMode = "declines-after-a-stub";
+        const other = (await a.loader.loadDll("other.dll"))!;
+        expect(a.generator.getAllStubs().filter(x => x.dllName === "test-hle").length).toBe(1);
+        expect(other.unsaved).toBeUndefined();
+        expect(other.contentHash).toBeDefined();
+
+        const b = await booted(FILES());
+        system.process = b.process as never;
+        hookedName = "plugin";
+        hookMode = "throws";
+        expect((await b.loader.loadDll("plugin.dll"))!.unsaved).toBe("is patched by host-side hooks");
+    });
+
+    test("a run-time image always has a content hash or a named reason, a start image has neither", async () => {
+        const a = await booted(FILES());
+        const on = (await a.loader.loadDll("plugin.dll"))!;
+        flag.__savestates = undefined;
+        const off = (await a.loader.loadDll("other.dll"))!;
+        for (const m of [on, off]) expect([m.name, Boolean(m.contentHash) !== Boolean(m.unsaved)]).toEqual([m.name, true]);
+        const boot = a.registry.getByName("boot.dll")!;
+        expect([boot.contentHash, boot.unsaved]).toEqual([undefined, undefined]);
     });
 
     test("the same hook on a start image is not a refusal", async () => {
