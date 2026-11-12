@@ -6,8 +6,9 @@ This release covers changes merged since 0.7 on October 8, 2026. The compatibili
 grows from 53 to 85 entries, including Half-Life 2, Red Alert 3, Deus Ex, Unreal Tournament
 GOTY, Empire Earth and GTA 1/2. LAN multiplayer arrives for Winsock and DirectPlay 1–4/8
 games through a self-hosted relay. The savestate foundation covers every major module,
-behind a developer flag. Other additions are a General MIDI synthesizer and performance
-work on Direct3D 9 and GDI. The public demo catalog now contains 48 entries.
+behind a developer flag. Games start on iPhone and iPad again: iOS 27 no longer crashes
+the tab, and larger games fit within Safari's memory limit. Other additions are a General
+MIDI synthesizer and performance work on Direct3D 9 and GDI. The public demo catalog now contains 48 entries.
 
 Read the [0.8 release notes](docs/releases/0.8.md) for the newly compatible games,
 multiplayer coverage and limitations, contributors and what comes next. The dated entries
