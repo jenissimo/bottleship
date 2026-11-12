@@ -13,6 +13,8 @@ import { ensureBackBufferSurface } from './device-lifecycle';
 import type { D3D8DeviceAdapter } from '../../backends/webgpu/d3d8/d3d8-device-adapter';
 import { writeDeviceCaps8 } from './caps';
 import { deviceCooperativeLevel } from '../../core/gpu/gpu-device-loss-contract';
+import { createPresentRegion, type PresentRect } from '../../backends/webgpu/shared/present-region';
+import { deviceWindowClientExtent } from '../../runtime/windowing/fullscreen-window';
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
@@ -111,10 +113,33 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
+    // Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion). With both
+    // rectangles NULL the whole back buffer is the picture; otherwise the device composes
+    // the destination window's client image from them (present-region.ts).
+    const presentRegion = createPresentRegion();
+    const readPresentRect = (ptr: number, out: PresentRect): boolean => {
+        if (!ptr) return false;
+        const left = Mem.readUint32(ptr), top = Mem.readUint32(ptr + 4);
+        const right = Mem.readUint32(ptr + 8), bottom = Mem.readUint32(ptr + 12);
+        if (left === null || top === null || right === null || bottom === null) return false;
+        out.left = left | 0; out.top = top | 0; out.right = right | 0; out.bottom = bottom | 0;
+        return true;
+    };
     exports['IDirect3DDevice8_Present'] = (_ctx, _mem, args) => {
         const device = devices.get(args[0]);
         if (!device) return D3DERR_INVALIDCALL;
-        return device.present();
+        const pSourceRect = args[1] >>> 0;
+        const pDestRect = args[2] >>> 0;
+        if (!pSourceRect && !pDestRect) return device.present();
+        presentRegion.hasSrc = readPresentRect(pSourceRect, presentRegion.src);
+        presentRegion.hasDst = readPresentRect(pDestRect, presentRegion.dst);
+        // A NULL destination is the destination window's client area for a windowed
+        // device and the back buffer for a fullscreen one (a zero client size says so).
+        const client = device.presentsExclusiveFullscreen
+            ? null : deviceWindowClientExtent((args[3] >>> 0) || device.presentWindow);
+        presentRegion.clientWidth = client ? client.width : 0;
+        presentRegion.clientHeight = client ? client.height : 0;
+        return device.present(presentRegion);
     };
 
     exports['IDirect3DDevice8_DrawPrimitive'] = (_ctx, _mem, args) => {

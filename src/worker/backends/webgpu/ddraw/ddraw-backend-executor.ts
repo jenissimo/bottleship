@@ -2202,8 +2202,11 @@ export class DDrawWebGPUExecutor {
         // Valid surfaces have surfacePtr in the SURFACE region
         const SURFACE_REGION_START = MEM_SURFACE_BASE;
         const SURFACE_REGION_END = MEM_SURFACE_BASE + MEM_SURFACE_SIZE;
-        const srcInRange = srcState.surfacePtr >= SURFACE_REGION_START && srcState.surfacePtr < SURFACE_REGION_END;
-        const dstInRange = dstState.surfacePtr >= SURFACE_REGION_START && dstState.surfacePtr < SURFACE_REGION_END;
+        // ... and a GPU-only render surface has no guest memory at all, by design.
+        const srcInRange = srcState.surfaceType === "render_surface" ||
+            (srcState.surfacePtr >= SURFACE_REGION_START && srcState.surfacePtr < SURFACE_REGION_END);
+        const dstInRange = dstState.surfaceType === "render_surface" ||
+            (dstState.surfacePtr >= SURFACE_REGION_START && dstState.surfacePtr < SURFACE_REGION_END);
 
         if (!srcInRange || !dstInRange) {
             Logger.warn(LogCategory.DDRAW,

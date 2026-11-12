@@ -342,6 +342,7 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             // be read as fullscreen.
             deviceWindowed.set(devicePtr, !!windowedFlag);
             device.setWindowed(!!windowedFlag);
+            device.presentWindow = (view.getUint32(pPresParams + 24, true) || hFocusWindow) >>> 0;
             // Remembered for GetCreationParameters (faithful echo of the game's own flags).
             deviceCreationParams.set(devicePtr, {
                 adapter: Adapter,
