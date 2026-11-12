@@ -26,6 +26,10 @@ import {
     getCtrl,
     CTRL_PLAY_CURSOR,
     CTRL_BUFFER_BYTES,
+    CTRL_CHANNELS,
+    CTRL_SAMPLE_RATE,
+    CTRL_BITS_PER_SAMPLE,
+    CTRL_BLOCK_BYTES,
     CTRL_STATE,
     CTRL_LOOP_MODE,
     CTRL_VOLUME,
@@ -353,6 +357,7 @@ const WAVE_FORMAT_DIRECT = 0x0008;
 // Target queued-ahead depth (ms of audio in the SAB ring past the play cursor)
 // maintained by early-completing interior buffers — see checkCompletions.
 const WAVEOUT_DEVICE_LEAD_MS = 60;
+const WAVEOUT_RING_BYTES = 131072;
 
 const TIME_MS = 0x0001;
 const TIME_SAMPLES = 0x0002;
@@ -414,28 +419,19 @@ export interface WinMMState {
     timerThreadHandle: number;
     timerWakeEvent: number;
     joystick: JoystickState;
+    waveOut: WaveOutState[];
+    playSound: PlaySoundState | null;
+    waveDone: WaveDoneState[];
 }
 
 export const WINMM_FIELDS = {
     name: 'transient', exports: 'host', timers: 'save', timersByWheel: 'derive', nextTimerId: 'save', mmioHandles: 'transient',
     dbgLastMmioInfo: 'transient', dbgMmioInfoCount: 'transient', nextMMIOHandle: 'save', mci: 'transient', midiOut: 'transient', periodRefCounts: 'save',
-    waveOutDevices: 'transient', nextWaveOutId: 'save', playSoundId: 'transient', nextPlaySoundId: 'save', playSoundSab: 'transient',
-    timerThreadId: 'save', timerThreadHandle: 'save', timerWakeEvent: 'save', pendingTimerCallbacks: 'transient',
+    waveOutDevices: 'save', nextWaveOutId: 'save', playSoundId: 'save', nextPlaySoundId: 'save', playSoundSab: 'host',
+    timerThreadId: 'save', timerThreadHandle: 'save', timerWakeEvent: 'save', pendingTimerCallbacks: 'save',
     dispatchingPosted: 'transient', pendingTimerHead: 'transient', dispatchingTimerCallback: 'transient', dbgTimerStats: 'transient',
     timerCallbackDrainCount: 'transient',
 } as const satisfies Record<string, FieldPolicy>;
-
-export const WINMM_SCHEMA = {
-    module: WINMM_FIELDS,
-    periodRow: ['periodMs', 'refCount'],
-    state: stateKeys<WinMMState>({
-        timers: true, nextTimerId: true, periodRefCounts: true, nextWaveOutId: true, nextMMIOHandle: true,
-        nextPlaySoundId: true, timerThreadId: true, timerThreadHandle: true, timerWakeEvent: true, joystick: true,
-    }),
-    joystick: stateKeys<JoystickState>({ thresholds: true, captures: true }),
-    joyCapture: stateKeys<JoyCapture>({ hwnd: true, changedOnly: true, timerId: true, x: true, y: true, z: true, buttons: true, primed: true }),
-    timer: WINMM_TIMER_FIELDS,
-} as const;
 
 export interface PendingTimerCallback {
     callbackAddr: number;
@@ -448,7 +444,7 @@ export interface PendingTimerCallback {
     onReturn?: () => void;
 }
 
-interface WaveFormat {
+export interface WaveFormat {
     channels: number;
     sampleRate: number;
     avgBytesPerSec: number;
@@ -456,12 +452,14 @@ interface WaveFormat {
     bitsPerSample: number;
 }
 
-interface PendingWaveBuffer {
+export interface PendingWaveBuffer {
     pwh: number;          // guest WAVEHDR pointer
+    data: number;
+    length: number;
     endOffset: number;    // unwrapped byte offset where this buffer ends
 }
 
-interface WaveOutDevice {
+export interface WaveOutDevice {
     id: number;
     format: WaveFormat;
     callback: number;
@@ -487,6 +485,70 @@ interface WaveOutDevice {
     // memory, synced by syncGuestToSab) only applies while this is false.
     multiBuffer: boolean;
 }
+
+export const WAVEOUT_DEVICE_FIELDS = {
+    id: 'save', format: 'save', callback: 'save', instance: 'save', flags: 'save', isPlaying: 'save', positionBytes: 'save',
+    startTime: 'transient', sab: 'host', writeOffset: 'save', registered: 'derive', pendingBuffers: 'save',
+    lastPlayCursor: 'save', playedBytes: 'save', completionPollerId: 'save', guestLpData: 'save', guestBufferLength: 'save',
+    multiBuffer: 'save',
+} as const satisfies Record<keyof WaveOutDevice, FieldPolicy>;
+
+type WaveOutSavedKeys = { [K in keyof typeof WAVEOUT_DEVICE_FIELDS]: typeof WAVEOUT_DEVICE_FIELDS[K] extends 'save' ? K : never }[keyof typeof WAVEOUT_DEVICE_FIELDS];
+
+export interface WaveOutState {
+    fields: Pick<WaveOutDevice, WaveOutSavedKeys>;
+    writeCursor: number;
+    dataLength: number;
+    loopMode: number;
+    volume: number;
+    pan: number;
+    tail: Uint8Array;
+}
+
+export interface WaveDoneState {
+    callback: number;
+    args: number[];
+}
+
+export interface PlaySoundState {
+    id: number;
+    channels: number;
+    sampleRate: number;
+    bitsPerSample: number;
+    loop: boolean;
+    playCursor: number;
+    pcm: Uint8Array;
+}
+
+type StoredWinMMState = Omit<WinMMState, 'waveOut' | 'playSound'> & {
+    waveOut: Array<Omit<WaveOutState, 'tail'> & { tail: string }>;
+    playSound: (Omit<PlaySoundState, 'pcm'> & { pcm: string }) | null;
+};
+
+export const WINMM_SCHEMA = {
+    module: WINMM_FIELDS,
+    periodRow: ['periodMs', 'refCount'],
+    state: stateKeys<WinMMState>({
+        timers: true, nextTimerId: true, periodRefCounts: true, nextWaveOutId: true, nextMMIOHandle: true,
+        nextPlaySoundId: true, timerThreadId: true, timerThreadHandle: true, timerWakeEvent: true, joystick: true,
+        waveOut: true, playSound: true, waveDone: true,
+    }),
+    joystick: stateKeys<JoystickState>({ thresholds: true, captures: true }),
+    joyCapture: stateKeys<JoyCapture>({ hwnd: true, changedOnly: true, timerId: true, x: true, y: true, z: true, buttons: true, primed: true }),
+    timer: WINMM_TIMER_FIELDS,
+    waveOutDevice: WAVEOUT_DEVICE_FIELDS,
+    waveOut: stateKeys<WaveOutState>({
+        fields: true, writeCursor: true, dataLength: true, loopMode: true, volume: true, pan: true, tail: true,
+    }),
+    waveFormat: stateKeys<WaveFormat>({ channels: true, sampleRate: true, avgBytesPerSec: true, blockAlign: true, bitsPerSample: true }),
+    waveDone: stateKeys<WaveDoneState>({ callback: true, args: true }),
+    waveDoneArgs: ['hwo', 'WOM_DONE', 'dwInstance', 'WAVEHDR', '0'],
+    blobs: ['waveOut.tail', 'playSound.pcm'],
+    waveHeader: stateKeys<PendingWaveBuffer>({ pwh: true, data: true, length: true, endOffset: true }),
+    playSound: stateKeys<PlaySoundState>({
+        id: true, channels: true, sampleRate: true, bitsPerSample: true, loop: true, playCursor: true, pcm: true,
+    }),
+} as const;
 
 export class WinMM implements IModule {
     name = "winmm";
@@ -519,12 +581,12 @@ export class WinMM implements IModule {
     private periodRefCounts: Map<number, number> = new Map();
 
     captureSavestate(): WinMMState {
-        if (this.waveOutDevices.size > 0) throw new Error('winmm: open waveOut devices are not part of a v1 savestate');
         if (this.mmioHandles.size > 0) throw new Error('winmm: open MMIO handles are not part of a v1 savestate');
         if ((this.mci?.openDeviceCount() ?? 0) > 0) throw new Error('winmm: open MCI devices are not part of a v1 savestate');
         if ((this.midiOut?.openCount() ?? 0) > 0) throw new Error('winmm: open MIDI output handles are not part of a v1 savestate');
-        if (this.playSoundSab) throw new Error('winmm: a PlaySound sound is playing');
-        if (this.pendingTimerCallbacks.length > this.pendingTimerHead || this.dispatchingTimerCallback || this.dispatchingPosted) {
+        const queued = this.pendingTimerCallbacks.slice(this.pendingTimerHead);
+        const waveDone = queued.every(cb => !cb.sourceTimer && !cb.onReturn && cb.args?.[1] === WOM_DONE);
+        if (!waveDone || this.dispatchingTimerCallback || this.dispatchingPosted) {
             throw new Error('winmm: a multimedia timer callback is queued or running; try saving again');
         }
         for (const [wheelId, t] of this.timersByWheel) {
@@ -541,7 +603,112 @@ export class WinMM implements IModule {
             timerThreadHandle: this.timerThreadHandle,
             timerWakeEvent: this.timerWakeEvent,
             joystick: captureWinmmJoystick(),
+            waveOut: [...this.waveOutDevices.values()].map(d => this.captureWaveOut(d)),
+            playSound: this.capturePlaySound(),
+            waveDone: queued.map(cb => ({ callback: cb.callbackAddr, args: [...cb.args!] })),
         };
+    }
+
+    private guestMemory(): Uint8Array | null {
+        return System.getInstance().process?.getCurrentMemory() ?? null;
+    }
+
+    private captureWaveOut(d: WaveOutDevice): WaveOutState {
+        const fields = {
+            ...pickDefined(d, WAVEOUT_DEVICE_FIELDS),
+            format: { ...d.format },
+            pendingBuffers: d.pendingBuffers.map(p => ({ ...p })),
+        };
+        if (!d.sab) return { fields, writeCursor: 0, dataLength: 0, loopMode: 1, volume: 0, pan: 0, tail: EMPTY_BYTES };
+        this.updatePlayedBytes(d);
+        fields.playedBytes = d.playedBytes;
+        fields.lastPlayCursor = d.lastPlayCursor;
+        const ringBytes = getCtrl(d.sab, CTRL_BUFFER_BYTES);
+        let tailBytes = 0;
+        if (!d.guestLpData) {
+            const first = d.pendingBuffers[0];
+            const queuedFrom = first ? first.endOffset - first.length : d.writeOffset;
+            tailBytes = Math.max(0, Math.min(ringBytes, queuedFrom - d.playedBytes));
+        }
+        const ring = new Uint8Array(d.sab, CTRL_BLOCK_BYTES, ringBytes);
+        const tail = new Uint8Array(tailBytes);
+        for (let i = 0; i < tailBytes; i++) tail[i] = ring[(d.lastPlayCursor + i) % ringBytes]!;
+        return {
+            fields,
+            writeCursor: getCtrl(d.sab, CTRL_WRITE_CURSOR),
+            dataLength: getCtrl(d.sab, CTRL_DATA_LENGTH),
+            loopMode: getCtrl(d.sab, CTRL_LOOP_MODE),
+            volume: getCtrl(d.sab, CTRL_VOLUME),
+            pan: getCtrl(d.sab, CTRL_PAN),
+            tail,
+        };
+    }
+
+    private restoreWaveOut(st: WaveOutState, mem: Uint8Array | null): WaveOutDevice {
+        const f = st.fields;
+        const guest = (at: number, length: number, what: string): Uint8Array => {
+            if (!mem || at < 0 || at + length > mem.length) {
+                throw new Error(`winmm: ${what} of waveOut device 0x${f.id.toString(16)} at 0x${at.toString(16)} (${length} bytes) is not in guest memory`);
+            }
+            return mem.subarray(at, at + length);
+        };
+        const sab = createAudioRingBuffer(WAVEOUT_RING_BYTES, {
+            channels: f.format.channels, sampleRate: f.format.sampleRate, bitsPerSample: f.format.bitsPerSample,
+        }, true);
+        setCtrl(sab, CTRL_FLAGS, FLAG_CIRCULAR | FLAG_STREAMING);
+        writeRingData(sab, f.lastPlayCursor, st.tail, st.tail.length);
+        for (const p of f.pendingBuffers) {
+            if (p.length > 0) writeRingData(sab, p.endOffset - p.length, guest(p.data, p.length, 'a queued buffer'), p.length);
+        }
+        if (f.guestLpData && f.guestBufferLength) {
+            const length = Math.min(f.guestBufferLength, WAVEOUT_RING_BYTES);
+            writeRingData(sab, 0, guest(f.guestLpData, length, 'the streaming buffer'), length);
+        }
+        setCtrl(sab, CTRL_DATA_LENGTH, st.dataLength);
+        setCtrl(sab, CTRL_WRITE_CURSOR, st.writeCursor);
+        setCtrl(sab, CTRL_LOOP_MODE, st.loopMode);
+        setCtrl(sab, CTRL_VOLUME, st.volume);
+        setCtrl(sab, CTRL_PAN, st.pan);
+        setCtrl(sab, CTRL_PLAY_CURSOR, f.lastPlayCursor);
+        setCtrl(sab, CTRL_RESET_POSITION, 1);
+        setCtrl(sab, CTRL_STATE, f.isPlaying ? STATE_PLAYING : STATE_STOPPED);
+        const device: WaveOutDevice = {
+            ...f, format: { ...f.format }, pendingBuffers: f.pendingBuffers.map(p => ({ ...p })),
+            startTime: 0, sab, registered: true,
+        };
+        ensureAudioStatsSab();
+        self.postMessage({ type: "audio_register", payload: { id: device.id, sab } });
+        return device;
+    }
+
+    private capturePlaySound(): PlaySoundState | null {
+        const sab = this.playSoundSab;
+        if (!sab || getCtrl(sab, CTRL_STATE) !== STATE_PLAYING || getCtrl(sab, CTRL_STOP_REQUESTED)) return null;
+        const length = getCtrl(sab, CTRL_DATA_LENGTH);
+        return {
+            id: this.playSoundId,
+            channels: getCtrl(sab, CTRL_CHANNELS),
+            sampleRate: getCtrl(sab, CTRL_SAMPLE_RATE),
+            bitsPerSample: getCtrl(sab, CTRL_BITS_PER_SAMPLE),
+            loop: getCtrl(sab, CTRL_LOOP_MODE) === -1,
+            playCursor: getCtrl(sab, CTRL_PLAY_CURSOR),
+            pcm: new Uint8Array(sab, CTRL_BLOCK_BYTES, length).slice(),
+        };
+    }
+
+    private restorePlaySound(st: PlaySoundState): void {
+        const sab = createAudioRingBuffer(Math.max(st.pcm.length, 4096), {
+            channels: st.channels, sampleRate: st.sampleRate, bitsPerSample: st.bitsPerSample,
+        }, false);
+        writeRingData(sab, 0, st.pcm, st.pcm.length);
+        setCtrl(sab, CTRL_DATA_LENGTH, st.pcm.length);
+        setCtrl(sab, CTRL_LOOP_MODE, st.loop ? -1 : 1);
+        setCtrl(sab, CTRL_PLAY_CURSOR, st.playCursor);
+        setCtrl(sab, CTRL_RESET_POSITION, 1);
+        self.postMessage({ type: "audio_register", payload: { id: st.id, sab } });
+        setCtrl(sab, CTRL_STATE, STATE_PLAYING);
+        this.playSoundId = st.id;
+        this.playSoundSab = sab;
     }
 
     restoreSavestate(s: WinMMState): void {
@@ -557,9 +724,19 @@ export class WinMM implements IModule {
         this.timerThreadHandle = s.timerThreadHandle;
         this.timerWakeEvent = s.timerWakeEvent;
         restoreWinmmJoystick(s.joystick);
-        this.pendingTimerCallbacks = [];
+        for (const device of this.waveOutDevices.values()) {
+            if (device.registered) self.postMessage({ type: "audio_unregister", payload: { id: device.id } });
+        }
+        const mem = s.waveOut.length > 0 ? this.guestMemory() : null;
+        this.waveOutDevices = new Map(s.waveOut.map(st => [st.fields.id, this.restoreWaveOut(st, mem)]));
+        this.stopPlaySound();
+        if (s.playSound) this.restorePlaySound(s.playSound);
+        this.pendingTimerCallbacks = s.waveDone.map(d => ({ callbackAddr: d.callback, timerId: d.args[0]!, dwUser: d.args[2]!, args: [...d.args] }));
         this.pendingTimerHead = 0;
+        this.dispatchingPosted = null;
+        this.dispatchingTimerCallback = null;
         System.getInstance().scheduler?.notifyWinmmTimerThread(this.timerThreadId, this.timerWakeEvent);
+        if (s.waveDone.length > 0 && this.timerWakeEvent) System.getInstance().scheduler?.setEvent(this.timerWakeEvent);
     }
 
     private publishTimerResolution(): void {
@@ -951,8 +1128,7 @@ export class WinMM implements IModule {
                 device.pendingBuffers.shift();
 
                 // Set WHDR_DONE, clear WHDR_INQUEUE in guest memory
-                const system = System.getInstance();
-                const mem = system.process?.getCurrentMemory();
+                const mem = this.guestMemory();
                 if (mem) {
                     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                     const hdrFlags = view.getUint32(pending.pwh + 16, true);
@@ -984,8 +1160,7 @@ export class WinMM implements IModule {
      */
     private syncGuestToSab(device: WaveOutDevice): void {
         if (!device.sab || !device.guestLpData || !device.guestBufferLength) return;
-        const system = System.getInstance();
-        const mem = system.process?.getCurrentMemory();
+        const mem = this.guestMemory();
         if (!mem) return;
 
         const ringBytes = getCtrl(device.sab, CTRL_BUFFER_BYTES);
@@ -1462,15 +1637,29 @@ export class WinMM implements IModule {
 
     registerSavestate(): () => void {
         return savestateParticipants.add({
-            id: 'winmm', version: 2, order: 63, covers: ['winmm'], schema: WINMM_SCHEMA as unknown as SaveValue,
-            capture: () => {
+            id: 'winmm', version: 3, order: 63, covers: ['winmm'], schema: WINMM_SCHEMA as unknown as SaveValue,
+            capture: (ctx) => {
+                let state: WinMMState;
                 try {
-                    return this.captureSavestate() as unknown as SaveValue;
+                    state = this.captureSavestate();
                 } catch (e) {
                     throw e instanceof CaptureRefusal ? e : new CaptureRefusal(e instanceof Error ? e.message : String(e));
                 }
+                const stored: StoredWinMMState = {
+                    ...state,
+                    waveOut: state.waveOut.map(d => ({ ...d, tail: d.tail.length > 0 ? ctx.blob(d.tail) : '' })),
+                    playSound: state.playSound && { ...state.playSound, pcm: ctx.blob(state.playSound.pcm) },
+                };
+                return stored as unknown as SaveValue;
             },
-            restore: (saved) => this.restoreSavestate(saved as unknown as WinMMState),
+            restore: (saved, ctx) => {
+                const stored = saved as unknown as StoredWinMMState;
+                this.restoreSavestate({
+                    ...stored,
+                    waveOut: stored.waveOut.map(d => ({ ...d, tail: d.tail ? ctx.blob(d.tail) : EMPTY_BYTES })),
+                    playSound: stored.playSound && { ...stored.playSound, pcm: ctx.blob(stored.playSound.pcm) },
+                });
+            },
         });
     }
 
@@ -1648,7 +1837,7 @@ export class WinMM implements IModule {
             // 128KB ring — must be large enough that CALLBACK_NULL games (which get
             // immediate WHDR_DONE and resubmit instantly) can't lap the play cursor.
             // Typical pool: 16 buffers × 4000 bytes = 64KB; 128KB gives 2× headroom.
-            const ringBytes = 131072;
+            const ringBytes = WAVEOUT_RING_BYTES;
             const sab = createAudioRingBuffer(ringBytes, {
                 channels: format.channels,
                 sampleRate: format.sampleRate,
@@ -1810,7 +1999,7 @@ export class WinMM implements IModule {
             const hdrFlags = view.getUint32(pwh + 16, true);
             view.setUint32(pwh + 16, (hdrFlags | WHDR_INQUEUE) & ~WHDR_DONE, true);
 
-            device.pendingBuffers.push({ pwh, endOffset: device.writeOffset });
+            device.pendingBuffers.push({ pwh, data: lpData, length: dwBufferLength, endOffset: device.writeOffset });
 
             // Start poller + timer thread as needed
             this.startCompletionPoller(device);
