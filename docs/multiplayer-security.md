@@ -108,11 +108,15 @@ Both implementations accept the same top-level limits:
 | `maxOfflineRooms` | 32 | Completely offline rooms retained for reconnect |
 | `maxOfflinePeersPerRoom` | 16 | Offline identities retained in each room |
 | `maxBindingsPerPeer` | 1024 | Distinct protocol/local-port slots per connection |
-| `maxBindingEntries` | 16384 | Distinct slots across all live connections |
+| `maxBindingEntries` | `maxConnections` × `maxBindingsPerPeer` (262144) | Distinct slots across all live connections |
 
 Reconnect ownership is a bounded cache, retained for at most `reconnectGraceMs`. Offline entries yield first when a new room or peer needs capacity; active peers and rooms are never evicted to make space. Set either offline quota to zero to disable that cache. Ownership is retained while its cache entry exists; public-room identities are not authenticated accounts.
 
-A port slot includes active generations and release tombstones across relay, multicast and native operations. Reusing a slot with a newer generation does not consume another credit. Tombstones stay until connection retirement, preserving rejection of delayed traffic. Exceeding either budget retires the creating connection and refunds all its credits. Global and per-peer limits bound retained state even when clients send release messages without ever opening a port.
+A port slot includes active generations and release tombstones across relay, multicast and native operations. Reusing a slot with a newer generation does not consume another credit. A release tombstone rejects delayed traffic of the released generation. When a new slot would exceed either budget, the creating connection's oldest released slot is reclaimed instead: Core, the native gateway and the TS reference forget that tombstone, and the new slot takes its credit. Only when the connection holds no released slot (every slot is a live binding) is the creating connection retired, refunding all its credits. Global and per-peer limits therefore bound retained state even when clients send release messages without ever opening a port, while a game that cycles through the guest's 16384 ephemeral ports per protocol, closing more sockets than `maxBindingsPerPeer`, is never retired for it.
+
+Reclaiming is a deliberate trade-off. A tombstone protects only its own participant from that participant's stale traffic, so the oldest-first reclaim keeps that protection for the most recently released `maxBindingsPerPeer` ports. A delayed packet of an older released generation could be admitted again, but only for the same participant; no other participant's state is affected.
+
+Leaving `maxBindingEntries` unset makes the global budget `maxConnections` × `maxBindingsPerPeer`, so no group of connections staying within their own budgets can exhaust it for an honest peer. An explicit smaller value is a hard memory cap, and connections reclaim their own tombstones first when it is reached. A slot costs under 128 bytes across Core and the native gateway (measured 96 B, `core/tests/binding_memory.rs`), so the default budget of 262144 slots bounds this state to about 25 MiB.
 
 ## Message and connection admission
 

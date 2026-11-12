@@ -23,7 +23,11 @@ pub struct Limits {
     pub max_offline_rooms: usize,
     pub max_offline_peers_per_room: usize,
     pub max_bindings_per_peer: usize,
-    pub max_binding_entries: usize,
+    /// Process-wide port-slot cap. `None` (the default) means maxConnections ×
+    /// maxBindingsPerPeer, so peers within their own budget can never exhaust it;
+    /// the server fills it in before constructing Core. Core alone treats `None`
+    /// as no separate global cap.
+    pub max_binding_entries: Option<usize>,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -38,7 +42,7 @@ impl Default for Limits {
             max_offline_rooms: 32,
             max_offline_peers_per_room: 16,
             max_bindings_per_peer: 1024,
-            max_binding_entries: 16384,
+            max_binding_entries: None,
         }
     }
 }
@@ -58,11 +62,18 @@ impl Limits {
             || self.max_offline_rooms > 65536
             || self.max_offline_peers_per_room > 4096
             || !(1..=65536).contains(&self.max_bindings_per_peer)
-            || !(1..=1048576).contains(&self.max_binding_entries)
+            || self
+                .max_binding_entries
+                .is_some_and(|n| !(1..=65536 * 65536).contains(&n))
         {
             return Err(err("Invalid LAN limit"));
         }
         Ok(())
+    }
+    /// Global port-slot budget for a server admitting at most `max_connections`.
+    pub fn binding_entry_budget(&self, max_connections: usize) -> usize {
+        self.max_binding_entries
+            .unwrap_or_else(|| max_connections.saturating_mul(self.max_bindings_per_peer))
     }
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

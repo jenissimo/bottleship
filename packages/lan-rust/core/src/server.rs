@@ -75,6 +75,12 @@ pub enum GatewayInput {
         port: u16,
         generation: u32,
     },
+    /// Drop the released tombstone of a port slot that Core reclaimed under its
+    /// port-slot budget. A live binding is never forgotten.
+    ForgetPort {
+        proto: u8,
+        port: u16,
+    },
     LeaseUdpPeer {
         request_id: u32,
         operation: u64,
@@ -233,7 +239,9 @@ struct Participant {
     join: JoinRequest,
     gateway: GatewayPermissions,
     access_expires_at: u64,
-    port_slots: HashSet<(u8,u16)>,
+    /// Port slot -> released. Released slots are reclaimable oldest-first.
+    port_slots: HashMap<(u8,u16),bool>,
+    released_slots: std::collections::VecDeque<(u8,u16)>,
     bindings: BindingRegistry,
     multicast_bindings: BindingRegistry,
     window_start: u64,
@@ -256,6 +264,7 @@ pub struct Core {
     access: AccessPolicy,
     epoch_unix_ms: u64,
     binding_entries: usize,
+    binding_budget: usize,
 }
 fn emit(to: ConnId, event: ServerEvent, reliable: bool, source: Option<ConnId>) -> Effect {
     let retained_bytes = event.retained_bytes();
@@ -287,6 +296,7 @@ fn lease_reply(to: ConnId, id: u32, code: u32) -> Effect {
 impl Core {
     pub fn new(limits: Limits, routes: Routes, access: AccessPolicy, epoch_unix_ms: u64) -> Result<Self, ConfigError> {
         limits.validate()?;
+        let binding_budget = limits.max_binding_entries.unwrap_or(usize::MAX);
         Ok(Self {
             limits,
             routes,
@@ -296,6 +306,7 @@ impl Core {
             access,
             epoch_unix_ms,
             binding_entries: 0,
+            binding_budget,
         })
     }
     /// Authenticated identity for trusted gateway construction; unknown/retired
@@ -390,7 +401,8 @@ impl Core {
             Participant {
                 join,
                 gateway: admission.gateway,
-                port_slots: HashSet::new(),
+                port_slots: HashMap::new(),
+                released_slots: Default::default(),
                 access_expires_at: admission.expires_at.map(|s|s.saturating_mul(1000).saturating_sub(self.epoch_unix_ms)).unwrap_or(u64::MAX),
                 bindings: BindingRegistry::default(),
                 multicast_bindings: BindingRegistry::default(),
@@ -489,15 +501,53 @@ impl Core {
             InboundEvent::OpenTcpHost {request,..} => Some((request.proto,request.local_port)),
             _ => None,
         };
-        let Some((proto,port))=key.filter(|(proto,port)|*proto<=7 && *port!=0) else {return true;};
-        let p=&self.participants[&connection];
-        if p.port_slots.contains(&(proto,port)) {return true;}
-        if p.port_slots.len()>=self.limits.max_bindings_per_peer || self.binding_entries>=self.limits.max_binding_entries {
-            self.disconnect(connection,now_ms,"LAN binding state limit exceeded",effects);return false;
+        let Some(slot)=key.filter(|(proto,port)|*proto<=7 && *port!=0) else {return true;};
+        let released=matches!(event,InboundEvent::ReleasePort{..});
+        let p=self.participants.get_mut(&connection).unwrap();
+        if let Some(state)=p.port_slots.get_mut(&slot) {
+            if released && !*state { p.released_slots.push_back(slot); }
+            *state=released;
+            Self::compact_released(p);
+            return true;
         }
-        self.participants.get_mut(&connection).unwrap().port_slots.insert((proto,port));
+        if p.port_slots.len()>=self.limits.max_bindings_per_peer || self.binding_entries>=self.binding_budget {
+            // Reclaim this connection's oldest released tombstone instead of retiring an
+            // honest peer whose ephemeral ports cycle. Only live bindings are retirement.
+            let Some((proto,port))=self.reclaim_released_slot(connection) else {
+                self.disconnect(connection,now_ms,"LAN binding state limit exceeded",effects);return false;
+            };
+            effects.push(Effect::NativeOperation{connection,input:GatewayInput::ForgetPort{proto,port}});
+        }
+        let p=self.participants.get_mut(&connection).unwrap();
+        p.port_slots.insert(slot,released);
+        if released { p.released_slots.push_back(slot); Self::compact_released(p); }
         self.binding_entries+=1;
         true
+    }
+    /// Oldest released slot whose bindings are all tombstones; forgets it in Core.
+    /// Losing a tombstone only lets this participant's own stale generation of that
+    /// port be admitted again; it never touches another participant's state.
+    fn reclaim_released_slot(&mut self, connection: ConnId) -> Option<(u8,u16)> {
+        let p=self.participants.get_mut(&connection)?;
+        while let Some(slot)=p.released_slots.pop_front() {
+            if p.port_slots.get(&slot)==Some(&true)
+                && p.bindings.is_released_or_absent(slot.0,slot.1)
+                && p.multicast_bindings.is_released_or_absent(slot.0,slot.1) {
+                p.port_slots.remove(&slot);
+                p.bindings.forget(slot.0,slot.1);
+                p.multicast_bindings.forget(slot.0,slot.1);
+                self.binding_entries-=1;
+                return Some(slot);
+            }
+        }
+        None
+    }
+    /// Keep the reclaim queue proportional to the slot table under port reuse.
+    fn compact_released(p:&mut Participant) {
+        if p.released_slots.len()>p.port_slots.len().saturating_mul(2)+16 {
+            let slots=&p.port_slots;let mut seen=HashSet::new();
+            p.released_slots.retain(|slot|slots.get(slot)==Some(&true) && seen.insert(*slot));
+        }
     }
     fn authorized_target(&self, connection: ConnId, datagram: &Datagram) -> Result<Target, ResolveError> {
         let target = self.routes.target(datagram)?;

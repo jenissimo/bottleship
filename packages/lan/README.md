@@ -164,7 +164,7 @@ Congestion drops unreliable frames; reliable relay overflow disconnects the send
 The recipient remains connected and receives departure through a separate bounded
 control reserve. Defaults also cap Engine.IO sessions at 256, TCP connections at
 1024, unauthenticated lifetime at 5 seconds, offline rooms at 32, offline leases
-per room at 16, port-state slots per peer at 1024 and process-wide slots at 16384.
+per room at 16, port-state slots per peer at 1024 (the oldest released slot is reclaimed first) and process-wide slots at maxConnections × maxBindingsPerPeer.
 All application events share the rate budget. See the security guide for details.
 
 `createLanServer(options)` in `src/server.ts` exposes listener, origin, room,

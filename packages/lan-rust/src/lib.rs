@@ -108,7 +108,11 @@ impl LanServer {
         }
         let started = Instant::now();
         let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis().min(u64::MAX as u128) as u64;
-        let core = Core::new(config.limits.clone(), routes, access, epoch)?;
+        // Unset global port-slot budget = maxConnections x maxBindingsPerPeer: peers that
+        // stay within their own budget can never exhaust it for anyone else.
+        let mut limits = config.limits.clone();
+        limits.max_binding_entries = Some(limits.binding_entry_budget(config.max_connections));
+        let core = Core::new(limits, routes, access, epoch)?;
         let mut wire = transport::Config::default();
         wire.max_connections = config.max_connections;
         wire.max_tcp_connections = config.max_tcp_connections;
@@ -235,6 +239,7 @@ impl Dispatcher {
                     | GatewayInput::ReleaseUdpPeer { .. }
                     | GatewayInput::ReleaseUdpHost { .. }
                     | GatewayInput::ReleasePort { .. }
+                    | GatewayInput::ForgetPort { .. }
             ) {
                 return Ok(());
             }

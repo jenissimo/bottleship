@@ -304,6 +304,12 @@ export class NativeGateway {
         this.bindings.set(key, { generation, released: true });
         this.retirePort(proto, port, generation);
     }
+    /** Drop a released tombstone that the server reclaimed under its port-slot budget. */
+    hasLiveBinding(proto: number, port: number): boolean { return this.bindings.get(proto * 65536 + port)?.released === false; }
+    forgetPort(proto: number, port: number): void {
+        const key = proto * 65536 + port;
+        if (this.bindings.get(key)?.released) this.bindings.delete(key);
+    }
     private retirePort(proto: number, port: number, generation: number): void {
         for (const [key, flow] of this.udp) if (flow.proto === proto && flow.localPort === port
             && (flow.bindingGeneration === undefined || flow.bindingGeneration <= generation)) this.closeUdp(key, flow);

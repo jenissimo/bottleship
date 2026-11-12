@@ -54,8 +54,15 @@ async function resourceChecks(port:number) {
     for(let i=0;i<12;i++){const c=await joined(port,"flood-"+i,11);await floodClose(c);}
     const legitimate=await joined(port,"legitimate",12);await floodClose(legitimate);
     assert(live.connected,"offline rooms must not retire active participants");
-    const attacker=await joined(port,"live",13),closed=event(attacker,"disconnect");
-    for(let i=1;i<=4;i++)attacker.emit("releasePort",1,1000+i,1);await closed;
+    // Releases recycle the sender's own oldest tombstone; live bindings are the hard budget.
+    const attacker=await joined(port,"live",13);
+    for(let i=1;i<=4;i++)attacker.emit("releasePort",1,1000+i,1);
+    const recycled=event(attacker,"resolved");attacker.emit("resolve",1,{host:"unknown.test",family:4});await recycled;
+    assert(attacker.connected,"a release flood must recycle tombstones instead of retiring");
+    await new Promise(r=>setTimeout(r,1100));
+    const closed=event(attacker,"disconnect");
+    for(let i=1;i<=4;i++)attacker.emit("frame",encodeDatagram(1,Uint8Array.of(2,0,0,0,0,10),9,3000+i,Uint8Array.of(1)),1);
+    await closed;
     const next=await joined(port,"live",14);
     for(let i=1;i<=3;i++)next.emit("releasePort",1,2000+i,1);
     const barrier=event(next,"resolved");next.emit("resolve",1,{host:"unknown.test",family:4});await barrier;

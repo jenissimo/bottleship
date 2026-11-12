@@ -49,13 +49,16 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
         maxConnections:256,maxTcpConnections:1024,authorizationTimeoutMs:5000,
         maxRooms: 128, maxPeersPerRoom: 64, maxBufferedFrames: 64, maxBufferedBytes: 1024 * 1024,
         maxFramesPerSecond: 2000, maxBytesPerSecond: 4 * 1024 * 1024, reconnectGraceMs: 60_000,
-        maxOfflineRooms:32, maxOfflinePeersPerRoom:16, maxBindingsPerPeer:1024, maxBindingEntries:16384, ...options,
+        maxOfflineRooms:32, maxOfflinePeersPerRoom:16, maxBindingsPerPeer:1024, ...options, maxBindingEntries:0,
     };
+    // Unset: maxConnections x maxBindingsPerPeer, so peers within their own budget can
+    // never exhaust the process-wide one for anyone else.
+    limits.maxBindingEntries=options.maxBindingEntries ?? limits.maxConnections*limits.maxBindingsPerPeer;
     for (const [key,min,max] of [
         ["maxConnections",1,65536],["maxTcpConnections",1,65536],["authorizationTimeoutMs",100,60000],
         ["maxRooms",1,65536],["maxPeersPerRoom",1,4096],["maxBufferedFrames",1,65536],["maxBufferedBytes",1,1073741824],
         ["maxFramesPerSecond",1,0xffffffff],["maxBytesPerSecond",1,Number.MAX_SAFE_INTEGER],["reconnectGraceMs",0,86400000],
-        ["maxOfflineRooms",0,65536],["maxOfflinePeersPerRoom",0,4096],["maxBindingsPerPeer",1,65536],["maxBindingEntries",1,1048576],
+        ["maxOfflineRooms",0,65536],["maxOfflinePeersPerRoom",0,4096],["maxBindingsPerPeer",1,65536],["maxBindingEntries",1,65536*65536],
     ] as const) {
         const value=limits[key];if(!Number.isSafeInteger(value)||value<min||value>max)throw new RangeError("Invalid LAN limit: "+key);
     }
@@ -201,12 +204,36 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
         const session=sessions.get(socket.conn);if(session){session.authorized=true;if(session.timer)clearTimeout(session.timer);}
         const { room, lease, admission } = socket.data as { room: Room; lease: Lease; admission: Admission };
         const allowedRoutes = new Set(admission.gateway.routes);
-        const portSlots=new Set<number>();
-        const reservePort=(proto:number,port:number):boolean=>{
+        // Port slot -> released. When a budget is full, this connection's oldest released
+        // tombstone is reclaimed (ephemeral ports cycle); live bindings are the hard limit.
+        // Losing a tombstone only lets this participant's own stale generation back in.
+        const portSlots=new Map<number,boolean>();
+        let releasedSlots:number[]=[],releasedHead=0;
+        const compactReleased=()=>{
+            if((releasedHead>64&&releasedHead*2>releasedSlots.length)||releasedSlots.length-releasedHead>portSlots.size*2+16){
+                const seen=new Set<number>(),kept:number[]=[];
+                for(let i=releasedHead;i<releasedSlots.length;i++){const k=releasedSlots[i];if(portSlots.get(k)===true&&!seen.has(k)){seen.add(k);kept.push(k);}}
+                releasedSlots=kept;releasedHead=0;
+            }
+        };
+        const reclaimReleased=():boolean=>{
+            while(releasedHead<releasedSlots.length){
+                const key=releasedSlots[releasedHead++],proto=Math.floor(key/65536),port=key%65536;
+                if(portSlots.get(key)!==true)continue;
+                if(proto===PROTO_UDP&&udpBindings.get(port)?.released===false||proto===PROTO_TCP&&tcpBindings.get(port)?.released===false||gateway.hasLiveBinding(proto,port))continue;
+                portSlots.delete(key);bindingEntries--;
+                if(proto===PROTO_UDP)udpBindings.delete(port);
+                if(proto===PROTO_TCP)tcpBindings.delete(port);
+                gateway.forgetPort(proto,port);compactReleased();return true;
+            }
+            compactReleased();return false;
+        };
+        const reservePort=(proto:number,port:number,released=false):boolean=>{
             if(!isProtocol(proto)||!validPort(port))return true;
-            const key=proto*65536+port;if(portSlots.has(key))return true;
-            if(portSlots.size>=limits.maxBindingsPerPeer||bindingEntries>=limits.maxBindingEntries){socket.disconnect(true);return false;}
-            portSlots.add(key);bindingEntries++;return true;
+            const key=proto*65536+port,state=portSlots.get(key);
+            if(state!==undefined){if(released&&!state)releasedSlots.push(key);portSlots.set(key,released);compactReleased();return true;}
+            if((portSlots.size>=limits.maxBindingsPerPeer||bindingEntries>=limits.maxBindingEntries)&&!reclaimReleased()){socket.disconnect(true);return false;}
+            portSlots.set(key,released);if(released)releasedSlots.push(key);compactReleased();bindingEntries++;return true;
         };
         const expiration = Number.isFinite(admission.expiresAt) ? setTimeout(() => socket.disconnect(true), Math.max(0, admission.expiresAt * 1000 - Date.now())) : undefined;
         let windowStart = Date.now(), frames = 0, bytes = 0;
@@ -228,7 +255,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             if(!withinLimits(size))return;
             if (admission.expiresAt <= Math.floor(Date.now() / 1000)) { socket.disconnect(true); return; }
             const [event,...args]=packet;
-            if(event==="releasePort" && !reservePort(args[0],args[1]))return;
+            if(event==="releasePort" && !reservePort(args[0],args[1],true))return;
             if(["leaseUdpPeer","openUdpHost","openTcpHost"].includes(event) && args[1] && typeof args[1]==="object" &&
                 !reservePort(args[1].proto,args[1].localPort))return;
             if(event==="frame" && validBindingGeneration(args[1])){
