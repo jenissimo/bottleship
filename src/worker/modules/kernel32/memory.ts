@@ -1857,7 +1857,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     exports['HeapAlloc'] = (ctx, mem, args) => {
         const hHeap = args[0];
         const dwFlags = args[1];
-        const dwBytes = args[2] >>> 0;
+        // Zero-byte requests still return a distinct, freeable allocation.
+        const dwBytes = Math.max(args[2] >>> 0, 1);
 
         Logger.verboseLazy(LogCategory.KERNEL32,
             () => `HeapAlloc(0x${hHeap.toString(16)}, 0x${dwFlags.toString(16)}, ${dwBytes})`);
@@ -1867,12 +1868,6 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const system = System.getInstance();
         const process = system.process;
         if (process) {
-            if (dwBytes === 0) {
-                system.scheduler.setLastError(HEAP_OOM_ERROR);
-                Logger.warn(LogCategory.KERNEL32, `HeapAlloc refused size 0 ${formatCallSite(ctx, mem, 4, [0x38, 0x44], [0])}`);
-                return 0;
-            }
-
             // If the slab arena is exhausted, grow it. Reaching JS for a sub-4KB
             // alloc is the signal: the inline x86 stub and the Rust hypercall both fall
             // through exactly when SLAB_END was overrun. After grow, the next call picks
@@ -3623,15 +3618,11 @@ export function registerFastPathHeapFunctions(dispatcher: HleDispatcher): void {
         if (esp + 16 > mem8.length) return null;
 
         const dwFlags = view.getUint32(esp + 8, true) >>> 0;
-        const dwBytes = view.getUint32(esp + 12, true) >>> 0;
+        // Zero bytes is a valid request (see exports['HeapAlloc']): serve the smallest block.
+        const dwBytes = Math.max(view.getUint32(esp + 12, true) >>> 0, 1);
         const system = System.getInstance();
         const process = system.process;
         if (!process) return null;
-
-        if (dwBytes === 0) {
-            system.scheduler.setLastError(HEAP_OOM_ERROR);
-            return 0;
-        }
 
         // A sub-4KB alloc reaching JS at all means the inline stub and the WASM hypercall
         // both fell through, i.e. the arena is full. This is the ONLY signal the arena has
