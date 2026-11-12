@@ -4,7 +4,7 @@ import { ThunkImplementation, ThunkResult, type X86Context } from "../core/thunk
 import { System } from "../core/system";
 import { Logger, LogCategory } from "../core/logger";
 import { InterfaceRegistry, registerStandardDirectXInterfaces } from "../core/com/interface-registry";
-import { ComObjectFactory, BaseComObject } from "../core/com/base-com-object";
+import { ComObjectFactory } from "../core/com/base-com-object";
 import { lookupHleComClass, releaseHleComServerLoads, leaveComApartment } from "../core/com/hle-com-registry";
 import { SystemResourceProvider } from "../core/resources/system-resource-provider";
 import { allocateComObject } from "../core/com/com-memory";
@@ -42,7 +42,7 @@ const BF_MAX_KEY_LEN = 0x38;
 export const OLE32_FIELDS = {
     name: 'transient', exports: 'host', process: 'host', iunknownStubs: 'derive', guidState: 'save', guidCounter: 'save',
     blowfishInstances: 'save', blowfishVtableAddr: 'save', mallocObjAddr: 'save', taskMemSizes: 'save', classRegistrations: 'save',
-    nextClassRegistration: 'save', messageFilter: 'save', dragDropRegistrations: 'save', objectAddressMap: 'transient',
+    nextClassRegistration: 'save', messageFilter: 'save', dragDropRegistrations: 'save',
 } as const satisfies Record<string, FieldPolicy>;
 
 export interface Ole32State {
@@ -97,10 +97,6 @@ export class Ole32 implements IModule {
         release: (dropTarget) => this.releaseGuestUnknown(dropTarget),
     });
 
-    // Map: object address in memory -> BaseComObject instance
-    // This allows IUnknown methods to find the object by its memory address
-    private objectAddressMap: Map<number, BaseComObject> = new Map();
-
     captureSavestate(): Ole32State {
         const sizes = new Uint32Array(this.taskMemSizes.size * 2);
         let i = 0;
@@ -144,7 +140,6 @@ export class Ole32 implements IModule {
             return [object, { refCount, cipher }];
         }));
         this.dragDropRegistrations.restoreState(s.dragDropRegistrations);
-        this.objectAddressMap.clear();
         comApartments.restoreState(s.apartments);
     }
 
@@ -1502,7 +1497,6 @@ export class Ole32 implements IModule {
         releaseHleComServerLoads(this.process, true);
         comApartments.reset();
         this.dragDropRegistrations.reset();
-        this.objectAddressMap.clear();
         this.classRegistrations.clear();
         this.nextClassRegistration = 0x1000;
         this.blowfishInstances.clear();

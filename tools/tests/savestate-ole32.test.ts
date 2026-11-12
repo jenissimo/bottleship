@@ -205,7 +205,7 @@ describe("ole32 participant", () => {
         const undo = ole.registerSavestate();
         try {
             expect(savestateParticipants.coveredModules().has("ole32")).toBe(true);
-            expect(savestateParticipants.schemas().ole32).toEqual({ version: 1, schemaHash: "4e3faea6b65bd84e" });
+            expect(savestateParticipants.schemas().ole32).toEqual({ version: 1, schemaHash: "a4e706e575999367" });
         } finally {
             undo();
         }
