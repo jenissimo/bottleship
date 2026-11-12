@@ -2895,8 +2895,7 @@ export class ThunkDispatcher {
             // Also refresh the hypercall page so the WASM GetTickCount hypercall sees the
             // updated value within the same tick (it reads OFF_HC_TICK_COUNT directly).
             const ts = this.cachedTimeService || (this.cachedTimeService = TimeService.getInstance());
-            const wallNow = performance.now();
-            const deficit = wallNow - ts.nowMs();
+            const deficit = ts.wallMs() - ts.nowMs();
             if (deficit > 0.5) {
                 ts.advanceVirtualTime(Math.min(deficit, 16));
             }

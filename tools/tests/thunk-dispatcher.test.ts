@@ -12,6 +12,7 @@ import { stubRegistry } from '../../src/worker/core/diagnostics/stub-registry';
 import { preemptionManager } from '../../src/worker/core/cpu/preemption-manager';
 import { System } from '../../src/worker/core/system';
 import { ThunkBoundaryKind } from '../../src/worker/core/scheduler/types';
+import { TimeService } from '../../src/worker/runtime/time';
 
 const SPIN_ADDR = 0xdead0000;
 
@@ -984,6 +985,43 @@ describe('ThunkDispatcher - implementation-lookup miss cache', () => {
         d._handlePortWriteSlow(id, true);
         expect(cpu.reg32[0] >>> 0).toBe(0x1234);
         expect(stubRegistry.list().find((h: any) => h.func === 'LateImpl' || h.functionName === 'LateImpl')?.count).toBe(2);
+    });
+
+    describe('clock catch-up after a sync thunk, on a clock a savestate restored', () => {
+        const ts = TimeService.getInstance() as any;
+        const FIELDS = ['virtualTimeActive', 'virtualTimeMs', 'wallOffsetMs', 'lastReturnedMs', 'unixEpochOffsetMs', 'mode'];
+        let saved: unknown[];
+        beforeEach(() => { saved = FIELDS.map(f => ts[f]); ts.mode = 'realtime'; ts.enableVirtualTime(); });
+        afterEach(() => { FIELDS.forEach((f, i) => { ts[f] = saved[i]; }); });
+        const spin = (ms: number) => { const until = performance.now() + ms; while (performance.now() < until) { /* wall passes */ } };
+        const thunks = (n: number, gapMs: number): number => {
+            const { d, id, cpu } = mkMissFixture('ClockImpl');
+            d.register('kernel32', 'ClockImpl', () => 1);
+            const before = ts.nowMs();
+            for (let i = 0; i < n; i++) { spin(gapMs); cpu.reg32[4] = 0x1000; d._handlePortWriteSlow(id, true); }
+            return ts.nowMs() - before;
+        };
+
+        it('a snapshot taken later in its session than this worker is old: the clock still follows wall', () => {
+            ts.restoreClock({ nowMs: performance.now() + 60_000 });
+            const advanced = thunks(10, 2);
+            expect(advanced).toBeGreaterThan(15);
+            expect(advanced).toBeLessThan(200);
+        });
+
+        it('a snapshot taken earlier than this worker is old: thunks do not push the clock ahead of wall', () => {
+            spin(20);
+            ts.restoreClock({ nowMs: 5 });
+            const t0 = performance.now();
+            const advanced = thunks(50, 0);
+            expect(advanced).toBeLessThanOrEqual(performance.now() - t0 + 1);
+        });
+
+        it('with no restored clock the catch-up is what it was', () => {
+            const advanced = thunks(10, 2);
+            expect(advanced).toBeGreaterThan(15);
+            expect(advanced).toBeLessThan(200);
+        });
     });
 
     it('throttles the full UNIMPLEMENTED log to 8 calls per id but keeps accounting', () => {
