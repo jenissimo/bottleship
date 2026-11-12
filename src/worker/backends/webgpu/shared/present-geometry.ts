@@ -120,6 +120,90 @@ export function coversTarget(dest: PresentRect, outW: number, outH: number): boo
         Math.abs(dest.w - outW) <= 1 && Math.abs(dest.h - outH) <= 1;
 }
 
+// ---- the part of the guest screen the host surface shows ---------------------------
+//
+// Screen-sized planes (the window plane, the video plane, a windowed DirectDraw primary)
+// are images of the whole guest screen. The host surface shows the rectangle V of that
+// screen which System publishes (app_resize), so a plane is presented as its V part,
+// stretched over the content rect like any presented frame. The host inverts the same V.
+
+/** V clipped to a plane; `whole` when the plane is shown entirely. One reused record. */
+export interface PlaneView { x: number; y: number; w: number; h: number; whole: boolean }
+
+// @transient(a copy of System's host view, republished with every host resize - the boot and restore mode sets included)
+let viewX = 0, viewY = 0, viewW = 0, viewH = 0;
+const planeView: PlaneView = { x: 0, y: 0, w: 0, h: 0, whole: true };
+
+/** The rectangle of the guest screen the host surface shows; a non-positive size means all of it. */
+export function setGuestView(x: number, y: number, width: number, height: number): void {
+    viewX = x; viewY = y;
+    viewW = width > 0 ? width : 0;
+    viewH = height > 0 ? height : 0;
+}
+
+/**
+ * The part of a `planeW x planeH` screen plane the host surface shows. A view that covers
+ * the plane, lies outside it, or was never published is the whole plane. Callers must not
+ * retain the record.
+ */
+export function guestViewOnPlane(planeW: number, planeH: number): PlaneView {
+    const v = planeView;
+    const x0 = Math.max(0, Math.min(viewX, planeW));
+    const y0 = Math.max(0, Math.min(viewY, planeH));
+    const x1 = Math.max(x0, Math.min(viewX + viewW, planeW));
+    const y1 = Math.max(y0, Math.min(viewY + viewH, planeH));
+    if (viewW <= 0 || viewH <= 0 || x1 - x0 <= 0 || y1 - y0 <= 0
+        || (x0 === 0 && y0 === 0 && x1 === planeW && y1 === planeH)) {
+        v.x = 0; v.y = 0; v.w = planeW; v.h = planeH; v.whole = true;
+        return v;
+    }
+    v.x = x0; v.y = y0; v.w = x1 - x0; v.h = y1 - y0; v.whole = false;
+    return v;
+}
+
+/**
+ * One quad (6 vertices of x, y, u, v) per rect of a screen plane, appended to `verts`.
+ * The rects are in guest screen coordinates, which is the plane's own space; `dest` is the
+ * content rect, which shows `view`. A rect is clipped to the view and lands over the pixels
+ * the presented frame has there.
+ */
+export function appendOverlayRectQuads(
+    verts: number[],
+    rects: ReadonlyArray<{ x: number; y: number; w: number; h: number }>,
+    planeW: number, planeH: number, view: PlaneView,
+    dest: PresentRect, outW: number, outH: number,
+): void {
+    const viewX = view.x, viewY = view.y;
+    const viewR = view.x + view.w, viewB = view.y + view.h;
+    const sx = dest.w / view.w;
+    const sy = dest.h / view.h;
+    for (const r of rects) {
+        const x = Math.max(viewX, Math.min(r.x, viewR));
+        const y = Math.max(viewY, Math.min(r.y, viewB));
+        const x2 = Math.max(x, Math.min(r.x + r.w, viewR));
+        const y2 = Math.max(y, Math.min(r.y + r.h, viewB));
+        if (x2 - x <= 0 || y2 - y <= 0) continue;
+
+        const nx0 = ((dest.x + (x - viewX) * sx) / outW) * 2 - 1;
+        const nx1 = ((dest.x + (x2 - viewX) * sx) / outW) * 2 - 1;
+        const ny1 = 1 - ((dest.y + (y - viewY) * sy) / outH) * 2;   // top edge
+        const ny0 = 1 - ((dest.y + (y2 - viewY) * sy) / outH) * 2;  // bottom edge
+        const u0 = x / planeW;
+        const u1 = x2 / planeW;
+        const v0 = y / planeH;   // top
+        const v1 = y2 / planeH;  // bottom
+
+        verts.push(
+            nx0, ny0, u0, v1,
+            nx1, ny0, u1, v1,
+            nx1, ny1, u1, v0,
+            nx0, ny0, u0, v1,
+            nx1, ny1, u1, v0,
+            nx0, ny1, u0, v0,
+        );
+    }
+}
+
 // ---- the host side of the same map -------------------------------------------------
 //
 // The host inverts this rect to turn a pointer event back into a guest coordinate. It lives

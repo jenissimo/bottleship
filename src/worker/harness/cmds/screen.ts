@@ -20,7 +20,7 @@ import { getOverlayCompositePlan, isGameScreenOwned, isFlipScreenOwned, isGdiOut
 import { windows as userWindows, getAbsoluteWindowPosition, isEffectivelyVisible } from "../../modules/user32/shared-state";
 import { controlTintColor, setControlTintArmed } from "../../modules/user32/control-tint";
 import { ddrawShowsContent } from "../../modules/ddraw/gdi-visibility";
-import { getPresentRect } from "../../backends/webgpu/shared/present-geometry";
+import { getPresentRect, guestViewOnPlane } from "../../backends/webgpu/shared/present-geometry";
 
 /** Where a `debug_png_dump` we post actually lands: the host writes it under its own
  *  session directory, so a `saved` path that ignored the session would point an agent
@@ -417,10 +417,14 @@ export function registerScreenCommands(svc: HarnessService): void {
                 if (x1 >= 0) {
                     const gw = overlayCanvas?.width ?? SW, gh = overlayCanvas?.height ?? SH;
                     const p = source === "overlay" ? null : getPresentRect();
+                    // The content rect shows the host view's part of the screen, not all of it.
+                    const view = guestViewOnPlane(gw, gh);
+                    const vx = view.x, vy = view.y, vw = view.w, vh = view.h;
                     const map = (cx: number, cy: number): [number, number] => {
-                        if (!p || p.w <= 0 || p.h <= 0) return [cx * (gw / SW), cy * (gh / SH)];
-                        return [((cx * p.outW) / SW - p.x) * (gw / p.w),
-                                ((cy * p.outH) / SH - p.y) * (gh / p.h)];
+                        if (source === "overlay") return [cx * (gw / SW), cy * (gh / SH)];
+                        if (!p || p.w <= 0 || p.h <= 0) return [vx + cx * (vw / SW), vy + cy * (vh / SH)];
+                        return [vx + ((cx * p.outW) / SW - p.x) * (vw / p.w),
+                                vy + ((cy * p.outH) / SH - p.y) * (vh / p.h)];
                     };
                     const [bx0, by0] = map(x0, y0);
                     const [bx1, by1] = map(x1 + 1, y1 + 1);

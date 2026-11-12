@@ -10,7 +10,7 @@ import { setD3D9FloatCapabilityContract } from "./shared/float-format-policy";
 import { setD3D9VolumeCapabilityContract } from "./shared/volume-policy";
 import { setD3D9MsaaCapabilityContract } from "./d3d9/multisample";
 import { setD3D9WebGpuCapabilityLimits } from "./shared/webgpu-capability-limits";
-import { coversTarget, overlayDestRect, publishComputedPresentRect } from "./shared/present-geometry";
+import { appendOverlayRectQuads, coversTarget, guestViewOnPlane, overlayDestRect, publishComputedPresentRect } from "./shared/present-geometry";
 import { instrumentGpuDeviceCensus } from "./shared/gpu-memory-census";
 
 /** Backoff between requestDevice attempts while recovering, in ms. The list also fixes how
@@ -44,7 +44,9 @@ export class WebGPUBackend implements RenderBackend {
     /** Positioned quad for an overlay plane that does not cover the whole target. */
     private overlayDestVertexBuffer: GPUBuffer | null = null;
     /** The rect the quad above currently holds — it only moves on a resize/mode change. */
-    private overlayDestVertexRect = { x: -1, y: -1, w: -1, h: -1, outW: -1, outH: -1 };
+    private overlayDestVertexRect = { x: -1, y: -1, w: -1, h: -1, outW: -1, outH: -1, u0: 0, v0: 0, u1: 1, v1: 1 };
+    /** UV rectangle of a cropped screen-plane present, reused. */
+    private readonly screenPlaneUv: [number, number, number, number] = [0, 0, 1, 1];
     /** getCanvasSize result, reused: it is read several times per frame. */
     private canvasSize = { width: 0, height: 0 };
     
@@ -210,7 +212,7 @@ export class WebGPUBackend implements RenderBackend {
         this.overlayVertexBuffer = null;
         this.overlayBindGroup = null;
         this.overlayDestVertexBuffer = null;
-        this.overlayDestVertexRect = { x: -1, y: -1, w: -1, h: -1, outW: -1, outH: -1 };
+        this.overlayDestVertexRect = { x: -1, y: -1, w: -1, h: -1, outW: -1, outH: -1, u0: 0, v0: 0, u1: 1, v1: 1 };
         this.rectsVertexBuffer = null;
         this.rectsVertexBufferCapacity = 0;
         this.statsTexture = null;
@@ -544,9 +546,6 @@ export class WebGPUBackend implements RenderBackend {
         const { width: outW, height: outH } = this.getCanvasSize();
         if (outW <= 0 || outH <= 0) return;
         const dest = overlayDestRect(outW, outH);
-        const sx = dest.w / screenW;
-        const sy = dest.h / screenH;
-
         this.updateOverlayTexture(overlay);
         if (!this.overlayTextureView) return;
 
@@ -556,34 +555,8 @@ export class WebGPUBackend implements RenderBackend {
             this.overlayBindGroup = null;
         }
 
-        // Build one quad per rect: position in NDC, UV = same rect in overlay space.
         const verts: number[] = [];
-        for (const r of rects) {
-            // Clamp to overlay bounds
-            const x = Math.max(0, Math.min(r.x, screenW));
-            const y = Math.max(0, Math.min(r.y, screenH));
-            const x2 = Math.max(x, Math.min(r.x + r.w, screenW));
-            const y2 = Math.max(y, Math.min(r.y + r.h, screenH));
-            if (x2 - x <= 0 || y2 - y <= 0) continue;
-
-            const nx0 = ((dest.x + x * sx) / outW) * 2 - 1;
-            const nx1 = ((dest.x + x2 * sx) / outW) * 2 - 1;
-            const ny1 = 1 - ((dest.y + y * sy) / outH) * 2;   // top edge
-            const ny0 = 1 - ((dest.y + y2 * sy) / outH) * 2;  // bottom edge
-            const u0 = x / screenW;
-            const u1 = x2 / screenW;
-            const v0 = y / screenH;   // top
-            const v1 = y2 / screenH;  // bottom
-
-            verts.push(
-                nx0, ny0, u0, v1,
-                nx1, ny0, u1, v1,
-                nx1, ny1, u1, v0,
-                nx0, ny0, u0, v1,
-                nx1, ny1, u1, v0,
-                nx0, ny1, u0, v0,
-            );
-        }
+        appendOverlayRectQuads(verts, rects, screenW, screenH, guestViewOnPlane(screenW, screenH), dest, outW, outH);
         if (verts.length === 0) return;
 
         const vertices = new Float32Array(verts);
@@ -705,7 +678,11 @@ export class WebGPUBackend implements RenderBackend {
 
         const { width: outW, height: outH } = this.getCanvasSize();
         const dest = overlayDestRect(outW, outH);
-        const full = coversTarget(dest, outW, outH);
+        const planeW = this.overlayTexture?.width ?? 0, planeH = this.overlayTexture?.height ?? 0;
+        const view = guestViewOnPlane(planeW, planeH);
+        const full = coversTarget(dest, outW, outH) && view.whole;
+        const u0 = view.whole ? 0 : view.x / planeW, u1 = view.whole ? 1 : (view.x + view.w) / planeW;
+        const v0 = view.whole ? 0 : view.y / planeH, v1 = view.whole ? 1 : (view.y + view.h) / planeH;
 
         // Ensure pipeline exists (recreate if format changed)
         if (!this.overlayPipeline || this.overlayPipelineFormat !== this.format) {
@@ -735,14 +712,17 @@ export class WebGPUBackend implements RenderBackend {
             });
         }
         renderPass.setBindGroup(0, this.overlayBindGroup);
-        renderPass.setVertexBuffer(0, full ? this.getVertexBuffer() : this.getOverlayDestVertexBuffer(dest, outW, outH));
+        renderPass.setVertexBuffer(0, full
+            ? this.getVertexBuffer()
+            : this.getOverlayDestVertexBuffer(dest, outW, outH, u0, v0, u1, v1));
         renderPass.draw(6, 1, 0, 0);
         renderPass.end();
     }
 
-    /** A full-quad-UV quad positioned at `dest` (pixels) inside a `outW x outH` target. */
+    /** A quad positioned at `dest` (pixels) inside a `outW x outH` target, sampling the given UV rect. */
     private getOverlayDestVertexBuffer(
         dest: { x: number; y: number; w: number; h: number }, outW: number, outH: number,
+        u0: number, v0: number, u1: number, v1: number,
     ): GPUBuffer {
         const x0 = (dest.x / outW) * 2 - 1;
         const x1 = ((dest.x + dest.w) / outW) * 2 - 1;
@@ -750,16 +730,17 @@ export class WebGPUBackend implements RenderBackend {
         const y0 = 1 - ((dest.y + dest.h) / outH) * 2;
         const c = this.overlayDestVertexRect;
         if (this.overlayDestVertexBuffer && c.x === dest.x && c.y === dest.y &&
-            c.w === dest.w && c.h === dest.h && c.outW === outW && c.outH === outH) {
+            c.w === dest.w && c.h === dest.h && c.outW === outW && c.outH === outH &&
+            c.u0 === u0 && c.v0 === v0 && c.u1 === u1 && c.v1 === v1) {
             return this.overlayDestVertexBuffer;
         }
         const verts = OVERLAY_DEST_SCRATCH;
-        verts[0] = x0; verts[1] = y0; verts[2] = 0; verts[3] = 1;
-        verts[4] = x1; verts[5] = y0; verts[6] = 1; verts[7] = 1;
-        verts[8] = x1; verts[9] = y1; verts[10] = 1; verts[11] = 0;
-        verts[12] = x0; verts[13] = y0; verts[14] = 0; verts[15] = 1;
-        verts[16] = x1; verts[17] = y1; verts[18] = 1; verts[19] = 0;
-        verts[20] = x0; verts[21] = y1; verts[22] = 0; verts[23] = 0;
+        verts[0] = x0; verts[1] = y0; verts[2] = u0; verts[3] = v1;
+        verts[4] = x1; verts[5] = y0; verts[6] = u1; verts[7] = v1;
+        verts[8] = x1; verts[9] = y1; verts[10] = u1; verts[11] = v0;
+        verts[12] = x0; verts[13] = y0; verts[14] = u0; verts[15] = v1;
+        verts[16] = x1; verts[17] = y1; verts[18] = u1; verts[19] = v0;
+        verts[20] = x0; verts[21] = y1; verts[22] = u0; verts[23] = v0;
         if (!this.overlayDestVertexBuffer) {
             this.overlayDestVertexBuffer = this.device!.createBuffer({
                 size: verts.byteLength,
@@ -767,7 +748,9 @@ export class WebGPUBackend implements RenderBackend {
             });
         }
         this.queue!.writeBuffer(this.overlayDestVertexBuffer, 0, verts);
-        this.overlayDestVertexRect = { x: dest.x, y: dest.y, w: dest.w, h: dest.h, outW, outH };
+        const c2 = this.overlayDestVertexRect;
+        c2.x = dest.x; c2.y = dest.y; c2.w = dest.w; c2.h = dest.h; c2.outW = outW; c2.outH = outH;
+        c2.u0 = u0; c2.v0 = v0; c2.u1 = u1; c2.v1 = v1;
         return this.overlayDestVertexBuffer;
     }
 
@@ -793,7 +776,11 @@ export class WebGPUBackend implements RenderBackend {
         viewportHeight?: number,
         clearColor?: GPUColor,
         useNearestFilter?: boolean,
-        present?: { srcW?: number; srcH?: number; outW?: number; outH?: number; toCanvas?: boolean }
+        present?: {
+            srcW?: number; srcH?: number; outW?: number; outH?: number; toCanvas?: boolean;
+            /** The source is an image of the whole guest screen: show the host view's part of it. */
+            screenPlane?: boolean;
+        }
     ): void {
         if (!this.device || !this.format) return;
         Logger.verbose(LogCategory.SYSTEM, `WebGPUBackend: drawTexture opaque=${opaque}`);
@@ -810,11 +797,23 @@ export class WebGPUBackend implements RenderBackend {
             // offscreen), and publishing from those made the rect alternate between two spaces.
             // Opt-in, and cross-checked against the canvas: a flag on a target that is not the
             // canvas publishes nothing, which degrades to the full-canvas fallback.
+            let srcW = present?.srcW, srcH = present?.srcH;
+            let sourceUv: readonly [number, number, number, number] | undefined;
+            if (present?.screenPlane && srcW && srcH) {
+                const view = guestViewOnPlane(srcW, srcH);
+                if (!view.whole) {
+                    const uv = this.screenPlaneUv;
+                    uv[0] = view.x / srcW; uv[1] = view.y / srcH;
+                    uv[2] = (view.x + view.w) / srcW; uv[3] = (view.y + view.h) / srcH;
+                    sourceUv = uv;
+                    srcW = view.w; srcH = view.h;
+                }
+            }
             if (present?.toCanvas) {
                 const canvas = this.getCanvasSize();
                 if (present.outW === canvas.width && present.outH === canvas.height) {
                     publishComputedPresentRect(
-                        present.srcW ?? 0, present.srcH ?? 0, canvas.width, canvas.height,
+                        srcW ?? 0, srcH ?? 0, canvas.width, canvas.height,
                         EmulatorConfig.getInstance().quality,
                     );
                 }
@@ -823,10 +822,11 @@ export class WebGPUBackend implements RenderBackend {
                 clearColor,
                 nearest: useNearestFilter,
                 viewport: useViewport ? { width: viewportWidth!, height: viewportHeight! } : undefined,
-                sourceWidth: present?.srcW,
-                sourceHeight: present?.srcH,
+                sourceWidth: srcW,
+                sourceHeight: srcH,
                 outputWidth: present?.outW,
                 outputHeight: present?.outH,
+                sourceUv,
             });
             return;
         }

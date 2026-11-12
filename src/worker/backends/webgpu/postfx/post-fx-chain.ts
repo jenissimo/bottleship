@@ -36,6 +36,8 @@ export interface PresentOptions {
     /** Output (canvas) pixel size. */
     outputWidth?: number;
     outputHeight?: number;
+    /** Show only this part of the source: a UV rectangle, [u0, v0, u1, v1]. */
+    sourceUv?: readonly [number, number, number, number];
 }
 
 interface PipelineEntry { pipeline: GPURenderPipeline | null; valid: boolean; }
@@ -63,6 +65,12 @@ export class PostFxChain {
 
     // Lazily-created shared resources.
     private vertexBuffer: GPUBuffer | null = null;
+    /** A full-target quad sampling a UV sub-rectangle; rewritten only when that changes. */
+    private cropVertexBuffer: GPUBuffer | null = null;
+    private readonly cropUv = [0, 0, 1, 1];
+    private readonly cropScratch = new Float32Array(24);
+    /** Set by present() for the one pass that samples the SOURCE; drawPass consumes it. */
+    private sourceQuad: GPUBuffer | null = null;
     private samplerLinear: GPUSampler | null = null;
     private samplerNearest: GPUSampler | null = null;
     private layout2: GPUBindGroupLayout | null = null;   // bindings 0,1,2 (no private uniforms)
@@ -256,9 +264,33 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
      *   - output-res chain (CRT/    → upscale source → content-res buffer, run the chain there so
      *     scanlines/FXAA active)       scanlines/aperture/edge-AA land on real display pixels.
      */
+    private getCropVertexBuffer(uv: readonly [number, number, number, number]): GPUBuffer {
+        const c = this.cropUv;
+        if (this.cropVertexBuffer && c[0] === uv[0] && c[1] === uv[1] && c[2] === uv[2] && c[3] === uv[3]) {
+            return this.cropVertexBuffer;
+        }
+        const [u0, v0, u1, v1] = uv;
+        const q = this.cropScratch;
+        q[0] = -1; q[1] = -1; q[2] = u0; q[3] = v1;
+        q[4] = 1; q[5] = -1; q[6] = u1; q[7] = v1;
+        q[8] = 1; q[9] = 1; q[10] = u1; q[11] = v0;
+        q[12] = -1; q[13] = -1; q[14] = u0; q[15] = v1;
+        q[16] = 1; q[17] = 1; q[18] = u1; q[19] = v0;
+        q[20] = -1; q[21] = 1; q[22] = u0; q[23] = v0;
+        if (!this.cropVertexBuffer) {
+            this.cropVertexBuffer = this.device.createBuffer({
+                size: q.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            });
+        }
+        this.device.queue.writeBuffer(this.cropVertexBuffer, 0, q);
+        c[0] = u0; c[1] = v0; c[2] = u1; c[3] = v1;
+        return this.cropVertexBuffer;
+    }
+
     present(srcView: GPUTextureView, target: GPUTextureView, encoder: GPUCommandEncoder, opts: PresentOptions): void {
         if (!this.format) return;
         this.ensureResources();
+        this.sourceQuad = opts.sourceUv ? this.getCropVertexBuffer(opts.sourceUv) : null;
         this.frame++;
         // Monotonic wall-clock seconds for animated effects. performance.now() is the worker's
         // standard monotonic clock (not the banned Date.now()/Math.random()).
@@ -409,7 +441,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
         }
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, bindGroup);
-        pass.setVertexBuffer(0, this.vertexBuffer!);
+        pass.setVertexBuffer(0, this.sourceQuad ?? this.vertexBuffer!);
+        this.sourceQuad = null;
         pass.draw(6, 1, 0, 0);
         pass.end();
     }

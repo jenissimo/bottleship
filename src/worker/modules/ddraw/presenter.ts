@@ -24,6 +24,7 @@ import {
 import { DDSCAPS_TEXTURE } from "./constants";
 import { ensureGpuTextureForBlt } from "./surface-blt-flip";
 import type { DDrawContext } from "./context";
+import { isDDrawExclusiveFullscreen } from "./gdi-visibility";
 import { getOverlayCompositePlan } from "../user32/dialog-overlay";
 import { getVideoPlanePlan, notifyVideoPlaneComposited } from "../../video/video-plane-policy";
 import { markGpuSyncedFromCpu, surfaceSyncManager } from "./surface-sync";
@@ -608,7 +609,9 @@ export class DDrawPresenter implements RenderActive {
                         undefined,
                         // Source (guest) + output (canvas) dims → post-fx chain does
                         // integer/aspect scaling + FXAA texel sizing.
-                        { srcW: surface.width, srcH: surface.height, outW: canvasTex.width, outH: canvasTex.height, toCanvas: true }
+                        { srcW: surface.width, srcH: surface.height, outW: canvasTex.width, outH: canvasTex.height, toCanvas: true,
+                          // Exclusive DirectDraw owns the whole screen whatever its window is.
+                          screenPlane: !isDDrawExclusiveFullscreen(system.ddrawContext) }
                     );
                     this.lastPresented = { view: presentTextureView, width: surface.width, height: surface.height };
 

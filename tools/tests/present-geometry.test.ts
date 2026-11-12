@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import {
+    appendOverlayRectQuads,
     clientToGuestPoint,
     computePresentDestRect,
     contentRectFromPresentRect,
     coversTarget,
     getPresentRect,
+    guestViewOnPlane,
     publishPresentRect,
+    setGuestView,
     type HostRect,
     type PresentRect,
 } from "../../src/worker/backends/webgpu/shared/present-geometry";
@@ -178,5 +181,97 @@ describe("a view that is a sub-rectangle of the guest screen", () => {
     test("a view at the screen origin is the plain size mapping", () => {
         const whole = { x: 0, y: 0, width: 640, height: 480 };
         expect(clientToGuestPoint(content, 100 + 560, 50 + 400, whole)).toEqual({ x: 320, y: 240 });
+    });
+});
+
+// A screen-sized plane is presented as the host view's part of it. The plane-side rectangle
+// (guestViewOnPlane) and the host's pointer inverse (clientToGuestPoint with the same view)
+// are one map: the plane pixel shown at a client point is the screen point the pointer reports.
+describe("the host view's part of a screen plane", () => {
+    const whole = { x: 0, y: 0, w: 640, h: 480, whole: true };
+
+    test("no view, a view that covers the plane, and a view outside it are the whole plane", () => {
+        setGuestView(0, 0, 0, 0);
+        expect({ ...guestViewOnPlane(640, 480) }).toEqual(whole);
+        setGuestView(0, 0, 640, 480);
+        expect({ ...guestViewOnPlane(640, 480) }).toEqual(whole);
+        setGuestView(0, 0, 1024, 768);
+        expect({ ...guestViewOnPlane(640, 480) }).toEqual(whole);
+        setGuestView(700, 500, 100, 100);
+        expect({ ...guestViewOnPlane(640, 480) }).toEqual(whole);
+        setGuestView(0, 0, 0, 0);
+    });
+
+    test("a view inside the plane is that rectangle", () => {
+        setGuestView(75, 49, 490, 400);
+        expect({ ...guestViewOnPlane(640, 480) }).toEqual({ x: 75, y: 49, w: 490, h: 400, whole: false });
+        setGuestView(0, 0, 0, 0);
+    });
+
+    test("a view that hangs over the plane's edge is clipped to it", () => {
+        setGuestView(-20, 100, 400, 500);
+        expect({ ...guestViewOnPlane(640, 480) }).toEqual({ x: 0, y: 100, w: 380, h: 380, whole: false });
+        setGuestView(0, 0, 0, 0);
+    });
+
+    test("the plane pixel under a client point is the screen point the pointer reports there", () => {
+        setGuestView(75, 49, 490, 400);
+        const view = guestViewOnPlane(640, 480);
+        const space = { x: view.x, y: view.y, width: view.w, height: view.h };
+        const content: HostRect = { left: 10, top: 20, width: 980, height: 800, right: 990, bottom: 820 };
+        for (const [fx, fy] of [[0, 0], [0.25, 0.5], [0.9, 0.1], [1, 1]]) {
+            const cx = content.left + fx * content.width, cy = content.top + fy * content.height;
+            // What the presenter samples there: the view's UV rectangle, interpolated.
+            const planeX = view.x + fx * view.w, planeY = view.y + fy * view.h;
+            const p = clientToGuestPoint(content, cx, cy, space);
+            expect(p.x).toBeCloseTo(planeX, 9);
+            expect(p.y).toBeCloseTo(planeY, 9);
+        }
+        setGuestView(0, 0, 0, 0);
+    });
+});
+
+describe("dialog rects over a screen plane", () => {
+    const dest = { x: 0, y: 0, w: 1280, h: 960 };
+    /** [left, top, right, bottom] in target pixels and [u0, v0, u1, v1] of one quad. */
+    function quad(v: number[], outW: number, outH: number) {
+        const px = (n: number) => ((n + 1) / 2) * outW, py = (n: number) => ((1 - n) / 2) * outH;
+        return { pos: [px(v[0]), py(v[9]), px(v[4]), py(v[1])], uv: [v[2], v[11], v[6], v[3]] };
+    }
+
+    test("with the whole plane shown a rect is scaled by target / plane", () => {
+        const verts: number[] = [];
+        setGuestView(0, 0, 0, 0);
+        appendOverlayRectQuads(verts, [{ x: 160, y: 120, w: 320, h: 240 }], 640, 480,
+            guestViewOnPlane(640, 480), dest, 1280, 960);
+        const q = quad(verts, 1280, 960);
+        expect(q.pos.map(Math.round)).toEqual([320, 240, 960, 720]);
+        expect(q.uv).toEqual([0.25, 0.25, 0.75, 0.75]);
+    });
+
+    test("with a view shown a rect is placed relative to it and scaled by target / view", () => {
+        const verts: number[] = [];
+        setGuestView(40, 40, 560, 400);
+        appendOverlayRectQuads(verts, [{ x: 180, y: 140, w: 280, h: 200 }], 640, 480,
+            guestViewOnPlane(640, 480), dest, 1280, 960);
+        const q = quad(verts, 1280, 960);
+        // (180-40)/560 = 0.25 of the width, (140-40)/400 = 0.25 of the height, half the view large.
+        expect(q.pos.map(Math.round)).toEqual([320, 240, 960, 720]);
+        // The texture is still the whole plane.
+        expect(q.uv).toEqual([180 / 640, 140 / 480, 460 / 640, 340 / 480]);
+        setGuestView(0, 0, 0, 0);
+    });
+
+    test("a rect is clipped to the view, and one outside it draws nothing", () => {
+        const verts: number[] = [];
+        setGuestView(40, 40, 560, 400);
+        const view = guestViewOnPlane(640, 480);
+        appendOverlayRectQuads(verts, [{ x: 0, y: 0, w: 30, h: 30 }, { x: 0, y: 400, w: 100, h: 80 }],
+            640, 480, view, dest, 1280, 960);
+        expect(verts.length).toBe(24);
+        const q = quad(verts, 1280, 960);
+        expect(q.pos.map(Math.round)).toEqual([0, 864, 137, 960]);
+        expect(q.uv).toEqual([40 / 640, 400 / 480, 100 / 640, 440 / 480]);
+        setGuestView(0, 0, 0, 0);
     });
 });
