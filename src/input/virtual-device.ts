@@ -16,8 +16,10 @@ import {
     INPUT_INDEX,
     KEY_BITFIELD_BASE,
     KEY_BITFIELD_COUNT,
+    KEY_TEXT_UNKNOWN,
     beginInputWrite,
     endInputWrite,
+    keyTextView,
 } from "./sab-layout";
 import type { Binding } from "./bindings";
 
@@ -67,6 +69,7 @@ export interface CommitOptions {
 
 export class VirtualInputDevice {
     private view: Int32Array | null = null;
+    private keyText: Uint16Array | null = null;
     private notify: (() => void) | null = null;
 
     private readonly sources = new Map<SourceId, SourceSlot>();
@@ -90,6 +93,7 @@ export class VirtualInputDevice {
     /** Bind to the SAB. `notify` pokes the worker that a new record is published. */
     attach(view: Int32Array, notify: () => void): void {
         this.view = view;
+        this.keyText = keyTextView(view);
         this.notify = notify;
     }
 
@@ -149,8 +153,14 @@ export class VirtualInputDevice {
         }
     }
 
-    setKey(vk: number, down: boolean, source: SourceId): void {
+    /**
+     * `text` is the UTF-16 unit this press types on the host layout (KEY_TEXT_*), known
+     * only to a producer that saw the real keystroke. Every press states it, so a virtual
+     * key never inherits what a hardware press of the same key typed before it.
+     */
+    setKey(vk: number, down: boolean, source: SourceId, text: number = KEY_TEXT_UNKNOWN): void {
         if (vk < 0 || vk > 0xff) return;
+        if (down && this.keyText) this.keyText[vk] = text;
         const s = this.slot(source);
         const word = vk >> 5;
         const bit = 1 << (vk & 31);

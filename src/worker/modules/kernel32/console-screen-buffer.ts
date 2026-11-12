@@ -62,6 +62,11 @@ function readCharInfo(mem: Uint8Array, addr: number): { ch: number; attr: number
     };
 }
 
+export interface ConsoleBufferState {
+    cols: number; rows: number; cursor: Coord; attributes: number; window: SmallRect;
+    chars: Uint16Array; attrs: Uint16Array;
+}
+
 export class ConsoleScreenBuffer {
     cols: number;
     rows: number;
@@ -79,6 +84,23 @@ export class ConsoleScreenBuffer {
         this.chars.fill(0x20); // space
         this.attrs.fill(DEFAULT_ATTR);
         this.window = { left: 0, top: 0, right: cols - 1, bottom: rows - 1 };
+    }
+
+    captureState(): ConsoleBufferState {
+        return {
+            cols: this.cols, rows: this.rows, cursor: { ...this.cursor }, attributes: this.attributes,
+            window: { ...this.window }, chars: this.chars.slice(), attrs: this.attrs.slice(),
+        };
+    }
+
+    static fromState(state: ConsoleBufferState): ConsoleScreenBuffer {
+        const buffer = new ConsoleScreenBuffer(state.cols, state.rows);
+        buffer.cursor = { ...state.cursor };
+        buffer.attributes = state.attributes;
+        buffer.window = { ...state.window };
+        buffer.chars = state.chars.slice();
+        buffer.attrs = state.attrs.slice();
+        return buffer;
     }
 
     private idx(x: number, y: number): number {
@@ -496,6 +518,20 @@ class ConsoleScreenBufferManager {
         this.nextHandle = 0x10000;
     }
 
+    captureState(): { default: ConsoleBufferState; extra: Array<[number, ConsoleBufferState]>; nextHandle: number } {
+        return {
+            default: this.defaultBuffer.captureState(),
+            extra: [...this.extraBuffers].map(([h, b]) => [h, b.captureState()]),
+            nextHandle: this.nextHandle,
+        };
+    }
+
+    restoreState(state: { default: ConsoleBufferState; extra: Array<[number, ConsoleBufferState]>; nextHandle: number }): void {
+        this.defaultBuffer = ConsoleScreenBuffer.fromState(state.default);
+        this.extraBuffers = new Map(state.extra.map(([h, b]) => [h, ConsoleScreenBuffer.fromState(b)]));
+        this.nextHandle = state.nextHandle;
+    }
+
     getDefault(): ConsoleScreenBuffer {
         return this.defaultBuffer;
     }
@@ -521,6 +557,7 @@ class ConsoleScreenBufferManager {
     }
 }
 
+// @participant(kernel32)
 export const consoleScreenBuffers = new ConsoleScreenBufferManager();
 
 export function readCoordFromMem(mem: Uint8Array, addr: number): Coord {

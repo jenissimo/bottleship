@@ -18,7 +18,7 @@ import { toPlainGuestMemory } from "../../core/memory/guest-memory";
 import { Logger, LogCategory } from "../../core/logger";
 import {
     GL_FLOAT, GL_DOUBLE, GL_INT, GL_SHORT, GL_UNSIGNED_BYTE, GL_UNSIGNED_SHORT,
-    GL_UNSIGNED_INT, GL_BYTE, GL_TEXTURE_GEN_S, GL_TEXTURE_GEN_T,
+    GL_UNSIGNED_INT, GL_BYTE, GL_TEXTURE_GEN_S, GL_TEXTURE_GEN_T, GL_FOG,
 } from "./constants";
 
 // Interleaved vertex layout (VERT_FLOATS floats):
@@ -699,9 +699,10 @@ export function gatherVertices(
     // Positions. The cache holds clip space, so it is ineligible whenever something
     // downstream still needs object space — texgen reads object position and normal.
     const texGen = ctx.enableFlags.has(GL_TEXTURE_GEN_S) || ctx.enableFlags.has(GL_TEXTURE_GEN_T);
+    const fog = ctx.enableFlags.has(GL_FOG);
     let space = VertexSpace.OBJECT;
     const posArr = ctx.vertexArray;
-    if (allowClipCache && !texGen && cvaUsable(ctx, CVA_POS, lo, hi)) {
+    if (allowClipCache && !texGen && !fog && cvaUsable(ctx, CVA_POS, lo, hi)) {
         refreshCvaMvp(ctx);
         cvaFill(ctx, v, CVA_POS, lo, hi);
         gatherFromCache(ctx, CVA_POS, idx, count, dst, dstBase, SLOT_POS);

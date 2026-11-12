@@ -41,6 +41,8 @@ import { eraseControlOverlayRect, repaintDialogAfterContentChange, restampOwnedP
 import { closeOpenComboboxes } from './control-interaction';
 import { getBitmapObjectDimensions, getIconObjectDimensions } from '../gdi32/bitmap-resolve';
 import { encodeAnsi, readAnsiOrWideFromGuest } from '../codepage-utils';
+import { clientSizeFromWindowSize } from './window-geometry';
+import { isValidAddress } from '../../core/memory/address-guard';
 
 const SS_TYPEMASK = 0x001F;
 const SS_BITMAP = 0x000E;
@@ -271,6 +273,8 @@ export function handleSystemControlMessage(
     const LB_SETCARETINDEX  = 0x019E;
     const LB_GETCARETINDEX  = 0x019F;
     const LB_GETITEMHEIGHT  = 0x01A1;
+    const LB_GETITEMRECT    = 0x0198;
+    const LB_GETSEL         = 0x0187;
 
     const CB_ERR = -1 >>> 0; // 0xFFFFFFFF
     const LB_ERR = CB_ERR;
@@ -491,6 +495,27 @@ export function handleSystemControlMessage(
         // Fixed-height list boxes use the same row height for painting and hit testing.
         case LB_GETITEMHEIGHT:
             return LIST_ITEM_H;
+        case LB_GETSEL: {
+            if ((child.systemControlClass ?? '').trim().toLowerCase() !== 'listbox') return 0;
+            const state = getOrCreateListState(child.handle);
+            const idx = wParam | 0;
+            if (idx < 0 || idx >= state.items.length) return LB_ERR;
+            return state.selectedIndex === idx ? 1 : 0;
+        }
+        case LB_GETITEMRECT: {
+            if ((child.systemControlClass ?? '').trim().toLowerCase() !== 'listbox') return 0;
+            const state = getOrCreateListState(child.handle);
+            const idx = wParam | 0;
+            if (idx < 0 || idx >= Math.max(1, state.items.length) || !lParam || !isValidAddress(mem, lParam, 16)) return LB_ERR;
+            const client = clientSizeFromWindowSize(child.style, child.exStyle ?? 0, false, child.width, child.height);
+            const top = (idx - (state.topIndex ?? 0)) * LIST_ITEM_H;
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            view.setInt32(lParam, 0, true);
+            view.setInt32(lParam + 4, top, true);
+            view.setInt32(lParam + 8, client.width, true);
+            view.setInt32(lParam + 12, top + LIST_ITEM_H, true);
+            return 1;
+        }
 
         // --- Combobox messages ---
         case CB_SETITEMHEIGHT: {

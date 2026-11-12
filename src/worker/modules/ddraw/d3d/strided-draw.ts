@@ -19,6 +19,7 @@ const DESC_BYTES = 96;
 type Memory = DDrawContext["process"]["memory"];
 interface Scratch { addr: number; bytes: number }
 // Numbers only: a guest view must never survive a thunk or memory growth.
+// @transient(host scratch)
 const scratchByMemory = new WeakMap<Memory, Scratch>();
 
 export function freeStridedDrawScratch(memory: Memory): void {

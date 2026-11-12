@@ -13,7 +13,7 @@ import { BaseComObject } from '../com/base-com-object';
 import { Logger, LogCategory } from '../logger';
 // Import from core directly: routing this through ddraw/constants would re-enter the
 // constants module while COM memory is initializing.
-import { checkComGuard, freeComObject } from '../com/com-memory';
+import { checkComGuard, comVtableLabel, comVtableOwner, freeComObject } from '../com/com-memory';
 import { System } from '../system';
 
 export enum ResourceType {
@@ -34,6 +34,25 @@ export interface ExternalHandleProvider {
     set(handle: number, attributes: HandleAttributes): boolean;
 }
 
+export interface ResourceProviderState {
+    com: number[][];
+    gdi: number[][];
+    kernel: number[][];
+    user: number[][];
+    file: number[][];
+    attributes: number[][];
+    addressToHandle: number[][];
+    handleToAddress: number[][];
+    handleToPrimaryAddress: number[][];
+    surfacePtrs: number[][];
+    counters: number[];
+    freeCom: number[];
+    freeUser: number[];
+    freeFile: number[];
+    comGenerations: number[][];
+    userGenerations: number[][];
+}
+
 export interface ResourceHandle {
     type: ResourceType;
     id: number; // Handle value returned to WinAPI
@@ -43,6 +62,13 @@ export interface ResourceHandle {
 /**
  * System Resource Provider - центральный менеджер всех системных ресурсов
  */
+export function describeComObject(obj: unknown): string {
+    const o = obj as { iid?: unknown; vtableAddress?: unknown } | null;
+    const iid = typeof o?.iid === 'string' && o.iid ? o.iid : 'unknown iid';
+    const vtable = typeof o?.vtableAddress === 'number' ? o.vtableAddress >>> 0 : 0;
+    return vtable ? `[${comVtableLabel(vtable)} of ${comVtableOwner(vtable)}, iid ${iid}]` : `[iid ${iid}]`;
+}
+
 export class SystemResourceProvider {
     private static instance: SystemResourceProvider;
 
@@ -355,6 +381,9 @@ export class SystemResourceProvider {
      * Register a kernel object (file handles, etc.)
      */
     registerKernelObject(obj: any, attributes?: HandleAttributes): number {
+        // Values a process inherited at creation are already taken in its table (see
+        // registerKernelObjectAt); a fresh object gets the next value nobody holds.
+        while (this.kernelObjects.getByHandle(this.nextKernelHandle) !== null) this.nextKernelHandle += 4;
         const handle = this.nextKernelHandle;
         if (handle >= 0x40000) {
             Logger.error(LogCategory.RESOURCE, `Kernel handle range exhausted! handle=0x${handle.toString(16)}`);
@@ -370,6 +399,35 @@ export class SystemResourceProvider {
 
         Logger.verbose(LogCategory.RESOURCE, `Registered kernel object handle=0x${handle.toString(16)}`);
         return handle;
+    }
+
+    /**
+     * Register a kernel object at a handle value chosen by the caller.
+     *
+     * Inheritance is the one producer: an inherited handle has the SAME value in the child
+     * as in the parent (the value travels on the command line or in the environment), so the
+     * child's table must hold it there rather than at the next free slot. Refuses a value
+     * outside the kernel range or one already in use.
+     */
+    registerKernelObjectAt(handle: number, obj: any, attributes?: HandleAttributes): boolean {
+        handle >>>= 0;
+        if (handle < 0x30000 || handle >= 0x40000 || (handle & 3) !== 0) return false;
+        if (this.kernelObjects.getByHandle(handle) !== null) return false;
+        this.kernelObjects.create(handle, obj);
+        this.handleAttributes.set(handle, attributes ?? { grantedAccess: 0x001fffff, flags: 0 });
+        if (obj !== null && (typeof obj === 'object' || typeof obj === 'function')) {
+            this.kernelObjectReferences.set(obj, (this.kernelObjectReferences.get(obj) ?? 0) + 1);
+        }
+        return true;
+    }
+
+    /** Every kernel handle this process holds with HANDLE_FLAG_INHERIT set, lowest first. */
+    inheritableKernelHandles(): number[] {
+        const out: number[] = [];
+        for (const [handle, attributes] of this.handleAttributes) {
+            if ((attributes.flags & HANDLE_FLAG_INHERIT) && this.kernelObjects.getByHandle(handle) !== null) out.push(handle);
+        }
+        return out.sort((a, b) => a - b);
     }
 
     /**
@@ -634,6 +692,60 @@ export class SystemResourceProvider {
         if (released > 0) {
             Logger.log(LogCategory.RESOURCE, `Force-released ${released} COM objects during shutdown`);
         }
+    }
+
+    captureState(ref: (obj: unknown, where: string) => number): ResourceProviderState {
+        const table = <T>(name: string, t: ResourceTable<T>) =>
+            t.entries().map(([handle, obj]) => [handle, ref(obj, `${name} 0x${handle.toString(16)}`)]);
+        const comTable = this.comObjects.entries().map(([handle, obj]) => [handle, ref(obj, `com 0x${handle.toString(16)} ${describeComObject(obj)}`)]);
+        return {
+            com: comTable,
+            gdi: table('gdi', this.gdiObjects),
+            kernel: table('kernel', this.kernelObjects),
+            user: table('user', this.userObjects),
+            file: table('file', this.fileHandles),
+            attributes: [...this.handleAttributes].map(([h, a]) => [h, a.grantedAccess, a.flags]),
+            addressToHandle: [...this.addressToHandle],
+            handleToAddress: [...this.handleToAddress],
+            handleToPrimaryAddress: [...this.handleToPrimaryAddress],
+            surfacePtrs: [...this.handleToSurfacePtr],
+            counters: [this.nextComHandle, this.nextGdiHandle, this.nextKernelHandle, this.nextUserHandle, this.nextFileHandle],
+            freeCom: [...this.freeComHandles],
+            freeUser: [...this.freeUserHandles],
+            freeFile: [...this.freeFileHandles],
+            comGenerations: [...this.comSlotGeneration],
+            userGenerations: [...this.userSlotGeneration],
+        };
+    }
+
+    restoreState(state: ResourceProviderState, object: (ref: number) => unknown): void {
+        const fill = <T>(t: ResourceTable<T>, rows: number[][]) => {
+            t.clear();
+            for (const [handle, ref] of rows) t.create(handle, object(ref) as T);
+        };
+        fill(this.comObjects, state.com);
+        fill(this.gdiObjects, state.gdi);
+        fill(this.kernelObjects, state.kernel);
+        fill(this.userObjects, state.user);
+        fill(this.fileHandles, state.file);
+        this.kernelObjectReferences = new WeakMap();
+        for (const [, ref] of state.kernel) {
+            const obj = object(ref);
+            if (obj !== null && typeof obj === 'object') this.kernelObjectReferences.set(obj, (this.kernelObjectReferences.get(obj) ?? 0) + 1);
+        }
+        this.handleAttributes = new Map(state.attributes.map(([h, grantedAccess, flags]) => [h, { grantedAccess, flags }]));
+        this.addressToHandle = new Map(state.addressToHandle.map(([a, h]) => [a, h]));
+        this.handleToAddress = new Map(state.handleToAddress.map(([h, a]) => [h, a]));
+        this.handleToPrimaryAddress = new Map(state.handleToPrimaryAddress.map(([h, a]) => [h, a]));
+        this.surfacePtrIndex.clear();
+        this.handleToSurfacePtr.clear();
+        for (const [handle, ptr] of state.surfacePtrs) this.registerSurfacePtr(handle, ptr);
+        [this.nextComHandle, this.nextGdiHandle, this.nextKernelHandle, this.nextUserHandle, this.nextFileHandle] = state.counters;
+        this.freeComHandles = [...state.freeCom];
+        this.freeUserHandles = [...state.freeUser];
+        this.freeFileHandles = [...state.freeFile];
+        this.comSlotGeneration = new Map(state.comGenerations.map(([k, v]) => [k, v]));
+        this.userSlotGeneration = new Map(state.userGenerations.map(([k, v]) => [k, v]));
     }
 
     /**

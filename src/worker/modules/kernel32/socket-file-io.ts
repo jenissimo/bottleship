@@ -37,7 +37,11 @@ export function socketIoWin32Error(error: number): number {
 }
 type FileIoAnswer = ThunkResult | Promise<ThunkResult>;
 interface SynchronousRequest { objectId: number; table: WsaSocketTable; generation: number; thread: number; epoch: number; cancel(): void; }
+// @refuse(a socket read is pending)
 const synchronousRequests = new WeakMap<Process, Set<SynchronousRequest>>();
+export function pendingSocketFileIoCount(process: Process): number {
+    return synchronousRequests.get(process)?.size ?? 0;
+}
 /** CancelIoEx(NULL) also cancels a synchronous ReadFile using the kernel's private IOSB. */
 export function cancelSocketFileIo(process: Process, socket: number, overlapped = 0, thread?: number): number {
     if (overlapped) return 0;

@@ -1,7 +1,7 @@
 // Module management functions for kernel32
 // GetModuleHandle*, LoadLibrary*, GetProcAddress, FreeLibrary, GetModuleFileName*
 
-import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, ThunkResult, type X86Context } from '../../../core/thunking/thunk-dispatcher';
 import type { FastPathImplementation } from '../../../core/thunking/thunk-dispatcher';
 import { System } from '../../../core/system';
 import { Marshaler } from '../../../core/memory/marshaler';
@@ -19,6 +19,13 @@ import { getProcAddressRegistry, type GetProcResolution } from '../../../core/di
 import { moduleHandleMissRegistry } from '../../../core/diagnostics/module-handle-miss-registry';
 import { isSuspectSilentStub } from '../../../core/diagnostics/api-census';
 import { resolveHleExportAddress } from '../../../core/thunking/export-resolver';
+import { shippedExportNames } from '../../../core/pe-export-names';
+import { processCrtBinding } from '../../../core/crt-binding';
+
+const DLL_PROCESS_DETACH = 0;
+
+// @transient(installed once when the kernel32 exports are built; holds no session data)
+export let freeLibraryWithoutDetach: (hModule: number) => void = () => undefined;
 
 export const exports: Record<string, ThunkImplementation> = {};
 
@@ -31,20 +38,30 @@ function getMainExeHandle(): number {
 // The HLE module images (their bases ARE the HMODULEs) live in hle-module-images.ts;
 // FORCE_NATIVE_PACKAGE_LOAD and the VFS presence rules in hle-system-catalog.ts.
 
+// @participant(kernel32)
 const loadLibraryHandleCache = new Map<string, number>();
+// @participant(kernel32)
 const handleToPathCache = new Map<number, string>();
+// @transient(cache of lookups answered again from the restored thunk table)
 const getProcAddressCache = new Map<string, number>();
+// @transient(cache of lookups answered again from the restored thunk table)
 const getProcAddressPointerCache = new Map<string, number>();
+// @transient(diagnostics)
 const loggedUnknownModuleHandles = new Set<number>();
 // FreeLibrary refcounting. Modules that appear in the registry WITHOUT a dynamic
 // LoadLibrary ref (the EXE + its static import closure, and static-import
 // dependencies auto-loaded while mapping a dynamic DLL) are PINNED — a static
 // import holds a permanent reference on real Windows, so FreeLibrary never unloads
 // them. Only explicitly LoadLibrary'd modules unload at refcount 0.
+// @participant(kernel32)
 const pinnedModuleBases = new Set<number>();
+// @participant(kernel32)
 const dynamicLoadRefs = new Map<number, number>();
+// @participant(kernel32)
 const hleLibraryReferences = new Map<number, Map<string, HleModuleLoadReference>>();
+// @transient(identity of the owning process object)
 let cacheOwnerProcess: any = null;
+// @transient(identity of the owning process object)
 let cacheOwnerResetGeneration = -1;
 
 function ensureProcessLocalCaches(): void {
@@ -69,6 +86,33 @@ function ensureProcessLocalCaches(): void {
     dynamicLoadRefs.clear();
     for (const aliases of hleLibraryReferences.values()) for (const reference of aliases.values()) reference.release();
     hleLibraryReferences.clear();
+}
+
+export interface ModuleRefState {
+    pinned: number[];
+    dynamicRefs: Array<[number, number]>;
+    hleReferences: Array<[number, string[]]>;
+    loadLibraryHandles: Array<[string, number]>;
+    handlePaths: Array<[number, string]>;
+}
+
+export function captureModuleRefs(): ModuleRefState {
+    return {
+        pinned: [...pinnedModuleBases],
+        dynamicRefs: [...dynamicLoadRefs],
+        hleReferences: [...hleLibraryReferences].map(([h, aliases]) => [h, [...aliases.keys()]]),
+        loadLibraryHandles: [...loadLibraryHandleCache],
+        handlePaths: [...handleToPathCache],
+    };
+}
+
+export function restoreModuleRefs(state: ModuleRefState): void {
+    ensureProcessLocalCaches();
+    for (const base of state.pinned) pinnedModuleBases.add(base);
+    for (const [base, n] of state.dynamicRefs) dynamicLoadRefs.set(base, n);
+    for (const [handle, names] of state.hleReferences) for (const name of names) rememberHleLibraryReference(name, handle);
+    for (const [name, handle] of state.loadLibraryHandles) loadLibraryHandleCache.set(name, handle);
+    for (const [handle, path] of state.handlePaths) handleToPathCache.set(handle, path);
 }
 
 /** Pin every registered module that holds no dynamic LoadLibrary ref (see
@@ -157,6 +201,7 @@ const EXE_GETPROC_FORWARD_MAP: Record<string, Array<{ dll: string; name: string 
  * by name and still gets the handler. _assert/_wassert are deliberately absent — the
  * release CRT exports both.
  */
+// @transient(constant table)
 const DEBUG_CRT_ONLY_EXPORTS = new Set([
     "_malloc_dbg", "_calloc_dbg", "_realloc_dbg", "_free_dbg", "_expand_dbg",
     "_strdup_dbg", "_wcsdup_dbg", "_msize_dbg", "_recalloc_dbg", "_aligned_malloc_dbg",
@@ -175,6 +220,7 @@ const RELEASE_CRT_MODULE_RE = /^(crtdll|msvcrt|msvcr\d+|msvcp\d+)$/;
  * The same probe aimed at the EXE's own base. An exe never exports these, so the two
  * the release CRT does export (_assert/_wassert) belong here as well.
  */
+// @transient(constant table)
 const EXE_DEBUG_CRT_PROBE_NAMES = new Set([...DEBUG_CRT_ONLY_EXPORTS, "_assert", "_wassert"]);
 
 /**
@@ -425,6 +471,15 @@ function requestsSystemCopyOfAppDirDll(requestedName: string): boolean {
  * files, so a hit under the system directory is our own presence, not the game's copy.
  */
 function appDirDllShadowsHle(dllName: string): boolean {
+    // The process bound this C runtime to the shipped DLL (crt-binding.ts): a LoadLibrary of
+    // it must hand back that same module, not the HLE one the IATs never saw.
+    if (processCrtBinding.choiceFor(dllName) === 'native') {
+        const path = System.getInstance().process?.loader?.findDllPath(dllName);
+        if (path) {
+            Logger.verbose(LogCategory.KERNEL32, `"${dllName}" -> the shipped ${path} (process CRT binding is native)`);
+            return true;
+        }
+    }
     if (!prefersAppDirDll(dllName)) return false;
     const path = System.getInstance().process?.loader?.findDllPath(dllName);
     return !!path && !isUnderSystemDirectory(normalizeDllPathToken(path));
@@ -1166,8 +1221,7 @@ function initModuleFunctions(): void {
         return notFound();
     };
 
-    exports['FreeLibrary'] = (ctx, mem, args) => {
-        const hModule = args[0] >>> 0;
+    const freeLibrary = (ctx: X86Context | null, hModule: number): ThunkResult => {
         ensureProcessLocalCaches();
         pinUntrackedModules();
 
@@ -1208,23 +1262,49 @@ function initModuleFunctions(): void {
         // whose static object lists must not survive into the next menu session). The
         // old image bytes stay mapped: safer than a real unmap, and any straggler
         // pointer into the old code keeps working instead of faulting.
-        registry!.unregister(mod.name);
-        for (const [k, v] of loadLibraryHandleCache) {
-            if (v === hModule) loadLibraryHandleCache.delete(k);
+        const unload = (): void => {
+            registry!.unregister(mod.name);
+            for (const [k, v] of loadLibraryHandleCache) {
+                if (v === hModule) loadLibraryHandleCache.delete(k);
+            }
+            handleToPathCache.delete(hModule);
+            const prefix = `${hModule}:`;
+            const ordPrefix = `${hModule}#`;
+            for (const k of getProcAddressCache.keys()) {
+                if (k.startsWith(prefix) || k.startsWith(ordPrefix)) getProcAddressCache.delete(k);
+            }
+            for (const k of getProcAddressPointerCache.keys()) {
+                if (k.startsWith(prefix) || k.startsWith(ordPrefix)) getProcAddressPointerCache.delete(k);
+            }
+            Logger.log(LogCategory.KERNEL32,
+                `FreeLibrary(0x${hModule.toString(16)}): unloaded "${mod.name}" (image left mapped; next LoadLibrary maps fresh)`);
+        };
+        const system = System.getInstance();
+        const callbackManager = system.process?.dispatcher?.callbackManager;
+        if (!ctx || !mod.isRealDll || !mod.initialized || !mod.entryPoint || !callbackManager || system.isExiting) {
+            unload();
+            return { value: 1, stackCleanup: 4 };
         }
-        handleToPathCache.delete(hModule);
-        const prefix = `${hModule}:`;
-        const ordPrefix = `${hModule}#`;
-        for (const k of getProcAddressCache.keys()) {
-            if (k.startsWith(prefix) || k.startsWith(ordPrefix)) getProcAddressCache.delete(k);
+        mod.initialized = false;
+        const frameId = callbackManager.saveSuspendedThunkContext(ctx as never, 4, 'FreeLibrary DllMain');
+        if (!frameId) {
+            unload();
+            return { value: 1, stackCleanup: 4 };
         }
-        for (const k of getProcAddressPointerCache.keys()) {
-            if (k.startsWith(prefix) || k.startsWith(ordPrefix)) getProcAddressPointerCache.delete(k);
+        const { callbackId } = callbackManager.invokeCallback(
+            (hModule + mod.entryPoint) >>> 0, [hModule, DLL_PROCESS_DETACH, 0], 0, () => { unload(); return 1; },
+            false, 'FreeLibrary DllMain', frameId,
+        );
+        if (!callbackId) {
+            callbackManager.abandonSuspendedFrame(frameId);
+            unload();
+            return { value: 1, stackCleanup: 4 };
         }
-        Logger.log(LogCategory.KERNEL32,
-            `FreeLibrary(0x${hModule.toString(16)}): unloaded "${mod.name}" (image left mapped; next LoadLibrary maps fresh)`);
-        return { value: 1, stackCleanup: 4 };
+        return { value: 1, suspendedForCallback: true, callbackId, stackCleanup: 4 };
     };
+
+    exports['FreeLibrary'] = (ctx, mem, args) => freeLibrary(ctx, args[0] >>> 0);
+    freeLibraryWithoutDetach = (hModule: number) => { freeLibrary(null, hModule >>> 0); };
 
     exports['FreeLibraryAndExitThread'] = (ctx, mem, args) => {
         const hModule = args[0];
@@ -1414,8 +1494,11 @@ function initModuleFunctions(): void {
                         // function by name with an `ordinal:` tag carry no literal `ord_N`
                         // entry, so the placeholder resolves nothing — ask the registry for
                         // the canonical name first, exactly as the PE import walk does.
+                        const shippedName = isOrdinal ? shippedExportNames.nameOf(dllName, ordinal) : undefined;
                         const exportName = isOrdinal
-                            ? apiRegistry.getFunctionNameByOrdinal(dllName, ordinal) ?? procName
+                            ? (shippedName !== undefined && apiRegistry.hasExportedFunction(dllName, shippedName)
+                                ? shippedName
+                                : apiRegistry.getFunctionNameByOrdinal(dllName, ordinal) ?? procName)
                             : procName;
                         address = resolveThunkedExportAddress(dispatcher, dllName, exportName, verbose);
                     }

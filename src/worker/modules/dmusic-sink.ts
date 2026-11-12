@@ -20,6 +20,15 @@ const NO_CONTEXT = { eax: 0, ecx: 0, edx: 0, ebx: 0, esp: 0, ebp: 0, esi: 0, edi
 /** Renders `frames` of interleaved 16-bit PCM into `out`. */
 export type RenderPcm = (out: Int16Array, frames: number) => void;
 
+/**
+ * The DirectSound object createSinkBuffer made for a buffer when the application supplied
+ * none, keyed by the buffer. It is released when the buffer's last reference goes: a
+ * device's last Release destroys the buffers it created (as on Windows), so releasing it
+ * right after creating the buffer would leave DirectMusic writing into a dead buffer.
+ */
+// @transient(after a restore an entry is missing and its private device simply stays alive; the buffer it backs keeps working)
+const privateDevices = new Map<number, number>();
+
 export function soundReference(process: Process, ptr: number, buffer: boolean, retain: boolean): void {
     if (!ptr) return;
     const iface = buffer ? "IDirectSoundBuffer8" : "IDirectSound8";
@@ -27,8 +36,16 @@ export function soundReference(process: Process, ptr: number, buffer: boolean, r
     const exports = process.getModule("dsound")?.exports;
     const fn = exports?.[`${iface}_${method}`] ?? exports?.[`${iface}_${method}`.toLowerCase()];
     const mem = Mem.getView();
-    if (fn && mem) fn(NO_CONTEXT, mem, [ptr]);
+    if (!fn || !mem) return;
+    const left = fn(NO_CONTEXT, mem, [ptr]);
+    if (buffer && !retain && left === 0) {
+        const device = privateDevices.get(ptr >>> 0);
+        privateDevices.delete(ptr >>> 0);
+        if (device) soundReference(process, device, false, false);
+    }
 }
+
+export interface SinkData { bufferBytes: number; scratch: number; writeOffset: number; playing: boolean; silentBytes: number }
 
 export class DirectSoundSink {
     private readonly process: Process;
@@ -48,6 +65,21 @@ export class DirectSoundSink {
         this.buffer = buffer >>> 0;
         this.blockAlign = channels * 2;
         this.bytesPerSecond = sampleRate * this.blockAlign;
+    }
+
+    captureState(): SinkData {
+        return {
+            bufferBytes: this.bufferBytes, scratch: this.scratch, writeOffset: this.writeOffset, playing: this.playing,
+            silentBytes: this.silentBytes,
+        };
+    }
+
+    restoreState(d: SinkData): void {
+        this.bufferBytes = d.bufferBytes;
+        this.scratch = d.scratch;
+        this.writeOffset = d.writeOffset;
+        this.playing = d.playing;
+        this.silentBytes = d.silentBytes;
     }
 
     private call(method: string, args: number[]): number {
@@ -71,6 +103,7 @@ export class DirectSoundSink {
         }
         this.bufferBytes = Mem.readUint32(this.scratch + 8) ?? 0;
         if (this.bufferBytes < this.blockAlign * 64) return false;
+        this.silentBytes = this.bufferBytes;
         this.writeOffset = -1;
         this.playing = this.call("play", [0, 0, DSBPLAY_LOOPING]) === 0;
         return this.playing;
@@ -86,6 +119,12 @@ export class DirectSoundSink {
         this.stop();
         if (this.scratch) this.process.memory.free(this.scratch);
         this.scratch = 0;
+    }
+
+    silentBytes = 0;
+
+    isSilent(): boolean {
+        return this.bufferBytes > 0 && this.silentBytes >= this.bufferBytes;
     }
 
     /** Top the buffer up to the lead beyond its write cursor, rendering what is missing. */
@@ -122,6 +161,9 @@ export class DirectSoundSink {
         if (this.pcm.length < samples) this.pcm = new Int16Array(samples);
         try {
             render(this.pcm, frames);
+            let silent = true;
+            for (let i = 0; i < samples; i++) if (this.pcm[i] !== 0) { silent = false; break; }
+            this.silentBytes = silent ? this.silentBytes + len1 + len2 : 0;
             const bytes = new Uint8Array(this.pcm.buffer, 0, samples * 2);
             if (ptr1 && len1) Mem.writeBytes(ptr1, bytes.subarray(0, len1));
             if (ptr2 && len2) Mem.writeBytes(ptr2, bytes.subarray(len1, len1 + len2));
@@ -137,7 +179,7 @@ export class DirectSoundSink {
  * DirectSound object when it passed one to the performance, else on a new one.
  * Returns the buffer's guest address, or 0.
  */
-export function createSinkBuffer(process: Process, directSound: number, channels: number, sampleRate: number): number {
+export function createSinkBuffer(process: Process, directSound: number, channels: number, sampleRate: number, flags?: number): number {
     const dsound = process.getModule("dsound");
     const mem = Mem.getView();
     if (!dsound || !mem) return 0;
@@ -164,15 +206,22 @@ export function createSinkBuffer(process: Process, directSound: number, channels
         const out = format + 18;
         Mem.writeBytes(scratch, new Uint8Array(DSBUFFERDESC_SIZE + 18 + 8));
         Mem.writeUint32(scratch, DSBUFFERDESC_SIZE);
-        Mem.writeUint32(scratch + 4, DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLPAN | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS);
+        Mem.writeUint32(scratch + 4, flags ?? (DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLPAN | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS));
         Mem.writeUint32(scratch + 8, sinkBufferBytes(channels, sampleRate));
         Mem.writeUint32(scratch + 16, format);
         writeWaveFormat(format, channels, sampleRate);
         const createBuffer = dsound.exports["idirectsound8_createsoundbuffer"] as ThunkImplementation | undefined;
         const fresh = Mem.getView();
         if (!createBuffer || !fresh || createBuffer(NO_CONTEXT, fresh, [ds, scratch, out, 0]) !== 0) return 0;
-        return Mem.readUint32(out) ?? 0;
+        const buffer = Mem.readUint32(out) ?? 0;
+        if (buffer && createdDevice) {
+            // The device must outlive the buffer: hand it to the buffer's last release.
+            privateDevices.set(buffer >>> 0, createdDevice);
+            createdDevice = 0;
+        }
+        return buffer;
     } finally {
+        // Only a device that ended up backing no buffer is released here.
         soundReference(process, createdDevice, false, false);
         process.memory.free(scratch);
     }

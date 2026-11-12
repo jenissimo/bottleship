@@ -2,7 +2,8 @@ import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { MemoryGuard } from "../../core/memory/mem-guard";
 import { MSSContext, SMP_PLAYING } from "./context";
-import { defaultStreamBufferSize, setSampleStatus } from "./helpers";
+import { defaultStreamBufferSize, setSampleStatus, refreshSampleLenDone, getMemory } from "./helpers";
+import { decodeRawSampleData } from "./sample";
 import { convertToFloat } from "./audio-decode";
 import { playSample, appendDecodedChunk } from "./playback-engine";
 
@@ -92,9 +93,12 @@ export function createSampleBufferExports(ctx: MSSContext): Record<string, Thunk
     // _AIL_set_sample_type@12
     exports["_AIL_set_sample_type@12"] = (ctxThunk, mem, args) => {
         const sample = args[0];
-        const format = args[1];
+        const format = args[1] >>> 0;
+        const flags = args[2] >>> 0;
         const sampleObj = ctx.samples.get(sample);
         if (!sampleObj) return 0;
+        sampleObj.sampleTypeFormat = format;
+        sampleObj.sampleTypeFlags = flags;
 
         const stereo = (format & 0x2) !== 0;
         const sixteen = (format & 0x1) !== 0;
@@ -105,9 +109,21 @@ export function createSampleBufferExports(ctx: MSSContext): Record<string, Thunk
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         MemoryGuard.writeUint32(mem, view, sample + 0x2C, sampleObj.formatTag, "MSS32:set_sample_type:format");
-        MemoryGuard.writeUint32(mem, view, sample + 0x30, 0, "MSS32:set_sample_type:flags");
+        MemoryGuard.writeUint32(mem, view, sample + 0x30, flags, "MSS32:set_sample_type:flags");
         MemoryGuard.writeUint32(mem, view, sample + 0x34, sampleObj.sampleRate >>> 0, "MSS32:set_sample_type:rate");
         MemoryGuard.writeUint32(mem, view, sample + 0x38, sampleObj.volume >>> 0, "MSS32:set_sample_type:vol");
+        if (sampleObj.fileFormat === "raw" && sampleObj.fileData) {
+            // Re-interpret the image the voice points at, as it is in guest memory now.
+            const address = sampleObj.fileDataAddress ?? 0;
+            const length = sampleObj.fileData.length;
+            const guest = getMemory(ctx);
+            if (address && MemoryGuard.isValidRange(guest, address, length)) {
+                decodeRawSampleData(sampleObj, guest, address, length);
+            } else {
+                decodeRawSampleData(sampleObj);
+            }
+            refreshSampleLenDone(ctx, sampleObj);
+        }
         return 0;
     };
 

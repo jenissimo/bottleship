@@ -63,8 +63,11 @@ const TOPOLOGY_MAP: Record<number, string> = {
     6: "trianglefan",
 };
 
+// @transient(cache derived from the viewport size)
 let cachedDefaultMvpWidth = -1;
+// @transient(cache derived from the viewport size)
 let cachedDefaultMvpHeight = -1;
+// @transient(cache derived from the viewport size)
 const cachedDefaultMvp = new Float32Array(16);
 
 /**
@@ -641,6 +644,7 @@ export const createDrawHandler = (context: DDrawContext, textureManager: Texture
                 mem, isIndexed,
                 rtState,
                 texStateObj: texStateObj ?? null,
+                textureHandle: texHandle,
                 texStateObj1: texStateObj1 ?? null,
                 stageTextures: stageTexturesScratch,
                 renderStates,

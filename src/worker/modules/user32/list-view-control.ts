@@ -209,8 +209,10 @@ export interface ListViewState {
     textBkColor: number;
 }
 
+// @refuse(list view controls are not part of a v1 savestate)
 const listViewStates = new Map<number, ListViewState>();
 
+// @transient(wiring done once per worker)
 let purgerRegistered = false;
 
 function ensurePurger(): void {
@@ -1357,3 +1359,7 @@ export {
     MK_SHIFT,
     LVIR_BOUNDS,
 };
+
+export function listViewControlCount(): number {
+    return listViewStates.size;
+}

@@ -73,6 +73,7 @@ export function directPlay4GuestEntity(player:DirectPlay4RemotePlayerProjection)
         name:{short:player.shortName,long:player.longName,shortNull:player.shortNull,longNull:player.longNull},
         data:[...player.data],members:[],parent:0,groupOwner:0};
 }
+// @transient(re-entrancy guard held only inside one synchronous roster install)
 const installing=new WeakSet<DirectPlaySession>();
 /** Publish a complete checked projection in one synchronous turn, with no
  * callbacks or guest-visible partial roster between individual insertions. */

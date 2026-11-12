@@ -89,16 +89,43 @@ function slotKeys(dllName: string): string[] {
  * Deliberately NOT inside hleImageBase — our own warmup
  * loops resolve every known module's base, and marking there would vouch for all of them.
  */
-export function markHleModuleLoaded(dllName: string): void {
+export function markHleModuleLoaded(dllName: string, attach = true): void {
+    const attached = !isHleModuleLoaded(dllName);
     for (const key of slotKeys(dllName)) if (slotByName.has(key)) loadedNames.add(key);
+    if (attach && attached && isHleModuleLoaded(dllName)) runAttach(dllName);
+}
+
+/**
+ * DLLs an HLE'd module statically imports on Windows, so loading it loads them too.
+ * shell32 imports comctl32, and comctl32's DllMain registers every common-control
+ * class: an app that links only shell32 can create a SysListView32 without ever
+ * calling InitCommonControls.
+ */
+const STATIC_IMPORTS: Readonly<Record<string, readonly string[]>> = { shell32: ["comctl32"] };
+const attachHooks = new Map<string, Array<() => void>>();
+
+/** Run `hook` each time a process first loads `dllName` (its DLL_PROCESS_ATTACH). */
+export function onHleModuleAttach(dllName: string, hook: () => void): void {
+    const key = canonicalHleModuleName(dllName);
+    attachHooks.set(key, [...(attachHooks.get(key) ?? []), hook]);
+}
+
+function runAttach(dllName: string): void {
+    const key = canonicalHleModuleName(dllName);
+    for (const dependency of STATIC_IMPORTS[key] ?? []) markHleModuleLoaded(dependency);
+    for (const hook of attachHooks.get(key) ?? []) {
+        try { hook(); } catch (e) { Logger.warn(LogCategory.SYSTEM, `[HleImages] ${key} attach hook failed: ${e}`); }
+    }
 }
 
 /** Hold one loader reason. A retired process' release cannot touch a new image epoch. */
-export function retainHleModuleLoaded(dllName: string): HleModuleLoadReference | undefined {
+export function retainHleModuleLoaded(dllName: string, attach = true): HleModuleLoadReference | undefined {
     if (hleImageBase(dllName) === undefined) return undefined;
     const names = slotKeys(dllName).filter(name => slotByName.has(name));
+    const attached = !isHleModuleLoaded(dllName);
     const counts = retainedNames;
     for (const name of names) counts.set(name, (counts.get(name) ?? 0) + 1);
+    if (attach && attached && isHleModuleLoaded(dllName)) runAttach(dllName);
     let released = false;
     return { release() {
         if (released) return;
@@ -108,6 +135,10 @@ export function retainHleModuleLoaded(dllName: string): HleModuleLoadReference |
             if (count > 0) counts.set(name, count); else counts.delete(name);
         }
     } };
+}
+
+export function boundHleModules(): string[] {
+    return [...loadedNames].sort();
 }
 
 /** Has this process loaded the module, or does it only have an image? See loadedNames. */

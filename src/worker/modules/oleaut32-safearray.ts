@@ -119,7 +119,10 @@ function ptrOfIndex(mem: Uint8Array, psa: number, rgIndices: number, ppvData: nu
 export function createSafeArrayExports(): {
     exports: Record<string, ThunkImplementation>;
     reset: () => void;
+    captureState: () => Uint32Array;
+    restoreState: (pairs: Uint32Array) => void;
 } {
+    // @participant(oleaut32)
     const owned = new Map<number, OwnedSafeArray>();
 
     const alloc = (size: number) => System.getInstance().process?.memory?.alloc(size) ?? 0;
@@ -346,5 +349,11 @@ export function createSafeArrayExports(): {
     return {
         exports,
         reset: () => owned.clear(),
+        captureState: () => Uint32Array.from([...owned.values()].flatMap(entry => [entry.descPtr, entry.dataPtr])),
+        restoreState: (pairs) => {
+            if (pairs.length % 2 !== 0) throw new Error(`oleaut32: a SAFEARRAY table of ${pairs.length} words is not a list of pairs`);
+            owned.clear();
+            for (let i = 0; i < pairs.length; i += 2) owned.set(pairs[i]!, { descPtr: pairs[i]!, dataPtr: pairs[i + 1]! });
+        },
     };
 }

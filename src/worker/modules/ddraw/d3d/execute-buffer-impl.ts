@@ -260,6 +260,7 @@ export const createExecuteBufferExports = (
     // A D3DMATRIXHANDLE is opaque; we hand out the guest address of the 64-byte
     // matrix itself, so D3DOP_STATETRANSFORM can pass it straight to SetTransform.
 
+    // @transient(Direct3D matrix handles; they belong to devices, which have no savestate codec, so a capture that holds one is refused by the object graph)
     const matrices = new Set<number>();
 
     exports["IDirect3DDevice_CreateMatrix"] = (ctx, mem, args) => {

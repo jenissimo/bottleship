@@ -71,7 +71,7 @@ const STREAMING_THRESHOLD_BYTES = 512 * 1024;
 // to be discovered as "the counters are all zero for no visible reason" —
 // AudioContext caches a worklet module by exact URL, so an unbumped `v` after
 // an edit serves the OLD module (old code, old baked-in version) silently.
-const AUDIO_WORKLET_VERSION = 12;
+const AUDIO_WORKLET_VERSION = 13;
 /** How long to wait for a worklet's "ready" handshake before treating a missing
  *  one as a stale-module load worth a loud console.error rather than silence. */
 const WORKLET_READY_TIMEOUT_MS = 3000;
@@ -145,7 +145,7 @@ export class AudioEngine {
   private ready: Promise<void> | null = null;
   private pausePromise: Promise<void> | null = null;
   private resumePromise: Promise<void> | null = null;
-  /** True only while the user has intentionally paused (Space toggle). Auto-resume
+  /** True while intentionally paused (UI or harness). Auto-resume
    *  (gesture / statechange) is suppressed while set, so a stray click during a
    *  manual pause never un-mutes the game. */
   private userPaused = false;
@@ -175,7 +175,7 @@ export class AudioEngine {
         const ctx = this.context;
         if (!ctx || ctx.state !== "suspended" || this.userPaused) return;
         const ua = (navigator as unknown as { userActivation?: { hasBeenActive: boolean } }).userActivation;
-        if (!ua || ua.hasBeenActive) void this.resume();
+        if (!ua || ua.hasBeenActive) void this.resumeIfNotPaused();
       });
     }
     // Arming is idempotent; do it here too so the first audio use is covered even
@@ -200,10 +200,13 @@ export class AudioEngine {
     const onGesture = () => {
       if (this.userPaused) return;
       if (this.context && this.context.state === "running") return;
-      void this.resume();
+      void this.resumeIfNotPaused();
     };
     // Capture phase + passive: fire before app handlers, never block the gesture.
-    for (const type of ["pointerdown", "keydown", "touchstart", "mousedown"] as const) {
+    // A touch pointerdown/touchstart is not activation-triggering (HTML user activation);
+    // pointerup/touchend are, so the first unlock on a touch screen does not depend on
+    // the compatibility mousedown.
+    for (const type of ["pointerdown", "pointerup", "keydown", "touchstart", "touchend", "mousedown"] as const) {
       window.addEventListener(type, onGesture, { capture: true, passive: true });
     }
   }
@@ -639,10 +642,24 @@ export class AudioEngine {
     }
   }
 
+  /** Automatic registration/gesture unlock must not cancel a UI or harness pause. */
+  async resumeIfNotPaused(): Promise<void> {
+    if (this.userPaused) return;
+    await this.ensureRunning();
+  }
+
+  /** Explicit unpause; automatic callers must use resumeIfNotPaused(). */
   async resume(): Promise<void> {
-    // Any resume request (gesture, statechange, or explicit unpause) means we want
-    // audio running again — clear the intentional-pause flag.
     this.userPaused = false;
+    await this.ensureRunning();
+  }
+
+  private async ensureRunning(): Promise<void> {
+    if (this.userPaused) return;
+    // An explicit unpause can arrive before the previous suspend settles.
+    // Finish that transition first, then re-check the latest pause intent.
+    if (this.pausePromise) await this.pausePromise;
+    if (this.userPaused) return;
     const context = this.ensureContext();
     // A pre-gesture resume may stay pending; a later gesture needs a fresh request.
     if (context.state === "suspended") {
@@ -657,6 +674,12 @@ export class AudioEngine {
         return;
       }
     }
+    // A browser resume promise may settle after a later intentional pause.
+    // Re-suspend rather than letting that stale automatic request undo it.
+    if (this.userPaused) {
+      await this.pause();
+      return;
+    }
     if (context.state !== "running") return;
     if (this.resumePromise) {
       await this.resumePromise;
@@ -665,23 +688,30 @@ export class AudioEngine {
 
     this.resumePromise = (async () => {
       await this.ensureReady();
+      if (this.userPaused) return;
 
       // Resume encoded sources that were playing before pause
       const pausedIds = Array.from(this.pausedEncodedSources);
       if (pausedIds.length === 0) return; // Nothing to resume
 
-      this.pausedEncodedSources.clear();
-
       for (const id of pausedIds) {
+        if (this.userPaused) break;
         const source = this.encodedSources.get(id);
         if (!source) {
           // Source was removed while paused, skip it
+          this.pausedEncodedSources.delete(id);
           continue;
         }
         try {
           await source.element.play();
+          if (this.userPaused) {
+            await this.pause();
+            break;
+          }
+          this.pausedEncodedSources.delete(id);
           console.log("BottleShip: Encoded source resumed", { id });
         } catch (err) {
+          if (!this.userPaused) this.pausedEncodedSources.delete(id);
           const error = err instanceof Error ? err.message : String(err);
           console.error("BottleShip: Failed to resume encoded source", { id, error });
           // Source might have been stopped/removed, which is fine

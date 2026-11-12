@@ -63,7 +63,9 @@ const alignSmallAlloc = (size: number): number =>
 // ---------------------------------------------------------------------------
 const PROCESS_HEAP_HANDLE_CONST = 0x12345678;
 const HEAP_CREATE_HANDLE_BASE = 0x12345679;
+// @participant(kernel32-memory)
 const createdHeaps = new Set<number>();
+// @participant(kernel32-memory)
 let nextCreatedHeapHandle = HEAP_CREATE_HANDLE_BASE;
 /**
  * HeapCompatibilityInformation per heap handle: 0 standard, 1 lookaside, 2 LFH. Ours is
@@ -72,9 +74,12 @@ let nextCreatedHeapHandle = HEAP_CREATE_HANDLE_BASE;
  * is documented to read back what HeapSetInformation accepted and a CRT that sets LFH and
  * then verifies it reads a mismatch as a hooked/corrupted heap.
  */
+// @participant(kernel32-memory)
 const heapCompatibility = new Map<number, number>();
 /** HeapEnableTerminationOnCorruption, once set, cannot be turned off (documented). */
+// @participant(kernel32-memory)
 let terminationOnCorruption = false;
+// @transient(identity of the owning process object)
 let heapManagerOwnerProcess: any = null;
 
 // HeapWalk is stateful: the caller zeroes the entry, calls once to get the first
@@ -86,6 +91,7 @@ interface HeapWalkState {
     snapshot: Array<{ addr: number; size: number; busy: boolean }>;
     index: number;
 }
+// @refuse(a HeapWalk enumeration is in progress)
 let heapWalkState: HeapWalkState | null = null;
 
 const ensureHeapManagerProcess = (): void => {
@@ -159,10 +165,15 @@ const isSlabHeader = (header: number): boolean => {
     const m = header & 0xFFFFFF00;
     return m === SLAB_MAGIC || m === SLAB_MAGIC_FREE;
 };
+// @transient(diagnostics)
 let _dblFreeLogCount = 0; // DIAG: rate-limit [DBLFREE] backtrace logging
+// @participant(kernel32-memory)
 let slabRanges: Array<{ base: number; end: number }> = [];
+// @participant(kernel32-memory)
 let totalSlabBytes = 0;
+// @participant(kernel32-memory)
 let nextSlabSize = HEAP_SLAB_INITIAL_SIZE;
+// @transient(host-time throttle for slab growth)
 let slabGrowLastAttempt = 0; // performance.now() of last grow attempt (throttle)
 
 /**
@@ -249,6 +260,7 @@ class IntervalMap {
 // are NOT heap blocks: HeapSize must return (SIZE_T)-1 and HeapWalk must omit them,
 // or third-party heaps (SmartHeap) treat a VirtualAlloc pool as HeapAlloc memory,
 // HeapFree the pool base, and reuse sub-allocations still held by the CRT (_piob UAF).
+// @participant(kernel32-memory)
 const virtualAllocRegions = new IntervalMap();
 
 // Decommitted page ranges within reserved regions.
@@ -259,9 +271,22 @@ const virtualAllocRegions = new IntervalMap();
 //   4. VirtualAlloc(MEM_COMMIT) — recommit = re-zero pages
 // Without tracking, decommit is a no-op and recommit skips zeroing, leaving stale
 // heap metadata that causes heap corruption. VirtualQuery reports these MEM_RESERVE.
+// @participant(kernel32-memory)
 const decommittedPages = new IntervalMap();
 // Released backing and unused allocation-granularity tails, coalesced by page range.
+// @participant(kernel32-memory)
 const freeVirtualPages = new IntervalMap();
+// VirtualFree'd blocks parked for VirtualAlloc to recycle (size -> bases): still live in
+// MemoryManager, FREE to the guest. A snapshot must carry them, or the restored blocks
+// stay allocated with nothing able to hand them back or let a fixed-address claim in.
+// @participant(kernel32-memory)
+const vaFreeCache: Map<number, number[]> = new Map();
+// @participant(kernel32-memory)
+let vaCacheBytes = 0;
+/** Bases whose page state we can no longer vouch for (VirtualProtect / MEM_DECOMMIT). */
+// @participant(kernel32-memory)
+const vaProtectionTouched: Set<number> = new Set();
+// @transient(identity of the owning process object)
 let virtualMemoryOwner: object | undefined;
 function ensureVirtualMemoryOwner(): void {
     const memory = System.getInstance().process?.memory;
@@ -298,6 +323,7 @@ function slabGrowBudget(): number | null {
     return heap.free - reserve;
 }
 
+// @transient(diagnostics)
 let slabBudgetRefusalLogged = false;
 
 function installNewSlab(size: number): boolean {
@@ -482,7 +508,72 @@ function buildHeapWalkSnapshot(view: DataView): HeapBlock[] {
 }
 
 /** Reset slab state on process cleanup. */
+// @transient(wiring set at module init)
 let resetVirtualAllocationState = (): void => { virtualAllocRegions.clear(); decommittedPages.clear(); };
+
+export interface Kernel32MemoryState {
+    createdHeaps: number[];
+    nextCreatedHeapHandle: number;
+    heapCompatibility: number[][];
+    terminationOnCorruption: boolean;
+    slabRanges: Array<{ base: number; end: number }>;
+    totalSlabBytes: number;
+    nextSlabSize: number;
+    virtualAllocRegions: number[][];
+    decommittedPages: number[][];
+    freeVirtualPages: number[][];
+    /** [size, ...bases] per recycler bucket. */
+    vaFreeCache: number[][];
+    vaProtectionTouched: number[];
+}
+
+export function captureKernel32Memory(): Kernel32MemoryState {
+    if (heapWalkState) throw new Error('kernel32: a HeapWalk enumeration is in progress');
+    return {
+        createdHeaps: [...createdHeaps],
+        nextCreatedHeapHandle,
+        heapCompatibility: [...heapCompatibility],
+        terminationOnCorruption,
+        slabRanges: slabRanges.map(r => ({ ...r })),
+        totalSlabBytes,
+        nextSlabSize,
+        virtualAllocRegions: [...virtualAllocRegions],
+        decommittedPages: [...decommittedPages],
+        freeVirtualPages: [...freeVirtualPages],
+        vaFreeCache: [...vaFreeCache].filter(([, bases]) => bases.length > 0).map(([size, bases]) => [size, ...bases]),
+        vaProtectionTouched: [...vaProtectionTouched],
+    };
+}
+
+export function restoreKernel32Memory(state: Kernel32MemoryState): void {
+    heapManagerOwnerProcess = System.getInstance().process;
+    virtualMemoryOwner = System.getInstance().process?.memory;
+    createdHeaps.clear();
+    for (const h of state.createdHeaps) createdHeaps.add(h);
+    nextCreatedHeapHandle = state.nextCreatedHeapHandle;
+    heapCompatibility.clear();
+    for (const [h, v] of state.heapCompatibility) heapCompatibility.set(h, v);
+    terminationOnCorruption = state.terminationOnCorruption;
+    heapWalkState = null;
+    slabRanges = state.slabRanges.map(r => ({ ...r }));
+    totalSlabBytes = state.totalSlabBytes;
+    nextSlabSize = state.nextSlabSize;
+    slabGrowLastAttempt = 0;
+    for (const [map, rows] of [[virtualAllocRegions, state.virtualAllocRegions], [decommittedPages, state.decommittedPages], [freeVirtualPages, state.freeVirtualPages]] as const) {
+        map.clear();
+        for (const [base, size] of rows) map.set(base, size);
+    }
+    // Replaces, never merges: what this process parked before the restore names blocks
+    // of the MemoryManager state the restore just discarded.
+    vaFreeCache.clear();
+    vaCacheBytes = 0;
+    for (const [size, ...bases] of state.vaFreeCache) {
+        vaFreeCache.set(size, [...bases]);
+        vaCacheBytes += size * bases.length;
+    }
+    vaProtectionTouched.clear();
+    for (const base of state.vaProtectionTouched) vaProtectionTouched.add(base);
+}
 
 export function resetHeapSlab(): void {
     slabRanges = [];
@@ -833,10 +924,6 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     const VA_CACHE_MAX_BLOCK = 0x100000;        // 1 MB — beyond this one flush is amortised
     const VA_CACHE_MAX_PER_SIZE = 8;
     const VA_CACHE_MAX_BYTES = 4 * 0x100000;    // total parked bytes
-    const vaFreeCache: Map<number, number[]> = new Map();
-    let vaCacheBytes = 0;
-    /** Bases whose page state we can no longer vouch for (VirtualProtect / MEM_DECOMMIT). */
-    const vaProtectionTouched: Set<number> = new Set();
     const vaCacheShapes: Map<string, number> = new Map();
     const vaCacheStats = { hits: 0, misses: 0, parked: 0, dropped: 0, refusedTouched: 0, refusedFull: 0, refusedShape: 0 };
     // Runtime switch so the A/B runs in ONE session on ONE scene: a frame-time
@@ -2421,6 +2508,23 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     address = process.memory.alloc(alignedSize, 'HEAP', perms, ALLOC_GRANULARITY);
                 }
             } else {
+                const claimEnd = address + alignedSize;
+                for (const [size, bases] of vaFreeCache) {
+                    for (let i = bases.length - 1; i >= 0; i--) {
+                        const base = bases[i]!;
+                        if (base >= claimEnd || base + size <= address) continue;
+                        bases.splice(i, 1);
+                        vaCacheBytes -= size;
+                        if (process.memory.getSize(base) === size) freeHeapBlock(process, base);
+                    }
+                }
+                const blocker = process.memory.liveBlockOverlapping?.(address, alignedSize,
+                    (base) => virtualAllocRegions.has(base));
+                if (blocker) {
+                    profiler.end("VirtualAlloc:alloc");
+                    System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
+                    return fail(`range holds the heap block 0x${blocker.addr.toString(16)}+0x${blocker.size.toString(16)}`);
+                }
                 process.memory.allocAt(address, alignedSize, 'HEAP', perms);
             }
         } catch (error) {
@@ -3606,11 +3710,17 @@ const MBI_PAGE_READWRITE = 0x04;
 const MBI_SIZE = 28;
 const BACKED_HEAP_SPAN_END = MEM_THUNK_DATA_BASE + MEM_THUNK_DATA_SIZE;
 
+// @transient(diagnostics)
 let vqFastHits = 0;
+// @transient(diagnostics)
 let vqFastDefers = 0;
+// @transient(diagnostics)
 let vqAuditChecked = 0;
+// @transient(diagnostics)
 let vqAuditMismatches = 0;
+// @transient(diagnostics)
 let vqAuditWarnBudget = 20;
+// @transient(diagnostics)
 let vqAuditBuf = 0;
 const vqAuditCtx: X86Context = {
     eax: 0, ecx: 0, edx: 0, ebx: 0, esp: 0, ebp: 0, esi: 0, edi: 0, eip: 0, eflags: 0,

@@ -6,7 +6,7 @@ import { writeGuestCode } from "../core/memory/guest-code";
 import { Mem } from "../core/memory/mem-accessor";
 import { isValidAddress } from "../core/memory/address-guard";
 import { System } from "../core/system";
-import { createMessageExports } from "./user32/message";
+import { Logger, LogCategory } from "../core/logger";
 import type { WsaProcessState } from "./wsa-stub-shared";
 import { WSA } from "./wsa-network";
 
@@ -29,6 +29,13 @@ class BlockingHooks {
             for (const task of this.tasks.values()) { task.controller.abort(); task.wake.forEach(wake => wake()); }
             this.tasks.clear();
         });
+    }
+    openForSavestate(): string[] {
+        const hex = (value: number) => "0x" + (value >>> 0).toString(16);
+        return [
+            ...[...this.tasks.keys()].map(tid => `blocking call of thread ${tid}`),
+            ...[...this.hooks].map(([tid, hook]) => `blocking hook ${hex(hook)} of thread ${tid}`),
+        ];
     }
     private thread(): number { return System.getInstance().scheduler.getCurrentThreadId(); }
     private error(code: number, value = -1): number { this.state.setError(code); return value; }
@@ -58,10 +65,17 @@ class BlockingHooks {
     }
     private defaultHook(): number {
         if (this.defaultPointer) return this.defaultPointer;
-        const messages = createMessageExports();
-        const peek = this.stub("LegacyPeekMessage",5,messages.PeekMessageA);
-        const translate = this.stub("LegacyTranslateMessage",1,messages.TranslateMessage);
-        const dispatch = this.stub("LegacyDispatchMessage",1,messages.DispatchMessageA);
+        // Pump through the session's user32 exports. Building another message factory would
+        // re-point user32's process-wide timer hooks at an empty timer map (issue #84).
+        const messages = this.owner.getModule("user32")?.exports as Record<string,ThunkImplementation> | undefined;
+        const peekMessage = messages?.PeekMessageA, translateMessage = messages?.TranslateMessage, dispatchMessage = messages?.DispatchMessageA;
+        if (!peekMessage || !translateMessage || !dispatchMessage) {
+            Logger.error(LogCategory.SYSTEM, "Winsock 1.1 default blocking hook: user32 message exports are not registered");
+            throw Error("Winsock 1.1 default blocking hook needs the session's user32 message exports");
+        }
+        const peek = this.stub("LegacyPeekMessage",5,peekMessage);
+        const translate = this.stub("LegacyTranslateMessage",1,translateMessage);
+        const dispatch = this.stub("LegacyDispatchMessage",1,dispatchMessage);
         const b = [0x83,0xec,28,0x89,0xe0,0x6a,1,0x6a,0,0x6a,0,0x6a,0,0x50];
         this.call(b,peek); b.push(0x85,0xc0,0x74,0); const jump = b.length-1;
         b.push(0x89,0xe0,0x50); this.call(b,translate);
@@ -168,7 +182,9 @@ class BlockingHooks {
         };
     }
 }
+// @refuse(the winsock participant refuses while a blocking hook is installed or a hooked call is in flight)
 const instances=new WeakMap<WsaProcessState,BlockingHooks>();
+export function wsaBlockingOpenForSavestate(state:WsaProcessState):string[]{return instances.get(state)?.openForSavestate()??[];}
 /** Both Winsock DLLs share per-thread hooks and one negotiated application version. */
 export function installWsaBlockingHooks(exports:Record<string,ThunkImplementation>, descriptor:ModuleDescriptor, state:WsaProcessState, process:Process):void {
     let hooks=instances.get(state);if(!hooks){hooks=new BlockingHooks(state,process);instances.set(state,hooks);}

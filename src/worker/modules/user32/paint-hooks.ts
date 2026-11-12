@@ -10,6 +10,7 @@
  */
 
 /** Re-stamps modal popups floating above a window whose controls were repainted. */
+// @transient(wiring set at module init)
 let ownedPopupRestamper: ((hwnd: number) => void) | null = null;
 
 export function registerOwnedPopupRestamper(fn: (hwnd: number) => void): void {

@@ -15,6 +15,7 @@
 import { ThunkImplementation } from '../core/thunking/thunk-dispatcher';
 import { System } from '../core/system';
 import { TimerKind } from '../core/scheduler/types';
+import { setTimerHandler } from '../core/scheduler/timer-wheel';
 import { TimeService } from '../runtime/time';
 import { GAMEPAD_AXES, GAMEPAD_BUTTONS, POV_CENTERED, gamepadPovAngle } from './dinput/emulated-gamepad';
 
@@ -70,7 +71,7 @@ const JOYCAPS_HASPOV = 0x0010;
 const JOYCAPS_POV4DIR = 0x0020;
 const JOY_POVCENTERED = 0xFFFF;
 
-interface JoyCapture {
+export interface JoyCapture {
     hwnd: number;
     /** Only post a message when the axis moved past the threshold. */
     changedOnly: boolean;
@@ -83,7 +84,9 @@ interface JoyCapture {
     primed: boolean;
 }
 
+// @participant(winmm)
 const thresholds: number[] = new Array(JOY_PORTS).fill(DEFAULT_THRESHOLD);
+// @participant(winmm)
 const captures: Array<JoyCapture | null> = new Array(JOY_PORTS).fill(null);
 
 /** Signed host axis (-32768..32767) → the 0..65535 range JOYCAPS declares. */
@@ -154,6 +157,8 @@ function stopCapture(joyId: number): void {
     captures[joyId] = null;
 }
 
+setTimerHandler(TimerKind.JOYSTICK_CAPTURE, (joyId) => pollCapture(joyId));
+
 /**
  * Capture poll: diff the stick against the last posted sample and emit the
  * MM_JOY* messages Windows would. Axis moves collapse into one MM_JOY*MOVE;
@@ -209,7 +214,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
             const uJoyID = args[0];
             const pjc = args[1];
             const cbjc = args[2];
-            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (uJoyID >= JOY_PORTS) return JOYERR_PARMS;
             if (!pjc || cbjc < JOYCAPS_MIN_SIZE || pjc + cbjc > mem.length) {
                 return MMSYSERR_INVALPARAM;
             }
@@ -261,7 +266,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
         exports["joyGetPos"] = (ctx, mem, args) => {
             const uJoyID = args[0];
             const pji = args[1];
-            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (uJoyID >= JOY_PORTS) return JOYERR_PARMS;
             if (!pji || pji + JOYINFO_SIZE > mem.length) {
                 return MMSYSERR_INVALPARAM;
             }
@@ -279,7 +284,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
         exports["joyGetPosEx"] = (ctx, mem, args) => {
             const uJoyID = args[0];
             const pji = args[1];
-            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (uJoyID >= JOY_PORTS) return JOYERR_PARMS;
             if (!pji || pji + JOYINFOEX_SIZE > mem.length) {
                 return MMSYSERR_INVALPARAM;
             }
@@ -312,7 +317,7 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
         exports["joyGetThreshold"] = (ctx, mem, args) => {
             const uJoyID = args[0];
             const puThreshold = args[1];
-            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (uJoyID >= JOY_PORTS) return JOYERR_PARMS;
             if (!puThreshold || puThreshold + 4 > mem.length) return MMSYSERR_INVALPARAM;
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             view.setUint32(puThreshold, thresholds[uJoyID]!, true);
@@ -350,8 +355,8 @@ export function registerWinmmJoystickExports(exports: Record<string, ThunkImplem
             };
             captures[uJoyID] = cap;
             cap.timerId = scheduler.timerWheel.add(
-                uPeriod, true, TimerKind.WINMM_TIMER,
-                () => pollCapture(uJoyID),
+                uPeriod, true, TimerKind.JOYSTICK_CAPTURE,
+                uJoyID,
                 TimeService.getInstance().nowMs(),
             );
             return JOYERR_NOERROR;
@@ -371,5 +376,19 @@ export function resetWinmmJoystick(): void {
     for (let i = 0; i < JOY_PORTS; i++) {
         stopCapture(i);
         thresholds[i] = DEFAULT_THRESHOLD;
+    }
+}
+
+export interface JoystickState { thresholds: number[]; captures: Array<JoyCapture | null> }
+
+export function captureWinmmJoystick(): JoystickState {
+    return { thresholds: [...thresholds], captures: captures.map(c => (c ? { ...c } : null)) };
+}
+
+export function restoreWinmmJoystick(s: JoystickState): void {
+    for (let i = 0; i < JOY_PORTS; i++) {
+        thresholds[i] = s.thresholds[i] ?? DEFAULT_THRESHOLD;
+        const c = s.captures[i];
+        captures[i] = c ? { ...c } : null;
     }
 }

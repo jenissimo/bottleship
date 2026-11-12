@@ -71,6 +71,87 @@ describe("dsound host output latency", () => {
         expect(t.span(22384, 23408)).toEqual(new Set([0xee]));
     });
 
+    test("a whole-buffer span is split at the shown cursor: ahead plays this lap, behind the next", () => {
+        // Quake II locks and unlocks the entire buffer every frame. The bytes it just mixed sit
+        // right after the shown cursor and are due now, not a lap later.
+        const t = setup();
+        t.setRaw(4096);
+        t.buffer.stepLastCursor = 4096 + 6000; // buffer offset 10096, 6000 ahead of the worklet
+        t.mem.fill(0xa1, PTR, PTR + 10096);
+        t.mem.fill(0xb2, PTR + 10096, PTR + SIZE);
+        t.call("writeToLaps", t.mem, 0, SIZE);
+        // [10096, SIZE) follows the shown cursor in its own lap: ring 10096..16384.
+        expect(t.span(10096, 16384)).toEqual(new Set([0xb2]));
+        // [0, 10096) is behind the cursor: the next lap, ring 16384..26480.
+        expect(t.span(16384, 26480)).toEqual(new Set([0xa1]));
+        // ...and the cursor's lap continues into it a lap on: ring 26480..RING is [10096, 16384).
+        expect(t.span(26480, RING)).toEqual(new Set([0xb2]));
+        // The host-latency queue between the worklet and the shown cursor is not rewritten.
+        expect(t.span(4096, 10096)).toEqual(new Set([0x11]));
+    });
+
+    test("a refill from behind the cursor is the next lap through the committed region, then this lap", () => {
+        // NFS5's menu pump refills [lastEnd, play + ~10 ms). Shown play at offset 10096 with
+        // a 2000-byte write lead: [8000, 12096) is the next lap, [12096, 13000) is past the
+        // write cursor and plays in the cursor's own lap.
+        const t = setup();
+        t.setRaw(4096);
+        t.buffer.stepLastCursor = 4096 + 6000;
+        t.buffer.reportedLeadBytes = 2000;
+        t.mem.fill(0xc3, PTR + 8000, PTR + 13000);
+        t.call("writeSpanToLaps", t.mem, 8000, 5000, 0);
+        expect(t.span(24384, 28480)).toEqual(new Set([0xc3]));
+        expect(t.span(8000, 12096)).toEqual(new Set([0x11]));
+        expect(t.span(12096, 13000)).toEqual(new Set([0xc3]));
+        // Negative control: split at the play cursor, the bytes just past it play this lap.
+        const u = setup();
+        u.setRaw(4096);
+        u.buffer.stepLastCursor = 4096 + 6000;
+        u.buffer.reportedLeadBytes = 2000;
+        u.mem.fill(0xc3, PTR + 8000, PTR + 13000);
+        (globalThis as { __noCommittedSplit?: boolean }).__noCommittedSplit = true;
+        try { u.call("writeSpanToLaps", u.mem, 8000, 5000, 0); } finally { delete (globalThis as { __noCommittedSplit?: boolean }).__noCommittedSplit; }
+        expect(u.span(10096, 12096)).toEqual(new Set([0xc3]));
+    });
+
+    test("a refill Locked as two spans across the buffer end is one piece of stream", () => {
+        // NFS5 Locks a wrapping refill as the buffer's tail, then its head, with no query in
+        // between. Here the tail ends exactly at the shown cursor (offset 0): the head that
+        // follows is in the committed region and is the next lap, like the tail.
+        const run = (queryBetween: boolean) => {
+            const t = setup();
+            t.setRaw(12000);
+            t.buffer.stepLastCursor = SIZE; // buffer offset 0, 4384 ahead of the worklet
+            t.buffer.reportedLeadBytes = 2000;
+            t.buffer.stepLastQueryAt = 1;
+            t.mem.fill(0xd4, PTR + 14000, PTR + SIZE);
+            t.mem.fill(0xd5, PTR, PTR + 600);
+            t.call("writeSpanToLaps", t.mem, 14000, SIZE - 14000, 0);
+            if (queryBetween) t.buffer.stepLastQueryAt = 2;
+            t.call("writeSpanToLaps", t.mem, 0, 600, 0);
+            return t;
+        };
+        const t = run(false);
+        expect(t.span(30384, RING)).toEqual(new Set([0xd4]));
+        expect(t.span(0, 600)).toEqual(new Set([0xd5]));
+        expect(t.span(16384, 16984)).toEqual(new Set([0x11]));
+        // Negative control: a cursor query between them ends the piece; the head is a new
+        // write at the cursor and plays in its lap.
+        expect(run(true).span(16384, 16984)).toEqual(new Set([0xd5]));
+    });
+
+    test("a whole-buffer span still splits at the play cursor through writeSpanToLaps", () => {
+        const t = setup();
+        t.setRaw(4096);
+        t.buffer.stepLastCursor = 4096 + 6000;
+        t.buffer.reportedLeadBytes = 2000;
+        t.mem.fill(0xa1, PTR, PTR + 10096);
+        t.mem.fill(0xb2, PTR + 10096, PTR + SIZE);
+        t.call("writeSpanToLaps", t.mem, 0, SIZE, 0);
+        expect(t.span(10096, 16384)).toEqual(new Set([0xb2]));
+        expect(t.span(16384, 26480)).toEqual(new Set([0xa1]));
+    });
+
     test("a span the worklet has already passed keeps only its part still ahead and its later laps", () => {
         const t = setup();
         t.setRaw(8000);
@@ -78,7 +159,9 @@ describe("dsound host output latency", () => {
         t.unlock(7000, 2048, 0xcd);
         expect(t.span(8000, 9048)).toEqual(new Set([0xcd]));
         expect(t.span(23384, 25432)).toEqual(new Set([0xcd]));
-        expect(t.span(7000, 8000)).toEqual(new Set([0xcd]));
+        // ...up to the frames just behind the head, which the mixer's interpolator still reads.
+        expect(t.span(7000, 8000 - 128)).toEqual(new Set([0xcd]));
+        expect(t.span(8000 - 128, 8000)).toEqual(new Set([0x11]));
         expect(t.span(9048, 23384)).toEqual(new Set([0x11]));
     });
 
@@ -107,8 +190,29 @@ describe("dsound host output latency", () => {
         t.mem.fill(0x77, PTR, PTR + SIZE);
         t.setRaw(5000);
         t.call("trailRing");
-        expect(t.span(1000, 5000)).toEqual(new Set([0x77]));
-        expect(t.span(5000, RING)).toEqual(new Set([0x11]));
+        // Up to the frames the mixer's interpolator still reads behind its head (2 x 8 frames
+        // of 8 bytes): those keep this lap's bytes until the head is past them.
+        expect(t.span(1000 - 128, 5000 - 128)).toEqual(new Set([0x77]));
+        expect(t.span(5000 - 128, RING)).toEqual(new Set([0x11]));
+        t.setRaw(9000);
+        t.call("trailRing");
+        expect(t.span(5000 - 128, 9000 - 128)).toEqual(new Set([0x77]));
+    });
+
+    test("negative control: refilled right up to the head, the interpolator's history is overwritten", () => {
+        const g = globalThis as { __noTrailKeep?: boolean };
+        g.__noTrailKeep = true;
+        try {
+            const t = setup();
+            t.setRaw(1000);
+            t.call("trailRing");
+            t.mem.fill(0x77, PTR, PTR + SIZE);
+            t.setRaw(5000);
+            t.call("trailRing");
+            expect(t.span(5000 - 128, 5000)).toEqual(new Set([0x77]));
+        } finally {
+            delete g.__noTrailKeep;
+        }
     });
 
     test("a diagnostic read of the cursors is not one of the app's queries", () => {

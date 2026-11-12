@@ -35,6 +35,9 @@ export interface LoadedPEModule {
     initialized: boolean;
     /** PE Sections (for debugging/diagnostics) */
     sections?: PESection[];
+    contentHash?: string;
+    imageBytes?: Uint8Array;
+    unsaved?: string;
 }
 
 export interface PESection {
@@ -99,7 +102,8 @@ export class ModuleRegistry {
         const base = cut >= 0 ? lower.slice(cut + 1) : lower;
         // A trailing "." is Win32's "this name has no extension, do not append one".
         if (base.endsWith('.')) return base.slice(0, -1);
-        return /\.\w+$/.test(base) ? base : `${base}.dll`;
+        // A numeric-only suffix ("lua5.1") is a version number left after ".dll" was stripped.
+        return /\.\w*[a-z_]\w*$/.test(base) ? base : `${base}.dll`;
     }
 
     /**
@@ -366,6 +370,16 @@ export class ModuleRegistry {
      */
     isLoaded(name: string): boolean {
         return this.getByName(name) !== undefined;
+    }
+
+    captureLayout(): { nextDllBase: number; freeDllRanges: Array<[number, number]> } {
+        return { nextDllBase: this.nextDllBase, freeDllRanges: this.freeDllRanges.map(r => [r.base, r.size]) };
+    }
+
+    restoreLayout(nextDllBase: number, freeDllRanges: ReadonlyArray<readonly [number, number]>): void {
+        this.nextDllBase = nextDllBase;
+        this.freeDllRanges = freeDllRanges.map(([base, size]) => ({ base, size }));
+        this.spanIndex = null;
     }
 
     /**

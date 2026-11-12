@@ -61,9 +61,11 @@ export interface LanState {
     tcpHostListenV1?: TcpHostListenCapability;
 }
 const EPHEMERAL = [[0x4000, 0x7fff], [49152, 65535], [49152, 65535], [49152, 65535], [49152, 65535], [49152, 65535], [1, 256], [1, 256]];
+/** Guests draw their address from one /16 (10.1.x.y, y in 1-254): some LAN lobbies refuse a peer outside their own
+ *  subnet, which two independently random 10.a.b.c addresses almost never share. */
 function randomNode(): Uint8Array {
-    const node = new Uint8Array([2, 0, 0, 0, 0, 0]);
-    do { crypto.getRandomValues(node.subarray(3)); } while (!isLanNode(node));
+    const node = new Uint8Array([2, 0, 0, 1, 0, 0]);
+    do { crypto.getRandomValues(node.subarray(4)); } while (node[5] === 0 || node[5] === 255);
     return node;
 }
 export class LanNetwork {

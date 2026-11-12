@@ -282,7 +282,8 @@ export class D3D9StateTracker {
         return true;
     }
 
-    /** D3DTS_* MultiplyTransform: post-multiply the current matrix and publish it through the
+    /** D3DTS_* MultiplyTransform: store `matrix * current` (the given matrix applies first, as
+     * IDirect3DDevice9::MultiplyTransform documents) and publish it through the
      * same dirty/pipeline path as SetTransform. Keeping this in the tracker makes state-block
      * replay and all FFP consumers observe one canonical matrix. */
     multiplyTransform(type: number, matrix: Float32Array): boolean {
@@ -297,7 +298,8 @@ export class D3D9StateTracker {
             current = this.getTextureMatrix(type);
         }
         if (!current || matrix.length < 16) return false;
-        return this.setTransform(type, multiplyMatrices(current, matrix));
+        this.setTransform(type, multiplyMatrices(matrix, current));
+        return true;
     }
 
     getWorldMatrix(): Float32Array { return this.worldMatrix; }

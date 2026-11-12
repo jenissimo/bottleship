@@ -6,6 +6,7 @@ import type { VfsFileHandle } from '../../runtime/filesystem/vfs';
 
 interface PendingRead { handle: number; thread: number; overlapped: number; cancel(): void; }
 interface ReadState { generation: number; pending: Set<PendingRead>; }
+// @refuse(an overlapped read is pending)
 const states = new WeakMap<Process, ReadState>();
 function state(process: Process): ReadState {
     let result = states.get(process);
@@ -15,6 +16,10 @@ function state(process: Process): ReadState {
         process.onReset(() => { captured.pending.clear(); captured.generation = process.resetGeneration; });
     }
     return result;
+}
+export function pendingReadExCount(process: Process): number {
+    const current = states.get(process);
+    return current && current.generation === process.resetGeneration ? current.pending.size : 0;
 }
 /** Cancellation selects the issuing thread for CancelIo, and any thread for CancelIoEx/close. */
 export function cancelFileReadEx(process: Process, handle: number, overlapped = 0, thread?: number): number {

@@ -15,6 +15,7 @@ export default function SettingsGraphicsSection({
   integerScale,
   unsupportedQualityKeys,
   overriddenQualityKeys,
+  internalScaleSupport,
 }: SettingsDrawerProps): React.ReactElement {
   return (
     <SettingsSection>
@@ -90,6 +91,7 @@ export default function SettingsGraphicsSection({
         onChange={onChange}
         unsupported={unsupportedQualityKeys}
         overridden={overriddenQualityKeys}
+        internalScaleSupport={internalScaleSupport}
         guestResolution={guestResolution}
         renderSize={renderSize}
       />

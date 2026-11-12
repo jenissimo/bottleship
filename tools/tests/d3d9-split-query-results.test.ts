@@ -17,7 +17,7 @@ import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { createQueryExports, notifyDeviceSubmission, resetD3D9QueryLedger, tryFastGetData } from "../../src/worker/modules/d3d9/query";
 import { devices, resetD3D9SharedState } from "../../src/worker/modules/d3d9/shared-state";
 import {
-    D3D9QueryManager, type QueryManagerDevice, type QueryManagerQueue, type QueryCommandEncoder, type QueryPassEncoder,
+    D3D9QueryManager, observeQueryBatchSettled, type QueryManagerDevice, type QueryManagerQueue, type QueryCommandEncoder, type QueryPassEncoder,
 } from "../../src/worker/modules/d3d9/query-manager";
 import { SplitQueryHost } from "../../src/worker/backends/webgpu/d3d9/split-query-host";
 import { SplitQueryResultTable, type SplitQueryChannel } from "../../src/worker/render/d3d9-remote-state";
@@ -38,8 +38,10 @@ const DATA_OUT = 0x400;
 
 class FakeBuffer {
     readonly bytes: ArrayBuffer;
+    /** The GPU still working on this buffer: its map resolves when this does. */
+    hold: Promise<void> | null = null;
     constructor(desc: { size: number }) { this.bytes = new ArrayBuffer(desc.size); }
-    mapAsync(): Promise<void> { return Promise.resolve(); }
+    mapAsync(): Promise<void> { return this.hold ?? Promise.resolve(); }
     getMappedRange(): ArrayBuffer { return this.bytes; }
     unmap(): void {}
     destroy(): void {}
@@ -78,6 +80,12 @@ class FakeWorker {
 
     /** What the executor does at a submit: run the frame's query commands, resolve, submit. */
     async submitFrame(samples: Map<number, bigint>): Promise<void> {
+        this.submitFrameNoWait(samples);
+        await this.manager.settled();
+    }
+
+    /** The same submit, returning while its readback is still in flight. */
+    submitFrameNoWait(samples: Map<number, bigint>, hold: Promise<void> | null = null): void {
         const serial = this.manager.allocateSubmissionSerial();
         const ids: number[] = [];
         for (const [op, q] of this.frame.splice(0)) {
@@ -88,11 +96,11 @@ class FakeWorker {
         if (batch.status === "encoded") {
             const view = new DataView(this.gpu.buffers[this.gpu.buffers.length - 1]!.bytes);
             batch.entries.forEach((e, i) => view.setBigUint64(i * 8, samples.get(Number(e.state.id)) ?? 0n, true));
+            this.gpu.buffers[this.gpu.buffers.length - 1]!.hold = hold;
             this.manager.markSubmitted(batch);
         } else {
             this.manager.notifySubmitted(serial);
         }
-        await this.manager.settled();
     }
 }
 
@@ -328,6 +336,48 @@ describe("split D3D9 query results (render-worker arm)", () => {
         await worker.submitFrame(new Map());
         deliverResults();
         expect(call("IDirect3DQuery9_GetData", q, DATA_OUT, 4, 0)).toBe(D3DERR_NOTAVAILABLE);
+    });
+
+    test("a settled readback batch is delivered while a later-finishing batch is still in flight", async () => {
+        // The render worker's channel: every settled batch posts what collect() reports.
+        const posted: Array<ReturnType<SplitQueryHost["collect"]>> = [];
+        const stop = observeQueryBatchSettled(() => {
+            const results = worker.host.collect();
+            if (results.length) posted.push(results);
+        });
+        try {
+            const a = createQuery(OCCLUSION, QUERY_OUT);
+            const b = createQuery(OCCLUSION, QUERY_OUT2);
+            call("IDirect3DQuery9_Issue", a, ISSUE_BEGIN);
+            call("IDirect3DQuery9_Issue", a, ISSUE_END);
+            ship();
+            let releaseA!: () => void;
+            worker.submitFrameNoWait(new Map([[a, 11n]]), new Promise<void>((r) => { releaseA = r; }));
+            call("IDirect3DQuery9_Issue", b, ISSUE_BEGIN);
+            call("IDirect3DQuery9_Issue", b, ISSUE_END);
+            ship();
+            worker.submitFrameNoWait(new Map([[b, 22n]]));
+            for (let i = 0; i < 8 && posted.length === 0; i++) await Promise.resolve();
+
+            expect(worker.manager.hasInflight()).toBe(true);
+            expect(posted).toHaveLength(1);
+            for (const r of posted) table.accept(r);
+            expect(call("IDirect3DQuery9_GetData", b, DATA_OUT, 4, 0)).toBe(D3D_OK);
+            expect(Mem.readUint32(DATA_OUT)).toBe(22);
+            expect(call("IDirect3DQuery9_GetData", a, DATA_OUT, 4, 0)).toBe(S_FALSE);
+
+            releaseA();
+            await worker.manager.settled();
+            expect(posted).toHaveLength(2);
+            table.accept(posted[1]!);
+            expect(call("IDirect3DQuery9_GetData", a, DATA_OUT, 4, 0)).toBe(D3D_OK);
+            expect(Mem.readUint32(DATA_OUT)).toBe(11);
+            // Each generation crossed once, and the retire-time collect has nothing left to send.
+            expect(worker.host.collect()).toEqual([]);
+            expect(table.counters).toMatchObject({ arrived: 2, stale: 0, answered: 2 });
+        } finally {
+            stop();
+        }
     });
 
     test("static information queries fence nothing and never reach the worker", () => {

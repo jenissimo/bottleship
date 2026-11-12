@@ -48,6 +48,11 @@ import {
     d3d9ObjectSupportsIid,
 } from './object-contracts';
 
+/** One range check and one copy for a float array the guest asked to have written back. */
+function writeFloats(addr: number, data: Float32Array): boolean {
+    return Mem.writeBytes(addr, new Uint8Array(data.buffer, data.byteOffset, data.byteLength)) === data.byteLength;
+}
+
 /**
  * A texture level / cube face surface has no refcount of its own: real D3D9 keeps
  * the parent texture's, and a Release through the surface is what frees the
@@ -219,12 +224,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             return D3DERR_INVALIDCALL;
         }
 
-        for (let i = 0; i < 16; i++) {
-            if (!Mem.writeFloat32(pMatrix + i * 4, matrix[i]!)) {
-                return D3DERR_INVALIDCALL;
-            }
-        }
-        return D3D_OK;
+        return writeFloats(pMatrix, matrix.subarray(0, 16)) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
     exports['IDirect3DDevice9_MultiplyTransform'] = (_ctx, mem, args) => {
@@ -855,10 +855,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             (count > 0 && !pData)) return D3DERR_INVALIDCALL;
 
         const data = device.getVertexShaderConstants(start, count);
-        for (let i = 0; i < data.length; i++) {
-            if (!Mem.writeFloat32(pData + i * 4, data[i]!)) return D3DERR_INVALIDCALL;
-        }
-        return D3D_OK;
+        return data.length === 0 || writeFloats(pData, data) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
     // ── Vertex Declaration ───────────────────────────────────────────

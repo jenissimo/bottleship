@@ -140,7 +140,20 @@ export interface WaitInfo {
     onWake?: WaitCompletion;
 }
 
-export type WaitCompletion = (waitResult: number) => { value: number; lastError?: number };
+export const enum WaitCompletionKind {
+    WAIT_ON_ADDRESS = 1,
+    OVERLAPPED_RESULT = 2,
+    RERUN_FROM_STUB = 3,
+}
+
+export interface WaitCompletion {
+    kind: WaitCompletionKind;
+    a: number;
+    b: number;
+    c: number;
+}
+
+export interface WaitAnswer { value: number; lastError?: number }
 
 // ─── APC ────────────────────────────────────────────────────────────────────────
 
@@ -173,6 +186,8 @@ export interface PendingApc {
 // ─── Thread Record ──────────────────────────────────────────────────────────────
 
 export interface Thread {
+    /** Object identity survives closure of the original handle while aliases remain. */
+    kernelObject?: KernelThreadObject;
     // Identity
     readonly id: number;
     readonly handle: number;
@@ -203,7 +218,8 @@ export interface Thread {
     // Exit
     exitCode: number | null;
 
-    // TLS
+    // TLS values NOT backed by the TEB TLS array (index >= 64, or no array yet). Slots
+    // 0..63 live in guest memory, where the WASM TlsGetValue/TlsSetValue serve them.
     tlsValues: Map<number, number>;
 
     // Per-thread error
@@ -328,6 +344,8 @@ export interface WaitDecision {
 // ─── Kernel Objects ─────────────────────────────────────────────────────────────
 
 export interface KernelThreadObject {
+    /** Last real scheduler values retained for queries after reaping. */
+    basicInformation?: { tebAddress: number; relativePriority: number };
     kind: 'thread';
     threadId: number;
     /** Set when the thread terminates; survives scheduler reaping. */
@@ -400,6 +418,13 @@ export const enum TimerKind {
     MSS_TIMER = 6,
     QUARTZ_VIDEO = 7,
     DMUSIC_SYNTH = 8,
+    JOYSTICK_CAPTURE = 9,
+    WAVEOUT_COMPLETION = 10,
+    TIMER_QUEUE_TIMER = 11,
+    THREADPOOL_TIMER = 12,
+    THREADPOOL_WAIT = 13,
+    MSS_HEARTBEAT = 14,
+    MIDI_SYNTH = 15,
 }
 
 // ─── Scheduler Configuration ────────────────────────────────────────────────────

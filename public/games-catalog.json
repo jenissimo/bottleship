@@ -1,5 +1,27 @@
 [
   {
+    "id": "gta1-rockstar-classics",
+    "name": "Grand Theft Auto",
+    "subtitle": "Freeware",
+    "wgbUrl": "/apps/gta1-rockstar-classics.8519e6e8330602c0a27558b2d12604c07be6b76d793c08de49edd53857bdff67.wgb",
+    "coverUrl": "/covers/gta1-box.jpg",
+    "description": "The original 1997 top-down crime game, released free by Rockstar Games as a Rockstar Classic. Start a career in Liberty City straight from the menu, with the original music.",
+    "year": "1997",
+    "genre": "Action",
+    "enabled": true
+  },
+  {
+    "id": "gta2-rockstar-classics",
+    "name": "Grand Theft Auto 2",
+    "subtitle": "Freeware",
+    "wgbUrl": "/apps/gta2-rockstar-classics.e6399cfd07a4d62b4be21709c6ae92d051974e4b88c14ed1fa53e3c5a01b719f.wgb",
+    "coverUrl": "/covers/gta2-box.jpg",
+    "description": "Anywhere City in the 1999 sequel, released free by Rockstar Games as a Rockstar Classic. The Bink intro plays first; Play, then Start Play in Area 1 enters Downtown.",
+    "year": "1999",
+    "genre": "Action",
+    "enabled": true
+  },
+  {
     "id": "lotr-return-of-the-king-demo",
     "name": "The Lord of the Rings: The Return of the King",
     "subtitle": "Original PC Demo",

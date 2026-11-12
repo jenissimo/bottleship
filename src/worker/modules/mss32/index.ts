@@ -4,6 +4,7 @@ import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
 import { TimerKind } from "../../core/scheduler/types";
+import { setTimerHandler } from "../../core/scheduler/timer-wheel";
 import { TimeService } from "../../runtime/time";
 import { MSSContext, createMSSContext, SMP_DONE, SMP_PLAYING } from "./context";
 import { finishSamplePlayback, getBytesPerSecond, getPlaybackLengthBytes, setSampleStatus, setStreamStatus, writeSamplePosition, writeStreamPosition, startHeartbeat, stopHeartbeat } from "./helpers";
@@ -25,6 +26,8 @@ import { createWavInfoExports } from "./wav-info";
 import { createSequenceExports } from "./sequence";
 import { createMidiDriverExports } from "./midi-driver";
 import { mssCensus, type MssCensus } from "./census";
+import { registerMssSavestate } from "./savestate";
+import { savestatesEnabled } from "../../savestate/participant";
 
 /**
  * Bytes each export pops on return, read from the SAME descriptor the guest stub's
@@ -38,6 +41,7 @@ import { mssCensus, type MssCensus } from "./census";
  * it, so a wrong number here desynchronises the guest stack only on the calls where a
  * refill happened to come due.
  */
+// @transient(a constant table built from the API descriptor)
 const EXPORT_CLEANUP: ReadonlyMap<string, number> = new Map(
     mss32Module.functions.map((fn) => [
         fn.name,
@@ -53,6 +57,7 @@ export class MSS32 implements IModule {
 
     initialize(process: Process): void {
         this.ctx = createMSSContext(process);
+        if (savestatesEnabled()) registerMssSavestate(this.ctx);
 
         // The heartbeat syncs emulator memory with playback state (50Hz / 20ms): EOS
         // detection (samples reaching SMP_DONE), position writeback, and the service
@@ -62,6 +67,8 @@ export class MSS32 implements IModule {
         // → MSS32 voice-pool saturation hang (mac). startHeartbeat re-arms it whenever a
         // digital driver is (re)opened; closing one stops it.
         this.ctx.heartbeatTick = () => { pumpVfsStreams(this.ctx); updateEmulatorState(this.ctx); };
+        const ctx = this.ctx;
+        setTimerHandler(TimerKind.MSS_HEARTBEAT, () => ctx.heartbeatTick?.());
         startHeartbeat(this.ctx);
 
         // Merge all domain exports

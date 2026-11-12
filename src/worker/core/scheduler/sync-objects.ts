@@ -78,7 +78,25 @@ export function describeSyncRing(limit = SYNC_RING_SIZE): SyncRingEntry[] {
     return ordered.slice(-limit);
 }
 
+/** A state change on an event other processes hold too (see SyncObjectManager.markShared). */
+export type SharedEventChange = 'set' | 'reset' | 'consume';
+
+/**
+ * Identity of an event held from several workers: the process that created it (which relays
+ * every change to the others) and its id there. Kept beside the object, not on it, so the
+ * kernel-object record a savestate captures is unchanged — and a savestate covers no
+ * child process, so sharing never needs to be saved.
+ */
+export interface SharedEventIdentity { ownerPid: number; id: number; }
+
 export class SyncObjectManager {
+    /**
+     * Told about every change to a SHARED event (one with `share` set) made in this process.
+     * Unshared events never reach it, and a shared one never takes the WASM fast path (its
+     * mirror is dropped when it becomes shared), so no change can bypass it.
+     */
+    onSharedEventChange: ((event: KernelEventObject, share: SharedEventIdentity, change: SharedEventChange) => void) | null = null;
+    private sharedEvents = new WeakMap<KernelEventObject, SharedEventIdentity>();
     private resourceProvider = SystemResourceProvider.getInstance();
     private eventHandles = new Set<number>();
     private eventAliasGroups = new WeakMap<KernelEventObject, Set<number>>();
@@ -150,6 +168,47 @@ export class SyncObjectManager {
         return duplicate;
     }
 
+    /**
+     * Make an event shareable with other processes (the caller then names it with
+     * markShared): from now on its state lives in the JS
+     * object only, because the byte-per-handle WASM mirror is private to this worker and a
+     * SetEvent served there would never be relayed. Returns the event, or null.
+     */
+    shareEvent(handle: number): KernelEventObject | null {
+        const event = this._getEvent(handle);
+        if (!event) return null;
+        const state = this._getEventState(event, handle);
+        event.signaled = state.signaled; event.pendingWake = state.pendingWake;
+        event.manualReset = state.manualReset;
+        for (const alias of this.getEventAliases(handle)) hypercallDataManager.unregisterEventMirror(alias);
+        return event;
+    }
+
+    /**
+     * Install an event at a fixed handle value (an inherited handle keeps its parent's
+     * value). Never mirrored into the WASM tier: such an event is shared by construction.
+     */
+    adoptEventAt(handle: number, event: KernelEventObject, attributes?: { grantedAccess: number; flags: number }): boolean {
+        if (!this.resourceProvider.registerKernelObjectAt(handle, event, attributes)) return false;
+        this.eventHandles.add(handle >>> 0);
+        return true;
+    }
+
+    markShared(event: KernelEventObject, share: SharedEventIdentity): void { this.sharedEvents.set(event, share); }
+    shareOf(event: KernelEventObject): SharedEventIdentity | undefined { return this.sharedEvents.get(event); }
+
+    private _noteShared(event: KernelEventObject, change: SharedEventChange): void {
+        const share = this.sharedEvents.get(event);
+        if (share) this.onSharedEventChange?.(event, share, change);
+    }
+
+    /** Every live handle in this process that names `event`. */
+    handlesOfEvent(event: KernelEventObject): number[] {
+        const out: number[] = [];
+        for (const h of this.eventHandles) if (this._getEvent(h) === event) out.push(h);
+        return out;
+    }
+
     getEventAliases(handle: number): number[] {
         const event = this._getEvent(handle); if (!event) return [];
         const group = this.eventAliasGroups.get(event); if (!group) return [handle];
@@ -178,6 +237,7 @@ export class SyncObjectManager {
             event.pendingWake = true;
         }
         hypercallDataManager.writeEventMirrorSignaled(handle, true, event.manualReset);
+        this._noteShared(event, 'set');
         return true;
     }
 
@@ -187,6 +247,7 @@ export class SyncObjectManager {
         event.signaled = false;
         event.pendingWake = false;
         hypercallDataManager.writeEventMirrorSignaled(handle, false, event.manualReset);
+        this._noteShared(event, 'reset');
         return true;
     }
 
@@ -312,6 +373,7 @@ export class SyncObjectManager {
                 recordSyncEvent("consume", h, threadId);
                 e.signaled = false;
                 hypercallDataManager.writeEventMirrorSignaled(h, false, false);
+                this._noteShared(e, 'consume');
             }
         }
         for (const h of decision.consumePendingWake ?? []) {
@@ -369,6 +431,37 @@ export class SyncObjectManager {
                 return `mutex(owner=${owner ?? 'none'},rec=${hypercallDataManager.readMutexMirrorState(handle)?.recursion ?? m.recursion})`;
             }
             case 'thread': return `thread(${(obj as KernelThreadObject).threadId})`;
+        }
+    }
+
+    captureState(): { events: number[]; semaphores: number[]; mutexes: number[] } {
+        return { events: [...this.eventHandles], semaphores: [...this.semaphoreHandles], mutexes: [...this.mutexHandles] };
+    }
+
+    restoreState(state: { events: number[]; semaphores: number[]; mutexes: number[] }): void {
+        this.eventHandles = new Set(state.events);
+        this.semaphoreHandles = new Set(state.semaphores);
+        this.mutexHandles = new Set(state.mutexes);
+        this.eventAliasGroups = new WeakMap();
+        for (const h of state.events) {
+            const event = this.resourceProvider.getKernelObject(h) as KernelEventObject | null;
+            if (!event) continue;
+            const group = this.eventAliasGroups.get(event) ?? new Set<number>();
+            group.add(h);
+            this.eventAliasGroups.set(event, group);
+        }
+    }
+
+    syncFromMirrors(): void {
+        for (const h of this.eventHandles) {
+            const event = this.resourceProvider.getKernelObject(h) as KernelEventObject | null;
+            const live = hypercallDataManager.readEventMirrorState(h);
+            if (event && live) { event.signaled = live.signaled; event.pendingWake = live.pendingWake; }
+        }
+        for (const h of this.mutexHandles) {
+            const mutex = this.resourceProvider.getKernelObject(h) as KernelMutexObject | null;
+            const live = hypercallDataManager.readMutexMirrorState(h);
+            if (mutex && live) { mutex.ownerThreadId = live.owner; mutex.recursion = live.recursion; mutex.abandoned = live.abandoned; }
         }
     }
 

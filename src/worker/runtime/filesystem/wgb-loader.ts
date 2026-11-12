@@ -1,10 +1,12 @@
-import { BlobSource, BufferSource, SyncHttpRangeSource, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
+import { BlobSource, BufferSource, SyncHttpRangeSource, WGB_BLOCK_INDEX_ENTRY, WGB_BLOCK_INDEX_VERSION, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
+import type { WgbBlockIndexRef } from "@bottleship/formats/zip";
 import type { ZipSource } from "@bottleship/formats/zip";
 import type { ExeRegistryRedirect } from "@bottleship/formats/sdb";
 import { CachedSource, computeAdaptiveMaxBytes } from "./cached-source";
 import { SabIoSource } from "./sab-io-source";
 import { Logger, LogCategory } from "../../core/logger";
 import { WgbCache } from "./wgb-cache";
+import { shouldPersistBundleUrl } from "./wgb-cache-policy";
 
 /**
  * Wrap a source in an LRU block-cache where that makes the guest's SYNCHRONOUS
@@ -109,6 +111,7 @@ export interface WgbManifest {
     /** Presentation baseline; enriched by editorial catalog / user overrides keyed by gameId. */
     meta?: WgbMeta;
     entrypoint: string;
+    blockIndex?: WgbBlockIndexRef;
     args?: string;
     rom?: string;
     registry?: string;
@@ -178,6 +181,8 @@ export interface WgbManifest {
          * (NatalieBrooksSTH music jumps). Mirrors real per-process x87 precision policy.
          */
         fpuStrict?: boolean;
+        /** See EmulatorConfig.ddrawHoldPresentsUntilFlip. */
+        ddrawHoldPresentsUntilFlip?: boolean;
         /**
          * Per-game graphics quality overrides (anisotropy, brightness/contrast/saturation,
          * aspect/integer scaling, post-FX, MSAA/internal-res…). Layered on top of the global
@@ -210,6 +215,13 @@ export interface WgbManifest {
          * Same rule syntax as disabledDlls ("ddraw", "ddraw.dll", wildcards).
          */
         appDirDlls?: string[];
+        /**
+         * Which C runtime the whole process binds to when the bundle ships its own msvcrt.dll
+         * (or msvcrNN / msvcpNN). "auto" (default): HLE when it covers every module's CRT
+         * imports, else the shipped DLL for every module. "hle" / "native" force one side.
+         * One CRT per process either way (src/worker/core/crt-binding.ts).
+         */
+        crt?: "auto" | "hle" | "native";
         /**
          * Registry subtrees a process names under one key but Windows serves from another — the
          * VirtualRegistry ADDREDIRECT shims of a shim database the game's installer registers
@@ -311,6 +323,19 @@ export class WgbLoader {
     }
 
     static async fromUrl(url: string, options?: { preload?: boolean; io?: import("@bottleship/formats/wgb/io-profile").WgbIoPolicy }): Promise<WgbBundle> {
+        // A dev disk route is already a local file: stream it, never stage it in OPFS.
+        if (!shouldPersistBundleUrl(url)) {
+            const io = await SabIoSource.create(url);
+            (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo = io;
+            try { return await this.fromSource(io); }
+            catch (error) {
+                (globalThis as { __wgbBlockCache?: CachedSource }).__wgbBlockCache?.close();
+                await io.closeAsync();
+                (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo = undefined;
+                (globalThis as { __wgbBlockCache?: unknown }).__wgbBlockCache = undefined;
+                throw error;
+            }
+        }
         // Fastest path: a cached bundle read SYNCHRONOUSLY off disk (no RAM copy).
         const syncSource = await WgbCache.openSyncSourceForUrl(url);
         if (syncSource) return this.fromSource(syncSource);
@@ -400,6 +425,7 @@ export class WgbLoader {
             );
         }
 
+        checkBlockIndex(manifest, archive);
         onStage?.(`Loading ${manifest.entrypoint.split(/[\\/]/).pop() ?? "game"}`);
         const entrypointBytes = await readEntrypointBytes(archive, manifest.entrypoint);
 
@@ -448,6 +474,21 @@ export async function readEntrypointBytes(archive: ZipArchive, entrypoint: strin
     return archive.readEntry(entry);
 }
 
+export function checkBlockIndex(manifest: Pick<WgbManifest, "blockIndex">, archive: ZipArchive): void {
+    const ref = manifest.blockIndex;
+    if (!ref) return;
+    if (ref.version !== WGB_BLOCK_INDEX_VERSION) {
+        throw new Error(`This bundle needs block-index v${ref.version}; this engine reads v${WGB_BLOCK_INDEX_VERSION}.`);
+    }
+    if (ref.member !== WGB_BLOCK_INDEX_ENTRY) {
+        throw new Error(`This bundle names block-index member "${ref.member}"; this engine reads "${WGB_BLOCK_INDEX_ENTRY}".`);
+    }
+    if (archive.blockIndexState !== "loaded") {
+        const why = archive.blockIndexState === "rejected" ? `damaged (${archive.blockIndexError})` : "missing";
+        throw new Error(`This bundle needs block-index v${ref.version}, but ${ref.member} is ${why}.`);
+    }
+}
+
 export function buildRomIndex(archive: ZipArchive, romRoot: string): Map<string, ZipEntry> {
     const normalized = normalizeZipPath(romRoot);
     const prefix = normalized.endsWith("/") ? normalized : `${normalized}/`;
@@ -459,7 +500,7 @@ export function buildRomIndex(archive: ZipArchive, romRoot: string): Map<string,
 
     for (const entry of archive.listEntries()) {
         const entryName = normalizeZipPath(entry.name);
-        if (!entryName.startsWith(prefix) || entry.isDirectory) continue;
+        if (!entryName.startsWith(prefix) || entry.isDirectory || entryName === WGB_BLOCK_INDEX_ENTRY) continue;
         const rel = entryName.slice(prefix.length);
         index.set(rel, entry);
     }

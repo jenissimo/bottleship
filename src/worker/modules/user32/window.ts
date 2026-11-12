@@ -5,6 +5,7 @@
  */
 
 import { type HleDispatcher, FastPathImplementation, ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
+import { syncWindowDCsToGeometry } from './window-dc-geometry';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
@@ -12,12 +13,14 @@ import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { getWindowClass, getWindowClassByName } from './class';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
+import { hasPendingStartupShowWindow, takeStartupShowWindow } from '../../core/process-startup-info';
 import { WindowInfo, windows, getWindowByHandle, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, markWindowPaintCycleRan, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, isWindowPosZOrderRequestValid, shouldSeedPaintFromParent, tryLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect } from './shared-state';
 import {
     invalidateWindow,
     validateWindow,
     hasPendingUpdate,
     getWindowUpdateBounds,
+    getWindowUpdateQuads,
     consumeNeedsErase,
     clearWindowUpdate,
     removeWindowUpdate,
@@ -31,6 +34,8 @@ import { registerWindowGeometryExports, removeWindowPlacement, clientSizeFromWin
 import { registerWindowQueryExports } from './window-query';
 import { registerWindowPropExports } from './window-props';
 import { GDIContext } from '../gdi32/context';
+import { makeClipRegion, normalizeClipRegion, clipRegionType } from '../gdi32/dc-clip';
+import { setRegionContents } from '../gdi32/painting-dc-state';
 import { ensureAnimateControlClasses, clearAnimateState, onAnimateShowWindow, isAnimateControlWindow } from './animate-control';
 import { clearMciWndState } from '../msvfw32-mciwnd';
 import { getBuiltinSystemClass, getDefDlgProcAddress, getDefWindowProcAddress } from './system-classes';
@@ -51,6 +56,8 @@ import {
 import { isSentinelWndProc } from './dialog';
 import { applyDefaultSetText, handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
 import { encodeAnsi, readAnsiOrWideFromGuest } from '../codepage-utils';
+
+const ERROR_CANNOT_FIND_WND_CLASS = 1407;
 import { noteDialogOverlayCandidate, eraseDialogOverlay, isWindowFullyCoveredByHigherTopLevel } from './dialog-overlay';
 import { eraseControlOverlayRect, eraseHiddenWindowPixels, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, requestGuestDialogPaint } from './dialog-paint';
 import {
@@ -61,12 +68,13 @@ import {
 } from './control-interaction';
 import { ddrawOwnsScreen } from '../ddraw/gdi-visibility';
 import { paintTraceEnabled, logBeginEndPaint } from './paint-trace';
-import { repaintChildControls } from './controls';
+import { repaintChildControls, applyComboBoxClosedHeight } from './controls';
 import { restampOwnedPopups } from './paint-hooks';
 import {
     tryEndPaintOwnerDrawChain,
     tryRepaintOwnerDrawButton,
     requestOwnerDrawButtonPaint,
+    requestSubclassedControlPaint,
     isOwnerDrawButton,
     isGuestPaintedControl,
     type OwnerDrawDeps,
@@ -79,6 +87,7 @@ import {
     setForegroundWithFocus,
     resolveForegroundTargets,
     reactivateOwnerIfNeeded,
+    deactivateWithoutSuccessor,
     buildPendingActivationSteps,
     buildInitialActivationSteps,
     markPendingActivation,
@@ -147,7 +156,7 @@ export function clientSizeFromCreateWindow(
 const makeGeometryLParam = (lo: number, hi: number): number =>
     (((lo & 0xFFFF) | ((hi & 0xFFFF) << 16)) >>> 0);
 
-interface DeferredWindowPosEntry {
+export interface DeferredWindowPosEntry {
     hWnd: number;
     hWndInsertAfter: number;
     x: number;
@@ -157,7 +166,9 @@ interface DeferredWindowPosEntry {
     uFlags: number;
 }
 
+// @participant(user32)
 const deferWindowPosBatches = new Map<number, DeferredWindowPosEntry[]>();
+// @participant(user32)
 let nextDeferWindowPosHandle = 1;
 
 interface ApplyWindowPosOptions {
@@ -339,6 +350,8 @@ function applyWindowPosGeometry(
         repaintParentDialogIfSystemControlGeometryChanged(window, moving, resizing);
     }
 
+    if (moving || resizing) syncWindowDCsToGeometry(hWnd);
+
     if (!options?.skipDialogOverlayRepaint && !(uFlags & 0x0008 /* SWP_NOREDRAW */)
         && window.visible && window.nativeClassName === '#32770'
         && (moving || resizing)) {
@@ -512,6 +525,7 @@ const WM_ERASEBKGND_PAINT = 0x0014;
  * Win32 hands the erase a DC clipped to the update region; the class-brush fill must
  * respect that or an InvalidateRect of one control's rect repaints the whole client.
  */
+// @refuse(a WM_ERASEBKGND is in flight)
 const pendingEraseRects = new Map<number, ClientRect>();
 
 /**
@@ -793,6 +807,7 @@ export function runDefaultWindowPaint(
  */
 type SyncWndProcImpl = (ctx: X86Context, mem: Uint8Array, args: number[]) => number | ThunkResult;
 
+// @transient(wiring set at module init)
 let defWindowProcImpl: SyncWndProcImpl | null = null;
 
 export function defaultWindowProc(
@@ -832,6 +847,7 @@ const SIZE_BORDER_CURSORS = [
 ];
 
 /** Windows whose parent WM_SETCURSOR offer is out with the guest. */
+// @refuse(a WM_SETCURSOR forward to a parent window is in flight)
 const setCursorForwardInFlight = new Set<number>();
 
 /** Bundle-switch reset: hwnds are recycled, so an unfinished offer must not outlive them. */
@@ -1026,7 +1042,19 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             classInfo = getWindowClassByName(className);
         }
 
+        // An empty class name can never name a registered class: CreateWindowEx fails with
+        // ERROR_CANNOT_FIND_WND_CLASS (Wine WIN_CreateWindowEx). Apps that fill a fixed control
+        // table create the unused slots this way and rely on the NULL HWND; a placeholder window
+        // there is an invisible-in-intent top-level window covering the app's own dialog.
+        if (!classInfo && className === '') {
+            Logger.warn(LogCategory.USER32, `CreateWindowEx: class ${JSON.stringify(className)} is not registered`);
+            System.getInstance().scheduler.setLastError(ERROR_CANNOT_FIND_WND_CLASS);
+            return null;
+        }
+
         if (!classInfo && typeof className === 'string') {
+            // A named class we do not implement is a missing implementation, not an app
+            // error; the placeholder keeps the gap visible in the log.
             Logger.warn(LogCategory.USER32, `CreateWindowEx: class "${className}" not found, using dummy`);
             classInfo = { lpfnWndProc: 0 };
         }
@@ -1123,6 +1151,9 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             if (!windowInfo.wndProc) {
                 windowInfo.wndProc = getDefWindowProcAddress();
             }
+            // The combobox's create-time sizing: cy is the height WITH the dropped list,
+            // the window itself is the closed box (same rule as a dialog template's).
+            applyComboBoxClosedHeight(windowInfo);
         }
 
         windows.set(windowInfo.handle, windowInfo);
@@ -1176,6 +1207,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         // WM_CREATE into it is a guest round-trip for a no-op (dialog children skip it
         // the same way). CBT hooks still fire below when present.
         const hasGuestCreateProc = !!windowInfo.wndProc && !windowInfo.isSystemControl;
+        if (!windowInfo.visible && (windowInfo.style & (0x40000000 | 0x80000000)) === 0) windowInfo.sizeMovePending = true;
 
         if (!callbackManager || (!hasGuestCreateProc && totalCbtHooks === 0)) {
             postInitialVisibleWindowMessages(windowInfo);
@@ -1525,6 +1557,11 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         };
         markSubtree(hWnd);
 
+        // The active window going with nothing to take over is deactivated first, while it
+        // still exists — the app hears WM_ACTIVATEAPP(FALSE) before WM_DESTROY (Wine
+        // send_destroy_message → activate_other_window; see deactivateWithoutSuccessor).
+        const deactivation = deactivateWithoutSuccessor(hWnd);
+
         // Erase the dialog's pixels from the GDI overlay BEFORE teardown, while its
         // rect is still known — otherwise a closed dialog lingers as a ghost over the
         // game (the overlay is a persistent screen-space canvas). Only #32770 dialogs
@@ -1539,6 +1576,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const sync = beginSyncDestroyDelivery(
             ctx, mem, hWnd, finalizeDestroy, stackCleanup,
             () => reactivateOwnerIfNeeded(hWnd, ownerHwnd),
+            deactivation,
         );
         if (sync) {
             return sync;
@@ -1796,8 +1834,30 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const WS_VISIBLE = 0x10000000;
         const WS_CHILD = 0x40000000;
         const WS_POPUP = 0x80000000;
+        const WS_CAPTION = 0x00c00000;
         const WS_MINIMIZE = 0x20000000;
         const WS_MAXIMIZE = 0x01000000;
+
+        // The launcher's wShowWindow is spent by the first ShowWindow of a top-level
+        // window — Wine's show_window uses the same test: no WS_CHILD, no owner, and a
+        // popup only when it also carries a caption. It is spent whatever command that
+        // call uses, because the whole point is that the launcher decided how the first
+        // window appears. Only the three "whatever the launcher said" commands take the
+        // value; an explicit SW_HIDE or SW_SHOWMAXIMIZED still wins, and later calls are
+        // ordinary shows, which is why an application can still hide its own window.
+        const spendsStartupShow = (window.style & WS_CHILD) === 0
+            && (window.parent ?? 0) === 0
+            && ((window.style & WS_POPUP) === 0
+                || (window.style & (WS_POPUP | WS_CAPTION)) === (WS_POPUP | WS_CAPTION));
+        if (spendsStartupShow) {
+            const fromStartup = takeStartupShowWindow();
+            if (fromStartup !== null && fromStartup >= 0 && fromStartup <= 11
+                && (nCmdShow === 1 /* SW_SHOWNORMAL */ || nCmdShow === 5 /* SW_SHOW */
+                    || nCmdShow === 10 /* SW_SHOWDEFAULT */)) {
+                nCmdShow = fromStartup;
+            }
+        }
+
         const wasVisible = (window.style & WS_VISIBLE) !== 0;
         const resultValue = forcedResult ?? (wasVisible ? 1 : 0);
         const show = nCmdShow !== 0;
@@ -1850,7 +1910,14 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                                 && (next.style & 0x08000000 /* WS_DISABLED */) === 0;
                         }) ?? 0;
                         if (successor) activateTopLevelWindow(successor);
-                        else wm.clearActiveWindow(hWnd);
+                        else {
+                            // Nothing takes over: activation goes to no window, and the
+                            // app is told so (Wine show_window → activate_other_window).
+                            for (const s of deactivateWithoutSuccessor(hWnd)) {
+                                wm.postMessage(s.hwnd, s.msg, s.wParam, s.lParam);
+                            }
+                            wm.clearActiveWindow(hWnd);
+                        }
                     }
                 } else if (isEffectivelyVisible(live)) {
                     if (!noZOrder && !isChild) wm.setWindowZOrder(hWnd, 0 /* HWND_TOP */);
@@ -1884,13 +1951,50 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             return resultValue;
         };
 
+        let chainFrameId = existingFrameId;
+        let chainDirect: { returnAddr: number; postEsp: number } | undefined;
+        let pendingSizeMoveSuspension: { callbackId: number; reusedFrame: boolean } | null = null;
+        const minMaxBefore = window.style & (WS_MINIMIZE | WS_MAXIMIZE);
+        const sendPendingSizeMove = (): number | null => {
+            const live = windows.get(hWnd);
+            if (!live || !show || !live.sizeMovePending) return resultValue;
+            if (!visibilityChanged && (live.style & (WS_MINIMIZE | WS_MAXIMIZE)) === minMaxBefore) return resultValue;
+            live.sizeMovePending = false;
+            const sizeType = (live.style & WS_MAXIMIZE) !== 0 ? 2 : ((live.style & WS_MINIMIZE) !== 0 ? 1 : 0);
+            const sizeLParam = sizeType === 1 ? 0 : makeGeometryLParam(live.width, live.height);
+            const sendMove = (): number | null => {
+                const move = trySuspendForSyncWindowMessage(
+                    ctx, hWnd, WM_MOVE_GEO, 0, makeGeometryLParam(live.x, live.y),
+                    'ShowWindow', stackCleanup, () => resultValue, chainFrameId || undefined, chainDirect,
+                );
+                return move.suspended ? null : resultValue;
+            };
+            const size = trySuspendForSyncWindowMessage(
+                ctx, hWnd, WM_SIZE_GEO, sizeType, sizeLParam,
+                'ShowWindow', stackCleanup, sendMove, chainFrameId || undefined, chainDirect,
+            );
+            if (!size.suspended) return resultValue;
+            pendingSizeMoveSuspension = size;
+            if (!chainFrameId && !chainDirect) {
+                chainFrameId = size.frameId;
+                chainDirect = size.directThunkReturn;
+            }
+            return null;
+        };
+        const showThenSizeMove = (): number | null => {
+            applyShowState();
+            return sendPendingSizeMove();
+        };
+
         // USER sends WM_SHOWWINDOW synchronously before SetWindowPos changes WS_VISIBLE.
         if (visibilityChanged || nCmdShow === 8 /* SW_SHOWNA */) {
             const sync = trySuspendForSyncWindowMessage(
                 ctx, hWnd, 0x0018 /* WM_SHOWWINDOW */, show ? 1 : 0, 0,
-                'ShowWindow', stackCleanup, applyShowState, existingFrameId || undefined,
+                'ShowWindow', stackCleanup, showThenSizeMove, existingFrameId || undefined,
             );
             if (sync.suspended) {
+                chainFrameId = sync.frameId || existingFrameId;
+                chainDirect = sync.directThunkReturn;
                 return {
                     value: resultValue,
                     suspendedForCallback: true,
@@ -1901,7 +2005,19 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 };
             }
         }
-        return applyShowState();
+        applyShowState();
+        if (sendPendingSizeMove() === null && pendingSizeMoveSuspension) {
+            const s: { callbackId: number; reusedFrame: boolean } = pendingSizeMoveSuspension;
+            return {
+                value: resultValue,
+                suspendedForCallback: true,
+                callbackId: s.callbackId,
+                stackCleanup,
+                skipStackCheck: true,
+                preserveCallbackReturnAddress: s.reusedFrame,
+            };
+        }
+        return resultValue;
     };
 
     exports['ShowWindow'] = (ctx, mem, args) =>
@@ -2242,7 +2358,9 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (isWindowUpdateLocked(hWnd)) return 1;
 
         const win = windows.get(hWnd);
-        if (win?.isSystemControl && win.parent) {
+        if (win?.isSystemControl && win.parent && requestSubclassedControlPaint(win)) {
+            invalidateControlColors(hWnd);
+        } else if (win?.isSystemControl && win.parent) {
             invalidateControlColors(hWnd); // next EndPaint chain re-queries WM_CTLCOLOR*
             // An owner-draw button's pixels exist only as the parent's WM_DRAWITEM, so the
             // chrome restamp below draws nothing for it — Win32 gets them back by handing
@@ -2476,6 +2594,12 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                     Logger.error(LogCategory.USER32,
                         `CallWindowProc owner-draw paint failed hwnd=0x${hWnd.toString(16)}: ${err}`);
                 }
+            }
+            if (Msg === WM_PAINT && subclassed?.isSystemControl && subclassed.wndProcSubclassed
+                && !isOwnerDrawButton(subclassed)) {
+                clearWindowUpdate(hWnd);
+                handleSystemControlMessage(subclassed, WM_PAINT, wParam, 0, mem);
+                return { value: 0, stackCleanup };
             }
             Logger.verbose(LogCategory.USER32,
                 `CallWindowProcA: sentinel WndProc 0x${lpPrevWndFunc.toString(16)}, returning 0`);
@@ -2781,10 +2905,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const hWnd = args[0] >>> 0;
         const lpRect = args[1] >>> 0;
         const bErase = args[2] >>> 0;
-        Logger.verbose(
-            LogCategory.USER32,
-            `GetUpdateRect(0x${hWnd.toString(16)}, 0x${lpRect.toString(16)}, ${bErase})`
-        );
+        Logger.verboseLazy(LogCategory.USER32, () =>
+            `GetUpdateRect(0x${hWnd.toString(16)}, 0x${lpRect.toString(16)}, ${bErase})`);
 
         const bounds = getWindowUpdateBounds(hWnd);
         if (!bounds) return 0; // FALSE
@@ -2792,14 +2914,40 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (lpRect) {
             writeClientRectToMem(mem, lpRect, bounds);
         }
-        // Win32: bErase=TRUE erases the background within the update region.
-        if (bErase) {
-            const win = windows.get(hWnd);
-            if (win && isDialogLikeWindow(win)) {
-                repaintDialogOverlayIfVisible(hWnd);
-            }
-        }
+        if (bErase) eraseUpdateBackground(hWnd);
         return 1; // TRUE
+    };
+
+    // Win32: bErase=TRUE erases the background within the update region.
+    const eraseUpdateBackground = (hWnd: number): void => {
+        const win = windows.get(hWnd);
+        if (win && isDialogLikeWindow(win)) {
+            repaintDialogOverlayIfVisible(hWnd);
+        }
+    };
+
+    // int GetUpdateRgn(HWND, HRGN, BOOL bErase): copies the update region, in client
+    // coordinates, into the caller's region and returns its type. RollerCoaster Tycoon's
+    // WM_PAINT handler picks what to redraw from the type: its paint rect on SIMPLEREGION,
+    // each GetRegionData rect on COMPLEXREGION, nothing on NULLREGION/ERROR.
+    exports['GetUpdateRgn'] = (ctx, mem, args) => {
+        const hWnd = args[0] >>> 0;
+        const hRgn = args[1] >>> 0;
+        const bErase = args[2] >>> 0;
+        if (!windows.has(hWnd)) return 0; // ERROR
+
+        // Validation can leave pieces that tile one rectangle; coalesce them so the
+        // type is SIMPLEREGION whenever the region is a single rectangle. One rect or
+        // none is already canonical.
+        const raw = makeClipRegion(getWindowUpdateQuads(hWnd));
+        const region = raw.rects.length > 4 ? normalizeClipRegion(raw) : raw;
+        if (!setRegionContents(hRgn, region)) return 0; // ERROR
+        if (bErase && region.rects.length > 0) eraseUpdateBackground(hWnd);
+
+        const type = clipRegionType(region);
+        Logger.verboseLazy(LogCategory.USER32, () =>
+            `GetUpdateRgn(0x${hWnd.toString(16)}, 0x${hRgn.toString(16)}, ${bErase}) -> ${type}`);
+        return type;
     };
 
     exports['ShowOwnedPopups'] = (ctx, mem, args) => {
@@ -3072,6 +3220,9 @@ export function registerFastPathWindowFunctions(dispatcher: HleDispatcher): void
         const cmd = view.getInt32(esp + 8, true);
         const win = windows.get(hwnd);
         if (!win) return null;
+        // A pending wShowWindow belongs to the first top-level ShowWindow and has to be
+        // spent there, so the call cannot be answered from the visible/flags state alone.
+        if (hasPendingStartupShowWindow()) return null;
         const visible = (win.style & 0x10000000) !== 0;
         if (cmd === 0 && !visible) return 0;
         if (cmd === 5 && visible) return 1;
@@ -3086,4 +3237,20 @@ export function registerFastPathWindowFunctions(dispatcher: HleDispatcher): void
     dispatcher.registerFastPath('user32', 'GetForegroundWindow', getForeground, { trivial: true });
     dispatcher.registerFastPath('user32', 'ShowCursor', showCursor, { trivial: true });
     dispatcher.registerFastPath('user32', 'ShowWindow', showWindowNoop, { trivial: true });
+}
+
+export interface WindowPosState { deferBatches: Array<[number, DeferredWindowPosEntry[]]>; nextDeferHandle: number }
+
+export function captureWindowPosState(): WindowPosState {
+    if (setCursorForwardInFlight.size > 0) throw new Error('user32: a WM_SETCURSOR forward to a parent window is in flight');
+    if (pendingEraseRects.size > 0) throw new Error('user32: a WM_ERASEBKGND is in flight');
+    return { deferBatches: [...deferWindowPosBatches].map(([h, b]) => [h, b.map(e => ({ ...e }))]), nextDeferHandle: nextDeferWindowPosHandle };
+}
+
+export function restoreWindowPosState(s: WindowPosState): void {
+    deferWindowPosBatches.clear();
+    for (const [h, b] of s.deferBatches) deferWindowPosBatches.set(h, b.map(e => ({ ...e })));
+    nextDeferWindowPosHandle = s.nextDeferHandle;
+    setCursorForwardInFlight.clear();
+    pendingEraseRects.clear();
 }

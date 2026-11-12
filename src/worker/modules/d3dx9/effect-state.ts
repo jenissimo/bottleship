@@ -160,6 +160,48 @@ export interface EffectModel {
     objects: EffectObject[];
 }
 
+export interface EffectWriteStamp {
+    at: number;
+}
+
+let effectStampCounter = 0;
+const valueBlockStamps = new WeakMap<ArrayBufferLike, EffectWriteStamp>();
+const objectParamStamps = new WeakMap<EffectParameter, EffectWriteStamp>();
+
+export function nextEffectStamp(): number {
+    return ++effectStampCounter;
+}
+
+export function effectWriteStampOf(param: EffectParameter): EffectWriteStamp {
+    if (param.value.length) {
+        let stamp = valueBlockStamps.get(param.value.buffer);
+        if (!stamp) {
+            stamp = { at: 0 };
+            valueBlockStamps.set(param.value.buffer, stamp);
+        }
+        return stamp;
+    }
+    let stamp = objectParamStamps.get(param);
+    if (!stamp) {
+        stamp = { at: 0 };
+        objectParamStamps.set(param, stamp);
+    }
+    return stamp;
+}
+
+export function markEffectParamWritten(param: EffectParameter): void {
+    effectWriteStampOf(param).at = ++effectStampCounter;
+}
+
+export function effectParamStamp(param: EffectParameter): number {
+    let stamp = (param.value.length ? valueBlockStamps.get(param.value.buffer)?.at : objectParamStamps.get(param)?.at) ?? 0;
+    for (const member of param.members) {
+        const s = effectParamStamp(member);
+        if (s > stamp) stamp = s;
+    }
+    return stamp;
+}
+
 // ── handles ──────────────────────────────────────────────────────────────────
 // 0 is reserved for "not found", so every kind starts its index at 1.
 

@@ -1,4 +1,5 @@
 import { ThunkGenerator, ThunkStub } from './thunk-generator';
+import { restartableCheck } from './restartable';
 import { CallbackManager } from './callback-manager';
 import { Logger, LogCategory } from '../logger';
 import { System } from '../system';
@@ -37,7 +38,7 @@ import {
     WBUF_ARG_PAYLOAD, WBUF_ARG_SHADER_CONSTANT, WBUF_ARG_UP_DRAW, WBUF_PAYLOAD_MAX_BYTES, wbufEntryStride,
 } from './wbuf-format';
 export { WBUF_ARG_PAYLOAD, WBUF_ARG_SHADER_CONSTANT, WBUF_ARG_UP_DRAW };
-import { cpuViews, cpuViewsForBuffer, readRetiredInsns, PROXY_BASELINE } from '../cpu/cpu-views';
+import { cpuViews, cpuViewsForBuffer, readEip, readRetiredInsns, PROXY_BASELINE } from '../cpu/cpu-views';
 import { PF_HALT_TARGET, TRAP_MARKER_VECTOR } from '../bootloader';
 import { faultRecorder, cr2RegisterCandidates, isFaultEipConsistent, analyzeIndirectCallFault, classifyWildTransfer } from '../memory/fault-recorder';
 import { stubRegistry } from '../diagnostics/stub-registry';
@@ -260,6 +261,21 @@ interface ActiveAsyncThunk {
     originalSpinBytes?: [number, number];
     /** Caller's module base at call time (for offset->linear patch on async return) */
     callerModuleBase?: number;
+    /** Whether the call can still be re-issued instead of awaited (see restartable.ts). */
+    restartable?: () => boolean;
+}
+
+export interface RestartablePark {
+    threadId: number;
+    functionId: number;
+    functionName: string;
+    generation: number;
+    esp: number;
+    returnAddr: number;
+    argBytes: number;
+    args: Uint8Array;
+    spinAddr: number;
+    spinBytes: [number, number];
 }
 
 interface PendingAsyncRestore {
@@ -384,7 +400,45 @@ export class ThunkDispatcher {
         slow: Uint32Array; async: Uint32Array; fastFallthrough: Uint32Array;
         callbackReturns: number; sehResults: number;
     } | null = null;
-    private wasmMissWarned: Set<number> = new Set();
+    /**
+     * Per-id "WASM-miss diagnostic already evaluated" flag (1 = checked). Lazily cleared
+     * (see wasmMissDirty) whenever a registration could have changed the hypercall table.
+     */
+    private wasmMissChecked = new Uint8Array(MAX_THUNK_ID);
+    private wasmMissDirty = false;
+    /**
+     * Negative cache for the implementation-lookup chain (_trySameNameLookup >
+     * _tryDllForward > _tryPendingRegistration). implLookupMissGen[id] === implRegistrationGen
+     * means that chain already failed for this id and nothing that could satisfy it has been
+     * registered since. EVERY site that adds an implementation or a pending registration
+     * (or resets the tables) MUST call noteRegistrationChanged().
+     */
+    private implLookupMissGen = new Uint32Array(MAX_THUNK_ID);
+    private implRegistrationGen = 1;
+    /** Per-id count of full UNIMPLEMENTED logs emitted (saturating); the rest are silent. */
+    private unimplementedLogCount = new Uint16Array(MAX_THUNK_ID);
+    private static readonly UNIMPLEMENTED_FULL_LOG_LIMIT = 8;
+    /** Lazy isDefaultWindowProcThunk cache by id: 0 = unknown, 1 = no, 2 = yes. Reset when namesTable[id] is rewritten. */
+    private defWndProcCache = new Uint8Array(MAX_THUNK_ID);
+
+    private noteRegistrationChanged(): void {
+        this.implRegistrationGen = (this.implRegistrationGen + 1) >>> 0;
+        if (this.implRegistrationGen === 0) {
+            this.implLookupMissGen.fill(0);
+            this.implRegistrationGen = 1;
+        }
+        this.wasmMissDirty = true;
+    }
+
+    private isDefaultWndProcId(id: number, name: string): boolean {
+        if (id < 0 || id >= MAX_THUNK_ID || name !== this.namesTable[id]) return isDefaultWindowProcThunk(name);
+        let v = this.defWndProcCache[id];
+        if (v === 0) {
+            v = isDefaultWindowProcThunk(name) ? 2 : 1;
+            this.defWndProcCache[id] = v;
+        }
+        return v === 2;
+    }
     // Static DLL forwarding table: source DLL > target DLL
     // shfolder.dll forwards all exports to shell32.dll on real Windows
     private static readonly DLL_FORWARDS: Record<string, string> = {
@@ -505,7 +559,7 @@ export class ThunkDispatcher {
     // Pending registrations for stubs that aren't created yet
     private pendingRegistrations: Map<string, { impl: ThunkImplementation; dllName: string; functionName: string }> = new Map();
     private pendingFastPathRegistrations: Map<string, { impl: FastPathImplementation; dllName: string; functionName: string; trivial?: boolean }> = new Map();
-    private pendingWriteBufRegistrations: Map<string, { handler: WriteBufHandler; dllName: string; functionName: string; argCount: number; isStdcall: boolean; ptrDeref?: boolean; floatCount?: number; shaderConstant?: boolean; coalesceArgMask?: number; shadowSpec?: ShadowTrampolineSpec; barrier?: boolean; structCapture?: { ptrArgIndex: number; payloadDwords: number }; multiStructCapture?: { ptrArgIndices: number[]; payloadDwords: number }; upDraw?: boolean; ownerDisarm?: boolean }> = new Map();
+    private pendingWriteBufRegistrations: Map<string, { handler: WriteBufHandler; dllName: string; functionName: string; argCount: number; isStdcall: boolean; zeroArg?: boolean; ptrDeref?: boolean; floatCount?: number; shaderConstant?: boolean; coalesceArgMask?: number; shadowSpec?: ShadowTrampolineSpec; barrier?: boolean; structCapture?: { ptrArgIndex: number; payloadDwords: number }; multiStructCapture?: { ptrArgIndices: number[]; payloadDwords: number }; upDraw?: boolean; ownerDisarm?: boolean }> = new Map();
     private pendingConstStubRegistrations: Map<string, { dllName: string; functionName: string; value: number; popBytes: number }> = new Map();
     private pendingIncRefStubRegistrations: Map<string, { dllName: string; functionName: string; spec: IncRefStubSpec }> = new Map();
 
@@ -1048,7 +1102,7 @@ export class ThunkDispatcher {
 
     private completeFailedSyncCall(id: number, name: string, cpu: any, esp: number, argCount: number): void {
         // The emitted RET still runs when a handler is missing or fails.
-        const cleanup = this.resolveThunkCleanup(id, argCount, name);
+        const cleanup = this.resolveThunkCleanup(id, argCount);
         this.lastThunkId = id;
         this.lastThunkName = name;
         this.lastExpectedEspAfterReturn = esp + 4 + cleanup;
@@ -1546,11 +1600,15 @@ export class ThunkDispatcher {
 
     enqueuePayloadById(
         id: number, h0: number, h1: number, h2: number, h3: number,
-        src: Uint8Array, srcOffset: number, byteCount: number,
+        src: Uint8Array, srcOffset: number, byteCount: number, tail: Uint8Array | null = null,
     ): boolean {
-        if (byteCount < 0 || byteCount > WBUF_PAYLOAD_MAX_BYTES) return false;
+        const headBytes = byteCount;
+        const tailBytes = tail === null ? 0 : tail.length;
+        byteCount += tailBytes;
+        if (headBytes < 0 || byteCount > WBUF_PAYLOAD_MAX_BYTES) return false;
         const stride = 24 + ((byteCount + 3) & ~3);
         this.ensureWbufQueue(this.wbufQueueEnd + stride);
+        if (tail !== null && tail.length !== tailBytes) return false;
         const q32 = this.wbufQueueU32!;
         const w = this.wbufQueueEnd >> 2;
         q32[w] = id;
@@ -1559,7 +1617,8 @@ export class ThunkDispatcher {
         q32[w + 3] = h2 >>> 0;
         q32[w + 4] = h3 >>> 0;
         q32[w + 5] = byteCount >>> 0;
-        if (byteCount > 0) this.wbufQueueU8!.set(src.subarray(srcOffset, srcOffset + byteCount), this.wbufQueueEnd + 24);
+        if (headBytes > 0) this.wbufQueueU8!.set(src.subarray(srcOffset, srcOffset + headBytes), this.wbufQueueEnd + 24);
+        if (tail !== null) this.wbufQueueU8!.set(tail, this.wbufQueueEnd + 24 + headBytes);
         this.wbufQueueEnd += stride;
         this.wbufDeferStats.enqueuedCalls++;
         this.wbufDeferStats.payloadBytes += byteCount;
@@ -1699,6 +1758,66 @@ export class ThunkDispatcher {
         this.wbufDeferStats.transports++;
         this.wbufDeferStats.bytesQueued += bytes;
         if (this.wbufQueueEnd > this.wbufDeferStats.peakQueueBytes) this.wbufDeferStats.peakQueueBytes = this.wbufQueueEnd;
+    }
+
+    captureState(): { wbufTail: number; asyncEpoch: number; uef: number; callbacks: ReturnType<CallbackManager['captureState']> } {
+        if (this.writeBufferPendingBytes() > 0) throw new Error('dispatcher: write-buffer entries are not flushed');
+        if (this.activeAsyncThunks.size > 0 && [...this.activeAsyncThunks.values()].some(i => i.restartable?.() !== true)) {
+            throw new Error('dispatcher: a thread waits on host work');
+        }
+        if (this.pendingAsyncRestores.length > 0 || this.sehDispatchStack.length > 0) throw new Error('dispatcher: not at a safe point');
+        return { wbufTail: this.wbufTail, asyncEpoch: this.asyncEpoch, uef: this.unhandledExceptionFilterAddr, callbacks: this.callbackManager.captureState() };
+    }
+
+    restoreState(state: { wbufTail: number; asyncEpoch: number; uef: number; callbacks: ReturnType<CallbackManager['captureState']> }): void {
+        this.applyPendingRegistrations();
+        this.wbufTail = state.wbufTail;
+        this.wbufQueueEnd = 0;
+        this.asyncEpoch = state.asyncEpoch;
+        this.unhandledExceptionFilterAddr = state.uef;
+        this.callbackManager.restoreState(state.callbacks);
+    }
+
+    restartableParks(): RestartablePark[] {
+        const out: RestartablePark[] = [];
+        for (const info of this.activeAsyncThunks.values()) {
+            if (info.restartable?.() !== true) continue;
+            if (info.returnAddr === undefined || info.esp === undefined || !info.stackSnapshot) {
+                throw new Error(`dispatcher: ${info.functionName ?? `#${info.functionId}`} parked without its stack`);
+            }
+            out.push({
+                threadId: info.threadId ?? 0, functionId: info.functionId, functionName: info.functionName ?? `#${info.functionId}`,
+                generation: info.asyncParkGeneration ?? 0, esp: info.esp, returnAddr: info.returnAddr,
+                argBytes: this.resolveThunkCleanup(info.functionId, 0),
+                args: info.stackSnapshot.slice(4),
+                spinAddr: info.spinAddr ?? this.spinLoopAddress, spinBytes: info.originalSpinBytes ?? [0, 0] as [number, number],
+            });
+        }
+        return out;
+    }
+
+    /** Threads parked on host Promises, for savestate readiness. */
+    asyncParks(): Array<{ name: string; threadId: number | null; restartable: boolean }> {
+        const out: Array<{ name: string; threadId: number | null; restartable: boolean }> = [];
+        for (const info of this.activeAsyncThunks.values()) {
+            out.push({ name: info.functionName ?? `#${info.functionId}`, threadId: info.threadId ?? null, restartable: info.restartable?.() === true });
+        }
+        return out;
+    }
+
+    pendingAsyncRestoreCount(): number {
+        return this.pendingAsyncRestores.length;
+    }
+
+    /** Bytes of write-buffer entries not yet applied: the guest ring past the tail, plus the queue. */
+    writeBufferPendingBytes(): number {
+        let ring = 0;
+        const mem32 = this.cachedMem32;
+        const headWordIdx = this.writeBufControlAddr >> 2;
+        if (this.writeBufControlAddr !== 0 && mem32 && headWordIdx < mem32.length) {
+            ring = Math.max(0, (mem32[headWordIdx]! >>> 0) - this.wbufTail);
+        }
+        return ring + this.wbufQueueEnd;
     }
 
     /** Run everything queued, in order. Public so a reader of back-end state outside a trap
@@ -2573,16 +2692,17 @@ export class ThunkDispatcher {
         if (this.crossingLedger) this.crossingLedger.slow[functionId]!++;
 
         // One-time warning per functionId: if WASM handler is registered but JS is handling it
-        if (hypercallDataManager.isEnabled() && !this.wasmMissWarned.has(functionId)) {
+        if (this.wasmMissDirty) { this.wasmMissChecked.fill(0); this.wasmMissDirty = false; }
+        if (this.wasmMissChecked[functionId] === 0 && hypercallDataManager.isEnabled()) {
             try {
                 const hpView = (hypercallDataManager as any).view as DataView | null;
                 const hpBase = (hypercallDataManager as any).hpBase as number;
                 if (hpView && hpBase) {
+                    this.wasmMissChecked[functionId] = 1;
                     const handlerId = hpView.getUint8(hpBase + 0x100 + functionId);
                     if (handlerId !== 0) {
                         Logger.warn(LogCategory.THUNK,
                             `[WASM MISS] ${thunkName} (funcId=${functionId}) has WASM handler ${handlerId} but hit JS slow path`);
-                        this.wasmMissWarned.add(functionId);
                     }
                 }
             } catch (_) {
@@ -2642,8 +2762,12 @@ export class ThunkDispatcher {
 
         // --- PHASE 7: Implementation Dispatch ---
         let impl = this.dispatchTable[functionId];
-        if (!impl) {
+        if (!impl && this.implLookupMissGen[functionId] !== this.implRegistrationGen) {
             impl = this._trySameNameLookup(functionId) || this._tryDllForward(functionId) || this._tryPendingRegistration(functionId);
+            // Only memoize the miss for a real stub; an id with no stub yet may gain one later.
+            if (!impl && this.thunkGenerator.getStubById(functionId)) {
+                this.implLookupMissGen[functionId] = this.implRegistrationGen;
+            }
         }
         let argCount = this.argCountsTable[functionId];
         if (!impl) {
@@ -2662,7 +2786,7 @@ export class ThunkDispatcher {
         this.fillStackArgs(espAtEntry, argCount);
 
         const allowStubPoolRet = this.wndProcThunkFlags[functionId] !== 0
-            || isDefaultWindowProcThunk(thunkName) || this.isDirectCallEntry(functionId, espAtEntry);
+            || this.isDefaultWndProcId(functionId, thunkName) || this.isDirectCallEntry(functionId, espAtEntry);
         if (!this.validateReturnAddrFast(espAtEntry, allowStubPoolRet)) {
             this._slowPathInvalidReturnPreCall(functionId, thunkName, espAtEntry, cpu);
             if (profileThunk) profiler.endAsync(thunkName);
@@ -2682,7 +2806,6 @@ export class ThunkDispatcher {
         // PERF: Capture wall-clock time for virtual time compensation.
         // Sync thunks don't spin-loop > instruction counter doesn't advance > virtual time
         // falls behind wall-clock. Credit handler time to keep game timing consistent.
-        const implWallStart = performance.now();
         try {
             // FRESHNESS: the raw views are plain arrays over one buffer, so a WASM grow
             // DETACHES them — reading a detached view yields undefined, which would land in
@@ -3117,7 +3240,7 @@ export class ThunkDispatcher {
             // DO NOT stop CPU
 
             // Capture CPU state at thunk entry (before any stack manipulation)
-            const suspendErrCleanup = this.resolveThunkCleanup(id, argCount, `sync:suspended-err:${name}`);
+            const suspendErrCleanup = this.resolveThunkCleanup(id, argCount);
 
             if (!this.ensureValidMemory()) {
                 Logger.error(LogCategory.THUNK, 'Cannot suspend thunk: memory/DataView not available');
@@ -3212,7 +3335,7 @@ export class ThunkDispatcher {
         }
 
         // Compute cleanup once � used by number, null, and ThunkResult branches below
-        const baseCleanup = this.resolveThunkCleanup(id, argCount, `sync:${name}`);
+        const baseCleanup = this.resolveThunkCleanup(id, argCount);
 
         // Check for stack corruption (internal check)
         // Skip if skipStackCheck is set (e.g., for DispatchMessageA which calls callbacks)
@@ -3226,7 +3349,7 @@ export class ThunkDispatcher {
         if (typeof result === 'number') {
             reg32[0] = result >>> 0;
             this.winApiRing.recordReturnValue(result >>> 0); // crash-diagnosis ring
-            const allowStub = this.wndProcThunkFlags[id] !== 0 || isDefaultWindowProcThunk(name)
+            const allowStub = this.wndProcThunkFlags[id] !== 0 || this.isDefaultWndProcId(id, name)
                 || this.isDirectCallEntry(id, espAtEntry);
             if (!this.validateReturnAddrFast(espAtEntry, allowStub)) {
                 this._slowPathInvalidReturn(id, name, espAtEntry, result, cpu);
@@ -3279,7 +3402,7 @@ export class ThunkDispatcher {
         this.winApiRing.recordReturnValue(thunkRes.value >>> 0); // crash-diagnosis ring
 
         const mem8 = this.cachedMem8;
-        const allowStubSync = this.wndProcThunkFlags[id] !== 0 || isDefaultWindowProcThunk(name)
+        const allowStubSync = this.wndProcThunkFlags[id] !== 0 || this.isDefaultWndProcId(id, name)
             || this.isDirectCallEntry(id, espAtEntry);
         // Skip return address validation for SEH/callback thunks � ESP was moved to catch frame
         if (mem8 && !skipStackCheck && !this.validateReturnAddr(mem8, espAtEntry, `Sync thunk ${name}`, allowStubSync)) {
@@ -3446,7 +3569,8 @@ export class ThunkDispatcher {
                 Logger.error(LogCategory.THUNK,
                     `SUSPICIOUS: Async thunk ${name} returnAddr 0x${returnAddr.toString(16)} inside THUNK region! ESP=0x${esp.toString(16)}`);
             }
-            stackSnapshot = mem.slice(esp, Math.min(esp + 16, mem.length));
+            const argBytes = this.resolveThunkCleanup(id, 0);
+            stackSnapshot = mem.slice(esp, Math.min(esp + Math.max(16, 4 + argBytes), mem.length));
         }
 
         const tid = System.getInstance().scheduler.getCurrentThreadId();
@@ -3462,7 +3586,8 @@ export class ThunkDispatcher {
             stackSnapshot,
             spinAddr,
             originalSpinBytes: originalBytes,
-            callerModuleBase: this.lastCallerModuleBase
+            callerModuleBase: this.lastCallerModuleBase,
+            restartable: restartableCheck(promise),
         };
 
         // Set boundary state for scheduler: CPU is now at spin loop.
@@ -3501,7 +3626,7 @@ export class ThunkDispatcher {
         if (profiler.isEnabled()) profiler.endAsync(name);
 
         let val: number = 0;
-        let cleanupBytes = this.resolveThunkCleanup(info.functionId, defaultArgCount, `async:${name}`);
+        let cleanupBytes = this.resolveThunkCleanup(info.functionId, defaultArgCount);
 
         if (typeof res === 'object' && res !== null) {
             val = res.value;
@@ -3573,7 +3698,7 @@ export class ThunkDispatcher {
 
         Logger.error(LogCategory.THUNK, `Async error in thunk ${name} (ID ${info.functionId}): ${err}`);
 
-        const cleanupBytes = this.resolveThunkCleanup(info.functionId, defaultArgCount, `async_error:${name}`);
+        const cleanupBytes = this.resolveThunkCleanup(info.functionId, defaultArgCount);
         if (info.threadId !== undefined && this.indexOfPendingRestoreForThread(info.threadId) >= 0) {
             Logger.warn(LogCategory.THUNK,
                 `Async-restore invariant violated: T${info.threadId} already has a pending restore on error-push of ${name} ` +
@@ -3697,6 +3822,25 @@ export class ThunkDispatcher {
         return cbMgr.tryApplyDeferredCompletion(tid, cpu);
     }
 
+    /**
+     * Run the current thread's deferred suspended-frame DISPATCH (a pump step that fired while
+     * a sibling was current). Same safe point and wake sequence as the deferred completion.
+     */
+    private drainDeferredFrameDispatch(cpu: any): boolean {
+        const cbMgr = this._callbackManager;
+        if (typeof cbMgr?.hasDeferredDispatchForThread !== "function") return false;
+        const scheduler = this.ensureScheduler();
+        const currentTid = scheduler.getCurrentThreadId();
+        if (currentTid === null || currentTid === undefined) return false;
+        const tid = currentTid >>> 0;
+        if (!cbMgr.hasDeferredDispatchForThread(tid)) return false;
+        const eip = readEip(cpu);
+        if (!this.isParkedAtSpinLoop(eip) && !(scheduler as any).isThreadAsyncParked?.(tid)) return false;
+        scheduler.wakeThreadForAsyncCompletion(tid);
+        (scheduler as any).markThreadRunningAfterAsyncWake?.(tid, cpu);
+        return cbMgr.dispatchDeferredToOwner(tid);
+    }
+
     hasPendingAsyncRestoreForThread(threadId: number | null): boolean {
         if (this.pendingAsyncRestores.length === 0) return false;
         if (threadId === null) return true;
@@ -3749,6 +3893,7 @@ export class ThunkDispatcher {
         // independently of pendingAsyncRestores, which may be empty) so a JS-driven pump
         // whose terminal step landed on a sibling thread is not stranded.
         if (this.drainDeferredFrameCompletion(cpu)) return true;
+        if (this.drainDeferredFrameDispatch(cpu)) return true;
 
         if (this.pendingAsyncRestores.length === 0) return false;
 
@@ -4365,6 +4510,8 @@ export class ThunkDispatcher {
                 // Cache stackCleanupBytes to avoid Map lookup in hot path
                 this.stackCleanupTable[id] = stub.stackCleanupBytes ?? -1;
                 this.namesTable[id] = `${dllName}:${functionName}`;
+                this.defWndProcCache[id] = 0;
+                this.noteRegistrationChanged();
                 Logger.verbose(LogCategory.THUNK, `Registered thunk [${id}] ${dllName}:${functionName}`);
 
                 hypercallDataManager.registerFunction(dllName, functionName, id);
@@ -4379,6 +4526,7 @@ export class ThunkDispatcher {
             // Store pending registration for later application when stubs are created
             const key = `${dllName}:${functionName}`.toLowerCase();
             this.pendingRegistrations.set(key, { impl, dllName, functionName });
+            this.noteRegistrationChanged();
         }
     }
 
@@ -4413,10 +4561,9 @@ export class ThunkDispatcher {
      * Overflow safety: if the ring is full the trampoline falls back to OUT 0xB077, which
      * hits the existing fast-path or slow-path handler as usual.
      *
-     * NOTE: Display-list recording (glNewList/GL_COMPILE) is NOT supported for write-buffer
-     * functions.  Vertex calls during display-list compilation will be buffered and executed
-     * immediately (GL_COMPILE_AND_EXECUTE) or lost (GL_COMPILE).  Add a WBUF_DISABLED flag
-     * mechanism if display-list correctness is required.
+     * Display-list recording is the handler's job: opengl32 registers handlers that go through
+     * its display-list-wrapped export table, so GL_COMPILE records and skips, and
+     * GL_COMPILE_AND_EXECUTE records and executes, exactly like the trap path.
      *
      * @param dllName   DLL name (e.g. 'ddraw', 'opengl32')
      * @param funcName  Export name (exact or normalised)
@@ -5024,6 +5171,40 @@ export class ThunkDispatcher {
         Logger.log(LogCategory.THUNK,
             `[WBUF] Registered ShaderConstant [${id}] ${dllName}:${funcName} ` +
             `(stub=0x${stubAddr.toString(16)}, trampoline=0x${trampolineAddr.toString(16)})`);
+    }
+
+    registerZeroArgWriteBufferFunction(dllName: string, funcName: string, handler: WriteBufHandler): boolean {
+        if (this.writeBufControlAddr === 0) return false;
+        const key = `${dllName}:${funcName}`.toLowerCase();
+        this.pendingWriteBufRegistrations.set(key, {
+            handler, dllName, functionName: funcName, argCount: 1, isStdcall: true, zeroArg: true,
+        });
+        const trampolineAddr = this.writeBufTrampolineAddrs[21];
+        if (!trampolineAddr) return false;
+        let patched = 0;
+        for (const stub of this.findStubsByName(dllName, funcName)) {
+            if (stub.functionId >= MAX_THUNK_ID) continue;
+            if (typeof stub.argCount === "number" && stub.argCount !== 0) continue;
+            let mem8 = this.cachedMem8;
+            if (!mem8 || mem8.byteLength === 0) { this.updateMemoryCache(); mem8 = this.cachedMem8; }
+            if (!mem8 || mem8.byteLength === 0) return false;
+            const stubAddr = stub.address;
+            const rel32 = (trampolineAddr - (stubAddr + 10)) | 0;
+            mem8[stubAddr + 5] = 0xE9;
+            mem8[stubAddr + 6] = rel32 & 0xFF;
+            mem8[stubAddr + 7] = (rel32 >> 8) & 0xFF;
+            mem8[stubAddr + 8] = (rel32 >> 16) & 0xFF;
+            mem8[stubAddr + 9] = (rel32 >> 24) & 0xFF;
+            invalidateGuestCode(stubAddr, 16);
+            const id = stub.functionId;
+            this.writeBufHandlerTable[id] = handler;
+            this.noteWriteBufTransportSafety(id, dllName);
+            this.writeBufArgCountTable[id] = 1;
+            this.writeBufCoalesceMaskTable[id] = 0;
+            this.writeBufBarrierTable[id] = 0;
+            patched++;
+        }
+        return patched > 0;
     }
 
     /** Shared tail for the capture-family registrations: emit-time guards, stub JMP patch,
@@ -5644,7 +5825,7 @@ export class ThunkDispatcher {
         }
     }
 
-    private resolveThunkCleanup(functionId: number, argCount: number, source: string): number {
+    private resolveThunkCleanup(functionId: number, argCount: number): number {
         // Cache-first: stackCleanupTable is populated from stub.stackCleanupBytes at
         // registration time (applyPendingRegistrations). Stub RET N bytes in THUNK_CODE
         // are immutable (RX region), so the cached value is authoritative.
@@ -8211,6 +8392,8 @@ export class ThunkDispatcher {
             const existingImpl = this.dispatchTable[s.functionId];
             if (existingImpl) {
                 this.dispatchTable[functionId] = existingImpl;
+                this.defWndProcCache[functionId] = 0;
+                this.noteRegistrationChanged();
                 this.argCountsTable[functionId] = this.argCountsTable[s.functionId];
                 if (this.stackCleanupTable[s.functionId] >= 0) {
                     this.stackCleanupTable[functionId] = this.stackCleanupTable[s.functionId];
@@ -8260,6 +8443,8 @@ export class ThunkDispatcher {
                 if (targetImpl) {
                     // Cache so next call is fast-path
                     this.dispatchTable[functionId] = targetImpl;
+                    this.defWndProcCache[functionId] = 0;
+                    this.noteRegistrationChanged();
                     this.argCountsTable[functionId] = this.argCountsTable[s.functionId];
                     if (this.stackCleanupTable[s.functionId] >= 0) {
                         this.stackCleanupTable[functionId] = this.stackCleanupTable[s.functionId];
@@ -8284,6 +8469,8 @@ export class ThunkDispatcher {
         const pending = this.pendingRegistrations.get(pendingKey);
         if (pending) {
             this.dispatchTable[functionId] = pending.impl;
+            this.defWndProcCache[functionId] = 0;
+            this.noteRegistrationChanged();
             const targetStub = allStubs.find(s =>
                 s.dllName.toLowerCase() === targetDll && s.functionName === targetFuncName
             );
@@ -8313,6 +8500,8 @@ export class ThunkDispatcher {
         pending: { impl: ThunkImplementation; dllName: string; functionName: string }
     ): ThunkImplementation {
         this.dispatchTable[functionId] = pending.impl;
+        this.defWndProcCache[functionId] = 0;
+        this.noteRegistrationChanged();
         this.argCountsTable[functionId] = stub.argCount ?? DEFAULT_ARGS_COUNT;
         this.stackCleanupTable[functionId] = stub.stackCleanupBytes ?? -1;
         this.namesTable[functionId] = `${pending.dllName}:${pending.functionName}`;
@@ -8370,6 +8559,11 @@ export class ThunkDispatcher {
                 pending.handler,
                 pending.isStdcall
             );
+            return;
+        }
+
+        if (pending.zeroArg) {
+            this.registerZeroArgWriteBufferFunction(pending.dllName, pending.functionName, pending.handler);
             return;
         }
 
@@ -8434,6 +8628,7 @@ export class ThunkDispatcher {
      * Used by on-demand stub creation paths to avoid a full applyPendingRegistrations() pass.
      */
     bindPendingRegistrationsForFunctionId(functionId: number): boolean {
+        this.noteRegistrationChanged();
         return this._tryPendingRegistration(functionId) !== null;
     }
 
@@ -8494,6 +8689,7 @@ export class ThunkDispatcher {
      */
     markHleRegistrationComplete(): void {
         this.hleRegistrationComplete = true;
+        this.noteRegistrationChanged();
     }
     private hleRegistrationComplete = false;
 
@@ -8558,19 +8754,33 @@ export class ThunkDispatcher {
         const caller = (this.cachedDataView && this.isDataViewValid() && esp < this.memLength - 4)
             ? this.cachedDataView.getUint32(esp, true) >>> 0 : 0;
 
+        // Full log only for the first few calls per id: an unimplemented export can be
+        // called thousands of times per frame. Accounting below is never throttled.
+        const logIdx = functionId >= 0 && functionId < MAX_THUNK_ID ? functionId : -1;
+        let fullLog = true;
+        if (logIdx >= 0) {
+            const n = this.unimplementedLogCount[logIdx];
+            if (n >= ThunkDispatcher.UNIMPLEMENTED_FULL_LOG_LIMIT) fullLog = false;
+            else this.unimplementedLogCount[logIdx] = n + 1;
+        }
+
         // Log with ESP and argCount for debugging stack issues
         if (stub) {
-            Logger.warn(LogCategory.THUNK,
-                `UNIMPLEMENTED: ${stub.dllName}:${stub.functionName} (id=0x${functionId.toString(16)}) ` +
-                `ESP=0x${esp.toString(16)} argCount=${argCount} caller=0x${caller.toString(16)} ` +
-                `-> returning ${returnsNull ? '0 (absent)' : `0x${returnValue.toString(16)}`}`);
-            Logger.unimplemented(stub.dllName, stub.functionName);
+            if (fullLog) {
+                Logger.warn(LogCategory.THUNK,
+                    `UNIMPLEMENTED: ${stub.dllName}:${stub.functionName} (id=0x${functionId.toString(16)}) ` +
+                    `ESP=0x${esp.toString(16)} argCount=${argCount} caller=0x${caller.toString(16)} ` +
+                    `-> returning ${returnsNull ? '0 (absent)' : `0x${returnValue.toString(16)}`}`);
+                Logger.unimplemented(stub.dllName, stub.functionName);
+            }
             stubRegistry.record(stub.dllName, stub.functionName, functionId, caller);
         } else {
-            Logger.warn(LogCategory.THUNK,
-                `UNIMPLEMENTED: ${name} (id=0x${functionId.toString(16)}) ` +
-                `ESP=0x${esp.toString(16)} caller=0x${caller.toString(16)} -> returning ${returnValue}`);
-            Logger.unimplemented("DLL", name);
+            if (fullLog) {
+                Logger.warn(LogCategory.THUNK,
+                    `UNIMPLEMENTED: ${name} (id=0x${functionId.toString(16)}) ` +
+                    `ESP=0x${esp.toString(16)} caller=0x${caller.toString(16)} -> returning ${returnValue}`);
+                Logger.unimplemented("DLL", name);
+            }
             // name is "module:Func" when the vtable knew it, else "unknown".
             const ci = name.indexOf(":");
             stubRegistry.record(ci > 0 ? name.slice(0, ci) : "", ci > 0 ? name.slice(ci + 1) : name, functionId, caller);
@@ -8656,6 +8866,7 @@ export class ThunkDispatcher {
      */
     applyPendingRegistrations(): void {
         let applied = 0;
+        this.noteRegistrationChanged();
 
         // Apply pending regular registrations.
         // NOTE: Multiple DLLs can import the same function (e.g. both HP.exe and core.dll
@@ -8677,6 +8888,7 @@ export class ThunkDispatcher {
                 const id = stub.functionId;
                 if (id < MAX_THUNK_ID) {
                     this.dispatchTable[id] = pending.impl;
+                    this.defWndProcCache[id] = 0;
                     this.argCountsTable[id] = stub.argCount ?? DEFAULT_ARGS_COUNT;
                     this.stackCleanupTable[id] = stub.stackCleanupBytes ?? -1;
                     this.namesTable[id] = `${pending.dllName}:${pending.functionName}`;
@@ -8904,6 +9116,10 @@ export class ThunkDispatcher {
         this.activeAsyncThunks.clear();
         this.pendingAsyncRestores.length = 0;
         this.pendingRegistrations.clear();
+        this.noteRegistrationChanged();
+        this.implLookupMissGen.fill(0);
+        this.defWndProcCache.fill(0);
+        this.unimplementedLogCount.fill(0);
         // NOTE: pendingFastPathRegistrations and pendingWriteBufRegistrations are
         // intentionally NOT cleared on reset. Both are populated once from
         // module.initialize() (which runs exactly once at worker boot) and must survive

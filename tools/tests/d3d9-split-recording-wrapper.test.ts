@@ -33,26 +33,35 @@ class FakeDevice {
     }
 }
 
-function harness() {
-    const records: Array<{ method: number; slot: number; result: unknown; args: unknown[] }> = [];
-    let client: { drainBegin(): void; drainEnd(): void } | null = null;
-    const dispatcher = {
+type Rec = { method: number; slot: number; result: unknown; args: unknown[] };
+
+function dispatcherOf(records: Rec[], order: string[] = [], setClient: (c: never) => void = () => {}) {
+    return {
         registerQueuePayloadHandler: () => -2,
         enqueuePayloadById: (_id: number, h0: number, h1: number, _h2: number, _h3: number,
-            src: Uint8Array, off: number, len: number) => {
-            const bytes = src.slice(off, off + len);
+            src: Uint8Array, off: number, len: number, tail: Uint8Array | null = null) => {
+            const bytes = new Uint8Array(len + (tail ? tail.length : 0));
+            bytes.set(src.subarray(off, off + len));
+            if (tail) bytes.set(tail, len);
             const d = new SplitDecoder(bytes, 0, bytes.length, noRefs);
             const result = d.value();
             const argc = d.value() as number;
             const args: unknown[] = [];
             for (let i = 0; i < argc; i++) args.push(d.value());
             expect(d.done).toBe(true);
+            order.push("enqueue");
             records.push({ method: h0, slot: h1, result, args });
             return true;
         },
         executeWbufQueue: () => {},
-        setWbufSplitClient: (c: never) => { client = c; },
+        setWbufSplitClient: setClient,
     };
+}
+
+function harness() {
+    const records: Rec[] = [];
+    let client: { drainBegin(): void; drainEnd(): void } | null = null;
+    const dispatcher = dispatcherOf(records, [], (c) => { client = c; });
     resetD3D9SplitStreamForTests();
     const front = new FakeDevice();
     attachD3D9Split(front as never, null, dispatcher, null);
@@ -118,5 +127,69 @@ describe("d3d9 split: recording wrapper", () => {
         const code = src.slice(start, end).replace(/\/\/.*$/gm, "");
         expect(code).toContain("return function (");
         expect(code).not.toMatch(/\barguments\b/);
+    });
+
+    test("an unlock is captured before the front's unlock and encoded after it, bytes unchanged", () => {
+        const records: Rec[] = [];
+        const order: string[] = [];
+        resetD3D9SplitStreamForTests();
+        const guest = new Uint8Array(4096).map((_, i) => (i * 7 + 3) & 0xff);
+        class LockingFront extends FakeDevice {
+            locked: { start: number; size: number } | null = { start: 512, size: 1024 };
+            captureLockedVertexBytes(_ptr: number): Uint8Array | null {
+                order.push("capture");
+                return this.locked ? guest.subarray(this.locked.start, this.locked.start + this.locked.size) : null;
+            }
+            unlockVertexBuffer(_ptr: number): number {
+                order.push("unlock");
+                this.locked = null;
+                return 0;
+            }
+        }
+        const front = new LockingFront();
+        attachD3D9Split(front as never, null, dispatcherOf(records, order), null);
+        expect(front.unlockVertexBuffer(0x5000)).toBe(0);
+        expect(order).toEqual(["capture", "unlock", "enqueue"]);
+        expect(records).toHaveLength(1);
+        const [ptr, bytes] = records[0]!.args as [number, Uint8Array];
+        expect(ptr).toBe(0x5000);
+        expect(Array.from(bytes)).toEqual(Array.from(guest.subarray(512, 1536)));
+        expect(d3d9SplitStats()!.encodeErrors).toEqual({});
+    });
+
+    test("a captured view detached during the front's call is counted, not recorded as empty", () => {
+        const records: Rec[] = [];
+        const order: string[] = [];
+        resetD3D9SplitStreamForTests();
+        class DetachingFront extends FakeDevice {
+            mem = new ArrayBuffer(4096);
+            captureLockedVertexBytes(): Uint8Array | null { return new Uint8Array(this.mem, 0, 1024); }
+            unlockVertexBuffer(): number {
+                this.mem.transfer();
+                return 0;
+            }
+        }
+        const front = new DetachingFront();
+        attachD3D9Split(front as never, null, dispatcherOf(records, order), null);
+        expect(() => front.unlockVertexBuffer(0x5000)).not.toThrow();
+        expect(records).toHaveLength(0);
+        expect(d3d9SplitStats()!.encodeErrors).toEqual({ unlockVertexBuffer: 1 });
+    });
+
+    test("a rejected enqueue is counted as an encode error and not thrown", () => {
+        const records: Rec[] = [];
+        const order: string[] = [];
+        resetD3D9SplitStreamForTests();
+        const guest = new Uint8Array(2048);
+        class Front extends FakeDevice {
+            captureLockedVertexBytes(): Uint8Array | null { return guest.subarray(0, 1024); }
+            unlockVertexBuffer(): number { return 0; }
+        }
+        const front = new Front();
+        const inner = dispatcherOf(records, order);
+        attachD3D9Split(front as never, null, { ...inner, enqueuePayloadById: () => false }, null);
+        expect(() => front.unlockVertexBuffer(0x5000)).not.toThrow();
+        expect(records).toHaveLength(0);
+        expect(d3d9SplitStats()!.encodeErrors).toEqual({ unlockVertexBufferBytes: 1 });
     });
 });

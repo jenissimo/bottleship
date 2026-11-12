@@ -418,7 +418,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
         return shortPath.length;
     };
 
-    exports['GetLongPathNameW'] = (ctx, mem, args) => {
+    const echoExistingPathW: ThunkImplementation = (ctx, mem, args) => {
         const input = args[0] >>> 0, output = args[1] >>> 0, capacity = args[2] >>> 0;
         const path = input ? readStringW(mem, input) : '';
         const system = System.getInstance();
@@ -445,6 +445,9 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
         }
         return path.length;
     };
+
+    exports['GetLongPathNameW'] = echoExistingPathW;
+    exports['GetShortPathNameW'] = echoExistingPathW;
 
     exports['GetLongPathNameA'] = (ctx, mem, args) => {
         const lpszShortPath = args[0] >>> 0;

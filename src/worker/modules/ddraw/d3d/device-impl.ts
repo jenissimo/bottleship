@@ -166,7 +166,9 @@ export const createDeviceExports = (
     // ==========================================================================
     // Instead of creating new DataView on every thunk call (700K+ allocations),
     // we cache a single DataView and only recreate when the underlying buffer changes.
+    // @transient(host view of guest memory)
     let cachedDataView: DataView | null = null;
+    // @transient(host view of guest memory)
     let cachedBuffer: ArrayBuffer | null = null;
 
     /**
@@ -182,6 +184,7 @@ export const createDeviceExports = (
     };
 
     // Matrix pool for SetTransform - avoids allocating Float32Array(16) on every call
+    // @transient(host allocation pool)
     const matrixPool: Float32Array[] = [];
     const MAX_POOL_SIZE = 32;
 
@@ -324,9 +327,12 @@ export const createDeviceExports = (
         const dvZ = new Float32Array(zBuf.buffer)[0];
         const validDepth = (typeof dvZ === "number" && !isNaN(dvZ) && isFinite(dvZ)) ? dvZ : 1.0;
 
+        // A count with a NULL rect array is the whole viewport, as it is for a count of 0
+        // (and as IDirect3DDevice9::Clear treats it). Reading the "rect" at guest address 0
+        // yields an empty one, and the clear would do nothing.
         let rects: Array<{ x1: number; y1: number; x2: number; y2: number }> | undefined;
         const n = Math.min(dwCount >>> 0, 256);
-        if (n > 0 && lpRects != null && lpRects >= 0 && lpRects + n * 16 <= mem.length) {
+        if (n > 0 && lpRects && lpRects >= 0 && lpRects + n * 16 <= mem.length) {
             rects = [];
             const view = getDataView(mem); // OPTIMIZED: Use cached DataView
             for (let i = 0; i < n; i++) {
@@ -457,6 +463,7 @@ export const createDeviceExports = (
     /** Per device, the parent object handed out for each IDirect3D generation. IDirect3D v1
      *  and IDirect3D3 are not an inheritance chain (v1 slot 7 is CreateViewport, v3 slot 7 is
      *  FindDevice), so a device asked for both must return two different objects. */
+    // @transient(keyed by Direct3D device objects, which have no savestate codec, so a capture that holds one is refused by the object graph)
     const parentD3ByDevice = new WeakMap<object, Map<ParentD3Iface, number>>();
 
     const writeGetDirect3D = (
@@ -1035,6 +1042,7 @@ export const createDeviceExports = (
     };
 
     // DIAGNOSTIC: Track SetTransform call count to detect missing init calls
+    // @transient(diagnostics)
     let setTransformCallCount = 0;
 
     exports["IDirect3DDevice7_SetTransform"] = (ctx, mem, args) => {
@@ -1422,6 +1430,7 @@ export const createDeviceExports = (
     };
 
     // Store HAL caps address for cross-function memory watchpoint
+    // @transient(diagnostics)
     let lastHalCapsAddr = 0;
 
     exports["IDirect3DDevice3_GetCaps"] = (ctx, mem, args) => {
@@ -1649,6 +1658,7 @@ export const createDeviceExports = (
     };
 
     // Track render state call count for init-time diagnostics
+    // @transient(diagnostics)
     let renderStateCallCount = 0;
 
     // Named render states from SetupDxState for diagnostics
@@ -1812,6 +1822,7 @@ export const createDeviceExports = (
     };
 
     // Track TSS call count for init-time diagnostics
+    // @transient(diagnostics)
     let tssCallCount = 0;
 
     // D3DTSS_* names for diagnostics

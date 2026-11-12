@@ -82,3 +82,41 @@ describe('split codec', () => {
         expect(() => enc.value(() => 0, 'cb')).toThrow(/function/);
     });
 });
+
+describe('split codec: tail', () => {
+    it('a large last typed array leaves as a tail that decodes like an inline copy', () => {
+        const ctors = [Uint8Array, Int8Array, Uint16Array, Int16Array, Uint32Array, Int32Array, Float32Array,
+            Float64Array, Uint8ClampedArray];
+        for (const C of ctors) {
+            const src = new C(512);
+            for (let i = 0; i < src.length; i++) src[i] = (i * 7) & 0x7f;
+            const inline = new SplitEncoder(noRefs);
+            inline.value(9);
+            inline.value(src);
+            const split = new SplitEncoder(noRefs);
+            split.value(9);
+            split.value(src, 'arg', true);
+            const tail = split.tail!;
+            expect(tail.length).toBe(src.byteLength);
+            expect(tail.buffer).toBe(src.buffer);
+            const joined = new Uint8Array(split.length + tail.length);
+            joined.set(split.bytes.subarray(0, split.length));
+            joined.set(tail, split.length);
+            expect([...joined]).toEqual([...inline.bytes.subarray(0, inline.length)]);
+            const dec = new SplitDecoder(joined, 0, joined.length, noRefs);
+            expect(dec.value()).toBe(9);
+            const out = dec.value() as InstanceType<typeof C>;
+            expect(out).toBeInstanceOf(C);
+            expect([...out]).toEqual([...src]);
+            split.reset();
+            expect(split.tail).toBeNull();
+        }
+    });
+
+    it('a small last typed array stays inline', () => {
+        const enc = new SplitEncoder(noRefs);
+        enc.value(new Uint8Array(64), 'arg', true);
+        expect(enc.tail).toBeNull();
+        expect(enc.length).toBe(1 + 1 + 4 + 64);
+    });
+});

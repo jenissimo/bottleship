@@ -42,6 +42,7 @@ const iidHex = (iid: string): string => {
     return [s.slice(0, 8).match(/../g)!.reverse().join(""), s.slice(8, 12).match(/../g)!.reverse().join(""),
         s.slice(12, 16).match(/../g)!.reverse().join(""), s.slice(16)].join("");
 };
+// @transient(empty constant)
 const EMPTY: Uint8Array = new Uint8Array();
 
 function encodeText(text: string, wide = false): Uint8Array {
@@ -155,16 +156,35 @@ interface GuestState {
 }
 type Frame = { esp: number; returnAddr?: number };
 type EnumerationEntry = { args: (base: number) => number[]; pack: (base: number) => Uint8Array };
+/** The process's API instance, for the `dplayState` harness verb. */
+// @transient(the module's API instance for the dplayState harness verb; rebuilt at boot)
+let currentDirectPlayApi: DirectPlayNetworkApi | null = null;
+export function describeDirectPlay(): ReturnType<DirectPlayNetworkApi["describe"]> { return currentDirectPlayApi?.describe() ?? []; }
+
 /** Guest COM/ABI boundary. Session state is keyed by the COM object, never by the process. */
 export class DirectPlayNetworkApi {
     private states = new Map<number, GuestState>();
+    /** One entry per DirectPlay object: what its session holds right now. */
+    describe() {
+        return [...this.states].map(([handle, s]) => ({ handle, ...s.session.describe() }));
+    }
     private lobbyInterfaces = new Map<number, Map<string, number>>();
     private generation = 0;
     private lobbyEndpoint?: DirectPlayLobbyEndpoint;
     private lobbyEvents = new Map<number, Map<number, number>>();
     private lobbyOwnedEvents = new Set<number>();
+    openForSavestate(): string[] {
+        const hex = (n: number) => `0x${(n >>> 0).toString(16)}`;
+        return [
+            ...[...this.states.keys()].map(h => `DirectPlay object ${hex(h)}`),
+            ...[...this.lobbyInterfaces.keys()].map(h => `DirectPlayLobby object ${hex(h)}`),
+            ...[...this.lobbyEvents.keys()].map(h => `lobby event registration of ${hex(h)}`),
+            ...[...this.lobbyOwnedEvents].map(h => `lobby event ${hex(h)}`),
+            ...(this.lobbyEndpoint?.hasRecord() ? ['the lobby record of this process'] : []),
+        ];
+    }
     constructor(private process: Process, private tables: () => Record<string, VTableInfo>, private network: LanNetwork = lanNetwork,
-        private nativeSockets: () => WsaSocketTable = () => getWsaProcessState(process).table) {}
+        private nativeSockets: () => WsaSocketTable = () => getWsaProcessState(process).table) { currentDirectPlayApi = this; }
     private valid(ptr: number, size: number, perms: "r" | "rw" | "rx" = "r"): boolean {
         return Number.isSafeInteger(ptr) && ptr >= 0x1000 && Number.isSafeInteger(size) && size >= 0
             && ptr + size <= this.process.getCurrentMemory().length && (this.process.addressSpace?.validateRange(ptr, size, perms) ?? true);
@@ -724,7 +744,9 @@ export class DirectPlayNetworkApi {
                         args: (base: number) => {
                             const callbackFlags = flags | e.flags | (parent?.groupOwner === e.id ? 0x2000 : 0)
                                 | (e.group && parent && e.parent !== parent.id ? 0x400 : 0);
-                            return legacy ? [e.id, base + 16, base + 16 + encodeAnsi(e.name.short + "\\0").length, callbackFlags, context]
+                            // packName lays out DPNAME, then the short name, then the long one.
+                            const shortBytes = e.name.shortNull ? 0 : encodeText(e.name.short + "\0", wide).length;
+                            return legacy ? [e.id, e.name.shortNull ? 0 : base + 16, e.name.longNull ? 0 : base + 16 + shortBytes, callbackFlags, context]
                                 : [e.id, e.group ? 0 : 1, base, callbackFlags, context];
                         },
                     }));
@@ -1190,7 +1212,7 @@ export class DirectPlayNetworkApi {
         const enumerateProviders = (wide: boolean): ThunkImplementation => (ctx, _mem, args) => {
             const a = args.slice(0, 2);
             return this.enumerate(ctx, a[0], 8, PROVIDERS.map(provider => ({
-                pack: () => { const bytes = new Uint8Array(16 + encodeText(provider.name + "\\0", wide).length); bytes.set(unhex(provider.guid)); bytes.set(encodeText(provider.name + "\\0", wide), 16); return bytes; },
+                pack: () => { const name = encodeText(provider.name + "\0", wide), bytes = new Uint8Array(16 + name.length); bytes.set(unhex(provider.guid)); bytes.set(name, 16); return bytes; },
                 args: base => [base, base + 16, 6, 0, a[1]],
             })));
         };

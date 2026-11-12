@@ -28,6 +28,7 @@ const PT_MOUSE = 4;
 const MOUSE_POINTER_ID = 1;
 
 /** EnableMouseInPointer latches on first call: -1 = never called. */
+// @participant(user32)
 let mouseInPointer = -1;
 
 export function resetTouchPointerState(): void {
@@ -113,4 +114,12 @@ export function createTouchPointerExports(): Record<string, ThunkImplementation>
     };
 
     return exports;
+}
+
+export function captureTouchPointerState(): number {
+    return mouseInPointer;
+}
+
+export function restoreTouchPointerState(value: number): void {
+    mouseInPointer = value;
 }

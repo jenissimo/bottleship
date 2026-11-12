@@ -4,18 +4,23 @@
  * Atomic implementation for system information
  */
 
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { ThunkImplementation, type ThunkResult, type X86Context } from '../../core/thunking/thunk-dispatcher';
+import { loadResourceCursor } from './resource-cursor';
 import { parseBMPHeader, parseBMPPixels } from '../gdi32/gdi-raster';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
 import { System } from '../../core/system';
+import { KEY_TEXT_NONE, KEY_TEXT_UNKNOWN } from '../../../input/sab-layout';
+import { hostTextToChar } from './translate-message';
 import { EMU_NATIVE_VIDEO_DLLS } from '../../core/cpu/emulator-config';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { encodeAnsi, getAnsiCodePage, getCodePageDecoder, decodeAnsiString, readAnsiFromGuest, writeAnsiToGuest, encodeAnsiString } from '../codepage-utils';
 import { findResourceInPE } from '../kernel32/resource';
 import { loadBitmapFromPeResource } from '../kernel32/bitmap-extractor';
+import { savestateParticipants, savestatesEnabled, stateKeys } from '../../savestate/participant';
+import type { SaveValue } from '../../savestate/value-codec';
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
 import {
     clipboardDataByFormat,
@@ -42,17 +47,20 @@ import {
 import * as Classic from './classic-theme';
 import { getSystemCursorHandle } from './system-cursors';
 import { registerDeviceNotification, unregisterDeviceNotification } from './device-notify';
-import { invokeWindowMessageSync } from './message';
+import { invokeWindowMessageSync, sendDisplayChange } from './message';
 import { PRIMARY_HMONITOR, monitorFromRect, monitorFallback } from './monitor';
 import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 
 // wsprintf's output buffer: reused across calls (hot path, thousands per frame) and
 // sized to the API's own 1024 code-unit budget including the terminator.
+// @transient(host scratch)
 const wsprintfScratch = new Uint8Array(1024 * 2);
+// @transient(host scratch)
 const wsprintfScratchView = new DataView(wsprintfScratch.buffer);
 
 /** The DBCS ANSI code pages (Shift-JIS, GBK, Wansung, Big5) — the ones whose
  *  MaximumCharacterSize is 2 and which therefore make SM_DBCSENABLED true. */
+// @transient(constant table)
 const DBCS_CODE_PAGES = new Set([932, 936, 949, 950, 1361]);
 function isDbcsCodePage(cp: number): boolean {
     return DBCS_CODE_PAGES.has(cp);
@@ -68,6 +76,7 @@ function cssToColorRef(css: string): number {
 // JS control painters also use come FROM classic-theme, so GetSysColor(COLOR_BTNFACE) and
 // a painted button face cannot drift apart: a window erased with the class brush would
 // otherwise sit a shade off every control on it.
+// @participant(user32-system)
 const sysColors = new Map<number, number>([
     [0,  cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_SCROLLBAR
     [1,  0xC0DCC0],                                  // COLOR_BACKGROUND / COLOR_DESKTOP
@@ -109,6 +118,7 @@ export function getSystemColorRef(nIndex: number): number {
 // reaches every painter (WM_CTLCOLOR*, class hbrBackground, FillRect) as "unresolvable"
 // and silently degrades to no fill. Cached per index, as Win32's are process-wide and
 // must not be deleted; re-created when a reset drops the object.
+// @participant(user32-system)
 const sysColorBrushes = new Map<number, number>();
 
 export function getSystemColorBrush(nIndex: number): number {
@@ -311,6 +321,7 @@ const SPI_UI_EFFECT_SET_TO_GET: Array<[number, number]> =
     SPI_UI_EFFECT_GETS.map((get) => [get + 1, get]);
 
 /** SETs whose new value arrives in pvParam (cast to a value) rather than uiParam. */
+// @transient(constant table)
 const SPI_SET_VALUE_IN_PVPARAM = new Set<number>([
     SPI_SETMOUSESPEED, SPI_SETFOREGROUNDLOCKTIMEOUT, SPI_SETFOREGROUNDFLASHCOUNT,
     SPI_SETCARETWIDTH,
@@ -399,11 +410,65 @@ export const getDisplayModes = (): DisplayMode[] => {
     }));
 };
 
+export interface User32SystemState {
+    mouseButtonsSwapped: boolean;
+    registeredClipboardFormats: Array<[string, number]>;
+    nextRegisteredClipboardFormat: number;
+    nextInputDesktop: number;
+    openInputDesktops: number[];
+    nextIconHandle: number;
+    spiSettings: Array<[number, number]>;
+    sysColors: Array<[number, number]>;
+    sysColorBrushes: Array<[number, number]>;
+}
+
 export function createSystemExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
+    // @participant(user32-system)
     let mouseButtonsSwapped = false;
+    // @participant(user32-system)
     const registeredClipboardFormats = new Map<string, number>();
+    // @participant(user32-system)
     let nextRegisteredClipboardFormat = 0xC000;
+    if (savestatesEnabled()) savestateParticipants.add({
+        id: 'user32-system', version: 1, order: 43,
+        schema: stateKeys<User32SystemState>({
+            mouseButtonsSwapped: true, registeredClipboardFormats: true, nextRegisteredClipboardFormat: true,
+            nextInputDesktop: true, openInputDesktops: true, nextIconHandle: true, spiSettings: true,
+            sysColors: true, sysColorBrushes: true,
+        }),
+        capture: () => {
+            const state: User32SystemState = {
+                mouseButtonsSwapped,
+                registeredClipboardFormats: [...registeredClipboardFormats],
+                nextRegisteredClipboardFormat,
+                nextInputDesktop,
+                openInputDesktops: [...openInputDesktops],
+                nextIconHandle,
+                spiSettings: [...spiSettings],
+                sysColors: [...sysColors],
+                sysColorBrushes: [...sysColorBrushes],
+            };
+            return state as unknown as SaveValue;
+        },
+        restore: (saved) => {
+            const s = saved as unknown as User32SystemState;
+            mouseButtonsSwapped = s.mouseButtonsSwapped;
+            registeredClipboardFormats.clear();
+            for (const [name, id] of s.registeredClipboardFormats) registeredClipboardFormats.set(name, id);
+            nextRegisteredClipboardFormat = s.nextRegisteredClipboardFormat;
+            nextInputDesktop = s.nextInputDesktop;
+            openInputDesktops.clear();
+            for (const h of s.openInputDesktops) openInputDesktops.add(h);
+            nextIconHandle = s.nextIconHandle;
+            spiSettings.clear();
+            for (const [k, v] of s.spiSettings) spiSettings.set(k, v);
+            sysColors.clear();
+            for (const [k, v] of s.sysColors) sysColors.set(k, v);
+            sysColorBrushes.clear();
+            for (const [k, v] of s.sysColorBrushes) sysColorBrushes.set(k, v);
+        },
+    });
 
     // System metrics constants
     const SM_CXSCREEN = 0;       // Width of screen
@@ -656,6 +721,20 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
 
     exports['MessageBeep'] = () => 1;
 
+    // BOOL WinHelp(HWND, LPCSTR lpszHelp, UINT uCommand, ULONG_PTR dwData). There is no
+    // help engine (winhlp32) to start, so every request fails; HELP_QUIT with no help
+    // window open has nothing to close and succeeds, as Windows and Wine answer it.
+    const HELP_QUIT = 0x0002;
+    const winHelp = (wide: boolean): ThunkImplementation => (ctx, mem, args) => {
+        const command = args[2] >>> 0;
+        const ok = command === HELP_QUIT ? 1 : 0;
+        Logger.log(LogCategory.USER32,
+            `WinHelp${wide ? 'W' : 'A'}(hwnd=0x${(args[0] >>> 0).toString(16)}, cmd=0x${command.toString(16)}) -> ${ok ? 'TRUE' : 'FALSE (no help engine)'}`);
+        return ok;
+    };
+    exports['WinHelpA'] = winHelp(false);
+    exports['WinHelpW'] = winHelp(true);
+
     exports['GetKeyboardType'] = (ctx, mem, args) => {
         const typeFlag = args[0] | 0;
         // 0 = keyboard type, 1 = subtype, 2 = number of function keys
@@ -722,7 +801,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const dwExtraInfo = args[3] >>> 0;
         const hwnd = System.getInstance().windowManager.getInputTargetWindow()?.hwnd ?? 0;
         if (hwnd) {
-            System.getInstance().windowManager.postMessage(hwnd, msg, bVk, lParam, 0, 0, 0, undefined, dwExtraInfo);
+            System.getInstance().windowManager.postInputMessage(hwnd, msg, bVk, lParam, 0, 0, 0, undefined, dwExtraInfo);
         }
         return 0;
     };
@@ -775,7 +854,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const pos = inputManager.getMouseState();
         const lParam = ((pos.y & 0xffff) << 16) | (pos.x & 0xffff);
         const post = (msg: number, wParam = 0) =>
-            wm.postMessage(hwnd, msg, wParam, lParam, 0, 0, 0, undefined, dwExtraInfo);
+            wm.postInputMessage(hwnd, msg, wParam, lParam, 0, 0, 0, undefined, dwExtraInfo);
 
         if (dwFlags & MOUSEEVENTF_LEFTDOWN) post(0x0201, 0x0001);
         if (dwFlags & MOUSEEVENTF_LEFTUP) post(0x0202, 0);
@@ -791,7 +870,9 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return 0;
     };
 
+    // @participant(user32-system)
     let nextInputDesktop = 0xd0000001;
+    // @participant(user32-system)
     const openInputDesktops = new Set<number>();
 
     exports['OpenInputDesktop'] = (ctx, mem, args) => {
@@ -866,15 +947,26 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return lpStr;
     };
 
-    // BOOL IsCharLowerA(CHAR ch)
-    // The ANSI entry point classifies the byte using the system ANSI code page. A
-    // character is lower case only when it has a distinct upper-case form and is
-    // already its lower-case form; digits, punctuation, and uncased letters are false.
-    exports['IsCharLowerA'] = (_ctx, _mem, args) => {
-        const cp = EmulatorConfig.getInstance().ansiCodePage;
-        const ch = getCodePageDecoder(cp).decode(new Uint8Array([args[0] & 0xFF]));
-        return ch === ch.toLowerCase() && ch !== ch.toUpperCase() ? 1 : 0;
-    };
+    // BOOL IsChar{Lower,Upper,Alpha,AlphaNumeric}{A,W}(TCHAR ch)
+    // The ANSI entry points classify the byte on the system ANSI code page, the wide
+    // ones the UTF-16 unit. A character is lower (upper) case only when it has a
+    // distinct other-case form and is already its lower (upper) form; a letter is any
+    // character of Unicode category L, which includes the uncased ones.
+    const ansiChar = (arg: number): string =>
+        getCodePageDecoder(EmulatorConfig.getInstance().ansiCodePage).decode(new Uint8Array([arg & 0xFF]));
+    const wideChar = (arg: number): string => String.fromCharCode(arg & 0xFFFF);
+    const isLower = (ch: string): boolean => ch === ch.toLowerCase() && ch !== ch.toUpperCase();
+    const isUpper = (ch: string): boolean => ch === ch.toUpperCase() && ch !== ch.toLowerCase();
+    const isAlpha = (ch: string): boolean => /^\p{L}$/u.test(ch);
+    const isAlphaNumeric = (ch: string): boolean => /^[\p{L}\p{Nd}]$/u.test(ch);
+    exports['IsCharLowerA'] = (_ctx, _mem, args) => isLower(ansiChar(args[0])) ? 1 : 0;
+    exports['IsCharLowerW'] = (_ctx, _mem, args) => isLower(wideChar(args[0])) ? 1 : 0;
+    exports['IsCharUpperA'] = (_ctx, _mem, args) => isUpper(ansiChar(args[0])) ? 1 : 0;
+    exports['IsCharUpperW'] = (_ctx, _mem, args) => isUpper(wideChar(args[0])) ? 1 : 0;
+    exports['IsCharAlphaA'] = (_ctx, _mem, args) => isAlpha(ansiChar(args[0])) ? 1 : 0;
+    exports['IsCharAlphaW'] = (_ctx, _mem, args) => isAlpha(wideChar(args[0])) ? 1 : 0;
+    exports['IsCharAlphaNumericA'] = (_ctx, _mem, args) => isAlphaNumeric(ansiChar(args[0])) ? 1 : 0;
+    exports['IsCharAlphaNumericW'] = (_ctx, _mem, args) => isAlphaNumeric(wideChar(args[0])) ? 1 : 0;
 
     // LPWSTR CharUpperW(LPWSTR lpsz)
     // If lpsz <= 0xFFFF it is a single wide character passed as atom; return uppercased code point.
@@ -950,18 +1042,22 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return { value: prev, stackCleanup: 4 };
     };
 
-    const loadCursorCommon = (apiName: string, hInstance: number, lpCursorName: number): number => {
-        // Ordinal ids resolve to the system cursor theme (system-cursors.ts).
-        // App PE-resource cursors (hInstance != 0 or a name string) are not
-        // decoded yet — they share the arrow shape so the pointer stays visible.
+    const loadCursorCommon = (apiName: string, hInstance: number, lpCursorName: number, mem?: Uint8Array, isWide = false): number => {
+        if (hInstance && mem && lpCursorName) {
+            const name = lpCursorName < 0x10000
+                ? lpCursorName
+                : (isWide ? Marshaler.readWideString(mem, lpCursorName) : Marshaler.readString(mem, lpCursorName));
+            const own = name ? loadResourceCursor(mem, hInstance, name) : 0;
+            if (own) return own;
+        }
         const handle = getSystemCursorHandle(lpCursorName < 0x10000 ? lpCursorName : 0);
         Logger.verbose(LogCategory.USER32, `${apiName}(0x${hInstance.toString(16)}, ${lpCursorName}) -> 0x${handle.toString(16)}`);
         return handle;
     };
 
-    exports['LoadCursorA'] = (ctx, mem, args) => loadCursorCommon('LoadCursorA', args[0], args[1] >>> 0);
+    exports['LoadCursorA'] = (ctx, mem, args) => loadCursorCommon('LoadCursorA', args[0], args[1] >>> 0, mem);
 
-    exports['LoadCursorW'] = (ctx, mem, args) => loadCursorCommon('LoadCursorW', args[0], args[1] >>> 0);
+    exports['LoadCursorW'] = (ctx, mem, args) => loadCursorCommon('LoadCursorW', args[0], args[1] >>> 0, mem, true);
 
     /**
      * LoadCursorFromFile: a game that ships its own .cur/.ani asks for one per pointer shape and
@@ -989,6 +1085,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     exports['LoadCursorFromFileW'] = (_ctx, mem, args) => loadCursorFromFile(mem, args[0] >>> 0, true);
 
     const FIRST_LOADICON_HANDLE = 0x200;
+    // @participant(user32-system)
     let nextIconHandle = FIRST_LOADICON_HANDLE;
 
     const loadIconCommon = (mem: Uint8Array, hInstance: number, lpIconName: number, isWide: boolean): number => {
@@ -1346,6 +1443,23 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     exports['MapVirtualKeyExA'] = (ctx, mem, args) => exports['MapVirtualKeyA']!(ctx, mem, args) as number;
     exports['MapVirtualKeyExW'] = (ctx, mem, args) => exports['MapVirtualKeyA']!(ctx, mem, args) as number;
 
+    // KEY_TEXT_* of a key that is held as this call translates its key-down. ToAscii is
+    // also called for keys nobody pressed (a game building its own key-name table), and
+    // those keep the US table: the host only knows what an actual press typed.
+    const heldKeyHostText = (vk: number, scanCode: number): number => {
+        if (scanCode & 0x8000) return KEY_TEXT_UNKNOWN;
+        const input = System.getInstance().inputManager;
+        if (!input || !(input.getKeyState(vk & 0xFF) & 0x8000)) return KEY_TEXT_UNKNOWN;
+        return input.getKeyDownText(vk & 0xFF);
+    };
+    /** ANSI byte the held key typed, 0 for a dead key, null when the US table decides. */
+    const heldKeyHostChar = (vk: number, scanCode: number): number | null => {
+        const text = heldKeyHostText(vk, scanCode);
+        if (text === KEY_TEXT_UNKNOWN) return null;
+        if (text === KEY_TEXT_NONE) return 0;
+        return hostTextToChar(text) || null;
+    };
+
     // int ToAscii(UINT uVirtKey, UINT uScanCode, const BYTE *lpKeyState, LPWORD lpChar, UINT uFlags)
     exports['ToAscii'] = (ctx, mem, args) => {
         const uVirtKey = args[0];
@@ -1356,6 +1470,15 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         Logger.verbose(LogCategory.USER32, `ToAscii(vk=0x${uVirtKey.toString(16)}, scan=0x${uScanCode.toString(16)})`);
 
         if (!lpChar) return 0;
+
+        // A key that is down right now types what its press typed on the host layout.
+        const hostChar = heldKeyHostChar(uVirtKey, uScanCode);
+        if (hostChar !== null) {
+            if (hostChar === 0) return 0;
+            mem[lpChar] = hostChar & 0xFF;
+            mem[lpChar + 1] = 0;
+            return 1;
+        }
 
         // Check shift state from keyboard state array
         const shiftDown = lpKeyState ? (mem[lpKeyState + 0x10] & 0x80) !== 0 : false;
@@ -1415,6 +1538,15 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const cchBuff = args[4] | 0;
         if (!pwszBuff || cchBuff <= 0) {
             return 0;
+        }
+
+        // The same rule as WM_CHAR: only a character the guest's ANSI code page has.
+        const hostUnit = heldKeyHostText(args[0], args[1]);
+        if (hostUnit === KEY_TEXT_NONE) return 0;
+        if (hostUnit !== KEY_TEXT_UNKNOWN && hostTextToChar(hostUnit) !== 0) {
+            mem[pwszBuff] = hostUnit & 0xFF;
+            mem[pwszBuff + 1] = (hostUnit >> 8) & 0xFF;
+            return 1;
         }
 
         return exports['ToAscii']!(ctx, mem, [
@@ -1715,6 +1847,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     // The scalar settings, with Windows' own defaults. A GET reads from here and a SET
     // writes to it, so a caller that sets a value and reads it back sees its own value —
     // the property games actually depend on (mouse speed, wheel lines, drag thresholds).
+    // @participant(user32-system)
     const spiSettings = new Map<number, number>([
         [SPI_GETBEEP, 1],
         [SPI_GETBORDER, 1],
@@ -1758,6 +1891,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     for (const action of SPI_UI_EFFECT_GETS) spiSettings.set(action, 0);
 
     /** GET action → the SET action that writes the same slot. */
+    // @transient(constant table)
     const spiSetToGet = new Map<number, number>([
         [SPI_SETBEEP, SPI_GETBEEP],
         [SPI_SETBORDER, SPI_GETBORDER],
@@ -2448,21 +2582,21 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return { value: 1, stackCleanup: 12 }; // TRUE
     };
 
-    exports['ChangeDisplaySettingsA'] = (_ctx, mem, args) => {
+    exports['ChangeDisplaySettingsA'] = (ctx, mem, args) => {
         const lpDevMode = args[0] >>> 0;
         const dwFlags = args[1] >>> 0;
         Logger.log(LogCategory.USER32, `ChangeDisplaySettingsA(0x${lpDevMode.toString(16)}, 0x${dwFlags.toString(16)})`);
-        return applyChangeDisplaySettings(mem, lpDevMode, dwFlags, DEVMODEA_OFFSETS, "ChangeDisplaySettingsA");
+        return applyChangeDisplaySettings(ctx, mem, 8, lpDevMode, dwFlags, DEVMODEA_OFFSETS, "ChangeDisplaySettingsA");
     };
 
-    exports['ChangeDisplaySettingsW'] = (_ctx, mem, args) => {
+    exports['ChangeDisplaySettingsW'] = (ctx, mem, args) => {
         const lpDevMode = args[0] >>> 0;
         const dwFlags = args[1] >>> 0;
         Logger.log(LogCategory.USER32, `ChangeDisplaySettingsW(0x${lpDevMode.toString(16)}, 0x${dwFlags.toString(16)})`);
-        return applyChangeDisplaySettings(mem, lpDevMode, dwFlags, DEVMODEW_OFFSETS, "ChangeDisplaySettingsW");
+        return applyChangeDisplaySettings(ctx, mem, 8, lpDevMode, dwFlags, DEVMODEW_OFFSETS, "ChangeDisplaySettingsW");
     };
 
-    exports['ChangeDisplaySettingsExA'] = (_ctx, mem, args) => {
+    exports['ChangeDisplaySettingsExA'] = (ctx, mem, args) => {
         const lpszDeviceName = args[0] >>> 0;
         const lpDevMode = args[1] >>> 0;
         const hwnd = args[2] >>> 0;
@@ -2470,10 +2604,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const lParam = args[4] >>> 0;
         void hwnd; void lParam;
         Logger.verbose(LogCategory.USER32, `ChangeDisplaySettingsExA(dev=0x${lpszDeviceName.toString(16)}, dm=0x${lpDevMode.toString(16)}, flags=0x${dwFlags.toString(16)})`);
-        return applyChangeDisplaySettings(mem, lpDevMode, dwFlags, DEVMODEA_OFFSETS, "ChangeDisplaySettingsExA");
+        return applyChangeDisplaySettings(ctx, mem, 20, lpDevMode, dwFlags, DEVMODEA_OFFSETS, "ChangeDisplaySettingsExA");
     };
 
-    exports['ChangeDisplaySettingsExW'] = (_ctx, mem, args) => {
+    exports['ChangeDisplaySettingsExW'] = (ctx, mem, args) => {
         const lpszDeviceName = args[0] >>> 0;
         const lpDevMode = args[1] >>> 0;
         const hwnd = args[2] >>> 0;
@@ -2481,7 +2615,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const lParam = args[4] >>> 0;
         void hwnd; void lParam;
         Logger.verbose(LogCategory.USER32, `ChangeDisplaySettingsExW(dev=0x${lpszDeviceName.toString(16)}, dm=0x${lpDevMode.toString(16)}, flags=0x${dwFlags.toString(16)})`);
-        return applyChangeDisplaySettings(mem, lpDevMode, dwFlags, DEVMODEW_OFFSETS, "ChangeDisplaySettingsExW");
+        return applyChangeDisplaySettings(ctx, mem, 20, lpDevMode, dwFlags, DEVMODEW_OFFSETS, "ChangeDisplaySettingsExW");
     };
 
     const DEVMODEA_OFFSETS = {
@@ -2599,20 +2733,22 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
      *  - lpDevMode == NULL  → restore to the desktop (registry) mode.
      *  - CDS_TEST           → validate against supported modes, return BADMODE/SUCCESSFUL,
      *                         WITHOUT applying.
-     *  - otherwise apply: update the DDraw display mode, resize the host, and broadcast
+     *  - otherwise apply: update the DDraw display mode, resize the host, and send
      *    WM_DISPLAYCHANGE (so EnumDisplaySettings(ENUM_CURRENT_SETTINGS)/SM_CXSCREEN reflect it).
      */
     const applyChangeDisplaySettings = (
+        ctx: X86Context,
         mem: Uint8Array,
+        stackCleanup: number,
         lpDevMode: number,
         dwFlags: number,
         offsets: DevModeOffsets,
         apiName: string
-    ): number => {
+    ): ThunkResult | number => {
         const system = System.getInstance();
         const ddraw = system.ddrawContext;
 
-        const applyMode = (width: number, height: number, bpp: number, refresh: number, isRestore: boolean): void => {
+        const applyMode = (width: number, height: number, bpp: number, refresh: number, isRestore: boolean): ThunkResult | number => {
             if (ddraw) {
                 if (width > 0 && height > 0) {
                     ddraw.display.width = width;
@@ -2631,8 +2767,8 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             system.requestHostResize(w, h, {
                 modeSet: true, bpp: b, refreshRate: ddraw?.display.refresh,
             });
-            system.windowManager.postDisplayChange(w, h, b);
             Logger.log(LogCategory.USER32, `${apiName}: applied ${w}x${h}x${b} (restore=${isRestore})`);
+            return sendDisplayChange(ctx, mem, { width: w, height: h, bpp: b }, stackCleanup, apiName, DISP_CHANGE_SUCCESSFUL);
         };
 
         // lpDevMode == NULL → restore to the desktop mode.
@@ -2641,8 +2777,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
                 ? { width: ddraw.desktopMode.width, height: ddraw.desktopMode.height, bpp: ddraw.desktopMode.bpp, refreshRate: ddraw.desktopMode.refresh }
                 : getCurrentScreenMode();
             if ((dwFlags & CDS_TEST) !== 0) return DISP_CHANGE_SUCCESSFUL;
-            applyMode(desktop.width, desktop.height, desktop.bpp, normalizeRefreshRate(desktop.refreshRate), true);
-            return DISP_CHANGE_SUCCESSFUL;
+            return applyMode(desktop.width, desktop.height, desktop.bpp, normalizeRefreshRate(desktop.refreshRate), true);
         }
 
         if (lpDevMode + offsets.minSize > mem.length) return DISP_CHANGE_BADMODE;
@@ -2672,8 +2807,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             return DISP_CHANGE_SUCCESSFUL;
         }
 
-        applyMode(effWidth, effHeight, effBpp, normalizeRefreshRate(reqHz || cur.refreshRate), false);
-        return DISP_CHANGE_SUCCESSFUL;
+        return applyMode(effWidth, effHeight, effBpp, normalizeRefreshRate(reqHz || cur.refreshRate), false);
     };
 
     exports['EnumDisplaySettingsA'] = (_ctx, mem, args) => {

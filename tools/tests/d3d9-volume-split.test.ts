@@ -61,10 +61,12 @@ function stream(front: any, twin: any) {
     const dispatcher = {
         registerQueuePayloadHandler: (h: typeof handler) => { handler = h; return 16300; },
         enqueuePayloadById: (_id: number, method: number, slot: number, h2: number, h3: number,
-            src: Uint8Array, off: number, size: number) => {
+            src: Uint8Array, off: number, head: number, tail: Uint8Array | null = null) => {
+            const size = head + (tail ? tail.length : 0);
             const bytes = new Uint8Array(20 + Math.ceil(size / 4) * 4);
             new Uint32Array(bytes.buffer).set([method, slot, h2, h3, size]);
-            bytes.set(src.subarray(off, off + size), 20);
+            bytes.set(src.subarray(off, off + head), 20);
+            if (tail) bytes.set(tail, 20 + head);
             packets.push(bytes);
             return true;
         },

@@ -8,7 +8,11 @@ import { createVTablesFromDescriptor, VTableInfo } from "../../api/adapters/modu
 import { dinputModule } from "../../api/dinput.api";
 import { InterfaceRegistry } from "../../core/com/interface-registry";
 import { readGuidFromMem } from "../../core/com/typelib/typelib-types";
-import { BaseComObject, ComObjectFactory } from "../../core/com/base-com-object";
+import { BaseComObject, ComObjectFactory, type ComBaseState } from "../../core/com/base-com-object";
+import { objectCodecs, CaptureRefusal } from "../../savestate/object-codecs";
+import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../../savestate/participant";
+import type { SaveValue } from "../../savestate/value-codec";
+import type { DInputBufferLane, DInputBufferState, DInputBufferedEvent } from "../../runtime/input/input-manager";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { Mem } from "../../core/memory/mem-accessor";
 import { Marshaler } from "../../core/memory/marshaler";
@@ -265,6 +269,7 @@ const IID_IDIRECTINPUT8W = "bf798031-483a-4da2-aa99-5d64ed369700";
 // Every IID a real dinput device object answers to: the whole ANSI chain, the whole UNICODE
 // chain, and IUnknown. Both families are served by one object here because the two vtable
 // layouts are identical — only the string flavour of the info/enum methods differs.
+// @transient(constant set)
 const DEVICE_QI_IIDS = new Set([
     "00000000-0000-0000-c000-000000000046", // IUnknown
     "5944e680-c92e-11cf-bfc7-444553540000", // IDirectInputDeviceA
@@ -300,6 +305,7 @@ const IID_IDIRECTINPUTA = "89521360-aa8a-11cf-bfc7-444553540000";
 const IID_IDIRECTINPUTW = "89521361-aa8a-11cf-bfc7-444553540000";
 /** The only pre-DI8 IID with a registered factory; its vtable is a superset of 2A/7W. */
 const IID_IDIRECTINPUT7A = "9a4cb684-236d-11d3-8e9d-00c04f6844ae";
+// @transient(constant set)
 const DIRECTINPUT_QI_IIDS = new Set([
     IID_IUNKNOWN,
     IID_IDIRECTINPUTA,
@@ -325,6 +331,7 @@ const IDirectInputDeviceA_StubMethods = ["RunControlPanel", "Initialize"];
 const IDirectInputDevice2A_StubMethods = ["EnumEffects", "EnumCreatedEffectObjects"];
 
 /** Devices with an armed SetEventNotification handle. */
+// @participant(dinput)
 const notifyRegistry = new DInputNotifyRegistry({
     setEvent: (handle) => System.getInstance().scheduler.setEvent(handle),
 });
@@ -354,6 +361,7 @@ export function deviceTypeConstant(deviceType: string, di8: boolean): number {
 }
 
 /** Every live device object, for the harness `dinputState` readout. */
+// @participant(dinput)
 const liveDInputDevices = new Set<DirectInputDeviceObject>();
 
 /**
@@ -390,6 +398,7 @@ function emptyTrafficRow(): DInputTrafficRow {
     };
 }
 
+// @transient(diagnostics)
 const dinputTraffic = new Map<string, DInputTrafficRow>();
 
 function trafficFor(kind: string): DInputTrafficRow {
@@ -446,6 +455,14 @@ export function describeDInputDevices(): Array<Record<string, unknown>> {
  * DirectInput COM object implementation
  */
 class DirectInputObject extends BaseComObject {
+    static captureObject(o: DirectInputObject): { base: ComBaseState } {
+        return { base: BaseComObject.captureComBase(o) };
+    }
+
+    static restoreObject(d: { base: ComBaseState }): DirectInputObject {
+        return BaseComObject.restoreComBase(() => new DirectInputObject(0), d.base);
+    }
+
     constructor(vtableAddress: number) {
         super("89521360-AA8A-11CF-BFC7-444553540000", vtableAddress); // IDirectInputA IID
     }
@@ -460,7 +477,49 @@ class DirectInputObject extends BaseComObject {
  */
 type DeviceKind = "keyboard" | "mouse" | "joystick" | "gamepad" | "unknown";
 
-class DirectInputDeviceObject extends BaseComObject {
+export interface SavedInputDevice {
+    base: ComBaseState;
+    deviceType: DeviceKind;
+    dataFormat: DeviceKind;
+    isDI8: boolean;
+    dataSize: number;
+    acquired: boolean;
+    inputLost: boolean;
+    exclusive: boolean;
+    lastMouseX: number;
+    lastMouseY: number;
+    notifyEvent: number;
+    isActionMapped: boolean;
+    actionMap: ActionMapEntry[];
+    actionMapGuid: string;
+    seq: number;
+    mousePollPrevButtons: number;
+}
+
+export interface DInputSavestate {
+    savedActionMaps: Array<[string, SavedActionBinding[]]>;
+    input: DInputBufferState;
+}
+
+export const SAVED_INPUT_DEVICE_KEYS = stateKeys<SavedInputDevice>({
+    base: true, deviceType: true, dataFormat: true, isDI8: true, dataSize: true, acquired: true, inputLost: true,
+    exclusive: true, lastMouseX: true, lastMouseY: true, notifyEvent: true, isActionMapped: true, actionMap: true,
+    actionMapGuid: true, seq: true, mousePollPrevButtons: true,
+});
+
+export const DINPUT_DEVICE_FIELDS = {
+    _deviceType: 'save', dataFormat: 'save', isDI8: 'save', dataSize: 'save', acquired: 'save', inputLost: 'save', exclusive: 'save',
+    lastMouseX: 'save', lastMouseY: 'save', lastDInputAccumX: 'derive', lastDInputAccumY: 'derive', mouseInitialized: 'derive',
+    notifyEvent: 'save', isActionMapped: 'save', actionMap: 'save', actionMapGuid: 'save', seq: 'save', mousePollPrevButtons: 'save',
+    actionDataPending: 'transient', actionDataOverflowed: 'transient', mouseLatchEpoch: 'derive',
+} as const satisfies Record<string, FieldPolicy>;
+
+export const DINPUT_FIELDS = {
+    name: 'transient', exports: 'host', process: 'host', vtables: 'derive', savedActionMaps: 'save', latchedMouseEdges: 'transient',
+    mouseLatchEpoch: 'transient', dinputDataListener: 'host',
+} as const satisfies Record<string, FieldPolicy>;
+
+export class DirectInputDeviceObject extends BaseComObject {
     private _deviceType: DeviceKind = "unknown";
     /** Assignment keeps the hot-plug tracker in sync: only a joystick/gamepad has
      *  backing hardware that can vanish mid-session. */
@@ -507,6 +566,39 @@ class DirectInputDeviceObject extends BaseComObject {
     /** Latch epoch this device has already observed — see DInput.readMouseButtons. */
     public mouseLatchEpoch = -1;
 
+    static captureObject(o: DirectInputDeviceObject): SavedInputDevice {
+        if (o.actionDataPending.length > 0 || o.actionDataOverflowed) throw new CaptureRefusal('dinput: action-mapped input is waiting to be read');
+        return {
+            base: BaseComObject.captureComBase(o), deviceType: o._deviceType, dataFormat: o.dataFormat, isDI8: o.isDI8,
+            dataSize: o.dataSize, acquired: o.acquired, inputLost: o.inputLost, exclusive: o.exclusive,
+            lastMouseX: o.lastMouseX, lastMouseY: o.lastMouseY, notifyEvent: o.notifyEvent,
+            isActionMapped: o.isActionMapped, actionMap: structuredClone(o.actionMap), actionMapGuid: o.actionMapGuid,
+            seq: o.seq, mousePollPrevButtons: o.mousePollPrevButtons,
+        };
+    }
+
+    static restoreObject(d: SavedInputDevice): DirectInputDeviceObject {
+        const o = BaseComObject.restoreComBase(() => new DirectInputDeviceObject(0), d.base);
+        o.deviceType = d.deviceType;
+        o.dataFormat = d.dataFormat;
+        o.isDI8 = d.isDI8;
+        o.dataSize = d.dataSize;
+        o.acquired = d.acquired;
+        o.inputLost = d.inputLost;
+        o.exclusive = d.exclusive;
+        o.lastMouseX = d.lastMouseX;
+        o.lastMouseY = d.lastMouseY;
+        o.notifyEvent = d.notifyEvent;
+        o.isActionMapped = d.isActionMapped;
+        o.actionMap = structuredClone(d.actionMap);
+        o.actionMapGuid = d.actionMapGuid;
+        o.seq = d.seq;
+        o.mousePollPrevButtons = d.mousePollPrevButtons;
+        if (o.notifyEvent) notifyRegistry.setEventNotification(o, o.notifyEvent);
+        if (o.acquired && o.exclusive && o.deviceType === "mouse") setExclusiveMouseOwner(o, true);
+        return o;
+    }
+
     constructor(vtableAddress: number, iid: string = "5944e680-c92e-11cf-bfc7-444553540000") {
         super(iid, vtableAddress); // default: IDirectInputDeviceA IID
         liveDInputDevices.add(this);
@@ -534,7 +626,43 @@ export class DInput implements IModule {
     private latchedMouseEdges = 0;
     private mouseLatchEpoch = 0;
 
+    registerSavestate(): () => void {
+        objectCodecs.add<DirectInputObject>({
+            tag: 'dinput-object',
+            matches: (o): o is DirectInputObject => o instanceof DirectInputObject,
+            capture: (o) => DirectInputObject.captureObject(o),
+            restore: (d: { base: ComBaseState }) => DirectInputObject.restoreObject(d),
+        });
+        objectCodecs.add<DirectInputDeviceObject>({
+            tag: 'dinput-device',
+            matches: (o): o is DirectInputDeviceObject => o instanceof DirectInputDeviceObject,
+            capture: (o) => DirectInputDeviceObject.captureObject(o),
+            restore: (d: SavedInputDevice) => DirectInputDeviceObject.restoreObject(d),
+        });
+        return savestateParticipants.add({
+            id: 'dinput', version: 1, order: 62, covers: ['dinput', 'dinput8'],
+            schema: {
+                module: DINPUT_FIELDS, deviceFields: DINPUT_DEVICE_FIELDS, device: SAVED_INPUT_DEVICE_KEYS,
+                state: stateKeys<DInputSavestate>({ savedActionMaps: true, input: true }),
+                input: stateKeys<DInputBufferState>({ mouse: true, keyboard: true, gamepad: true }),
+                lane: stateKeys<DInputBufferLane>({ size: true, seq: true, events: true, overflowed: true }),
+                event: stateKeys<DInputBufferedEvent>({ dwOfs: true, dwData: true, dwTimeStamp: true, dwSequence: true }),
+                actionMapRow: ['registryKey', 'bindings'],
+            } as unknown as SaveValue,
+            capture: () => ({
+                savedActionMaps: [...this.savedActionMaps].map(([k, v]) => [k, structuredClone(v)]),
+                input: System.getInstance().inputManager.captureDInputBuffers(),
+            }) as unknown as SaveValue,
+            restore: (saved) => {
+                const st = saved as unknown as DInputSavestate;
+                this.savedActionMaps = new Map(st.savedActionMaps.map(([k, v]) => [k, structuredClone(v)]));
+                System.getInstance().inputManager.restoreDInputBuffers(st.input);
+            },
+        });
+    }
+
     initialize(process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         this.process = process;
         const resourceProvider = SystemResourceProvider.getInstance();
 

@@ -792,7 +792,7 @@ export async function finalizeBundle(args: FinalizeArgs): Promise<FinalizeResult
     const sources: ZipStreamEntry[] = [];
     for (const entry of archive.listEntries()) {
         if (entry.isDirectory || replacements.has(entry.name)) continue;
-        if (entry.compression !== 0) throw new Error("WGB finalization requires store-only entries");
+        if (entry.compression !== 0) throw new Error(`WGB finalization requires store-only entries; ${entry.name} is compressed. Run "bun tools/wgb.ts repack <bundle>" first (a block-compressed bundle is made from the store-only one with tools/wgb-compress.ts).`);
         sources.push({ name: entry.name, source: { size: entry.uncompressedSize,
             readRange: (start, end) => archive.readEntryRange(entry, start, end - start) } });
     }

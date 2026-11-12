@@ -73,6 +73,17 @@ export abstract class DMusicObject extends BaseComObject {
     }
 }
 
+export type MadeSource =
+    | { made: "motif"; index: number }
+    | { made: "band-segment" }
+    | { made: "style-band"; index: number }
+    | { made: "transition"; style: number; tempo: number; command: number; grooveLevel: number };
+
+export type ObjectSource =
+    | { bytes: Uint8Array }
+    | { file: string; length: number; hash: string }
+    | (MadeSource & { of: ObjectSource | null });
+
 const LOADABLE = { [IID_IDirectMusicObject]: "IDirectMusicObject", [IID_IPersistStream]: "IDirectMusicPersistStream", [IID_IPersist]: "IDirectMusicPersistStream" };
 
 /** A segment, style, band or collection: created empty, filled by IPersistStream::Load. */
@@ -84,6 +95,8 @@ export abstract class LoadableObject extends DMusicObject {
     loaded = false;
     /** Objects this one refers to, held for as long as it lives. */
     readonly references: DMusicObject[] = [];
+    source: ObjectSource | null = null;
+    resolved: Array<DMusicObject | null> = [];
 }
 
 export class LoaderObject extends DMusicObject {
@@ -91,6 +104,9 @@ export class LoaderObject extends DMusicObject {
     readonly interfaces = { [IID_IDirectMusicLoader]: "IDirectMusicLoader8", [IID_IDirectMusicLoader8]: "IDirectMusicLoader8" };
     /** The default GM collection, one per loader, made on first request. */
     defaultCollection: CollectionObject | null = null;
+    searchDirectory = "";
+    readonly cache = new Map<string, LoadableObject>();
+    readonly cacheDisabled = new Set<string>();
 }
 
 export interface PendingNotification {
@@ -141,6 +157,7 @@ export class SegmentObject extends LoadableObject {
     segment: PerfSegment | null = null;
     file: Segment | null = null;
     tracks: SegmentTrackInfo[] = [];
+    readonly commandEdits = new Map<number, [command: number, grooveLevel: number, grooveRange: number]>();
 }
 
 export class SegmentStateObject extends DMusicObject {
@@ -151,11 +168,17 @@ export class SegmentStateObject extends DMusicObject {
     };
     state: PerfSegmentState | null = null;
     segment: SegmentObject | null = null;
+    performance: PerformanceObject | null = null;
 }
 
 export class AudioPathObject extends DMusicObject {
     readonly primaryVtable = "IDirectMusicAudioPath";
     readonly interfaces = { [IID_IDirectMusicAudioPath]: "IDirectMusicAudioPath" };
+    performance: PerformanceObject | null = null;
+    pathType = 0;
+    buffer = 0;
+    sink: DirectSoundSink | null = null;
+    channels = 2;
 }
 
 export class ComposerObject extends DMusicObject {
@@ -188,6 +211,7 @@ export class PortObject extends DMusicObject {
     sink: DirectSoundSink | null = null;
     active = false;
     performance: PerformanceObject | null = null;
+    owner: DirectMusicObject | null = null;
 }
 
 export class StyleObject extends LoadableObject {

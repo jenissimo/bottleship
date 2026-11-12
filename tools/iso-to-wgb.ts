@@ -32,6 +32,8 @@
  *   --cd-label <str>      Override the volume label D: reports
  *   --disc-dirs           Keep each disc in its own rom/discN/ subtree
  *   --list                Parse + list disc contents, do not pack
+  --raw                 Pack the disc filesystem as-is; skip installer detection (for a disc
+                        that is already the game tree but carries a bundled 3rd-party setup)
  *   --allow-msi-hash-mismatch  Keep source bytes when MSI hashes are stale; print each mismatch
  */
 
@@ -491,10 +493,16 @@ async function extractInstallerFromDisc(): Promise<{ files: Map<string, Uint8Arr
     return { files: result.gameFiles, via: result.via };
 }
 
-console.log("\nProbing disc for an installer…");
-const installed = await extractInstallerFromDisc();
+// A disc that IS the game tree may still carry a bundled third-party installer (a GameSpy or
+// DirectX setup) that the probe would otherwise take for the game's own.
+let installed: Awaited<ReturnType<typeof extractInstallerFromDisc>> = null;
+if (has("--raw")) console.log("\n--raw: not probing for an installer");
+else {
+    console.log("\nProbing disc for an installer…");
+    installed = await extractInstallerFromDisc();
+}
 if (installed) console.log(`  → ${installed.via} installer: ${installed.files.size} game files extracted`);
-else console.log("  → no recognized installer; packaging the disc filesystem as-is");
+else if (!has("--raw")) console.log("  → no recognized installer; packaging the disc filesystem as-is");
 
 // A pack entry resolves either to in-memory bytes (extracted) or a streamed disc extent.
 interface PackEntry { romPath: string; size: number; write: (writeChunk: (c: Uint8Array) => void) => void; }

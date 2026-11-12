@@ -69,6 +69,7 @@ function buildImage(preserve: boolean): { bytes: Uint8Array; calls: Call[]; stub
         stubs.wbuf3 = wbuf[(3 - 1) * 2];     // 3 args, stdcall
         stubs.ptr3f = wbuf[16];               // PtrDeref3F, stdcall
         stubs.shaderConst = wbuf[20];
+        stubs.zeroArg = wbuf[21];
 
         // Guest state the stubs consult.
         dv.setUint32(OWNER, DEV, true);
@@ -104,6 +105,8 @@ function buildImage(preserve: boolean): { bytes: Uint8Array; calls: Call[]; stub
             { stub: 'ptr3f', args: [PAYLOAD] },
             { stub: 'shaderConst', args: [DEV, 4, PAYLOAD, 2] },
             { stub: 'wbuf3', args: [4, 5, 6], ringHead: CAPACITY - 8 },   // ring full -> OUT
+            { stub: 'zeroArg', args: [] },
+            { stub: 'zeroArg', args: [], ringHead: CAPACITY - 8 },
         ];
 
         // Driver: per call, seed callee-saved sentinels, push args, call, record the state.
@@ -206,7 +209,7 @@ describe.skipIf(!HAVE_V86)('guest stub trampolines, executed', () => {
         expect(eax(11)).toBe(5);                                  // Release answered in guest
         expect(a.obj).toEqual([5, 9, 1]);                         // 5->6->5; foreign & 1->0 untouched
         expect(a.owner).toBe(0);                                  // disarmed
-        expect(a.outs).toEqual([fid(9), fid(10), fid(12), fid(16), fid(19), fid(23)]);
+        expect(a.outs).toEqual([fid(9), fid(10), fid(12), fid(16), fid(19), fid(23), fid(25)]);
         const ring = a.ring;
         const expected = [
             fid(0), DEV, 5, 7,
@@ -223,6 +226,7 @@ describe.skipIf(!HAVE_V86)('guest stub trampolines, executed', () => {
             fid(20), 1, 2, 3,
             fid(21), 0xa0000000, 0xa0000001, 0xa0000002,
             fid(22), DEV, 4, 2, ...Array.from({ length: 8 }, (_, i) => 0xa0000000 + i),
+            fid(24), 0,
         ];
         expect(ring.map(v => v.toString(16))).toEqual(expected.map(v => (v >>> 0).toString(16)));
     }, 60_000);

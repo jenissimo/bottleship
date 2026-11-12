@@ -51,7 +51,7 @@
       "name": "@bottleship/formats",
       "version": "0.1.0",
       "dependencies": {
-        "pako": "^2.1.0",
+        "pako": "2.1.0",
       },
     },
     "packages/lan": {

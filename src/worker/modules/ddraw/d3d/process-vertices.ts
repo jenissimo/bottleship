@@ -133,7 +133,9 @@ export interface ProcessVerticesRequest {
 const DDERR_INVALIDPARAMS = 0x80070057; // E_INVALIDARG — ddraw.h aliases it onto the COM code.
 const D3D_OK = 0;
 
+// @transient(diagnostics)
 let warnedLight = false;
+// @transient(diagnostics)
 let warnedExtents = false;
 
 /**

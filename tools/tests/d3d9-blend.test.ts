@@ -250,7 +250,24 @@ describe("stencil capability boundary", () => {
         expect(hasUnsupportedStencilState(get(m))).toBe(true);
         m[D3DRS_STENCILENABLE] = 0;
         m[D3DRS_TWOSIDEDSTENCILMODE] = 1;
-        expect(hasUnsupportedStencilState(get(m))).toBe(true);
+        expect(hasUnsupportedStencilState(get(m))).toBe(false);
+    });
+
+    test("latent two-sided mode cannot enable stencil on a depth-only pass", () => {
+        // D3DRS_STENCILENABLE controls the test; TWOSIDEDSTENCILMODE only
+        // selects operations. Captured Unity depth passes retain two-sided=1.
+        // https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3drenderstatetype
+        const m = defaults();
+        m[D3DRS_STENCILENABLE] = 0;
+        m[D3DRS_TWOSIDEDSTENCILMODE] = 1;
+        expect(hasUnsupportedStencilState(get(m), "depth24plus")).toBe(false);
+        const state = buildDepthStencilState("depth24plus", get(m));
+        expect(state.stencilFront).toEqual({ compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "keep" });
+        expect(state.stencilBack).toEqual(state.stencilFront);
+        // Actual stencil still requires a stencil-capable attachment.
+        m[D3DRS_STENCILENABLE] = 1;
+        expect(hasUnsupportedStencilState(get(m), "depth24plus")).toBe(true);
+        expect(hasUnsupportedStencilState(get(m), "depth24plus-stencil8")).toBe(false);
     });
 });
 

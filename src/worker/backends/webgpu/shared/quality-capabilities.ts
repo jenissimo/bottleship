@@ -31,6 +31,7 @@
 
 import { DEFAULT_QUALITY, QualityConfig } from "../../../core/quality-config";
 import { Logger, LogCategory } from "../../../core/logger";
+import type { InternalScaleSupport } from "./internal-resolution";
 
 export type QualityKey = keyof QualityConfig;
 
@@ -54,6 +55,21 @@ export const VIDEO_QUALITY_KEYS: ReadonlySet<QualityKey> = new Set<QualityKey>([
 interface RegisteredBackend {
     backend: string;
     supports: ReadonlySet<QualityKey>;
+    /**
+     * What `internalScale = 0` ("Auto") renders at on this backend. Every backend but D3D9
+     * fits the canvas and supersamples on top (internal-resolution.ts); D3D9 pins Auto to
+     * 1x, because it exposes its raster sample grid through occlusion queries and a
+     * fractional supersample changes edge coverage. That difference is invisible in
+     * `supports` — the key is declared either way — but it decides what the panel may
+     * honestly claim, so it is declared here rather than inferred from the backend name.
+     */
+    autoInternalScale: "fit" | "native";
+}
+
+/** Options a backend may declare alongside the keys it reads. */
+interface BackendQualityOptions {
+    /** Defaults to "fit": Auto follows the canvas and supersamples on top of it. */
+    autoInternalScale?: "fit" | "native";
 }
 
 let active: RegisteredBackend | null = null;
@@ -65,9 +81,14 @@ const warnedGaps = new Set<string>();
  * Call once, from the backend executor's constructor (it is reconstructed per game
  * load, so this naturally tracks whichever backend is currently active).
  */
-export function registerBackendQualitySupport(backend: string, supports: readonly QualityKey[]): void {
-    const changed = active?.backend !== backend;
-    active = { backend, supports: new Set(supports) };
+export function registerBackendQualitySupport(
+    backend: string, supports: readonly QualityKey[], options: BackendQualityOptions = {},
+): void {
+    const autoInternalScale = options.autoInternalScale ?? "fit";
+    // A re-registration that only changes how Auto is honoured still changes what the
+    // panel has to say about the setting, so it has to be announced like a backend switch.
+    const changed = active?.backend !== backend || active?.autoInternalScale !== autoInternalScale;
+    active = { backend, supports: new Set(supports), autoInternalScale };
     // A backend registers when the GUEST opens its graphics API — long after the host's
     // last set_quality. Gaps computed before that answered for a different backend (or for
     // none at all), and nothing recomputed them, so the UI kept showing a stale verdict
@@ -87,6 +108,23 @@ export function onQualityBackendChanged(fn: BackendListener): () => void {
 /** The backend currently driving the frame, or null before any executor has registered. */
 export function activeQualityBackend(): string | null {
     return active?.backend ?? null;
+}
+
+/**
+ * Whether the active backend applies `internalScale` at all, and what Auto means there.
+ *
+ * `computeQualityGaps` cannot answer this: it reports keys the user moved AWAY from their
+ * default, so a backend that never reads `internalScale` is silent for as long as the
+ * setting stays on Auto (0) — which is the default, i.e. always, for anyone who has not
+ * touched it. The panel used that silence as "supported" and printed a multiplier for a
+ * render target that does not exist (ddraw renders 640x480 and was labelled 4.00x).
+ * Support has to be answered from the declaration, not from whether the value is a gap.
+ */
+export function internalScaleSupport(): InternalScaleSupport {
+    return {
+        implemented: !!active?.supports.has("internalScale"),
+        autoIsNative: active?.autoInternalScale === "native",
+    };
 }
 
 /** Test-only: drop the registration so an isolated test doesn't inherit another suite's. */

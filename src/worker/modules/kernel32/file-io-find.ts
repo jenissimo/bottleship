@@ -7,6 +7,8 @@ import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { readStringA, readStringW, encodeFileApiString } from './file-io-strings';
 import { fileTimeOf } from '../../runtime/filesystem/file-time';
+import type { VfsEntry } from '../../runtime/filesystem/vfs';
+import { objectCodecs } from '../../savestate/object-codecs';
 
 const INVALID_HANDLE_VALUE = -1;
 const ERROR_FILE_NOT_FOUND = 2;
@@ -75,6 +77,15 @@ const splitFindPattern = (rawPattern: string): { searchPath: string; searchMask:
     return { searchPath, searchMask };
 };
 
+const dotEntriesFor = (searchPath: string, searchMask: string): VfsEntry[] => {
+    if (searchMask !== '*' && searchMask !== '*.*') return [];
+    const vfs = System.getInstance().fileSystem;
+    if (searchPath === '\\' || /^[A-Za-z]:\\$/.test(searchPath)) return [];
+    const full = vfs.resolvePath(searchPath);
+    if (/^[A-Za-z]:\\?$/.test(full) || !vfs.directoryExists(full)) return [];
+    return ['.', '..'].map(name => ({ path: full, name, kind: 'dir' as const, size: 0, source: 'overlay' as const }));
+};
+
 const fillFindDataA = (mem: Uint8Array, addr: number, entry: any) => {
     // Keep ABI-compatible layout and avoid leaking stale heap bytes.
     mem.fill(0, addr, Math.min(addr + WIN32_FIND_DATAA_SIZE, mem.length));
@@ -113,6 +124,27 @@ const fillFindDataW = (mem: Uint8Array, addr: number, entry: any) => {
     view.setUint16(addr + 44 + name.length * 2, 0, true);
 };
 
+interface FindHandle { kind: 'find'; entries: VfsEntry[]; index: number }
+type SavedFindEntry = [path: string, name: string, kind: VfsEntry['kind'], size: number, source: VfsEntry['source'], modified: number];
+
+objectCodecs.add<FindHandle>({
+    tag: 'kernel32-find',
+    matches: (o: unknown): o is FindHandle => typeof o === 'object' && o !== null
+        && (o as { kind?: unknown }).kind === 'find' && Array.isArray((o as { entries?: unknown }).entries),
+    capture: (o) => ({
+        remaining: o.entries.slice(o.index).map((e): SavedFindEntry => [e.path, e.name, e.kind, e.size, e.source, e.modified ?? -1]),
+    }),
+    restore: (d: { remaining: SavedFindEntry[] }): FindHandle => ({
+        kind: 'find',
+        index: 0,
+        entries: d.remaining.map(([path, name, kind, size, source, modified]) => {
+            const entry: VfsEntry = { path, name, kind, size, source };
+            if (modified >= 0) entry.modified = modified;
+            return entry;
+        }),
+    }),
+});
+
 export function registerFileIoFindExports(exports: Record<string, ThunkImplementation>): void {
     exports['FindFirstFileA'] = (ctx, mem, args) => {
         const lpFileName = args[0];
@@ -132,7 +164,7 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
         // enumeration. Stat it directly (O(1)) instead of scanning the whole ROM index.
         const exactPath = pattern.replace(/\//g, '\\');
         if (exactPath.includes('\\') && !/[*?]/.test(exactPath)) {
-            const entry = vfs.statEntry(exactPath);
+            const entry = vfs.statEntry(exactPath) ?? vfs.statVirtualSystemFile(exactPath);
             if (!entry) {
                 System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
                 return INVALID_HANDLE_VALUE;
@@ -151,7 +183,7 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
 
         const entries = vfs.listDirectory(searchPath);
         const regex = patternToRegex(searchMask);
-        const matches = entries.filter(e => regex.test(e.name));
+        const matches = [...dotEntriesFor(searchPath, searchMask), ...entries.filter(e => regex.test(e.name))];
 
         if (matches.length === 0) {
             Logger.log(LogCategory.KERNEL32, `FindFirstFileA("${pattern}") -> NOT FOUND (searchPath="${searchPath}", mask="${searchMask}", cwd="${vfs.currentDir}")`);
@@ -189,7 +221,7 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
         // Fast path: explicit path, no wildcard → direct stat (see FindFirstFileA).
         const exactPath = pattern.replace(/\//g, '\\');
         if (exactPath.includes('\\') && !/[*?]/.test(exactPath)) {
-            const entry = vfs.statEntry(exactPath);
+            const entry = vfs.statEntry(exactPath) ?? vfs.statVirtualSystemFile(exactPath);
             if (!entry) {
                 System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
                 return INVALID_HANDLE_VALUE;
@@ -206,7 +238,7 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
 
         const entries = vfs.listDirectory(searchPath);
         const regex = patternToRegex(searchMask);
-        const matches = entries.filter(e => regex.test(e.name));
+        const matches = [...dotEntriesFor(searchPath, searchMask), ...entries.filter(e => regex.test(e.name))];
 
         if (matches.length === 0) {
             System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);

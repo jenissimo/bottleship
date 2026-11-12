@@ -9,7 +9,10 @@ export interface MSSSample {
     streamBuffers?: { ptr: number; size: number; inUse: boolean }[];
     userData?: number[];
     totalBytes?: number;
-    fileFormat?: "wav" | "mp3" | "ogg" | "unknown";
+    fileFormat?: "wav" | "mp3" | "ogg" | "raw" | "unknown";
+    /** Last AIL_set_sample_type (format, flags); undefined until the app declares one. */
+    sampleTypeFormat?: number;
+    sampleTypeFlags?: number;
     sampleRate: number;
     channels: number;
     bitsPerSample: number;
@@ -134,7 +137,7 @@ export interface MSSStream {
     fileData: Uint8Array | null;
     decodedData: Float32Array | null;
     filename: string | null;
-    fileFormat?: "wav" | "mp3" | "ogg" | "unknown";
+    fileFormat?: "wav" | "mp3" | "ogg" | "raw" | "unknown";
     sampleRate: number;
     channels: number;
     bitsPerSample: number;

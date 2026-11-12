@@ -6,7 +6,7 @@
 import { WindowManager } from '../windowing/window-manager';
 import type { WindowObject } from '../windowing/window-manager';
 import { Logger, LogCategory } from '../../core/logger';
-import { getAbsoluteWindowPosition, clampToCursorClip, getWindowByHandle, getDoubleClickTimeMs } from '../../modules/user32/shared-state';
+import { getAbsoluteWindowPosition, clampToCursorClip, getVirtualScreenRect, getWindowByHandle, getDoubleClickTimeMs } from '../../modules/user32/shared-state';
 import { vkToDik } from '../../modules/dinput/dinput-vk-dik';
 import { TimeService } from '../time';
 import { markJoystickInputLost } from '../../modules/dinput/device-presence';
@@ -20,8 +20,10 @@ import {
     INPUT_INDEX,
     KEY_BITFIELD_BASE,
     KEY_BITFIELD_COUNT,
+    KEY_TEXT_UNKNOWN,
     beginInputWrite,
     endInputWrite,
+    keyTextView,
 } from '../../../input/sab-layout';
 
 // Windows message constants
@@ -56,6 +58,19 @@ export interface DInputBufferedEvent {
     dwData: number;      // value (0x80/0x00 for keys/buttons, axis delta/value for axes)
     dwTimeStamp: number; // ms timestamp
     dwSequence: number;  // sequence number
+}
+
+export interface DInputBufferLane {
+    size: number;
+    seq: number;
+    events: DInputBufferedEvent[];
+    overflowed: boolean;
+}
+
+export interface DInputBufferState {
+    mouse: DInputBufferLane;
+    keyboard: DInputBufferLane;
+    gamepad: DInputBufferLane;
 }
 
 /** @deprecated use DInputBufferedEvent */
@@ -289,6 +304,7 @@ interface TmeHoverEntry {
 
 export class InputManager {
     private inputView: Int32Array | null = null;
+    private keyTextView: Uint16Array | null = null;
     private windowManager: WindowManager;
     public readonly keyStates = new Uint8Array(256);
     private readonly toggleStates = new Uint8Array(KEY_STATE_BYTES);
@@ -414,6 +430,7 @@ export class InputManager {
      */
     setInputBuffer(buffer: SharedArrayBuffer | null): void {
         this.inputView = buffer ? new Int32Array(buffer) : null;
+        this.keyTextView = this.inputView ? keyTextView(this.inputView) : null;
         // A new buffer carries an unknown initial pad level — seed, never announce.
         this.gamepadPresence.reset();
         if (this.inputView) {
@@ -685,7 +702,7 @@ export class InputManager {
         // Flush buffered keyboard events now that we can enqueue
         if (enqueue && this.pendingKeyEvents.length > 0) {
             for (const evt of this.pendingKeyEvents) {
-                this.windowManager.postMessage(
+                this.windowManager.postInputMessage(
                     targetHwnd,
                     evt.pressed ? WM_KEYDOWN : WM_KEYUP,
                     evt.vk,
@@ -719,7 +736,7 @@ export class InputManager {
             if (!mouseInside && deviceMouseMessages) {
                 // Mouse left canvas — fire WM_MOUSELEAVE for all tracked windows (one-shot)
                 for (const hwnd of this.tmeLeaveHwnds) {
-                    this.windowManager.postMessage(hwnd, WM_MOUSELEAVE, 0, 0, screenX, screenY, 0, keyStateSnapshot);
+                    this.windowManager.postInputMessage(hwnd, WM_MOUSELEAVE, 0, 0, screenX, screenY, 0, keyStateSnapshot);
                     Logger.verbose(LogCategory.SYSTEM, `Input: WM_MOUSELEAVE hwnd=0x${hwnd.toString(16)}`);
                 }
                 this.tmeLeaveHwnds.clear();
@@ -764,7 +781,7 @@ export class InputManager {
             for (const [hwnd, entry] of this.tmeHoverMap) {
                 if (now >= entry.fireAt && cursorX === entry.x && cursorY === entry.y) {
                     const hoverWParam = this.buttonsToWParam(buttons);
-                    this.windowManager.postMessage(hwnd, WM_MOUSEHOVER, hoverWParam, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
+                    this.windowManager.postInputMessage(hwnd, WM_MOUSEHOVER, hoverWParam, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
                     Logger.verbose(LogCategory.SYSTEM, `Input: WM_MOUSEHOVER hwnd=0x${hwnd.toString(16)}`);
                     this.tmeHoverMap.delete(hwnd); // hover is one-shot; app must re-register
                 }
@@ -790,13 +807,13 @@ export class InputManager {
         if (leftDown !== wasLeftDown && deviceMouseMessages) {
             let msg = leftDown ? WM_LBUTTONDOWN : WM_LBUTTONUP;
             if (leftDown) msg = this.checkDblClick(0, mouseTargetHwnd, clientX, clientY, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK);
-            this.windowManager.postMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
+            this.windowManager.postInputMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
         }
 
         if (rightDown !== wasRightDown && deviceMouseMessages) {
             let msg = rightDown ? WM_RBUTTONDOWN : WM_RBUTTONUP;
             if (rightDown) msg = this.checkDblClick(1, mouseTargetHwnd, clientX, clientY, WM_RBUTTONDOWN, WM_RBUTTONDBLCLK);
-            this.windowManager.postMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
+            this.windowManager.postInputMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
 
             Logger.verbose(LogCategory.SYSTEM, `Input: ${
                 rightDown
@@ -808,7 +825,7 @@ export class InputManager {
         if (middleDown !== wasMiddleDown && deviceMouseMessages) {
             let msg = middleDown ? WM_MBUTTONDOWN : WM_MBUTTONUP;
             if (middleDown) msg = this.checkDblClick(2, mouseTargetHwnd, clientX, clientY, WM_MBUTTONDOWN, WM_MBUTTONDBLCLK);
-            this.windowManager.postMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
+            this.windowManager.postInputMessage(mouseTargetHwnd, msg, wParamButtons, mouseLParam, screenX, screenY, 0, keyStateSnapshot);
             Logger.verbose(LogCategory.SYSTEM, `Input: ${
                 middleDown
                     ? (msg === WM_MBUTTONDBLCLK ? 'MButtonDblClk' : 'MButtonDown')
@@ -824,7 +841,7 @@ export class InputManager {
             const lParamWheel = ((clampScreenCoord(screenY) & 0xFFFF) << 16) | (clampScreenCoord(screenX) & 0xFFFF);
             const wheelDelta = Math.round(-mouseWheel * 1.2);
             const wParam = (this.buttonsToWParam(buttons) & 0xFFFF) | ((wheelDelta & 0xFFFF) << 16);
-            if (deviceMouseMessages) this.windowManager.postMessage(mouseTargetHwnd, WM_MOUSEWHEEL, wParam, lParamWheel, screenX, screenY, 0, keyStateSnapshot);
+            if (deviceMouseMessages) this.windowManager.postInputMessage(mouseTargetHwnd, WM_MOUSEWHEEL, wParam, lParamWheel, screenX, screenY, 0, keyStateSnapshot);
             Logger.verbose(LogCategory.SYSTEM, `Input: MouseWheel delta=${wheelDelta} at (${clientX},${clientY})`);
             // Slot already consumed atomically at the top of poll(); a store(0) here
             // would race a scroll that arrived in between and drop it.
@@ -859,7 +876,7 @@ export class InputManager {
             if (newKeyEvents.length > 0) {
                 if (enqueue) {
                     for (const evt of newKeyEvents) {
-                        this.windowManager.postMessage(
+                        this.windowManager.postInputMessage(
                             targetHwnd,
                             evt.pressed ? WM_KEYDOWN : WM_KEYUP,
                             evt.vk,
@@ -946,10 +963,10 @@ export class InputManager {
         const client = this.clientPointFor(target, screenX, screenY);
         const lParam = ((client.y & 0xFFFF) << 16) | (client.x & 0xFFFF);
         if (withSetCursor) {
-            this.windowManager.postMessage(target.hwnd, WM_SETCURSOR, target.hwnd,
+            this.windowManager.postInputMessage(target.hwnd, WM_SETCURSOR, target.hwnd,
                 (HTCLIENT | (WM_MOUSEMOVE << 16)) >>> 0, screenX, screenY, 0, keyState);
         }
-        this.windowManager.postMessage(target.hwnd, WM_MOUSEMOVE, this.buttonsToWParam(buttons),
+        this.windowManager.postInputMessage(target.hwnd, WM_MOUSEMOVE, this.buttonsToWParam(buttons),
             lParam, screenX, screenY, 0, keyState);
     }
 
@@ -1022,7 +1039,7 @@ export class InputManager {
         const scan = vkToScanCode(vk);
         const ext = isExtendedKey(vk) ? 0x01000000 : 0;
         const lParam = ((repeatCount & 0xFFFF) | (scan << 16) | ext | 0x40000000) >>> 0;
-        this.windowManager.postMessage(
+        this.windowManager.postInputMessage(
             targetWin.hwnd, WM_KEYDOWN, vk, lParam, 0, 0, 0,
             this.buildPackedKeyState(this.packedKeyStateScratch),
         );
@@ -1106,6 +1123,11 @@ export class InputManager {
             this.messageKeyStates.set(threadId, table);
         }
         table.set(packedKeyState.length === KEY_STATE_BYTES ? packedKeyState : packedKeyState.subarray(0, KEY_STATE_BYTES));
+    }
+
+    /** KEY_TEXT_* for the latest press of `vk`: the UTF-16 unit it typed on the host layout. */
+    getKeyDownText(vk: number): number {
+        return this.keyTextView ? this.keyTextView[vk & 0xFF]! : KEY_TEXT_UNKNOWN;
     }
 
     getKeyState(vk: number): number {
@@ -1524,6 +1546,62 @@ export class InputManager {
         };
     }
 
+    captureHeldKeys(): number[] {
+        const held: number[] = [];
+        for (let vk = 0; vk < 256; vk++) if (this.prevKeyBitfield[vk >> 5]! & (1 << (vk & 31))) held.push(vk);
+        return held;
+    }
+
+    restoreHeldKeys(held: readonly number[]): void {
+        this.prevKeyBitfield.fill(0);
+        for (const vk of held) {
+            this.prevKeyBitfield[vk >> 5]! |= 1 << (vk & 31);
+            this.keyStates[vk] = 0x80;
+        }
+        this.lastSeq = -1;
+    }
+
+    captureHeldButtons(): number {
+        return this.lastButtons & 7;
+    }
+
+    restoreHeldButtons(buttons: number): void {
+        this.lastButtons = buttons & 7;
+        this.currentButtons = buttons & 7;
+        this.keyStates[0x01] = (buttons & 1) ? 0x80 : 0x00;
+        this.keyStates[0x02] = (buttons & 2) ? 0x80 : 0x00;
+        this.keyStates[0x04] = (buttons & 4) ? 0x80 : 0x00;
+        this.lastSeq = -1;
+    }
+
+    captureDInputBuffers(): DInputBufferState {
+        const lane = (size: number, seq: number, events: DInputBufferedEvent[], overflowed: boolean): DInputBufferLane =>
+            ({ size, seq, events: events.map(e => ({ ...e })), overflowed });
+        return {
+            mouse: lane(this.dinputMouseBufferSize, this.dinputMouseSeq, this.dinputMouseEvents, this.dinputMouseOverflowed),
+            keyboard: lane(this.dinputKeyboardBufferSize, this.dinputKeyboardSeq, this.dinputKeyboardEvents, this.dinputKeyboardOverflowed),
+            gamepad: lane(this.dinputGamepadBufferSize, this.dinputGamepadSeq, this.dinputGamepadEvents, this.dinputGamepadOverflowed),
+        };
+    }
+
+    restoreDInputBuffers(s: DInputBufferState): void {
+        this.dinputMouseBufferSize = s.mouse.size;
+        this.dinputMouseSeq = s.mouse.seq;
+        this.dinputMouseEvents = s.mouse.events.map(e => ({ ...e }));
+        this.dinputMouseOverflowed = s.mouse.overflowed;
+        this.dinputKeyboardBufferSize = s.keyboard.size;
+        this.dinputKeyboardSeq = s.keyboard.seq;
+        this.dinputKeyboardEvents = s.keyboard.events.map(e => ({ ...e }));
+        this.dinputKeyboardOverflowed = s.keyboard.overflowed;
+        this.dinputGamepadBufferSize = s.gamepad.size;
+        this.dinputGamepadSeq = s.gamepad.seq;
+        this.dinputGamepadEvents = s.gamepad.events.map(e => ({ ...e }));
+        this.dinputGamepadOverflowed = s.gamepad.overflowed;
+        this.baselineDInputMouse();
+        this.baselineDInputKeyboard();
+        this.baselineDInputGamepad();
+    }
+
     /** Set DirectInput mouse buffer size (DIPROP_BUFFERSIZE). 0 = unbuffered. */
     setDInputMouseBufferSize(size: number): void {
         this.dinputMouseBufferSize = size;
@@ -1730,20 +1808,29 @@ export class InputManager {
     }
 
     /**
-     * Feed RELATIVE pointer motion, leaving the absolute pointer where it is — the
-     * worker-side twin of the host's Pointer Lock branch (App.tsx addPointerRelative),
-     * which likewise publishes movement with no position. A guest steering by motion
-     * (DirectInput axes) sees this; one reading position does not. That split is the
-     * whole point: an absolute injector cannot express a delta larger than the screen,
-     * and a guest whose own cursor is already at the edge needs exactly that.
+     * Feed RELATIVE pointer motion — the worker-side twin of the host's Pointer Lock
+     * branch (App.tsx addPointerRelative). The raw delta goes to the DirectInput axes
+     * unclamped, so a guest whose own cursor is already at the edge still turns. As on
+     * Windows, the same device motion is also added to the one system cursor (from
+     * where the guest last put it, so a SetCursorPos recentre is honoured), clamped to
+     * the screen and ClipCursor: a title that emulates a relative mouse by reading
+     * WM_MOUSEMOVE against a recentred cursor (UE1's WinDrv) steers by this too.
      */
     injectPointerDelta(dx: number, dy: number): boolean {
         const view = this.inputView;
         if (!view) return false;
+        const screen = getVirtualScreenRect();
+        const x = Math.max(screen.left, Math.min(screen.right - 1, this.currentMouseX + (dx | 0)));
+        const y = Math.max(screen.top, Math.min(screen.bottom - 1, this.currentMouseY + (dy | 0)));
         beginInputWrite(view);
         if (dx) Atomics.add(view, INPUT_INDEX.dinputDX, dx | 0);
         if (dy) Atomics.add(view, INPUT_INDEX.dinputDY, dy | 0);
+        view[INPUT_INDEX.mouseX] = x;
+        view[INPUT_INDEX.mouseY] = y;
+        view[INPUT_INDEX.mouseInside] = 1;
         endInputWrite(view);
+        const confined = clampToCursorClip(x, y);
+        this.commitCursorPosition(confined.x, confined.y);
         this.poll(true);
         return true;
     }
@@ -1812,6 +1899,7 @@ export class InputManager {
         const bit = v & 31;
         const idx = KEY_BITFIELD_BASE + word;
         beginInputWrite(view);
+        if (down && this.keyTextView) this.keyTextView[v] = KEY_TEXT_UNKNOWN;
         view[idx] = down ? (view[idx] | (1 << bit)) : (view[idx] & ~(1 << bit));
         endInputWrite(view);
         this.poll(true);

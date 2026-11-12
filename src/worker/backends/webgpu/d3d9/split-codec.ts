@@ -30,6 +30,22 @@ const TYPED_CTORS = [
 ] as const;
 type TypedCtor = (typeof TYPED_CTORS)[number];
 
+/** A typed array at least this large may leave the encoder as its tail instead of being
+ *  copied into the encode buffer first. */
+const SPLIT_TAIL_MIN_BYTES = 256;
+
+function typedKind(obj: object): number {
+    switch (obj.constructor) {
+        case Uint8Array: return 0;
+        case Float32Array: return 6;
+        case Uint16Array: return 2;
+        case Uint32Array: return 4;
+        case Int32Array: return 5;
+    }
+    for (let i = 0; i < TYPED_CTORS.length; i++) if (obj instanceof TYPED_CTORS[i]!) return i;
+    return -1;
+}
+
 /** Objects created by a recorded call on both sides, keyed by the front's instance. */
 export interface SplitRefTable {
     idOf(frontObject: object): number | undefined;
@@ -42,10 +58,17 @@ export class SplitEncoder {
     private dv = new DataView(this.buf);
     private pos = 0;
     private readonly text = new TextEncoder();
+    private pendingTail: Uint8Array | null = null;
+    private pendingTailLength = 0;
 
     constructor(private readonly refs: SplitRefTable) {}
 
-    reset(): void { this.pos = 0; }
+    reset(): void { this.pos = 0; this.pendingTail = null; this.pendingTailLength = 0; }
+    /** The bytes that follow `bytes[0..length)` in the encoded record, when the last value
+     *  was encoded with `tail`. A view of the caller's array: consume it before returning. */
+    get tail(): Uint8Array | null { return this.pendingTail; }
+    /** The length the tail was encoded with: a view that no longer has it was detached. */
+    get tailLength(): number { return this.pendingTailLength; }
     get length(): number { return this.pos; }
     get bytes(): Uint8Array { return this.u8; }
 
@@ -63,7 +86,7 @@ export class SplitEncoder {
     private tag(t: number): void { this.reserve(1); this.u8[this.pos++] = t; }
     private u32(v: number): void { this.reserve(4); this.dv.setUint32(this.pos, v >>> 0, true); this.pos += 4; }
 
-    value(v: unknown, path = "arg"): void {
+    value(v: unknown, path = "arg", tail = false): void {
         if (v === undefined) { this.tag(T_UNDEFINED); return; }
         if (v === null) { this.tag(T_NULL); return; }
         switch (typeof v) {
@@ -96,7 +119,7 @@ export class SplitEncoder {
         }
         const obj = v as object;
         if (ArrayBuffer.isView(obj) && !(obj instanceof DataView)) {
-            const kind = TYPED_CTORS.findIndex((C) => obj instanceof C);
+            const kind = typedKind(obj);
             if (kind < 0) throw new Error(`split codec: ${path} is an unsupported typed array`);
             const view = obj as unknown as { byteLength: number; byteOffset: number; buffer: ArrayBufferLike };
             if (view.byteLength > SPLIT_MAX_TYPED_BYTES) {
@@ -106,6 +129,11 @@ export class SplitEncoder {
             this.reserve(1);
             this.u8[this.pos++] = kind;
             this.u32(view.byteLength);
+            if (tail && view.byteLength >= SPLIT_TAIL_MIN_BYTES) {
+                this.pendingTail = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+                this.pendingTailLength = view.byteLength;
+                return;
+            }
             this.reserve(view.byteLength);
             this.u8.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength), this.pos);
             this.pos += view.byteLength;

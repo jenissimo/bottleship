@@ -23,24 +23,28 @@ import type { DirectDrawSurfaceState } from "./com-objects";
  * RGB565 to RGBA8888 lookup table (65536 entries × 4 bytes = 256KB)
  * Format: 0xAABBGGRR (little-endian RGBA for direct Uint32 write)
  */
+// @transient(constant table)
 export const RGB565_TO_RGBA = new Uint32Array(65536);
 
 /**
  * RGB555 to RGBA8888 lookup table (32768 entries × 4 bytes = 128KB)
  * Format: 0xAABBGGRR
  */
+// @transient(constant table)
 export const RGB555_TO_RGBA = new Uint32Array(32768);
 
 /**
  * ARGB1555 to RGBA8888 lookup table (65536 entries × 4 bytes = 256KB)
  * Format: 0xAABBGGRR
  */
+// @transient(constant table)
 export const ARGB1555_TO_RGBA = new Uint32Array(65536);
 
 /**
  * ARGB4444 to RGBA8888 lookup table (65536 entries × 4 bytes = 256KB)
  * Format: 0xAABBGGRR
  */
+// @transient(constant table)
 export const ARGB4444_TO_RGBA = new Uint32Array(65536);
 
 /**
@@ -53,7 +57,9 @@ export const ARGB4444_TO_RGBA = new Uint32Array(65536);
  */
 
 /** 5/6-bit to 8-bit expansion (internal, used only for LUT init) */
+// @transient(constant table)
 const EXPAND_5_TO_8 = new Uint8Array(32);
+// @transient(constant table)
 const EXPAND_6_TO_8 = new Uint8Array(64);
 
 // Initialize lookup tables at module load
@@ -1729,6 +1735,7 @@ export function quantizeColorKey(
 const GPU_TEXTURE_POOL_MAX_PER_KEY = 16;
 
 /** Pool of recycled GPU textures keyed by "WxH_format_usage". */
+// @transient(host GPU textures)
 const gpuTexturePool: Map<string, GPUTexture[]> = new Map();
 
 function texturePoolKey(w: number, h: number, format: GPUTextureFormat, usage: GPUTextureUsageFlags): string {
@@ -2088,6 +2095,7 @@ export function uploadToGPUTexture(
  * Returns undefined if no palette is attached.
  */
 /** Default grayscale palette for 8bpp surfaces without an attached palette */
+// @transient(constant table, built on first use)
 let defaultGrayscalePalette: Uint32Array | undefined;
 
 function getDefaultGrayscalePalette(): Uint32Array {

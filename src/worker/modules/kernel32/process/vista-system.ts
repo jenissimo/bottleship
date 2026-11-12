@@ -61,13 +61,15 @@ function processOf(handle: number): { pid: number; imagePath: string } | null {
     const p = getVirtualProcessManager().describeProcessHandle(handle);
     if (!p) return null;
     if (p.pid === VIRTUAL_CURRENT_PROCESS_ID) return { pid: p.pid, imagePath: system.executablePath };
-    return { pid: p.pid, imagePath: childImagePath(p.commandLine, p.imageName, p.currentDirectory) };
+    // The lookup already settled on a file; a record without one is the only case
+    // where the command line has to be read again.
+    return { pid: p.pid, imagePath: p.imagePath ?? childImagePath(p.commandLine, p.imageName, p.currentDirectory) };
 }
 
 /** A child's image as its command line names it, made absolute against its directory. */
 function childImagePath(commandLine: string, imageName: string, currentDirectory: string): string {
     const line = commandLine.trim();
-    let token = line.startsWith('"') ? line.slice(1, Math.max(1, line.indexOf('"', 1))) : line.split(' ')[0];
+    let token = line.startsWith('"') ? line.slice(1, Math.max(1, line.indexOf('"', 1))) : line.search(/\s/) < 0 ? line : line.slice(0, line.search(/\s/));
     if (!token) token = imageName;
     token = token.replace(/\//g, '\\');
     if (/^[A-Za-z]:\\/.test(token)) return token;
@@ -96,8 +98,11 @@ function writeWideString(addr: number, s: string): boolean {
 
 // ─── Per-thread state ────────────────────────────────────────────────────────────
 
+// @participant(kernel32)
 const threadDescriptions = new Map<number, string>();
+// @participant(kernel32)
 const threadErrorModes = new Map<number, number>();
+// @participant(kernel32)
 const threadStackGuarantees = new Map<number, number>();
 
 // ─── Mitigation policies ─────────────────────────────────────────────────────────
@@ -106,7 +111,9 @@ const PROCESS_DEP_POLICY = 0;
 const PROCESS_MITIGATION_OPTIONS_MASK = 5;
 const MAX_PROCESS_MITIGATION_POLICY = 19;
 /** Flags (and, for DEP, the Permanent byte) the process has turned on. */
+// @participant(kernel32)
 const mitigationFlags = new Map<number, number>();
+// @participant(kernel32)
 let depPermanent = 0;
 
 function mitigationPolicySize(policy: number, requested: number): number {
@@ -117,6 +124,7 @@ function mitigationPolicySize(policy: number, requested: number): number {
 
 // ─── Fail-fast / WER ─────────────────────────────────────────────────────────────
 
+// @participant(kernel32)
 const werRuntimeExceptionModules: Array<{ dll: string; context: number }> = [];
 const WER_MAX_REGISTERED_RUNTIME_EXCEPTION_MODULES = 16;
 
@@ -127,6 +135,32 @@ export function resetVistaSystemState(): void {
     mitigationFlags.clear();
     depPermanent = 0;
     werRuntimeExceptionModules.length = 0;
+}
+
+export interface VistaSystemState {
+    descriptions: Array<[number, string]>;
+    errorModes: Array<[number, number]>;
+    stackGuarantees: Array<[number, number]>;
+    mitigations: Array<[number, number]>;
+    depPermanent: number;
+    werModules: Array<{ dll: string; context: number }>;
+}
+
+export function captureVistaSystemState(): VistaSystemState {
+    return {
+        descriptions: [...threadDescriptions], errorModes: [...threadErrorModes], stackGuarantees: [...threadStackGuarantees],
+        mitigations: [...mitigationFlags], depPermanent, werModules: werRuntimeExceptionModules.map(m => ({ ...m })),
+    };
+}
+
+export function restoreVistaSystemState(state: VistaSystemState): void {
+    resetVistaSystemState();
+    for (const [k, v] of state.descriptions) threadDescriptions.set(k, v);
+    for (const [k, v] of state.errorModes) threadErrorModes.set(k, v);
+    for (const [k, v] of state.stackGuarantees) threadStackGuarantees.set(k, v);
+    for (const [k, v] of state.mitigations) mitigationFlags.set(k, v);
+    depPermanent = state.depPermanent;
+    for (const m of state.werModules) werRuntimeExceptionModules.push({ ...m });
 }
 
 // ─── SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX (x86 layout) ──────────────────────

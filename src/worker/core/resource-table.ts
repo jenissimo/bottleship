@@ -94,6 +94,22 @@ export class ResourceTable<T> {
         return this.items.filter((item): item is T => item !== undefined);
     }
 
+    entries(): Array<[number, T]> {
+        const out: Array<[number, T]> = [];
+        for (const handle of this.handleToIndex.keys()) {
+            const item = this.getByHandle(handle);
+            if (item !== null) out.push([handle, item]);
+        }
+        return out.sort((a, b) => a[0] - b[0]);
+    }
+
+    clear(): void {
+        this.items = [];
+        this.freeList = [];
+        this.handleToIndex.clear();
+        this.generations = new Uint16Array(this.capacity);
+    }
+
     private grow(): void {
         const newCapacity = this.capacity * 2;
         const newGenerations = new Uint16Array(newCapacity);

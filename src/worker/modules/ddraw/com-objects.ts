@@ -1,5 +1,7 @@
 import { Logger, LogCategory } from "../../core/logger";
-import { BaseComObject } from "../../core/com/base-com-object";
+import { BaseComObject, type ComBaseState } from "../../core/com/base-com-object";
+import type { FieldPolicy } from "../../savestate/participant";
+import { CaptureRefusal } from "../../savestate/object-codecs";
 import { System } from "../../core/system";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { leaseRegistry } from "../../core/memory/lease-registry";
@@ -373,6 +375,8 @@ export interface RenderSurface extends BaseSurfaceState {
     lastUploadVersion: number;
     /** Bounding box of dirty region (for partial upload optimization - Phase 2). */
     dirtyRegion?: Rect;
+    /** Region still awaiting upload when the current Lock began; the Unlock adds its writes to it. */
+    leasePriorDirtyRegion?: Rect;
 
     /** Ephemeral RGBA cache (can invalidate/recreate). */
     rgbaScratch?: Uint8Array;
@@ -393,6 +397,109 @@ export interface RenderSurface extends BaseSurfaceState {
  * TypeScript enforces correct field access via type guards.
  */
 export type DirectDrawSurfaceState = BitmapTextureSurface | RenderSurface;
+
+export const SURFACE_FIELDS = {
+    width: 'save', height: 'save', pitch: 'save', caps: 'save', caps2: 'save', caps3: 'save', caps4: 'save',
+    surfacePtr: 'save', format: 'save', attachedSurfaceAddr: 'save', attachedSurfaceAddrs: 'save',
+    implicitChainMember: 'save', attachRefOwner: 'save', zOwnerSurfaces: 'save',
+    gpuTexture: 'host', gpuTextureView: 'host', gpuMipLevels: 'host', gpuTextureFormat: 'host',
+    gpuTextureRGB565: 'host', gpuTextureRGB565View: 'host', rgbaPaddedScratch: 'transient',
+    surfacePtrAllocated: 'save', vidMemSize: 'save',
+    activeLeaseId: 'transient', activeLeaseSnapshot: 'transient', activeLeaseSnapshotBase: 'transient', activeLeaseSnapshotSize: 'transient',
+    srcColorKey: 'save', destColorKey: 'save', mipMapCount: 'save', mipSublevels: 'save', textureStage: 'save',
+    alphaBitDepth: 'save', paletteHandle: 'save', clipperHandle: 'save', lastPaletteVersion: 'derive',
+    needsColorClear: 'save', clearColor: 'save', boundByDevices: 'derive', surfaceEverWritten: 'save',
+    lastLoadFingerprint: 'derive', lastLoadSrcDimensions: 'derive', writeGeneration: 'save',
+    lastLoadSourceGeneration: 'derive', lastLoadSourcePtr: 'derive', privateData: 'save',
+    sampledEncoderEpoch: 'host', sampledContentVersion: 'host', surfaceLost: 'save',
+} as const satisfies Record<keyof BaseSurfaceState, FieldPolicy>;
+
+export const BITMAP_TEXTURE_FIELDS = {
+    surfaceType: 'save', rgbaScratch: 'save', gpuNeedsUpload: 'derive', contentVersion: 'save', d3dFormat: 'save',
+    dxtFormat: 'save', palette: 'save', needsUVFlip: 'save', rgbaScratchWithColorKey: 'derive', appliedColorKey: 'derive',
+} as const satisfies Record<Exclude<keyof BitmapTextureSurface, keyof BaseSurfaceState>, FieldPolicy>;
+
+export const RENDER_SURFACE_FIELDS = {
+    surfaceType: 'save', mode: 'save', version: 'save', gpuDirty: 'derive', gpuWrittenVersion: 'derive', everLocked: 'save',
+    lastLockReadOnly: 'save', lastUploadVersion: 'derive', dirtyRegion: 'derive', leasePriorDirtyRegion: 'transient',
+    rgbaScratch: 'derive', rgbaScratchVersion: 'derive', cpuSyncedVersion: 'derive',
+} as const satisfies Record<Exclude<keyof RenderSurface, keyof BaseSurfaceState>, FieldPolicy>;
+
+export const PRIVATE_DATA_FIELDS = {
+    size: 'save', bytes: 'save', unknownPtr: 'save',
+} as const satisfies Record<keyof PrivateDataEntry, FieldPolicy>;
+
+const copyValue = (v: unknown): unknown => ArrayBuffer.isView(v) ? (v as Uint8Array).slice() : structuredClone(v);
+
+/** True when only the GPU holds this render surface's current pixels (guest memory is stale). */
+export function gpuHoldsLatest(st: DirectDrawSurfaceState): boolean {
+    if (!isRenderSurface(st) || !st.gpuTexture) return false;
+    return st.gpuWrittenVersion === st.version && st.cpuSyncedVersion !== st.version;
+}
+
+// @transient(restored render surfaces whose GPU texture the presenter creates on their first present; empty in a session that never loaded)
+const restoredWithoutTexture = new WeakSet<DirectDrawSurfaceState>();
+
+export function awaitsTextureAfterRestore(st: DirectDrawSurfaceState): boolean {
+    return restoredWithoutTexture.has(st);
+}
+
+export function textureCreatedAfterRestore(st: DirectDrawSurfaceState): void {
+    restoredWithoutTexture.delete(st);
+}
+
+export type MipRef = (mip: DirectDrawSurfaceState) => number | null;
+
+export function captureSurfaceState(st: DirectDrawSurfaceState, mipRef: MipRef = () => null): Record<string, unknown> {
+    if (st.activeLeaseId !== undefined) throw new CaptureRefusal('ddraw: a surface is locked');
+    if (gpuHoldsLatest(st)) {
+        throw new CaptureRefusal(`ddraw: surface 0x${st.surfacePtr.toString(16)} has pixels only on the GPU and could not be read back`);
+    }
+    const out: Record<string, unknown> = {};
+    const own = isBitmapTexture(st) ? BITMAP_TEXTURE_FIELDS : RENDER_SURFACE_FIELDS;
+    for (const table of [SURFACE_FIELDS, own] as Record<string, FieldPolicy>[]) {
+        for (const [key, policy] of Object.entries(table)) {
+            if (policy !== 'save') continue;
+            const v = (st as unknown as Record<string, unknown>)[key];
+            if (v === undefined) continue;
+            if (key === 'mipSublevels') {
+                out[key] = (v as DirectDrawSurfaceState[]).map(m => {
+                    const id = mipRef(m);
+                    return id === null ? captureSurfaceState(m, mipRef) : { mipRef: id };
+                });
+            }
+            else if (key === 'privateData') out[key] = [...(v as Map<string, PrivateDataEntry>)].map(([k, e]) => [k, copyValue(e)]);
+            else out[key] = copyValue(v);
+        }
+    }
+    return out;
+}
+
+export function restoreSurfaceState(saved: Record<string, unknown>): DirectDrawSurfaceState {
+    const st: Record<string, unknown> = {};
+    for (const [key, v] of Object.entries(saved)) st[key] = copyValue(v);
+    if (Array.isArray(saved.mipSublevels)) {
+        st.mipSublevels = (saved.mipSublevels as Record<string, unknown>[]).map(m => ('mipRef' in m ? { ...m } : restoreSurfaceState(m)));
+    }
+    if (Array.isArray(saved.privateData)) st.privateData = new Map(saved.privateData as Array<[string, PrivateDataEntry]>);
+    if (st.surfaceType === 'bitmap_texture') {
+        st.gpuNeedsUpload = true;
+    } else {
+        st.gpuDirty = true;
+        st.lastUploadVersion = -1;
+        if (st.mode === 'GPU_ONLY') st.mode = 'CPU';
+        restoredWithoutTexture.add(st as unknown as DirectDrawSurfaceState);
+    }
+    return st as unknown as DirectDrawSurfaceState;
+}
+
+export interface SavedSurfaceObject {
+    base: ComBaseState;
+    state: Record<string, unknown>;
+    texture2: number;
+    texture: number;
+    owner: number;
+}
 
 // ============================================================================
 // TYPE GUARDS - Compile-time safety
@@ -436,10 +543,42 @@ export class DirectDrawSurfaceObject extends BaseComObject {
         const ddrawModule = System.getInstance().process?.getModule("ddraw") as {
             purgeTextureRegistryForRecycledComSlot?: (slot: number, newHandle: number) => void;
         } | undefined;
-        if (ddrawModule?.purgeTextureRegistryForRecycledComSlot) {
+        if (ddrawModule?.purgeTextureRegistryForRecycledComSlot && this.handle) {
             const slot = (this.handle & SystemResourceProvider.COM_SLOT_MASK) >>> 0;
             ddrawModule.purgeTextureRegistryForRecycledComSlot(slot, this.handle);
         }
+    }
+
+    static captureObject(o: DirectDrawSurfaceObject, ref: (obj: unknown, where: string) => number = () => { throw new Error('no object graph'); }): SavedSurfaceObject {
+        const mipRef: MipRef = (mip) => {
+            const owner = DirectDrawSurfaceObject.ownerOf(mip);
+            return owner && owner !== o ? ref(owner, `mip of 0x${o.state.surfacePtr.toString(16)}`) : null;
+        };
+        return {
+            base: BaseComObject.captureComBase(o), state: captureSurfaceState(o.state, mipRef),
+            texture2: o.cachedTexture2Handle, texture: o.cachedTextureHandle, owner: o.ddrawOwnerAddr,
+        };
+    }
+
+    static restoreObject(d: SavedSurfaceObject): DirectDrawSurfaceObject {
+        const o = BaseComObject.restoreComBase(() => new DirectDrawSurfaceObject(0, restoreSurfaceState(d.state)), d.base);
+        o.cachedTexture2Handle = d.texture2;
+        o.cachedTextureHandle = d.texture;
+        o.ddrawOwnerAddr = d.owner;
+        return o;
+    }
+
+    static linkObject(o: DirectDrawSurfaceObject, resolve: (ref: number) => unknown): void {
+        const mips = o.state.mipSublevels as Array<DirectDrawSurfaceState | { mipRef: number }> | undefined;
+        if (!mips) return;
+        o.state.mipSublevels = mips.map(m => ('mipRef' in m ? (resolve(m.mipRef) as DirectDrawSurfaceObject).state : m));
+    }
+
+    static ownerOf(state: DirectDrawSurfaceState): DirectDrawSurfaceObject | null {
+        for (const obj of SystemResourceProvider.getInstance().getAllComObjects()) {
+            if (obj instanceof DirectDrawSurfaceObject && obj.state === state) return obj;
+        }
+        return null;
     }
 
     getCachedTexture2Handle(): number {

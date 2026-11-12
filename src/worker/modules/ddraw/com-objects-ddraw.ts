@@ -2,7 +2,7 @@
  * DirectDraw COM objects: DirectDraw, Clipper, Palette.
  */
 import { Logger, LogCategory } from "../../core/logger";
-import { BaseComObject } from "../../core/com/base-com-object";
+import { BaseComObject, type ComBaseState } from "../../core/com/base-com-object";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { System } from "../../core/system";
 import { Mem } from "../../core/memory/mem-accessor";
@@ -17,7 +17,19 @@ import {
 } from "./constants";
 import { guestPtrToMemOffset } from "./helpers";
 
+export interface SavedClipper { base: ComBaseState; hwnd: number; clipList: Uint8Array | null }
+
+export interface SavedPalette { base: ComBaseState; entries: Uint8Array; rgba: Uint32Array; caps: number; version: number }
+
 export class DirectDrawObject extends BaseComObject {
+    static captureObject(o: DirectDrawObject): { base: ComBaseState } {
+        return { base: BaseComObject.captureComBase(o) };
+    }
+
+    static restoreObject(d: { base: ComBaseState }): DirectDrawObject {
+        return BaseComObject.restoreComBase(() => new DirectDrawObject(0), d.base);
+    }
+
     constructor(vtableAddress: number) {
         super(IID_IDirectDraw7, vtableAddress);
     }
@@ -143,6 +155,18 @@ export class DirectDrawClipperObject extends BaseComObject {
     private clipListData: Uint8Array | null = null;
     private clipListChanged = false;
 
+    static captureObject(o: DirectDrawClipperObject): SavedClipper {
+        return { base: BaseComObject.captureComBase(o), hwnd: o.hwnd, clipList: o.clipListData ? o.clipListData.slice() : null };
+    }
+
+    static restoreObject(d: SavedClipper): DirectDrawClipperObject {
+        const o = BaseComObject.restoreComBase(() => new DirectDrawClipperObject(0), d.base);
+        o.hwnd = d.hwnd;
+        o.clipListData = d.clipList ? d.clipList.slice() : null;
+        o.clipListChanged = true;
+        return o;
+    }
+
     constructor(vtableAddress: number) {
         super(IID_IDirectDrawClipper, vtableAddress);
     }
@@ -225,6 +249,19 @@ export class DirectDrawPaletteObject extends BaseComObject {
     private paletteRGBA: Uint32Array = new Uint32Array(256);
     private caps: number = 0;
     private version: number = 0;
+
+    static captureObject(o: DirectDrawPaletteObject): SavedPalette {
+        return { base: BaseComObject.captureComBase(o), entries: o.entriesRaw.slice(), rgba: o.paletteRGBA.slice(), caps: o.caps, version: o.version };
+    }
+
+    static restoreObject(d: SavedPalette): DirectDrawPaletteObject {
+        const o = BaseComObject.restoreComBase(() => new DirectDrawPaletteObject(0), d.base);
+        o.entriesRaw = d.entries.slice();
+        o.paletteRGBA = d.rgba.slice();
+        o.caps = d.caps;
+        o.version = d.version;
+        return o;
+    }
 
     constructor(vtableAddress: number) {
         super(IID_IDirectDrawPalette, vtableAddress);

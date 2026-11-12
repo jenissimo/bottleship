@@ -235,15 +235,4 @@ export class SplitQueryHost {
         this.counters.posted += out.length;
         return out;
     }
-
-    /** A readback is still in flight for some awaited generation: collect() again once settled. */
-    async inflight(): Promise<boolean> {
-        const managers = new Set<D3D9QueryManager>();
-        for (const q of this.queries.values()) {
-            if (q.token && !q.posted && q.manager?.hasInflight()) managers.add(q.manager);
-        }
-        if (managers.size === 0) return false;
-        await Promise.all([...managers].map((m) => m.settled()));
-        return true;
-    }
 }

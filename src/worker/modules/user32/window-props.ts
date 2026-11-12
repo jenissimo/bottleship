@@ -8,8 +8,9 @@ import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { windows, type WindowInfo } from './shared-state';
-import { applyDefaultSetText } from './dialog-control-messages';
-import { sendWindowGetText, sendWindowGetTextLength, sendWindowSetText } from './message';
+import { System } from '../../core/system';
+import { applyDefaultSetText, handleSystemControlMessage } from './dialog-control-messages';
+import { invokeWindowMessageSync, sendWindowGetText, sendWindowGetTextLength, sendWindowSetText } from './message';
 import { encodeAnsi } from '../codepage-utils';
 import { getDefDlgProcAddress, getDefWindowProcAddress, getDefWindowProcWAddress } from './system-classes';
 
@@ -95,10 +96,17 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
                 prev = window.controlId ?? 0;
                 window.controlId = dwNewLong >>> 0;
                 break;
-            case GWL_STYLE:
+            case GWL_STYLE: {
                 prev = window.style >>> 0;
                 window.style = dwNewLong >>> 0;
+                const visible = (window.style & 0x10000000) !== 0;
+                if (((prev ^ window.style) & 0x10000000) !== 0 && window.visible !== visible) {
+                    window.visible = visible;
+                    const wmWin = System.getInstance().windowManager.getWindow(hWnd);
+                    if (wmWin) wmWin.visible = visible;
+                }
                 break;
+            }
             case GWL_EXSTYLE:
                 prev = window.exStyle ?? 0;
                 window.exStyle = dwNewLong >>> 0;
@@ -133,6 +141,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         const GWL_STYLE = -16;
         const GWL_EXSTYLE = -20;
         const GWL_USERDATA = -21;
+        const GWL_HWNDPARENT = -8;
 
         const idx = nIndex | 0;
         if (idx >= 0) {
@@ -154,6 +163,8 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
                 return (window.exStyle ?? 0) >>> 0;
             case GWL_USERDATA:
                 return (window.userData ?? 0) >>> 0;
+            case GWL_HWNDPARENT:
+                return (window.parent ?? 0) >>> 0;
             default:
                 return 0;
         }
@@ -256,17 +267,31 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
     exports['SetWindowTextW'] = (ctx, mem, args) =>
         setWindowTextImpl(ctx, mem, args, 'SetWindowTextW', (ptr) => Marshaler.readWideString(mem, ptr));
 
+    // Wine NtUserEnableWindow: a state CHANGE sends WM_ENABLE (a control's class proc
+    // repaints itself on it), and a disabled window loses the focus. Without the message a
+    // re-enabled button keeps its greyed pixels, since nothing else asks it to repaint.
     exports['EnableWindow'] = (ctx, mem, args) => {
-        const hWnd = args[0];
+        const hWnd = args[0] >>> 0;
         const bEnable = args[1] !== 0;
         Logger.verbose(LogCategory.USER32, `EnableWindow(0x${hWnd.toString(16)}, ${bEnable})`);
         const window = windows.get(hWnd);
         if (!window) return 0;
         const WS_DISABLED_FLAG = 0x08000000;
+        const WM_ENABLE = 0x000A;
         const wasDisabled = (window.style & WS_DISABLED_FLAG) !== 0;
+        // Returns TRUE if the window was PREVIOUSLY disabled.
+        const result = wasDisabled ? 1 : 0;
+        if (bEnable !== wasDisabled) return result;
         if (bEnable) window.style &= ~WS_DISABLED_FLAG;
         else window.style |= WS_DISABLED_FLAG;
-        // Real EnableWindow: returns TRUE if the window was PREVIOUSLY disabled.
-        return wasDisabled ? 1 : 0;
+        const wm = System.getInstance().windowManager;
+        const wmWin = wm.getWindow(hWnd);
+        if (wmWin) wmWin.style = window.style;
+        if (!bEnable && wm.getFocusHwnd() === hWnd) wm.setFocus(0);
+        const sent = invokeWindowMessageSync(
+            ctx, mem, hWnd, WM_ENABLE, bEnable ? 1 : 0, 0, 8, 'EnableWindow', () => result);
+        if (sent) return sent;
+        if (window.isSystemControl) handleSystemControlMessage(window, WM_ENABLE, bEnable ? 1 : 0, 0, mem);
+        return result;
     };
 }

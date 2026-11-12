@@ -1,4 +1,4 @@
-import { wgbEtag } from "./deploy/wgb-etag";
+import { diskWgbEtag } from "./deploy/wgb-etag";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import basicSsl from "@vitejs/plugin-basic-ssl";
@@ -161,9 +161,10 @@ function serveWgbFromDisk(): Plugin {
         } catch { res.statusCode = 404; res.end(`not found: ${file}`); return; }
         res.setHeader("Accept-Ranges", "bytes");
         res.setHeader("Content-Type", "application/octet-stream");
+        // Same metadata validator as the sidecar's /wgb (deploy/wgb-etag.ts diskWgbEtag).
         let etag: string;
-        try { etag = await wgbEtag(file); }
-        catch { res.statusCode = 503; res.end("bundle changed while hashing"); return; }
+        try { etag = await diskWgbEtag(file); }
+        catch { res.statusCode = 404; res.end(`not found: ${file}`); return; }
         res.setHeader("ETag", etag);
         res.setHeader("Cache-Control", "no-cache");
         const validator = req.headers["if-range"];

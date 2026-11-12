@@ -22,7 +22,7 @@ import { EmulatorConfig } from '../emulator-config-manager';
 import { runDetector } from './lib-detector';
 import { libRegistry } from './lib-registry';
 import { applyPatch, PatchContext } from './lib-patcher';
-import { applyNativeLeaves, findNativeLeaves, type NativeLeafSite } from './native-leaves';
+import { applyNativeLeaves, findNativeLeaves, type NativeLeafSite, applyNativeSplices } from './native-leaves';
 import {
     LiveShadowView,
     ScratchShadowView,
@@ -157,20 +157,20 @@ class LibHleManager {
     }
 
     /** Entry point from pe-loader. Safe to call before initialize — will no-op. */
-    onModuleLoaded(module: LoadedPEModule): void {
+    onModuleLoaded(module: LoadedPEModule): boolean {
         if (!this.init) {
             Logger.log(LogCategory.SYSTEM, `[HLE-lib] onModuleLoaded(${module.name}) — manager not yet initialized, skipping`);
-            return;
+            return false;
         }
         const cfg = EmulatorConfig.getInstance().hleLibs;
-        if (!cfg.enable) return;
+        if (!cfg.enable) return false;
 
-        this.replaceNativeLeaves(module, cfg.logOnly);
+        let patched = this.replaceNativeLeaves(module, cfg.logOnly);
 
         const descriptors = libRegistry.getAll();
         if (descriptors.length === 0) {
             Logger.warn(LogCategory.SYSTEM, `[HLE-lib] onModuleLoaded(${module.name}) — no descriptors registered; did libs/*/index.ts import?`);
-            return;
+            return patched;
         }
 
         const sectionSummary = (module.sections ?? []).map(s =>
@@ -211,30 +211,35 @@ class LibHleManager {
                 continue;
             }
 
-            this.applyMatch(match);
+            if (this.applyMatch(match)) patched = true;
         }
+        return patched;
     }
 
     /** Kill switch for A/B: `setWorkerFlag('__noNativeLeaves', true)` before the image loads. */
-    private replaceNativeLeaves(module: LoadedPEModule, logOnly: boolean): void {
-        if ((globalThis as { __noNativeLeaves?: boolean }).__noNativeLeaves === true) return;
+    private replaceNativeLeaves(module: LoadedPEModule, logOnly: boolean): boolean {
+        if ((globalThis as { __noNativeLeaves?: boolean }).__noNativeLeaves === true) return false;
         const image = this.init?.getMemory();
-        if (!image) return;
+        if (!image) return false;
         if (logOnly) {
             for (const s of findNativeLeaves(image, module)) {
                 Logger.log(LogCategory.SYSTEM, `[HLE-lib] logOnly=true — native leaf ${s.crt} ${s.name} @ 0x${s.address.toString(16)} NOT replaced`);
             }
-            return;
+            return false;
         }
+        const before = this.nativeLeafSites.length;
         this.nativeLeafSites.push(...applyNativeLeaves(image, module));
+        this.nativeLeafSites.push(...applyNativeSplices(image, module));
+        return this.nativeLeafSites.length > before;
     }
 
     getNativeLeafSites(): NativeLeafSite[] {
         return [...this.nativeLeafSites];
     }
 
-    private applyMatch(match: LibMatch): void {
-        if (!this.init) return;
+    private applyMatch(match: LibMatch): boolean {
+        if (!this.init) return false;
+        let patched = false;
         const { descriptor, module, functionMatches } = match;
 
         const patchCtx: PatchContext = {
@@ -307,6 +312,7 @@ class LibHleManager {
                 entryFilter: decl.entryFilter,
             });
             if (handle) {
+                patched = true;
                 this.patches.set(key, handle);
                 if (needsTrampoline && handle.trampolineAddress === undefined) {
                     Logger.error(LogCategory.SYSTEM,
@@ -347,6 +353,7 @@ class LibHleManager {
         } catch (e) {
             Logger.warn(LogCategory.SYSTEM, `[HLE-lib] ${descriptor.id}.onActivated threw: ${e}`);
         }
+        return patched;
     }
 
     /**

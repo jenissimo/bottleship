@@ -4,9 +4,6 @@ const VK_TO_DIK: Record<number, number> = {
     0x08: 0x0E, // VK_BACK -> DIK_BACK
     0x09: 0x0F, // VK_TAB -> DIK_TAB
     0x0D: 0x1C, // VK_RETURN -> DIK_RETURN
-    0x10: 0x2A, // VK_SHIFT -> DIK_LSHIFT
-    0x11: 0x1D, // VK_CONTROL -> DIK_LCONTROL
-    0x12: 0x38, // VK_MENU -> DIK_LMENU
     0x14: 0x3A, // VK_CAPITAL -> DIK_CAPITAL
     0x1B: 0x01, // VK_ESCAPE -> DIK_ESCAPE
     0x20: 0x39, // VK_SPACE -> DIK_SPACE
@@ -31,7 +28,13 @@ const VK_TO_DIK: Record<number, number> = {
     0x78: 0x43, // VK_F9 -> DIK_F9
     0x79: 0x44, // VK_F10 -> DIK_F10
     0x7A: 0x57, // VK_F11 -> DIK_F11
-    0x7B: 0x58  // VK_F12 -> DIK_F12
+    0x7B: 0x58, // VK_F12 -> DIK_F12
+    0xA0: 0x2A,
+    0xA1: 0x36,
+    0xA2: 0x1D,
+    0xA3: 0x9D,
+    0xA4: 0x38,
+    0xA5: 0xB8
 };
 
 const VK_TO_DIK_ALPHANUM: Array<[number, number]> = [

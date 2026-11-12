@@ -14,14 +14,20 @@ import { Process } from "../core/process";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { System } from "../core/system";
 import { Mem } from "../core/memory/mem-accessor";
-import { WAIT_BLOCKED_NO_SWITCH, WAIT_FAILED, WAIT_OBJECT_0 } from "../core/scheduler/types";
+import { WAIT_BLOCKED_NO_SWITCH, WAIT_FAILED, WAIT_OBJECT_0, WaitCompletionKind, type WaitCompletion } from "../core/scheduler/types";
+import { completeWait, setWaitCompletionHandler } from "../core/scheduler/wait-completion";
 import { kernelbaseModule } from "../api/kernelbase.api";
 import { appPolicyExport } from "./kernel32/process/vista-system";
 
 const ERROR_INVALID_PARAMETER = 87;
 const ERROR_TIMEOUT = 1460;
 
+setWaitCompletionHandler(WaitCompletionKind.WAIT_ON_ADDRESS, (_c, waitResult) => waitResult === WAIT_OBJECT_0
+    ? { value: 1 }
+    : { value: 0, lastError: ERROR_TIMEOUT });
+
 /** WaitOnAddress: guest address -> the event its waiters park on. */
+// @participant(kernel32)
 const addressWaitEvents = new Map<number, number>();
 
 // WaitOnAddress parks on a per-address wake event. Like a condition variable it carries
@@ -33,6 +39,15 @@ function addressWaitEvent(address: number, create: boolean): number {
         addressWaitEvents.set(address, evt);
     }
     return evt;
+}
+
+export function captureAddressWaits(): Array<[number, number]> {
+    return [...addressWaitEvents];
+}
+
+export function restoreAddressWaits(rows: ReadonlyArray<[number, number]>): void {
+    addressWaitEvents.clear();
+    for (const [address, evt] of rows) addressWaitEvents.set(address, evt);
 }
 
 function createKernelbaseOwnExports(): Record<string, ThunkImplementation> {
@@ -60,9 +75,7 @@ function createKernelbaseOwnExports(): Record<string, ThunkImplementation> {
             if (current[i] !== expected[i]) return { value: 1, stackCleanup: 16 };
         }
 
-        const onWake = (waitResult: number) => waitResult === WAIT_OBJECT_0
-            ? { value: 1 }
-            : { value: 0, lastError: ERROR_TIMEOUT };
+        const onWake: WaitCompletion = { kind: WaitCompletionKind.WAIT_ON_ADDRESS, a: 0, b: 0, c: 0 };
         const returnAddr = Mem.readUint32(ctx.esp) ?? 0;
         const result = sched.waitForObjectsWithContext(
             [addressWaitEvent(address, true)], false, dwMilliseconds, returnAddr, ctx.esp + 20,
@@ -73,7 +86,7 @@ function createKernelbaseOwnExports(): Record<string, ThunkImplementation> {
             return { value: 0, blockedNoSwitch: true, stackCleanup: 16 };
         }
         if (result === WAIT_FAILED) return { value: 0, stackCleanup: 16 };
-        const done = onWake(result);
+        const done = completeWait(onWake, result);
         if (done.lastError !== undefined) sched.setLastError(done.lastError);
         return { value: done.value, stackCleanup: 16 };
     };

@@ -7,6 +7,8 @@ import { IModule } from "../core/module";
 import { ws2_32Module } from "../api/ws2_32.api";
 import { Process } from "../core/process";
 import { installWsaBlockingHooks } from "./wsa-blocking";
+import { savestatesEnabled } from "../savestate/participant";
+import { registerWinsockSavestate } from "./wsa-savestate";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { System } from "../core/system";
 import { deliverPendingApcs } from "./kernel32/sync";
@@ -51,6 +53,7 @@ export class Ws2_32 implements IModule {
 
     initialize(process: Process): void {
         const state = this.wsaState = getWsaProcessState(process);
+        if (savestatesEnabled()) registerWinsockSavestate(process, state);
         this.socketTable = state.table;
 
         const htons = (_ctx: unknown, _mem: unknown, args: number[]) => {

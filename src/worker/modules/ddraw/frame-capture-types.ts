@@ -64,6 +64,8 @@ export type CapturedDrawCall = {
     rtFormat?: string | null;
     // Texture 0
     tex0: {
+        /** Guest texture identifier; registry-backed textures have no pixel pointer. */
+        handle?: number;
         surfacePtr: number;
         width: number;
         height: number;

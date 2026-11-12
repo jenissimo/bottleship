@@ -22,8 +22,31 @@ export function leaveComApartment(process: Process, threadId: number, ole = fals
 
 /** Final apartment teardown releases only COM's ownership, never imports/LoadLibrary. */
 export function releaseHleComServerLoads(process: Process, reset = false): void {
-    const servers = new Set([...registrations.get(process)?.values() ?? []].map(entry => entry.server));
-    for (const server of servers) {
+    for (const server of hleComServers(process)) {
         if (reset) server.releaseLoaderReference(); else server.releaseUnusedLoaderReference();
+    }
+}
+
+function hleComServers(process: Process): HleComServer[] {
+    return [...new Set([...registrations.get(process)?.values() ?? []].map(entry => entry.server))];
+}
+
+export function captureHleComServerLoads(process: Process): string[] {
+    return [...new Set(hleComServers(process).filter(server => server.holdsLoaderReference).map(server => server.descriptor.name))].sort();
+}
+
+export function restoreHleComServerLoads(process: Process, modules: readonly string[]): void {
+    const servers = hleComServers(process);
+    for (const module of modules) {
+        if (!servers.some(server => server.descriptor.name === module)) {
+            throw new Error(`ole32: COM held ${module} loaded for an activated class, but this session registers no COM server for it`);
+        }
+    }
+    const held = new Set(modules);
+    for (const server of servers) {
+        if (!held.has(server.descriptor.name)) server.releaseLoaderReference();
+        else if (!server.acquireLoaderReference(false)) {
+            throw new Error(`ole32: COM held ${server.descriptor.name} loaded for an activated class, but this session cannot load it`);
+        }
     }
 }

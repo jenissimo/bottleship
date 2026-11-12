@@ -33,6 +33,7 @@ import { registerGlideCommands } from "./cmds/glide";
 import { registerFsCommands } from "./cmds/fs";
 import { registerIoCommands } from "./cmds/io";
 import { registerIdleCommands } from "./cmds/idle";
+import { registerSavestateCommands } from "./cmds/savestate";
 import { registerDispatchCommands } from "./cmds/dispatch";
 import { registerCensusCommands } from "./cmds/census";
 import { registerCrossingCommands } from "./cmds/crossings";
@@ -93,6 +94,7 @@ export function installHarnessCommands(): void {
     registerFsCommands(harnessService);
     registerIoCommands(harnessService);
     registerIdleCommands(harnessService);
+    registerSavestateCommands(harnessService);
     registerDispatchCommands(harnessService);
     registerCensusCommands(harnessService);
     registerCrossingCommands(harnessService);

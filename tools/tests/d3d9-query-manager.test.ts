@@ -33,16 +33,19 @@ class FakeBuffer {
     readonly bytes: ArrayBuffer;
     destroyed = false;
     mapped = false;
+    mapCalls = 0;
 
-    constructor(desc: { size: number; usage: number }) {
+    constructor(desc: { size: number; usage: number }, private readonly owner: FakeDevice) {
         this.size = desc.size;
         this.usage = desc.usage;
         this.bytes = new ArrayBuffer(desc.size);
     }
 
-    mapAsync(): Promise<void> {
+    /** As in WebGPU: the map resolves only once the queue finished the work using this buffer. */
+    async mapAsync(): Promise<void> {
+        this.mapCalls++;
+        await this.owner.queue?.workDone();
         this.mapped = true;
-        return Promise.resolve();
     }
 
     getMappedRange(): ArrayBuffer {
@@ -62,6 +65,8 @@ class FakeDevice {
     readonly features: ReadonlySet<string>;
     readonly querySets: FakeQuerySet[] = [];
     readonly buffers: FakeBuffer[] = [];
+    /** The queue whose completion gates buffer maps (set by makeManager). */
+    queue: FakeQueue | null = null;
 
     constructor(features: readonly string[] = []) {
         this.features = new Set(features);
@@ -75,12 +80,13 @@ class FakeDevice {
     }
 
     createBuffer(desc: { size: number; usage: number }): FakeBuffer {
-        const buffer = new FakeBuffer(desc);
+        const buffer = new FakeBuffer(desc, this);
         this.buffers.push(buffer);
         return buffer;
     }
 }
 
+/** No onSubmittedWorkDone: the manager must fence a readback on its own mapAsync. */
 class FakeQueue {
     readonly submissions: unknown[][] = [];
     private resolveDone: (() => void) | null = null;
@@ -94,7 +100,7 @@ class FakeQueue {
         this.submissions.push(commandBuffers);
     }
 
-    onSubmittedWorkDone(): Promise<void> {
+    workDone(): Promise<void> {
         return this.done;
     }
 
@@ -145,6 +151,7 @@ function makeManager(
     queue = new FakeQueue(),
     querySetCapacity = 4,
 ): { manager: D3D9QueryManager; queue: FakeQueue } {
+    device.queue = queue;
     const manager = new D3D9QueryManager({
         device: device as unknown as QueryManagerDevice,
         queue: queue as unknown as QueryManagerQueue,
@@ -350,8 +357,35 @@ describe("D3D9 WebGPU query manager", () => {
         expect(manager.poll(7)).toEqual({
             state: "ready", submissionSerial: 7, value: 0x1234_5678_9abcn,
         });
+        // Settled cleanly: the pair is kept for the next batch of its size, not destroyed.
+        expect(readback.destroyed).toBe(false);
+        expect(readback.mapped).toBe(false);
+        expect(device.buffers[0]!.destroyed).toBe(false);
+        manager.destroy();
         expect(readback.destroyed).toBe(true);
         expect(device.buffers[0]!.destroyed).toBe(true);
+    });
+
+    test("settled resolve/readback buffers are reused by the next batch of the same size", async () => {
+        const device = new FakeDevice(["timestamp-query"]);
+        const queue = new FakeQueue();
+        const { manager } = makeManager(device, queue);
+        const record = { type: D3D9_QUERYTYPE_TIMESTAMP, begun: false, issued: true, issueSerial: 1 };
+        manager.acquire(7, record);
+        for (let serial = 1; serial <= 3; serial++) {
+            const encoder = new FakeCommandEncoder();
+            record.issueSerial = serial;
+            expect(manager.writeTimestamp(7, encoder as unknown as QueryCommandEncoder, record).ok).toBe(true);
+            const batch = manager.encodeResolves(encoder as unknown as QueryCommandEncoder, [7], serial);
+            expect(batch.status).toBe("encoded");
+            manager.submit(encoder as unknown as QueryCommandEncoder, batch);
+            queue.complete();
+            await manager.waitForBatch(batch);
+            expect(manager.poll(7).state).toBe("ready");
+            if (serial < 3) manager.rearm(7, record);
+        }
+        expect(device.buffers).toHaveLength(2);
+        expect(device.buffers.every((buffer) => !buffer.destroyed)).toBe(true);
     });
 
     test("abandon retires an encoded batch that never reaches markSubmitted", () => {
@@ -577,6 +611,64 @@ describe("D3D9 WebGPU query manager", () => {
             state: "fallback",
             reason: "query-resolve-validation-failed:resolve destination is invalid",
         });
+    });
+
+    test("the readback map is issued at submit and is the batch's only GPU fence", async () => {
+        const device = new FakeDevice(["timestamp-query"]);
+        const queue = new FakeQueue();
+        const { manager } = makeManager(device, queue);
+        const encoder = new FakeCommandEncoder();
+        const record = { type: D3D9_QUERYTYPE_TIMESTAMP, begun: false, issued: true, issueSerial: 1 };
+        manager.acquire("fence", record);
+        expect(manager.writeTimestamp("fence", encoder as unknown as QueryCommandEncoder, record).ok).toBe(true);
+        const batch = manager.encodeResolves(encoder as unknown as QueryCommandEncoder, ["fence"], 1);
+        const readback = device.buffers[1]!;
+        expect(readback.mapCalls).toBe(0);
+        new DataView(readback.bytes).setBigUint64(0, 99n, true);
+        manager.markSubmitted(batch);
+        expect(readback.mapCalls).toBe(1);
+        for (let i = 0; i < 4; i++) await Promise.resolve();
+        // Mapped only once the queue finished: the value is not visible before that.
+        expect(manager.poll("fence")).toEqual({ state: "pending", submissionSerial: 1 });
+        queue.complete();
+        await manager.waitForBatch(batch);
+        expect(manager.poll("fence")).toEqual({ state: "ready", submissionSerial: 1, value: 99n });
+    });
+
+    test("the resolve validation verdict is awaited alongside the map and still discards its values", async () => {
+        const device = new FakeDevice(["timestamp-query"]) as FakeDevice & {
+            pushErrorScope: (filter: "validation") => void;
+            popErrorScope: () => Promise<{ message?: string } | null>;
+        };
+        const scopes: Array<(value: { message?: string } | null) => void> = [];
+        device.pushErrorScope = () => undefined;
+        device.popErrorScope = () => new Promise((resolve) => { scopes.push(resolve); });
+        const queue = new FakeQueue();
+        const { manager } = makeManager(device, queue);
+        const encoder = new FakeCommandEncoder();
+        const record = { type: D3D9_QUERYTYPE_TIMESTAMP, begun: false, issued: true, issueSerial: 1 };
+        manager.acquire("parallel-scope", record);
+        expect(manager.writeTimestamp("parallel-scope", encoder as unknown as QueryCommandEncoder, record).ok).toBe(true);
+        const batch = manager.encodeResolves(encoder as unknown as QueryCommandEncoder, ["parallel-scope"], 1);
+        const readback = device.buffers[1]!;
+        new DataView(readback.bytes).setBigUint64(0, 1234n, true);
+        manager.markSubmitted(batch);
+        // The map does not wait for the verdict.
+        expect(readback.mapCalls).toBe(1);
+        scopes[0]!(null);
+        queue.complete();
+        for (let i = 0; i < 6; i++) await Promise.resolve();
+        expect(readback.mapped).toBe(true);
+        // Mapped, but the verdict is still out: nothing is exposed.
+        expect(manager.poll("parallel-scope")).toEqual({ state: "pending", submissionSerial: 1 });
+        scopes[1]!({ message: "resolve destination is invalid" });
+        await manager.waitForBatch(batch);
+        expect(manager.poll("parallel-scope")).toMatchObject({
+            state: "fallback",
+            reason: "query-resolve-validation-failed:resolve destination is invalid",
+        });
+        expect(readback.mapped).toBe(false);
+        expect(readback.destroyed).toBe(true);
     });
 
     test("device loss retires query state and exposes a loss reason", async () => {

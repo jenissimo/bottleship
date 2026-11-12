@@ -15,14 +15,17 @@ export interface DeploymentConfig {
     allowedBrowsers?: string[];
     /** Shown instead of the app when the browser is not on the list. */
     blockedMessage?: string;
+    soundFonts?: string[];
 }
 
 let cached: DeploymentConfig | null = null;
 
+export const DEPLOYMENT_CONFIG_URL = "/deployment.json";
+
 export async function loadDeploymentConfig(): Promise<DeploymentConfig> {
     if (cached) return cached;
     try {
-        const resp = await fetch("/deployment.json");
+        const resp = await fetch(DEPLOYMENT_CONFIG_URL);
         cached = resp.ok ? await resp.json() : {};
     } catch {
         cached = {};

@@ -224,6 +224,11 @@ export class VideoEngine {
     /** Where the video knobs come from (the worker's EmulatorConfig); null = faithful defaults. */
     private qualitySource: (() => Pick<QualityConfig, "videoChroma" | "videoDither" | "videoDeinterlace">) | null = null;
 
+    /** Decoder sessions currently open (video playback in progress). */
+    activeSessionCount(): number {
+        return this.sessions.size + this.wcSessions.size;
+    }
+
     /**
      * Inject the quality source. Read per frame rather than pushed, so a manifest layer
      * applied at load or a set_quality mid-movie both land without a second wiring point.

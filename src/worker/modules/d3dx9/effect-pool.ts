@@ -22,7 +22,7 @@ import { InterfaceDescriptor, IUnknown, ModuleDescriptor } from "../../api/types
 import { addComRef, createComObject, registerComFinalizer, releaseComRef } from "../d3d9/shared-state";
 import { Mem } from "../../core/memory/mem-accessor";
 import { normalizeGuid, readGuidFromMem } from "../../core/com/typelib/typelib-types";
-import type { EffectModel, EffectParameter } from "./effect-state";
+import { markEffectParamWritten, type EffectModel, type EffectParameter } from "./effect-state";
 
 const S_OK = 0;
 const E_POINTER = 0x80004003;
@@ -74,6 +74,20 @@ export function effectPoolCount(): number {
     return pools.size;
 }
 
+function rebaseChildBlocks(param: EffectParameter, from: Uint8Array, to: Uint8Array): void {
+    const children = param.elementsList ? [...param.members, ...param.elementsList] : param.members;
+    for (const child of children) {
+        const block = child.value;
+        if (block.byteLength > 0 && block.buffer === from.buffer) {
+            const offset = block.byteOffset - from.byteOffset;
+            if (offset >= 0 && offset + block.byteLength <= to.byteLength) {
+                child.value = to.subarray(offset, offset + block.byteLength);
+            }
+        }
+        rebaseChildBlocks(child, from, to);
+    }
+}
+
 /**
  * Bind every `shared` parameter of `model` to `poolPtr`'s storage.
  *
@@ -98,6 +112,7 @@ export function bindSharedParameters(poolPtr: number, model: EffectModel): numbe
             if (!existing) {
                 pool.values.set(param.name, param.value);
             } else if (existing.byteLength === param.value.byteLength) {
+                rebaseChildBlocks(param, param.value, existing);
                 param.value = existing;
             } else {
                 continue; // shape disagreement: keep the private block rather than corrupt both
@@ -149,6 +164,7 @@ export function propagateSharedObject(param: EffectParameter): void {
         if (other === param) continue;
         other.objectPtr = param.objectPtr;
         other.objectIndex = param.objectIndex;
+        markEffectParamWritten(other);
     }
 }
 

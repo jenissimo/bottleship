@@ -25,7 +25,7 @@ import { cpuViews, readEip, readEsp, readRetiredInsns, PROXY_BASELINE } from '..
 import { Mem } from '../memory/mem-accessor';
 import { ERROR_INVALID_HANDLE } from '../thunking/thunk-errors';
 import { setParkedStackProvider, guardStackWrite } from '../memory/stack-write-guard';
-import { TebManager } from '../teb-manager';
+import { TebManager, TLS_INDEX_LIMIT } from '../teb-manager';
 import {
     clearFpuSimdDirty,
     createDefaultFpuSnapshot,
@@ -38,6 +38,7 @@ import {
     simdSnapshot,
 } from '../fpu-helper';
 import { TimerWheel } from './timer-wheel';
+import { completeWait } from './wait-completion';
 import { dispatchThreadApcs } from './apc-dispatch';
 import { SyncObjectManager, recordSyncEvent } from './sync-objects';
 import { WaitEngine } from './wait-engine';
@@ -83,6 +84,7 @@ import type { WinMM, PendingTimerCallback as PostedTimerCallback } from '../../m
 // idle anchor is stale after a pause / background-throttle gap. See pollTimeouts().
 const IDLE_PUMP_MAX_MS = 250;
 
+
 /** Sole-runnable Sleep(ms): credit+yield only for short pump sleeps; longer → blockThread. */
 const SOLE_RUNNABLE_SLEEP_CREDIT_MAX_MS = 50;
 
@@ -119,6 +121,57 @@ interface SwitchTraceRecord {
     state: number;
     kind: ThunkBoundaryKind;
     cleanup: number;
+}
+
+export interface SavedThread {
+    id: number; handle: number; state: ThreadState; kernelObject: number;
+    context: CpuContext | null; lastFpuState: Uint8Array | null; lastSimdState: Uint8Array | null;
+    stackBase: number; stackSize: number; stackTop: number; startAddress: number; parameter: number;
+    waitInfo: WaitInfo | null; exitCode: number | null; tlsValues: number[][]; lastError: number;
+    suspendCount: number; priority: number; backgroundMode: boolean; tebAddress: number; kernelPinCount: number;
+    apcQueue: Array<{ routine: number; arg0: number; arg1: number; arg2: number; arg3: number | null; kind: ApcKind }>;
+    quitPosted: boolean; quitExitCode: number; asyncParkGeneration: number;
+}
+
+export const THREAD_FIELDS = {
+    kernelObject: 'save', id: 'save', handle: 'save', state: 'save', context: 'save',
+    lastFpuState: 'save', lastSimdState: 'save', stackBase: 'save', stackSize: 'save', stackTop: 'save',
+    startAddress: 'save', parameter: 'save', waitInfo: 'save', exitCode: 'save', tlsValues: 'save',
+    lastError: 'save', suspendCount: 'save', priority: 'save', backgroundMode: 'save',
+    lastSwitchTime: 'host', lastSwitchInsn: 'derive', tebAddress: 'save', kernelPinCount: 'save',
+    apcQueue: 'save', quitPosted: 'save', quitExitCode: 'save', asyncParkGeneration: 'save',
+} as const satisfies Record<keyof Thread, 'save' | 'derive' | 'host' | 'transient'>;
+
+type SavedThreadField = { [K in keyof typeof THREAD_FIELDS]: (typeof THREAD_FIELDS)[K] extends 'save' ? K : never }[keyof typeof THREAD_FIELDS];
+
+export type SavedThreadMatchesPolicy = [Exclude<keyof SavedThread, SavedThreadField>, Exclude<SavedThreadField, keyof SavedThread>] extends [never, never] ? true : never;
+
+export const SAVED_THREAD_MATCHES_POLICY: SavedThreadMatchesPolicy = true;
+
+export interface SchedulerState {
+    threads: SavedThread[];
+    currentThreadId: number | null;
+    nextThreadId: number;
+    mainThreadId: number;
+    runQueue: number[];
+    bootstrapUntilFirstWait: number[];
+    tlsSlots: number[];
+    nextTlsIndex: number;
+    criticalSectionOwners: number[][];
+    csLockSemaphores: number[][];
+    stackPool: Array<[number, number[]]>;
+    stackBytesPooled: number;
+    stackBytesReserved: number;
+    ownedStackBases: number[];
+    mainStack: number[];
+    threadExitStubAddr: number;
+    apcDispatchStub: number;
+    apcDispatchGeneration: number;
+    alertedWaitResults: number[][];
+    reapQueue: number[];
+    reapRetryQueue: number[];
+    teb: { peb: number; params: number; tebs: number[][]; tls: number[][] };
+    sync: { events: number[]; semaphores: number[]; mutexes: number[] };
 }
 
 export class Scheduler {
@@ -651,7 +704,8 @@ export class Scheduler {
 
     constructor(config: Partial<SchedulerConfig> = {}) {
         this.config = { ...DEFAULT_SCHEDULER_CONFIG, ...config };
-
+        this.timerWheel.bind(TimerKind.SLEEP_TIMEOUT, (tid) => this.onWaitTimeout(tid));
+        hypercallDataManager.setQuitPendingProbe(() => this.hasPendingQuit());
     }
 
     private readonly onYieldTask = (): void => {
@@ -736,6 +790,115 @@ export class Scheduler {
         this.mainStackBase = stackPointer - stackSize;
     }
 
+    captureState(ref: (obj: unknown, where: string) => number): SchedulerState {
+        this.syncObjects.syncFromMirrors();
+        const threads: SavedThread[] = [];
+        for (const t of this.threads.values()) {
+            if (this.activeOwnedApcs.get(t.id)?.size) throw new Error(`thread ${t.id}: an APC callback is running`);
+            if (t.apcQueue.some(a => a.lifetime)) throw new Error(`thread ${t.id}: an APC carries host lifetime hooks`);
+            threads.push({
+                id: t.id, handle: t.handle, state: t.state,
+                kernelObject: t.kernelObject ? ref(t.kernelObject, `thread ${t.id} kernel object`) : -1,
+                context: t.context ? { ...t.context } : null,
+                lastFpuState: t.lastFpuState ?? null, lastSimdState: t.lastSimdState ?? null,
+                stackBase: t.stackBase, stackSize: t.stackSize, stackTop: t.stackTop,
+                startAddress: t.startAddress, parameter: t.parameter,
+                waitInfo: t.waitInfo ? { ...t.waitInfo } : null,
+                exitCode: t.exitCode, tlsValues: [...t.tlsValues], lastError: t.lastError,
+                suspendCount: t.suspendCount, priority: t.priority, backgroundMode: t.backgroundMode ?? false,
+                tebAddress: t.tebAddress, kernelPinCount: t.kernelPinCount,
+                apcQueue: t.apcQueue.map(a => ({ routine: a.routine, arg0: a.arg0, arg1: a.arg1, arg2: a.arg2, arg3: a.arg3 ?? null, kind: a.kind })),
+                quitPosted: t.quitPosted, quitExitCode: t.quitExitCode, asyncParkGeneration: t.asyncParkGeneration,
+            } satisfies SavedThread);
+        }
+        return {
+            threads,
+            currentThreadId: this.currentThreadId,
+            nextThreadId: this.nextThreadId,
+            mainThreadId: this.mainThreadId,
+            runQueue: [...this.runQueue],
+            bootstrapUntilFirstWait: [...this.bootstrapUntilFirstWait],
+            tlsSlots: [...this.tlsSlots],
+            nextTlsIndex: this.nextTlsIndex,
+            criticalSectionOwners: [...this.criticalSectionOwners],
+            csLockSemaphores: [...this.csLockSemaphores],
+            stackPool: [...this.stackPool].map(([size, bases]) => [size, [...bases]]),
+            stackBytesPooled: this.stackBytesPooled,
+            stackBytesReserved: this.stackBytesReserved,
+            ownedStackBases: [...this.ownedStackBases],
+            mainStack: [this.mainStackBase, this.mainStackTop, this.imageStackReserve],
+            threadExitStubAddr: this.threadExitStubAddr,
+            apcDispatchStub: this.apcDispatchStub,
+            apcDispatchGeneration: this.apcDispatchGeneration,
+            alertedWaitResults: [...this.alertedWaitResults],
+            reapQueue: this.reapQueue.slice(this.reapHead).map(r => r.threadId),
+            reapRetryQueue: [...this.reapRetryQueue],
+            teb: this.tebManager.captureState(),
+            sync: this.syncObjects.captureState(),
+        };
+    }
+
+    restoreState(state: SchedulerState, object: (ref: number) => unknown): void {
+        this.threads.clear();
+        this.stackSpanIndex = null;
+        this.waitEngine.reset();
+        const insn = this.readInsnCounterForRestore();
+        for (const saved of state.threads) {
+            const t: Thread = {
+                kernelObject: saved.kernelObject >= 0 ? object(saved.kernelObject) as KernelThreadObject : undefined,
+                id: saved.id, handle: saved.handle, state: saved.state,
+                context: saved.context ? { ...saved.context } : null,
+                lastFpuState: saved.lastFpuState ?? undefined, lastSimdState: saved.lastSimdState ?? undefined,
+                stackBase: saved.stackBase, stackSize: saved.stackSize, stackTop: saved.stackTop,
+                startAddress: saved.startAddress, parameter: saved.parameter,
+                waitInfo: saved.waitInfo ? { ...saved.waitInfo } : null,
+                exitCode: saved.exitCode, tlsValues: new Map(saved.tlsValues.map(([k, v]) => [k, v])),
+                lastError: saved.lastError, suspendCount: saved.suspendCount, priority: saved.priority,
+                backgroundMode: saved.backgroundMode || undefined,
+                lastSwitchTime: performance.now(), lastSwitchInsn: insn,
+                tebAddress: saved.tebAddress, kernelPinCount: saved.kernelPinCount,
+                apcQueue: saved.apcQueue.map(a => ({ routine: a.routine, arg0: a.arg0, arg1: a.arg1, arg2: a.arg2, arg3: a.arg3 ?? undefined, kind: a.kind })),
+                quitPosted: saved.quitPosted, quitExitCode: saved.quitExitCode, asyncParkGeneration: saved.asyncParkGeneration,
+            };
+            this.threads.set(t.id, t);
+        }
+        this.currentThreadId = state.currentThreadId;
+        this.nextThreadId = state.nextThreadId;
+        this.mainThreadId = state.mainThreadId;
+        this.runQueue = [...state.runQueue];
+        this.bootstrapUntilFirstWait = new Set(state.bootstrapUntilFirstWait);
+        this.tlsSlots = new Set(state.tlsSlots);
+        this.nextTlsIndex = state.nextTlsIndex;
+        this.criticalSectionOwners = new Map(state.criticalSectionOwners.map(([a, t]) => [a, t]));
+        this.csLockSemaphores = new Map(state.csLockSemaphores.map(([a, h]) => [a, h]));
+        this.stackPool = new Map(state.stackPool.map(([size, bases]) => [size, [...bases]]));
+        this.stackBytesPooled = state.stackBytesPooled;
+        this.stackBytesReserved = state.stackBytesReserved;
+        this.ownedStackBases = new Set(state.ownedStackBases);
+        [this.mainStackBase, this.mainStackTop, this.imageStackReserve] = state.mainStack;
+        this.threadExitStubAddr = state.threadExitStubAddr;
+        this.apcDispatchStub = state.apcDispatchStub;
+        this.apcDispatchGeneration = state.apcDispatchGeneration;
+        this.alertedWaitResults.clear();
+        for (const [t, r] of state.alertedWaitResults) this.alertedWaitResults.set(t, r);
+        this.reapQueue = state.reapQueue.map(threadId => ({ threadId }));
+        this.reapHead = 0;
+        this.reapRetryQueue = [...state.reapRetryQueue];
+        this.tebManager.restoreState(state.teb);
+        this.syncObjects.restoreState(state.sync);
+        this.fpuLiveOwnerThreadId = null;
+        this.switchRequested = false;
+        for (const t of this.threads.values()) {
+            if (t.state === ThreadState.WAITING && t.waitInfo) this.waitEngine.registerWait(t);
+        }
+    }
+
+    private readInsnCounterForRestore(): number {
+        const counter = (this.process?.v86 as { cpu?: { instruction_counter?: Int32Array }; v86?: { cpu?: { instruction_counter?: Int32Array } } } | undefined);
+        const c = counter?.cpu?.instruction_counter ?? counter?.v86?.cpu?.instruction_counter;
+        return c ? c[0] >>> 0 : 0;
+    }
+
     reset(): void {
         for (const thread of this.threads.values()) {
             this.discardThreadApcs(thread);
@@ -757,6 +920,7 @@ export class Scheduler {
         this.unhandledFaultFired = false;
         this.tlsSlots.clear();
         this.nextTlsIndex = 0;
+        hypercallDataManager.clearTlsSlotsAllocated();
         this.switchRequested = false;
         this.bootstrapUntilFirstWait.clear();
         this.idleAnchorWallMs = 0;
@@ -1930,14 +2094,21 @@ export class Scheduler {
         // A surviving thread parked on the dead thread's stack must keep it. The RUNNING
         // thread's ESP is in the register file, not in its saved context (which is stale
         // while it runs), so it is read live rather than from the loop below.
-        const liveEsp = cpu ? readEsp(cpu) : 0;
-        if (liveEsp >= base && liveEsp < top) { s.heldForeignEsp++; return false; }
-        for (const other of this.threads.values()) {
-            if (other.id === thread.id || other.state === ThreadState.TERMINATED) continue;
-            const esp = (other.context?.esp ?? 0) >>> 0;
-            if (esp >= base && esp < top) { s.heldForeignEsp++; return false; }
-        }
+        if (this.espInStackSpan(base, top, thread.id)) { s.heldForeignEsp++; return false; }
         return true;
+    }
+
+    /** Does the live ESP, or the saved ESP of any other live thread, point into [base, top)? */
+    private espInStackSpan(base: number, top: number, exceptThreadId: number): boolean {
+        const cpu = this.getCpu();
+        const liveEsp = cpu ? readEsp(cpu) : 0;
+        if (liveEsp >= base && liveEsp < top) return true;
+        for (const other of this.threads.values()) {
+            if (other.id === exceptThreadId || other.state === ThreadState.TERMINATED) continue;
+            const esp = (other.context?.esp ?? 0) >>> 0;
+            if (esp >= base && esp < top) return true;
+        }
+        return false;
     }
 
     /**
@@ -1951,7 +2122,11 @@ export class Scheduler {
         const base = thread.stackBase >>> 0;
         if (size === 0 || !this.ownedStackBases.has(base)) return;
         if (!this.canReleaseStack(thread)) return;
+        this.returnStackBlock(base, size);
+    }
 
+    /** Pool (or, past the pool ceiling, free) an owned stack whose release gates passed. */
+    private returnStackBlock(base: number, size: number): void {
         this.ownedStackBases.delete(base);
         const allocBase = base - Scheduler.STACK_GUARD;
         const total = size + Scheduler.STACK_GUARD;
@@ -1972,6 +2147,52 @@ export class Scheduler {
         free.push(allocBase);
         this.stackBytesPooled += total;
         this.stackPoolStats.pooled++;
+    }
+
+    /**
+     * A stack of `size` bytes outside any thread record (kernel32 fiber stacks), from the
+     * same guarded pool as thread stacks. Returns its lowest usable byte — the NOACCESS
+     * guard page sits just below — or 0 when the VA is exhausted.
+     */
+    allocateStack(size: number): number {
+        let acquired: { allocBase: number; reused: boolean };
+        try {
+            acquired = this.acquireStack(size);
+        } catch {
+            // A burst of spawns inside one reap-throttle window can pin released-eligible
+            // dead stacks past heap exhaustion; reap now (failure path — no throttle) and
+            // retry once before reporting the guest-visible failure.
+            this.reapTerminatedThreads();
+            try { acquired = this.acquireStack(size); } catch { return 0; }
+        }
+        const stackBase = (acquired.allocBase + Scheduler.STACK_GUARD) >>> 0;
+        // A fresh stack comes from MemoryManager.alloc, which hands out zeroed memory (and
+        // writes only pages something dirtied — guest-page-dirty.ts). Re-zeroing it would
+        // make the whole reserve resident on creation, where Windows commits a stack lazily
+        // behind its guard page. A pooled stack still carries its previous tenant's frames.
+        // Guests run code on their own stacks (the SEH trampoline this dispatcher writes
+        // into the dead zone below ESP is ours), so a recycled stack can still carry v86
+        // blocks compiled from its previous tenant. The zero-fill is a JS write and is
+        // invisible to the JIT — same turn, no await between (see §3.1 coherence).
+        if (acquired.reused) {
+            this.process!.getCurrentMemory().fill(0, stackBase, stackBase + size);
+            invalidateGuestCode(stackBase, size);
+        }
+        return stackBase;
+    }
+
+    /**
+     * Give back a stack from allocateStack. Refused (false, the block stays owned) while
+     * the live ESP or another thread's saved ESP still points into it. The current
+     * thread's saved context is stale while it runs, so only its live ESP counts.
+     */
+    releaseStackBlock(stackBase: number, size: number): boolean {
+        const base = stackBase >>> 0;
+        size >>>= 0;
+        if (size === 0 || !this.ownedStackBases.has(base)) return false;
+        if (this.espInStackSpan(base, base + size, this.currentThreadId ?? -1)) { this.stackPoolStats.heldForeignEsp++; return false; }
+        this.returnStackBlock(base, size);
+        return true;
     }
 
     /** Stack footprint + lifecycle ledger (harness `threads` state, CreateThread failures).
@@ -2003,6 +2224,10 @@ export class Scheduler {
         this.imageStackReserve = Math.max(0, bytes | 0);
     }
 
+    getImageStackReserve(): number {
+        return this.imageStackReserve;
+    }
+
     createThread(
         startAddress: number, parameter: number, stackSize: number,
         creationFlags: number, outThreadId: number, memory: Uint8Array
@@ -2015,43 +2240,17 @@ export class Scheduler {
         // STATUS_STACK_OVERFLOW at the moment it happens. Without one the overflow is
         // silent and lands in whatever the allocator placed underneath — the corruption
         // then detonates in an unrelated subsystem with nothing pointing back here.
-        let stackBase: number;
-        let reusedStack: boolean;
-        try {
-            const acquired = this.acquireStack(size);
-            stackBase = acquired.allocBase + Scheduler.STACK_GUARD;
-            reusedStack = acquired.reused;
-        } catch {
-            // A burst of spawns inside one reap-throttle window can pin released-eligible
-            // dead stacks past heap exhaustion; reap now (failure path — no throttle) and
-            // retry once before reporting the guest-visible failure.
-            this.reapTerminatedThreads();
-            try {
-                const acquired = this.acquireStack(size);
-                stackBase = acquired.allocBase + Scheduler.STACK_GUARD;
-                reusedStack = acquired.reused;
-            } catch (e) {
-                const f = this.getStackFootprint();
-                Logger.error(LogCategory.THREAD,
-                    `CreateThread failed: ${e} (wanted ${size} bytes; dwStackSize=${stackSize}, ` +
-                    `image reserve=${this.imageStackReserve}, ${this.threads.size} thread(s) hold ` +
-                    `${f.liveBytes} of ${f.reservedBytes} bytes of stack, ${f.pooledBytes} idle in ` +
-                    `the stack pool, ${f.heldBytes} leaked by a refused release)`);
-                return 0;
-            }
+        const stackBase = this.allocateStack(size);
+        if (!stackBase) {
+            const f = this.getStackFootprint();
+            Logger.error(LogCategory.THREAD,
+                `CreateThread failed: out of VA (wanted ${size} bytes; dwStackSize=${stackSize}, ` +
+                `image reserve=${this.imageStackReserve}, ${this.threads.size} thread(s) hold ` +
+                `${f.liveBytes} of ${f.reservedBytes} bytes of stack, ${f.pooledBytes} idle in ` +
+                `the stack pool, ${f.heldBytes} leaked by a refused release)`);
+            return 0;
         }
-
         const stackTop = stackBase + size;
-        // A fresh stack comes from MemoryManager.alloc, which hands out zeroed memory (and
-        // writes only pages something dirtied — guest-page-dirty.ts). Re-zeroing it would
-        // make the whole reserve resident on creation, where Windows commits a stack lazily
-        // behind its guard page. A pooled stack still carries its previous tenant's frames.
-        if (reusedStack) memory.fill(0, stackBase, stackTop);
-        // Guests run code on their own stacks (the SEH trampoline this dispatcher writes
-        // into the dead zone below ESP is ours), so a recycled stack can still carry v86
-        // blocks compiled from its previous tenant. The zero-fill above is a JS write and
-        // is invisible to the JIT — same turn, no await between (see §3.1 coherence).
-        if (reusedStack) invalidateGuestCode(stackBase, size);
 
         // Set up stack: [parameter, exitStubAddr]
         const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
@@ -2075,6 +2274,7 @@ export class Scheduler {
         const thread: Thread = {
             id: threadId, handle,
             state: isSuspended ? ThreadState.SUSPENDED : ThreadState.READY,
+            kernelObject: this.resourceProvider.getKernelObject(handle) as KernelThreadObject,
             context,
             stackBase, stackSize: size, stackTop,
             startAddress, parameter,
@@ -2198,10 +2398,11 @@ export class Scheduler {
 
         // Persist exit metadata into the kernel object so GetExitCodeThread /
         // WaitForSingleObject can still work after the Thread record is reaped.
-        const kobj = this.resourceProvider.getKernelObject(thread.handle) as KernelThreadObject | null;
+        const kobj = thread.kernelObject ?? this.resourceProvider.getKernelObject(thread.handle) as KernelThreadObject | null;
         if (kobj && kobj.kind === 'thread') {
             kobj.terminated = true;
             kobj.exitCode = safeExitCode;
+            kobj.basicInformation = { tebAddress: thread.tebAddress, relativePriority: thread.priority };
         }
 
         // Release owned mutexes
@@ -2281,8 +2482,37 @@ export class Scheduler {
         // and the gate walks the live threads for a foreign ESP in this span.
         this.releaseStack(thread);
         if (this.ownedStackBases.has(thread.stackBase >>> 0)) return false;
+        if (!this.releaseTeb(thread)) return false;
         this.threads.delete(threadId);
         this.stackSpanIndex = null;
+        return true;
+    }
+
+    /**
+     * Give a reaped thread's TEB and TLS array back, at the same point and behind the same
+     * gates as its stack (tryReap runs this only once the stack is out): NT frees the TEB at
+     * thread teardown too. Still held (false = retry on a later pass) while FS or the
+     * hypercall page still name this TEB — the guest has not left the context. Kept for
+     * good: the main thread's, and every TEB once the process is exiting, so the exit report
+     * and post-mortem diagnostics read what they always did.
+     * Nothing runs in a dead thread after terminateThread (no DLL_THREAD_DETACH or FLS
+     * callbacks are delivered) and its SEH state keyed by TEB address is cleared there. The
+     * kernel object outlives the record for GetExitCodeThread/waits, which need no TEB; its
+     * ThreadBasicInformation TebBaseAddress becomes 0 here, as NT clears Tcb.Teb when it
+     * deletes the TEB — the freed address may already be another thread's TEB.
+     */
+    private releaseTeb(thread: Thread): boolean {
+        const teb = thread.tebAddress >>> 0;
+        if (teb === 0 || thread.id === this.mainThreadId || System.getInstance().isExiting) return true;
+        const cpu = this.getCpu();
+        const fsBase = cpu ? (cpuViews(cpu).segmentOffsets[4] ?? 0) >>> 0 : 0;
+        if (fsBase === teb || hypercallDataManager.readTebBase() === teb) return false;
+        const memory = this.process?.memory;
+        if (!memory) return true;
+        if (this.tebManager.releaseTeb(thread.id, memory)) {
+            const kobj = thread.kernelObject ?? this.resourceProvider.getKernelObject(thread.handle) as KernelThreadObject | null;
+            if (kobj?.kind === 'thread' && kobj.basicInformation) kobj.basicInformation = { ...kobj.basicInformation, tebAddress: 0 };
+        }
         return true;
     }
 
@@ -2444,6 +2674,15 @@ export class Scheduler {
         const thread = this.threads.get(threadId);
         if (!thread) return null;
         return { posted: thread.quitPosted, exitCode: thread.quitExitCode };
+    }
+
+    /** True when `threadId` (or, with no id, any live thread) has an unconsumed PostQuitMessage. */
+    hasPendingQuit(threadId?: number): boolean {
+        if (threadId !== undefined) return this.threads.get(threadId)?.quitPosted === true;
+        for (const thread of this.threads.values()) {
+            if (thread.quitPosted && thread.state !== ThreadState.TERMINATED) return true;
+        }
+        return false;
     }
 
     /** Clear the quit flag after WM_QUIT has been consumed by GetMessage/PeekMessage. */
@@ -3499,6 +3738,25 @@ export class Scheduler {
         return null;
     }
 
+    /** Native query snapshot; aliases resolve by kernel-object identity, closed handles fail. */
+    getThreadBasicInformation(handle: number): { id: number; tebAddress: number; exitStatus: number; relativePriority: number } | null {
+        const h = handle >>> 0;
+        if (h === 0xfffffffe) {
+            const thread = this.getCurrentThread();
+            return thread ? { id: thread.id, tebAddress: thread.tebAddress,
+                exitStatus: thread.exitCode ?? 259, relativePriority: thread.priority } : null;
+        }
+        const object = this.resourceProvider.getKernelObject(h) as KernelThreadObject | null;
+        if (!object || object.kind !== 'thread') return null;
+        const thread = this.threads.get(object.threadId);
+        if (thread) return { id: thread.id, tebAddress: thread.tebAddress,
+            exitStatus: thread.exitCode ?? 259, relativePriority: thread.priority };
+        if (object.terminated && object.basicInformation && object.exitCode !== undefined) {
+            return { id: object.threadId, ...object.basicInformation, exitStatus: object.exitCode };
+        }
+        return null;
+    }
+
     getAllThreadInfo(): Array<{ id: number; priority: number }> {
         const result: Array<{ id: number; priority: number }> = [];
         for (const t of this.threads.values()) {
@@ -3553,30 +3811,43 @@ export class Scheduler {
     // TLS
     // ═══════════════════════════════════════════════════════════════════════
 
+    /** NT hands out the LOWEST free index (RtlFindClearBitsAndSet over the TLS bitmap): 0..63,
+     *  the WASM-served range, and the expansion range only while all 64 are live. Resuming
+     *  after the last index instead walked an allocator that only churns (TlsAlloc/TlsFree
+     *  pairs) out of that range with one live slot. Every index below TLS_INDEX_LIMIT is held
+     *  by the thread's TEB+0x2C array (teb-manager.ts). nextTlsIndex is no longer consulted;
+     *  it stays in the savestate shape. */
     tlsAlloc(): number {
-        while (this.tlsSlots.has(this.nextTlsIndex)) {
-            this.nextTlsIndex++;
-            if (this.nextTlsIndex >= 64) {
-                this.nextTlsIndex = 0;
-                if (this.tlsSlots.size >= 64) return 0xFFFFFFFF;
-            }
+        for (let index = 0; index < TLS_INDEX_LIMIT; index++) {
+            if (this.tlsSlots.has(index)) continue;
+            this.tlsSlots.add(index);
+            this.nextTlsIndex = index + 1;
+            hypercallDataManager.setTlsSlotAllocated(index, true);
+            return index;
         }
-        const index = this.nextTlsIndex;
-        this.tlsSlots.add(index);
-        this.nextTlsIndex = index + 1;
-        return index;
+        return 0xFFFFFFFF;   // TLS_OUT_OF_INDEXES
     }
 
     tlsFree(index: number): boolean {
         if (!this.tlsSlots.has(index)) return false;
         this.tlsSlots.delete(index);
+        hypercallDataManager.setTlsSlotAllocated(index, false);
         for (const t of this.threads.values()) t.tlsValues.delete(index);
+        this.tebManager.clearTlsSlotAllThreads(index);
         return true;
     }
 
     tlsGetValue(index: number): number {
         const t = this.getCurrentThread();
-        return t ? (t.tlsValues.get(index) ?? 0) : 0;
+        if (!t) return 0;
+        return this.tebManager.readTlsSlot(t.id, index) ?? t.tlsValues.get(index) ?? 0;
+    }
+
+    /** Every slot is stored in the thread's TEB TLS array (shared with the WASM fast paths and
+     *  with guest code indexing fs:[2Ch]); the map only serves a thread that has no array. */
+    private storeTlsValue(threadId: number, thread: Thread, index: number, value: number): void {
+        if (this.tebManager.syncTlsSlot(threadId, index, value)) thread.tlsValues.delete(index);
+        else thread.tlsValues.set(index, value);
     }
 
     tlsIsAllocated(index: number): boolean {
@@ -3586,8 +3857,7 @@ export class Scheduler {
     tlsSetValue(index: number, value: number): boolean {
         const t = this.getCurrentThread();
         if (!t || !this.tlsSlots.has(index)) return false;
-        t.tlsValues.set(index, value >>> 0);
-        this.tebManager.syncTlsSlot(t.id, index, value >>> 0);
+        this.storeTlsValue(t.id, t, index, value >>> 0);
         return true;
     }
 
@@ -3615,9 +3885,7 @@ export class Scheduler {
             memory.fill(0, tlsDataAddr + entry.templateSize, tlsDataAddr + totalSize);
         }
 
-        // Store in thread's TLS values and sync to guest memory
-        thread.tlsValues.set(entry.tlsIndex, tlsDataAddr >>> 0);
-        this.tebManager.syncTlsSlot(threadId, entry.tlsIndex, tlsDataAddr >>> 0);
+        this.storeTlsValue(threadId, thread, entry.tlsIndex, tlsDataAddr >>> 0);
 
         Logger.log(LogCategory.THREAD,
             `  TLS slot ${entry.tlsIndex} (${entry.moduleName}): data=0x${tlsDataAddr.toString(16)} ` +
@@ -3639,7 +3907,9 @@ export class Scheduler {
         const memory = System.getInstance().process?.getCurrentMemory?.();
         if (!memManager || !memory) return;
         for (const [threadId, thread] of this.threads) {
-            if (thread.tlsValues.has(entry.tlsIndex)) continue;
+            // A materialized block is never at 0, so a nonzero array slot means "already has it".
+            const held = this.tebManager.readTlsSlot(threadId, entry.tlsIndex);
+            if (held !== undefined ? held !== 0 : thread.tlsValues.has(entry.tlsIndex)) continue;
             this.materializeTlsEntry(threadId, thread, entry, memory, memManager);
         }
     }
@@ -4355,7 +4625,8 @@ export class Scheduler {
         }
 
         const now = this.timeService.nowMs();
-        // Telemetry: count WINMM timers fired by a wall-paced idle pump.
+        // Telemetry: count timeSetEvent timers (TimerKind.WINMM_TIMER only; joystick and waveOut
+        // polls have their own kinds) fired by a wall-paced idle pump.
         const winmmFiredBefore = this.timerWheel.firedByKind[TimerKind.WINMM_TIMER];
         this.timerWheel.poll(now);
         if (pumpedIdle) {
@@ -4565,6 +4836,10 @@ export class Scheduler {
         else Logger.error(LogCategory.THREAD, message);
     }
 
+    lazyFpuOwnerThreadId(): number | null {
+        return this.fpuLiveOwnerThreadId;
+    }
+
     getAsyncParkGeneration(threadId: number): number {
         return (this.threads.get(threadId)?.asyncParkGeneration ?? 0) >>> 0;
     }
@@ -4696,14 +4971,7 @@ export class Scheduler {
         // Create timeout timer if needed
         let timerId = 0;
         if (timeoutMs !== null) {
-            const tid = thread.id;
-            timerId = this.timerWheel.add(timeoutMs, false, TimerKind.SLEEP_TIMEOUT, () => {
-                const t = this.threads.get(tid);
-                if (t && t.state === ThreadState.WAITING) {
-                    const wakeResult = t.waitInfo?.reason === WaitReason.SLEEP ? 0 : WAIT_TIMEOUT;
-                    this.wakeThread(t, wakeResult);
-                }
-            }, this.timeService.nowMs());
+            timerId = this.timerWheel.add(timeoutMs, false, TimerKind.SLEEP_TIMEOUT, thread.id, this.timeService.nowMs());
         }
 
         const waitInfo: WaitInfo = {
@@ -4739,6 +5007,14 @@ export class Scheduler {
                 this.syncObjects.consumeWait(recheck, thread.id);
                 this.wakeThread(thread, recheck.result);
             }
+        }
+    }
+
+    private onWaitTimeout(tid: number): void {
+        const t = this.threads.get(tid);
+        if (t && t.state === ThreadState.WAITING) {
+            const wakeResult = t.waitInfo?.reason === WaitReason.SLEEP ? 0 : WAIT_TIMEOUT;
+            this.wakeThread(t, wakeResult);
         }
     }
 
@@ -4813,7 +5089,7 @@ export class Scheduler {
 
         const onWake = thread.waitInfo?.onWake;
         if (onWake) {
-            const done = onWake(result);
+            const done = completeWait(onWake, result);
             result = done.value;
             if (done.lastError !== undefined) this.setThreadLastError(thread, done.lastError);
         }
@@ -5273,6 +5549,7 @@ export class Scheduler {
         const thread: Thread = {
             id: threadId, handle,
             state: ThreadState.RUNNING,
+            kernelObject: this.resourceProvider.getKernelObject(handle) as KernelThreadObject,
             context: null,
             stackBase, stackSize, stackTop,
             startAddress: readEip(cpu),
@@ -5315,6 +5592,12 @@ export class Scheduler {
     private getCpu(): V86Cpu | null {
         if (!this.process) return null;
         return this.process.v86?.cpu || this.process.v86?.v86?.cpu;
+    }
+
+    /** Guest address that ends the calling thread with EAX as exit code (a start routine's return address). */
+    getThreadExitStubAddress(): number {
+        this.writeThreadExitStub();
+        return this.threadExitStubAddr >>> 0;
     }
 
     private writeThreadExitStub(): void {

@@ -26,7 +26,6 @@ describe("crt-vc9-io", () => {
             fseek: () => 0,
             ftell: () => 42,
             filelength: () => 100,
-            fileStreams: new Map(),
             malloc: (n) => {
                 const p = 0x2000;
                 return p + n;
@@ -41,6 +40,13 @@ describe("crt-vc9-io", () => {
             },
         };
         registerVc9IoExports(exports, host);
+    });
+
+    test("does not register fscanf over msvcrt's streaming one", () => {
+        // msvcrt.ts installs this table after its own exports, so any fscanf here replaces
+        // the real one. The old entry scanned an empty string: every fscanf consumed nothing
+        // and The Longest Journey's speech headers parsed as garbage (no voice-over).
+        expect(exports["fscanf"]).toBeUndefined();
     });
 
     test("asctime formats struct tm", () => {

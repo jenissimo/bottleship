@@ -17,7 +17,9 @@ const DEVICE_NOTIFY_WINDOW_HANDLE = 0x0;
 const DEVICE_NOTIFY_SERVICE_HANDLE = 0x1;
 const GUID_SIZE = 16;
 
+// @participant(user32)
 const registrations = new Set<number>();
+// @participant(user32)
 let nextHandle = 0x00023000;
 
 export function resetPowerNotifications(): void {
@@ -65,4 +67,16 @@ export function createPowerNotifyExports(): Record<string, ThunkImplementation> 
     };
 
     return exports;
+}
+
+export interface PowerNotifyState { registrations: number[]; nextHandle: number }
+
+export function capturePowerNotifications(): PowerNotifyState {
+    return { registrations: [...registrations], nextHandle };
+}
+
+export function restorePowerNotifications(s: PowerNotifyState): void {
+    registrations.clear();
+    for (const h of s.registrations) registrations.add(h);
+    nextHandle = s.nextHandle;
 }

@@ -103,6 +103,10 @@ const captureActiveLeaseSnapshot = (
     leaseId: number
 ): void => {
     clearActiveLeaseSnapshot(state);
+    if (isRenderSurface(state)) {
+        const prior = state.dirtyRegion;
+        state.leasePriorDirtyRegion = prior ? { left: prior.left, top: prior.top, right: prior.right, bottom: prior.bottom } : undefined;
+    }
     const lease = leaseRegistry.validateLease(leaseId);
     if (!lease || lease.perms === "r") return;
     mem = toPlainGuestMemory(mem);
@@ -206,7 +210,12 @@ const consumeActiveLeaseWriteState = (
         const box = dirtyBoxFromLeaseDiff(mem, base, snapshot, pitch, bpp, state.width, state.height);
         lockCostProfiler.add(LP.udirty, lcDirty, LC.write);
         if (box) {
-            state.dirtyRegion = box;
+            // Earlier writes may still await upload when presents are coalesced: keep them.
+            const prior = state.leasePriorDirtyRegion;
+            state.dirtyRegion = prior ? {
+                left: Math.min(prior.left, box.left), top: Math.min(prior.top, box.top),
+                right: Math.max(prior.right, box.right), bottom: Math.max(prior.bottom, box.bottom),
+            } : box;
         }
     }
     clearActiveLeaseSnapshot(state);
@@ -310,11 +319,15 @@ function resolveGetAttachedSurfaceTarget(
 export const createSurfaceExports = (context: DDrawContext): Record<string, ThunkImplementation> => {
     const exports: Record<string, ThunkImplementation> = {};
     // Diagnostic counters for texture interface creation (per surface)
+    // @transient(diagnostics)
     const textureQueryCounts: Map<number, number> = new Map();
+    // @transient(diagnostics)
     let texture2CreateCount = 0;
+    // @transient(diagnostics)
     let textureCreateCount = 0;
 
     // Performance: Cache memory regions to avoid repeated lookups in Lock/Unlock hot paths
+    // @transient(cache of memory regions)
     let cachedRegions: any = null;
     const getRegions = () => {
         if (!cachedRegions) {
@@ -1819,8 +1832,8 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     if (!isTexture) {
                         state.everLocked = true;
                     }
-                    // Lock may have marked a full dirtyRegion; no guest writes → drop it.
-                    state.dirtyRegion = undefined;
+                    // Lock may have marked a full dirtyRegion; no guest writes → back to what was pending.
+                    state.dirtyRegion = state.leasePriorDirtyRegion;
                 }
                 Logger.verbose(LogCategory.DDRAW,
                     `Unlock: writable lock unchanged - preserving GPU sync state for 0x${thisPtr.toString(16)}`);
@@ -2212,6 +2225,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
     };
 
     // Reserve a surface while its readback suspends the caller. Only publish a seeded DC.
+    // @transient(non-empty only while a GetDC readback suspends its caller, which the safe point excludes)
     const pendingSurfaceDCs = new WeakSet<DirectDrawSurfaceState>();
     exports["IDirectDrawSurface7_GetDC"] = (ctx, mem, args) => {
         const thisPtr = args[0];

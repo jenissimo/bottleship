@@ -9,7 +9,10 @@ import { isValidAddress } from "../core/memory/address-guard";
 import { System } from "../core/system";
 import {
     stackWalk32, stackWalk64, symGetModuleBase32, symGetModuleBase64,
+    captureStackWalks, restoreStackWalks, resetStackWalks, type StackWalkRow,
 } from "./dbghelp-stackwalk";
+import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
+import type { SaveValue } from "../savestate/value-codec";
 
 const MAX_PATH = 260;
 const ERROR_FILE_NOT_FOUND = 2;
@@ -199,11 +202,47 @@ export function createDbgHelpExports(): Record<string, ThunkImplementation> {
         return exports;
 }
 
+export const DBGHELP_FIELDS = {
+    name: 'transient', exports: 'host',
+} as const satisfies Record<string, FieldPolicy>;
+
+export interface DbgHelpState {
+    stackWalks: StackWalkRow[];
+}
+
+export const DBGHELP_SCHEMA = {
+    module: DBGHELP_FIELDS,
+    stackWalkRow: ['framePtr', 'index', 'lastPc', ['pc', 'ret', 'frame', 'stack']],
+    state: stateKeys<DbgHelpState>({ stackWalks: true }),
+};
+
 export class DbgHelp implements IModule {
     name = "dbghelp";
     exports: Record<string, ThunkImplementation> = createDbgHelpExports();
 
-    initialize(_process: Process): void {}
+    captureSavestate(): DbgHelpState {
+        return { stackWalks: captureStackWalks() };
+    }
+
+    restoreSavestate(s: DbgHelpState): void {
+        restoreStackWalks(s.stackWalks);
+    }
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'dbghelp', version: 1, order: 79, covers: ['dbghelp'], schema: DBGHELP_SCHEMA as unknown as SaveValue,
+            capture: () => this.captureSavestate() as unknown as SaveValue,
+            restore: (saved) => this.restoreSavestate(saved as unknown as DbgHelpState),
+        });
+    }
+
+    initialize(_process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
+    }
+
+    reset(): void {
+        resetStackWalks();
+    }
 
     constructor(_process?: Process) {}
 }

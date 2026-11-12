@@ -8,11 +8,13 @@ import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
 import { TimeService } from '../../runtime/time';
 import {
-    INFINITE, TimerKind, WAIT_BLOCKED_NO_SWITCH, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    INFINITE, TimerKind, WAIT_BLOCKED_NO_SWITCH, WAIT_OBJECT_0, WAIT_TIMEOUT, WaitCompletionKind,
 } from '../../core/scheduler/types';
 import { resolveHleExportAddress } from '../../core/thunking/export-resolver';
 import { resetSrwLock } from './srw-lock';
-import { exports as moduleExports } from './module/module';
+import { freeLibraryWithoutDetach } from './module/module';
+import { setTimerHandler, TIMER_PHASE_DUE, TIMER_PHASE_EVERY } from '../../core/scheduler/timer-wheel';
+import { setWaitCompletionHandler } from '../../core/scheduler/wait-completion';
 
 const ERROR_INVALID_PARAMETER = 87;
 const ERROR_GEN_FAILURE = 31;
@@ -82,10 +84,16 @@ function onceComplete(once: number, flags: number, context: number): number {
 }
 
 /** INIT_ONCE address -> the event its waiters park on while another thread initializes. */
+// @participant(kernel32)
 const onceWaitEvents = new Map<number, number>();
 
 const callerRegs = (ctx: X86Context) =>
     ({ ecx: ctx.ecx, edx: ctx.edx, ebx: ctx.ebx, ebp: ctx.ebp, esi: ctx.esi, edi: ctx.edi, eflags: ctx.eflags });
+
+setWaitCompletionHandler(WaitCompletionKind.RERUN_FROM_STUB, ({ a: esp, b: returnAddr }) => {
+    Mem.writeUint32(esp, returnAddr);
+    return { value: 0 };
+});
 
 /**
  * Park the caller until the INIT_ONCE's initializer completes, then run the same call again
@@ -108,10 +116,7 @@ function parkUntilOnceCompletes(ctx: X86Context, once: number, exportName: strin
     }
     const result = sched.waitForObjectsWithContext(
         [evt], false, INFINITE, stub, esp, callerRegs(ctx), false,
-        () => {
-            Mem.writeUint32(esp, returnAddr);
-            return { value: 0 };
-        },
+        { kind: WaitCompletionKind.RERUN_FROM_STUB, a: esp, b: returnAddr, c: 0 },
     );
     return result === WAIT_BLOCKED_NO_SWITCH ? { value: 0, blockedNoSwitch: true, stackCleanup: cleanup } : null;
 }
@@ -138,19 +143,28 @@ interface TpTracked {
 
 interface TpTimer extends TpTracked {
     wheelId: number | null;
+    periodMs: number;
 }
 
 interface TpWait extends TpTracked {
     pollId: number | null;
+    object: number;
+    deadline: number;
 }
 
 type TpWork = TpTracked;
 
+// @refuse(thread-pool objects are not part of a v1 savestate)
 const tpTimers = new Map<number, TpTimer>();
+// @refuse(thread-pool objects are not part of a v1 savestate)
 const tpWaits = new Map<number, TpWait>();
+// @refuse(thread-pool objects are not part of a v1 savestate)
 const tpWork = new Map<number, TpWork>();
+// @refuse(thread-pool objects are not part of a v1 savestate)
 const tpInstances = new Map<number, TpInstance>();
+// @participant(kernel32)
 let nextTpHandle = 0x00080000;
+// @participant(kernel32)
 let nextTpInstance = 0x000C0000;
 
 /** How often a thread-pool wait re-checks its object, in virtual milliseconds. */
@@ -174,7 +188,7 @@ function endInstance(id: number): void {
     const inst = tpInstances.get(id);
     tpInstances.delete(id);
     if (inst?.freeLibrary) {
-        moduleExports['FreeLibrary']({} as X86Context, Mem.getView() ?? new Uint8Array(0), [inst.freeLibrary]);
+        freeLibraryWithoutDetach(inst.freeLibrary);
     }
 }
 
@@ -254,6 +268,38 @@ function fileTimeToDelayMs(pft: number): number {
     return signed > nowFt ? Number((signed - nowFt) / 10000n) : 0;
 }
 
+setTimerHandler(TimerKind.THREADPOOL_TIMER, (handle, phase) => {
+    const timer = tpTimers.get(handle);
+    if (!timer) return;
+    // PTP_TIMER_CALLBACK(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_TIMER Timer).
+    if (timer.callback) postPoolCallback(timer, handle, []);
+    if (phase === TIMER_PHASE_DUE) {
+        timer.wheelId = System.getInstance().scheduler.timerWheel.add(
+            Math.max(1, timer.periodMs), true, TimerKind.THREADPOOL_TIMER, handle,
+            TimeService.getInstance().nowMs(), TIMER_PHASE_EVERY);
+    }
+});
+
+setTimerHandler(TimerKind.THREADPOOL_WAIT, (handle, _arg, wheelId) => {
+    const entry = tpWaits.get(handle);
+    if (entry && entry.pollId === wheelId) checkPoolWait(handle, entry);
+});
+
+function checkPoolWait(handle: number, entry: TpWait): boolean {
+    const sched = System.getInstance().scheduler;
+    const winmm = System.getInstance().process?.getModule('winmm') as { timerThreadId?: number } | undefined;
+    // The wait is satisfied on behalf of the pool thread that will run the callback.
+    const signalled = sched.tryConsumeWait(entry.object, winmm?.timerThreadId ?? 0);
+    if (signalled === null) return true;
+    if (signalled || TimeService.getInstance().nowMs() >= entry.deadline) {
+        stopWaitPoll(entry);
+        // PTP_WAIT_CALLBACK(Instance, Context, Wait, WaitResult)
+        postPoolCallback(entry, handle, [signalled ? WAIT_OBJECT_0 : WAIT_TIMEOUT]);
+        return true;
+    }
+    return false;
+}
+
 function stopWaitPoll(entry: TpWait): void {
     if (entry.pollId !== null) {
         System.getInstance().scheduler.timerWheel.cancel(entry.pollId);
@@ -267,6 +313,20 @@ export function resetVistaRuntimeState(): void {
     tpWaits.clear();
     tpWork.clear();
     tpInstances.clear();
+}
+
+export function captureVistaRuntimeState(): { onceWaits: Array<[number, number]>; nextTpHandle: number; nextTpInstance: number } {
+    if (tpTimers.size + tpWaits.size + tpWork.size + tpInstances.size > 0) {
+        throw new Error('kernel32: thread-pool objects are not part of a v1 savestate');
+    }
+    return { onceWaits: [...onceWaitEvents], nextTpHandle, nextTpInstance };
+}
+
+export function restoreVistaRuntimeState(state: { onceWaits: Array<[number, number]>; nextTpHandle: number; nextTpInstance: number }): void {
+    resetVistaRuntimeState();
+    for (const [once, evt] of state.onceWaits) onceWaitEvents.set(once, evt);
+    nextTpHandle = state.nextTpHandle;
+    nextTpInstance = state.nextTpInstance;
 }
 
 function initVistaRuntime(): Record<string, ThunkImplementation> {
@@ -422,7 +482,7 @@ function initVistaRuntime(): Record<string, ThunkImplementation> {
 
     exports['CreateThreadpoolTimer'] = (_ctx, _mem, args) => {
         const handle = nextTpHandle++;
-        tpTimers.set(handle, { ...newTracked(args[0] >>> 0, args[1] >>> 0), wheelId: null });
+        tpTimers.set(handle, { ...newTracked(args[0] >>> 0, args[1] >>> 0), wheelId: null, periodMs: 0 });
         System.getInstance().scheduler.ensureTimerPumpThread();
         return handle;
     };
@@ -444,25 +504,12 @@ function initVistaRuntime(): Record<string, ThunkImplementation> {
         if (!pftDueTime) return 0;
 
         const dueMs = fileTimeToDelayMs(pftDueTime);
-        const fire = () => {
-            const timer = tpTimers.get(handle);
-            if (!timer || !timer.callback) return;
-            // PTP_TIMER_CALLBACK(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_TIMER Timer).
-            postPoolCallback(timer, handle, []);
-        };
-        const arm = (delayMs: number, periodic: boolean, onFire: () => void) => wheel.add(
-            Math.max(1, delayMs), periodic, TimerKind.WAITABLE_TIMER, onFire, TimeService.getInstance().nowMs());
-
-        if (msPeriod > 0 && dueMs !== msPeriod) {
-            // First expiry at the due time, then every period.
-            entry.wheelId = arm(dueMs, false, () => {
-                fire();
-                const timer = tpTimers.get(handle);
-                if (timer) timer.wheelId = arm(msPeriod, true, fire);
-            });
-        } else {
-            entry.wheelId = arm(dueMs, msPeriod > 0, fire);
-        }
+        entry.periodMs = msPeriod;
+        // First expiry at the due time, then every period.
+        const phase = msPeriod > 0 && dueMs !== msPeriod ? TIMER_PHASE_DUE : TIMER_PHASE_EVERY;
+        entry.wheelId = wheel.add(
+            Math.max(1, dueMs), phase === TIMER_PHASE_EVERY && msPeriod > 0, TimerKind.THREADPOOL_TIMER, handle,
+            TimeService.getInstance().nowMs(), phase);
         return 0;
     };
 
@@ -482,7 +529,7 @@ function initVistaRuntime(): Record<string, ThunkImplementation> {
 
     exports['CreateThreadpoolWait'] = (_ctx, _mem, args) => {
         const handle = nextTpHandle++;
-        tpWaits.set(handle, { ...newTracked(args[0] >>> 0, args[1] >>> 0), pollId: null });
+        tpWaits.set(handle, { ...newTracked(args[0] >>> 0, args[1] >>> 0), pollId: null, object: 0, deadline: Infinity });
         System.getInstance().scheduler.ensureTimerPumpThread();
         return handle;
     };
@@ -499,28 +546,12 @@ function initVistaRuntime(): Record<string, ThunkImplementation> {
         stopWaitPoll(entry);
         if (!hObject) return 0;
 
-        const sched = System.getInstance().scheduler;
         const time = TimeService.getInstance();
-        const deadline = pftTimeout ? time.nowMs() + fileTimeToDelayMs(pftTimeout) : Infinity;
-        const winmm = System.getInstance().process?.getModule('winmm') as { timerThreadId?: number } | undefined;
-
-        const check = (): boolean => {
-            const current = tpWaits.get(handle);
-            if (current !== entry) return true;
-            // The wait is satisfied on behalf of the pool thread that will run the callback.
-            const signalled = sched.tryConsumeWait(hObject, winmm?.timerThreadId ?? 0);
-            if (signalled === null) return true;
-            if (signalled || time.nowMs() >= deadline) {
-                stopWaitPoll(entry);
-                // PTP_WAIT_CALLBACK(Instance, Context, Wait, WaitResult)
-                postPoolCallback(entry, handle, [signalled ? WAIT_OBJECT_0 : WAIT_TIMEOUT]);
-                return true;
-            }
-            return false;
-        };
-        if (!check()) {
-            entry.pollId = sched.timerWheel.add(
-                TP_WAIT_POLL_MS, true, TimerKind.WAITABLE_TIMER, () => { check(); }, time.nowMs());
+        entry.object = hObject;
+        entry.deadline = pftTimeout ? time.nowMs() + fileTimeToDelayMs(pftTimeout) : Infinity;
+        if (!checkPoolWait(handle, entry)) {
+            entry.pollId = System.getInstance().scheduler.timerWheel.add(
+                TP_WAIT_POLL_MS, true, TimerKind.THREADPOOL_WAIT, handle, time.nowMs());
         }
         return 0;
     };

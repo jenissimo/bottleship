@@ -16,12 +16,14 @@
  */
 
 /** Live binding — importers see arm/disarm without re-importing. */
+// @transient(diagnostic trace)
 export let paintTraceEnabled = false;
 
 /** Paint-family messages; anything else is only recorded under an explicit hwnd filter. */
 const WM_PAINT = 0x000F;
 const WM_ERASEBKGND = 0x0014;
 const WM_NCPAINT = 0x0085;
+// @transient(constant message set)
 const PAINT_MESSAGES = new Set([WM_PAINT, WM_ERASEBKGND, WM_NCPAINT]);
 
 const MAX_ENTRIES = 2048;
@@ -37,9 +39,12 @@ export interface PaintTraceEntry {
     detail: string;
 }
 
+// @transient(diagnostic trace)
 let ring: PaintTraceEntry[] = [];
+// @transient(diagnostic trace)
 let hwndFilter: Set<number> | null = null;
 /** Entries dropped by the cap — a truncated ring must say so, not look complete. */
+// @transient(diagnostic trace)
 let dropped = 0;
 
 export function armPaintTrace(on: boolean, hwnds?: number[]): void {

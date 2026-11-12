@@ -29,6 +29,15 @@ describe("EmulatorConfig manifest display modes", () => {
         expect(cfg.supportedResolutions.some((m) => m.width === 640 && m.height === 480 && m.bpp === 16)).toBe(true);
     });
 
+    test("default modes offer every 16bpp size at 8bpp too", () => {
+        const modes = EmulatorConfig.getInstance().supportedResolutions;
+        const has = (w: number, h: number, bpp: number) =>
+            modes.some((m) => m.width === w && m.height === h && m.bpp === bpp);
+        for (const m of modes.filter((m) => m.bpp === 16)) {
+            expect(has(m.width, m.height, 8)).toBe(true);
+        }
+    });
+
     test("explicit supportedResolutions keeps author-listed depths", () => {
         const cfg = EmulatorConfig.getInstance();
         cfg.applyFromManifest(

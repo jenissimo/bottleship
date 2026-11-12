@@ -74,8 +74,10 @@ import { clearDepthForZSurface, fillZSurfaceMemory, isZBufferSurface } from "./d
 import { collectFlipChain, findFlipBlockingLease, flipStorageCompatible, rotateFlipChain } from "./flip-chain";
 
 // Module-level rect pool to reduce allocations in hot paths
+// @transient(host allocation pool)
 const rectPool = new RectPool(8);
 
+// @transient(diagnostics)
 const missingFormatWarnedSurfacePtrs = new Set<number>();
 
 /**
@@ -157,7 +159,7 @@ export function fillSurfaceRectCpu(
  * @param targetFormat - GPU texture format to use (should match destination for copyTextureToTexture)
  * @returns true if surface now has a valid GPU texture
  */
-function ensureGpuTextureForBlt(
+export function ensureGpuTextureForBlt(
     state: DirectDrawSurfaceState,
     context: DDrawContext,
     mem: Uint8Array,
@@ -551,7 +553,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                     context.gdiSurfaceVisible = false;
                     Logger.verbose(LogCategory.DDRAW,
                         `Flip: calling present dst=0x${dstState.surfacePtr.toString(16)} gpuDirty=${(dstState as any).gpuDirty} gpuTexView=${!!dstState.gpuTextureView}`);
-                    void context.presenter.present(dstState, mem, { throttle: true, frameAlreadyMarked: true });
+                    void context.presenter.present(dstState, mem, { throttle: true, frameAlreadyMarked: true, flip: true });
                 } else {
                     Logger.warn(LogCategory.DDRAW, `Flip: suppressPresent=true, skipping present!`);
                 }

@@ -17,6 +17,8 @@ export interface InstallComVtableOptions {
     methods: ComVtableMethod[];
     handlers: Record<string, ThunkImplementation>;
     logLabel?: string;
+    /** Bind to a vtable that already exists in guest memory (a restored session) instead of allocating one; its slots are checked, not written. */
+    existingVtableAddr?: number;
 }
 
 export interface InstalledComVtable {
@@ -29,7 +31,7 @@ export interface InstalledComVtable {
  * Install COM interface stubs in THUNK_CODE and vtable pointer array in THUNK_DATA.
  */
 export function installComVtable(process: Process, options: InstallComVtableOptions): InstalledComVtable | null {
-    const { moduleName, methods, handlers, logLabel = moduleName } = options;
+    const { moduleName, methods, handlers, logLabel = moduleName, existingVtableAddr } = options;
     const tg = process.thunkGenerator;
 
     process.dispatcher.registerModule(moduleName, handlers);
@@ -71,7 +73,7 @@ export function installComVtable(process: Process, options: InstallComVtableOpti
         writeGuestCode(mem, stubDll.stubCode, stubBase);
     }
 
-    const vtableAddr = process.memory.alloc(methods.length * 4, "THUNK_DATA", "rw");
+    const vtableAddr = existingVtableAddr ? existingVtableAddr >>> 0 : process.memory.alloc(methods.length * 4, "THUNK_DATA", "rw");
     mem = process.getCurrentMemory();
 
     for (let i = 0; i < methods.length; i++) {
@@ -81,7 +83,15 @@ export function installComVtable(process: Process, options: InstallComVtableOpti
             Logger.error(LogCategory.COM, `${logLabel}: missing stub export ${methods[i].name}`);
             return null;
         }
-        Mem.writeUint32(vtableAddr + i * 4, stubAddr);
+        if (!existingVtableAddr) {
+            Mem.writeUint32(vtableAddr + i * 4, stubAddr);
+        } else if (Mem.readUint32(vtableAddr + i * 4) !== stubAddr) {
+            Logger.error(
+                LogCategory.COM,
+                `${logLabel}: existing vtable 0x${vtableAddr.toString(16)} slot ${i} (${methods[i].name}) does not hold stub 0x${stubAddr.toString(16)}`
+            );
+            return null;
+        }
         if (!verifyComVtableSlot(mem, stubAddr)) {
             Logger.error(
                 LogCategory.COM,

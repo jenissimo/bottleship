@@ -1,6 +1,12 @@
 import { asBlobPart } from "../dom-buffer";
 import { inflateRawSync as inflateRawInto } from './inflate';
 import { dosDateTimeToUnix } from './dos-time';
+import { applyBlockIndex, decodeBlockIndex, WGB_BLOCK_INDEX_ENTRY } from './block-index';
+import type { BlockIndexRow, ZipBlockMap } from './block-index';
+import { inflateRawBlock } from './block-codec';
+export { WGB_BLOCK_INDEX_ENTRY, WGB_BLOCK_INDEX_VERSION, encodeBlockIndex, decodeBlockIndex } from './block-index';
+export type { ZipBlockMap, BlockIndexRow, WgbBlockIndexRef } from './block-index';
+export { inflateRawBlock, deflateRawBlock, BLOCK_STREAM_END } from './block-codec';
 export { dosDateTimeToUnix, unixToDosDateTime, wallClockToInstant, instantToWallClock } from './dos-time';
 
 // Synchronous inflate — usable where DecompressionStream is not (guest traps).
@@ -75,8 +81,21 @@ export interface ZipEntry {
     compression: number;
     localHeaderOffset: number;
     isDirectory: boolean;
+    /** CRC-32 from the central directory; absent on entries built in memory. */
+    crc32?: number;
     /** Last-modified time from the DOS stamp, as wall-clock seconds (zip/dos-time.ts); absent when the entry has none. */
     modified?: number;
+    blocks?: ZipBlockMap;
+}
+
+export interface ZipArchiveOptions {
+    blockCacheBytes?: number;
+}
+
+const DEFAULT_BLOCK_CACHE_BYTES = 16 * 1024 * 1024;
+
+export function isRangeReadableEntry(entry: ZipEntry): boolean {
+    return entry.compression === 0 || entry.blocks !== undefined;
 }
 
 export class BufferSource implements ZipSource {
@@ -278,9 +297,15 @@ export class ZipArchive {
      * truth — the CD always sits immediately before the EOCD — and adds it to every offset.
      */
     private prefixDelta = 0;
+    private readonly blockCache = new Map<number, Uint8Array>();
+    private blockCacheBytes = 0;
+    private readonly blockCacheBudget: number;
+    blockIndexState: "absent" | "loaded" | "rejected" = "absent";
+    blockIndexError: string | null = null;
 
-    constructor(source: ZipSource) {
+    constructor(source: ZipSource, options: ZipArchiveOptions = {}) {
         this.source = source;
+        this.blockCacheBudget = options.blockCacheBytes ?? DEFAULT_BLOCK_CACHE_BYTES;
     }
 
     getEntry(name: string): ZipEntry | undefined {
@@ -350,6 +375,26 @@ export class ZipArchive {
         const cdStart = cdOffset + this.prefixDelta;
         const cd = await this.source.readRange(cdStart, cdStart + cdSize);
         this.parseCentralDirectory(cd);
+        await this.loadBlockIndex();
+    }
+
+    private async loadBlockIndex(): Promise<void> {
+        const entry = this.entries.get(WGB_BLOCK_INDEX_ENTRY);
+        if (!entry || entry.isDirectory || entry.compression !== 0) return;
+        let rows: BlockIndexRow[];
+        try {
+            rows = decodeBlockIndex(await this.readEntryRange(entry, 0, entry.uncompressedSize));
+        } catch (e) {
+            this.blockIndexState = "rejected";
+            this.blockIndexError = e instanceof Error ? e.message : String(e);
+            return;
+        }
+        applyBlockIndex(rows, name => this.entries.get(name));
+        this.blockIndexState = "loaded";
+    }
+
+    isRangeReadable(entry: ZipEntry): boolean {
+        return isRangeReadableEntry(entry);
     }
 
     private parseCentralDirectory(cd: Uint8Array): void {
@@ -365,6 +410,7 @@ export class ZipArchive {
 
             const flags = view.getUint16(offset + 8, true);
             const compression = view.getUint16(offset + 10, true);
+            const crc32 = view.getUint32(offset + 16, true);
             let compressedSize = view.getUint32(offset + 20, true);
             let uncompressedSize = view.getUint32(offset + 24, true);
             const nameLen = view.getUint16(offset + 28, true);
@@ -404,6 +450,7 @@ export class ZipArchive {
                 compression,
                 localHeaderOffset,
                 isDirectory,
+                crc32,
                 ...(modified !== undefined ? { modified } : {}),
             });
 
@@ -421,7 +468,7 @@ export class ZipArchive {
      * entire file for reads the caller may never make.
      */
     canRangeReadSync(entry: ZipEntry): boolean {
-        if (entry.compression !== 0) return false;
+        if (!this.isRangeReadable(entry)) return false;
         if (typeof this.source.readRangeSync !== "function") return false;
         // A decorator can EXPOSE readRangeSync and still fail it: a block cache over an
         // async-only transport answers null for a block it has not faulted. Taking the
@@ -437,7 +484,7 @@ export class ZipArchive {
 
         const dataStart = await this.getEntryDataStart(entry);
         const dataEnd = dataStart + entry.compressedSize;
-        const compressed = await this.source.readRange(dataStart, dataEnd);
+        const compressed = await this.source.readRange(dataStart, dataEnd, entry.blocks ? this.blockHint(entry, dataStart, dataStart, true) : undefined);
 
         if (entry.compression === 8) {
             return inflateRaw(compressed, entry.uncompressedSize);
@@ -449,6 +496,25 @@ export class ZipArchive {
      * Reads an uncompressed (STORED) entry range without loading the whole file.
      */
     async readEntryRange(entry: ZipEntry, offset: number, length: number, sequential = false): Promise<Uint8Array> {
+        if (entry.blocks) {
+            const plan = this.planBlocks(entry, offset, length);
+            if (!plan) return new Uint8Array();
+            const dataStart = await this.getEntryDataStart(entry);
+            const span = this.missingSpan(entry, dataStart, plan.first, plan.last);
+            const compressed = span ? await this.source.readRange(span.start, span.end, this.blockHint(entry, dataStart, span.start, sequential)) : null;
+            if (span && compressed!.byteLength < span.end - span.start) {
+                throw new Error(`short read in ${entry.name}: ${compressed!.byteLength} of ${span.end - span.start} compressed bytes`);
+            }
+            const out = this.assembleBlocks(entry, dataStart, plan, span, compressed);
+            if (out) return out;
+            const offsets = entry.blocks.offsets;
+            const whole = { start: dataStart + offsets[plan.first], end: dataStart + offsets[plan.last + 1], first: plan.first, last: plan.last };
+            const all = await this.source.readRange(whole.start, whole.end, this.blockHint(entry, dataStart, whole.start, sequential));
+            if (all.byteLength < whole.end - whole.start) {
+                throw new Error(`short read in ${entry.name}: ${all.byteLength} of ${whole.end - whole.start} compressed bytes`);
+            }
+            return this.assembleBlocks(entry, dataStart, plan, whole, all)!;
+        }
         if (entry.compression !== 0) {
             throw new Error(`Range read is supported only for STORED entries (${entry.name})`);
         }
@@ -476,6 +542,24 @@ export class ZipArchive {
      *  `sequential` is the caller's own read-pattern state (it owns the file object);
      *  this is the layer that can turn it into an entry-bounded {@link ReadHint}. */
     readEntryRangeSync(entry: ZipEntry, offset: number, length: number, sequential = false): Uint8Array | null {
+        if (entry.blocks) {
+            if (!this.source.readRangeSync) return null;
+            const plan = this.planBlocks(entry, offset, length);
+            if (!plan) return new Uint8Array();
+            const dataStart = this.getEntryDataStartSync(entry);
+            if (dataStart === null) return null;
+            const span = this.missingSpan(entry, dataStart, plan.first, plan.last);
+            let compressed: Uint8Array | null = null;
+            if (span) {
+                compressed = this.source.readRangeSync(span.start, span.end, this.blockHint(entry, dataStart, span.start, sequential));
+                if (!compressed || compressed.byteLength < span.end - span.start) return null;
+            }
+            try {
+                return this.assembleBlocks(entry, dataStart, plan, span, compressed);
+            } catch {
+                return null;
+            }
+        }
         if (entry.compression !== 0 || !this.source.readRangeSync) return null;
         if (length <= 0 || offset >= entry.uncompressedSize) return new Uint8Array();
         const clampedOffset = Math.max(0, offset);
@@ -491,6 +575,84 @@ export class ZipArchive {
             sequential,
         };
         return this.source.readRangeSync(dataStart + clampedOffset, dataStart + clampedEnd, hint);
+    }
+
+    private planBlocks(entry: ZipEntry, offset: number, length: number): { from: number; to: number; first: number; last: number } | null {
+        if (length <= 0 || offset >= entry.uncompressedSize) return null;
+        const from = Math.max(0, offset);
+        const to = Math.min(entry.uncompressedSize, from + length);
+        if (from >= to) return null;
+        const shift = entry.blocks!.shift;
+        return { from, to, first: Math.floor(from / 2 ** shift), last: Math.floor((to - 1) / 2 ** shift) };
+    }
+
+    private missingSpan(entry: ZipEntry, dataStart: number, first: number, last: number): { start: number; end: number; first: number; last: number } | null {
+        const offsets = entry.blocks!.offsets;
+        let lo = first;
+        while (lo <= last && this.blockCache.has(dataStart + offsets[lo])) lo++;
+        if (lo > last) return null;
+        let hi = last;
+        while (hi > lo && this.blockCache.has(dataStart + offsets[hi])) hi--;
+        return { start: dataStart + offsets[lo], end: dataStart + offsets[hi + 1], first: lo, last: hi };
+    }
+
+    private blockHint(entry: ZipEntry, dataStart: number, cursor: number, sequential: boolean): ReadHint {
+        return { entryName: entry.name, entryStart: dataStart, entryEnd: dataStart + entry.compressedSize, cursor, sequential };
+    }
+
+    private assembleBlocks(
+        entry: ZipEntry, dataStart: number,
+        plan: { from: number; to: number; first: number; last: number },
+        span: { start: number; first: number; last: number } | null,
+        compressed: Uint8Array | null,
+    ): Uint8Array | null {
+        const { shift, offsets } = entry.blocks!;
+        const blockSize = 2 ** shift;
+        const parts: Array<Uint8Array | undefined> = [];
+        for (let b = plan.first; b <= plan.last; b++) {
+            const key = dataStart + offsets[b];
+            const block = this.blockCache.get(key);
+            if (block) {
+                this.blockCache.delete(key);
+                this.blockCache.set(key, block);
+            }
+            parts.push(block);
+        }
+        for (let b = plan.first; b <= plan.last; b++) {
+            if (parts[b - plan.first]) continue;
+            if (!span || !compressed || b < span.first || b > span.last) return null;
+            const rel = dataStart + offsets[b] - span.start;
+            const expected = Math.min(blockSize, entry.uncompressedSize - b * blockSize);
+            const block = new Uint8Array(expected);
+            const written = inflateRawBlock(compressed.subarray(rel, rel + offsets[b + 1] - offsets[b]), block);
+            if (written !== expected) throw new Error(`block inflate: block ${b} of ${entry.name} gave ${written} bytes, expected ${expected}`);
+            this.cacheBlock(dataStart + offsets[b], block);
+            parts[b - plan.first] = block;
+        }
+        const base = plan.first * blockSize;
+        if (parts.length === 1) return parts[0]!.subarray(plan.from - base, plan.to - base);
+        const out = new Uint8Array(plan.to - plan.from);
+        let w = 0;
+        for (let i = 0; i < parts.length; i++) {
+            const blockStart = base + i * blockSize;
+            const s = Math.max(plan.from, blockStart) - blockStart;
+            const block = parts[i]!;
+            const e = Math.min(plan.to, blockStart + block.length) - blockStart;
+            out.set(block.subarray(s, e), w);
+            w += e - s;
+        }
+        return out;
+    }
+
+    private cacheBlock(key: number, block: Uint8Array): void {
+        if (this.blockCacheBudget <= 0) return;
+        this.blockCache.set(key, block);
+        this.blockCacheBytes += block.byteLength;
+        while (this.blockCacheBytes > this.blockCacheBudget && this.blockCache.size > 1) {
+            const oldest = this.blockCache.keys().next().value as number;
+            this.blockCacheBytes -= this.blockCache.get(oldest)!.byteLength;
+            this.blockCache.delete(oldest);
+        }
     }
 
     private async getEntryDataStart(entry: ZipEntry): Promise<number> {

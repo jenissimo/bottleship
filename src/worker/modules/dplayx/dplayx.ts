@@ -14,6 +14,9 @@ import { DirectPlayNetworkApi } from "./network-api";
 import { HleComServer } from '../../core/com/hle-com-server';
 import { installDirectPlayRegistration } from '../directplay-registration';
 import { DIRECTPLAY_COM_CLASSES } from '../directplay-classes';
+import { savestateParticipants, savestatesEnabled, type FieldPolicy } from "../../savestate/participant";
+import { CaptureRefusal } from "../../savestate/object-codecs";
+import type { SaveValue } from "../../savestate/value-codec";
 
 // COM error codes
 const DP_OK = 0x00000000;
@@ -35,10 +38,12 @@ const IID_DPLAY_LOBBY_ANSI = "26c66a70-b367-11cf-a024-00aa006157ac";
 const IID_DPLAY = "5454e9a0-db65-11ce-921c-00aa006c4972";
 
 const GUID_SIZE = 16;
+// @transient(constant GUID bytes)
 const DPAID_SERVICE_PROVIDER_GUID = new Uint8Array([
     0xc0, 0x16, 0xd9, 0x07, 0xaf, 0xe0, 0xcf, 0x11, 0x9c, 0x4e, 0x00, 0xa0, 0xc9, 0x05, 0x42, 0x5e
 ]);
 // {1318F560-912C-11d0-9DAA-00A0C90A43CB}
+// @transient(constant GUID bytes)
 const DPAID_TOTAL_SIZE = new Uint8Array([
     0x60, 0xf5, 0x18, 0x13, 0x2c, 0x91, 0xd0, 0x11, 0x9d, 0xaa, 0x00, 0xa0, 0xc9, 0x0a, 0x43, 0xcb
 ]);
@@ -105,6 +110,12 @@ class DirectPlayLobbyCompatObject extends BaseComObject {
     }
 }
 
+export const DPLAYX_FIELDS = {
+    name: 'transient', exports: 'host', process: 'host', vtables: 'derive', networkApi: 'transient', comServer: 'transient',
+} as const satisfies Record<string, FieldPolicy>;
+
+export const DPLAYX_SCHEMA = { module: DPLAYX_FIELDS, state: [] as string[] };
+
 export class DPlayX implements IModule {
     name = "dplayx";
     exports: Record<string, ThunkImplementation> = {};
@@ -131,7 +142,36 @@ export class DPlayX implements IModule {
         return mem.slice(ptr, ptr + GUID_SIZE);
     }
 
+    captureSavestate(): Record<string, never> {
+        const open = this.networkApi?.openForSavestate() ?? [];
+        if (open.length > 0) {
+            throw new Error(`dplayx: not idle, ${open.length} thing(s) open: ${open.slice(0, 4).join(', ')}${open.length > 4 ? ', …' : ''}`);
+        }
+        if ((this.comServer?.lockCount ?? 0) > 0) throw new Error(`dplayx: the class factory is locked ${this.comServer.lockCount} time(s) (IClassFactory::LockServer)`);
+        return {};
+    }
+
+    restoreSavestate(): void {
+        const open = this.networkApi?.openForSavestate() ?? [];
+        if (open.length > 0) throw new Error(`dplayx: the fresh session is not idle: ${open.slice(0, 4).join(', ')}`);
+    }
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'dplayx', version: 1, order: 74, covers: ['dplayx'], schema: DPLAYX_SCHEMA as unknown as SaveValue,
+            capture: () => {
+                try {
+                    return this.captureSavestate() as unknown as SaveValue;
+                } catch (e) {
+                    throw e instanceof CaptureRefusal ? e : new CaptureRefusal(e instanceof Error ? e.message : String(e));
+                }
+            },
+            restore: () => this.restoreSavestate(),
+        });
+    }
+
     initialize(process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         this.process = process;
 
         const interfaceRegistry = InterfaceRegistry.getInstance();

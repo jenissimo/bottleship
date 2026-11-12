@@ -8,8 +8,82 @@ import type { VirtualFileSystem } from '../runtime/filesystem/vfs';
 import type { RegistryMutation, RegistryStore } from '../runtime/filesystem/registry';
 import type { NamedObjectSpec } from '../modules/kernel32/named-objects';
 import type { GuestImagePatch } from './system';
+import type { HostJitMode } from '../../utils/host-jit-policy';
+import type { ProcessStartupInfo } from './process-startup-info';
 
 export interface ChildProcessPreparation { imagePatches?: GuestImagePatch[]; }
+
+/**
+ * The Win32 errors a child start can name. Spelled out here rather than imported from
+ * kernel32: core/ must not depend on the module layer, and the launch path (which maps
+ * them onto CreateProcess/WinExec) is the only consumer.
+ */
+const ERROR_FILE_NOT_FOUND = 2;
+const ERROR_PATH_NOT_FOUND = 3;
+// 193 is what CreateProcess reports for a file that is not a Win32 image. 11 is a
+// different code, ERROR_BAD_FORMAT, which only WinExec hands back as its own answer.
+const ERROR_BAD_EXE_FORMAT = 193;
+
+/** A child start that failed for a condition Windows itself names. */
+class ChildStartFailure extends Error {
+    constructor(message: string, readonly win32Error: number) {
+        super(message);
+        this.name = 'ChildStartFailure';
+    }
+}
+
+/**
+ * The Win32 code a start failure carries, if it carries one. Only a positive integer
+ * counts: a reported 0 would fail the launch with GetLastError 0, which is not an error
+ * code any caller can act on. A failure with no code keeps ERROR_BAD_EXE_FORMAT, the
+ * answer for a child that could not load or prepare its image at all.
+ */
+export function win32ErrorOf(error: unknown): number | undefined {
+    const reported = (error as { win32Error?: unknown } | null)?.win32Error;
+    return typeof reported === 'number' && Number.isInteger(reported) && reported > 0 ? reported : undefined;
+}
+
+/**
+ * Windows separates "nothing at that path" from "a directory on the way is missing".
+ * The caller resolved this path already, so reaching here means it went away in
+ * between; report what is true now rather than assuming.
+ */
+function missingImageError(vfs: VirtualFileSystem, imagePath: string): ChildStartFailure {
+    const cut = Math.max(imagePath.lastIndexOf('\\'), imagePath.lastIndexOf('/'));
+    let directory = cut > 0 ? imagePath.slice(0, cut) : '';
+    if (/^[a-z]:$/i.test(directory)) directory += '\\';
+    const code = directory && !vfs.directoryExists(directory) ? ERROR_PATH_NOT_FOUND : ERROR_FILE_NOT_FOUND;
+    return new ChildStartFailure(`Cannot open child image: ${imagePath}`, code);
+}
+
+/**
+ * One handle a child inherits (CreateProcess with bInheritHandles = TRUE). It is installed
+ * at the SAME value in the child: the parent passes the number itself, on the command line
+ * or in the environment. Only object kinds that can be held across workers are described;
+ * the parent logs the ones it could not carry (see modules/kernel32/inherited-handles.ts).
+ */
+export type InheritedHandleSpec = {
+    handle: number;
+    access: number;
+} & ({
+    kind: 'process' | 'thread';
+    pid: number;
+    tid?: number;
+    ownerPid: number;
+    imageName: string;
+    imagePath?: string;
+    commandLine: string;
+    currentDirectory: string;
+    terminated: boolean;
+    exitCode: number;
+} | {
+    kind: 'event';
+    /** The process that created the event and relays its state to every holder. */
+    ownerPid: number;
+    id: number;
+    manualReset: boolean;
+    signaled: boolean;
+});
 
 export interface ChildProcessRequest {
     processId?: number;
@@ -19,6 +93,10 @@ export interface ChildProcessRequest {
     currentDirectory: string;
     rawCommandLine?: string;
     environment?: [string, string][];
+    /** The caller's lpStartupInfo, already copied out of its memory. */
+    startupInfo?: ProcessStartupInfo;
+    /** The parent's inheritable handles, when it asked for them to be inherited. */
+    inheritedHandles?: InheritedHandleSpec[];
 }
 
 export interface ChildBoot extends ChildProcessRequest {
@@ -32,6 +110,8 @@ export interface ChildBoot extends ChildProcessRequest {
     config?: Record<string, unknown>;
     registry?: ReturnType<RegistryStore['serialize']>;
     namedObjects?: NamedObjectSpec[];
+    /** The parent's host JIT mode: the page that decided it is not this worker's. */
+    jitMode?: HostJitMode;
 }
 
 export interface ChildProcessRecord extends ChildProcessRequest {
@@ -107,7 +187,7 @@ let nextChildBootId = 1;
 const unfinished = new Set<ChildProcessRecord>();
 let publishSession: ((port: MessagePort, record: ChildProcessRecord) => void) | undefined;
 let sessionFinished: (() => void) | undefined;
-let bootContext: (() => Pick<ChildBoot, 'config' | 'registry' | 'namedObjects'>) | undefined;
+let bootContext: (() => Pick<ChildBoot, 'config' | 'registry' | 'namedObjects' | 'jitMode'>) | undefined;
 export function setChildBootContext(provider: typeof bootContext): void { bootContext = provider; }
 
 /** Applies a child's registry write to THIS process's store — the registry is system-wide,
@@ -291,8 +371,11 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
         });
         const file = await vfs.open(request.imagePath, 0x80000000, 3);
         context.checkActive();
-        if (!file) throw new Error(`Cannot open child image: ${request.imagePath}`);
+        if (!file) throw missingImageError(vfs, request.imagePath);
         const bytes = new Uint8Array(vfs.getFileSize(file.path));
+        // Nothing to load: an empty file is not a Win32 image, and the child would wait
+        // for a readiness it can never signal.
+        if (!bytes.length) throw new ChildStartFailure(`Child image is empty: ${request.imagePath}`, ERROR_BAD_EXE_FORMAT);
         let offset = 0;
         while (offset < bytes.length) {
             const chunk = await vfs.read(file, bytes.length - offset);
@@ -366,7 +449,7 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
                     });
                 }
                 else if (message.type === 'process_exit') {
-                    getProcessIpc().markProcessExited(identity.pid);
+                    getProcessIpc().markProcessExited(identity.pid, message.exitCode >>> 0);
                     context.record.fault = message.fault;
                     context.record.logs = message.logs;
                     // The child exited; its barrier did not drain. Not a crash, but the
@@ -379,7 +462,15 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
                     }
                     finish(message.exitCode >>> 0);
                 } else if (message.type === 'error' || message.type === 'crash') {
-                    finish(undefined, new Error(message.message ?? message.reason ?? 'Child process crashed'));
+                    const failure = new Error(message.message ?? message.reason ?? 'Child process crashed');
+                    // A child that knows which Win32 error its startup failed with
+                    // reports it under a dedicated field; the kernel32 launch path reads
+                    // only this one, so a generic `code` (a DOMException, an errno from
+                    // somewhere else) cannot pose as a Win32 error.
+                    if (typeof message.win32Error === 'number') {
+                        (failure as Error & { win32Error?: number }).win32Error = message.win32Error;
+                    }
+                    finish(undefined, failure);
                 } else if ((message.type === 'window_title' && message.visible !== false) || message.type === 'show_message_box') {
                     // MessageBox is a titled top-level window on Windows; ours is host-served
                     // DOM with no HWND, so it never reaches the window_title callback. Both are
@@ -430,4 +521,9 @@ export function runChildProcess(vfs: VirtualFileSystem, request: ChildProcessReq
     createWorker?: () => Worker,
 ): Promise<number> {
     return startChildProcess(vfs, request, createWorker).completion;
+}
+
+/** Child process workers that are booting, running, or not yet reaped. */
+export function liveChildProcessCount(): number {
+    return active.size + unfinished.size;
 }

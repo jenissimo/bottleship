@@ -2369,3 +2369,11 @@ export function dispatchCxxException(
         `ESP=0x${(cpu.reg32[4] >>> 0).toString(16)} EBP=0x${(cpu.reg32[5] >>> 0).toString(16)})`);
     return null;
 }
+
+/** Exceptions being dispatched or caught right now, across all threads. */
+export function sehDispatchInFlight(): number {
+    let n = 0;
+    for (const records of activeCatchRecords.values()) n += records.length;
+    for (const stack of activeExceptions.values()) n += stack.length;
+    return n;
+}

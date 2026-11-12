@@ -22,6 +22,7 @@ export interface ActiveDialog {
 }
 
 /** Modal dialogs of the CURRENT process, keyed by HWND (EndDialog result capture). */
+// @refuse(a modal dialog is open)
 export const activeDialogs = new Map<number, ActiveDialog>();
 
 export interface PumpScheduler {
@@ -32,7 +33,9 @@ export interface PumpScheduler {
     abandon(): void;
 }
 
+// @transient(generation of the host modal pump timers)
 let pumpEpoch = 0;
+// @transient(host timers of a modal pump, which only runs while a modal dialog is open)
 const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
 
 export function createPumpScheduler(): PumpScheduler {
@@ -53,6 +56,15 @@ export function createPumpScheduler(): PumpScheduler {
             pendingTimers.add(timer);
         },
     };
+}
+
+/**
+ * A modal pump with its next step armed is a thread blocked in the dialog's GetMessage:
+ * like a GetMessage waiter, it can only be woken by a message, and USER timers are on
+ * the virtual-time wheel, so the scheduler must keep that clock moving for it.
+ */
+export function hasWaitingModalPump(): boolean {
+    return pendingTimers.size > 0;
 }
 
 /** Process teardown / new bundle load: no pump armed so far may run again. */

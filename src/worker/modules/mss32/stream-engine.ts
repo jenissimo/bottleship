@@ -202,6 +202,11 @@ function declaredDataChunkSize(head: Uint8Array, info: WavChunkInfo): number {
     return new DataView(head.buffer, head.byteOffset, head.byteLength).getUint32(sizeAt, true);
 }
 
+function sourceRingBytes(info: WavChunkInfo): number {
+    const frameBytes = Math.max(1, info.channels) * 4;
+    return Math.max(frameBytes * 1024, Math.ceil(info.sampleRate * RING_SECONDS) * frameBytes);
+}
+
 /** How the engine reaches this stream's bytes — see the header. */
 type SourceBacking = Pick<MSSStreamSource, "kind" | "fileHandle" | "scratch" | "vfsHandle">;
 
@@ -267,9 +272,7 @@ function adoptSource(
     };
     stream.source = source;
 
-    const frameBytes = Math.max(1, info.channels) * 4;
-    const ringBytes = Math.max(frameBytes * 1024, Math.ceil(info.sampleRate * RING_SECONDS) * frameBytes);
-    ensureStreamingRing(stream, ringBytes);
+    ensureStreamingRing(stream, sourceRingBytes(info));
 
     // The header read already delivered the first slab of data — decode it rather
     // than seeking backwards over bytes we are holding.
@@ -359,7 +362,12 @@ export function serveIncrementalStreams(
  * threads could otherwise be parked in a chain at once and interleave seeks and reads
  * on whatever cursor those callbacks share. One chain in flight restores the contract.
  */
+// @refuse(a refill chain is running through the title's file callbacks)
 let refillChainInFlight = false;
+
+export function refillChainRunning(): boolean {
+    return refillChainInFlight;
+}
 
 /** Consume the tail a full ring made us hold back. True = ring still full, stop here. */
 function drainPending(stream: MSSStream, src: MSSStreamSource): boolean {
@@ -713,6 +721,14 @@ export function seekIncrementalStream(stream: MSSStream, positionBytes: number):
     src.exhausted = false;
     src.endReported = false;
     resetStreamingRing(stream);
+}
+
+export function restoreStreamingSource(stream: MSSStream, positionBytes: number, endReported: boolean): void {
+    const src = stream.source;
+    if (!src) return;
+    ensureStreamingRing(stream, sourceRingBytes(src.info));
+    seekIncrementalStream(stream, positionBytes);
+    src.endReported = endReported;
 }
 
 /** Begin (or resume) playback of an incrementally fed stream. */

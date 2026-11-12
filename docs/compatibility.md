@@ -5,8 +5,10 @@ BottleShip targets native Win32 games of roughly **1997–2004** — the DirectD
 not exhaustive, and "runs" means different things at different stages (boots to menu vs. fully
 playable). Your mileage will vary with the exact build/version you own.
 
-Updated **2026-10-26** for **BottleShip 0.7**. Working statuses include maintainer reports; every title has not
-been retested for this release. Observed demo stages are listed separately below. Successful
+Updated **2026-11-07** for the `develop` branch after **BottleShip 0.7** (titles added since
+2026-10-26 come from merged pull requests; see [Added since 0.7](#added-since-07)). Working
+statuses include maintainer and contributor reports; every title has not been retested for this
+release. Observed demo stages are listed separately below. Successful
 GOG extraction does not establish gameplay coverage for that installer edition.
 
 **How to read the table**
@@ -26,6 +28,7 @@ GOG extraction does not establish gameplay coverage for that installer edition.
 |-------|--------|:---:|
 | Re-Volt | playable | ✓ |
 | Heroes of Might & Magic III | playable | ✓ |
+| Heroes of Might and Magic II Gold (GOG) | playable | ✓ |
 | StarCraft / Brood War | playable | |
 | Warcraft III (demo) | playable | |
 | Diablo II | playable | |
@@ -35,16 +38,21 @@ GOG extraction does not establish gameplay coverage for that installer edition.
 | Need for Speed: Porsche Unleashed | playable\* | |
 | Need for Speed: Underground | playable | |
 | Need for Speed: Underground 2 | playable | |
+| Colin McRae Rally 2.0 | playable | |
 | Midtown Madness 2 (full game) | runtime imported; gameplay unverified† | |
 | Carmageddon 2: Carpocalypse Now | playable | ✓ |
 | Star Wars Episode I: Racer | playable | ✓ |
+| Star Wars Episode I: Battle for Naboo | playable | |
 | Unreal Gold | playable | |
 | Unreal Tournament (demo) | playable | |
+| Unreal Tournament GOTY (full game, v432) | playable | |
 | Quake II | playable | ✓ |
 | Half-Life: Uplink / Day One (demos) | playable | |
 | Half-Life 2 (20th Anniversary) | playable | |
-| Empires: Dawn of the Modern World (2003, GOG) | boots | ✓ |
+| Empires: Dawn of the Modern World (2003, GOG) | boots; random map reaches gameplay | ✓ |
 | Red Faction | playable | ✓ |
+| Grand Theft Auto (1997, Rockstar Classics freeware) | playable | |
+| Grand Theft Auto 2 (Rockstar Classics freeware) | playable | |
 | Grand Theft Auto III | playable | |
 | Grand Theft Auto: Vice City | playable | |
 | Hitman: Codename 47 | playable | ✓ |
@@ -75,6 +83,10 @@ GOG extraction does not establish gameplay coverage for that installer edition.
 | Alice Greenfingers | playable | |
 | Farm Frenzy | playable | |
 | Montezuma | playable | |
+| Diner Dash | boots | |
+| Safari Biathlon (2001, Lithuanian) | playable | |
+| Shrek 2 (English PC) | playable§ | |
+| RollerCoaster Tycoon Deluxe (Steam) | playable | |
 | Far Cry | playable | ✓ |
 | Mafia (original) | playable | ✓ |
 | The Bard's Tale ARPG (Remastered and Resnarkled, Win32) | playable | ✓ |
@@ -87,8 +99,23 @@ GOG extraction does not establish gameplay coverage for that installer edition.
 | Painkiller Black Edition | playable | ✓ |
 | Empire Earth (2.00, single player) | playable‡ | |
 | Empire Earth: The Art of Conquest (1.00, single player) | playable‡ | |
+| Command & Conquer (Tiberian Dawn, Win95 edition) | playable | |
+| Command & Conquer: Red Alert (Win95 edition) | playable | |
+| Heart of Empty (Delphi, OpenGL) | playable | |
+| Bigfoot 4x4 Challenge | playable | |
+| Stabilo Boss Mania | playable | |
+| Amore | playable | |
+| Beavis and Butt-Head in Hock-A-Loogie | playable | |
+| T-32K (freeware) | playable | |
+| I'm OK (freeware) | playable | |
+| Zep's Dreamland (freeware, Allegro 4) | playable | |
+| Echoes (freeware, DarkBASIC Pro) | playable | |
+| Gravity Bone (freeware) | boots; in game at about 17 fps | |
 
 \* retail has an intermittent mode-switch hiccup; the demo does not.
+
+§ First level only: movies, menu, new game, the storybook and the first swamp level, with
+smooth audio confirmed by the contributor. Not a complete playthrough.
 
 ‡ Single player only, checked 2026-10-21 with the unmodified Empire Earth 2.00
 (v2.00.3466) and The Art of Conquest 1.00 (v1.00.2657) game files: the first Learning
@@ -155,6 +182,89 @@ MPEG assets with leading padding are recognized. The original disc's three stale
 hash records require explicit acceptance during import. Later episodes and campaign
 completion have not been tested.
 
+## Added since 0.7
+
+These titles were brought up in pull requests merged between 2026-10-26 and 2026-11-07. The
+observed stage is what the PR reports; the maintainer has not retested every one of them.
+
+- **Safari Biathlon** (2001, Lithuanian, DirectX 7 + DirectShow): menus and levels play. The
+  Lithuanian text needs the wizard's *Language for non-Unicode programs* set to Lithuanian
+  (CP1257). The contributor reports it working fully (#44, #45).
+- **Colin McRae Rally 2.0**: menu with its DXT textures and text, MS-ADPCM menu music at the
+  correct pitch, and a full race in 3D with the HUD (#160).
+- **RollerCoaster Tycoon Deluxe** (Steam): title screen, menu, and New Game → Forest Frontiers
+  loads (#158).
+- **Diner Dash** (Director 8 behind a Reflexive wrapper, XP bundle): intro, animated loading
+  screen (some stutter) and a fully drawn main menu (#42). Gameplay is unverified.
+- **Heroes of Might and Magic II Gold** (GOG installer): intro videos, main menu, a new
+  standard game, the adventure map and the town screen, with CD music in the menu, map and town
+  (#113, #129).
+- **Grand Theft Auto** (1997) and **Grand Theft Auto 2**, both the freeware Rockstar Classics
+  releases: playable in-game with music and sound; GTA2 plays its Bink intro. The GTA Settings
+  dialog works. Multiplayer was checked as a two-tab DirectPlay match for GTA1 and through the
+  GTA2 Manager with lobby chat for GTA2 (#67, #69, #75, #76, #78; audio and timing fixes in
+  #51–#53, #57/#65, #58, #59).
+- **Unreal Tournament GOTY** (full game, CD v432): single player, and LAN multiplayer through
+  bottleship-lan with a listen server and a joining client (#79, #80).
+- **Star Wars Episode I: Battle for Naboo** (retail, Direct3D 7): opening crawl, in-engine
+  cutscene and the playable first level, Escape from Theed (#22).
+- **Shrek 2** (English PC): see § above (#34–#37).
+
+Fixes since 0.7 for titles already listed:
+
+- **Empires**: one C runtime per process fixes the random-map `abort()` (#116, #123), and the
+  black "Loading Game Window" drops from 50–115 s to 25–30 s. Single Player → Play Random Map →
+  Start Game reaches gameplay (#145).
+- **Harry Potter and the Chamber of Secrets**: voice-over no longer starts mid-line or stutters
+  (#147, checked in game over the Privet Drive / Diagon Alley intro and the Lockhart
+  cutscene). An intermittent startup failure from a `Game.ini` race is fixed (#144).
+- **The Longest Journey**: no more trails behind characters' heads (#156), and the opening
+  voice-over plays (#157). Only the opening scene was checked.
+- **Max Payne**: the intro movie is visible again (#141, #142).
+- **Half-Life: Day One demo**: New Game no longer crashes and reaches the tram introduction
+  (#146).
+- **Quake II**: sound no longer arrives about 1.5 s late (#143). The same fix is expected to
+  remove the splash-sound stutter in Serious Sam: The First Encounter (not yet confirmed by
+  ear).
+- **Deus Ex: GOTY**: the first-run wizard no longer ends in a Critical Error; a fresh profile
+  reaches Liberty Island (#128).
+- **Blade of Darkness**: loading the first level as Naglfar no longer hangs (#131).
+- **Star Wars Episode I: Racer**: cutscene audio plays (#132).
+- **Grand Theft Auto: Vice City**: the radio resumes mid-song on car entry and engine loops hold
+  steady (#49).
+- **Cossacks: European Wars (GOG)**: the GOG Video Player plays its videos and hands over to
+  the game. Existing bundles need the GOG shortcut arguments in the manifest, or a fresh repack
+  (#121).
+- **Alice Greenfingers**: no longer closes itself after 10–20 s; reaches the first garden level
+  (#119).
+- **Mafia**: the Steam Czech edition plays its intro mission with Czech menus and dubbing when
+  the bundle is packed with `make-wgb --sdb` for the game's own registry shims (#50).
+- **Red Alert 3**: the cold load no longer spends about 41 s hashing the bundle (#120).
+- **Hitman: Codename 47 demo**: touch controls can map movement to the numpad on phones (#63).
+
+## Contributor bring-ups (freeware and late-90s titles)
+
+These titles were brought up by a contributor who mainly targets games from the late 1990s
+and early 2000s, especially ones that are awkward or impossible to install and start on
+Windows 10/11 today, plus newer freeware titles up to a modest download size. The stage is
+what the contributor observed in the browser; none is claimed finished, and more titles will
+be added in later updates.
+
+- **Command & Conquer** (Tiberian Dawn) and **Command & Conquer: Red Alert**, Win95 editions:
+  missions played (#74, #139).
+- **Heart of Empty** (Delphi, OpenGL): several levels played, shooting and level loads work;
+  the game itself caps at about 30 fps (#106–#110).
+- **Bigfoot 4x4 Challenge**: reaches races; sound effects since #168.
+- **Stabilo Boss Mania** and **Amore**: in game and played.
+- **Beavis and Butt-Head in Hock-A-Loogie**: character selection and in game.
+- **T-32K** (freeware): start, movement and shooting (shot-heavy scenes sped up by #167).
+- **I'm OK** (freeware): level 1, walking, jumping and hitting.
+- **Zep's Dreamland** (freeware, Allegro 4): playable with its MIDI soundtrack through the
+  General MIDI synth (#151–#155).
+- **Echoes** (freeware, DarkBASIC Pro): reaches the playfield at about 115 fps (#150, #169).
+- **Gravity Bone** (freeware): in game, but limited to about 17 fps; performance work is
+  ongoing.
+
 ## Demo coverage
 
 These observations cover the listed demo editions only; a rendered menu does not establish
@@ -188,12 +298,22 @@ full playability.
 | Cossacks: European Wars demo | Original Wise demo: rendered menu and playable random map; primary scanout and palette animation verified. Native Slow mode with a 50 ms interval gives 20 simulation steps/s | ✓ |
 | Thief Gold demo | Original demo: menu, Thieves Guild mission, movement and mouse look verified. Bundle includes the installer-generated install.cfg pointing at its root-level resource archives; without it the guest dereferences a missing interface image | ✓ |
 | [Mafia original demo](https://archive.org/details/Mafia_201405) | Rendered mission with a car, city and HUD. WGB includes the native Setup registry value for 1024 × 768, 32-bit fullscreen startup; fresh launch bypasses Setup | ✓ |
+| Star Wars Episode I: Battle for Naboo (LucasArts web demo) | Playable Neimoidian Plunder level with the Heavy STAP; thrust, steering and blaster input verified | ✓ |
+| Midtown Madness 2 trial | San Francisco Cruise driving (accelerate, steer, brake, horn), Blitz and Checkpoint races, and the first Crash Course gate. "Trial Time Up!" is the trial's own limit | ✓ |
 | [Carmageddon II demo](https://archive.org/details/Carmageddon2CarpocalypseNowDemo) | Rendered Controls screen; race entry remains unverified | ✓ |
 | [Painkiller Demo 2](https://archive.org/details/Painkiller_Demo_2_build_v1.0) | Rendered main menu; level entry remains unverified | ✓ |
 | [Worms World Party original demo](https://ftp.zx.net.nz/pub/archive/ftp.team17.com/pub/t17/goodies/wwp_demo.exe) | Rendered demo splash; match entry remains unverified | ✓ |
 | Crimson Skies trial | [Contributor bring-up (#33)](https://github.com/jenissimo/bottleship/issues/33), independently verified on 2026-10-20: visible pilot-name editing, campaign hangar, voiced briefing, legible Flight Check objectives and the Hawaii mission in flight with HUD and keyboard roll controls. Direct3D 6; graphical glitches remain. Repacked from the original CrimsonTrial.exe with its own TrueType fonts installed under Windows Fonts. Wrapped DrawTextEx measurement and text color after solid GDI blits were fixed against native Windows oracles. Force feedback and mission completion remain unverified | ✓ |
 
 Harry Potter 1 and Unreal Tournament demos also reach their rendered menus.
+
+### Freeware in the public catalog
+
+| Release | Observed stage | Public catalog |
+|---|---|:---:|
+| Command & Conquer: Tiberian Sun (EA freeware) | Playable; see the table above | ✓ |
+| Grand Theft Auto (1997, Rockstar Classics freeware) | Checked 2026-11-12 on `develop` (35bfdb24): the WGB starts `Grand Theft Auto.exe` with the GTA Settings defaults in the registry, reaches the main menu and enters Liberty City with the HUD. The published WGB contains only the files of Rockstar's `GTAINSTALLER.exe`; GTA Settings needs MFC42.DLL, which it does not ship | ✓ |
+| Grand Theft Auto 2 (Rockstar Classics freeware) | Checked 2026-11-12 on `develop` (35bfdb24): Bink intro, main menu, Play → Start Play in Area 1 enters Downtown with the HUD | ✓ |
 
 These four original installers use the project's own readers: Mafia's RAR4 LZ payload
 (27 files, CRC verified), Carmageddon II's ZIP → InstallShield 3 `data.z` payload

@@ -8,6 +8,7 @@ import {
     DDSD_BACKBUFFERCOUNT,
     DDSD_CAPS,
     DDSD_HEIGHT,
+    DDSD_LINEARSIZE,
     DDSD_LPSURFACE,
     DDSD_CKSRCBLT,
     DDSD_CKDESTBLT,
@@ -207,8 +208,7 @@ export const writePixelFormat = (
     if (!isValidAddress(mem, address, Math.min(Math.max(targetSize, 4), 32))) return;
     const cappedSize = Math.max(0, Math.min(targetSize, 32));
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-    const canWrite = (offset: number, bytes: number = 4) =>
-        cappedSize >= offset + bytes && isValidAddress(mem, address + offset, bytes);
+    const canWrite = (offset: number, bytes: number = 4) => cappedSize >= offset + bytes;
     if (canWrite(DDPIXELFORMAT_OFFSETS.size)) {
         view.setUint32(address + DDPIXELFORMAT_OFFSETS.size, cappedSize, true);
     }
@@ -248,7 +248,11 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
     const flags = hasField(DDSURFACEDESC2_OFFSETS.flags) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.flags, true) : 0;
     const height = hasField(DDSURFACEDESC2_OFFSETS.height) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.height, true) : 0;
     const width = hasField(DDSURFACEDESC2_OFFSETS.width) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.width, true) : 0;
-    const pitch = hasField(DDSURFACEDESC2_OFFSETS.pitch) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.pitch, true) : 0;
+    // lPitch is only valid under DDSD_PITCH, like every member. Half-Life's sw.dll creates a
+    // 320x240 SYSTEMMEMORY offscreen surface with DDSD_CAPS|HEIGHT|WIDTH and stack garbage
+    // (a code pointer) in lPitch; honoring it asked for a 135 GB surface, CreateSurface
+    // failed, and the engine derailed right after New Game → difficulty.
+    const pitch = (flags & DDSD_PITCH) && hasField(DDSURFACEDESC2_OFFSETS.pitch) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.pitch, true) : 0;
     // Like every member, dwBackBufferCount is only valid under its DDSD_ flag; callers that
     // set just DDSD_CAPS often leave stack garbage there.
     const backBufferCount = (flags & DDSD_BACKBUFFERCOUNT) && hasField(DDSURFACEDESC2_OFFSETS.backBufferCount) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.backBufferCount, true) : 0;
@@ -343,6 +347,21 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
     };
 };
 
+/**
+ * lPitch and dwLinearSize are a union. A block-compressed surface has no row stride to report,
+ * so the union carries the level's total bytes and DDSD_LINEARSIZE says so — callers branch on
+ * that flag, and a loader that falls through to `width * dwRGBBitCount / 8` computes 0 for a
+ * DDPF_FOURCC format and copies nothing.
+ */
+const pitchFieldOf = (desc: SurfaceDesc): { value: number; flag: number } => {
+    const format = desc.pixelFormat;
+    if (format) {
+        const layout = getSurfaceFormatLayout(format, desc.width, desc.height);
+        if (layout.compressed) return { value: layout.bytes, flag: DDSD_LINEARSIZE };
+    }
+    return { value: desc.pitch, flag: DDSD_PITCH };
+};
+
 export const writeSurfaceDesc = (
     mem: Uint8Array,
     address: number,
@@ -386,9 +405,10 @@ export const writeSurfaceDesc = (
     let flags = desc.flags ?? 0;
     
     // We always write these fields — flags must be set
+    const pitchField = pitchFieldOf(desc);
     if (desc.width) flags |= DDSD_WIDTH;
     if (desc.height) flags |= DDSD_HEIGHT;
-    if (desc.pitch) flags |= DDSD_PITCH;
+    if (pitchField.value) flags |= pitchField.flag;
     
     // We always write pixelFormat — flag is mandatory
     flags |= DDSD_PIXELFORMAT;
@@ -401,7 +421,7 @@ export const writeSurfaceDesc = (
     // would otherwise ask for user memory aliasing the surface it came from.
     flags &= ~DDSD_LPSURFACE;
     if (desc.surfacePtr && desc.surfacePtr > 0) {
-        flags |= DDSD_PITCH;
+        flags |= pitchField.flag;
         if (desc.caps) flags |= DDSD_CAPS;
     }
     if (canWrite(DDSURFACEDESC2_OFFSETS.flags)) {
@@ -414,7 +434,7 @@ export const writeSurfaceDesc = (
         view.setUint32(address + DDSURFACEDESC2_OFFSETS.width, desc.width, true);
     }
     if (canWrite(DDSURFACEDESC2_OFFSETS.pitch)) {
-        view.setUint32(address + DDSURFACEDESC2_OFFSETS.pitch, desc.pitch, true);
+        view.setUint32(address + DDSURFACEDESC2_OFFSETS.pitch, pitchField.value, true);
     }
     if (canWrite(DDSURFACEDESC2_OFFSETS.backBufferCount)) {
         view.setUint32(address + DDSURFACEDESC2_OFFSETS.backBufferCount, desc.backBufferCount, true);
@@ -472,7 +492,7 @@ export const readSurfaceDescV1 = (mem: Uint8Array, address: number): SurfaceDesc
     const flags = hasField(DDSURFACEDESC_OFFSETS.flags) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.flags, true) : 0;
     const height = hasField(DDSURFACEDESC_OFFSETS.height) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.height, true) : 0;
     const width = hasField(DDSURFACEDESC_OFFSETS.width) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.width, true) : 0;
-    const pitch = hasField(DDSURFACEDESC_OFFSETS.pitch) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.pitch, true) : 0;
+    const pitch = (flags & DDSD_PITCH) && hasField(DDSURFACEDESC_OFFSETS.pitch) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.pitch, true) : 0;
     const backBufferCount = (flags & DDSD_BACKBUFFERCOUNT) && hasField(DDSURFACEDESC_OFFSETS.backBufferCount) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.backBufferCount, true) : 0;
     // Only read lpSurface if DDSD_LPSURFACE flag is set AND field exists
     const surfacePtr = (flags & DDSD_LPSURFACE) && hasField(DDSURFACEDESC_OFFSETS.lpSurface)
@@ -529,15 +549,16 @@ export const writeSurfaceDescV1 = (
     
     // Build flags based on what we actually write (same logic as v2)
     let flags = desc.flags ?? 0;
+    const pitchField = pitchFieldOf(desc);
     if (desc.width) flags |= DDSD_WIDTH;
     if (desc.height) flags |= DDSD_HEIGHT;
-    if (desc.pitch) flags |= DDSD_PITCH;
+    if (pitchField.value) flags |= pitchField.flag;
     flags |= DDSD_PIXELFORMAT;
     if (desc.caps) flags |= DDSD_CAPS;
     
     flags &= ~DDSD_LPSURFACE;
     if (desc.surfacePtr && desc.surfacePtr > 0) {
-        flags |= DDSD_PITCH;
+        flags |= pitchField.flag;
         if (desc.caps) flags |= DDSD_CAPS;
     }
     
@@ -551,7 +572,7 @@ export const writeSurfaceDescV1 = (
         view.setUint32(address + DDSURFACEDESC_OFFSETS.width, desc.width, true);
     }
     if (canWrite(DDSURFACEDESC_OFFSETS.pitch)) {
-        view.setUint32(address + DDSURFACEDESC_OFFSETS.pitch, desc.pitch, true);
+        view.setUint32(address + DDSURFACEDESC_OFFSETS.pitch, pitchField.value, true);
     }
     if (canWrite(DDSURFACEDESC_OFFSETS.backBufferCount)) {
         view.setUint32(address + DDSURFACEDESC_OFFSETS.backBufferCount, desc.backBufferCount, true);
@@ -661,9 +682,11 @@ export const normalizeSurfaceDesc = (
     const height = isPrimary ? fallbackHeight : (input.height || fallbackHeight);
     const layout = getSurfaceFormatLayout(pixelFormat, width, height);
     const computedPitch = layout.compressed ? layout.pitch : computePitch(width, pixelFormat.bpp);
+    // The union holds dwLinearSize on a compressed desc (often copied straight from a texture
+    // file's header), so it is never a stride there.
     const pitch = isPrimary
         ? computePitch(fallbackWidth, pixelFormat.bpp)
-        : (input.pitch || computedPitch);
+        : layout.compressed ? computedPitch : (input.pitch || computedPitch);
     let flags =
         input.flags ||
         (DDSD_WIDTH | DDSD_HEIGHT | DDSD_PITCH | DDSD_PIXELFORMAT);

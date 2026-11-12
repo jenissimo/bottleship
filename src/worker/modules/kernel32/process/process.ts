@@ -3,7 +3,7 @@
 
 import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
 import {
-    promoteChildSession, hasChildSession, pendingChildHandoff,
+    promoteChildSession, hasChildSession, pendingChildHandoff, win32ErrorOf,
     type ChildProcessRequest, type ChildProcessRecord,
 } from '../../../core/child-process';
 import { Logger, LogCategory } from '../../../core/logger';
@@ -27,15 +27,23 @@ import { isDifferentCommandLine } from '../../shell32';
 import { getVirtualProcessManager, VIRTUAL_CURRENT_PROCESS_ID } from './virtual-process-manager';
 import { hostToolsEnabled } from '../../../core/host-tool-bridge';
 import { startProcessRuntime } from './runtime-child';
+import { applyInheritFlag, collectInheritedHandles, terminateForeignProcess } from '../inherited-handles';
 import { createActCtxExports } from './actctx';
 import { versionVerifyExports } from './version-verify';
 import { GUEST_COMPUTER_NAME } from '../../../core/guest-identity';
+import { SYSTEM32_DIR } from '../../../core/dll-search-order';
+import {
+    cachedStartupStrings, getProcessStartupInfo, STARTF_USESHOWWINDOW,
+    STARTUPINFO_OFFSETS, STARTUPINFO_SIZE, type ProcessStartupInfo,
+} from '../../../core/process-startup-info';
 
+const ERROR_ACCESS_DENIED = 5;
 const ERROR_INVALID_HANDLE = 6;
 const ERROR_INVALID_PARAMETER = 87;
 const ERROR_FILE_NOT_FOUND = 2;
 const ERROR_PATH_NOT_FOUND = 3;
 const ERROR_BAD_FORMAT = 11;
+const ERROR_BAD_EXE_FORMAT = 193;
 const ERROR_CALL_NOT_IMPLEMENTED = 120;
 const ERROR_PARTIAL_COPY = 299;
 const ERROR_NO_MORE_FILES = 18;
@@ -66,7 +74,11 @@ const IMAGE_FILE_DLL = 0x2000;
 const PE_SNIFF_BYTES = 0x1000;
 const IMAGE_SUBSYSTEM_WINDOWS_CUI = 3;
 
+// @participant(kernel32)
 let currentPriorityClass = NORMAL_PRIORITY_CLASS;
+
+/** Shared with native thread-information queries; no duplicate priority-class state. */
+export function getCurrentProcessPriorityClass(): number { return currentPriorityClass; }
 
 /**
  * The relative priorities SetThreadPriority accepts: IDLE and TIME_CRITICAL always,
@@ -82,6 +94,7 @@ function isValidThreadPriority(priority: number): boolean {
 
 // Tracks the last ES_CONTINUOUS SetThreadExecutionState value.
 // Initial state: ES_CONTINUOUS only (no active power-management request).
+// @participant(kernel32)
 let threadExecutionState = 0x80000000; // ES_CONTINUOUS
 
 // ==================== Toolhelp32 Snapshot internals ====================
@@ -98,6 +111,7 @@ interface ToolhelpSnapshot {
 }
 
 /** Active snapshots keyed by handle. Cleaned up on access if handle was closed. */
+// @refuse(open toolhelp snapshots are not part of a v1 savestate)
 const toolhelpSnapshots = new Map<number, ToolhelpSnapshot>();
 
 export function resetProcessApiState(): void {
@@ -107,6 +121,17 @@ export function resetProcessApiState(): void {
     virtualProcessMemoryByPid.clear();
     childImageByPid.clear();
     childImagePathsByPid.clear();
+}
+
+export function captureProcessApiState(): { priorityClass: number; executionState: number } {
+    if (toolhelpSnapshots.size > 0) throw new Error('kernel32: open toolhelp snapshots are not part of a v1 savestate');
+    if (childImageByPid.size > 0 || childImagePathsByPid.size > 0 || virtualProcessMemoryByPid.size > 0) throw new Error('kernel32: child process images are not part of a v1 savestate');
+    return { priorityClass: currentPriorityClass, executionState: threadExecutionState };
+}
+
+export function restoreProcessApiState(state: { priorityClass: number; executionState: number }): void {
+    currentPriorityClass = state.priorityClass;
+    threadExecutionState = state.executionState;
 }
 
 function getSnapshot(handle: number): ToolhelpSnapshot | null {
@@ -418,6 +443,80 @@ const readNullableProcessString = (memory: Uint8Array, ptr: number, isWide: bool
     return isWide ? Marshaler.readWideString(memory, ptr) : Marshaler.readString(memory, ptr);
 };
 
+/**
+ * The caller's lpStartupInfo, copied out of its memory.
+ *
+ * The strings are read here, while the caller is still the running process: keeping
+ * lpTitle/lpDesktop as pointers would hand the child addresses that mean something
+ * else in its own address space.
+ */
+const readStartupInfo = (memory: Uint8Array, ptr: number, isWide: boolean): ProcessStartupInfo | null => {
+    if (!ptr || !isValidAddress(ptr, STARTUPINFO_SIZE, 'r')) return null;
+    const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
+    const word = (offset: number): number => view.getUint32(ptr + offset, true);
+    return {
+        dwFlags: word(STARTUPINFO_OFFSETS.dwFlags),
+        wShowWindow: view.getUint16(ptr + STARTUPINFO_OFFSETS.wShowWindow, true),
+        dwX: view.getInt32(ptr + STARTUPINFO_OFFSETS.dwX, true),
+        dwY: view.getInt32(ptr + STARTUPINFO_OFFSETS.dwY, true),
+        dwXSize: view.getInt32(ptr + STARTUPINFO_OFFSETS.dwXSize, true),
+        dwYSize: view.getInt32(ptr + STARTUPINFO_OFFSETS.dwYSize, true),
+        desktop: readNullableProcessString(memory, word(STARTUPINFO_OFFSETS.lpDesktop), isWide),
+        title: readNullableProcessString(memory, word(STARTUPINFO_OFFSETS.lpTitle), isWide),
+    };
+};
+
+/**
+ * The child's own copies of lpDesktop/lpTitle, placed once per process.
+ *
+ * Windows keeps these strings for the life of the process, so a second GetStartupInfo
+ * has to hand back the same addresses rather than allocating another pair. The block
+ * lives in the session-state store, which is what makes it go away with the image it
+ * points into.
+ */
+const startupStrings = (memory: Uint8Array, info: ProcessStartupInfo, isWide: boolean): { desktop: number; title: number } => {
+    const key = (isWide ? 'w:' : 'a:') + info.desktop + '\u0000' + info.title;
+    return cachedStartupStrings(key, () => {
+        const owner = System.getInstance().process;
+        const place = (text: string): number => {
+            if (!text || !owner) return 0;
+            const size = isWide ? (text.length + 1) * 2 : text.length + 1;
+            try {
+                const at = owner.memory.alloc(size, 'THUNK_DATA', 'rw');
+                if (!at) return 0;
+                if (isWide) Marshaler.writeWideString(memory, at, text);
+                else Marshaler.writeString(memory, at, text);
+                return at;
+            } catch { return 0; }
+        };
+        return { desktop: place(info.desktop), title: place(info.title) };
+    });
+};
+
+/**
+ * GetStartupInfoA/W: the parent's copy, cb set.
+ *
+ * A process this build booted directly has no parent, so it gets what Windows gives an
+ * Explorer start: cb filled, dwFlags 0 and every other field zero.
+ */
+const writeStartupInfo = (memory: Uint8Array, ptr: number, isWide: boolean): void => {
+    if (!ptr || ptr + STARTUPINFO_SIZE > memory.length) return;
+    const info = getProcessStartupInfo();
+    const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
+    memory.fill(0, ptr, ptr + STARTUPINFO_SIZE);
+    view.setUint32(ptr + STARTUPINFO_OFFSETS.cb, STARTUPINFO_SIZE, true);
+    if (!info) return;
+    view.setUint32(ptr + STARTUPINFO_OFFSETS.dwFlags, info.dwFlags, true);
+    view.setUint16(ptr + STARTUPINFO_OFFSETS.wShowWindow, info.wShowWindow, true);
+    view.setInt32(ptr + STARTUPINFO_OFFSETS.dwX, info.dwX, true);
+    view.setInt32(ptr + STARTUPINFO_OFFSETS.dwY, info.dwY, true);
+    view.setInt32(ptr + STARTUPINFO_OFFSETS.dwXSize, info.dwXSize, true);
+    view.setInt32(ptr + STARTUPINFO_OFFSETS.dwYSize, info.dwYSize, true);
+    const strings = startupStrings(memory, info, isWide);
+    view.setUint32(ptr + STARTUPINFO_OFFSETS.lpDesktop, strings.desktop, true);
+    view.setUint32(ptr + STARTUPINFO_OFFSETS.lpTitle, strings.title, true);
+};
+
 /** argv[0] of a Win32 command line: a quoted run, else up to the first space. */
 export const firstCommandLineToken = (commandLine: string): string => {
     const s = commandLine.trimStart();
@@ -455,6 +554,7 @@ const isKnownProcessHandle = (handle: number): boolean => {
     return getVirtualProcessManager().hasProcessHandle(handle >>> 0);
 };
 
+// @refuse(child process images are not part of a v1 savestate)
 const virtualProcessMemoryByPid = new Map<number, Map<number, number>>();
 
 const getVirtualProcessPid = (handle: number): number | null => {
@@ -493,6 +593,7 @@ interface ChildImageMap {
     /** RVA -> file offset for the section containing it, or -1 when it maps to no raw bytes. */
     sections: Array<{ va: number; vsize: number; raw: number; rawSize: number }>;
 }
+// @refuse(child process images are not part of a v1 savestate)
 const childImageByPid = new Map<number, ChildImageMap | null>();
 
 const loadChildImage = (path: string): ChildImageMap | null => {
@@ -685,8 +786,10 @@ const failVirtualProcess = (
     currentDirectory: string,
     isWide: boolean,
     errorCode: number,
+    errOut?: { code: number },
 ): ThunkResult => {
     writeProcessInformationZeroed(lpProcessInformation);
+    if (errOut) errOut.code = errorCode;
     System.getInstance().scheduler.setLastError(errorCode);
     Logger.warn(
         LogCategory.KERNEL32,
@@ -696,26 +799,179 @@ const failVirtualProcess = (
     return { value: 0, stackCleanup: 40 };
 };
 
+/** The Windows directories CreateProcess probes after the application directory. */
+const WINDOWS_DIRS = [SYSTEM32_DIR, 'C:\\WINDOWS\\SYSTEM\\', 'C:\\WINDOWS\\'];
+
+export interface CommandLineImage {
+    /** The resolved image to start, or "" when no prefix names an executable. */
+    imagePath: string;
+    /** Everything that followed the image token on the command line. */
+    reExecArgs: string;
+    /** The error CreateProcess must report when the image cannot be started. */
+    error: number;
+}
+
+/**
+ * The directories CreateProcess probes for a module named without a path
+ * (lpApplicationName = NULL, which is how WinExec calls it), in the documented
+ * order: the directory the parent's application was loaded from, the parent's
+ * current directory, the Windows system directories, then PATH from the parent's
+ * environment. The parent's current directory is `system.fileSystem.currentDir` —
+ * lpCurrentDirectory is the *child's* working directory, is not part of the
+ * search, and is only passed through to the child.
+ */
+export function imageSearchDirectories(system: System): string[] {
+    const dirs: string[] = [];
+    const push = (d: string): void => {
+        const w = d.trim().replace(/\//g, '\\');
+        if (!w) return;
+        const s = w.endsWith('\\') ? w : `${w}\\`;
+        if (!dirs.some((x) => x.toLowerCase() === s.toLowerCase())) dirs.push(s);
+    };
+    const self = system.executablePath.replace(/\//g, '\\');
+    push(self.slice(0, self.lastIndexOf('\\') + 1));
+    push(system.fileSystem.currentDir);
+    for (const dir of WINDOWS_DIRS) push(dir);
+    for (const [key, value] of system.process?.environment ?? []) {
+        if (key.toLowerCase() !== 'path') continue;
+        for (const dir of value.split(';')) push(dir);
+    }
+    return dirs;
+}
+
+/** A final path component with a period names the extension Windows takes literally. */
+// Windows accepts either separator in a module name, so the file name starts after
+// the last of them: with `C:/System/my.app/helper` only looking for a backslash
+// reads the dot in the directory as an extension and skips appending `.exe`.
+const hasFileExtension = (name: string): boolean =>
+    name.slice(Math.max(name.lastIndexOf('\\'), name.lastIndexOf('/')) + 1).includes('.');
+
+/**
+ * Resolve the image a bare command line (lpApplicationName = NULL) names, the way
+ * CreateProcess does: each space-separated prefix of the command line is tried in
+ * turn, shortest first; a name without an extension gets `.exe` appended; and a name
+ * without a path is looked up in the documented directory order. The first prefix
+ * that names an existing executable wins and carries the rest of the line as its
+ * arguments; when none does, the error distinguishes a missing directory
+ * (ERROR_PATH_NOT_FOUND) from a missing image (ERROR_FILE_NOT_FOUND) from a file
+ * that exists but is not executable (ERROR_BAD_EXE_FORMAT).
+ */
+export function resolveCommandLineImage(system: System, commandLine: string): CommandLineImage {
+    const line = commandLine.trimStart();
+    if (!line) return { imagePath: "", reExecArgs: "", error: ERROR_FILE_NOT_FOUND };
+    // The prefixes to try: a quoted run is one candidate; otherwise every
+    // space-separated prefix, shortest first, exactly as the documented example
+    // walks `c:\program files\sub dir\program name`.
+    const prefixes: { name: string; args: string }[] = [];
+    if (line.startsWith('"')) {
+        const end = line.indexOf('"', 1);
+        prefixes.push({
+            name: end < 0 ? line.slice(1) : line.slice(1, end),
+            args: end < 0 ? '' : line.slice(end + 1).trimStart(),
+        });
+    } else {
+        // Each prefix is a slice of the line as written, not a rebuild of it. A directory
+        // may contain a run of spaces (`c:\program  files`), and rejoining tokens with a
+        // single separator would probe a path that does not exist while the real one is
+        // skipped. A prefix that ends inside a whitespace run cannot name a file at all
+        // (Windows forbids trailing spaces in a name), so the walk resumes at the next
+        // token instead of trying it.
+        let start = 0;
+        for (;;) {
+            let end = start;
+            while (end < line.length && !/\s/.test(line.charAt(end))) end++;
+            if (end > start) prefixes.push({ name: line.slice(0, end), args: line.slice(end).trimStart() });
+            if (end >= line.length) break;
+            while (end < line.length && /\s/.test(line.charAt(end))) end++;
+            if (end >= line.length) break;
+            start = end;
+        }
+    }
+    const dirs = imageSearchDirectories(system);
+    let badFormat = false;
+    const probe = (name: string): string | null => {
+        const candidates = /^[a-z]:[\\/]/i.test(name) || /^[\\/]/.test(name)
+            ? [name]
+            : dirs.map((dir) => dir + name);
+        for (const candidate of candidates) {
+            const path = system.resolveImagePath(candidate, "");
+            if (!path) continue;
+            if (isBundledImage(path)) return path;
+            if (system.fileSystem.fileExists(path)) badFormat = true;
+        }
+        return null;
+    };
+    // The lpCommandLine remark says ".exe is not appended if the file name contains
+    // a path", but the documented `c:\program files\sub dir\program name` example on
+    // the same page only resolves when it is appended (Wine appends it too). Follow
+    // the example and append; otherwise this line looks like the bug to fix.
+    for (const prefix of prefixes) {
+        const name = prefix.name;
+        if (!name) continue;
+        const found = probe(hasFileExtension(name) ? name : `${name}.exe`);
+        if (found) return { imagePath: found, reExecArgs: prefix.args, error: 0 };
+    }
+    // Path-vs-file is decided from the module-name candidate alone — the quoted
+    // name, or the first token of an unquoted line. The later prefixes are
+    // speculative re-splits that already contain arguments: for WinExec("setup /S")
+    // the prefix "setup /S" contains a separator, and reading it as a path would
+    // report ERROR_PATH_NOT_FOUND where Windows reports ERROR_FILE_NOT_FOUND. A
+    // module candidate whose directory does not exist is a path error — the
+    // documented WinExec("C:\Missing\Dir\x.exe") case.
+    let pathNotFound = false;
+    const moduleName = prefixes[0]?.name ?? '';
+    if (/[\\/]/.test(moduleName)) {
+        const sep = Math.max(moduleName.lastIndexOf('\\'), moduleName.lastIndexOf('/'));
+        if (sep > 0 && !system.fileSystem.directoryExists(moduleName.slice(0, sep))) pathNotFound = true;
+    }
+    return {
+        imagePath: "", reExecArgs: "",
+        error: pathNotFound ? ERROR_PATH_NOT_FOUND : badFormat ? ERROR_BAD_EXE_FORMAT : ERROR_FILE_NOT_FOUND,
+    };
+}
+
 const CREATE_SUSPENDED = 0x00000004;
 
 // Image lookup remains process-local while a real child Worker owns execution.
+// @refuse(child process images are not part of a v1 savestate)
 const childImagePathsByPid = new Map<number, string>();
+
+/** CreateProcess's inheritance arguments: bInheritHandles and the two SECURITY_ATTRIBUTES. */
+interface ProcessInheritance { inheritHandles: boolean; lpProcessAttributes: number; lpThreadAttributes: number; }
 
 const finishVirtualProcess = (
     lpProcessInformation: number, applicationName: string, commandLine: string,
     currentDirectory: string, dwCreationFlags: number, isWide: boolean,
     childRequest?: ChildProcessRequest, childBackend: 'worker' | 'host' = 'worker',
+    errOut?: { code: number }, inheritance?: ProcessInheritance,
 ): ThunkResult | Promise<ThunkResult> => {
     const system = System.getInstance(), manager = getVirtualProcessManager();
     const ownerThread = system.scheduler.getCurrentThreadId();
     const ownerProcess = system.process, ownerGeneration = ownerProcess?.resetGeneration;
     const ownerCurrent = (): boolean => !system.isExiting && system.process === ownerProcess && ownerProcess?.resetGeneration === ownerGeneration;
     const proc = manager.createProcess({
-        applicationName, commandLine, currentDirectory, creationFlags: dwCreationFlags, runtimeBacked: !!childRequest,
+        applicationName, commandLine, currentDirectory, creationFlags: dwCreationFlags,
+        runtimeBacked: !!childRequest, imagePath: childRequest?.imagePath,
     });
+    if (inheritance) {
+        // The child's table is filled from the parent's BEFORE its own process/thread
+        // handles exist, so those two are never among what it inherits.
+        if (inheritance.inheritHandles && childRequest && childBackend === 'worker') {
+            childRequest.inheritedHandles = collectInheritedHandles(proc.processId, [proc.processHandle, proc.threadHandle]);
+        }
+        // lpProcessAttributes/lpThreadAttributes decide whether THESE handles can be
+        // inherited by the next child the caller starts.
+        applyInheritFlag(proc.processHandle, inheritance.lpProcessAttributes);
+        applyInheritFlag(proc.threadHandle, inheritance.lpThreadAttributes);
+    }
     const setError = (code: number): void => {
         if (system.scheduler.getCurrentThreadId() === ownerThread) system.scheduler.setLastError(code);
         else system.scheduler.setLastErrorForThread(ownerThread, code);
+        // errOut travels with the result, because the thread that reads GetLastError
+        // when the promise settles need not be the one that recorded it. Every path
+        // that reports a code goes through here, so none of them can miss it; a
+        // successful publish leaves 0, which callers already read as "fall through".
+        if (errOut) errOut.code = code;
     };
     const publish = (): ThunkResult => {
         if (!ownerCurrent()) return { value: 0, stackCleanup: 40 };
@@ -744,17 +1000,31 @@ const finishVirtualProcess = (
         system.resourceProvider.unregisterKernelObject(proc.threadHandle);
         system.resourceProvider.unregisterKernelObject(proc.processHandle);
         writeProcessInformationZeroed(lpProcessInformation);
-        setError(193);
+        // A child that could not load or prepare its image reads as 193 BAD_EXE_FORMAT;
+        // a start that failed for a condition Windows names reports it through
+        // win32Error instead (child-process.ts is the only producer). Reading a
+        // duck-typed `code` would also match DOMException's legacy numeric codes
+        // (NotFoundError = 8, DataCloneError = 25), turning a VFS or postMessage failure
+        // during start into an errno Win32 never produced.
+        setError(win32ErrorOf(error) ?? ERROR_BAD_EXE_FORMAT);
         Logger.warn(LogCategory.SYSTEM, 'Child image preparation failed: ' + String(error));
         return { value: 0, stackCleanup: 40 };
     });
 };
 
-const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolean): ThunkResult | Promise<ThunkResult> => {
+// errOut, when given, receives the error code the failure path reported — WinExec
+// must map that exact code, and a threadless harness cannot read it back from the
+// scheduler, so the value travels with the result instead of through the thread.
+const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolean,
+    errOut?: { code: number }, startupOverride?: ProcessStartupInfo): ThunkResult | Promise<ThunkResult> => {
     const lpApplicationName = args[0] >>> 0;
     const lpCommandLine = args[1] >>> 0;
+    const inheritance: ProcessInheritance = {
+        lpProcessAttributes: args[2] >>> 0, lpThreadAttributes: args[3] >>> 0, inheritHandles: (args[4] >>> 0) !== 0,
+    };
     const dwCreationFlags = args[5] >>> 0;
     const lpCurrentDirectory = args[7] >>> 0;
+    const lpStartupInfo = args[8] >>> 0;
     const lpProcessInformation = args[9] >>> 0;
 
     const applicationName = readNullableProcessString(memory, lpApplicationName, isWide);
@@ -762,24 +1032,35 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
     const currentDirectory = readNullableProcessString(memory, lpCurrentDirectory, isWide);
 
     if (!lpProcessInformation || !isValidAddress(lpProcessInformation, 16, 'rw')) {
+        if (errOut) errOut.code = ERROR_INVALID_PARAMETER;
         System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
         return { value: 0, stackCleanup: 40 };
     }
 
     if (!applicationName && !commandLine) {
         writeProcessInformationZeroed(lpProcessInformation);
+        if (errOut) errOut.code = ERROR_INVALID_PARAMETER;
         System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
         return { value: 0, stackCleanup: 40 };
     }
 
     // lpApplicationName may be NULL, in which case the image is argv[0] of the command
     // line and the arguments are what follows it, the split CreateProcess itself performs.
+    // For a bare command line the split follows the documented lookup: prefixes tried
+    // shortest first, `.exe` appended to extensionless names, pathless names probed in
+    // the documented directory order. With an explicit lpApplicationName the name is
+    // taken literally — Windows does not append `.exe` and does not search.
     const system = System.getInstance();
-    const argv0 = applicationName || firstCommandLineToken(commandLine || "");
-    const reExecArgs = applicationName
-        ? (commandLine || "")
-        : stripFirstCommandLineToken(commandLine || "");
-    const imagePath = argv0 ? system.resolveImagePath(argv0, currentDirectory || "") : "";
+    let imagePath: string, reExecArgs: string, lookupError = ERROR_FILE_NOT_FOUND;
+    if (applicationName) {
+        imagePath = system.resolveImagePath(applicationName, currentDirectory || "");
+        reExecArgs = commandLine || "";
+    } else {
+        const resolved = resolveCommandLineImage(system, commandLine || "");
+        imagePath = resolved.imagePath;
+        reExecArgs = resolved.reExecArgs;
+        lookupError = resolved.error;
+    }
     const startSuspended = (dwCreationFlags & CREATE_SUSPENDED) !== 0;
     const isConsoleTool = !!imagePath && isBundledImage(imagePath) && isConsoleSubsystemImage(imagePath);
     if (imagePath && isBundledImage(imagePath)) {
@@ -790,12 +1071,17 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
                 currentDirectory: currentDirectory || system.fileSystem.currentDir,
                 rawCommandLine: commandLine || applicationName,
                 environment: system.process ? [...system.process.environment] : undefined,
+                // Copied here, while the caller's memory is still readable: a child
+                // cannot follow a pointer into the parent's address space. WinExec has
+                // no caller structure to read, so it passes the one it would have built.
+                startupInfo: startupOverride ?? readStartupInfo(memory, lpStartupInfo, isWide) ?? undefined,
             },
             !startSuspended && isConsoleTool && hostToolsEnabled() ? 'host' : 'worker',
+            errOut, inheritance,
         );
     }
     return failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide,
-        imagePath && system.fileSystem.fileExists(imagePath) ? 193 : 2); // BAD_EXE_FORMAT / FILE_NOT_FOUND
+        imagePath && system.fileSystem.fileExists(imagePath) ? ERROR_BAD_EXE_FORMAT : lookupError, errOut); // BAD_EXE_FORMAT / FILE_NOT_FOUND / PATH_NOT_FOUND
 };
 
 /**
@@ -934,9 +1220,13 @@ function fillVersionExW(mem: Uint8Array, lpVersionInfo: number, apiName: string)
     return 1;
 }
 
+// @transient(diagnostics)
 let rpmCalls = 0;
+// @transient(diagnostics)
 let lastRpmLog = 0;
+// @transient(diagnostics)
 let rpmPartial = 0;
+// @transient(diagnostics)
 let lastRpmPartialLog = 0;
 
 export const exports: Record<string, ThunkImplementation> = {
@@ -1010,24 +1300,13 @@ export const exports: Record<string, ThunkImplementation> = {
     },
 
     'GetStartupInfoW': (ctx, mem, args) => {
-        const lpStartupInfo = args[0];
-        // Clear the structure (size is 68 bytes for STARTUPINFOW)
-        if (lpStartupInfo && lpStartupInfo + 68 <= mem.length) {
-            mem.fill(0, lpStartupInfo, lpStartupInfo + 68);
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(lpStartupInfo, 68, true); // cb
-        }
+        // The parent's copy, or the zeroed structure Windows gives a direct launch.
+        writeStartupInfo(mem, args[0] >>> 0, true);
         return { value: 0, stackCleanup: 4 };
     },
 
     'GetStartupInfoA': (ctx, mem, args) => {
-        const lpStartupInfo = args[0];
-        // Clear the structure (size is 68 bytes for STARTUPINFOA)
-        if (lpStartupInfo && lpStartupInfo + 68 <= mem.length) {
-            mem.fill(0, lpStartupInfo, lpStartupInfo + 68);
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(lpStartupInfo, 68, true); // cb
-        }
+        writeStartupInfo(mem, args[0] >>> 0, false);
         return { value: 0, stackCleanup: 4 };
     },
 
@@ -1093,6 +1372,7 @@ export const exports: Record<string, ThunkImplementation> = {
     // so an error must never leak out as a value that reads as success.
     'WinExec': (ctx, mem, args): ThunkResult | Promise<ThunkResult> => {
         const lpCmdLine = args[0] >>> 0;
+        const uCmdShow = args[1] >>> 0;
         const system = System.getInstance();
         const ownerProcess = system.process;
         let processInfo = 0;
@@ -1111,10 +1391,41 @@ export const exports: Record<string, ThunkImplementation> = {
             release();
             return { value: 33, stackCleanup: 8 };
         };
-        const result = createVirtualProcess(mem, [0, lpCmdLine, 0, 0, 0, 0, 0, 0, 0, processInfo], false);
-        if (result instanceof Promise) return result.then(r => toWinExec(r, ERROR_BAD_FORMAT));
-        const error = system.scheduler.getLastError();
-        return toWinExec(result, error === 193 ? ERROR_BAD_FORMAT : error === ERROR_PATH_NOT_FOUND ? ERROR_PATH_NOT_FOUND : ERROR_FILE_NOT_FOUND);
+        const errOut = { code: 0 };
+        // WinExec is CreateProcess with the caller's window state folded into
+        // STARTUPINFO: dwFlags says wShowWindow is meaningful, wShowWindow is uCmdShow.
+        // Wine builds exactly this on the stack (dlls/kernel32/process.c) before calling
+        // CreateProcess, so it is passed as a value here rather than placed in guest memory.
+        const startupInfo: ProcessStartupInfo = {
+            dwFlags: STARTF_USESHOWWINDOW, wShowWindow: uCmdShow & 0xFFFF,
+            dwX: 0, dwY: 0, dwXSize: 0, dwYSize: 0, desktop: '', title: '',
+        };
+        const result = createVirtualProcess(mem, [0, lpCmdLine, 0, 0, 0, 0, 0, 0, 0, processInfo], false, errOut, startupInfo);
+        // WinExec's return value doubles as its error code: anything under 32 is the
+        // GetLastError of the failed CreateProcess, anything else means failure.
+        // Wine (dlls/kernel32/process.c) therefore hands back the recorded code as it
+        // is when it is below 32 - access denied (5) stays 5 - and falls back to its
+        // own ERROR_BAD_FORMAT for the rest, which is where 193 BAD_EXE_FORMAT from a
+        // child that could not load its image ends up.
+        const toFailure = (code: number): number =>
+            code > 0 && code < 32 ? code : ERROR_BAD_FORMAT;
+        if (result instanceof Promise) {
+            return result.then(
+                // A child whose start fails resolves with value 0 and its code
+                // recorded (errOut, or the thread's last error). Map that code the
+                // same way the synchronous branch does, instead of assuming every
+                // asynchronous failure is a bad image.
+                r => toWinExec(r, toFailure(errOut.code || system.scheduler.getLastError())),
+                (): ThunkResult => {
+                    // A rejected child start must not surface as an unhandled rejection:
+                    // report the last error the failed start recorded, from errOut when
+                    // the failure path got that far.
+                    release();
+                    return { value: toFailure(errOut.code || system.scheduler.getLastError()), stackCleanup: 8 };
+                },
+            );
+        }
+        return toWinExec(result, toFailure(errOut.code || system.scheduler.getLastError()));
     },
 
     // CreateProcessAsUser* = CreateProcess* with hToken prepended (11 args).
@@ -1140,12 +1451,27 @@ export const exports: Record<string, ThunkImplementation> = {
         return { value: 0, terminated: true };
     },
 
-    'TerminateProcess': (ctx, mem, args): ThunkResult => {
+    'TerminateProcess': (ctx, mem, args): ThunkResult | Promise<ThunkResult> => {
         const hProcess = args[0] >>> 0;
         const exitCode = args[1] >>> 0;
 
         if (hProcess === CURRENT_PROCESS_PSEUDO_HANDLE) {
             return shutdownProcess(exitCode);
+        }
+
+        // An inherited handle to a process another worker runs: only the process holding
+        // that runtime can stop it. One that already exited cannot be terminated again
+        // (Wine: STATUS_PROCESS_IS_TERMINATING -> ERROR_ACCESS_DENIED).
+        const foreign = getVirtualProcessManager().foreignProcessOf(hProcess);
+        if (foreign) {
+            const system = System.getInstance(), caller = system.scheduler.getCurrentThreadId();
+            const denied = (): ThunkResult => {
+                system.scheduler.setLastErrorForThread(caller, ERROR_ACCESS_DENIED);
+                return { value: 0, stackCleanup: 8 };
+            };
+            if (foreign.terminated) return denied();
+            return terminateForeignProcess(foreign.pid, foreign.ownerPid, exitCode)
+                .then((ok): ThunkResult => ok ? { value: 1, stackCleanup: 8 } : denied());
         }
 
         const terminated = getVirtualProcessManager().terminateProcess(hProcess, exitCode);
@@ -1680,6 +2006,13 @@ export const exports: Record<string, ThunkImplementation> = {
             }
         }
 
+        // A handle this call created carries the caller's bInheritHandle — the usual way a
+        // launcher hands its OWN process handle to a child is DuplicateHandle(GetCurrentProcess(),
+        // GetCurrentProcess(), ..., bInheritHandle = TRUE) followed by an inheriting CreateProcess.
+        if (targetHandle !== hSourceHandle && targetHandle !== CURRENT_PROCESS && targetHandle !== CURRENT_THREAD) {
+            System.getInstance().resourceProvider.setHandleFlags(targetHandle >>> 0, 1, _bInheritHandle ? 1 : 0);
+        }
+
         // Write the target handle to the output parameter
         if (lpTargetHandle !== 0 && lpTargetHandle + 4 <= mem.length) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -2154,6 +2487,7 @@ export const exports: Record<string, ThunkImplementation> = {
             `OpenProcess(access=0x${dwDesiredAccess.toString(16)}, inherit=${bInheritHandle}, pid=${dwProcessId})`);
         const handle = manager.openProcessById(dwProcessId >>> 0);
         if (handle !== 0) {
+            if (bInheritHandle) System.getInstance().resourceProvider.setHandleFlags(handle >>> 0, 1, 1);
             Logger.log(
                 LogCategory.KERNEL32,
                 `OpenProcess(pid=${dwProcessId}) -> 0x${(handle >>> 0).toString(16)}`
@@ -2173,6 +2507,7 @@ export const exports: Record<string, ThunkImplementation> = {
             `OpenThread(access=0x${dwDesiredAccess.toString(16)}, inherit=${bInheritHandle}, tid=${dwThreadId})`);
         const handle = manager.openThreadById(dwThreadId >>> 0);
         if (handle !== 0) {
+            if (bInheritHandle) System.getInstance().resourceProvider.setHandleFlags(handle >>> 0, 1, 1);
             Logger.log(
                 LogCategory.KERNEL32,
                 `OpenThread(tid=${dwThreadId}) -> 0x${(handle >>> 0).toString(16)}`
@@ -2537,6 +2872,19 @@ export const exports: Record<string, ThunkImplementation> = {
  */
 export function registerFastPathProcessFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
+
+    // HANDLE GetCurrentThread(void) — stdcall, RET 0. The constant pseudo-handle.
+    dispatcher.registerFastPath('kernel32', 'GetCurrentThread', (): number | null =>
+        System.getInstance().scheduler?.getCurrentThreadHandle() ?? null);
+
+    // BOOL TlsSetValue(DWORD dwTlsIndex, LPVOID lpTlsValue) — stdcall, RET 8. A refused
+    // index defers to the slow path, which owns the failure result.
+    dispatcher.registerFastPath('kernel32', 'TlsSetValue', (esp: number, view: DataView, mem8: Uint8Array): number | null => {
+        if (esp + 12 > mem8.length) return null;
+        const sched = System.getInstance().scheduler;
+        if (!sched) return null;
+        return sched.tlsSetValue(view.getUint32(esp + 4, true), view.getUint32(esp + 8, true)) ? 1 : null;
+    });
 
     // DWORD SuspendThread(HANDLE hThread) — stdcall, RET 4. Returns prev suspend count.
     dispatcher.registerFastPath('kernel32', 'SuspendThread', (esp: number, _view: DataView, mem8: Uint8Array): number | null => {

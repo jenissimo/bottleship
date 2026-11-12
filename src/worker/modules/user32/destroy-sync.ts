@@ -25,6 +25,8 @@ const WM_NCDESTROY = 0x0082;
 interface DeliverAction {
     hwnd: number;
     msg: number;
+    wParam: number;
+    lParam: number;
     /** Finalize (remove from maps) this hwnd after the callback completes. */
     finalizeAfter: boolean;
     /** False for a window with no guest procedure: it is only finalized, in order. */
@@ -45,6 +47,8 @@ export interface SyncDestroySuspendResult {
  * least one guest callback was scheduled; otherwise runs `afterAll` and returns null (the
  * caller should then just return).
  * `afterAll` (owner reactivation, etc.) runs once all destroy deliveries complete.
+ * `sentFirst` are messages Windows sends before WM_DESTROY while the window still exists
+ * (the deactivation when nothing takes over its activation — deactivateWithoutSuccessor).
  */
 export function beginSyncDestroyDelivery(
     ctx: any,
@@ -53,6 +57,7 @@ export function beginSyncDestroyDelivery(
     finalize: (hwnd: number) => void,
     stackCleanup: number,
     afterAll?: () => void,
+    sentFirst: ReadonlyArray<{ hwnd: number; msg: number; wParam: number; lParam: number }> = [],
 ): SyncDestroySuspendResult | null {
     if (!windows.get(rootHwnd)) { afterAll?.(); return null; }
 
@@ -85,11 +90,16 @@ export function beginSyncDestroyDelivery(
         return !!wi && !!wndProc && !isSentinelWndProc(wndProc) && (!wi.isSystemControl || !!wi.wndProcSubclassed);
     };
     const actions: DeliverAction[] = [];
+    for (const s of sentFirst) {
+        if (hasGuestProc(s.hwnd)) {
+            actions.push({ hwnd: s.hwnd, msg: s.msg, wParam: s.wParam, lParam: s.lParam, finalizeAfter: false, deliver: true });
+        }
+    }
     for (const h of preOrder) {
-        if (hasGuestProc(h)) actions.push({ hwnd: h, msg: WM_DESTROY, finalizeAfter: false, deliver: true });
+        if (hasGuestProc(h)) actions.push({ hwnd: h, msg: WM_DESTROY, wParam: 0, lParam: 0, finalizeAfter: false, deliver: true });
     }
     for (const h of postOrder) {
-        actions.push({ hwnd: h, msg: WM_NCDESTROY, finalizeAfter: true, deliver: hasGuestProc(h) });
+        actions.push({ hwnd: h, msg: WM_NCDESTROY, wParam: 0, lParam: 0, finalizeAfter: true, deliver: hasGuestProc(h) });
     }
 
     if (!actions.some(a => a.deliver)) {
@@ -131,7 +141,7 @@ export function beginSyncDestroyDelivery(
             Logger.verbose(LogCategory.USER32,
                 `deliverDestroy: hwnd=0x${a.hwnd.toString(16)} msg=0x${a.msg.toString(16)} wndProc=0x${wndProc.toString(16)}`);
             callbackManager.invokeCallback(
-                wndProc, [a.hwnd, a.msg, 0, 0], 0,
+                wndProc, [a.hwnd, a.msg, a.wParam, a.lParam], 0,
                 completeAndAdvance, false, 'sync-destroy', frameId);
             return null;
         }
@@ -152,7 +162,7 @@ export function beginSyncDestroyDelivery(
         Logger.verbose(LogCategory.USER32,
             `deliverDestroy: hwnd=0x${a.hwnd.toString(16)} msg=0x${a.msg.toString(16)} wndProc=0x${wndProc.toString(16)}`);
         const r = callbackManager.invokeCallback(
-            wndProc, [a.hwnd, a.msg, 0, 0], 0,
+            wndProc, [a.hwnd, a.msg, a.wParam, a.lParam], 0,
             completeAndAdvance, false, 'sync-destroy', frameId);
         firstCallbackId = r.callbackId;
         break;

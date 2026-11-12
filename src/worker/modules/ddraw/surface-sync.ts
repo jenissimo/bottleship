@@ -323,6 +323,7 @@ interface PooledReadbackBuffer {
     size: number;
     busy: boolean;
 }
+// @transient(host GPU buffers)
 const readbackBufferPool = new WeakMap<object, PooledReadbackBuffer>();
 
 /** Acquire a readback buffer for `state`; `release()` unmaps it and returns it to the
@@ -398,6 +399,7 @@ registerSurfaceTeardownHook(releaseReadbackBufferPool);
 /** Last version each surface was actually read back at, for the redundancy assertion.
  *  Separate from `cpuSyncedVersion` on purpose: this one is never cleared by the
  *  memo-invalidating paths, so it can still catch a memo that stopped working. */
+// @transient(readback bookkeeping keyed by live surface objects; a restored surface starts CPU-authoritative)
 const lastGpuReadbackVersion = new WeakMap<object, number>();
 
 /** Count a real GPU→CPU round trip and assert it is not a repeat of one we already did
@@ -1202,6 +1204,9 @@ export class SurfaceSyncManager {
             // below belong to this version even if another writer advances the state
             // while mapAsync is pending.
             const readbackVersion = state.version;
+            const readbackPtr = state.surfacePtr;
+            const guestMemoryStillThisVersion = (): boolean =>
+                state.version === readbackVersion && state.surfacePtr === readbackPtr;
 
             // The Lock's rect, or the whole surface. A PARTIAL download must never record
             // cpuSyncedVersion: the memo claims every byte of this version is in guest
@@ -1273,6 +1278,7 @@ export class SurfaceSyncManager {
                                 `(bounds=${inBounds}, thunk=${overlapsThunkCode(regionPtr, writeSpan)})`);
                             return false;
                         }
+                        if (!guestMemoryStillThisVersion()) return true;
                         compareStaleServe(state, readbackVersion, memNow, regionPtr, pitch,
                             mapped, rowBytes, rows, bytesPerPixel);
                         landRegionRows(mapped, rowBytes, rows, memNow, regionPtr, pitch);
@@ -1340,6 +1346,10 @@ export class SurfaceSyncManager {
             Logger.log(LogCategory.DDRAW,
                 `syncToCPU: mapAsync completed in ${(afterMap - beforeWait).toFixed(2)}ms`
             );
+            if (!guestMemoryStillThisVersion()) {
+                releaseReadback();
+                return false;
+            }
             const mapped = new Uint8Array(readback.getMappedRange());
 
             const copyConvertToken = profiler.startToken("syncToCPU:copyConvert");
@@ -1466,6 +1476,7 @@ export class SurfaceSyncManager {
 }
 
 // Singleton instance
+// @transient(stateless helper)
 export const surfaceSyncManager = new SurfaceSyncManager();
 
 /**

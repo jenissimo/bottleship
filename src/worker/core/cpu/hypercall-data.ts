@@ -69,6 +69,9 @@ const OFF_HC_RAND_SEED = 0x0B0;
 // authoritative at all times: published at init, on every capture mutation, and on
 // buffer-change resync (rewriteState).
 const OFF_HC_CAPTURE_HWND = 0x0B4;
+/** One byte per TEB TLS-array slot: the scheduler's TlsAlloc set, read by TlsSetValue. */
+const OFF_HC_TLS_ALLOCATED = 0x0B8;
+const HC_TLS_SLOT_COUNT = 64;
 const OFF_HC_DISPATCH_TABLE = 0x100;
 const OFF_HC_DISPATCH_TABLE_EXT = 0x4000;
 const HC_DISPATCH_LIMIT = 0x10000;
@@ -144,6 +147,7 @@ const HANDLER_MEMCMP = 62;
 // the matching ABI (see BULK_MEMORY_HANDLERS below).
 const HANDLER_MEMMOVE = 84;
 const HANDLER_MEMCHR = 85;
+const HANDLER_TLS_SET_VALUE = 86;
 const BULK_MEMORY_HANDLERS = new Set([HANDLER_MEMMOVE, HANDLER_MEMCHR]);
 /** Must match `get_bulk_memory_abi()` in vendor/v86/src/rust/cpu/bulk_memory.rs. */
 const BULK_MEMORY_ABI = 1;
@@ -266,6 +270,9 @@ const HANDLER_MAP: Record<string, number> = {
     // skipped onThunkComplete the same as GetLastError. Hot via the CRT's _getptd().
     'kernel32.getcurrentthreadid': HANDLER_GET_CURRENT_THREAD_ID,
     'kernel32.tlsgetvalue': HANDLER_TLS_GET_VALUE,
+    // TlsSetValue — stores into the TEB TLS array (the scheduler's storage for slots
+    // 0..63). Unallocated and expansion indices fall through to the scheduler.
+    'kernel32.tlssetvalue': HANDLER_TLS_SET_VALUE,
     'kernel32.flsgetvalue': HANDLER_FLS_GET_VALUE,
     // Pointer validation via page probe (EA titles call these per-pointer in hot loops).
     // Read-only probe; falls back to JS on any probe fault (decommit/CoW disambiguation).
@@ -466,6 +473,22 @@ export function interpolatedClockCeilingUs(
     return publishedBaseUs + Math.floor(deltaInsn / mips);
 }
 
+export interface HypercallState {
+    registered: number[][];
+    enabled: boolean;
+    slabControlAddr: number;
+    mutexMirrorAddr: number;
+    eaglTokenCfgAddr: number;
+    eventTable: Uint8Array;
+    flsAllocated: Uint8Array;
+    flsValues: Array<[number, Uint32Array]>;
+    flsCurrentTid: number;
+    captureHwnd: number;
+    suspendSlots: number[][];
+    suspendTable: Uint8Array;
+    wasmStringWritersOff: boolean;
+}
+
 export class HypercallDataManager {
     private hpBase = 0;
     // Guest-RAM address of the slab control block (BASE/END/BUMP/GEN/counts/FREELIST[9]),
@@ -525,6 +548,8 @@ export class HypercallDataManager {
     // that v86.restart() zeroes: without a shadow, a buffer change would silently drop a
     // held capture to 0 and the WASM handler would keep answering 0 forever.
     private captureHwndShadow = 0;
+    // Scheduler's TlsAlloc set, kept so a restart (which zeroes the page) can republish it.
+    private readonly tlsAllocatedShadow = new Uint8Array(HC_TLS_SLOT_COUNT);
 
     private flsValuesFor(tid: number): Uint32Array {
         let v = this.flsValuesByThread.get(tid);
@@ -573,6 +598,7 @@ export class HypercallDataManager {
 
         this.view.setUint32(this.hpBase + OFF_HC_CAPTURE_HWND, this.captureHwndShadow, true);
 
+        this.writeTlsAllocatedState();
         this.writeFlsSharedState();
         this.writeEventMirrorState();
 
@@ -634,6 +660,56 @@ export class HypercallDataManager {
         return true;
     }
 
+    captureState(): HypercallState {
+        this.refreshViews();
+        const view = this.view;
+        if (!view) throw new Error('hypercall page: no view');
+        const page = (off: number, len: number) => new Uint8Array(view.buffer, this.hpBase + off, len).slice();
+        return {
+            registered: [...this.registeredEntries],
+            enabled: this.enabled,
+            slabControlAddr: this.slabControlAddr,
+            mutexMirrorAddr: this.mutexMirrorAddr,
+            eaglTokenCfgAddr: this.eaglTokenCfgAddr,
+            eventTable: page(OFF_HC_EVENT_TABLE, EVENT_TABLE_SLOTS),
+            flsAllocated: this.flsAllocatedShadow.slice(),
+            flsValues: [...this.flsValuesByThread].map(([tid, v]) => [tid, v.slice()]),
+            flsCurrentTid: this.flsCurrentTid,
+            captureHwnd: this.captureHwndShadow,
+            suspendSlots: [...this.threadSuspendSlots],
+            suspendTable: page(OFF_HC_THREAD_SUSPEND, HC_THREAD_SUSPEND_SLOTS * 8),
+            wasmStringWritersOff: this.wasmStringWritersOff,
+        };
+    }
+
+    restoreState(state: HypercallState): void {
+        this.refreshViews();
+        const view = this.view;
+        if (!view) throw new Error('hypercall page: no view');
+        this.registeredEntries = new Map(state.registered.map(([f, h]) => [f, h]));
+        this.slabControlAddr = state.slabControlAddr;
+        this.mutexMirrorAddr = state.mutexMirrorAddr;
+        this.eaglTokenCfgAddr = state.eaglTokenCfgAddr;
+        this.eventMirrorShadow.set(state.eventTable);
+        this.flsAllocatedShadow.set(state.flsAllocated);
+        this.flsValuesByThread.clear();
+        for (const [tid, v] of state.flsValues) this.flsValuesByThread.set(tid, v.slice());
+        this.flsCurrentTid = state.flsCurrentTid;
+        this.captureHwndShadow = state.captureHwnd;
+        this.wasmStringWritersOff = state.wasmStringWritersOff;
+        this.threadSuspendSlots.clear();
+        for (const [h, slot] of state.suspendSlots) this.threadSuspendSlots.set(h, slot);
+        new Uint8Array(view.buffer, this.hpBase + OFF_HC_THREAD_SUSPEND, HC_THREAD_SUSPEND_SLOTS * 8).set(state.suspendTable);
+        new Uint8Array(view.buffer, this.hpBase + OFF_HC_DISPATCH_TABLE, 4096).fill(0);
+        new Uint8Array(view.buffer, this.hpBase + OFF_HC_DISPATCH_TABLE_EXT, HC_DISPATCH_EXT_COUNT).fill(0);
+        this.mutexMirrorShadow.fill(0);
+        this.rewriteState();
+        this.writeEventMirrorState(false);
+        this.enabled = state.enabled;
+        view.setUint32(this.hpBase + OFF_HC_ENABLED, state.enabled ? 1 : 0, true);
+        this.resetInsnBaseline();
+    }
+
     /** Re-write all JS-owned state into HYPERCALL_PAGE after buffer change. */
     private rewriteState(): void {
         if (!this.view) return;
@@ -668,6 +744,7 @@ export class HypercallDataManager {
         // Capture owner — JS-owned, WASM never writes it, so the shadow is authoritative.
         this.view.setUint32(this.hpBase + OFF_HC_CAPTURE_HWND, this.captureHwndShadow, true);
 
+        this.writeTlsAllocatedState();
         this.writeFlsSharedState();
         this.writeEventMirrorState(true); // preserve WASM-set signal bits across buffer-change resync
         this.resyncPublishedClockAfterBufferChange();
@@ -677,11 +754,35 @@ export class HypercallDataManager {
             this.view.setUint32(this.hpBase + OFF_HC_ENABLED, 1, true);
             // Re-snapshot instruction counter and wall-clock — it may also have been reset
             this.lastInsnSnapshot = readRetiredInsns(this.cpu);
-            this.lastWallSnapshot = performance.now();
+            this.lastWallSnapshot = TimeService.getInstance().wallMs();
             Logger.log(LogCategory.SYSTEM,
                 `[HYPERCALL] Re-synced state after buffer change ` +
                 `(${this.registeredEntries.size} handlers, enabled=true)`);
         }
+    }
+
+    private writeTlsAllocatedState(): void {
+        if (!this.view) return;
+        for (let i = 0; i < HC_TLS_SLOT_COUNT; i++) {
+            this.view.setUint8(this.hpBase + OFF_HC_TLS_ALLOCATED + i, this.tlsAllocatedShadow[i]!);
+        }
+    }
+
+    /** Mirror one scheduler TlsAlloc/TlsFree. Indices past the TEB array are never published,
+     *  so the WASM TlsSetValue declines them. */
+    setTlsSlotAllocated(index: number, allocated: boolean): void {
+        if (index < 0 || index >= HC_TLS_SLOT_COUNT) return;
+        this.tlsAllocatedShadow[index] = allocated ? 1 : 0;
+        this.refreshViews();
+        if (!this.view || this.hpBase === 0) return;
+        this.view.setUint8(this.hpBase + OFF_HC_TLS_ALLOCATED + index, this.tlsAllocatedShadow[index]!);
+    }
+
+    clearTlsSlotsAllocated(): void {
+        this.tlsAllocatedShadow.fill(0);
+        this.refreshViews();
+        if (!this.view || this.hpBase === 0) return;
+        this.writeTlsAllocatedState();
     }
 
     private writeFlsSharedState(): void {
@@ -1206,7 +1307,7 @@ export class HypercallDataManager {
         // Re-enable after buffer change (rewriteState) already re-snapshots.
         if (!this.enabled) {
             this.lastInsnSnapshot = readRetiredInsns(this.cpu);
-            this.lastWallSnapshot = performance.now();
+            this.lastWallSnapshot = TimeService.getInstance().wallMs();
         }
         this.enabled = true;
 
@@ -1253,7 +1354,7 @@ export class HypercallDataManager {
     /** Reset instruction baseline after pause/resume to prevent stale delta. */
     resetInsnBaseline(): void {
         this.lastInsnSnapshot = readRetiredInsns(this.cpu);
-        this.lastWallSnapshot = performance.now();
+        this.lastWallSnapshot = TimeService.getInstance().wallMs();
         this.resetPublishedClock();
     }
 
@@ -1285,7 +1386,7 @@ export class HypercallDataManager {
         // Hard clamp: virtual time must not lead wall clock by more than MAX_AHEAD_MS.
         // v86 in a Web Worker can tick faster than 1ms, causing instruction-based time
         // to accumulate faster than wall clock. This prevents runaway speedup.
-        const wallNow = performance.now();
+        const wallNow = timeService.wallMs();
         const currentVirtual = timeService.nowMs();
         const maxAllowed = wallNow + MAX_AHEAD_MS - currentVirtual;
         if (maxAllowed < virtualDeltaMs) {
@@ -1506,6 +1607,14 @@ export class HypercallDataManager {
         }
     }
 
+    /** The TEB the WASM fast paths currently resolve TLS/LastError through (0 = none). */
+    readTebBase(): number {
+        if (!this.initialized || !this.view) return 0;
+        this.refreshViews();
+        if (!this.view) return 0;
+        return this.view.getUint32(this.hpBase + OFF_HC_TEB_BASE, true);
+    }
+
     /** Read lastError back from WASM (WASM may have modified via SetLastError) */
     readLastError(): number {
         if (!this.initialized || !this.view) return 0;
@@ -1706,15 +1815,31 @@ export class HypercallDataManager {
         this.view.setInt32(this.hpBase + OFF_HC_WINDOW_Y, y, true);
     }
 
+    /** Whether any thread has a PostQuitMessage that GetMessage/PeekMessage has not consumed. */
+    private quitPendingProbe: (() => boolean) | null = null;
+
+    /** The scheduler owns the per-thread quit flags; it registers how to ask about them. */
+    setQuitPendingProbe(probe: (() => boolean) | null): void {
+        this.quitPendingProbe = probe;
+    }
+
     /**
      * Update the message queue flag in shared page.
      * WASM PeekMessage handler reads this to short-circuit when queue is empty.
+     *
+     * A pending quit keeps the flag up even with an empty queue: WM_QUIT is synthesized by
+     * the JS PeekMessage paths from the per-thread flag, so a WASM short-circuit would hide
+     * it. (Win32 marks the queue QS_POSTMESSAGE on PostQuitMessage for the same reason.)
+     * Every caller passes "is the queue non-empty", so the quit leg lives here, once —
+     * a BeginPaint that drained the last WM_PAINT used to clear the flag under a pending
+     * quit and leave a Delphi pump (PeekMessage -> WaitMessage) asleep forever.
      */
     updateMessageQueueFlag(hasMessages: boolean): void {
         if (!this.initialized || !this.view) return;
         this.refreshViews();
         if (!this.view) return;
-        this.view.setUint32(this.hpBase + OFF_HC_MSG_QUEUE_FLAG, hasMessages ? 1 : 0, true);
+        const flag = hasMessages || (this.quitPendingProbe?.() ?? false);
+        this.view.setUint32(this.hpBase + OFF_HC_MSG_QUEUE_FLAG, flag ? 1 : 0, true);
     }
 
     /**

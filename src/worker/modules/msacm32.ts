@@ -25,6 +25,8 @@ import { System } from "../core/system";
 import { isValidAddress } from "../core/memory/address-guard";
 import { borrowGuestMemory } from "../core/memory/guest-memory";
 import { encodeAnsi } from "./codepage-utils";
+import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
+import type { SaveValue } from "../savestate/value-codec";
 
 // mmsystem.h
 const MMSYSERR_NOERROR = 0;
@@ -191,6 +193,8 @@ const clampS16 = (v: number): number => (v < -32768 ? -32768 : v > 32767 ? 32767
  * audio deadline; four fresh arrays per block put the codec's own garbage in front of the
  * mixer. Decoding is synchronous on the worker thread with no await inside it, so one
  * module-level set of buffers cannot be re-entered.
+ *
+ * @transient(decode scratch: every block reloads it from its own header before reading it)
  */
 const MAX_ADPCM_CHANNELS = 8;
 const st = {
@@ -369,6 +373,42 @@ function frameBytes(f: WaveFormat): number {
     return Math.max(1, (f.bitsPerSample >> 3) * f.channels);
 }
 
+export const MSACM32_FIELDS = {
+    name: 'transient', exports: 'host', process: 'host', streams: 'save', nextStreamHandle: 'save', pcmScratch: 'transient',
+} as const satisfies Record<string, FieldPolicy>;
+
+export interface Msacm32StreamState {
+    handle: number;
+    src: WaveFormat;
+    dst: WaveFormat;
+}
+
+export interface Msacm32State {
+    nextStreamHandle: number;
+    streams: Msacm32StreamState[];
+}
+
+export const MSACM32_SCHEMA = {
+    module: MSACM32_FIELDS,
+    format: stateKeys<WaveFormat>({
+        formatTag: true, channels: true, samplesPerSec: true, bitsPerSample: true, blockAlign: true, samplesPerBlock: true, coefs: true,
+    }),
+    stream: stateKeys<Msacm32StreamState>({ handle: true, src: true, dst: true }),
+    state: stateKeys<Msacm32State>({ nextStreamHandle: true, streams: true }),
+};
+
+function copyFormat(f: WaveFormat): WaveFormat {
+    return {
+        formatTag: f.formatTag, channels: f.channels, samplesPerSec: f.samplesPerSec, bitsPerSample: f.bitsPerSample,
+        blockAlign: f.blockAlign, samplesPerBlock: f.samplesPerBlock, coefs: f.coefs ? new Int16Array(f.coefs) : null,
+    };
+}
+
+function describeFormat(f: WaveFormat): string {
+    const tag = FORMAT_TAGS.find(t => t.tag === f.formatTag)?.name ?? `tag 0x${f.formatTag.toString(16)}`;
+    return `${tag} ${f.bitsPerSample}bit/${f.channels}ch/${f.samplesPerSec}Hz`;
+}
+
 export class Msacm32 implements IModule {
     name = "msacm32";
     exports: Record<string, ThunkImplementation> = {};
@@ -376,7 +416,40 @@ export class Msacm32 implements IModule {
     private streams = new Map<number, AcmStream>();
     private nextStreamHandle = STREAM_HANDLE_BASE;
 
+    captureSavestate(): Msacm32State {
+        return {
+            nextStreamHandle: this.nextStreamHandle,
+            streams: [...this.streams].map(([handle, s]) => ({ handle, src: copyFormat(s.src), dst: copyFormat(s.dst) })),
+        };
+    }
+
+    restoreSavestate(s: Msacm32State): void {
+        const streams = new Map<number, AcmStream>();
+        for (const row of s.streams) {
+            const stream: AcmStream = { src: copyFormat(row.src), dst: copyFormat(row.dst) };
+            const name = `conversion stream 0x${row.handle.toString(16)} (${describeFormat(stream.src)} → ${describeFormat(stream.dst)})`;
+            if (streams.has(row.handle) || row.handle >= s.nextStreamHandle) {
+                throw new Error(`msacm32: saved ${name} does not fit the saved handle counter 0x${s.nextStreamHandle.toString(16)}`);
+            }
+            if (!this.isSupportedFormat(stream.dst) || !(this.isSupportedFormat(stream.src) || this.isDecodableAdpcm(stream.src))) {
+                throw new Error(`msacm32: saved ${name} is not a conversion this build performs`);
+            }
+            streams.set(row.handle, stream);
+        }
+        this.streams = streams;
+        this.nextStreamHandle = s.nextStreamHandle;
+    }
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'msacm32', version: 1, order: 78, covers: ['msacm32'], schema: MSACM32_SCHEMA as unknown as SaveValue,
+            capture: () => this.captureSavestate() as unknown as SaveValue,
+            restore: (saved) => this.restoreSavestate(saved as unknown as Msacm32State),
+        });
+    }
+
     initialize(process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         this.process = process;
         this.registerVersionAndMetrics();
         this.registerDriverApi();
@@ -573,10 +646,14 @@ export class Msacm32 implements IModule {
             const uMetric = args[1] >>> 0;
             const pMetric = args[2] >>> 0;
 
-            // The counts and sizes are global (hao NULL); the per-driver metrics need one.
+            // Counts are global (hao NULL) and the DRIVER_* metrics need a driver. The size
+            // metrics take either: a caller sizing its WAVEFORMATEX for one driver passes that
+            // driver, and failing it leaves the caller's buffer too small for every ADPCM format.
+            const isDriver = hao === PCM_DRIVER_ID || hao === PCM_DRIVER_HANDLE;
             const perDriver = uMetric === ACM_METRIC_DRIVER_SUPPORT || uMetric === ACM_METRIC_DRIVER_PRIORITY;
-            if (perDriver && hao !== PCM_DRIVER_ID && hao !== PCM_DRIVER_HANDLE) return MMSYSERR_INVALHANDLE;
-            if (!perDriver && hao !== 0) return MMSYSERR_INVALHANDLE;
+            const sizeMetric = uMetric === ACM_METRIC_MAX_SIZE_FORMAT || uMetric === ACM_METRIC_MAX_SIZE_FILTER;
+            if (perDriver && !isDriver) return MMSYSERR_INVALHANDLE;
+            if (!perDriver && hao !== 0 && !(sizeMetric && isDriver)) return MMSYSERR_INVALHANDLE;
             if (!pMetric || !isValidAddress(mem, pMetric, 4, "rw")) return MMSYSERR_INVALPARAM;
 
             const values: Record<number, number> = {

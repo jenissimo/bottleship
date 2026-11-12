@@ -24,6 +24,26 @@ export interface ActivationStep {
     lParam: number;
 }
 
+// @transient(which queued WM_ACTIVATE messages USER posted itself; after a load the queue is restored without them and they are simply delivered)
+const postedActivations = new Map<number, { wParam: number; lParam: number }>();
+
+function postActivation(hwnd: number, wParam: number, lParam: number): void {
+    const wm = System.getInstance().windowManager;
+    wm.removePostedMessages((m) => {
+        if (m.message !== WM_ACTIVATE || (m.wParam & 0xffff) === WA_INACTIVE || m.hwnd === hwnd) return false;
+        const own = postedActivations.get(m.hwnd);
+        if (!own || own.wParam !== m.wParam || own.lParam !== m.lParam) return false;
+        postedActivations.delete(m.hwnd);
+        return true;
+    });
+    wm.postMessage(hwnd, WM_ACTIVATE, wParam, lParam);
+    postedActivations.set(hwnd >>> 0, { wParam: wParam >>> 0, lParam: lParam >>> 0 });
+}
+
+export function resetPostedActivations(): void {
+    postedActivations.clear();
+}
+
 function resolveWndProc(hwnd: number): number {
     return windows.get(hwnd)?.wndProc ?? 0;
 }
@@ -176,7 +196,7 @@ export function postActivationTransition(newHwnd: number, prevHwnd: number): voi
     if (newHwnd) {
         if (appBoundary) wm.postMessage(newHwnd, WM_ACTIVATEAPP, 1, 0);
         wm.postMessage(newHwnd, WM_NCACTIVATE, 1, prevHwnd >>> 0);
-        wm.postMessage(newHwnd, WM_ACTIVATE, WA_ACTIVE, prevHwnd >>> 0);
+        postActivation(newHwnd, WA_ACTIVE, prevHwnd >>> 0);
     }
     // Focus moves after activation has settled (Wine input.c:2094).
     if (deactivating) wm.postMessage(prevHwnd, WM_KILLFOCUS, newHwnd >>> 0, 0);
@@ -190,13 +210,71 @@ export function postActivationTransition(newHwnd: number, prevHwnd: number): voi
     }
 }
 
+/**
+ * The active top-level window is leaving (DestroyWindow, or ShowWindow(SW_HIDE)) and no
+ * other window can take activation. Windows looks for one (Wine activate_other_window,
+ * win32u/window.c:4514 — the owner, then the next windows in Z-order; can_activate_window
+ * :4497 wants them visible and enabled) and, finding none, activates NOTHING:
+ * set_active_window(0) (win32u/input.c:2120). The leaving window — it still exists, this
+ * happens before WM_DESTROY (window.c:5412 in send_destroy_message) — hears
+ * WM_NCACTIVATE(FALSE) and WM_ACTIVATE(WA_INACTIVE) with lParam NULL (:2141-2146); then,
+ * activation leaving its thread for no thread, EVERY top-level window of that thread hears
+ * WM_ACTIVATEAPP(FALSE) (:2170-2187), the leaving one included; then the focus is dropped
+ * (set_focus_window(0) → WM_KILLFOCUS). user32/tests/msg.c WmDestroyOverlappedSeq is that
+ * sequence ahead of WM_DESTROY.
+ *
+ * Silently zeroing the active window instead left the app "active" in its own eyes, so its
+ * next window, activated from nothing, heard a WM_ACTIVATEAPP(TRUE) never preceded by a
+ * FALSE (#234: Neverwinter Nights rebuilt its window on each one, in a loop).
+ *
+ * Returns [] when hwnd is not the active window or another window can take over (the
+ * callers' successor paths handle that). Otherwise clears the active/foreground/focus
+ * slots and returns the steps in Win32 order, for the caller to send (destroy) or post
+ * (hide) while hwnd still exists.
+ */
+export function deactivateWithoutSuccessor(hwnd: number): ActivationStep[] {
+    const wm = System.getInstance().windowManager;
+    if (!hwnd || wm.getActiveHwnd() !== hwnd) return [];
+    const successor = wm.getZOrder().some(candidate => {
+        if (candidate === hwnd) return false;
+        const next = wm.getWindow(candidate);
+        const info = windows.get(candidate);
+        return !!next?.visible
+            && info?.visible !== false
+            && !info?.pendingDestroy
+            && (next.style & WS_CHILD) === 0
+            && (next.style & 0x08000000 /* WS_DISABLED */) === 0;
+    });
+    if (successor) return [];
+
+    const prevFocus = wm.getFocusHwnd();
+    const thread = wm.getWindowOwnerThread(hwnd);
+    const steps: ActivationStep[] = [];
+    const step = (target: number, msg: number, wParam: number, lParam: number): void => {
+        steps.push({ hwnd: target, wndProc: resolveWndProc(target), msg, wParam, lParam });
+    };
+    step(hwnd, WM_NCACTIVATE, 0, 0);
+    step(hwnd, WM_ACTIVATE, WA_INACTIVE, 0);
+    wm.forEachTopLevel((win) => {
+        if (win.creatorThreadId === thread) step(win.hwnd, WM_ACTIVATEAPP, 0, 0);
+    });
+    wm.clearActiveWindow(hwnd);
+    if (prevFocus && wm.getFocusHwnd() === 0 && wm.getWindow(prevFocus)) {
+        step(prevFocus, WM_KILLFOCUS, 0, 0);
+    }
+    markPendingActivation(hwnd);
+    Logger.verbose(LogCategory.USER32,
+        `deactivateWithoutSuccessor: 0x${hwnd.toString(16)} leaves, nothing takes activation`);
+    return steps;
+}
+
 /** First visible top-level window at CreateWindow time (no previous active hwnd). */
 export function postInitialActivationMessages(hwnd: number): void {
     if (!hwnd) return;
     const wm = System.getInstance().windowManager;
     wm.postMessage(hwnd, WM_ACTIVATEAPP, 1, 0);
     wm.postMessage(hwnd, WM_NCACTIVATE, 1, 0);
-    wm.postMessage(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
+    postActivation(hwnd, WA_ACTIVE, 0);
     wm.postMessage(hwnd, WM_SETFOCUS, 0, 0);
     markActivationDelivered(hwnd); // queued counts as delivered (see postActivationTransition)
 }
@@ -277,7 +355,7 @@ export function activateOwnedDialog(hwnd: number): number {
     if (hwnd === prevActive) {
         if (needsActivationDelivery(hwnd)) {
             wm.postMessage(hwnd, WM_NCACTIVATE, 1, 0);
-            wm.postMessage(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
+            postActivation(hwnd, WA_ACTIVE, 0);
             wm.postMessage(hwnd, WM_SETFOCUS, 0, 0);
             markActivationDelivered(hwnd);
         }

@@ -24,6 +24,9 @@ import { readPeVersionResourceBytes } from "../core/pe-version";
 import { buildHleDllVersionBlock } from "../core/hle-dll-versions";
 import { queryVersionBlock } from "../core/version-block";
 import { encodeAnsi } from "./codepage-utils";
+import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
+import { CaptureRefusal } from "../savestate/object-codecs";
+import type { SaveValue } from "../savestate/value-codec";
 
 const TRUE = 1;
 const FALSE = 0;
@@ -69,6 +72,20 @@ interface VersionBlockPair {
     /** The version resource is UTF-16 for both GetFileVersionInfoA and W. */
     reportedSize: number;
 }
+
+export const VERSION_FIELDS = {
+    name: 'transient', exports: 'host', process: 'host', blockCache: 'derive', ansiQueryBuffers: 'save',
+} as const satisfies Record<string, FieldPolicy>;
+
+export interface VersionState {
+    ansiQueryBuffers: Array<[string, number, number]>;
+}
+
+export const VERSION_SCHEMA = {
+    module: VERSION_FIELDS,
+    ansiQueryBufferRow: ['key', 'ptr', 'size'],
+    state: stateKeys<VersionState>({ ansiQueryBuffers: true }),
+};
 
 export class Version implements IModule {
     name = "version";
@@ -280,7 +297,31 @@ export class Version implements IModule {
         return TRUE;
     }
 
+    captureSavestate(): VersionState {
+        return { ansiQueryBuffers: [...this.ansiQueryBuffers].map(([key, b]) => [key, b.ptr, b.size]) };
+    }
+
+    restoreSavestate(s: VersionState): void {
+        this.blockCache.clear();
+        this.ansiQueryBuffers = new Map(s.ansiQueryBuffers.map(([key, ptr, size]) => [key, { ptr, size }]));
+    }
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'version', version: 1, order: 70, covers: ['version'], schema: VERSION_SCHEMA as unknown as SaveValue,
+            capture: () => {
+                try {
+                    return this.captureSavestate() as unknown as SaveValue;
+                } catch (e) {
+                    throw e instanceof CaptureRefusal ? e : new CaptureRefusal(e instanceof Error ? e.message : String(e));
+                }
+            },
+            restore: (saved) => this.restoreSavestate(saved as unknown as VersionState),
+        });
+    }
+
     initialize(process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         this.process = process;
         this.blockCache.clear();
         this.ansiQueryBuffers.clear();

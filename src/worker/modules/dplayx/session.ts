@@ -22,9 +22,13 @@ const DISCOVERY_PORT = 47624;
 const MAX_STATE = 1024 * 1024;
 const CHUNK = 60000;
 const MAGIC = 0x314c5044;
+// @transient(constant address)
 const BROADCAST = new Uint8Array(6).fill(255);
+// @transient(stateless text encoder)
 const encoder = new TextEncoder();
+// @transient(stateless text decoder)
 const decoder = new TextDecoder("utf-8", { fatal: true });
+// @transient(empty constant)
 const EMPTY: Uint8Array = new Uint8Array();
 
 export interface SessionDesc {
@@ -114,6 +118,7 @@ class DiscoveryHub implements LanEndpoint {
         for (const session of this.sessions) session.discoveryPacket(dg);
     }
 }
+// @transient(discovery hub per network; it lists only the sessions of live DirectPlay objects, and the dplayx participant refuses while one exists)
 const hubs = new WeakMap<LanNetwork, DiscoveryHub>();
 
 /** Owned initialization bytes; interpretation belongs to the selected provider. */
@@ -153,6 +158,16 @@ export class DirectPlaySession implements LanEndpoint {
     private nativeMode = false;
     private nativeBackend?: DirectPlay4NativeSession;
     get isNative(): boolean { return this.nativeMode; }
+    /** Harness view: the roster and queue as THIS process sees them. */
+    describe() {
+        return {
+            open: !!this.desc, host: this.hostMode, native: this.nativeMode, ownKey: this.ownKey,
+            session: this.desc ? { name: this.desc.name, instance: this.desc.instance, maxPlayers: this.desc.maxPlayers } : null,
+            peers: this.peers.size, queued: this.queue.length,
+            entities: [...this.entities.values()].map(e => ({ id: e.id, group: e.group, owner: e.owner,
+                local: e.owner === this.ownKey, name: e.name.short, members: [...e.members], parent: e.parent })),
+        };
+    }
     private lastHostSeen = 0;
     private stopState: () => void;
     private stopPeer: () => void;

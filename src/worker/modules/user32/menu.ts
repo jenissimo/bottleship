@@ -33,23 +33,26 @@ const MF_APPEND = 0x0100;
 const MF_DELETE = 0x0200;
 const MF_REMOVE = 0x1000;
 
-interface MenuItem {
+export interface MenuItem {
     id: number;
     flags: number;
     text: string;
     hSubMenu: number;
 }
 
-interface MenuData {
+export interface MenuData {
     handle: number;
     isPopup: boolean;
     items: MenuItem[];
 }
 
+// @participant(user32)
 const menus = new Map<number, MenuData>();
+// @participant(user32)
 let nextMenuHandle = 0x50000;
 
 // System (window) menu handles per hWnd, created lazily by GetSystemMenu.
+// @participant(user32)
 const systemMenus = new Map<number, number>();
 // Standard system-menu command IDs (WM_SYSCOMMAND).
 const SC_SIZE     = 0xF000;
@@ -625,4 +628,22 @@ export function createMenuExports(): Record<string, ThunkImplementation> {
     };
 
     return exports;
+}
+
+export interface MenuState { menus: MenuData[]; nextMenuHandle: number; systemMenus: Array<[number, number]> }
+
+export function captureMenus(): MenuState {
+    return {
+        menus: [...menus.values()].map(m => ({ handle: m.handle, isPopup: m.isPopup, items: m.items.map(i => ({ id: i.id, flags: i.flags, text: i.text, hSubMenu: i.hSubMenu })) })),
+        nextMenuHandle,
+        systemMenus: [...systemMenus],
+    };
+}
+
+export function restoreMenus(s: MenuState): void {
+    menus.clear();
+    for (const m of s.menus) menus.set(m.handle, { handle: m.handle, isPopup: m.isPopup, items: m.items.map(i => ({ ...i })) });
+    nextMenuHandle = s.nextMenuHandle;
+    systemMenus.clear();
+    for (const [hwnd, h] of s.systemMenus) systemMenus.set(hwnd, h);
 }

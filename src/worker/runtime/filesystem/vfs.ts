@@ -1,11 +1,11 @@
 import { enterIoReadPolicy, restoreIoReadPolicy, type IoReadPolicy } from "./io-read-policy";
-import { ZipArchive, ZipEntry } from "@bottleship/formats/zip";
+import { isRangeReadableEntry, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
 import { LruCache } from "../../core/collections/lru-cache";
 import { Logger, LogCategory } from "../../core/logger";
 import { harnessBus } from "../../harness/event-bus";
 import { getContainerDir } from "./container-store";
 import { PathPolicy, DEFAULT_PATH_POLICY } from "./path-policy";
-import { isVirtualHleSystemFile } from "../../core/hle-system-catalog";
+import { isVirtualHleSystemFile, VIRTUAL_HLE_DLL_SIZE } from "../../core/hle-system-catalog";
 import { expandFileLookupPaths } from "./guest-path-resolver";
 import { asArrayBuffer } from "../../../dom-buffer";
 
@@ -67,6 +67,13 @@ interface RomDirNode {
     isDir: boolean[];
     /** An explicit ZIP directory entry (trailing "/") names this directory. */
     selfEntry: boolean;
+}
+
+function syncWidenTarget(entry: ZipEntry, position: number, length: number): number {
+    if (!entry.blocks) return VirtualFileSystem.SYNC_WIDEN_BYTES;
+    const blockSize = 2 ** entry.blocks.shift;
+    const blockEnd = (Math.floor((position + Math.max(1, length) - 1) / blockSize) + 1) * blockSize;
+    return blockEnd - position;
 }
 
 export interface VfsFindHandle {
@@ -327,6 +334,7 @@ export class VirtualFileSystem {
     private static readonly READ_INTO_CHUNK = 256 * 1024;
     /** Sequential read-ahead chunk size (512KB) */
     private static readonly PREFETCH_CHUNK_SIZE = 512 * 1024;
+    static readonly SYNC_WIDEN_BYTES = VirtualFileSystem.PREFETCH_CHUNK_SIZE;
     /** Trigger prefetch when less than this many bytes remain in current window */
     private static readonly PREFETCH_TRIGGER_REMAINING = 256 * 1024;
     /** Align ROM/OPFS range reads to 4KB pages for steadier I/O behavior */
@@ -354,6 +362,15 @@ export class VirtualFileSystem {
     private cdRedirect: string | null = null;
     /** The disc's volume label, as GetVolumeInformation reports it for D:\. See manifest emulator.cdLabel. */
     private cdVolumeLabel: string | null = null;
+
+    async describeOverlay(): Promise<string[]> {
+        return this.overlay ? this.overlay.describeEntries() : [];
+    }
+
+    /** Overlay (game save tree) writes not yet durable in OPFS. */
+    pendingOverlayWrites(): number {
+        return this.overlay?.pendingWriteCount() ?? 0;
+    }
 
     /**
      * Open the writable overlay for a game's container (bottleship/games/<containerDir>/overlay/).
@@ -417,7 +434,7 @@ export class VirtualFileSystem {
                 dir = slash === -1 ? "" : dir.slice(0, slash);
             }
             this.indexRomChildren(lowerKey, entry);
-            if (!entry.isDirectory && entry.compression !== 0) {
+            if (!entry.isDirectory && !isRangeReadableEntry(entry)) {
                 compressedEntries++;
                 if (firstCompressedName === null) {
                     firstCompressedName = entry.name;
@@ -431,9 +448,9 @@ export class VirtualFileSystem {
                 `Invalid WGB archive: found ${compressedEntries} compressed ZIP entr` +
                 `${compressedEntries === 1 ? "y" : "ies"} ` +
                 `(first="${firstCompressedName ?? "n/a"}", method=${firstCompressedMethod ?? -1}). ` +
-                `BottleShip expects WGB as ZIP STORED-only (method=0). ` +
-                `Compressed entries force full decompression and break deterministic range reads. ` +
-                `Repack archive with STORE-only entries and retry.`;
+                `BottleShip expects WGB entries STORED (method=0) or block-indexed DEFLATE (see docs/bundles.md). ` +
+                `Compressed entries without a block index force full decompression and break deterministic range reads. ` +
+                `Repack archive with STORE-only entries, or block-compress it with tools/wgb-compress.ts, and retry.`;
             Logger.error(LogCategory.SYSTEM, `VFS: ${message}`);
             throw new Error(message);
         }
@@ -522,6 +539,18 @@ export class VirtualFileSystem {
         if (this.directoryExists(full)) return false;
         if (this.resolveStoredFile(full)) return true;
         return isVirtualHleSystemFile(full);
+    }
+
+    /**
+     * The directory entry a real install has for an HLE system DLL (ddraw.dll in the system
+     * directory) that no stored file backs — the stat-shaped counterpart of fileExists. Kept
+     * apart from statEntry, which names STORED files the loader may map.
+     */
+    statVirtualSystemFile(path: string): VfsEntry | null {
+        const full = normalizePath(this.resolvePath(path));
+        if (this.directoryExists(full) || this.resolveStoredFile(full) || !isVirtualHleSystemFile(full)) return null;
+        const name = full.slice(full.lastIndexOf("\\") + 1).toLowerCase();
+        return { path: full, name, kind: "file", size: VIRTUAL_HLE_DLL_SIZE, source: "rom" };
     }
 
     /** Resolve a stored file (ROM/overlay), trying Win9x/NT system-directory aliases. */
@@ -990,7 +1019,7 @@ export class VirtualFileSystem {
 
         // Large uncached STORED ROM entries: sync range read (BufferSource WGB cache).
         const entry = this.romIndex.get(rel);
-        if (!entry || !this.romArchive || entry.compression !== 0) return null;
+        if (!entry || !this.romArchive || !isRangeReadableEntry(entry)) return null;
 
         // A run of small sequential reads (a pak read record-by-record) would otherwise
         // re-cross VFS → ZipArchive → source once per read. Widen to the readahead chunk
@@ -1010,7 +1039,7 @@ export class VirtualFileSystem {
         // A/B kill-switch: globalThis.__noRomReadWindow restores the un-widened read.
         const widen = !(globalThis as { __noRomReadWindow?: boolean }).__noRomReadWindow
             && (sequential || handle.lastReadEnd === undefined);
-        const want = widen ? Math.max(length, VirtualFileSystem.PREFETCH_CHUNK_SIZE) : length;
+        const want = widen ? Math.max(length, syncWidenTarget(entry, handle.position, length)) : length;
         const data = this.romArchive.readEntryRangeSync(entry, handle.position, want, sequential);
         if (!data) return null;
         // A SHORT answer mid-file is not a small read, it is a MISS: the block cache below
@@ -2018,7 +2047,7 @@ export class VirtualFileSystem {
         if (!data) {
             // For uncompressed (STORED) large entries we read only requested range.
             // This avoids loading huge assets (e.g. videos) fully into memory.
-            if (entry.compression === 0 && entry.uncompressedSize > this.MAX_CACHE_ENTRY_SIZE) {
+            if (isRangeReadableEntry(entry) && entry.uncompressedSize > this.MAX_CACHE_ENTRY_SIZE) {
                 return this.romArchive.readEntryRange(entry, offset, length);
             }
 
@@ -2482,6 +2511,25 @@ class OpfsOverlay {
      */
     private policy: PathPolicy = DEFAULT_PATH_POLICY;
     private ephemeralFiles = new Map<string, Uint8Array>();
+
+    async describeEntries(): Promise<string[]> {
+        const rows: string[] = [];
+        for (const key of [...this.entries.keys()].sort()) {
+            const e = this.entries.get(key)!;
+            let modified = 0;
+            if (e.kind === 'file') {
+                try { modified = (await (await this.getFileHandle(e.path, false)).getFile()).lastModified; } catch { modified = -1; }
+            }
+            rows.push(`${key}\t${e.kind}\t${e.size}\t${modified}`);
+        }
+        for (const key of [...this.shadowed].sort()) rows.push(`${key}\tshadowed`);
+        return rows;
+    }
+
+    /** Overlay paths with writes buffered or still being committed to OPFS. */
+    pendingWriteCount(): number {
+        return new Set([...this.writerCache.keys(), ...this.pendingFlushes.keys()]).size;
+    }
 
     setPolicy(policy: PathPolicy): void { this.policy = policy; }
 
@@ -3746,7 +3794,21 @@ function readSyncAccessHandle(
     return got;
 }
 
-function normalizePath(path: string): string {
+// @transient(pure path normalization memo)
+const normalizedPathMemo = new Map<string, string>();
+
+export function normalizePath(path: string): string {
+    if ((globalThis as { __vfsPathMemo?: boolean }).__vfsPathMemo === false) return normalizePathUncached(path);
+    let n = normalizedPathMemo.get(path);
+    if (n === undefined) {
+        n = normalizePathUncached(path);
+        if (normalizedPathMemo.size >= 4096) normalizedPathMemo.clear();
+        normalizedPathMemo.set(path, n);
+    }
+    return n;
+}
+
+function normalizePathUncached(path: string): string {
     const cleaned = path.replace(/\//g, "\\");
     const driveMatch = cleaned.match(/^([A-Za-z]):/);
     const drive = driveMatch ? driveMatch[1].toUpperCase() : "C";

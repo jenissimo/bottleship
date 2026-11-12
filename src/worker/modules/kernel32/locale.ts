@@ -24,6 +24,7 @@ import { codePageToUnicodeLut, codePageToByteLut } from './codepage-lut';
 import { localeString } from './locale-db';
 import { LocaleField } from './locale-db-schema';
 
+// @transient(constant table)
 const GREGORIAN_CALENDAR_IDS = new Set([0, 1, 2, 9, 10, 11, 12]);
 
 /** CAL_ITWODIGITYEARMAX of the Gregorian calendars. */
@@ -1012,29 +1013,6 @@ export const exports: Record<string, ThunkImplementation> = {
     // BOOL GetStringTypeExA(LCID, DWORD, LPCSTR, int, LPWORD) is GetStringTypeA itself.
     'GetStringTypeExA': (ctx, mem, args) => exports['GetStringTypeA']!(ctx, mem, args),
 
-    // GetPrivateProfileSectionA - retrieves all key/value pairs from a section of an INI file
-    'GetPrivateProfileSectionA': (ctx, mem, args) => {
-        const lpAppName = args[0];        // LPCSTR - section name
-        const lpReturnedString = args[1]; // LPSTR - buffer
-        const nSize = args[2];            // DWORD - buffer size
-        const lpFileName = args[3];       // LPCSTR - INI file name
-
-        const appName = lpAppName ? Marshaler.readString(mem, lpAppName) : '';
-        const fileName = lpFileName ? Marshaler.readString(mem, lpFileName) : '';
-
-        Logger.verbose(LogCategory.KERNEL32,
-            `GetPrivateProfileSectionA(section="${appName}", bufSize=${nSize}, file="${fileName}")`);
-
-        if (!lpReturnedString || nSize < 2) {
-            return 0;
-        }
-
-        // We don't parse INI files — return empty section (double-null terminated)
-        mem[lpReturnedString] = 0;
-        mem[lpReturnedString + 1] = 0;
-        return 0;
-    },
-
     // lstrcpynA - copies a string with length limit
     'lstrcpynA': (ctx, mem, args) => {
         const lpString1 = args[0];  // LPSTR - destination buffer
@@ -1352,6 +1330,7 @@ export const localeFastPathStats = {
  * multi-byte page is not conservative — it makes the caller allocate too little.
  */
 const CPINFO_SIZE = 18;
+// @transient(constant table)
 const DBCS_CODE_PAGES = new Set([932, 936, 949, 950, 1361]);
 
 /** CP_ACP/CP_OEMCP/CP_THREAD_ACP are indirections, not code pages; resolve them first. */

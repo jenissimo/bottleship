@@ -2,7 +2,8 @@
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { MessageQueue } from './message-queue';
-import type { Message } from './message-queue';
+import type { Message, MessageQueueState } from './message-queue';
+import { pickSaved, type FieldPolicy } from '../../savestate/participant';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 
 // Pseudo-handle returned by GetDesktopWindow() when no top-level window is active.
@@ -54,6 +55,31 @@ export interface WindowObject {
 
 export type { Message } from './message-queue';
 
+export const WINDOW_CLASS_FIELDS = {
+    name: 'save', wndProc: 'save', hInstance: 'save', style: 'save', hbrBackground: 'save',
+} as const satisfies Record<keyof WindowClass, FieldPolicy>;
+
+export const WINDOW_OBJECT_FIELDS = {
+    hwnd: 'save', wndClass: 'save', parent: 'save', rect: 'save', style: 'save', exStyle: 'save', userData: 'save',
+    wndProc: 'save', visible: 'save', title: 'save', clientOffsetX: 'save', clientOffsetY: 'save', creatorThreadId: 'save',
+} as const satisfies Record<keyof WindowObject, FieldPolicy>;
+
+export interface SavedWindowObject extends Omit<WindowObject, 'wndClass'> {
+    wndClass: { name: string } | { own: WindowClass };
+}
+
+export interface WindowManagerState {
+    classes: Array<[string, WindowClass]>;
+    windows: SavedWindowObject[];
+    nextHwnd: number;
+    activeHwnd: number;
+    focusHwnd: number;
+    foregroundHwnd: number;
+    foregroundThreadId: number;
+    captureHwnd: number;
+    zOrder: number[];
+}
+
 // Window styles for frame detection
 const WS_POPUP = 0x80000000;
 const WS_CAPTION = 0x00C00000;
@@ -78,7 +104,7 @@ const WM_KILLFOCUS = 0x0008;
 const WM_ACTIVATEAPP = 0x001c;
 const WM_NCACTIVATE = 0x0086;
 const WM_CAPTURECHANGED = 0x0215;
-const WM_DISPLAYCHANGE = 0x007e;
+export const WM_DISPLAYCHANGE = 0x007e;
 const WA_INACTIVE = 0;
 const WA_ACTIVE = 1;
 
@@ -120,6 +146,53 @@ export class WindowManager {
     private foregroundQueueObservers: ForegroundQueueObserver[] = [];
 
     constructor() { }
+
+    captureState(): WindowManagerState {
+        const named = new Map<WindowClass, string>();
+        for (const [key, c] of this.classes) named.set(c, key);
+        return {
+            classes: [...this.classes].map(([key, c]) => [key, pickSaved(c, WINDOW_CLASS_FIELDS)]),
+            windows: [...this.windows.values()].map(w => {
+                const key = named.get(w.wndClass);
+                return {
+                    ...pickSaved(w, WINDOW_OBJECT_FIELDS), rect: { ...w.rect },
+                    wndClass: key !== undefined ? { name: key } : { own: pickSaved(w.wndClass, WINDOW_CLASS_FIELDS) },
+                };
+            }),
+            nextHwnd: this.nextHwnd,
+            activeHwnd: this.activeHwnd,
+            focusHwnd: this.focusHwnd,
+            foregroundHwnd: this.foregroundHwnd,
+            foregroundThreadId: this.foregroundThreadId,
+            captureHwnd: this.captureHwnd,
+            zOrder: [...this.zOrder],
+        };
+    }
+
+    restoreState(s: WindowManagerState): void {
+        this.classes = new Map(s.classes.map(([key, c]) => [key, { ...c }]));
+        this.windows = new Map();
+        for (const w of s.windows) {
+            const wndClass = 'name' in w.wndClass ? this.classes.get(w.wndClass.name) : { ...w.wndClass.own };
+            if (!wndClass) throw new Error(`window manager: window 0x${w.hwnd.toString(16)} names a missing class`);
+            this.windows.set(w.hwnd, { ...w, rect: { ...w.rect }, wndClass });
+        }
+        this.nextHwnd = s.nextHwnd;
+        this.activeHwnd = s.activeHwnd;
+        this.focusHwnd = s.focusHwnd;
+        this.foregroundHwnd = s.foregroundHwnd;
+        this.foregroundThreadId = s.foregroundThreadId;
+        this.captureHwnd = s.captureHwnd;
+        this.zOrder = [...s.zOrder];
+    }
+
+    captureQueueState(): MessageQueueState {
+        return this.messageQueue.captureState();
+    }
+
+    restoreQueueState(s: MessageQueueState): void {
+        this.messageQueue.restoreState(s);
+    }
 
     registerMouseTargetResolver(resolver: (screenX: number, screenY: number) => number): void {
         this.mouseTargetResolver = resolver;
@@ -744,36 +817,29 @@ export class WindowManager {
     }
 
     /**
-     * Post WM_DISPLAYCHANGE to every top-level window (faithful Win32: on a display-mode
-     * change the system broadcasts WM_DISPLAYCHANGE to all top-level windows with
-     * wParam = new bpp, lParam = MAKELPARAM(width, height)). The guest WinDrv / windowed
-     * vs fullscreen reconciliation keys off this. Children are not notified (Windows only
-     * broadcasts to top-level windows). Enumerates the Z-order list plus any tracked
-     * top-level windows not yet in the Z-order, so newly-created hidden windows still hear it.
+     * Post a message to every top-level window (the HWND_BROADCAST target set) and
+     * return how many got it.
      */
-    postDisplayChange(width: number, height: number, bpp: number): void {
-        const lParam = (((height & 0xFFFF) << 16) | (width & 0xFFFF)) >>> 0;
-        const count = this.broadcastToTopLevel(WM_DISPLAYCHANGE, bpp >>> 0, lParam);
-        Logger.log(LogCategory.SYSTEM,
-            `WindowManager: WM_DISPLAYCHANGE broadcast ${width}x${height}x${bpp} to ${count} top-level window(s)`);
+    broadcastToTopLevel(msg: number, wParam: number, lParam: number): number {
+        return this.forEachTopLevel((win) => this.postMessage(win.hwnd, msg, wParam, lParam));
     }
 
     /**
-     * Post a message to every top-level window (the HWND_BROADCAST target set) and
-     * return how many got it. Enumerates the Z-order list plus any tracked top-level
-     * window not yet in it, so a newly-created hidden window still hears the broadcast.
+     * Visit every top-level window once and return how many there were. Enumerates the
+     * Z-order list plus any tracked top-level window not yet in it, so a newly-created
+     * hidden window still hears a broadcast. Children are never visited.
      */
-    broadcastToTopLevel(msg: number, wParam: number, lParam: number): number {
+    forEachTopLevel(visit: (win: WindowObject) => void): number {
         const seen = new Set<number>();
-        const broadcast = (hwnd: number): void => {
+        const each = (hwnd: number): void => {
             if (seen.has(hwnd)) return;
             const win = this.windows.get(hwnd);
             if (!win || (win.style & WS_CHILD) !== 0) return;
             seen.add(hwnd);
-            this.postMessage(hwnd, msg, wParam, lParam);
+            visit(win);
         };
-        for (const hwnd of this.zOrder) broadcast(hwnd);
-        for (const win of this.windows.values()) broadcast(win.hwnd);
+        for (const hwnd of this.zOrder) each(hwnd);
+        for (const win of this.windows.values()) each(win.hwnd);
         return seen.size;
     }
 
@@ -810,6 +876,10 @@ export class WindowManager {
         return this.windows.get(hwnd)?.creatorThreadId ?? 0;
     }
 
+    removePostedMessages(match: (msg: Message) => boolean): number {
+        return this.messageQueue.removePosted(match);
+    }
+
     // Message Pump / Queue
     postMessage(
         hwnd: number,
@@ -822,14 +892,15 @@ export class WindowManager {
         keyStatePacked?: Uint8Array,
         extraInfo = 0,
         synthesizedTimer = true,
-        timerEpoch = 0
+        timerEpoch = 0,
+        hardware = false
     ): void {
         // Auto-resolve thread targeting from window ownership (matches Windows behavior:
         // PostMessage routes to the thread that created the window)
         if (targetThreadId === 0 && hwnd > 0) {
             targetThreadId = this.getWindowOwnerThread(hwnd);
         }
-        const discrete = this.messageQueue.enqueue(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked, extraInfo, synthesizedTimer, timerEpoch);
+        const discrete = this.messageQueue.enqueue(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked, extraInfo, synthesizedTimer, timerEpoch, hardware);
         if (discrete) {
             // Eagerly update shared flag so WASM PeekMessage sees new messages immediately.
             // Coalesced WM_MOUSEMOVE does NOT set the flag (starvation / spin avoidance).
@@ -845,9 +916,18 @@ export class WindowManager {
         }
     }
 
+    /** Queue a HARDWARE input message (device input, keybd_event/mouse_event/SendInput):
+     *  retrieved after every posted message, as USER's input queue is. */
+    postInputMessage(
+        hwnd: number, msg: number, wParam: number, lParam: number,
+        ptX = 0, ptY = 0, targetThreadId = 0, keyStatePacked?: Uint8Array, extraInfo = 0,
+    ): void {
+        this.postMessage(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked, extraInfo, true, 0, true);
+    }
+
     // Get message from queue (with priority handling built into MessageQueue)
-    getMessage(): Message | null {
-        return this.messageQueue.dequeue();
+    getMessage(callerThreadId = 0): Message | null {
+        return this.messageQueue.dequeue(0, 0, callerThreadId);
     }
 
     waitForMessage(callerThreadId = 0, msgMin = 0, msgMax = 0): Promise<Message> {
@@ -914,6 +994,10 @@ export class WindowManager {
     }
 
     // Legacy compatibility
+    hasPendingMoveSetCursor(msgMin = 0, msgMax = 0, callerThreadId = 0): boolean {
+        return this.messageQueue.hasPendingMoveSetCursor(msgMin, msgMax, callerThreadId);
+    }
+
     peekMessage(remove: boolean, msgMin = 0, msgMax = 0, callerThreadId = 0): Message | undefined {
         if (remove) {
             return this.messageQueue.dequeue(msgMin, msgMax, callerThreadId) ?? undefined;

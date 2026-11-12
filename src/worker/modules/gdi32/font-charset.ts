@@ -35,6 +35,7 @@ export const EASTEUROPE_CHARSET = 238;
 export const OEM_CHARSET = 255;
 
 /** charset → the code page a Win32 app would encode 8-bit text in for it. */
+// @transient(constant table)
 const CHARSET_TO_CODEPAGE = new Map<number, number>([
     [ANSI_CHARSET, 1252],
     [EASTEUROPE_CHARSET, 1250],
@@ -54,11 +55,13 @@ const CHARSET_TO_CODEPAGE = new Map<number, number>([
 ]);
 
 /** The inverse, for resolving DEFAULT_CHARSET against the system ANSI code page. */
+// @transient(constant table)
 const CODEPAGE_TO_CHARSET = new Map<number, number>(
     [...CHARSET_TO_CODEPAGE].map(([charset, cp]) => [cp, charset]),
 );
 
 /** FONTSIGNATURE.fsCsb[0] bit per charset (the FS_* set from wingdi.h). */
+// @transient(constant table)
 const CHARSET_TO_FSCSB = new Map<number, number>([
     [ANSI_CHARSET, 0x00000001],       // FS_LATIN1
     [EASTEUROPE_CHARSET, 0x00000002], // FS_LATIN2
@@ -94,6 +97,7 @@ const USB_HEBREW = 0x00000800;           // bit 11
 const USB_ARABIC = 0x00002000;           // bit 13
 const USB_THAI = 0x00010000;             // bit 16
 
+// @transient(constant table)
 const CHARSET_TO_USB0 = new Map<number, number>([
     [ANSI_CHARSET, USB_BASIC_LATIN | USB_LATIN1_SUPPLEMENT],
     [EASTEUROPE_CHARSET, USB_BASIC_LATIN | USB_LATIN1_SUPPLEMENT | USB_LATIN_EXT_A],

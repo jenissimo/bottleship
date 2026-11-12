@@ -15,6 +15,14 @@ import {
 } from './shared-state';
 import { GUEST_INPUT_FLAG } from '../../../input/sab-layout';
 
+const WS_DISABLED_ACCEL = 0x08000000;
+const WS_MINIMIZE_ACCEL = 0x20000000;
+import { savestateParticipants, savestatesEnabled, stateKeys } from '../../savestate/participant';
+import type { SaveValue } from '../../savestate/value-codec';
+import { ACCEL_WM_COMMAND, copyAccelerators, createAccelerators, destroyAcceleratorTable, findAcceleratorFor, loadAccelerators, registerAcceleratorParticipant } from './accelerators';
+import { isSentinelWndProc } from './dialog';
+import { invokeGuestWndProcSync } from './message';
+
 // The three polled key readers are the hottest thunks any title issues (a per-frame
 // input poll, millions of calls over a session), so each has a fast path. The bodies
 // live here, once, so the two tiers cannot answer differently.
@@ -42,6 +50,7 @@ function readKeyState(nVirtKey: number): number {
 
 // Reused across calls: the packed table is host-side scratch handed straight to
 // Mem.writeBytes, never retained by anyone.
+// @transient(host scratch refilled by every GetKeyboardState)
 const packedKeyboardState = new Uint8Array(256);
 
 /** GetKeyboardState: 256 packed VK bytes into a guest buffer. Returns BOOL. */
@@ -57,6 +66,21 @@ function readKeyboardState(lpKeyState: number): number {
     return written === packedKeyboardState.length ? 1 : 0;
 }
 
+export interface User32InputState {
+    windowProperties: Array<[number, Array<[string, number]>]>;
+    nextDdeInstance: number;
+    nextDdeStringHandle: number;
+    nextDdeConv: number;
+    ddeStrings: Array<[number, string]>;
+    ddeServices: Array<[string, number[]]>;
+    ddeLastError: Array<[number, number]>;
+    ddeClientOnly: number[];
+    heldKeys: number[];
+    heldButtons: number;
+    ddeInstances: number[];
+    ddeConversations: number[];
+}
+
 export function createInputExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
     const ERROR_INVALID_WINDOW_HANDLE = 1400;
@@ -64,13 +88,91 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     const DMLERR_INVALIDPARAMETER = 0x4006;
     const DMLERR_NO_CONV_ESTABLISHED = 0x400a;
 
+    // @participant(user32-input)
     const windowProperties: Map<number, Map<string, number>> = new Map();
+    // @participant(user32-input)
     let nextDdeInstance = 1;
+    // @participant(user32-input)
     let nextDdeStringHandle = 1;
+    // @participant(user32-input)
     let nextDdeConv = 1;
+    // @participant(user32-input)
     const ddeInstances = new Set<number>();
+    // @participant(user32-input)
     const ddeLastError = new Map<number, number>();
+    // @participant(user32-input)
     const ddeStrings = new Map<number, string>();
+    // @participant(user32-input)
+    const ddeServices = new Map<string, Set<number>>();
+    // @participant(user32-input)
+    const ddeConversations = new Set<number>();
+    // @participant(user32-input)
+    const ddeClientOnly = new Set<number>();
+    if (savestatesEnabled()) savestateParticipants.add({
+        id: 'user32-input', version: 4, order: 42,
+        schema: stateKeys<User32InputState>({
+            windowProperties: true, nextDdeInstance: true, nextDdeStringHandle: true, nextDdeConv: true,
+            ddeStrings: true, ddeServices: true, ddeLastError: true, ddeClientOnly: true, heldKeys: true, heldButtons: true,
+            ddeInstances: true, ddeConversations: true,
+        }),
+        capture: () => {
+            const state: User32InputState = {
+                windowProperties: [...windowProperties].map(([h, props]) => [h, [...props]]),
+                nextDdeInstance, nextDdeStringHandle, nextDdeConv,
+                ddeStrings: [...ddeStrings],
+                ddeServices: [...ddeServices].map(([name, insts]) => [name, [...insts]]),
+                ddeLastError: [...ddeLastError],
+                ddeClientOnly: [...ddeClientOnly],
+                heldKeys: System.getInstance().inputManager.captureHeldKeys(),
+                heldButtons: System.getInstance().inputManager.captureHeldButtons(),
+                ddeInstances: [...ddeInstances],
+                ddeConversations: [...ddeConversations],
+            };
+            return state as unknown as SaveValue;
+        },
+        restore: (saved) => {
+            const s = saved as unknown as User32InputState;
+            System.getInstance().inputManager.restoreHeldKeys(s.heldKeys);
+            System.getInstance().inputManager.restoreHeldButtons(s.heldButtons);
+            windowProperties.clear();
+            for (const [h, props] of s.windowProperties) windowProperties.set(h, new Map(props));
+            nextDdeInstance = s.nextDdeInstance;
+            nextDdeStringHandle = s.nextDdeStringHandle;
+            nextDdeConv = s.nextDdeConv;
+            ddeInstances.clear();
+            for (const inst of s.ddeInstances) ddeInstances.add(inst);
+            ddeConversations.clear();
+            for (const conv of s.ddeConversations) ddeConversations.add(conv);
+            ddeClientOnly.clear();
+            for (const inst of s.ddeClientOnly) ddeClientOnly.add(inst);
+            ddeLastError.clear();
+            for (const [inst, err] of s.ddeLastError) ddeLastError.set(inst, err);
+            ddeStrings.clear();
+            for (const [h, text] of s.ddeStrings) ddeStrings.set(h, text);
+            ddeServices.clear();
+            for (const [name, insts] of s.ddeServices) ddeServices.set(name, new Set(insts));
+        },
+    });
+    // Wine's shell32 DDE server registers Progman, Shell and Folders, and also accepts
+    // AppProperties as a service; it answers the Progman and Shell topics.
+    // @transient(constant name table)
+    const ddeShellServices = new Set(['progman', 'shell', 'folders', 'appproperties']);
+    // @transient(constant name table)
+    const ddeShellTopics = new Set(['progman', 'shell']);
+    const DNS_REGISTER = 0x0001;
+    const DNS_UNREGISTER = 0x0002;
+    const APPCMD_CLIENTONLY = 0x00000010;
+    const DMLERR_DLL_USAGE = 0x4004;
+    const ddeServiceKey = (hsz: number): string | null => {
+        const name = ddeStrings.get(hsz);
+        return name === undefined ? null : name.toLowerCase();
+    };
+    const ddeDropInstanceServices = (idInst: number): void => {
+        for (const [key, owners] of ddeServices) {
+            owners.delete(idInst);
+            if (owners.size === 0) ddeServices.delete(key);
+        }
+    };
     function resolvePropertyKey(mem: Uint8Array, lpString: number, wide: boolean): string | null {
         if (lpString === 0) {
             return null;
@@ -302,43 +404,42 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         return 1; // TRUE
     };
 
+    registerAcceleratorParticipant();
+
     exports['LoadAcceleratorsA'] = (ctx, mem, args) => {
-        const hInstance = args[0];
-        const lpTableName = args[1];
-        Logger.verbose(LogCategory.USER32, `LoadAcceleratorsA(0x${hInstance.toString(16)}, 0x${lpTableName.toString(16)})`);
-        return 0; // NULL - accelerator table not found
+        const name = args[1] >>> 0;
+        return loadAccelerators(mem, args[0] >>> 0, name < 0x10000 ? name : Marshaler.readString(mem, name));
     };
 
-    exports['CopyAcceleratorTableA'] = (ctx, mem, args) => {
-        const hAccelSrc = args[0];
-        const lpAccelDst = args[1];
-        const cAccelEntries = args[2];
-        Logger.verbose(LogCategory.USER32, `CopyAcceleratorTableA(0x${hAccelSrc.toString(16)}, 0x${lpAccelDst.toString(16)}, ${cAccelEntries})`);
-        // No real accelerator tables — return 0 entries copied
-        return 0;
+    exports['LoadAcceleratorsW'] = (ctx, mem, args) => {
+        const name = args[1] >>> 0;
+        return loadAccelerators(mem, args[0] >>> 0, name < 0x10000 ? name : Marshaler.readWideString(mem, name));
     };
 
-    exports['CreateAcceleratorTableA'] = (ctx, mem, args) => {
-        const lpAccel = args[0];
-        const cAccel = args[1];
-        Logger.verbose(LogCategory.USER32, `CreateAcceleratorTableA(0x${lpAccel.toString(16)}, ${cAccel})`);
-        // Return a non-zero dummy handle so callers don't treat it as failure
-        return 0x1ACC;
-    };
+    exports['CopyAcceleratorTableA'] = (ctx, mem, args) =>
+        copyAccelerators(mem, args[0] >>> 0, args[1] >>> 0, args[2] | 0);
+
+    exports['CreateAcceleratorTableA'] = (ctx, mem, args) =>
+        createAccelerators(mem, args[0] >>> 0, args[1] | 0);
 
     exports['TranslateAcceleratorA'] = exports['TranslateAcceleratorW'] = (ctx, mem, args) => {
-        const hWnd = args[0];
-        const hAccTable = args[1];
-        const lpMsg = args[2];
-        Logger.verbose(LogCategory.USER32, `TranslateAccelerator(0x${hWnd.toString(16)}, 0x${hAccTable.toString(16)}, 0x${lpMsg.toString(16)})`);
-        return 0; // Message not translated
+        const hWnd = args[0] >>> 0;
+        const hit = hWnd ? findAcceleratorFor(mem, args[1] >>> 0, args[2] >>> 0) : null;
+        if (!hit) return 0;
+        const win = windows.get(hWnd);
+        if (!win || getCapture() || (win.style & (WS_DISABLED_ACCEL | WS_MINIMIZE_ACCEL)) !== 0) return 1;
+        const wParam = ((1 << 16) | hit.cmd) >>> 0;
+        if (win.wndProc && !isSentinelWndProc(win.wndProc) && !(win.isSystemControl && !win.wndProcSubclassed)) {
+            const sent = invokeGuestWndProcSync(ctx, mem, win.wndProc, hWnd, ACCEL_WM_COMMAND, wParam, 0, 12,
+                'TranslateAccelerator', () => 1);
+            if (sent) return sent;
+        }
+        System.getInstance().windowManager.postMessage(hWnd, ACCEL_WM_COMMAND, wParam, 0);
+        System.getInstance().scheduler.wakeMessageWaiters();
+        return 1;
     };
 
-    exports['DestroyAcceleratorTable'] = (ctx, mem, args) => {
-        const hAccel = args[0];
-        Logger.verbose(LogCategory.USER32, `DestroyAcceleratorTable(0x${hAccel.toString(16)})`);
-        return 1; // TRUE - success
-    };
+    exports['DestroyAcceleratorTable'] = (ctx, mem, args) => (destroyAcceleratorTable(args[0] >>> 0) ? 1 : 0);
 
     exports['SetPropA'] = (ctx, mem, args) => {
         const hWnd = args[0];
@@ -492,6 +593,7 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         }
         const inst = nextDdeInstance++;
         ddeInstances.add(inst);
+        if ((args[2] >>> 0) & APPCMD_CLIENTONLY) ddeClientOnly.add(inst);
         ddeLastError.set(inst, DMLERR_NO_ERROR);
         Mem.writeUint32(pidInst, inst >>> 0);
         return DMLERR_NO_ERROR;
@@ -505,7 +607,49 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         }
         ddeInstances.delete(idInst);
         ddeLastError.delete(idInst);
+        ddeClientOnly.delete(idInst);
+        ddeDropInstanceServices(idInst);
         return 1;
+    };
+
+    // HDDEDATA DdeNameService(DWORD idInst, HSZ hsz1, HSZ hsz2, UINT afCmd)
+    exports['DdeNameService'] = (ctx, mem, args) => {
+        const idInst = args[0] >>> 0;
+        const hsz1 = args[1] >>> 0;
+        const afCmd = args[3] >>> 0;
+        if (!ddeInstances.has(idInst)) {
+            return 0;
+        }
+        if (ddeClientOnly.has(idInst)) {
+            ddeLastError.set(idInst, DMLERR_DLL_USAGE);
+            return 0;
+        }
+        if (afCmd & DNS_UNREGISTER) {
+            if (hsz1 === 0) {
+                ddeDropInstanceServices(idInst);
+            } else {
+                const key = ddeServiceKey(hsz1);
+                const owners = key === null ? undefined : ddeServices.get(key);
+                owners?.delete(idInst);
+                if (key !== null && owners && owners.size === 0) ddeServices.delete(key);
+            }
+        } else if (afCmd & DNS_REGISTER) {
+            const key = ddeServiceKey(hsz1);
+            if (key === null) {
+                ddeLastError.set(idInst, DMLERR_INVALIDPARAMETER);
+                return 0;
+            }
+            let owners = ddeServices.get(key);
+            if (!owners) ddeServices.set(key, owners = new Set());
+            owners.add(idInst);
+        }
+        ddeLastError.set(idInst, DMLERR_NO_ERROR);
+        return 1;
+    };
+
+    // BOOL DdeDisconnect(HCONV hConv)
+    exports['DdeDisconnect'] = (ctx, mem, args) => {
+        return ddeConversations.delete(args[0] >>> 0) ? 1 : 0;
     };
 
     // UINT DdeGetLastError(DWORD idInst)
@@ -567,14 +711,27 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         const idInst = args[0] >>> 0;
         const hszService = args[1] >>> 0;
         const hszTopic = args[2] >>> 0;
-        if (!ddeInstances.has(idInst) || hszService === 0 || hszTopic === 0) {
-            if (ddeInstances.has(idInst)) {
-                ddeLastError.set(idInst, DMLERR_NO_CONV_ESTABLISHED);
-            }
+        if (!ddeInstances.has(idInst)) {
+            return 0;
+        }
+        // A NULL service or topic is a wildcard: any server, or any topic the server
+        // supports. Registration alone accepts the connection here; real DDEML also asks
+        // the server's callback (XTYP_CONNECT, refused under CBF_FAIL_CONNECTIONS). The
+        // service table is per process, while DDEML's is system-wide, so a service a
+        // parent process registered is not visible to its child.
+        const service = hszService === 0 ? null : ddeServiceKey(hszService);
+        const topic = hszTopic === 0 ? null : ddeServiceKey(hszTopic);
+        const connectable = hszService === 0
+            ? ddeServices.size > 0 || hszTopic === 0 || (topic !== null && ddeShellTopics.has(topic))
+            : service !== null && (ddeServices.has(service) || ddeShellServices.has(service));
+        if (!connectable) {
+            ddeLastError.set(idInst, DMLERR_NO_CONV_ESTABLISHED);
             return 0;
         }
         ddeLastError.set(idInst, DMLERR_NO_ERROR);
-        return (0xD0000000 | (nextDdeConv++ & 0x0FFFFFFF)) >>> 0;
+        const hConv = (0xD0000000 | (nextDdeConv++ & 0x0FFFFFFF)) >>> 0;
+        ddeConversations.add(hConv);
+        return hConv;
     };
 
     // HDDEDATA DdeClientTransaction(...)

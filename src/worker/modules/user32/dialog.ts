@@ -12,8 +12,9 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { registerDialogItemExports } from './dialog-items';
 import { registerMessageBoxExports } from './dialog-messagebox';
 import { System } from '../../core/system';
-import { WindowInfo, windows, controlImageHandles, getAbsoluteWindowPosition, getGroupSiblingRange, getVirtualScreenRect, killWindowTimers, finalizeWindowDestroy, buttonCheckStates, findChildByControlId, isEffectivelyVisible } from './shared-state';
+import { WindowInfo, windows, controlImageHandles, getAbsoluteWindowPosition, getGroupSiblingRange, getVirtualScreenRect, killWindowTimers, noteTimerMessageRemoved, finalizeWindowDestroy, buttonCheckStates, findChildByControlId, isEffectivelyVisible } from './shared-state';
 import { validateWindow } from './paint-region';
+import { translateKeyMessage } from './translate-message';
 import { WH_CBT, HCBT_CREATEWND, getHooksOfType } from './hooks';
 import { parseDlgTemplate, dluToPixelX, dluToPixelY, getDialogBaseUnits, logDlgTemplateDump, ParsedDlgTemplate } from './dialog-template';
 import { findResourceInPE } from '../../modules/kernel32/resource';
@@ -107,6 +108,9 @@ const WS_EX_CLIENTEDGE = 0x00000200;
 const WS_EX_NOPARENTNOTIFY = 0x00000004;
 
 const DS_CENTER = 0x0800;
+const DS_NOIDLEMSG = 0x0100;
+const WM_ENTERIDLE = 0x0121;
+const MSGF_DIALOGBOX = 0;
 const DS_CENTERMOUSE = 0x1000;
 
 /**
@@ -324,6 +328,7 @@ function resolveModalOwner(owner: number): number {
 }
 
 /** Wine IsDialogMessage VK_RETURN / DM_GETDEFID path. */
+// @refuse(a dialog command is pending)
 let pendingDialogCommand: { hwnd: number; wParam: number; lParam: number } | null = null;
 
 /**
@@ -572,12 +577,17 @@ export function createDialogChildren(
  * Dequeue the next message from the queue (like real GetMessage(NULL, 0, 0)).
  * Modal behavior comes from disabling the owner, not from message filtering.
  * WM_NULL (hwnd=0, message=0) idle messages are skipped automatically.
+ * Like GetMessage, the loop sees only the queue of the thread that called DialogBox:
+ * another thread's windows are served by that thread's own loop.
  */
-function dequeueNextDialogMessage(system: System): { hwnd: number; message: number; wParam: number; lParam: number } | undefined {
+function dequeueNextDialogMessage(system: System, threadId: number): { hwnd: number; message: number; wParam: number; lParam: number; time: number } | undefined {
     for (let i = 0; i < 32; i++) {
-        const msg = system.windowManager.getMessage();
+        const msg = system.windowManager.getMessage(threadId);
         if (!msg) return undefined;
         if (msg.hwnd === 0 && msg.message === 0) continue; // WM_NULL idle
+        // Removing an expired timer's WM_TIMER is what re-arms it; without this every
+        // SetTimer made inside a modal dialog fires exactly once.
+        noteTimerMessageRemoved(msg);
         return msg;
     }
     return undefined;
@@ -629,6 +639,7 @@ function hitTestSystemControlRecursive(
 }
 
 const WM_PAINT = 0x000F;
+const WM_TIMER = 0x0113;
 
 /** DefDlgProc epilogue messages (Wine defdlg.c) — see answersWithDlgProcResult. */
 const WM_CTLCOLOR16 = 0x0019;
@@ -867,6 +878,7 @@ function runModalDialog(
         restoreOwnerActivation();
         return IDCANCEL;
     }
+    const pumpThreadId = (system.scheduler?.getCurrentThreadId() ?? 0) >>> 0;
 
     const completeClosedDialog = (reason: string): number | null => {
         const dialog = activeDialogs.get(dialogHwnd);
@@ -969,6 +981,25 @@ function runModalDialog(
     // -------------------------------------------------------------------------
     let pumpIterations = 0;
     let pumpCompleteThunk: (_ret: number) => number | null;
+    let idleNotified = false;
+    const sendEnterIdle = (): boolean => {
+        if (!hWndParent) return false;
+        const dialogInfo = windows.get(dialogHwnd);
+        if (!dialogInfo || (dialogInfo.style & DS_NOIDLEMSG) !== 0) return false;
+        const owner = windows.get(hWndParent);
+        const ownerProc = owner?.wndProc ?? 0;
+        if (!ownerProc || isSentinelWndProc(ownerProc)) return false;
+        const result = callbackManager.invokeCallback(
+            ownerProc,
+            [hWndParent, WM_ENTERIDLE, MSGF_DIALOGBOX, dialogHwnd],
+            0,
+            (ret) => pumpCompleteThunk(ret),
+            false,
+            `${label}:enter-idle`,
+            frameId,
+        );
+        return result.callbackId !== 0;
+    };
 
     const pumpScheduler = createPumpScheduler();
     const schedulePump = (delayMs: number): void => pumpScheduler.schedule(pumpStep, delayMs);
@@ -1053,7 +1084,12 @@ function runModalDialog(
 
         system.inputManager.poll(true);
 
-        const msg = dequeueNextDialogMessage(system);
+        const msg = dequeueNextDialogMessage(system, pumpThreadId);
+        if (!msg && !idleNotified) {
+            idleNotified = true;
+            if (sendEnterIdle()) return;
+        }
+        if (msg) idleNotified = false;
         if (!msg) {
             if (pumpIterations <= 5 || pumpIterations % 100 === 0) {
                 Logger.warn(LogCategory.USER32,
@@ -1063,7 +1099,7 @@ function runModalDialog(
             return;
         }
 
-        const { hwnd, message, wParam, lParam } = msg;
+        const { hwnd, message, wParam, lParam, time } = msg;
         const targetInfo = windows.get(hwnd);
 
         Logger.log(
@@ -1084,6 +1120,9 @@ function runModalDialog(
             schedulePump(0);
             return;
         }
+        // DialogBox's own loop runs TranslateMessage on what IsDialogMessage did not
+        // claim; without it an Edit in a modal dialog never receives a character.
+        translateKeyMessage(hwnd, message, wParam, lParam);
 
         // --- Modal dialog mouse re-routing ---
         // Real modal dialogs are active owned top-level windows. If an already queued
@@ -1165,7 +1204,12 @@ function runModalDialog(
         // --- Dispatch to x86 wndProc ---
         // Determine which wndProc to call for this message
         let targetWndProc = 0;
-        if (hwnd === dialogHwnd) {
+        let dispatchArgs = [hwnd, message, wParam, lParam];
+        if (message === WM_TIMER && lParam !== 0) {
+            // DispatchMessage calls a timer's TIMERPROC instead of the window procedure.
+            targetWndProc = lParam >>> 0;
+            dispatchArgs = [hwnd, message, wParam, time >>> 0];
+        } else if (hwnd === dialogHwnd) {
             // Message to the dialog itself -> call lpDialogFunc
             targetWndProc = lpDialogFunc;
         } else if (targetInfo?.wndProc && !isSentinelWndProc(targetInfo.wndProc)) {
@@ -1179,7 +1223,7 @@ function runModalDialog(
             try {
                 const result = callbackManager.invokeCallback(
                     targetWndProc,
-                    [hwnd, message, wParam, lParam],
+                    dispatchArgs,
                     0,
                     pumpCompleteThunk,
                     false,
@@ -2065,11 +2109,13 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
         || Msg === WM_CHARTOITEM || Msg === WM_QUERYDRAGICON || Msg === WM_INITDIALOG;
 
     /** Messages the dialog manager must NOT default-process when the DlgProc declines. */
+    // @transient(constant message set)
     const NO_DEFAULT_PROCESSING = new Set(
         [WM_INITDIALOG, WM_VKEYTOITEM, WM_COMPAREITEM, WM_CHARTOITEM]);
 
     /** hwnd:msg:wParam:lParam of a DlgProc call in flight — a DlgProc that itself calls
      *  DefDlgProc would otherwise recurse until the callback pool is exhausted. */
+    // @transient(non-empty only while a DlgProc callback runs, and the safe point allows no callback in flight)
     const dlgProcInFlight = new Set<string>();
 
     /**
@@ -2264,4 +2310,8 @@ export function runModalDialogFromTemplate(
 
 export function isSentinelWndProc(wndProc: number): boolean {
     return (wndProc >>> 16) === 0xFFFF;
+}
+
+export function pendingDialogCommandFor(): number {
+    return pendingDialogCommand?.hwnd ?? 0;
 }

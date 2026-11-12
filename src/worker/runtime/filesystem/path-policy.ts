@@ -110,7 +110,20 @@ export class PathPolicy {
         this.persistRules = compile([...DEFAULT_PERSIST_GLOBS, ...(cfg.persist ?? [])]);
     }
 
+    private readonly memo = new Map<string, Classification>();
+
     classify(guestPath: string): Classification {
+        if ((globalThis as { __pathPolicyMemo?: boolean }).__pathPolicyMemo === false) return this.classifyUncached(guestPath);
+        let c = this.memo.get(guestPath);
+        if (c === undefined) {
+            c = this.classifyUncached(guestPath);
+            if (this.memo.size >= 4096) this.memo.clear();
+            this.memo.set(guestPath, c);
+        }
+        return c;
+    }
+
+    private classifyUncached(guestPath: string): Classification {
         const rel = toOverlayRel(guestPath);
         if (this.persistOnly) {
             // Allowlist: persist only known-save paths; everything else is ephemeral.

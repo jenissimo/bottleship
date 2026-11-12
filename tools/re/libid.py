@@ -50,7 +50,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
-PROJECT_ROOT = os.path.join(REPO, "tmp", "ghidra_project")
+PROJECT_ROOT = os.environ.get("BS_RE_PROJECT_ROOT") or os.path.join(REPO, "tmp", "ghidra_project")
 INDEX_ROOT = os.path.join(REPO, "tmp", "libid")
 SIG_ROOT = os.path.join(HERE, "libsigs")
 FINGERPRINTS = os.path.join(HERE, "lib-fingerprints.json")

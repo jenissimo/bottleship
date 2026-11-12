@@ -38,7 +38,12 @@ export interface Vc9CrtHost {
 /** Synthetic guest addresses for MSVC CRT _lock/_unlock file numbers. */
 const CRT_LOCK_BASE = 0xE0000000;
 
-export function registerVc9AbiExports(exports: Record<string, ThunkImplementation>, host: Vc9CrtHost): void {
+export interface Vc9AbiState {
+    umask(): number;
+    restoreUmask(mask: number): void;
+}
+
+export function registerVc9AbiExports(exports: Record<string, ThunkImplementation>, host: Vc9CrtHost): Vc9AbiState {
     const invalidParam = () => {
         /* _invalid_parameter_noinfo */
     };
@@ -299,4 +304,5 @@ export function registerVc9AbiExports(exports: Record<string, ThunkImplementatio
     };
     exports["?_type_info_dtor_internal_method@type_info@@QAEXXZ"] = () => 0;
 
+    return { umask: () => umaskVal, restoreUmask: (mask) => { umaskVal = mask | 0; } };
 }

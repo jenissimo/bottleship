@@ -7,7 +7,7 @@ import { MSSSample } from "./types";
 import {
     ensureDriverHandle, getBytesPerSecond, getMemory, makeView,
     setSampleStatus, updateSampleMemory, refreshSampleLenDone,
-    readFilenameArg, isEncodedFormat, MSS_SAMPLE_STRUCT_SIZE,
+    readFilenameArg, isEncodedFormat, MSS_SAMPLE_STRUCT_SIZE, isMp3,
     computeSampleVolumes, getPlaybackLengthBytes, writeSamplePosition,
 } from "./helpers";
 import {
@@ -18,7 +18,70 @@ import { playSample, updateSamplePlayback, stopRingBuffer, resumeRingBuffer, see
 import { System } from "../../core/system";
 import { i32ToFloat } from "../../../audio/audio-ring-buffer";
 import { ensureListener3D, writeListener3D } from "./spatial";
+import { decodeRawSampleImage } from "./raw-sample-cache";
 import { clampLevel, f32Arg, levelsToVolumePan, pan127ToPanLevel, panLevelToPan127, volumePanToLevels } from "./volume-levels";
+
+const tagAt = (d: Uint8Array, o: number, tag: string): boolean => {
+    if (d.length < o + tag.length) return false;
+    for (let i = 0; i < tag.length; i++) if (d[o + i] !== tag.charCodeAt(i)) return false;
+    return true;
+};
+
+/**
+ * A sound image that names its own format by an unambiguous file signature: RIFF/WAVE,
+ * Ogg, or an ID3-tagged MP3. Anything else is raw data in the layout AIL_set_sample_type
+ * gave the voice. No MPEG frame-sync heuristic here: raw PCM routinely starts with bytes
+ * that look like one (16-bit sample -1 is FF FF, a loud 8-bit start is FF Fx), and the
+ * voice's declared type is the contract for this call.
+ */
+export function isContainerImage(data: Uint8Array, typeDeclared = true): boolean {
+    if (tagAt(data, 0, "RIFF") && tagAt(data, 8, "WAVE")) return true;
+    if (tagAt(data, 0, "OggS") || tagAt(data, 0, "ID3")) return true;
+    // A voice that never got AIL_set_sample_type has no declared layout to trust; keep
+    // the previous behaviour of recognising a bare MPEG stream there.
+    return !typeDeclared && isMp3(data);
+}
+
+/** DIG_PCM_SIGN (AIL_set_sample_type flags): the data is signed. */
+export const DIG_PCM_SIGN = 0x0001;
+
+// @transient(log-once flag)
+let adpcmRawWarned = false;
+
+/**
+ * Decode a voice's raw PCM sound image with its current type (8/16-bit, mono/stereo) and
+ * rate. Decoding goes through the per-image cache, so replaying or re-typing an unchanged
+ * image neither copies nor converts it again.
+ */
+export function decodeRawSampleData(sampleObj: MSSSample, src?: Uint8Array, offset = 0, length?: number): Float32Array | null {
+    const source = src ?? sampleObj.fileData;
+    if (!source) return null;
+    const len = length ?? source.length;
+    const channels = sampleObj.channels > 0 ? sampleObj.channels : 1;
+    const bits = sampleObj.bitsPerSample > 0 ? sampleObj.bitsPerSample : 8;
+    const adpcm = ((sampleObj.sampleTypeFormat ?? 0) & DIG_F_ADPCM_MASK) !== 0;
+    if (adpcm && !adpcmRawWarned) {
+        adpcmRawWarned = true;
+        Logger.warn(LogCategory.SYSTEM,
+            `MSS32: raw DIG_F_ADPCM sound image (format=${sampleObj.sampleTypeFormat}) is not decoded; playing silence`);
+    }
+    const signed8 = ((sampleObj.sampleTypeFlags ?? 0) & DIG_PCM_SIGN) !== 0;
+    const image = decodeRawSampleImage(sampleObj.fileDataAddress ?? 0, source, offset, len,
+        { channels, bits, signed8, adpcm });
+    sampleObj.fileData = image.data;
+    sampleObj.fileFormat = "raw";
+    sampleObj.formatTag = 1;
+    sampleObj.channels = channels;
+    sampleObj.bitsPerSample = bits;
+    sampleObj.blockAlign = channels * Math.max(1, bits >> 3);
+    sampleObj.encodedDurationMs = undefined;
+    const rate = (sampleObj.playbackRateHz ?? 0) > 0 ? sampleObj.playbackRateHz! : (sampleObj.sampleRate > 0 ? sampleObj.sampleRate : 22050);
+    sampleObj.sampleRate = rate;
+    sampleObj.playbackRate = 1.0;
+    sampleObj.decodedData = image.decoded;
+    sampleObj.pcmBytes = image.pcmBytes;
+    return image.decoded;
+}
 
 export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
@@ -711,8 +774,16 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         sampleObj.fileDataAddress = address;
         sampleObj.fileDataAllocated = false;
         sampleObj.decodedData = null;
-        sampleObj.fileData = memRef.slice(address, address + len);
-        decodeAudioFile(ctx, sampleObj);
+        const image = memRef.subarray(address, address + len);
+        if (isContainerImage(image, sampleObj.sampleTypeFormat !== undefined)) {
+            sampleObj.fileData = image.slice();
+            decodeAudioFile(ctx, sampleObj);
+        } else {
+            const decoded = decodeRawSampleData(sampleObj, memRef, address, len);
+            if (sampleObj.pendingStart && decoded && decoded.length > 0) {
+                playSample(ctx, sampleObj);
+            }
+        }
 
         updateSampleMemory(ctx, sampleObj, address, sampleObj.pcmBytes ?? len);
         if (sampleObj.pcmBytes !== undefined) {

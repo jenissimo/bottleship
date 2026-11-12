@@ -20,13 +20,13 @@
  */
 
 import { Process } from '../../core/process';
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import type { HleDispatcher, ThunkImplementation, X86Context } from '../../core/thunking/thunk-dispatcher';
 import { createVTablesFromDescriptor, VTableInfo } from '../../api/adapters/module-adapter';
 import { IUnknown } from '../../api/types';
 import { InterfaceDescriptor, ModuleDescriptor } from '../../api/types';
 import { createComObject, devices } from '../d3d9/shared-state';
 import { bindSharedParameters } from './effect-pool';
-import { disposeEffectParameters, effectLostDevice } from './effect-lifetime';
+import { disposeEffectParameters, effectLostDevice, selectEffectTechnique } from './effect-lifetime';
 import { addComRef, registerComFinalizer, releaseComRef } from '../d3d9/com-refs';
 import { normalizeGuid, readGuidFromMem } from '../../core/com/typelib/typelib-types';
 import { Mem } from '../../core/memory/mem-accessor';
@@ -72,6 +72,7 @@ import {
     setMatrixArray,
     setNumberArray,
     setObjectParam,
+    setRawBytesAt,
     setRawValue,
     setScalarBool,
     setScalarFloat,
@@ -94,7 +95,7 @@ const E_FAIL = 0x80004005;
 const FAKE_HANDLE = 1;
 
 /** [name, argCount] in vtable order; argCount INCLUDES the pushed `this` (COM stdcall). */
-const EFFECT_METHODS: ReadonlyArray<readonly [string, number]> = [
+export const EFFECT_METHODS: ReadonlyArray<readonly [string, number]> = [
     // --- ID3DXBaseEffect ---
     ['GetDesc', 2],
     ['GetParameterDesc', 3],
@@ -427,7 +428,7 @@ export function createEffectExports(process: Process): Record<string, ThunkImple
         if (!handle || !isTechniqueHandle(handle) || handle.index >= inst.model.techniques.length) {
             return D3DERR_INVALIDCALL;
         }
-        inst.currentTechnique = handle.index;
+        selectEffectTechnique(inst, handle.index);
         return D3D_OK;
     };
 
@@ -721,10 +722,7 @@ export function createEffectExports(process: Process): Record<string, ThunkImple
             noteSetTextureOutcome(found.param.objectPtr ? "setRaw" : "setRawNull");
             return D3D_OK;
         }
-        const block = found.param.value;
-        if (!block.length || offset >= block.length) return D3DERR_INVALIDCALL;
-        block.set(bytes.subarray(0, Math.min(bytes.length, block.length - offset)), offset);
-        return D3D_OK;
+        return setRawBytesAt(found.param, bytes, offset) ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
     exports['ID3DXEffect_SetValue'] = (_ctx, _mem, args) => {
@@ -1086,14 +1084,14 @@ export function createEffectExports(process: Process): Record<string, ThunkImple
         return hr;
     };
 
-    /** Re-applies the active pass so parameter writes since BeginPass reach the device. */
+    /** Sends the parameter writes made since the pass was last applied to the device. */
     exports['ID3DXEffect_CommitChanges'] = (_ctx, mem, args) => {
         const inst = instanceOf(args[0]);
         if (!inst || inst.activePass < 0) return D3D_OK;
         const pass = inst.model.techniques[inst.currentTechnique]?.passes[inst.activePass];
         const deps = pass ? applyDepsFor(inst, mem) : null;
         if (!pass || !deps) return D3D_OK;
-        return applyPassStates(deps, inst, pass);
+        return applyPassStates(deps, inst, pass, true);
     };
 
     // EndPass restores nothing: a multi-pass technique relies on pass N+1 overwriting only
@@ -1265,7 +1263,34 @@ export function createEffectExports(process: Process): Record<string, ThunkImple
     exports['D3DXCreateEffectFromFileExW'] = (_ctx, _mem, args) =>
         publishEffect(args[7] >>> 0, null, args[0] >>> 0, args[6] >>> 0, parseSkipConstants(args[4] >>> 0));
 
+    registerSetterFastPaths(process, exports);
     return exports;
+}
+
+export const FAST_SETTERS: ReadonlyArray<readonly [string, number]> = [
+    ['SetBool', 3], ['SetInt', 3], ['SetFloat', 3],
+    ['SetBoolArray', 4], ['SetIntArray', 4], ['SetFloatArray', 4],
+    ['SetVector', 3], ['SetVectorArray', 4],
+    ['SetMatrix', 3], ['SetMatrixArray', 4], ['SetMatrixPointerArray', 4],
+    ['SetMatrixTranspose', 3], ['SetMatrixTransposeArray', 4], ['SetMatrixTransposePointerArray', 4],
+    ['SetTexture', 3],
+];
+
+function registerSetterFastPaths(process: Process, exports: Record<string, ThunkImplementation>): void {
+    const dispatcher = process.dispatcher as HleDispatcher | undefined;
+    if (!dispatcher?.registerFastPath) return;
+    for (const [method, argCount] of FAST_SETTERS) {
+        const name = `ID3DXEffect_${method}`;
+        const setter = exports[name];
+        if (!setter) continue;
+        const args = new Array<number>(argCount).fill(0);
+        const ctx = { esp: 0 } as X86Context;
+        dispatcher.registerFastPath('d3dx9', name, (esp, view, mem) => {
+            for (let i = 0; i < argCount; i++) args[i] = view.getUint32(esp + 4 + i * 4, true);
+            ctx.esp = esp;
+            return setter(ctx, mem, args) as number;
+        }, { trivial: true });
+    }
 }
 
 /** Distinct pSkipConstants lists already reported, so a per-effect list is not a firehose. */

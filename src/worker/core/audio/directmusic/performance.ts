@@ -27,6 +27,7 @@ import {
     type ChordContext, DEFAULT_CHORD, DMUS_PLAYMODE_NONE, musicValueToMidi, variationMatchesChord,
 } from "./music-value";
 import type { DlsSynth } from "./synth";
+import type { WaveData } from "./wave";
 
 export const DMUS_SEGF_REFTIME = 1 << 6;
 export const DMUS_SEGF_SECONDARY = 1 << 7;
@@ -95,6 +96,7 @@ export class PerfSegment {
     curves: SeqCurve[] = [];
     /** A motif or transition plays this one pattern instead of choosing by groove level. */
     fixedPattern: { style: Style; pattern: StylePattern } | null = null;
+    wave: WaveData | null = null;
 
     /** The time signature the segment is counted in: its style's. */
     timeSig(): TimeSignature {
@@ -137,6 +139,22 @@ export class PerfSegment {
             segment.loopEnd = settings.loopEnd;
             segment.resolution = settings.resolution;
         }
+        return segment;
+    }
+
+    static fromWave(wave: WaveData): PerfSegment {
+        const segment = new PerfSegment();
+        segment.wave = wave;
+        segment.length = Math.max(1, Math.ceil((wave.frames / wave.rate) * (120 * DMUS_PPQ / 60)));
+        return segment;
+    }
+
+    static transition(style: Style, tempo: number, command: number, grooveLevel: number): PerfSegment {
+        const segment = new PerfSegment();
+        segment.length = ticksPerMeasure(style.timeSig);
+        segment.styles = [{ time: 0, style }];
+        segment.tempos = [{ time: 0, tempo }];
+        segment.commands = [{ time: 0, measure: 0, beat: 0, command, grooveLevel, grooveRange: 0 }];
         return segment;
     }
 
@@ -184,6 +202,8 @@ export class PerfSegmentState {
     /** Per part: the variation last played, for parts that take them in sequence. */
     readonly sequentialVariation = new Map<string, number>();
     grooveLevel = 0;
+    wavePosition = 0;
+    output: object | null = null;
 
     constructor(segment: PerfSegment, primary: boolean, startTime: number) {
         this.segment = segment;
@@ -191,6 +211,108 @@ export class PerfSegmentState {
         this.startTime = startTime;
         this.repeatsLeft = segment.repeats;
     }
+}
+
+export interface PerfSegmentStateData {
+    primary: boolean;
+    startTime: number;
+    base: number;
+    repeatsLeft: number;
+    started: boolean;
+    ended: boolean;
+    queued: number;
+    fresh: boolean;
+    stopAt: number | null;
+    patternStyle: number;
+    pattern: number;
+    patternStart: number;
+    patternEnd: number;
+    variations: number[];
+    sequentialVariation: Array<[string, number]>;
+    grooveLevel: number;
+    wavePosition: number;
+    output: number;
+}
+
+const NONE = -1;
+const FIXED = -2;
+
+export class PerfStateError extends Error {}
+
+function partState(ref: PartRef, part: StylePart, variation: number): PartState {
+    return {
+        ref, part, variation,
+        lengthTicks: Math.max(1, part.measures) * ticksPerMeasure(part.timeSig),
+        gridTicks: ticksPerGrid(part.timeSig),
+    };
+}
+
+export function capturePerfSegmentState(
+    s: PerfSegmentState, stateRef: (state: PerfSegmentState) => number, outputRef: (output: object) => number,
+): PerfSegmentStateData {
+    const fixed = s.segment.fixedPattern;
+    const patternStyle = !s.patternStyle ? NONE : s.patternStyle === fixed?.style ? FIXED
+        : s.segment.styles.findIndex((item) => item.style === s.patternStyle);
+    const pattern = !s.pattern ? NONE : s.pattern === fixed?.pattern ? FIXED : s.patternStyle?.patterns.indexOf(s.pattern) ?? NONE;
+    if ((s.patternStyle && patternStyle === NONE) || (s.pattern && pattern === NONE)) {
+        throw new PerfStateError("directmusic: a playing pattern is not part of its segment");
+    }
+    return {
+        primary: s.primary, startTime: s.startTime, base: s.base, repeatsLeft: s.repeatsLeft, started: s.started, ended: s.ended,
+        queued: s.queued ? stateRef(s.queued) : NONE, fresh: s.fresh, stopAt: s.stopAt ?? null,
+        patternStyle, pattern, patternStart: s.patternStart, patternEnd: s.patternEnd,
+        variations: s.parts.map((part) => part.variation), sequentialVariation: [...s.sequentialVariation],
+        grooveLevel: s.grooveLevel, wavePosition: s.wavePosition, output: s.output ? outputRef(s.output) : NONE,
+    };
+}
+
+export function restorePerfSegmentState(segment: PerfSegment, d: PerfSegmentStateData): PerfSegmentState {
+    const s = new PerfSegmentState(segment, d.primary, d.startTime);
+    s.base = d.base;
+    s.repeatsLeft = d.repeatsLeft;
+    s.started = d.started;
+    s.ended = d.ended;
+    s.fresh = d.fresh;
+    s.stopAt = d.stopAt ?? undefined;
+    const fixed = segment.fixedPattern;
+    const style = d.patternStyle === NONE ? null : d.patternStyle === FIXED ? fixed?.style : segment.styles[d.patternStyle]?.style;
+    const pattern = d.pattern === NONE ? null : d.pattern === FIXED ? fixed?.pattern : style?.patterns[d.pattern];
+    if (style === undefined || pattern === undefined) throw new Error("directmusic: a saved pattern is not part of its segment");
+    s.patternStyle = style;
+    s.pattern = pattern;
+    s.patternStart = d.patternStart;
+    s.patternEnd = d.patternEnd;
+    if (style && pattern) {
+        for (const ref of pattern.partRefs) {
+            const part = style.parts.get(ref.partId);
+            if (part) s.parts.push(partState(ref, part, d.variations[s.parts.length] ?? NONE));
+        }
+    }
+    if (s.parts.length !== d.variations.length) throw new Error("directmusic: a saved pattern has other parts than its style");
+    for (const [key, variation] of d.sequentialVariation) s.sequentialVariation.set(key, variation);
+    s.grooveLevel = d.grooveLevel;
+    s.wavePosition = d.wavePosition;
+    return s;
+}
+
+export function linkPerfSegmentState(
+    s: PerfSegmentState, d: PerfSegmentStateData, stateOf: (ref: number) => PerfSegmentState, outputOf: (ref: number) => object,
+): void {
+    s.queued = d.queued === NONE ? null : stateOf(d.queued);
+    s.output = d.output === NONE ? null : outputOf(d.output);
+}
+
+export interface PerformanceData {
+    now: number;
+    tempo: number;
+    masterTempo: number;
+    randomState: number;
+    states: number[];
+    events: Array<[time: number, kind: string, channel: number, a: number, b: number, owner: number]>;
+    transpose: Array<[number, number]>;
+    drumChannels: number[];
+    installed: Array<[channel: number, collection: number, patch: number]>;
+    defaultCollection: number;
 }
 
 interface PendingEvent {
@@ -207,6 +329,7 @@ export class Performance {
     readonly synth: DlsSynth;
     /** Random source; replaceable so a test can make pattern and variation choices repeatable. */
     random: () => number = Math.random;
+    randomState = 0;
     /** Segment notifications: (DMUS_NOTIFICATION_SEG*, state, music time it happens at). */
     onNotification: ((type: number, state: PerfSegmentState, time: number) => void) | null = null;
     /** Instruments a band takes from the default (GM) collection resolve here. */
@@ -219,9 +342,54 @@ export class Performance {
     private events: PendingEvent[] = [];
     private readonly transpose = new Map<number, number>();
     private readonly drumChannels = new Set<number>();
+    private readonly installed = new Map<number, { collection: DlsCollection | null; patch: number }>();
 
     constructor(synth: DlsSynth) {
         this.synth = synth;
+    }
+
+    seedRandom(seed: number): void {
+        this.randomState = seed >>> 0;
+        this.random = () => {
+            let t = this.randomState = (this.randomState + 0x6d2b79f5) >>> 0;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 0x100000000;
+        };
+    }
+
+    captureState(stateRef: (state: PerfSegmentState) => number, collectionRef: (collection: DlsCollection | null) => number): PerformanceData {
+        return {
+            now: this.now, tempo: this.tempo, masterTempo: this.masterTempo, randomState: this.randomState,
+            states: this.states.map(stateRef),
+            events: this.events.map((e) => [e.time, e.kind, e.channel, e.a, e.b, e.owner && !e.owner.ended ? stateRef(e.owner) : NONE]),
+            transpose: [...this.transpose], drumChannels: [...this.drumChannels],
+            installed: [...this.installed].map(([channel, entry]) => [channel, collectionRef(entry.collection), entry.patch]),
+            defaultCollection: collectionRef(this.defaultCollection),
+        };
+    }
+
+    restoreState(d: PerformanceData, stateOf: (ref: number) => PerfSegmentState, collectionOf: (ref: number) => DlsCollection | null): void {
+        this.now = d.now;
+        this.tempo = d.tempo;
+        this.masterTempo = d.masterTempo;
+        this.seedRandom(d.randomState);
+        this.states = d.states.map(stateOf);
+        this.events = d.events.map(([time, kind, channel, a, b, owner]) => (
+            { time, kind: kind as PendingEvent["kind"], channel, a, b, owner: owner === NONE ? null : stateOf(owner) }));
+        this.transpose.clear();
+        for (const [channel, value] of d.transpose) this.transpose.set(channel, value);
+        this.drumChannels.clear();
+        for (const channel of d.drumChannels) this.drumChannels.add(channel);
+        this.installed.clear();
+        for (const [channel, collection, patch] of d.installed) this.installed.set(channel, { collection: collectionOf(collection), patch });
+        this.defaultCollection = collectionOf(d.defaultCollection);
+    }
+
+    reinstallInstruments(collection: DlsCollection): void {
+        for (const [channel, entry] of this.installed) {
+            if (entry.collection === collection) this.synth.setInstrument(channel, collection, entry.patch);
+        }
     }
 
     /** Current music time in ticks (768 per quarter note). */
@@ -275,7 +443,8 @@ export class Performance {
         const state = new PerfSegmentState(segment, !secondary, start);
         if (!secondary) {
             // A primary segment not yet started is superseded by this one.
-            this.states = this.states.filter((s) => !(s.primary && !s.started));
+            for (const s of this.states) if (s.primary && !s.started) this.finish(s, DMUS_NOTIFICATION_SEGABORT, this.now);
+            this.states = this.states.filter((s) => !s.ended);
         }
         this.states.push(state);
         return state;
@@ -290,7 +459,7 @@ export class Performance {
         for (const s of this.states) {
             if (s.ended) continue;
             if (state ? s !== state : segment ? s.segment !== segment : false) continue;
-            s.queued = null;
+            this.dropQueued(s, this.now);
             if (at <= this.now || !s.started) this.finish(s, DMUS_NOTIFICATION_SEGABORT, Math.max(this.now, s.startTime));
             else s.stopAt = at;
         }
@@ -334,13 +503,7 @@ export class Performance {
             return { transition: null, transitionState: null, toState };
         }
 
-        const transition = new PerfSegment();
-        transition.length = ticksPerMeasure(style.timeSig);
-        transition.styles = [{ time: 0, style }];
-        transition.tempos = [{ time: 0, tempo: this.tempo }];
-        transition.commands = [{
-            time: 0, measure: 0, beat: 0, command, grooveLevel: from.grooveLevel || 1, grooveRange: 0,
-        }];
+        const transition = PerfSegment.transition(style, this.tempo, command, from.grooveLevel || 1);
         const transitionState = this.playSegment(transition, boundary);
         let toState: PerfSegmentState | null = null;
         if (to) {
@@ -378,10 +541,68 @@ export class Performance {
             }
             if (taken > 0) this.events.splice(0, taken);
             if (cursor < count) this.synth.render(left, right, done + cursor, count - cursor);
+            this.mixWaves(left, right, done, count, t1);
 
             this.now = t1;
             done += count;
         }
+    }
+
+    hasWaveOn(output: object): boolean {
+        for (const s of this.states) if (s.output === output && s.segment.wave && !s.ended) return true;
+        return false;
+    }
+
+    endWavesOn(output: object): void {
+        let ended = false;
+        for (const s of this.states) {
+            if (s.output !== output || !s.segment.wave || s.ended) continue;
+            this.finish(s, DMUS_NOTIFICATION_SEGEND, this.now);
+            ended = true;
+        }
+        if (ended) this.states = this.states.filter((s) => !s.ended);
+    }
+
+    renderWaves(output: object, left: Float32Array, right: Float32Array, frames: number, rate: number): void {
+        this.mixWaves(left, right, 0, frames, this.now, output, rate);
+    }
+
+    private mixWaves(left: Float32Array, right: Float32Array, offset: number, count: number, sliceEnd: number,
+        output: object | null = null, rate = this.synth.sampleRate): void {
+        let ended = false;
+        for (const s of this.states) {
+            const wave = s.segment.wave;
+            if (!wave || !s.started || s.ended || s.output !== output) continue;
+            if (wave.frames === 0) {
+                this.finish(s, DMUS_NOTIFICATION_SEGEND, sliceEnd);
+                ended = true;
+                continue;
+            }
+            const step = wave.rate / rate;
+            let pos = s.wavePosition;
+            for (let i = 0; i < count; i++) {
+                let idx = pos | 0;
+                if (idx >= wave.frames) {
+                    if (s.repeatsLeft > 0) {
+                        s.repeatsLeft--;
+                        pos -= wave.frames;
+                        idx = pos | 0;
+                        this.onNotification?.(DMUS_NOTIFICATION_SEGLOOP, s, sliceEnd);
+                    } else {
+                        this.finish(s, DMUS_NOTIFICATION_SEGEND, sliceEnd);
+                        ended = true;
+                        break;
+                    }
+                }
+                const frac = pos - idx;
+                const next = idx + 1 < wave.frames ? idx + 1 : idx;
+                left[offset + i] = left[offset + i]! + wave.left[idx]! + (wave.left[next]! - wave.left[idx]!) * frac;
+                right[offset + i] = right[offset + i]! + wave.right[idx]! + (wave.right[next]! - wave.right[idx]!) * frac;
+                pos += step;
+            }
+            s.wavePosition = pos;
+        }
+        if (ended) this.states = this.states.filter((s) => !s.ended);
     }
 
     private dispatch(e: PendingEvent): void {
@@ -417,7 +638,6 @@ export class Performance {
         if (s.primary) {
             for (const other of this.states) {
                 if (other !== s && other.primary && other.started && !other.ended) {
-                    other.queued = null;
                     this.finish(other, DMUS_NOTIFICATION_SEGABORT, s.startTime);
                 }
             }
@@ -434,11 +654,19 @@ export class Performance {
         for (const e of this.events) if (e.owner === s && e.kind === "off" && e.time > at) e.time = at;
         if (s.started) this.onNotification?.(notification, s, at);
         const next = s.queued;
-        s.queued = null;
         if (next && notification === DMUS_NOTIFICATION_SEGEND) {
+            s.queued = null;
             next.startTime = at;
             this.states.push(next);
+        } else {
+            this.dropQueued(s, at);
         }
+    }
+
+    private dropQueued(s: PerfSegmentState, at: number): void {
+        const next = s.queued;
+        s.queued = null;
+        if (next && next !== s) this.finish(next, DMUS_NOTIFICATION_SEGABORT, at);
     }
 
     /**
@@ -447,6 +675,7 @@ export class Performance {
      */
     private playState(s: PerfSegmentState, from: number, until: number): number {
         const seg = s.segment;
+        if (seg.wave) return until;
         const loopEnd = seg.loopEnd > 0 ? seg.loopEnd : seg.length;
         const looping = s.repeatsLeft > 0 && loopEnd > seg.loopStart;
         const boundary = s.base + (looping ? loopEnd : seg.length);
@@ -486,6 +715,7 @@ export class Performance {
             if (inst.flags & DMUS_IO_INST_PATCH) {
                 const collection = loaded.collections[index] ?? this.defaultCollection;
                 this.synth.setInstrument(channel, collection, inst.patch);
+                this.installed.set(channel, { collection, patch: inst.patch });
                 if (inst.patch & F_INSTRUMENT_DRUMS) this.drumChannels.add(channel);
                 else this.drumChannels.delete(channel);
             }
@@ -624,11 +854,7 @@ export class Performance {
                 }
                 if (lock) locked.set(lock, variation);
             }
-            s.parts.push({
-                ref, part, variation,
-                lengthTicks: Math.max(1, part.measures) * ticksPerMeasure(part.timeSig),
-                gridTicks: ticksPerGrid(part.timeSig),
-            });
+            s.parts.push(partState(ref, part, variation));
         }
     }
 

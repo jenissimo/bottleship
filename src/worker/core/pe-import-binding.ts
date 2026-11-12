@@ -9,6 +9,7 @@
 import { EMU_NATIVE_VIDEO_DLLS, VIDEO_DLL_NAMES } from './cpu/emulator-config';
 import { normalizeDllBaseName, resolveThunkedDllAlias } from './dll-aliases';
 import { deriveStackCleanupFromMangledName } from './thunking/msvc-mangling';
+import type { CrtChoice } from './crt-binding';
 
 /**
  * DLLs whose implementation IS the emulator. The "registry cannot cover these imports, but
@@ -30,6 +31,10 @@ export function isD3dx9VersionedDll(dllNameLower: string): boolean {
 
 export interface ImportFn { name?: string; ordinal?: number }
 
+export function trapsUnknownImport(f: ImportFn, aliased: boolean): boolean {
+    return aliased || (f.name === undefined && f.ordinal !== undefined);
+}
+
 /** What the API registry knows about one export of the thunked module. */
 export interface ExportFacts {
     callingConvention?: string;
@@ -48,6 +53,11 @@ export interface ImportBindingDeps {
     /** Would that path resolve to our own synthetic system directory rather than the game's? */
     isUnderSystemDirectory(path: string): boolean;
     exportFacts(thunkedName: string, f: ImportFn): ExportFacts;
+    /**
+     * The process-wide C runtime decision for a CRT import name (crt-binding.ts), or undefined
+     * when none applies. When set it replaces the per-module coverage rule for that name.
+     */
+    processCrtChoice?(dllNameRaw: string): CrtChoice | undefined;
     log(message: string): void;
     warn(message: string): void;
 }
@@ -67,7 +77,7 @@ export interface ImportBinding {
  * for an ALIAS standing in for a file the app ships: there the absence of a registry entry is
  * the absence of the library, and binding it anyway hands the guest a trap stub or a zero.
  */
-function coversImport(thunkedName: string, f: ImportFn, aliased: boolean, deps: ImportBindingDeps): boolean {
+function coversImport(thunkedName: string, f: ImportFn, aliased: boolean, deps: Pick<ImportBindingDeps, 'exportFacts'>): boolean {
     const facts = deps.exportFacts(thunkedName, f);
     if (f.name === undefined) {
         return f.ordinal === undefined || facts.argCount !== undefined;
@@ -76,6 +86,22 @@ function coversImport(thunkedName: string, f: ImportFn, aliased: boolean, deps: 
     if (facts.isDataExport) return true;
     if (facts.argCount !== undefined || facts.stackCleanupBytes !== undefined) return true;
     return !aliased && deriveStackCleanupFromMangledName(f.name) !== undefined;
+}
+
+/**
+ * The imports the HLE module standing for this DLL cannot answer, whether or not a real file
+ * exists — what the per-process CRT decision warns about when there is nothing to fall back on.
+ * Empty for names with no HLE module and for the DLLs that are HLE-only by policy.
+ */
+export function uncoveredHleImports(
+    dllNameRaw: string,
+    functions: readonly ImportFn[],
+    deps: Pick<ImportBindingDeps, 'hasThunkedModule' | 'exportFacts'>,
+): ImportFn[] {
+    const before = dllNameRaw.toLowerCase().replace(/\.dll$/i, '');
+    const name = resolveThunkedDllAlias(before);
+    if (!deps.hasThunkedModule(name) || HLE_ONLY_DLLS.has(name) || isD3dx9VersionedDll(name)) return [];
+    return functions.filter(f => !coversImport(name, f, name !== before, deps));
 }
 
 export function resolveImportBinding(
@@ -127,8 +153,26 @@ export function resolveImportBinding(
         !(!EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(dllName)) &&
         !isD3dx9VersionedDll(dllName)) {
         const uncovered = functions.filter(f => !coversImport(dllName, f, aliasTarget !== null, deps));
-        if (uncovered.length > 0 && deps.findDllPath(dllNameBeforeAlias) !== null) {
-            const names = uncovered.slice(0, 5).map(f => f.name ?? `ord_${f.ordinal}`).join(', ');
+        const names = uncovered.slice(0, 5).map(f => f.name ?? `ord_${f.ordinal}`).join(', ');
+        // One C runtime per process (crt-binding.ts): the process decision outranks this
+        // module's own coverage, in both directions, so no two importers end up on two CRTs.
+        const processChoice = deps.processCrtChoice?.(dllNameRaw);
+        if (processChoice === 'native' && deps.findDllPath(dllNameBeforeAlias) !== null) {
+            if (uncovered.length === 0) {
+                deps.log(`[PE] ${dllNameRaw}: HLE covers every import, but the process binds this CRT ` +
+                    `to the shipped DLL — following it`);
+            }
+            isThunked = false;
+            dllName = dllNameBeforeAlias;
+            aliasTarget = null;
+        } else if (processChoice === 'hle') {
+            if (uncovered.length > 0 && deps.findDllPath(dllNameBeforeAlias) !== null) {
+                deps.warn(
+                    `[PE] ${dllNameRaw}: HLE does not cover ${uncovered.length}/${functions.length} imports ` +
+                    `(${names}${uncovered.length > 5 ? ', …' : ''}), but the process binds this CRT to HLE — ` +
+                    `following it rather than loading a second C runtime`);
+            }
+        } else if (uncovered.length > 0 && deps.findDllPath(dllNameBeforeAlias) !== null) {
             deps.warn(
                 `[PE] Thunked module "${dllName}" cannot cover ${uncovered.length}/${functions.length} ` +
                 `imports of ${dllNameRaw} (${names}${uncovered.length > 5 ? ', …' : ''}); ` +
@@ -140,4 +184,11 @@ export function resolveImportBinding(
     }
 
     return { dllName, aliasTarget, isThunked };
+}
+
+const CRT_DLL = /^(msvcrt(d|20|40)?|msvcr\d+d?|ucrtbased?|crtdll|api-ms-win-crt-[a-z0-9-]+)$/;
+
+export function bindTimeCallingConvention(dll: string, known: string | undefined, argCount: number | undefined): string | undefined {
+    if (known !== undefined || argCount !== undefined) return known;
+    return CRT_DLL.test(dll.toLowerCase().replace(/\.dll$/, '')) ? 'cdecl' : undefined;
 }

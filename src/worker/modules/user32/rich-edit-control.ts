@@ -120,10 +120,12 @@ interface RichEditState {
     format: RichCharFormat;
 }
 
+// @refuse(rich edit controls are not part of a v1 savestate)
 const richEditStates = new Map<number, RichEditState>();
 
 // Registered lazily for the same reason edit-control's purger is: shared-state sits
 // in an import cycle with the control modules.
+// @transient(wiring done once per worker)
 let hooksRegistered = false;
 
 function ensureHooks(): void {
@@ -607,4 +609,12 @@ function richEditPageLines(child: WindowInfo): number {
     const state = getState(child);
     if (state.lineCount >= 0) return Math.max(1, state.visibleLines);
     return Math.max(1, Math.floor((child.height - RICH_EDIT_INSET * 2) / NOMINAL_LINE_HEIGHT));
+}
+
+export function richEditControlCount(): number {
+    return richEditStates.size;
+}
+
+export function resetRichEditStatesForTests(): void {
+    richEditStates.clear();
 }

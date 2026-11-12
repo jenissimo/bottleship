@@ -201,12 +201,17 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             return D3DERR_INVALIDCALL;
         }
 
-        const emulatorConfig = EmulatorConfig.getInstance();
+        // "The current display mode of the adapter": after a fullscreen device or a
+        // ChangeDisplaySettings mode-set this is that mode, the same answer SM_CXSCREEN,
+        // EnumDisplaySettings(ENUM_CURRENT_SETTINGS) and GetDeviceCaps(HORZRES) give. The
+        // manifest's resolution is only the desktop the guest booted on.
+        const desktop = EmulatorConfig.getInstance().screenResolution;
+        const current = System.getInstance().emulatedDisplayMode;
         const mode: D3D9Mode = {
-            width: emulatorConfig.screenResolution.width,
-            height: emulatorConfig.screenResolution.height,
-            refreshRate: emulatorConfig.screenResolution.refreshRate || 60,
-            format: getFormatForBpp(emulatorConfig.screenResolution.bpp),
+            width: current?.width || desktop.width,
+            height: current?.height || desktop.height,
+            refreshRate: current?.refreshRate || desktop.refreshRate || 60,
+            format: getFormatForBpp(current?.bpp || desktop.bpp),
         };
 
         return writeDisplayMode(pMode, mode) ? D3D_OK : D3DERR_INVALIDCALL;

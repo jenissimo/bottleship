@@ -18,6 +18,7 @@ interface WindowUpdateState {
 }
 
 const MAX_REGION_RECTS = 8;
+// @participant(user32)
 const updates = new Map<number, WindowUpdateState>();
 
 function normalizeClientRect(win: WindowInfo, rect: ClientRect): ClientRect | null {
@@ -150,6 +151,13 @@ export function getWindowUpdateRects(hwnd: number): ClientRect[] {
     return state ? [...state.rects] : [];
 }
 
+/** The update region as flat left,top,right,bottom quads — the input a GDI region is built from. */
+export function getWindowUpdateQuads(hwnd: number): number[] {
+    const quads: number[] = [];
+    for (const r of updates.get(hwnd)?.rects ?? []) quads.push(r.left, r.top, r.right, r.bottom);
+    return quads;
+}
+
 /** Win32 BeginPaint: fErase reflects whether background should be erased. */
 export function consumeNeedsErase(hwnd: number): boolean {
     const state = updates.get(hwnd);
@@ -185,4 +193,15 @@ export function writeClientRectToMem(mem: Uint8Array, lpRect: number, rect: Clie
     view.setInt32(lpRect + 4, rect.top, true);
     view.setInt32(lpRect + 8, rect.right, true);
     view.setInt32(lpRect + 12, rect.bottom, true);
+}
+
+export type SavedUpdateRegion = [hwnd: number, rects: ClientRect[], needsErase: boolean];
+
+export function capturePaintRegions(): SavedUpdateRegion[] {
+    return [...updates].map(([h, u]) => [h, u.rects.map(r => ({ left: r.left, top: r.top, right: r.right, bottom: r.bottom })), u.needsErase]);
+}
+
+export function restorePaintRegions(rows: readonly SavedUpdateRegion[]): void {
+    updates.clear();
+    for (const [h, rects, needsErase] of rows) updates.set(h, { rects: rects.map(r => ({ ...r })), needsErase });
 }

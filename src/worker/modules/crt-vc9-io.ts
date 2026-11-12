@@ -4,11 +4,10 @@
 
 import { Mem } from "../core/memory/mem-accessor";
 import { System } from "../core/system";
-import type { VfsEntry, VfsFileHandle } from "../runtime/filesystem/vfs";
+import type { VfsEntry } from "../runtime/filesystem/vfs";
 import { VFS_FILE_TIME_UNIX_SECONDS, unixTimeOf } from "../runtime/filesystem/file-time";
 import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { getCPU } from "../core/thunking/thunk-utils";
-import { ArrayVaListReader, scanCLazy } from "./crt-format";
 import { formatAsctime } from "./crt-time";
 
 export interface Vc9IoHost {
@@ -19,7 +18,6 @@ export interface Vc9IoHost {
     fseek(filePtr: number, offset: number, origin: number): number;
     ftell(filePtr: number): number;
     filelength(fd: number): number;
-    fileStreams: Map<number, { fd: number; handle: VfsFileHandle; ungetChar: number }>;
     malloc(size: number): number;
     writeCString(ptr: number, value: string): void;
     memset(ptr: number, val: number, size: number): number;
@@ -30,7 +28,9 @@ interface FindState {
     index: number;
 }
 
+// @participant(msvcrt)
 let nextFindHandle = 0x4000;
+// @refuse(an open _findfirst search holds a directory listing)
 const findHandles = new Map<number, FindState>();
 
 /** Drop trailing fraction zeros but KEEP the decimal point (CRT _cropzeros stops on it). */
@@ -239,8 +239,27 @@ function fillStat32(structPtr: number, size: number, isDir: boolean, host: Vc9Io
  * in the real CRT: asctime(localtime(t)) is a legal call, and one shared buffer
  * has the formatted text land on top of the tm being read.
  */
+// @participant(msvcrt)
 let asctimeBuf = 0;
+// @participant(msvcrt)
 let localtime64Buf = 0;
+
+export interface Vc9IoStatics { nextFindHandle: number; asctimeBuf: number; localtime64Buf: number }
+
+export function openFindHandleCount(): number {
+    return findHandles.size;
+}
+
+export function captureVc9IoStatics(): Vc9IoStatics {
+    return { nextFindHandle, asctimeBuf, localtime64Buf };
+}
+
+export function restoreVc9IoStatics(s: Vc9IoStatics): void {
+    findHandles.clear();
+    nextFindHandle = s.nextFindHandle;
+    asctimeBuf = s.asctimeBuf;
+    localtime64Buf = s.localtime64Buf;
+}
 
 /** Both live in memory Process.reset() rewinds — forget them with it (see crt-time). */
 export function resetVc9TimeStatics(): void {
@@ -465,32 +484,11 @@ export function registerVc9IoExports(exports: Record<string, ThunkImplementation
         return asctimeBuf >>> 0;
     };
 
-    exports["fscanf"] = (_ctx, _mem, args) => {
-        const filePtr = args[0] ?? 0;
-        const fmtPtr = args[1] ?? 0;
-        if (!filePtr || !fmtPtr) return -1;
-        const stream = host.fileStreams.get(filePtr);
-        if (!stream) return -1;
-        const format = host.readCString(fmtPtr, 4096);
-        // Minimal: no stream read — use empty input unless fgets buffer exists
-        const input = "";
-        let argIdx = 2;
-        const reader = new ArrayVaListReader(args, argIdx);
-        return scanCLazy(
-            input,
-            format,
-            (addr, v) => Mem.writeUint32(addr, v >>> 0),
-            (addr, v) => {
-                const buf = new ArrayBuffer(8);
-                const f = new Float64Array(buf);
-                f[0] = v;
-                const u = new Uint32Array(buf);
-                Mem.writeUint32(addr, u[0] ?? 0);
-                Mem.writeUint32(addr + 4, u[1] ?? 0);
-            },
-            () => reader.nextUint32(),
-        );
-    };
+    // No fscanf here. msvcrt registers this table AFTER its own exports, so an entry here
+    // REPLACES msvcrt's streaming fscanf (crt-scanf core over the FILE's VFS handle). A
+    // stub that scanned an empty string used to sit here: every fscanf read nothing and
+    // left its outputs untouched — The Longest Journey parses each speech .iss header
+    // with fscanf, got garbage lengths, and every voice line ended the instant it began.
 
     /**
      * char *_gcvt(double value, int ndec, char *buf) — cdecl, so the double occupies

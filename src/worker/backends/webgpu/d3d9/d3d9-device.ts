@@ -107,7 +107,7 @@ import {
 } from "./shader";
 import type { CensusSummary } from "./shader/census";
 import { AlphaTest, alphaTestSnippet } from "./shader/sm-wgsl";
-import { devices as d3d9Devices, noteD3D9TextureUpload, twinStateBlocks } from "../../../modules/d3d9/shared-state";
+import { D3D9EX_SHADOWED_SETTERS, devices as d3d9Devices, noteD3D9TextureUpload, twinStateBlocks } from "../../../modules/d3d9/shared-state";
 import { pixelShaderComObjects, vertexDeclComObjects, vertexShaderComObjects } from "./d3d9-com-objects";
 // renderSpace only: the windowed regime is exactly where the guest picture space and the
 // guest POINTER space stop coinciding, so the verb has to be able to print both.
@@ -191,7 +191,7 @@ import {
     MAX_VERTEX_BUFFER_SLOTS, MAX_VERTEX_STREAMS, StreamBindingPlan, StreamBindingTable,
     applyStepModes, bindingSize, declStreamMask, layoutAttributeEnds, layoutStrides, planInstancing,
     isWebGpuArrayStrideAligned, slotArrayStride, slotMaskExceedsLimit, slotsInMask, stepModeFromFreq, zeroStreamBuffer,
-    streamInstanceDivisor, expandInstanceRateData,
+    streamInstanceDivisor, expandInstanceRateData, streamSourceFreqArgsValid,
 } from "../shared/vertex-streams";
 import {
     parseFvf, planFvf, makeFvfDeclaration,
@@ -283,9 +283,6 @@ const D3D9_MAX_RENDER_TARGETS = 4;
 const D3DCULL_NONE = 1;
 const D3DCULL_CW = 2;
 const D3DCULL_CCW = 3;
-/** SetStreamSourceFreq dividers (d3d9types.h): the flag half of the setting word. */
-const D3DSTREAMSOURCE_INDEXEDDATA = 0x40000000;
-const D3DSTREAMSOURCE_INSTANCEDATA = 0x80000000;
 
 type ShaderDiagnosticStage = "vs" | "ps";
 type ShaderDiagnosticBuild = "pending" | "linked" | "built" | "failed";
@@ -670,6 +667,11 @@ function isTransformState(state: number): boolean {
         || (state >= D3DTS_TEXTURE0 && state < D3DTS_TEXTURE0 + FFP_TEXTURE_TRANSFORM_COUNT);
 }
 
+export function d3d9BufferAlignment(): number {
+    const v = (globalThis as { __d3d9BufferAlign?: number }).__d3d9BufferAlign;
+    return v === 8 || v === 32 ? v : 16;
+}
+
 export class D3D9Device {
     /** Set when the parent interface is IDirect3D9Ex; Ex reset/pool rules follow the parent. */
     public isExtended = false;
@@ -767,14 +769,14 @@ export class D3D9Device {
 
     /** Guest heap belongs to the front: the render twin takes the address the front's call
      *  returned (a bare pointer, or the `ptr` of a lock result) and allocates nothing. */
-    private guestAlloc(bytes: number): number {
+    private guestAlloc(bytes: number, alignment?: number): number {
         if (this.role === "render") {
             const r = this.splitFrontResult;
             const ptr = typeof r === "number" ? r : (r as { ptr?: unknown } | null | undefined)?.ptr;
             if (typeof ptr !== "number" || ptr <= 0) throw new Error("split twin: no front allocation to adopt");
             return ptr;
         }
-        return System.getInstance().process!.memory.alloc(bytes, "HEAP");
+        return System.getInstance().process!.memory.alloc(bytes, "HEAP", undefined, alignment);
     }
 
     private guestFree(ptr: number): void {
@@ -2053,10 +2055,9 @@ export class D3D9Device {
             d = (System.getInstance().process?.dispatcher as typeof this.shadowSyncDispatcher) ?? null;
             this.shadowSyncDispatcher = d;
         }
-        for (const fn of ['IDirect3DDevice9_SetRenderState', 'IDirect3DDevice9_SetSamplerState',
-            'IDirect3DDevice9_SetTexture', 'IDirect3DDevice9_SetVertexShader',
-            'IDirect3DDevice9_SetPixelShader']) {
+        for (const [fn, exFn] of Object.entries(D3D9EX_SHADOWED_SETTERS)) {
             d?.resetShadow?.('d3d9', fn);
+            d?.resetShadow?.('d3d9', exFn);
         }
     }
 
@@ -2065,7 +2066,11 @@ export class D3D9Device {
         this.d3d9MsaaProbe = d3d9MsaaProbe;
 
         this.backendExecutor = new D3D9BackendExecutor(backend);
-        registerBackendQualitySupport("d3d9", ["anisotropy", "forceTrilinear", "msaa", "internalScale"]);
+        // Auto pins to 1x here (see resolveOffscreenExtent): fractional supersampling would
+        // change the sample grid the guest reads back through occlusion queries.
+        registerBackendQualitySupport("d3d9", ["anisotropy", "forceTrilinear", "msaa", "internalScale"],
+            { autoInternalScale: "native" });
+
         this.pipelineCache = new LruCache<string, number>({
             maxEntries: this.pipelineCacheMaxSize,
             canEvict: (key) => key !== this.currentPipelineKey,
@@ -2351,6 +2356,12 @@ export class D3D9Device {
             this.shadowSyncDispatcher = d;
         }
         d?.writeShadowSlot?.('d3d9', funcName, slot, value);
+        // The IDirect3DDevice9Ex setter stubs carry their own shadow tables (bound when the
+        // first Ex device is created, modules/d3d9/fast-path.ts). They get exactly the writes
+        // the base table gets, so either one can be the table a guest call compares against.
+        // A no-op until they exist.
+        const exName = D3D9EX_SHADOWED_SETTERS[funcName];
+        if (exName !== undefined) d?.writeShadowSlot?.('d3d9', exName, slot, value);
     }
 
     private samplerSpecForStage(stage: number): SamplerSpec {
@@ -3861,14 +3872,8 @@ export class D3D9Device {
         // A/B: bring back the E_NOTIMPL this replaced, so the failure it causes can be
         // reproduced on demand instead of argued about.
         if ((globalThis as { __noStreamSourceFreq?: boolean }).__noStreamSourceFreq) return 0x80004001;
-        if (streamNumber < 0 || streamNumber >= D3D9Device.MAX_STREAMS) return D3DERR_INVALIDCALL;
+        if (!streamSourceFreqArgsValid(streamNumber, setting)) return D3DERR_INVALIDCALL;
         const value = setting >>> 0;
-        const indexed = (value & D3DSTREAMSOURCE_INDEXEDDATA) !== 0;
-        const instance = (value & D3DSTREAMSOURCE_INSTANCEDATA) !== 0;
-        // The two flags are mutually exclusive, and the divider itself is never 0.
-        if ((indexed && instance) || ((value & ~(D3DSTREAMSOURCE_INDEXEDDATA | D3DSTREAMSOURCE_INSTANCEDATA)) === 0)) {
-            return D3DERR_INVALIDCALL;
-        }
         if (this.recordingStateBlock) {
             this.recordStateBlock({ op: "streamSourceFreq", stream: streamNumber, setting: value });
             return D3D_OK;
@@ -3935,7 +3940,7 @@ export class D3D9Device {
         if (this.role !== "render" && !System.getInstance().process) return 0;
         try {
             // +16: tail canary (see BUF_CANARY) — kept outside the size the store/game sees.
-            const guestPtr = this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES);
+            const guestPtr = this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES, d3d9BufferAlignment());
             const index = this.vertexBuffers.create(vbPtr, size, fvf, guestPtr, pool);
             this.dropBufferVersions(index, "vb");
             if (this.role !== "render") this.writeCanary(null, guestPtr, size);
@@ -4327,7 +4332,7 @@ export class D3D9Device {
         if (this.role !== "render" && !System.getInstance().process) return 0;
         try {
             // +16: tail canary, same scheme as createVertexBuffer.
-            const guestPtr = this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES);
+            const guestPtr = this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES, d3d9BufferAlignment());
             const index = this.indexBuffers.create(ibPtr, size, format, guestPtr, pool);
             this.dropBufferVersions(index, "ib");
             if (this.role !== "render") this.writeCanary(null, guestPtr, size);
@@ -4363,14 +4368,19 @@ export class D3D9Device {
         return ptr >= 0 ? ptr : 0;
     }
 
-    // ── Split D3D9: the front captures guest bytes at the call; the twin applies them ──
+    // ── Split D3D9: the front hands the split recorder the locked bytes; the twin applies them ──
+    // The capture* methods return VIEWS of guest memory, not copies. That is sound because the
+    // recorder runs TRANSFORMS (capture) before the front's own unlock, and encodes the view
+    // into the queue only after that unlock returned: commitUnlock/checkCanary read just the
+    // locked range and never write guest bytes, so the view still holds exactly what the guest
+    // wrote. The queue entry is the only copy, made synchronously, before the guest runs again.
 
     captureLockedVertexBytes(vbPtr: number): Uint8Array | null {
         const index = this.vertexBuffers.getIndex(vbPtr);
         const range = index === null ? null : this.vertexBuffers.lockedRange(index);
         if (index === null || !range) return null;
         const start = this.vertexBuffers.getGuestPtr(index) + range.offset;
-        return this.memory.slice(start, start + range.size);
+        return this.memory.subarray(start, start + range.size);
     }
 
     captureLockedIndexBytes(ibPtr: number): Uint8Array | null {
@@ -4378,7 +4388,7 @@ export class D3D9Device {
         const range = index === null ? null : this.indexBuffers.lockedRange(index);
         if (index === null || !range) return null;
         const start = this.indexBuffers.getGuestPtr(index) + range.offset;
-        return this.memory.slice(start, start + range.size);
+        return this.memory.subarray(start, start + range.size);
     }
 
     unlockVertexBufferBytes(vbPtr: number, bytes: Uint8Array | null): number {
@@ -4550,11 +4560,6 @@ export class D3D9Device {
     /** Query generations that became answerable since the last call (render worker). */
     collectSplitQueryResults(): SplitQueryResult[] {
         return this.splitQueryHost?.collect() ?? [];
-    }
-
-    /** Resolves true once in-flight query readbacks settled; false when none were in flight. */
-    splitQueriesInflight(): Promise<boolean> {
-        return this.splitQueryHost?.inflight() ?? Promise.resolve(false);
     }
 
     splitQueryHostCounters(): Record<string, unknown> | null {
@@ -5695,7 +5700,12 @@ export class D3D9Device {
             this.guestFree(tex.guestPtr);
         }
         if (tex.gpuTexture) {
-            tex.gpuTexture.destroy();
+            // Recorded draws may still reference this view after COM Release, so it lives
+            // until the open frame is released. An open frame that has recorded nothing
+            // cannot reference it: destroy now, so a level unload does not hold the old
+            // textures next to the new ones until the next Present.
+            if (this.commandRecorder.hasWork()) this.commandRecorder.registerTemporaryTexture(tex.gpuTexture);
+            else tex.gpuTexture.destroy();
         }
     }
 
@@ -5741,7 +5751,7 @@ export class D3D9Device {
             for (let row = 0; row < 4; row++) {
                 for (let col = 0; col < 4; col++) {
                     let v = 0;
-                    for (let k = 0; k < 4; k++) v += current[row * 4 + k]! * matrix[k * 4 + col]!;
+                    for (let k = 0; k < 4; k++) v += matrix[row * 4 + k]! * current[k * 4 + col]!;
                     result[row * 4 + col] = v;
                 }
             }
@@ -6708,28 +6718,76 @@ export class D3D9Device {
         return this.scissorRect;
     }
 
-    /** Snapshot the effective D3D scissor for a draw. WebGPU keeps scissor state on the pass,
-     * so disabled draws explicitly receive the full target rectangle to prevent state leakage
-     * from a preceding enabled draw. */
-    getScissorRectForDraw(): { left: number; top: number; width: number; height: number } {
+    /** Pre-transformed (XYZRHW / POSITIONT) vertices are already in render-target pixels: D3D
+     *  skips the viewport transform for them and only clips to the viewport rectangle. The RHW
+     *  shader maps against the whole target, so such a draw needs the whole-target viewport and
+     *  the guest viewport as a clip rectangle instead. The layout test goes first: it is two
+     *  memoized integer compares and settles every ordinary draw. */
+    private preTransformedViewportClips(w: number, h: number): boolean {
+        if (!this.activeDeclIsPreTransformed()) return false;
+        const v = this.viewport;
+        return !(v.x === 0 && v.y === 0 && v.width === w && v.height === h);
+    }
+
+    private rhwDrawViewport = { x: 0, y: 0, width: 0, height: 0, minZ: 0, maxZ: 1 };
+    private drawRects: { scissorRect: { left: number; top: number; width: number; height: number }; viewport: D3D9ViewportValues }
+        = { scissorRect: this.scissorDrawRect, viewport: this.viewport };
+
+    /** Resolve the scissor rectangle and the viewport a draw records, deciding the
+     *  pre-transformed sub-viewport case once for both. WebGPU keeps scissor state on the pass,
+     *  so disabled draws explicitly receive the full target rectangle to prevent state leakage
+     *  from a preceding enabled draw. The depth range always stays the guest's. */
+    private resolveDrawRects(): { scissorRect: { left: number; top: number; width: number; height: number }; viewport: D3D9ViewportValues } {
         const { w, h } = this.getCurrentTargetSize();
-        if (this.getRS(D3DRS_SCISSORTESTENABLE) === 0) {
-            this.scissorDrawRect.left = 0;
-            this.scissorDrawRect.top = 0;
-            this.scissorDrawRect.width = Math.max(0, w);
-            this.scissorDrawRect.height = Math.max(0, h);
-            return this.scissorDrawRect;
+        const vpClip = this.preTransformedViewportClips(w, h);
+        const out = this.drawRects;
+        const rect = this.scissorDrawRect;
+        const v = this.viewport;
+        out.scissorRect = rect;
+        if (vpClip) {
+            const full = this.rhwDrawViewport;
+            full.width = w; full.height = h;
+            full.minZ = v.minZ; full.maxZ = v.maxZ;
+            out.viewport = full;
+        } else {
+            out.viewport = v;
         }
-        const scissor = this.effectiveScissorRect();
-        const left = Math.max(0, Math.min(w, scissor.left | 0));
-        const top = Math.max(0, Math.min(h, scissor.top | 0));
-        const right = Math.max(left, Math.min(w, scissor.right | 0));
-        const bottom = Math.max(top, Math.min(h, scissor.bottom | 0));
-        this.scissorDrawRect.left = left;
-        this.scissorDrawRect.top = top;
-        this.scissorDrawRect.width = right - left;
-        this.scissorDrawRect.height = bottom - top;
-        return this.scissorDrawRect;
+        const scissorOn = this.getRS(D3DRS_SCISSORTESTENABLE) !== 0;
+        if (!scissorOn && !vpClip) {
+            rect.left = 0;
+            rect.top = 0;
+            rect.width = Math.max(0, w);
+            rect.height = Math.max(0, h);
+            return out;
+        }
+        let sl = 0, st = 0, sr = w, sb = h;
+        if (scissorOn) {
+            const scissor = this.effectiveScissorRect();
+            sl = scissor.left | 0; st = scissor.top | 0; sr = scissor.right | 0; sb = scissor.bottom | 0;
+        }
+        if (vpClip) {
+            sl = Math.max(sl, Math.floor(v.x));
+            st = Math.max(st, Math.floor(v.y));
+            sr = Math.min(sr, Math.ceil(v.x + v.width));
+            sb = Math.min(sb, Math.ceil(v.y + v.height));
+        }
+        const left = Math.max(0, Math.min(w, sl));
+        const top = Math.max(0, Math.min(h, st));
+        const right = Math.max(left, Math.min(w, sr));
+        const bottom = Math.max(top, Math.min(h, sb));
+        rect.left = left;
+        rect.top = top;
+        rect.width = right - left;
+        rect.height = bottom - top;
+        return out;
+    }
+
+    getScissorRectForDraw(): { left: number; top: number; width: number; height: number } {
+        return this.resolveDrawRects().scissorRect;
+    }
+
+    getViewportForDraw(): D3D9ViewportValues {
+        return this.resolveDrawRects().viewport;
     }
 
     /** Harness CaptureBus producer for D3D9. D3D9's programmable path has
@@ -7533,8 +7591,7 @@ export class D3D9Device {
             pipelineId, streams: this.streamPlan,
             vertexCount: outVerts, startVertex: 0,
             ffpStateIndex,
-            scissorRect: this.getScissorRectForDraw(),
-            viewport: this.viewport,
+            ...this.resolveDrawRects(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -7792,8 +7849,7 @@ export class D3D9Device {
             guestStride: streamSource.stride,
             bindStateIndex,
             ffpStateIndex,
-            scissorRect: this.getScissorRectForDraw(),
-            viewport: this.viewport,
+            ...this.resolveDrawRects(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -8115,8 +8171,7 @@ export class D3D9Device {
             startVertex: 0,
             bindStateIndex,
             ffpStateIndex,
-            scissorRect: this.getScissorRectForDraw(),
-            viewport: this.viewport,
+            ...this.resolveDrawRects(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -8492,8 +8547,7 @@ export class D3D9Device {
             startVertex: 0,
             bindStateIndex,
             ffpStateIndex,
-            scissorRect: this.getScissorRectForDraw(),
-            viewport: this.viewport,
+            ...this.resolveDrawRects(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -8796,8 +8850,9 @@ export class D3D9Device {
         cmd.instanceCount = instancing.instanceCount;
         cmd.bindStateIndex = bindStateIndex;
         cmd.ffpStateIndex = ffpStateIndex;
-        cmd.scissorRect = this.getScissorRectForDraw();
-        cmd.viewport = this.viewport;
+        const rects = this.resolveDrawRects();
+        cmd.scissorRect = rects.scissorRect;
+        cmd.viewport = rects.viewport;
         cmd.stencilReference = this.getRS(D3DRS_STENCILREF) & 0xff;
         cmd.blendConstant = this.getRS(D3DRS_BLENDFACTOR) >>> 0;
         this.commandRecorder.recordDrawIndexed(cmd);
@@ -9123,8 +9178,7 @@ export class D3D9Device {
             compactDescriptorOffset,
             prefixVsBits,
             prefixStartFloat: startRegister * 4,
-            scissorRect: this.getScissorRectForDraw(),
-            viewport: this.viewport,
+            ...this.resolveDrawRects(),
             stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
             blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
         });
@@ -9988,10 +10042,11 @@ export class D3D9Device {
         const streamHash = this.streamHash(slotMask, stride ?? 0);
         const streamKey = this.streamKey(slotMask, stride ?? 0);
         const ptSize = this.getCurrentTargetSize();
+        const ptWholeTarget = this.preTransformedViewportClips(ptSize.w, ptSize.h);
         const preTransformed = this.activeDeclIsPreTransformed()
             ? {
-                viewportWidth: this.viewport.width || ptSize.w,
-                viewportHeight: this.viewport.height || ptSize.h,
+                viewportWidth: ptWholeTarget ? ptSize.w : this.viewport.width || ptSize.w,
+                viewportHeight: ptWholeTarget ? ptSize.h : this.viewport.height || ptSize.h,
                 pixelCenterOffset: pixelCenterOffsetPx(this.activeRenderScale()),
             }
             : null;
@@ -10755,10 +10810,11 @@ export class D3D9Device {
         // into the generated vertex entry, so it is part of the pipeline identity — and both
         // fast paths below key on state that does not carry it, so those are skipped.
         const ptSize = this.getCurrentTargetSize();
+        const ptWholeTarget = this.preTransformedViewportClips(ptSize.w, ptSize.h);
         const preTransformed = this.activeDeclIsPreTransformed()
             ? {
-                viewportWidth: this.viewport.width || ptSize.w,
-                viewportHeight: this.viewport.height || ptSize.h,
+                viewportWidth: ptWholeTarget ? ptSize.w : this.viewport.width || ptSize.w,
+                viewportHeight: ptWholeTarget ? ptSize.h : this.viewport.height || ptSize.h,
                 pixelCenterOffset: pixelCenterOffsetPx(this.activeRenderScale()),
             }
             : null;
@@ -11406,11 +11462,13 @@ export class D3D9Device {
     private captureFfpDrawState(slotMask: number = this.activeSlotMask()): number {
         this.declDrawCounts.set(this.activeVertexDecl, (this.declDrawCounts.get(this.activeVertexDecl) ?? 0) + 1);
         const targetSize = this.getCurrentTargetSize();
-        // FFP RHW coordinates and the pixel-centre correction are expressed in the
-        // active D3D9 viewport; the executor applies the same viewport to the pass.
+        // FFP RHW coordinates and the pixel-centre correction are expressed in the viewport
+        // the executor applies to the pass: the active D3D9 viewport, or the whole target for
+        // a pre-transformed draw in a sub-viewport (resolveDrawRects makes the same choice).
         // Falling back to the target dimensions only covers a not-yet-initialized state.
-        const w = this.viewport.width || targetSize.w;
-        const h = this.viewport.height || targetSize.h;
+        const rhwFull = this.preTransformedViewportClips(targetSize.w, targetSize.h);
+        const w = rhwFull ? targetSize.w : this.viewport.width || targetSize.w;
+        const h = rhwFull ? targetSize.h : this.viewport.height || targetSize.h;
         // Resolved once and shared: the uniform the shader reads and the census that reports
         // what it could not honor must be looking at the same stages.
         const stageCount = this.activeStageCount();
@@ -11663,8 +11721,9 @@ export class D3D9Device {
             state.psVersion = this.copyConstantPrefixWithKey(state.psBits, state.psBits, psLen);
         } else {
             const targetSize = this.getCurrentTargetSize();
-            const w = this.viewport.width || targetSize.w;
-            const h = this.viewport.height || targetSize.h;
+            const rhwFull = this.preTransformedViewportClips(targetSize.w, targetSize.h);
+            const w = rhwFull ? targetSize.w : this.viewport.width || targetSize.w;
+            const h = rhwFull ? targetSize.h : this.viewport.height || targetSize.h;
             const ffp = this.buildFfpUniformBlock(w, h);
             const stageCount = this.activeStageCount();
             for (let stage = 0; stage < stageCount; stage++) {
@@ -13228,6 +13287,16 @@ export class D3D9Device {
             out[i] = source[baseIdx + i]!;
         }
         return out;
+    }
+
+    copyHardwareVertexShaderConstantsToGuest(start: number, vector4fCount: number, pData: number, view: DataView): boolean {
+        if (this.softwareVertexProcessing) return false;
+        const bits = this.vsConstantBits;
+        const baseIdx = start * 4;
+        const count = vector4fCount * 4;
+        if (baseIdx > bits.length || count > bits.length - baseIdx) return false;
+        for (let i = 0; i < count; i++) view.setUint32(pData + i * 4, bits[baseIdx + i]!, true);
+        return true;
     }
 
     getPixelShaderConstants(start: number, vector4fCount: number): Float32Array {

@@ -21,7 +21,7 @@ import { windows, buttonCheckStates, type WindowInfo } from './shared-state';
 import { paintTraceEnabled, logOwnerDrawChain, logPaintRequest } from './paint-trace';
 import { isButtonSystemControl, repaintChildControls } from './controls';
 import { isAppRegisteredClass } from './class';
-import { invalidateWindow, clearWindowUpdate } from './paint-region';
+import { invalidateWindow, clearWindowUpdate, hasPendingUpdate } from './paint-region';
 import {
     enumerateCtlColorChildren,
     ctlColorMessageFor,
@@ -44,6 +44,7 @@ const BS_DEFPUSHBUTTON = 0x0001;
 const WS_DISABLED = 0x08000000;
 const BST_PUSHED = 4;
 
+// @participant(user32)
 let drawItemScratchPtr = 0;
 
 export function resetOwnerDrawScratch(): void {
@@ -122,6 +123,21 @@ export function requestOwnerDrawButtonPaint(button: WindowInfo | undefined): boo
     system.windowManager.postMessage(button!.handle, WM_PAINT, 0, 0);
     system.scheduler.wakeMessageWaiters();
     if (paintTraceEnabled) logPaintRequest(button!.handle, true, 'owner-draw button invalidated');
+    return true;
+}
+
+export function requestSubclassedControlPaint(control: WindowInfo | undefined): boolean {
+    if (!control?.isSystemControl || !control.wndProcSubclassed || !control.wndProc) return false;
+    if (isOwnerDrawButton(control)) return requestOwnerDrawButtonPaint(control);
+    if (!control.visible) {
+        if (paintTraceEnabled) logPaintRequest(control.handle, false, 'subclassed control hidden');
+        return true;
+    }
+    if (!hasPendingUpdate(control.handle)) invalidateWindow(control.handle, null, true);
+    const system = System.getInstance();
+    system.windowManager.postMessage(control.handle, WM_PAINT, 0, 0);
+    system.scheduler.wakeMessageWaiters();
+    if (paintTraceEnabled) logPaintRequest(control.handle, true, 'subclassed control invalidated');
     return true;
 }
 
@@ -524,4 +540,12 @@ export function tryRepaintOwnerDrawButton(
             `${thunkName} ${chain ? 'dispatched' : 'not-dispatched'}`);
     }
     return chain;
+}
+
+export function captureOwnerDrawScratch(): number {
+    return drawItemScratchPtr;
+}
+
+export function restoreOwnerDrawScratch(ptr: number): void {
+    drawItemScratchPtr = ptr;
 }

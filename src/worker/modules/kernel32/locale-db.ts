@@ -23,6 +23,7 @@ interface Tables {
     nLocales: number;
 }
 
+// @transient(constant data, loaded on first use)
 let tables: Tables | null = null;
 
 function load(): Tables {

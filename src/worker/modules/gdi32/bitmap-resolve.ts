@@ -13,6 +13,7 @@ import { System } from '../../core/system';
 import { SystemResourceProvider } from '../../core/resources/system-resource-provider';
 import { asArrayBufferView } from '../../../dom-buffer';
 import { toPlainGuestMemory } from '../../core/memory/guest-memory';
+import type { GDIContext } from './context';
 
 export interface ResolvedBitmapRgba {
     data: Uint8ClampedArray;
@@ -45,6 +46,8 @@ interface BitmapUserObj {
     /** BI_BITFIELDS red/green/blue masks; absent for BI_RGB. */
     dibMasks?: readonly number[];
     isTopDown?: boolean;
+    /** Conversion buffer of the last blit that read this bitmap (resolveDibSectionRectRgba, reuse). */
+    rectScratch?: Uint8ClampedArray;
     loading?: boolean;
     compatibleBitmap?: boolean;
     compatibleEmpty?: boolean;
@@ -149,6 +152,87 @@ function readDibSectionRgba(
     return out;
 }
 
+// @transient(lookup tables derived from a mask layout / a colour table; rebuilt on demand)
+const dib16Luts = new Map<string, Uint32Array>();
+// @transient(scratch for the 8 bpp colour table in canvas byte order)
+const dib8Lut = new Uint32Array(256);
+
+/** 16 bpp pixel value -> canvas RGBA word (little-endian R,G,B,A), for one mask layout. */
+function dib16Lut(masks: readonly [number, number, number]): Uint32Array {
+    const key = masks.join(',');
+    let lut = dib16Luts.get(key);
+    if (!lut) {
+        const decoder = new Dib16Decoder(masks);
+        const px = new Uint8ClampedArray(4);
+        lut = new Uint32Array(65536);
+        for (let v = 0; v < 65536; v++) {
+            decoder.write(v, px, 0);
+            lut[v] = (0xff000000 | (px[2]! << 16) | (px[1]! << 8) | px[0]!) >>> 0;
+        }
+        if (dib16Luts.size >= 4) dib16Luts.clear();
+        dib16Luts.set(key, lut);
+    }
+    return lut;
+}
+
+/**
+ * The 32, 16 and 8 bpp rectangle conversions a whole word at a time: one store per pixel
+ * instead of four, and for 32 bpp one load. Same pixels as the byte loops below, which
+ * stay for the other depths and for an output buffer that is not word-aligned. Needs a
+ * little-endian host, which every WebAssembly target is.
+ */
+function convertDibRectFast(
+    obj: BitmapUserObj, mem: Uint8Array, out: Uint8ClampedArray, outW: number,
+    x: number, y: number, w: number, h: number, bw: number, bh: number, bpp: number,
+): boolean {
+    if (bpp !== 32 && bpp !== 16 && bpp !== 8) return false;
+    if ((out.byteOffset & 3) !== 0) return false;
+    if (obj.bitsPtr! + obj.dibStride! * bh > mem.length) return false;
+    const out32 = new Uint32Array(out.buffer, out.byteOffset, outW * (h - 1) + w);
+    // Rows start `outW` apart: the output may be wider than the rect (see `into`).
+    const skip = outW - w;
+    const rowOf = (row: number) => obj.bitsPtr! + (obj.dibTopDown ? y + row : bh - 1 - (y + row)) * obj.dibStride!;
+    if (bpp === 32) {
+        const aligned = ((mem.byteOffset + obj.bitsPtr! + x * 4) & 3) === 0 && (obj.dibStride! & 3) === 0;
+        const mem32 = aligned ? new Uint32Array(mem.buffer, mem.byteOffset, mem.byteLength >>> 2) : null;
+        for (let row = 0, di = 0; row < h; row++, di += skip) {
+            if (mem32) {
+                let si = (rowOf(row) + x * 4) >>> 2;
+                for (let c = 0; c < w; c++, si++, di++) {
+                    const v = mem32[si]!;
+                    const rgb = (v & 0x0000ff00) | ((v & 0xff) << 16) | ((v >>> 16) & 0xff);
+                    out32[di] = (((v >>> 24) || 255) << 24 | rgb) >>> 0;
+                }
+            } else {
+                let so = rowOf(row) + x * 4;
+                for (let c = 0; c < w; c++, so += 4, di++) {
+                    out32[di] = (((mem[so + 3]! || 255) << 24) | (mem[so]! << 16) | (mem[so + 1]! << 8) | mem[so + 2]!) >>> 0;
+                }
+            }
+        }
+        return true;
+    }
+    if (bpp === 16) {
+        const lut = dib16Lut(dibColorMasks(16, obj.dibMasks));
+        for (let row = 0, di = 0; row < h; row++, di += skip) {
+            let so = rowOf(row) + x * 2;
+            for (let c = 0; c < w; c++, so += 2, di++) out32[di] = lut[mem[so]! | (mem[so + 1]! << 8)]!;
+        }
+        return true;
+    }
+    const palette = obj.dibPalette;
+    if (!palette || palette.length === 0) return false;
+    for (let i = 0; i < 256; i++) {
+        const c = i < palette.length ? palette[i]! : 0xff000000;
+        dib8Lut[i] = ((c & 0xff000000) | ((c & 0xff) << 16) | (c & 0xff00) | ((c >>> 16) & 0xff)) >>> 0;
+    }
+    for (let row = 0, di = 0; row < h; row++, di += skip) {
+        let so = rowOf(row) + x;
+        for (let c = 0; c < w; c++, so++, di++) out32[di] = dib8Lut[mem[so]!]!;
+    }
+    return true;
+}
+
 /**
  * Read a sub-rect of a DIBSection's guest bits as RGBA (blit-source liveness:
  * the app writes bits directly, so blits must see the CURRENT bytes, but only
@@ -162,6 +246,8 @@ export function resolveDibSectionRectRgba(
     ry: number,
     rw: number,
     rh: number,
+    reuse = false,
+    into?: { data: Uint8ClampedArray; width: number; height: number },
 ): { data: Uint8ClampedArray; x: number; y: number; width: number; height: number } | null {
     mem = toPlainGuestMemory(mem);
     const obj = unwrapBitmapObj(hBitmap);
@@ -171,13 +257,30 @@ export function resolveDibSectionRectRgba(
     const w = Math.min(rw | 0, bw - x), h = Math.min(rh | 0, bh - y);
     if (w <= 0 || h <= 0) return null;
     const bpp = obj.dibBpp ?? 32;
-    const out = new Uint8ClampedArray(w * h * 4);
+    // `into`: the caller's own pixels, at least as large as the rect; rows land at ITS
+    // width, so the rect sits in the top-left corner of a buffer that may be wider.
+    // `reuse`: the caller consumes the pixels before the next call for this bitmap (a
+    // blit's putImageData), so the buffer is the bitmap's own and lives as long as it
+    // does — a renderer blitting its frame every tick allocates nothing per frame.
+    if (into && (into.width < w || into.height < h)) return null;
+    let out: Uint8ClampedArray;
+    if (into) {
+        out = into.data;
+    } else if (reuse && obj.rectScratch?.length === w * h * 4) {
+        out = obj.rectScratch;
+    } else {
+        out = new Uint8ClampedArray(w * h * 4);
+        if (reuse) obj.rectScratch = out;
+    }
+    const outW = into ? into.width : w;
+    if (convertDibRectFast(obj, mem, out, outW, x, y, w, h, bw, bh, bpp)) return { data: out, x, y, width: w, height: h };
+    const outStride = outW * 4;
     const palette = obj.dibPalette;
     const decoder16 = bpp === 16 ? new Dib16Decoder(dibColorMasks(16, obj.dibMasks)) : null;
     for (let row = 0; row < h; row++) {
         const srcY = obj.dibTopDown ? y + row : bh - 1 - (y + row);
         const srcRow = obj.bitsPtr + srcY * obj.dibStride;
-        const dstOff = row * w * 4;
+        const dstOff = row * outStride;
         if (bpp === 32) {
             let so = srcRow + x * 4;
             for (let c = 0; c < w; c++, so += 4) {
@@ -225,6 +328,47 @@ export function resolveDibSectionRectRgba(
         }
     }
     return { data: out, x, y, width: w, height: h };
+}
+
+// @transient(host scratch pixels, refilled before every use)
+let dibRefreshScratch: ImageData | null = null;
+
+/**
+ * Bring a rect of a DC's canvas up to date with the guest bits of the DIB section selected
+ * into it. The app writes those bits directly, with no API call to observe, so a draw that
+ * only covers part of the rect it later writes back (text: glyphs inside a padded box) must
+ * start from the current bits; otherwise the write-back returns whatever the canvas held
+ * when the section was selected. Returns false, touching nothing, for a bitmap that has no
+ * guest bits. The pixels go through one scratch ImageData that only ever grows, and the
+ * DC's cached pixels are dropped here, since the canvas no longer matches them.
+ */
+export function refreshCanvasFromDibSectionRect(
+    gdi: Pick<GDIContext, "invalidateImageDataCache">,
+    hdc: number,
+    hBitmap: number,
+    ctx: OffscreenCanvasRenderingContext2D,
+    x: number, y: number, width: number, height: number,
+): boolean {
+    if (!hBitmap) return false;
+    const obj = unwrapBitmapObj(hBitmap);
+    if (!obj || !obj.bitsPtr || !obj.dibStride) return false;
+    const mem = System.getInstance().process?.getCurrentMemory?.();
+    if (!mem) return false;
+    const bw = obj.width ?? 0, bh = obj.height ?? 0;
+    const cx = Math.max(0, x | 0), cy = Math.max(0, y | 0);
+    const cw = Math.min(width | 0, bw - cx), ch = Math.min(height | 0, bh - cy);
+    if (cw <= 0 || ch <= 0) return false;
+    if (obj.bitsPtr + obj.dibStride * bh > mem.length) return false;
+    if (!dibRefreshScratch || dibRefreshScratch.width < cw || dibRefreshScratch.height < ch) {
+        dibRefreshScratch = new ImageData(
+            Math.max(cw, dibRefreshScratch?.width ?? 0), Math.max(ch, dibRefreshScratch?.height ?? 0));
+    }
+    const fresh = resolveDibSectionRectRgba(hBitmap, mem, cx, cy, cw, ch, false, dibRefreshScratch);
+    if (!fresh) return false;
+    ctx.putImageData(dibRefreshScratch, cx, cy, 0, 0, cw, ch);
+    // The canvas changed under any pixels the DC has cached.
+    gdi.invalidateImageDataCache(hdc);
+    return true;
 }
 
 /**
@@ -278,6 +422,60 @@ export function writeBackDibSectionRect(
             mem[o + 2] = src[si];
         }
     }
+}
+
+/**
+ * One pixel written straight into a DIB section's guest bits, without reading the
+ * canvas back. Returns the colour the section now holds at that pixel as a COLORREF
+ * (0x00BBGGRR): the requested one at 24/32 bpp, rounded to the channel widths at 16 bpp,
+ * the nearest colour-table entry at 1/4/8 bpp. Null when the bitmap has no guest bits,
+ * the pixel lies outside it, or an indexed section has no colour table.
+ */
+export function writeDibSectionPixel(hBitmap: number, x: number, y: number, r: number, g: number, b: number): number | null {
+    if (!hBitmap) return null;
+    const obj = unwrapBitmapObj(hBitmap);
+    if (!obj || !obj.bitsPtr || !obj.dibStride) return null;
+    const bpp = obj.dibBpp ?? 32;
+    const bw = obj.width ?? 0, bh = obj.height ?? 0;
+    if (x < 0 || y < 0 || x >= bw || y >= bh) return null;
+    const mem = toPlainGuestMemory(System.getInstance().process?.getCurrentMemory?.());
+    if (!mem || obj.bitsPtr + obj.dibStride * bh > mem.length) return null;
+    const row = obj.bitsPtr + (obj.dibTopDown ? y : bh - 1 - y) * obj.dibStride;
+    if (bpp === 32 || bpp === 24) {
+        const o = row + x * (bpp >> 3);
+        mem[o] = b; mem[o + 1] = g; mem[o + 2] = r;
+        return (b << 16) | (g << 8) | r;
+    }
+    if (bpp === 16) {
+        const [cr, cg, cb] = dibColorMasks(16, obj.dibMasks).map(maskChannel) as [MaskChannel, MaskChannel, MaskChannel];
+        const qr = Math.round(r * cr.max / 255), qg = Math.round(g * cg.max / 255), qb = Math.round(b * cb.max / 255);
+        const v = ((qr << cr.shift) | (qg << cg.shift) | (qb << cb.shift)) >>> 0;
+        const o = row + x * 2;
+        mem[o] = v & 0xff; mem[o + 1] = (v >>> 8) & 0xff;
+        const widen = (q: number, c: MaskChannel) => c.max ? Math.round(q * 255 / c.max) : 0;
+        return (widen(qb, cb) << 16) | (widen(qg, cg) << 8) | widen(qr, cr);
+    }
+    if (bpp !== 8 && bpp !== 4 && bpp !== 1) return null;
+    const palette = obj.dibPalette;
+    if (!palette || palette.length === 0) return null;
+    const count = Math.min(palette.length, 1 << bpp);
+    let best = 0, bestDistance = Infinity;
+    for (let i = 0; i < count; i++) {
+        const c = palette[i]!;
+        const d = (r - ((c >>> 16) & 0xff)) ** 2 + (g - ((c >>> 8) & 0xff)) ** 2 + (b - (c & 0xff)) ** 2;
+        if (d < bestDistance) { bestDistance = d; best = i; if (d === 0) break; }
+    }
+    if (bpp === 8) {
+        mem[row + x] = best;
+    } else if (bpp === 4) {
+        const o = row + (x >> 1);
+        mem[o] = (x & 1) ? ((mem[o]! & 0xf0) | best) : ((mem[o]! & 0x0f) | (best << 4));
+    } else {
+        const o = row + (x >> 3), bit = 0x80 >> (x & 7);
+        mem[o] = best ? (mem[o]! | bit) : (mem[o]! & ~bit);
+    }
+    const c = palette[best]!;
+    return ((c & 0xff) << 16) | (c & 0xff00) | ((c >>> 16) & 0xff);
 }
 
 /** 24bpp as B,G,R; 16bpp packed through the section's masks, each channel rounded to its width. */
@@ -371,7 +569,7 @@ export function resolveDib32RawAlphaRgba(
 }
 
 /** Read 4/8/16/24/32 bpp DIBSection row data into RGBA (best-effort). */
-function readDibSectionRgbaGeneric(
+export function readDibSectionRgbaGeneric(
     mem: Uint8Array,
     bitsPtr: number,
     w: number,
@@ -381,18 +579,30 @@ function readDibSectionRgbaGeneric(
     dibBpp: number,
     palette?: Uint32Array,
     masks?: readonly number[],
+    firstRow = 0,
+    rowCount = h,
 ): Uint8ClampedArray | null {
-    if (dibBpp === 32) {
+    const whole = firstRow === 0 && rowCount === h;
+    if (dibBpp === 32 && whole) {
         return readDibSectionRgba(mem, bitsPtr, w, h, dibStride, dibTopDown);
     }
-    if (!bitsPtr || w <= 0 || h <= 0) return null;
-    const out = new Uint8ClampedArray(w * h * 4);
+    if (!bitsPtr || w <= 0 || h <= 0 || firstRow < 0 || rowCount <= 0 || firstRow + rowCount > h) return null;
+    const out = new Uint8ClampedArray(w * rowCount * 4);
     const decoder16 = dibBpp === 16 ? new Dib16Decoder(dibColorMasks(16, masks)) : null;
-    for (let y = 0; y < h; y++) {
+    for (let y = firstRow; y < firstRow + rowCount; y++) {
         const srcY = dibTopDown ? y : (h - 1 - y);
         const srcRow = bitsPtr + srcY * dibStride;
-        const dstOff = y * w * 4;
-        if (dibBpp === 24) {
+        const dstOff = (y - firstRow) * w * 4;
+        if (dibBpp === 32) {
+            for (let x = 0; x < w; x++) {
+                const si = srcRow + x * 4;
+                const di = dstOff + x * 4;
+                out[di] = mem[si + 2];
+                out[di + 1] = mem[si + 1];
+                out[di + 2] = mem[si];
+                out[di + 3] = 255;
+            }
+        } else if (dibBpp === 24) {
             for (let x = 0; x < w; x++) {
                 const si = srcRow + x * 3;
                 const di = dstOff + x * 4;

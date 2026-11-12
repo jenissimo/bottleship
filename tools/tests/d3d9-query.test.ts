@@ -538,9 +538,97 @@ describe("GetData fast path defers unless the answer is the free S_FALSE", () =>
         expect(tryFastGetData(query, DATA_OUT, 4, 0)).toBe(null);
     });
 
-    test("defers on D3DGETDATA_FLUSH", () => {
+    test("defers on D3DGETDATA_FLUSH on a local device (the flush is the side effect)", () => {
         const query = makeIssuedEventQuery();
         expect(tryFastGetData(query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(null);
+        // Still null after a FLUSH reached the thunk: only the split front ships once per generation.
+        call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, D3DGETDATA_FLUSH);
+        call("IDirect3DQuery9_Issue", query, D3DISSUE_END);
+        expect(tryFastGetData(query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(null);
+    });
+
+    /** A split front: queries answered from results its render worker sends back. */
+    function splitFront(): { flushes: number; results: Map<number, { token: number; state: "ready"; value: bigint }> } {
+        const state = { flushes: 0, results: new Map<number, { token: number; state: "ready"; value: bigint }>() };
+        let tokens = 0;
+        devices.set(DEVICE, {
+            getQueryManager: () => null,
+            getViewport: () => ({ width: 64, height: 32 }),
+            getDrawCount: () => 0,
+            resetSubsystemPerf: () => undefined,
+            splitQueries: {
+                timestampSupported: () => false,
+                create: () => undefined,
+                begin: () => undefined,
+                end: () => ++tokens,
+                flush: () => { state.flushes++; },
+                shipMark: () => 1,
+                shipped: () => false,
+                release: () => undefined,
+                result: (token: number) => state.results.get(token),
+                noteAnswered: () => undefined,
+                noteShipReadyAnswered: () => undefined,
+            },
+        } as any);
+        return state;
+    }
+
+    function makeIssuedRemoteOcclusion(): number {
+        expect(call("IDirect3DDevice9_CreateQuery", DEVICE, D3DQUERYTYPE_OCCLUSION, QUERY_OUT)).toBe(D3D_OK);
+        const query = Mem.readUint32(QUERY_OUT)!;
+        expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_BEGIN)).toBe(D3D_OK);
+        expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_END)).toBe(D3D_OK);
+        return query;
+    }
+
+    test("defers the first D3DGETDATA_FLUSH of a split generation: that call ships it", () => {
+        const front = splitFront();
+        const query = makeIssuedRemoteOcclusion();
+        expect(tryFastGetData(query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(null);
+        expect(front.flushes).toBe(0);
+        expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(S_FALSE);
+        expect(front.flushes).toBe(1);
+    });
+
+    test("serves a split FLUSH poll after its generation shipped as S_FALSE, counted like the thunk", () => {
+        const front = splitFront();
+        const query = makeIssuedRemoteOcclusion();
+        expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(S_FALSE);
+        const pending = getD3D9QueryLedger().pending;
+        expect(tryFastGetData(query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(S_FALSE);
+        expect(getD3D9QueryLedger().pending).toBe(pending + 1);
+        // Same answer the thunk gives, and neither ships again.
+        expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(S_FALSE);
+        expect(getD3D9QueryLedger().pending).toBe(pending + 2);
+        expect(front.flushes).toBe(1);
+
+        // The measured result arrived: the fast path steps aside and the thunk answers it.
+        front.results.set(1, { token: 1, state: "ready", value: 37n });
+        expect(tryFastGetData(query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(null);
+        expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(D3D_OK);
+        expect(Mem.readUint32(DATA_OUT)).toBe(37);
+
+        // A new generation needs its own ship: its first FLUSH goes to the thunk again.
+        expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_BEGIN)).toBe(D3D_OK);
+        expect(call("IDirect3DQuery9_Issue", query, D3DISSUE_END)).toBe(D3D_OK);
+        expect(tryFastGetData(query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(null);
+        expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(S_FALSE);
+        expect(front.flushes).toBe(2);
+    });
+
+    test("defers a shipped split FLUSH poll while the device is lost (it must answer DEVICELOST)", () => {
+        splitFront();
+        registerLossTrackedDevice(DEVICE);
+        const query = makeIssuedRemoteOcclusion();
+        expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(S_FALSE);
+        gpuDeviceLifecycle.notifyLost("test-fast-getdata", "forced query loss");
+        try {
+            expect(tryFastGetData(query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(null);
+            expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(D3DERR_DEVICELOST);
+        } finally {
+            if (!gpuDeviceLifecycle.isUsable()) gpuDeviceLifecycle.notifyRecreated({} as GPUDevice);
+            forgetLossTrackedDevice(DEVICE);
+        }
     });
 
     test("defers on a NULL pData with a non-zero size", () => {

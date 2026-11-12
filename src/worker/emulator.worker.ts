@@ -2,12 +2,17 @@ import { parseIoProfile, profileChunkOrder, type WgbIoPolicy } from "@bottleship
 import { V86 } from "v86";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { adoptFreshGuestMemory } from "./core/memory/guest-page-dirty";
+import { noteBootError, noteBootIdentity, restorePendingAtEntry, savestatesEnabled, type BundleEntryKey } from "./savestate/host";
+import { RestoreFailed } from "./savestate/session";
+import { registerCoreParticipants } from "./savestate/core-participants";
 import { Process } from "./core/process";
 import { System, type GuestImagePatch } from "./core/system";
-import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, setChildRegistrySink, forwardRegistryToChildren, type ChildBoot, type ChildProcessPreparation } from "./core/child-process";
+import { applyHostJitMode, isHostJitMode, type HostJitMode } from "../utils/host-jit-policy";
+import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, setChildRegistrySink, forwardRegistryToChildren, win32ErrorOf, type ChildBoot, type ChildProcessPreparation } from "./core/child-process";
 import { ChildStartupGate } from "./core/child-startup";
 import { createChildVfsClient } from "./core/child-vfs";
 import { adoptProcessIdentity } from "./core/process-identity";
+import { adoptProcessStartupInfo } from "./core/process-startup-info";
 import { adoptProcessIpc, beginProcessIpcLifetime } from "./core/process-ipc";
 import { adoptProcessNetworkNamespace, getProcessNetworkNamespace, beginProcessNetworkLifetime, finishProcessNetworkLifetime, flushProcessNetworkNamespace } from "./core/process-network";
 import type { RegistryMutation } from "./runtime/filesystem/registry";
@@ -32,7 +37,11 @@ setChildSessionPublisher((port, record) => {
   System.getInstance().inputManager.setInputBuffer(null);
   (self as unknown as Worker).postMessage({ type: 'child_session', port, imagePath: record.imagePath, record }, [port]);
 }, () => System.getInstance().releaseChildSessionBroker());
+/** Set by the page (set_jit_policy) or inherited by a child; applied at every v86 init. */
+// @transient(host JIT policy from the page, applies to every session in this worker by design)
+let hostJitMode: HostJitMode = "on";
 setChildBootContext(() => ({
+  jitMode: hostJitMode,
   config: EmulatorConfig.getInstance().snapshotForChild(),
   registry: System.getInstance().registry.serialize(),
   namedObjects: namedObjects.snapshot(),
@@ -50,6 +59,7 @@ import { memoryWatch } from "./core/memory/memory-watch";
 import { memWriteTrap } from "./core/memory/mem-write-trap";
 import { Kernel32 } from "./modules/kernel32";
 import { adoptNamedObjects, namedObjects, type NamedObjectSpec } from "./modules/kernel32/named-objects";
+import { adoptInheritedHandles } from "./modules/kernel32/inherited-handles";
 import { User32 } from "./modules/user32";
 import { GDI32 } from "./modules/gdi32";
 import { installWindowsFonts } from "./modules/gdi32/installed-fonts";
@@ -99,6 +109,7 @@ import { Wtsapi32 } from "./modules/wtsapi32";
 import { Msacm32 } from "./modules/msacm32";
 import { Imm32 } from "./modules/imm32";
 import { Msimg32 } from "./modules/msimg32";
+import { Wing32 } from "./modules/wing32";
 import { Uxtheme } from "./modules/uxtheme";
 import { Wintrust } from "./modules/wintrust";
 import { Crypt32 } from "./modules/crypt32";
@@ -143,6 +154,7 @@ import {
 } from "./core/cpu/emulator-config";
 import { WgbLoader, buildRomIndex, readEntrypointBytes, type WgbManifest, type WgbWriteFileSpec } from "./runtime/filesystem/wgb-loader";
 import { WgbCache } from "./runtime/filesystem/wgb-cache";
+import { shouldPersistBundleUrl } from "./runtime/filesystem/wgb-cache-policy";
 import { detectSourceFormat, sniffBlobHead } from "@bottleship/repack/detect";
 import { blobRandomAccess } from "./runtime/filesystem/installer-opfs";
 import { InnoFormatError } from "@bottleship/formats/inno";
@@ -168,7 +180,7 @@ import { EmulatorConfig } from "./core/emulator-config-manager";
 import { configureNetplay } from "./net/configure-netplay";
 import { lanNetwork } from "./net/lan-network";
 import type { NetworkStatus } from "../network-config";
-import { logQualityGapsOnce, activeQualityBackend, onQualityBackendChanged } from "./backends/webgpu/shared/quality-capabilities";
+import { logQualityGapsOnce, activeQualityBackend, onQualityBackendChanged, internalScaleSupport } from "./backends/webgpu/shared/quality-capabilities";
 import type { QualityConfig } from "./core/quality-config";
 import { videoEngine } from "../video/video-engine";
 import { preemptionManager } from "./core/cpu/preemption-manager";
@@ -192,6 +204,7 @@ import { registerFastPathHeapFunctions, registerFastPathVirtualQuery, allocateHe
 import { registerFastPathMsvcrtFunctions } from "./modules/msvcrt";
 import { registerFastPathPointerFunctions } from "./modules/kernel32/exception";
 import { registerFastPathProcessFunctions } from "./modules/kernel32/process/process";
+import { registerFastPathThreadInformation } from "./modules/ntdll/thread-information";
 import { prePopulateGetProcAddressCache, registerFastPathModuleFunctions, ensureGetProcAddressDynamicExports } from "./modules/kernel32/module/module";
 import { loadedHleModules, materializedHleModules, materializeHleModuleImages } from "./core/hle-module-images";
 import { KERNEL32_VISTA_WARMUP_EXPORTS } from "./api/kernel32-vista-supplement";
@@ -613,18 +626,24 @@ const gdiPresentOnce = () => {
 
     if (shouldComposite) {
       let composedAny = false;
+      // The video plane goes ABOVE the window plane. On Windows the movie is a window of its
+      // own (DirectShow's renderer after put_Owner, an MCI child) on top of the app window
+      // that owns it, and the plane is transparent outside its dest rect, so only the rect
+      // the movie covers is taken. Drawn the other way round, an app window with a painted
+      // background hides the whole movie (Max Payne's movies\intro.mpg: black screen).
+      const videoWillComposite = videoPlan.onScreen && (videoDirty || gdiDirty);
 
-      if (videoPlan.onScreen && (videoDirty || gdiDirty)) {
-        backend.composite(videoPlan.canvas!, shouldClear);
-        notifyVideoPlaneComposited(videoPlan);
-        composedAny = true;
-      }
-
-      if (gdiCanvas && (gdiDirty || composedAny)) {
-        backend.composite(gdiCanvas, shouldClear && !composedAny);
+      if (gdiCanvas && (gdiDirty || videoWillComposite)) {
+        backend.composite(gdiCanvas, shouldClear);
         if (gdiDirty) {
           gdi.clearOverlayDirty();
         }
+        composedAny = true;
+      }
+
+      if (videoWillComposite) {
+        backend.composite(videoPlan.canvas!, shouldClear && !composedAny);
+        notifyVideoPlaneComposited(videoPlan);
         composedAny = true;
       }
 
@@ -1599,6 +1618,9 @@ const postBundleMeta = (manifest: WgbManifest, gameId: string): void => {
   });
 };
 
+/** @transient(boots this worker has run; a savestate loads only on the first, into untouched module state) */
+let bootsInThisWorker = 0;
+
 const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean; io?: WgbIoPolicy }) => {
   const system = System.getInstance();
   if (!system.process) {
@@ -1607,6 +1629,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
   }
   // The Process exists but the dispatch table may still be empty (see hleReady).
   await hleReady;
+  bootsInThisWorker++;
 
   bootMark("load-bundle-start");
   // Scope the GPU-error census to this run, so report().gpuErrors answers "this game",
@@ -1638,7 +1661,10 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       // no 1.5GB BufferSource held in worker RAM, and the same OPFS copy a disk-blob
       // load of this game would use (one copy per game, not two).
       const url = payload.url;
-      let cachedSource = await WgbCache.openSyncSourceForUrl(url);
+      // A dev disk route (sidecar /wgb?path=, Vite /__wgb/?path=) is already a local file:
+      // stream it, never copy it into OPFS (see wgb-cache-policy.ts).
+      const persist = shouldPersistBundleUrl(url);
+      let cachedSource = persist ? await WgbCache.openSyncSourceForUrl(url) : null;
       if (cachedSource) {
         try { bundle = await WgbLoader.fromSource(cachedSource); }
         catch (error) {
@@ -1661,9 +1687,9 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       // against a local synchronous pread — the ceiling for any transport change.
       const streamCapable = (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true
         && !bundle
-        && payload.preload !== true
-        && payload.io?.mode !== "preload-full"
+        && (!persist || (payload.preload !== true && payload.io?.mode !== "preload-full"))
         && (globalThis as Record<string, unknown>).__noSabIo !== true;
+      let streamError: unknown = null;
       if (streamCapable) {
         try {
           // Cold reads from async-capable APIs park their guest thread; disk hits
@@ -1690,8 +1716,18 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
             throw loadErr;
           }
         } catch (e) {
-          Logger.log(LogCategory.SYSTEM, `WGB: sync-stream unavailable (${(e as Error).message}) — staging to OPFS`);
+          streamError = e;
+          Logger.log(LogCategory.SYSTEM, `WGB: sync-stream unavailable (${(e as Error).message})${persist ? " — staging to OPFS" : ""}`);
         }
+      }
+
+      // The fallback below downloads the WHOLE bundle into OPFS; for a local disk bundle
+      // that is the multi-GB copy this policy exists to avoid. `__noSabIo` still opts in.
+      if (!bundle && !persist && (globalThis as Record<string, unknown>).__noSabIo !== true) {
+        const reason = streamError instanceof Error ? streamError.message
+          : streamError ? String(streamError) : "page is not cross-origin isolated";
+        throw new Error(`Could not stream local bundle ${url} (${reason}). Local disk bundles are not ` +
+          `copied into browser storage; check that the dev sidecar (:3001) or Vite /__wgb/ route is serving it.`);
       }
 
       if (!bundle) {
@@ -1987,10 +2023,16 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     const liveIo = (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo;
     if (liveIo && payload.url) {
       const policy = payload.io ?? bundle.manifest.emulator?.io ?? {};
-      const mode = payload.preload ? "preload-full" : policy.mode ?? "stream+fill";
+      // No background fill for a local disk bundle: fill exists to complete the OPFS copy.
+      const mode = !shouldPersistBundleUrl(payload.url) ? "stream"
+        : payload.preload ? "preload-full" : policy.mode ?? "stream+fill";
       if (mode === "preload-full") {
         await liveIo.preloadFull();
-      } else if (policy.profileUrl) {
+      } else if (policy.profileUrl && mode !== "stream") {
+        // The profile only orders preload/fill; plain "stream" (always the case for a local
+        // disk route, whose ETag is a size/mtime stamp rather than the content hash a
+        // profile may have been recorded against) has no use for it, so it is neither
+        // fetched nor allowed to fail the boot.
         const response = await fetch(policy.profileUrl, { signal: AbortSignal.timeout(15_000), cache: "no-cache" });
         if (!response.ok) throw new Error(`WGB profile HTTP ${response.status}`);
         const profile = parseIoProfile(await response.json());
@@ -2001,8 +2043,8 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         if (mode === "preload-profile") {
           await liveIo.preloadChunks(profileChunkOrder(profile, liveIo.chunkBytes, policy.preloadPhases ?? ["loading", "first-level"]));
         }
-        if (mode !== "stream") liveIo.armFill(order);
-      } else {
+        liveIo.armFill(order);
+      } else if (mode !== "stream") {
         if (mode === "preload-profile") throw new Error("preload-profile requires io.profileUrl");
         if (mode === "stream+fill") liveIo.armFill();
       }
@@ -2205,6 +2247,43 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     // put the launch overlay back over that dialog and read as a hang.
     if (await loadPeData(bundle.entrypointBytes, true) === "failed") return;
     bootMark("pe-loaded");
+    if (savestatesEnabled()) {
+      pauseEmulator();
+      let savestateStep = "participants";
+      let loadFailed: string | null = null;
+      try {
+        registerCoreParticipants();
+        savestateStep = "layout";
+        const layout = {
+          thunks: system.process?.thunkGenerator.getAllStubs().map((st: { functionId: number; dllName: string; functionName: string }) => [st.functionId, `${st.dllName}:${st.functionName}`]) ?? [],
+          modules: [...(system.process?.modules.keys() ?? [])],
+        };
+        let entries: BundleEntryKey[] = [];
+        try {
+          entries = bundle.archive.listEntries().map((e) => ({ name: e.name, size: e.uncompressedSize, crc32: e.crc32 }));
+        } catch { entries = []; }
+        savestateStep = "identity";
+        await noteBootIdentity({
+          gameId, manifest: bundle.manifest, entries,
+          config: EmulatorConfig.getInstance().snapshotForChild(), layout,
+        });
+        savestateStep = "restore";
+        const outcome = await restorePendingAtEntry(bootsInThisWorker === 1);
+        (globalThis as Record<string, unknown>).__bsSavestateRestored = outcome;
+      } catch (e) {
+        const message = e instanceof Error ? (e.stack ?? e.message) : String(e);
+        Logger.error(LogCategory.SYSTEM, `[SAVESTATE] ${savestateStep} at entry failed: ${message}`);
+        (globalThis as Record<string, unknown>).__bsSavestateRestored = { error: String(e) };
+        if (e instanceof RestoreFailed) loadFailed = e.message;
+        else noteBootError(`${savestateStep}: ${message}`.slice(0, 600));
+      } finally {
+        if (loadFailed === null) resumeEmulator();
+      }
+      if (loadFailed !== null) {
+        system.reportGuestCrash({ reason: `Savestate load failed: ${loadFailed}`, eip: 0, threadId: null });
+        return;
+      }
+    }
 
     // AOT units must be transaction-committed BEFORE the JIT claims their pages
     // refuses a page the live JIT already owns (rc 2), and that is the whole ordering problem
@@ -2676,6 +2755,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const msacm32 = new Msacm32();
       const imm32 = new Imm32();
       const msimg32 = new Msimg32();
+      const wing32 = new Wing32();
       const uxtheme = new Uxtheme();
       const wintrust = new Wintrust();
       const crypt32 = new Crypt32();
@@ -2759,6 +2839,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       msacm32.initialize(process);
       imm32.initialize(process);
       msimg32.initialize(process);
+      wing32.initialize(process);
       uxtheme.initialize(process);
       wintrust.initialize(process);
       crypt32.initialize(process);
@@ -2839,6 +2920,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(msacm32.name, msacm32);
       process.registerModule(imm32.name, imm32);
       process.registerModule(msimg32.name, msimg32);
+      process.registerModule(wing32.name, wing32);
       process.registerModule(uxtheme.name, uxtheme);
       process.registerModule(wintrust.name, wintrust);
       process.registerModule(crypt32.name, crypt32);
@@ -2856,6 +2938,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(netapi32.name, netapi32);
       process.registerModule(imagehlp.name, imagehlp);
       const dbghelp = new DbgHelp(process);
+      dbghelp.initialize(process);
       process.registerModule(dbghelp.name, dbghelp);
       process.registerModule(ifc20.name, ifc20);
       process.registerModule(gdiplus.name, gdiplus);
@@ -2921,6 +3004,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(msacm32.name, msacm32.exports);
       process.dispatcher.registerModule(imm32.name, imm32.exports);
       process.dispatcher.registerModule(msimg32.name, msimg32.exports);
+      process.dispatcher.registerModule(wing32.name, wing32.exports);
       process.dispatcher.registerModule(uxtheme.name, uxtheme.exports);
       process.dispatcher.registerModule(wintrust.name, wintrust.exports);
       process.dispatcher.registerModule(crypt32.name, crypt32.exports);
@@ -2965,6 +3049,11 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           if (import.meta.env?.DEV && import.meta.env?.VITE_BS_JIT_OFF && cpu.wm.exports.set_jit_config) {
             cpu.wm.exports.set_jit_config(0, 1);
             console.warn("[dbg] JIT DISABLED at init (VITE_BS_JIT_OFF)");
+          }
+          // Host policy (iOS WebKit 27 gate / ?jit=). Same placement and reason as above.
+          const hostJitWrites = applyHostJitMode(cpu.wm.exports, hostJitMode);
+          if (hostJitWrites.length) {
+            Logger.log(LogCategory.SYSTEM, `[JIT] host mode "${hostJitMode}": set_jit_config ${hostJitWrites.map(([i, v]) => `${i}=${v}`).join(",")}`);
           }
           hypercallDataManager.initialize(cpu, preemptionManager.getHypercallPageBase());
           // Report the effective FPU mode this bundle booted with (manifest fpuStrict OR a
@@ -3016,6 +3105,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       registerFastPathMsvcrtFunctions(process.dispatcher);
       registerFastPathPointerFunctions(process.dispatcher);
       registerFastPathProcessFunctions(process.dispatcher);
+      registerFastPathThreadInformation(process.dispatcher);
       registerFastPathModuleFunctions(process.dispatcher);
 
       // Tick hooks for time data sync + onTickHook compensation
@@ -3261,6 +3351,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         // image before restoring inherited objects; otherwise that stale TEB survives
         // while the new bootloader resets FS, and CRT startup faults at fs:[0].
         await prepareFullGameSwitch();
+        // Inherited handles first: they hold the PARENT's values, and every object this
+        // process creates from here on (the named-object adoption below included) must be
+        // allocated around them, as a Windows child's own handles are.
+        if (boot.inheritedHandles?.length) adoptInheritedHandles(boot.inheritedHandles);
         // A child is matched on its own image, not on its parent's: it inherits the bundle's
         // whole rule list in its EmulatorConfig and picks the entry that names it.
         system.registry.setRedirectsForImage(EmulatorConfig.getInstance().registryRedirects, boot.imagePath);
@@ -3307,6 +3401,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         system.executableArgs = boot.commandLine;
         system.executableCommandLine = boot.rawCommandLine ?? null;
         if (boot.environment) process.environment = new Map(boot.environment);
+        noteBootError('this game runs as a child process, which a savestate does not cover yet');
         if (await loadPeData(boot.bytes, true) === 'ok') resolveChildImageReady?.();
       }
 
@@ -3345,11 +3440,22 @@ const initV86 = async (canvas: OffscreenCanvas) => {
  */
 let pendingStop: Promise<void> | null = null;
 
+/**
+ * Tell the host the guest stopped/started. A stopped guest stops feeding the streaming audio
+ * ring while the worklet keeps looping it, so the host silences audio on every pause, not just
+ * the ones its own button caused (harness pause, __pauseOnFault, tickFrames park, breakpoints).
+ * Posted on every call, not only on change: the host dedups, and a repeat is cheap.
+ */
+function announceGuestPauseState(paused: boolean): void {
+  self.postMessage({ type: "guest_pause_state", paused });
+}
+
 function pauseEmulator(): void {
   const system = System.getInstance();
   if (!system.process?.v86) return;
   isPaused = true;
   system.isPaused = true;
+  announceGuestPauseState(true);
   if (gdiPresentRafId !== null) { cancelAnimationFrame(gdiPresentRafId); gdiPresentRafId = null; }
   system.windowManager.wakeWaiters();
   const v86 = system.process.v86;
@@ -3367,6 +3473,7 @@ function resumeEmulator(): void {
   if (!system.process?.v86) return;
   isPaused = false;
   system.isPaused = false;
+  announceGuestPauseState(false);
   if (gdiPresentRafId === null) gdiPresentRafId = requestAnimationFrame(gdiPresentLoop);
   TimeService.getInstance().notifyPauseResume();
   hypercallDataManager.resetInsnBaseline();
@@ -3401,7 +3508,14 @@ function resumeEmulator(): void {
  */
 function postQualityState(q: QualityConfig): void {
     const gaps = logQualityGapsOnce(q);
-    self.postMessage({ type: "set_quality", ok: true, quality: q, unsupported: gaps, backend: activeQualityBackend() });
+    // `unsupported` answers "did the user ask this backend for something it cannot do".
+    // That is a different question from "can this backend apply internalScale at all", and
+    // only the second one lets the panel label the resolution honestly: an untouched Auto
+    // is never a gap, so a backend with no internal-resolution path looks supported.
+    self.postMessage({
+        type: "set_quality", ok: true, quality: q, unsupported: gaps,
+        backend: activeQualityBackend(), internalScale: internalScaleSupport(),
+    });
 }
 
 onQualityBackendChanged(() => postQualityState(EmulatorConfig.getInstance().quality));
@@ -3413,18 +3527,28 @@ const handleWorkerMessage = (event: MessageEvent): void => {
     const boot = childBoot;
     childStartupGate = new ChildStartupGate<ChildProcessPreparation>(
       () => postToParent({ type: 'child_ready', bootId: boot.bootId, processId: boot.processIdentity?.pid ?? boot.processId }),
-      error => postToParent({ type: 'error', message: 'Child startup failed: ' + String(error) }),
+      error => postToParent({
+        type: 'error',
+        message: 'Child startup failed: ' + String(error),
+        // A start that failed for a condition Windows names carries the code the launch
+        // path has to map; anything else leaves it unset and reads as ERROR_BAD_EXE_FORMAT.
+        win32Error: win32ErrorOf(error),
+      }),
     );
     if (childBoot.processIdentity) {
       adoptProcessIdentity(childBoot.processIdentity);
       if (childBoot.ipcPort) adoptProcessIpc(childBoot.processIdentity, childBoot.ipcPort);
     }
+    // Always adopted, even when the parent passed none: a worker that ran a child
+    // before must not answer GetStartupInfo with the previous child's window state.
+    adoptProcessStartupInfo(childBoot.startupInfo);
     if (childBoot.networkNamespace) adoptProcessNetworkNamespace(childBoot.networkNamespace);
     childImageReady = new Promise<void>(resolve => { resolveChildImageReady = resolve; });
     childSessionTransport = new ChildSessionTransport((message, transfer = []) => postToParent(message, transfer), handleWorkerMessage);
     childFrameClock = new ChildFrameClock(() => postToParent({ type: 'child_animation_request' }));
     self.requestAnimationFrame = childFrameClock.request;
     self.cancelAnimationFrame = childFrameClock.cancel;
+    if (isHostJitMode(childBoot.jitMode)) hostJitMode = childBoot.jitMode;
     if (childBoot.config) EmulatorConfig.getInstance().restoreForChild(childBoot.config);
     applySessionNetwork(EmulatorConfig.getInstance().network);
     const canvas = new OffscreenCanvas(640, 480);
@@ -3490,6 +3614,14 @@ const handleWorkerMessage = (event: MessageEvent): void => {
   if (message?.type === "dbg") {
     // Guest debugger bridge: window.dbg.<cmd>(...args) on the page -> here.
     handleDbgCommand(message.cmd, message.args);
+    return;
+  }
+
+  if (message?.type === "set_jit_policy") {
+    // Must arrive before load_bundle: the mode is applied when v86 initialises.
+    if (isHostJitMode(message.mode)) hostJitMode = message.mode;
+    // JIT_DISABLED only stops compiling; a replayed AOT recording would still run modules.
+    if (hostJitMode === "off") (globalThis as Record<string, unknown>).__aotNoAutoLoad = true;
     return;
   }
 

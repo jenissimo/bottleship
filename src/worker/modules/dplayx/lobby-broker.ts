@@ -137,6 +137,12 @@ export class DirectPlayLobbyBroker {
             default: return { hr: DP.INVALIDPARAMS };
         }
     }
+    hasRecord(pid: number): boolean {
+        const own = this.games.get(pid);
+        if (own?.settings || own?.wait) return true;
+        for (const game of this.games.values()) if (game.subscribers.has(pid) || game.queues.get(pid)?.length) return true;
+        return false;
+    }
     private exited(pid: number): void {
         const game = this.games.get(pid);
         if (game) {
@@ -149,6 +155,7 @@ export class DirectPlayLobbyBroker {
         }
     }
 }
+// @transient(host-side lobby broker of the root process; the dplayx participant refuses while it holds a record of this process, and a child process refuses the save in kernel32)
 const brokers = new WeakMap<ProcessIpc, DirectPlayLobbyBroker>();
 export function ensureLobbyBroker(ipc = getProcessIpc()): void {
     if (ipc.pid === ipc.rootPid && !brokers.has(ipc)) brokers.set(ipc, new DirectPlayLobbyBroker(ipc));
@@ -171,6 +178,7 @@ export class DirectPlayLobbyEndpoint {
         if (local) return local.dispatch(clone(request), this.ipc.pid);
         return this.ipc.request(0, LOBBY_TOPIC, request).then(value => value as LobbyReply, () => ({ hr: DP.UNAVAILABLE }));
     }
+    hasRecord(): boolean { return !this.closed && !!brokers.get(this.ipc)?.hasRecord(this.ipc.pid); }
     close(): void {
         if (!this.closed) { void this.call({ op: "resetOwner" }); this.closed = true; this.off(); }
     }

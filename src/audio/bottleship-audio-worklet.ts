@@ -17,7 +17,7 @@ import {
     CTRL_SAMPLE_RATE, CTRL_BITS_PER_SAMPLE, CTRL_BLOCK_ALIGN, CTRL_STATE,
     CTRL_LOOP_MODE, CTRL_VOLUME, CTRL_PAN, CTRL_FREQUENCY, CTRL_DATA_LENGTH,
     CTRL_STOP_REQUESTED, CTRL_FLAGS, CTRL_RESERVED, CTRL_BLOCK_BYTES, CTRL_SLOTS,
-    STATE_PLAYING, FLAG_CIRCULAR, FLAG_STREAMING,
+    STATE_PLAYING, FLAG_CIRCULAR, FLAG_STREAMING, MIX_HISTORY_FRAMES,
     CTRL_3D_POS_X, CTRL_3D_POS_Y, CTRL_3D_POS_Z,
     CTRL_3D_VEL_X, CTRL_3D_VEL_Y, CTRL_3D_VEL_Z,
     CTRL_3D_MIN_DIST, CTRL_3D_MAX_DIST, CTRL_3D_MODE,
@@ -82,7 +82,7 @@ const LIMIT_K = 1 - LIMIT_T;
 // audio-engine.ts verifies the echo and logs loudly on a mismatch or timeout,
 // because a cache hit that silently skips this whole file is worse than a version
 // bump you forgot: the failure otherwise looks identical to "nothing is wrong".
-const WORKLET_MODULE_VERSION = 12;
+const WORKLET_MODULE_VERSION = 13;
 
 // Discontinuity detector threshold: |s[n]−s[n−1]| above this between adjacent
 // output samples counts as a click/splice candidate.
@@ -94,6 +94,56 @@ const DISC_THRESHOLD = 0.5;
 // Pure consumer-side; does NOT touch the guest-visible cursors. EAR-VERIFY before
 // committing — set to 0 to disable.
 const CONCEAL_FADE_FRAMES = 64;
+
+// Band-limited interpolation for a source played SLOWER than the output rate (a 16 kHz
+// or 22 kHz buffer on a 48 kHz context). Linear interpolation leaves the spectral images
+// of the source between its Nyquist and the output's: for a 16 kHz source that is the
+// 8-16 kHz band, where the ear is most sensitive, and on full-range content it sits only
+// ~31 dB under the music (~21 dB in its worst 85 ms frames) -- a grainy hiss riding on
+// every note (Need for Speed: Porsche Unleashed streams its menu music at 16 kHz). A
+// Kaiser-windowed sinc, 16 taps, cut off just below the source Nyquist puts the images
+// ~68 dB down. Sources at or above the output rate keep linear interpolation: there the
+// kernel would have to follow the output's Nyquist instead, and an equal rate (frac 0)
+// is already exact.
+// Reads frames k-7 .. k+8 around frame k. A producer refilling what the head has passed
+// leaves MIX_HISTORY_FRAMES behind it alone (dsound trailRing).
+const SINC_HALF = MIX_HISTORY_FRAMES;
+const SINC_TAPS = SINC_HALF * 2;
+const SINC_PHASES = 256;                // rows; weights are interpolated between rows
+const SINC_CUTOFF = 0.85;               // fraction of the source Nyquist
+const SINC_BETA = 6;
+
+function besselI0(x: number): number {
+  let sum = 1, term = 1;
+  for (let k = 1; k < 32; k++) { term *= (x / (2 * k)) ** 2; sum += term; }
+  return sum;
+}
+
+/** (SINC_PHASES + 1) rows of SINC_TAPS weights; row p is frac = p / SINC_PHASES, tap t
+ *  weighs frame k + t - (SINC_HALF - 1). Each row sums to 1 (unity gain at DC). */
+function buildSincTable(): Float32Array {
+  const table = new Float32Array((SINC_PHASES + 1) * SINC_TAPS);
+  const i0Beta = besselI0(SINC_BETA);
+  for (let p = 0; p <= SINC_PHASES; p++) {
+    const frac = p / SINC_PHASES;
+    let sum = 0;
+    for (let t = 0; t < SINC_TAPS; t++) {
+      const x = t - (SINC_HALF - 1) - frac;
+      const r = x / SINC_HALF;
+      const window = Math.abs(r) >= 1 ? 0 : besselI0(SINC_BETA * Math.sqrt(1 - r * r)) / i0Beta;
+      const arg = Math.PI * SINC_CUTOFF * x;
+      const w = (x === 0 ? 1 : Math.sin(arg) / arg) * window;
+      table[p * SINC_TAPS + t] = w;
+      sum += w;
+    }
+    for (let t = 0; t < SINC_TAPS; t++) table[p * SINC_TAPS + t] /= sum;
+  }
+  return table;
+}
+const SINC_TABLE = buildSincTable();
+
+/** How a sinc window reaches the frames it covers (see the mixer loop). */
+const SINC_OFF = 0, SINC_INTERIOR = 1, SINC_WRAP = 2, SINC_ZERO_OUTSIDE = 3;
 
 // DS3D mode constants
 const DS3DMODE_NORMAL = 0;
@@ -170,6 +220,11 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
   private statsCtrl: Int32Array | null = null;
   // Last output sample per channel, for cross-block discontinuity detection
   private lastOut: number[] = [0, 0];
+  // Per-output-frame sinc weights (shared by every channel of the frame).
+  private sincWeights = new Float32Array(SINC_TAPS);
+  // Diagnostic A/B: `{type:"set_resampler", mode:"linear"}` restores linear
+  // interpolation for every source; `mode:"sinc"` returns to the default.
+  private linearResampleOnly = false;
 
   constructor() {
     super();
@@ -187,6 +242,11 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       // ─── Signal-stats SAB registration ───
       if (msg.type === "register_stats") {
         this.statsCtrl = new Int32Array(msg.sab, 0, 16);
+        return;
+      }
+
+      if (msg.type === "set_resampler") {
+        this.linearResampleOnly = msg.mode === "linear";
         return;
       }
 
@@ -661,6 +721,16 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       const writeCursorBytes = isStreaming ? Atomics.load(ctrl, CTRL_WRITE_CURSOR) : 0;
       const writeCursorFrame = isStreaming ? Math.floor(writeCursorBytes / blockAlign) : 0;
 
+      // Band-limited interpolation (SINC_TABLE) for a source slower than the output. Where
+      // its window crosses the data's edge, a ring that continues there (a looping buffer,
+      // a stream) wraps, a one-shot ring is silent outside its data, and any other buffer
+      // falls back to linear: its loop seam is not one contiguous run of frames.
+      const sinc = rate < 1 && totalFrames > 2 * SINC_TAPS && !this.linearResampleOnly;
+      const sincEdge = !isCircular ? SINC_OFF
+        : (loopMode === -1 || isStreaming) ? SINC_WRAP : SINC_ZERO_OUTSIDE;
+      const sincLimit = isCircular ? totalFrames : loopEnd;
+      const sincWeights = this.sincWeights;
+
       // A looping dsound buffer whose guest stopped refilling it keeps mixing the stale
       // ring — that is the documented looping behavior: DirectSound tracks only the play
       // and write cursors and has no notion of how far the app has written, so there is
@@ -736,38 +806,88 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         const frac = pos - frameIndex;
         const wrappedFrame = isCircular ? frameIndex % totalFrames : frameIndex;
 
+        // The sinc window must not read past a holding stream's frontier.
+        let sincMode = SINC_OFF;
+        if (sinc && (!streamingHold || availableFrames > SINC_HALF)) {
+          sincMode = wrappedFrame >= SINC_HALF - 1 && wrappedFrame + SINC_HALF < sincLimit
+            ? SINC_INTERIOR : sincEdge;
+          if (sincMode !== SINC_OFF) {
+            const phase = frac * SINC_PHASES;
+            const p0 = Math.min(SINC_PHASES - 1, Math.floor(phase));
+            const pf = phase - p0;
+            const r0 = p0 * SINC_TAPS;
+            for (let t = 0; t < SINC_TAPS; t++) {
+              const a = SINC_TABLE[r0 + t];
+              sincWeights[t] = a + (SINC_TABLE[r0 + SINC_TAPS + t] - a) * pf;
+            }
+          }
+        }
+
         for (let ch = 0; ch < outChannels; ch++) {
           const srcCh = Math.min(ch, channels - 1);
-          // Current sample
-          const byteOff = CTRL_BLOCK_BYTES + (wrappedFrame * blockAlign) + (srcCh * bytesPerSample);
-
-          // Next sample for interpolation
-          let nextFrame = wrappedFrame + 1;
-          if (streamingHold && availableFrames === 1) {
-            nextFrame = wrappedFrame; // interpolation cannot read beyond the producer's frontier
-          } else if (isCircular) {
-            nextFrame = nextFrame % totalFrames;
+          let sample: number;
+          if (sincMode === SINC_INTERIOR && (fastRead === 2 || fastRead === 3)) {
+            // The common case: the whole window inside the data, an aligned 16-bit or float layout.
+            const at = CTRL_BLOCK_BYTES + srcCh * bytesPerSample + (wrappedFrame - (SINC_HALF - 1)) * blockAlign;
+            let acc = 0;
+            if (fastRead === 2) {
+              const stride = blockAlign >> 1;
+              for (let t = 0, k = at >> 1; t < SINC_TAPS; t++, k += stride) acc += sincWeights[t] * i16[k];
+              sample = acc / 32768;
+            } else {
+              const stride = blockAlign >> 2;
+              for (let t = 0, k = at >> 2; t < SINC_TAPS; t++, k += stride) acc += sincWeights[t] * f32[k];
+              sample = acc;
+            }
+          } else if (sincMode !== SINC_OFF) {
+            const chOff = CTRL_BLOCK_BYTES + srcCh * bytesPerSample;
+            let acc = 0;
+            for (let t = 0; t < SINC_TAPS; t++) {
+              let f = wrappedFrame + t - (SINC_HALF - 1);
+              if (f < 0 || f >= totalFrames) {
+                if (sincMode === SINC_ZERO_OUTSIDE) continue;
+                f = f < 0 ? f + totalFrames : f - totalFrames;
+              }
+              const off = chOff + f * blockAlign;
+              const s = fastRead === 2 ? i16[off >> 1] / 32768
+                : fastRead === 1 ? (u8[off] - 128) / 128
+                : fastRead === 3 ? f32[off >> 2]
+                : this.readSampleFloat(dataView, off, bitsPerSample);
+              acc += sincWeights[t] * s;
+            }
+            sample = acc;
           } else {
-            nextFrame = Math.min(nextFrame, totalFrames - 1);
-          }
-          const byteOffNext = CTRL_BLOCK_BYTES + (nextFrame * blockAlign) + (srcCh * bytesPerSample);
+            // Current sample
+            const byteOff = CTRL_BLOCK_BYTES + (wrappedFrame * blockAlign) + (srcCh * bytesPerSample);
 
-          let s0: number, s1: number;
-          if (fastRead === 2) {
-            s0 = i16[byteOff >> 1] / 32768;
-            s1 = i16[byteOffNext >> 1] / 32768;
-          } else if (fastRead === 1) {
-            s0 = (u8[byteOff] - 128) / 128;
-            s1 = (u8[byteOffNext] - 128) / 128;
-          } else if (fastRead === 3) {
-            s0 = f32[byteOff >> 2];
-            s1 = f32[byteOffNext >> 2];
-          } else {
-            s0 = this.readSampleFloat(dataView, byteOff, bitsPerSample);
-            s1 = this.readSampleFloat(dataView, byteOffNext, bitsPerSample);
-          }
+            // Next sample for interpolation
+            let nextFrame = wrappedFrame + 1;
+            if (streamingHold && availableFrames === 1) {
+              nextFrame = wrappedFrame; // interpolation cannot read beyond the producer's frontier
+            } else if (isCircular) {
+              nextFrame = nextFrame % totalFrames;
+            } else {
+              nextFrame = Math.min(nextFrame, totalFrames - 1);
+            }
+            const byteOffNext = CTRL_BLOCK_BYTES + (nextFrame * blockAlign) + (srcCh * bytesPerSample);
 
-          const sample = s0 * (1 - frac) + s1 * frac;
+            let s0: number, s1: number;
+            if (fastRead === 2) {
+              s0 = i16[byteOff >> 1] / 32768;
+              s1 = i16[byteOffNext >> 1] / 32768;
+            } else if (fastRead === 1) {
+              s0 = (u8[byteOff] - 128) / 128;
+              s1 = (u8[byteOffNext] - 128) / 128;
+            } else if (fastRead === 3) {
+              s0 = f32[byteOff >> 2];
+              s1 = f32[byteOffNext >> 2];
+            } else {
+              s0 = this.readSampleFloat(dataView, byteOff, bitsPerSample);
+              s1 = this.readSampleFloat(dataView, byteOffNext, bitsPerSample);
+            }
+
+            sample = s0 * (1 - frac) + s1 * frac;
+          }
           let gain: number;
           if (outChannels >= 2) {
             gain = ch === 0 ? leftGain : rightGain;

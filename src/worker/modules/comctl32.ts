@@ -11,13 +11,16 @@ import { Marshaler } from "../core/memory/marshaler";
 import { Logger, LogCategory } from "../core/logger";
 import { System } from "../core/system";
 import { ensureAnimateControlClasses } from "./user32/animate-control";
-import { registerFlatSbExports, resetFlatSbState } from "./comctl32-flatsb";
+import { captureFlatSbState, registerFlatSbExports, resetFlatSbState, restoreFlatSbState, type FlatSbState } from "./comctl32-flatsb";
+import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
+import { CaptureRefusal } from "../savestate/object-codecs";
+import type { SaveValue } from "../savestate/value-codec";
 import {
     INITCOMMONCONTROLSEX_SIZE,
     initCommonControls,
     initCommonControlsEx,
 } from "./comctl32-init";
-import { propertySheet, propSheetDlgProc, resetPropSheetState } from "./comctl32-propsheet";
+import { capturePropSheetCounter, openPropSheetCount, propertySheet, propSheetDlgProc, resetPropSheetState, restorePropSheetState } from "./comctl32-propsheet";
 
 type ImageListState = {
     count: number;
@@ -136,6 +139,30 @@ function suspendForIStreamRead(
     };
 }
 
+export const COMCTL32_FIELDS = {
+    name: 'transient', exports: 'host', nextImageListHandle: 'save', nextIconHandle: 'save', imageLists: 'transient',
+    nextPropPageHandle: 'save', propPageHandles: 'save',
+} as const satisfies Record<string, FieldPolicy>;
+
+export interface Comctl32State {
+    nextImageListHandle: number;
+    nextIconHandle: number;
+    nextPropPageHandle: number;
+    propPageHandles: Array<[number, number]>;
+    nextSheetId: number;
+    flatSb: FlatSbState;
+}
+
+export const COMCTL32_SCHEMA = {
+    module: COMCTL32_FIELDS,
+    propPageRow: ['handle', 'guestCopy'],
+    flatSb: stateKeys<FlatSbState>({ windows: true, props: true }),
+    flatSbPropRow: ['hwnd', ['index', 'value']],
+    state: stateKeys<Comctl32State>({
+        nextImageListHandle: true, nextIconHandle: true, nextPropPageHandle: true, propPageHandles: true, nextSheetId: true, flatSb: true,
+    }),
+};
+
 export class Comctl32 implements IModule {
     name = "comctl32";
     exports: Record<string, ThunkImplementation> = {};
@@ -150,7 +177,48 @@ export class Comctl32 implements IModule {
     private nextPropPageHandle = 0x8000;
     private propPageHandles: Map<number, number> = new Map();
 
+    captureSavestate(sheets = openPropSheetCount()): Comctl32State {
+        if (this.imageLists.size > 0) {
+            const handles = [...this.imageLists.keys()].slice(0, 4).map(h => `0x${h.toString(16)}`).join(', ');
+            throw new Error(`comctl32: ${this.imageLists.size} image list(s) are not part of a v1 savestate (${handles}${this.imageLists.size > 4 ? ', …' : ''})`);
+        }
+        if (sheets > 0) throw new Error(`comctl32: ${sheets} open property sheet(s) are not part of a v1 savestate`);
+        return {
+            nextImageListHandle: this.nextImageListHandle,
+            nextIconHandle: this.nextIconHandle,
+            nextPropPageHandle: this.nextPropPageHandle,
+            propPageHandles: [...this.propPageHandles],
+            nextSheetId: capturePropSheetCounter(),
+            flatSb: captureFlatSbState(),
+        };
+    }
+
+    restoreSavestate(s: Comctl32State): void {
+        this.imageLists.clear();
+        this.nextImageListHandle = s.nextImageListHandle;
+        this.nextIconHandle = s.nextIconHandle;
+        this.nextPropPageHandle = s.nextPropPageHandle;
+        this.propPageHandles = new Map(s.propPageHandles);
+        restorePropSheetState(s.nextSheetId);
+        restoreFlatSbState(s.flatSb);
+    }
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'comctl32', version: 1, order: 75, covers: ['comctl32'], schema: COMCTL32_SCHEMA as unknown as SaveValue,
+            capture: () => {
+                try {
+                    return this.captureSavestate() as unknown as SaveValue;
+                } catch (e) {
+                    throw e instanceof CaptureRefusal ? e : new CaptureRefusal(e instanceof Error ? e.message : String(e));
+                }
+            },
+            restore: (saved) => this.restoreSavestate(saved as unknown as Comctl32State),
+        });
+    }
+
     initialize(_process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         this.exports["InitCommonControls"] = (_ctx, _mem, _args) =>
             initCommonControls() ? 1 : 0;
 

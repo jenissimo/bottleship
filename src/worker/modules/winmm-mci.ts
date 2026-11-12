@@ -8,6 +8,10 @@
  */
 import { ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatcher";
 import { TimeService } from "../runtime/time";
+import { gmBankAvailable } from "../core/audio/gm-bank";
+import { parseSmfSong } from "../core/audio/smf-events";
+import { SmfPlayer } from "../core/audio/smf-player";
+import { MidiSynthOutput } from "./winmm-midi-synth";
 import { Logger, LogCategory } from "../core/logger";
 import { System } from "../core/system";
 import { EmulatorConfig } from "../core/emulator-config-manager";
@@ -39,6 +43,9 @@ const MCIERR_OUTOFRANGE = 282;
 const MCIERR_DUPLICATE_ALIAS = 289;
 const MCIERR_BAD_TIME_FORMAT = 293;
 const MCIERR_NULL_PARAMETER_BLOCK = 297;
+const MCIERR_FILE_NOT_FOUND = 275;
+const MCIERR_INVALID_FILE = 304;
+const MCIERR_SEQ_NOMIDIPRESENT = 343;
 
 // MCI command messages
 const MCI_OPEN = 0x0803;
@@ -113,6 +120,7 @@ const MCI_CDA_TRACK_AUDIO = MCI_CD_OFFSET + 0;
 const MCI_CDA_TRACK_OTHER = MCI_CD_OFFSET + 1;
 const MCI_DEVTYPE_CD_AUDIO = 516;
 const MCI_DEVTYPE_DIGITAL_VIDEO = 520;
+const MCI_DEVTYPE_SEQUENCER = 523;
 
 // MCI notification codes
 const MCI_NOTIFY_SUCCESSFUL = 1;
@@ -127,6 +135,7 @@ const MCI_MODE_PAUSE = 529;
 const MM_MCINOTIFY = 0x03B9;
 
 /** Simple (non-compound) MCI device types openable by name alone. */
+// @transient(constant set)
 const MCI_SIMPLE_DEVICE_TYPES = new Set([
     "cdaudio", "videodisc", "vcr", "dat", "scanner", "sequencer", "other",
 ]);
@@ -288,8 +297,16 @@ export interface WinmmMciHost {
     writeWideString(ptr: number, cch: number, value: string): boolean;
 }
 
+interface SequencerState {
+    player: SmfPlayer;
+    output: MidiSynthOutput;
+    untick: () => void;
+    notifyHwnd: number;
+}
+
 export class WinmmMci {
     private mciDevices: Map<number, MCIDevice> = new Map();
+    private readonly sequencers = new Map<number, SequencerState>();
     private mciAliases: Map<string, number> = new Map();
     private nextMCIDeviceId = 1;
     private readAnsiString: (ptr: number, maxLen: number) => string;
@@ -304,6 +321,10 @@ export class WinmmMci {
         this.writeAnsiString = host.writeAnsiString;
         this.readWideString = host.readWideString;
         this.writeWideString = host.writeWideString;
+    }
+
+    openDeviceCount(): number {
+        return this.mciDevices.size;
     }
 
     private tokenizeMciCommand(command: string): string[] {
@@ -380,6 +401,7 @@ export class WinmmMci {
         const key = this.normalizeMciText(name);
         if (MCI_SIMPLE_DEVICE_TYPES.has(key)) return key;
         if (key.endsWith(".avi")) return "avivideo";
+        if (key.endsWith(".mid") || key.endsWith(".midi") || key.endsWith(".rmi")) return "sequencer";
         return undefined;
     }
 
@@ -1369,6 +1391,217 @@ export class WinmmMci {
 
     /** Shared body of mciSendStringA/W; `emit` writes the command's return string.
      *  Video playback with MCI_WAIT parks the thunk, hence the ThunkResult union. */
+    private isMciSequencer(device: MCIDevice): boolean {
+        return this.normalizeMciText(device.deviceType) === "sequencer";
+    }
+
+    private openSequencer(device: MCIDevice): number {
+        if (!device.elementName) return MCIERR_UNSUPPORTED_FUNCTION;
+        const path = this.resolveMciVideoVfsPath(device);
+        const bytes = path ? this.readMciVideoFileSync(path) : null;
+        if (!bytes) return MCIERR_FILE_NOT_FOUND;
+        const song = parseSmfSong(bytes);
+        if (!song) return MCIERR_INVALID_FILE;
+        const process = System.getInstance().process;
+        if (!gmBankAvailable() || !process) return MCIERR_SEQ_NOMIDIPRESENT;
+        const output = MidiSynthOutput.acquire(process);
+        if (!output) return MCIERR_SEQ_NOMIDIPRESENT;
+        const player = new SmfPlayer(song, output.router);
+        const state: SequencerState = { player, output, untick: () => undefined, notifyHwnd: 0 };
+        state.untick = output.addTicker((now) => player.tick(now));
+        player.seek(0);
+        this.sequencers.set(device.id, state);
+        device.timeFormatId = MCI_FORMAT_MILLISECONDS;
+        device.timeFormat = timeFormatName(MCI_FORMAT_MILLISECONDS);
+        Logger.log(LogCategory.SYSTEM,
+            `MCI sequencer open: ${this.describeMciDevice(device)} ${song.tracks} tracks, ${song.events.length} events, ${song.lengthMs} ms`);
+        return MMSYSERR_NOERROR;
+    }
+
+    private closeSequencer(device: MCIDevice): void {
+        const seq = this.sequencers.get(device.id);
+        if (!seq) return;
+        this.sequencers.delete(device.id);
+        seq.player.stop(TimeService.getInstance().nowMs());
+        seq.untick();
+        seq.output.release();
+    }
+
+    private sequencerPlay(device: MCIDevice, fromMs: number | null, toMs: number, notify: boolean, hwndCallback: number): number {
+        const seq = this.sequencers.get(device.id);
+        if (!seq) return MCIERR_DEVICE_NOT_READY;
+        const now = TimeService.getInstance().nowMs();
+        if (seq.player.playing && seq.notifyHwnd) {
+            this.postMciNotify(device, MCI_NOTIFY_SUPERSEDED, seq.notifyHwnd, "sequencer play superseded");
+        }
+        seq.player.pause(now);
+        if (fromMs !== null) seq.player.seek(fromMs);
+        else if (seq.player.positionAt(now) >= seq.player.song.lengthMs) seq.player.seek(0);
+        seq.notifyHwnd = notify ? this.resolveMciNotifyHwnd(device, hwndCallback) : 0;
+        device.mode = "playing";
+        seq.player.play(now, toMs, () => {
+            device.mode = "stopped";
+            const hwnd = seq.notifyHwnd;
+            seq.notifyHwnd = 0;
+            if (hwnd) this.postMciNotify(device, MCI_NOTIFY_SUCCESSFUL, hwnd, "sequencer end");
+        });
+        return MMSYSERR_NOERROR;
+    }
+
+    private sequencerStop(device: MCIDevice, aborted: boolean): void {
+        const seq = this.sequencers.get(device.id);
+        if (!seq) return;
+        const wasPlaying = seq.player.playing;
+        seq.player.stop(TimeService.getInstance().nowMs());
+        device.mode = "stopped";
+        const hwnd = seq.notifyHwnd;
+        seq.notifyHwnd = 0;
+        if (wasPlaying && hwnd && aborted) this.postMciNotify(device, MCI_NOTIFY_ABORTED, hwnd, "sequencer stop");
+    }
+
+    private sequencerStatus(device: MCIDevice, item: number): [number, number] {
+        const seq = this.sequencers.get(device.id);
+        if (!seq) return [MCIERR_DEVICE_NOT_READY, 0];
+        const now = TimeService.getInstance().nowMs();
+        switch (item) {
+            case MCI_STATUS_LENGTH: return [MMSYSERR_NOERROR, seq.player.song.lengthMs];
+            case MCI_STATUS_POSITION: return [MMSYSERR_NOERROR, Math.floor(seq.player.positionAt(now))];
+            case MCI_STATUS_NUMBER_OF_TRACKS: return [MMSYSERR_NOERROR, 1];
+            case MCI_STATUS_CURRENT_TRACK: return [MMSYSERR_NOERROR, 1];
+            case MCI_STATUS_MODE:
+                return [MMSYSERR_NOERROR, seq.player.playing ? MCI_MODE_PLAY : device.mode === "paused" ? MCI_MODE_PAUSE : MCI_MODE_STOP];
+            case MCI_STATUS_MEDIA_PRESENT: return [MMSYSERR_NOERROR, 1];
+            case MCI_STATUS_READY: return [MMSYSERR_NOERROR, 1];
+            case MCI_STATUS_TIME_FORMAT: return [MMSYSERR_NOERROR, MCI_FORMAT_MILLISECONDS];
+            default: return [MCIERR_UNSUPPORTED_FUNCTION, 0];
+        }
+    }
+
+    private handleSequencerCommand(device: MCIDevice, uMsg: number, fdwCommand: number, dwParam: number, view: DataView): number {
+        const seq = this.sequencers.get(device.id);
+        const now = TimeService.getInstance().nowMs();
+        switch (uMsg) {
+            case MCI_PLAY: {
+                const notify = (fdwCommand & MCI_NOTIFY) !== 0;
+                const hwnd = dwParam ? view.getUint32(dwParam, true) >>> 0 : 0;
+                const from = (fdwCommand & MCI_FROM) && dwParam ? view.getUint32(dwParam + 4, true) >>> 0 : null;
+                const to = (fdwCommand & MCI_TO) && dwParam ? view.getUint32(dwParam + 8, true) >>> 0 : 0;
+                return this.sequencerPlay(device, from, to, notify, hwnd);
+            }
+            case MCI_STOP:
+                this.sequencerStop(device, true);
+                return MMSYSERR_NOERROR;
+            case MCI_PAUSE:
+                seq?.player.pause(now);
+                device.mode = "paused";
+                return MMSYSERR_NOERROR;
+            case MCI_RESUME:
+                if (seq && device.mode === "paused") {
+                    seq.player.play(now, 0, null);
+                    device.mode = "playing";
+                }
+                return MMSYSERR_NOERROR;
+            case MCI_SEEK: {
+                if (!seq) return MCIERR_DEVICE_NOT_READY;
+                this.sequencerStop(device, true);
+                if (fdwCommand & MCI_SEEK_TO_START) seq.player.seek(0);
+                else if (fdwCommand & MCI_SEEK_TO_END) seq.player.seek(seq.player.song.lengthMs);
+                else if ((fdwCommand & MCI_TO) && dwParam) seq.player.seek(view.getUint32(dwParam + 4, true) >>> 0);
+                else return MCIERR_MISSING_PARAMETER;
+                return MMSYSERR_NOERROR;
+            }
+            case MCI_STATUS: {
+                if (!(fdwCommand & MCI_STATUS_ITEM)) return MCIERR_MISSING_PARAMETER;
+                if (!dwParam) return MCIERR_NULL_PARAMETER_BLOCK;
+                const [err, value] = this.sequencerStatus(device, view.getUint32(dwParam + 8, true) >>> 0);
+                if (err === MMSYSERR_NOERROR) view.setUint32(dwParam + 4, value >>> 0, true);
+                return err;
+            }
+            case MCI_SET: {
+                if (!(fdwCommand & MCI_SET_TIME_FORMAT)) return MMSYSERR_NOERROR;
+                if (!dwParam) return MCIERR_NULL_PARAMETER_BLOCK;
+                return (view.getUint32(dwParam + 4, true) >>> 0) === MCI_FORMAT_MILLISECONDS ? MMSYSERR_NOERROR : MCIERR_BAD_TIME_FORMAT;
+            }
+            case MCI_GETDEVCAPS: {
+                if (!(fdwCommand & MCI_GETDEVCAPS_ITEM)) return MCIERR_MISSING_PARAMETER;
+                if (!dwParam) return MCIERR_NULL_PARAMETER_BLOCK;
+                const item = view.getUint32(dwParam + 8, true) >>> 0;
+                const caps: Record<number, number> = {
+                    [MCI_GETDEVCAPS_CAN_RECORD]: 0, [MCI_GETDEVCAPS_HAS_AUDIO]: 1, [MCI_GETDEVCAPS_HAS_VIDEO]: 0,
+                    [MCI_GETDEVCAPS_DEVICE_TYPE]: MCI_DEVTYPE_SEQUENCER, [MCI_GETDEVCAPS_USES_FILES]: 1,
+                    [MCI_GETDEVCAPS_COMPOUND_DEVICE]: 1, [MCI_GETDEVCAPS_CAN_EJECT]: 0, [MCI_GETDEVCAPS_CAN_PLAY]: 1,
+                    [MCI_GETDEVCAPS_CAN_SAVE]: 0,
+                };
+                if (!(item in caps)) return MCIERR_UNSUPPORTED_FUNCTION;
+                view.setUint32(dwParam + 4, caps[item]!, true);
+                return MMSYSERR_NOERROR;
+            }
+            case MCI_CLOSE:
+                this.sequencerStop(device, true);
+                this.closeSequencer(device);
+                this.mciDevices.delete(device.id);
+                this.mciAliases.delete(device.alias.toLowerCase());
+                return MMSYSERR_NOERROR;
+            case MCI_BREAK:
+                return MMSYSERR_NOERROR;
+            default:
+                return MCIERR_UNSUPPORTED_FUNCTION;
+        }
+    }
+
+    private handleSequencerString(device: MCIDevice, verb: string, tokens: string[], lower: string[],
+        hwndCallback: number, emit: (value: string) => void): number {
+        const seq = this.sequencers.get(device.id);
+        const now = TimeService.getInstance().nowMs();
+        const number = (word: string): number | null => (lower.indexOf(word) >= 0 && lower.indexOf(word) + 1 < tokens.length
+            ? (/^\d+$/.test(tokens[lower.indexOf(word) + 1]!) ? parseInt(tokens[lower.indexOf(word) + 1]!, 10) : NaN) : null);
+        switch (verb) {
+            case "play": {
+                const from = number("from"), to = number("to");
+                if ((from !== null && Number.isNaN(from)) || (to !== null && Number.isNaN(to))) return MCIERR_BAD_INTEGER;
+                return this.sequencerPlay(device, from, to ?? 0, lower.includes("notify"), hwndCallback);
+            }
+            case "stop":
+                this.sequencerStop(device, true);
+                return MMSYSERR_NOERROR;
+            case "pause":
+                return this.handleSequencerCommand(device, MCI_PAUSE, 0, 0, new DataView(new ArrayBuffer(0)));
+            case "resume":
+                return this.handleSequencerCommand(device, MCI_RESUME, 0, 0, new DataView(new ArrayBuffer(0)));
+            case "seek": {
+                if (!seq) return MCIERR_DEVICE_NOT_READY;
+                const toIdx = lower.indexOf("to");
+                if (toIdx < 0 || toIdx + 1 >= tokens.length) return MCIERR_MISSING_PARAMETER;
+                this.sequencerStop(device, true);
+                const arg = lower[toIdx + 1]!;
+                if (arg === "start") seq.player.seek(0);
+                else if (arg === "end") seq.player.seek(seq.player.song.lengthMs);
+                else if (/^\d+$/.test(arg)) seq.player.seek(parseInt(arg, 10));
+                else return MCIERR_BAD_INTEGER;
+                return MMSYSERR_NOERROR;
+            }
+            case "status": {
+                const item = lower.slice(2).filter((t) => t !== "wait" && t !== "notify").join(" ") || "mode";
+                const items: Record<string, number> = {
+                    "length": MCI_STATUS_LENGTH, "position": MCI_STATUS_POSITION, "mode": MCI_STATUS_MODE,
+                    "number of tracks": MCI_STATUS_NUMBER_OF_TRACKS, "current track": MCI_STATUS_CURRENT_TRACK,
+                    "media present": MCI_STATUS_MEDIA_PRESENT, "ready": MCI_STATUS_READY, "time format": MCI_STATUS_TIME_FORMAT,
+                };
+                const code = items[item];
+                if (code === undefined) return MCIERR_UNSUPPORTED_FUNCTION;
+                const [err, value] = this.sequencerStatus(device, code);
+                if (err !== MMSYSERR_NOERROR) return err;
+                if (code === MCI_STATUS_MODE) emit(value === MCI_MODE_PLAY ? "playing" : value === MCI_MODE_PAUSE ? "paused" : "stopped");
+                else if (code === MCI_STATUS_MEDIA_PRESENT || code === MCI_STATUS_READY) emit("true");
+                else if (code === MCI_STATUS_TIME_FORMAT) emit("milliseconds");
+                else emit(String(value));
+                return MMSYSERR_NOERROR;
+            }
+            default:
+                return MCIERR_UNRECOGNIZED_COMMAND;
+        }
+    }
+
     private sendMciString(
         command: string,
         hwndCallback: number,
@@ -1411,6 +1644,14 @@ export class WinmmMci {
                 ? this.normalizeMciText(tokens[typeIndex + 1])
                 : this.inferMciDeviceType(name);
             Logger.log(LogCategory.SYSTEM, `mciSendString open: ${this.describeMciDevice(device)}`);
+            if (this.isMciSequencer(device)) {
+                const err = this.openSequencer(device);
+                if (err !== MMSYSERR_NOERROR) {
+                    this.mciDevices.delete(device.id);
+                    this.mciAliases.delete(device.alias.toLowerCase());
+                }
+                return err;
+            }
             if (this.isMciCdAudioDevice(device)) {
                 this.openCdAudioDevice(device);
             } else {
@@ -1424,7 +1665,8 @@ export class WinmmMci {
             const target = tokens[1].toLowerCase();
             if (target === "all") {
                 for (const device of this.mciDevices.values()) {
-                    if (this.isMciCdAudioDevice(device)) this.cdStop(device);
+                    if (this.isMciSequencer(device)) this.closeSequencer(device);
+                    else if (this.isMciCdAudioDevice(device)) this.cdStop(device);
                     else this.stopMciPlayback(device, "mciSendString close all");
                 }
                 this.mciDevices.clear();
@@ -1434,7 +1676,10 @@ export class WinmmMci {
             }
             const device = this.findMciDevice(tokens[1]);
             if (!device) return MCIERR_INVALID_DEVICE_NAME;
-            if (this.isMciCdAudioDevice(device)) this.cdStop(device);
+            if (this.isMciSequencer(device)) {
+                this.sequencerStop(device, true);
+                this.closeSequencer(device);
+            } else if (this.isMciCdAudioDevice(device)) this.cdStop(device);
             else this.stopMciPlayback(device, "mciSendString close");
             this.mciDevices.delete(device.id);
             this.mciAliases.delete(device.alias.toLowerCase());
@@ -1499,6 +1744,9 @@ export class WinmmMci {
 
             if (this.isMciCdAudioDevice(device)) {
                 return this.handleCdAudioString(device, verb, tokens, lower, hwndCallback, emit);
+            }
+            if (this.isMciSequencer(device)) {
+                return this.handleSequencerString(device, verb, tokens, lower, hwndCallback, emit);
             }
 
             if (verb === "play") {
@@ -1828,6 +2076,15 @@ export class WinmmMci {
                 }
                 Logger.log(LogCategory.SYSTEM,
                     `mciSendCommandA MCI_OPEN: ${this.describeMciDevice(device)}`);
+                if (this.isMciSequencer(device)) {
+                    const err = this.openSequencer(device);
+                    if (err !== MMSYSERR_NOERROR) {
+                        this.mciDevices.delete(device.id);
+                        this.mciAliases.delete(device.alias.toLowerCase());
+                        if (dwParam) view.setUint32(dwParam + 4, 0, true);
+                    }
+                    return err;
+                }
                 if (this.isMciCdAudioDevice(device)) {
                     this.openCdAudioDevice(device);
                 } else {
@@ -1840,6 +2097,9 @@ export class WinmmMci {
 
             if (device && this.isMciCdAudioDevice(device)) {
                 return this.handleCdAudioCommand(device, uMsg, fdwCommand, dwParam, view);
+            }
+            if (device && this.isMciSequencer(device)) {
+                return this.handleSequencerCommand(device, uMsg, fdwCommand, dwParam, view);
             }
 
             if (uMsg === MCI_WINDOW && device) {

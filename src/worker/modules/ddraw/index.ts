@@ -1,4 +1,6 @@
 import { surfaceAt } from "./helpers";
+import { savestatesEnabled } from "../../savestate/participant";
+import { liveSurfaceStates, registerDDrawParticipant } from "./savestate";
 import { IModule } from '../../core/module';
 import { Process } from '../../core/process';
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
@@ -554,7 +556,7 @@ export class DDraw implements IModule {
         };
     }
 
-    /** HARNESS: full RGBA readback of a surface by pixel pointer. Prefers
+    /** HARNESS: full RGBA readback by pixel pointer or texture handle. Prefers
      *  the authoritative CPU rgbaScratch (zero GPU work, for bitmap textures), else
      *  GPU-reads the texture, de-pads rows, and applies the bgra->rgba swizzle so
      *  the bytes are straight top-down RGBA8 ready for PNG encoding. */
@@ -568,14 +570,22 @@ export class DDraw implements IModule {
             const s = getState.call(obj);
             if (s && (s.surfacePtr >>> 0) === want) { state = s; break; }
         }
-        if (!state) return { err: `surface 0x${want.toString(16)} not found` };
+        if (!state) {
+            const registry = this.context.textureHandles.get(want);
+            const owner = this.context.resourceProvider.getComObject(registry?.handle ?? want)
+                ?? this.context.resourceProvider.getComObjectByAddress(want);
+            if (owner instanceof DirectDrawSurfaceObject) state = owner.getState();
+            else state = registry?.surfaceState ?? null;
+        }
+        if (!state) return { err: `surface or texture handle 0x${want.toString(16)} not found` };
         if (from === "guest") {
             const mem = this.getMemory(), w = state.width, h = state.height;
             const pitch = state.pitch || Math.ceil(w * state.format.bpp / 8);
-            if (!want || w <= 0 || h <= 0 || pitch <= 0 || !isValidAddress(mem, want, pitch * h, "r")) {
+            const pixels = state.surfacePtr;
+            if (!pixels || w <= 0 || h <= 0 || pitch <= 0 || !isValidAddress(mem, pixels, pitch * h, "r")) {
                 return { err: "invalid guest pixel backing" };
             }
-            return { w, h, source: "guest", rgba: convertSurfaceToRGBA(mem, want, w, h, pitch, state.format,
+            return { w, h, source: "guest", rgba: convertSurfaceToRGBA(mem, pixels, w, h, pitch, state.format,
                 undefined, undefined, resolvePalette(state)) };
         }
         return readSurfaceStateRGBA(state, this.context.backend ?? null, () => this.context.executor?.flush(), from);
@@ -583,6 +593,12 @@ export class DDraw implements IModule {
 
     initialize(process: Process): void {
         this.process = process;
+        if (savestatesEnabled()) {
+            registerDDrawParticipant({
+                context: () => this.context, bitmapSurfaces: () => this.bitmapToSurfaceCache,
+                surfaceStates: () => liveSurfaceStates(this.context.resourceProvider.getAllComObjects()),
+            });
+        }
 
         const interfaceRegistry = InterfaceRegistry.getInstance();
         interfaceRegistry.registerFromModuleDescriptor(ddrawModule);

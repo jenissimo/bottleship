@@ -8,7 +8,7 @@
 //!
 //!   lower_entry <entry-eip-hex> <code-hex>
 
-use bottleship_opt_compiler::{dead_flag_publications, lift_slice, lower_region_with, Passes, Scope};
+use bottleship_opt_compiler::{dead_flag_publications, lift_slice, lower_region_with, Passes, Scope, StackForwarding};
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -88,6 +88,13 @@ fn main() {
     // Why the scope pass did or did not fire. A pass that silently does nothing looks exactly
     // like a pass that is off, and every measurement of it then compares a unit with itself.
     let scope = format!("{:?}", Scope::explain(&region));
+    let forwarding = format!("{:?}", StackForwarding::explain(&region));
+    let forwarding_slots = StackForwarding::of(&region).map_or(Vec::new(), |plan| {
+        plan.slots.iter().map(|slot| format!(
+            "{{\"base\":\"{:?}\",\"displacement\":{},\"read_sites\":{:?},\"disjoint_stores\":{:?}}}",
+            slot.address.base.unwrap(), slot.address.displacement, slot.reads, slot.disjoint_stores
+        )).collect::<Vec<_>>()
+    });
     // The instruction stream, so a report about indices can be read without a disassembler.
     let ops: Vec<String> = region
         .instructions
@@ -144,7 +151,7 @@ fn main() {
     println!(
         "{{\"status\":\"ok\",\"entry_eip\":{entry},\"instructions\":{},\
          \"lifted_sha256\":\"{sha}\",\"bytes\":{},\"body_start\":{},\"local_count\":{},\
-         \"imports\":[{}],\"relocs\":[{}],\"entries\":[{}],\"unclaimable_entries\":[{}],\"exit_eips\":[{}],\"loop_bound\":{loop_bound},\"scope\":\"{scope}\",\"dead_publications\":[{}],\"ops\":[{}],\"passes\":[{}],\"hex\":\"{hex_out}\"}}",
+         \"imports\":[{}],\"relocs\":[{}],\"entries\":[{}],\"unclaimable_entries\":[{}],\"exit_eips\":[{}],\"loop_bound\":{loop_bound},\"scope\":\"{scope}\",\"stack_forwarding\":\"{forwarding}\",\"stack_forwarding_slots\":[{}],\"dead_publications\":[{}],\"ops\":[{}],\"passes\":[{}],\"hex\":\"{hex_out}\"}}",
         region.instructions.len(),
         lowered.unit.bytes.len(),
         lowered.unit.body_start,
@@ -154,6 +161,7 @@ fn main() {
         entries.join(","),
         unclaimable.join(","),
         exit_eips.join(","),
+        forwarding_slots.join(","),
         dead.join(","),
         ops.join(","),
         passes

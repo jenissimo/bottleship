@@ -1,4 +1,4 @@
-import { wgbEtag } from "../../deploy/wgb-etag";
+import { diskWgbEtag } from "../../deploy/wgb-etag";
 /**
  * BottleShip dev sidecar (:3001) — the local process that does the things the browser cannot,
  * for both the app and the agent harness. Five roles:
@@ -465,7 +465,9 @@ async function serveWgb(req: Request, url: URL): Promise<Response> {
     "Content-Type": "application/octet-stream",
   };
 
-  headers.ETag = await wgbEtag(file);
+  // Metadata validator, not a content hash: hashing a multi-GB bundle on its first request
+  // outlasted the page's probe deadline (deploy/wgb-etag.ts).
+  headers.ETag = await diskWgbEtag(file);
   headers["Cache-Control"] = "no-cache";
   const validator = req.headers.get("if-range");
   const range = !validator || validator === headers.ETag ? req.headers.get("range") : null;

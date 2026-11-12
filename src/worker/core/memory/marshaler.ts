@@ -113,6 +113,18 @@ export class Marshaler {
             .decode(asBufferSource(memory.subarray(address, end)));
     }
 
+    /** At most `count` ANSI bytes, stopping at a NUL inside them: a counted string such as
+     *  GDI's text calls take, read without scanning the rest of the buffer for its terminator. */
+    static readStringN(memory: Uint8Array, address: number, count: number): string {
+        if (address <= 0 || address >= memory.length) return '';
+        const limit = Math.min(memory.length, address + Math.max(0, count | 0));
+        let end = address;
+        while (end < limit && memory[end] !== 0) end++;
+        if (end === address) return '';
+        return getCodePageDecoder(EmulatorConfig.getInstance().ansiCodePage)
+            .decode(asBufferSource(memory.subarray(address, end)));
+    }
+
     static readStringW(memory: Uint8Array, address: number): string {
         if (address <= 0 || address >= memory.length - 1) return '';
         const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);

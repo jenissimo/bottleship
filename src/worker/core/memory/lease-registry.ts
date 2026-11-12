@@ -25,6 +25,10 @@ export class LeaseRegistry {
     private leases: Map<number, Lease> = new Map();
     private nextLeaseId = 1;
 
+    activeLeaseCount(): number {
+        return this.leases.size;
+    }
+
     createLease(
         base: number,
         size: number,

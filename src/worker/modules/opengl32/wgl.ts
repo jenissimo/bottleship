@@ -5,6 +5,8 @@ import { OpenGLBackendExecutor } from "../../backends/webgpu/opengl/opengl-backe
 import { System } from "../../core/system";
 import { gammaService } from "../../core/gamma-service";
 import { resolveHleExportAddress } from "../../core/thunking/export-resolver";
+import { guestDrawableSize } from "./drawable";
+import { adoptDrawableExtent } from "./state";
 import {
     chooseWglPixelFormat,
     describeWglPixelFormat,
@@ -37,11 +39,14 @@ function resolveImplementedEntryPoint(dispatcher: any, name: string): number {
     return addr;
 }
 
-export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplementation> {
+export function createWglExports(
+    ctx: OpenGLContext,
+    drawableSize: (hdc: number) => { width: number; height: number } = guestDrawableSize,
+): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
     let nextHglrc = 1;
-    const contexts = new Map<number, { hdc: number }>();
+    const contexts = new Map<number, { hdc: number; attached: boolean }>();
     const threadBindings = new Map<number, WGLContextBinding>(); // threadId -> binding
     let currentHglrc = 0;
     let currentHdc = 0;
@@ -49,7 +54,7 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
     exports['wglCreateContext'] = (_c, _m, args): number => {
         const hdc = args[0] >>> 0;
         const hglrc = nextHglrc++;
-        contexts.set(hglrc, { hdc });
+        contexts.set(hglrc, { hdc, attached: false });
         if (!ctx.drawableDC) ctx.drawableDC = hdc;
         Logger.log(LogCategory.GDI32, `wglCreateContext(hdc=0x${hdc.toString(16)}) -> 0x${hglrc.toString(16)}`);
         return hglrc;
@@ -66,6 +71,11 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
             }
         }
         contexts.delete(hglrc);
+        if (contexts.size === 0) {
+            // The next context is a new GL state as far as its default rectangles go.
+            ctx.viewportFromGuest = false;
+            ctx.scissorFromGuest = false;
+        }
         Logger.log(LogCategory.GDI32, `wglDeleteContext(0x${hglrc.toString(16)}) -> TRUE`);
         return 1;
     };
@@ -82,13 +92,19 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
             Logger.verbose(LogCategory.GDI32, `wglMakeCurrent(0, 0) -> TRUE (unbind, keep active)`);
             return 1;
         }
-        if (!contexts.has(hglrc)) {
+        const binding = contexts.get(hglrc);
+        if (!binding) {
             Logger.warn(LogCategory.GDI32, `wglMakeCurrent: invalid hglrc 0x${hglrc.toString(16)}`);
             return 0;
         }
         currentHglrc = hglrc;
         currentHdc = hdc;
         if (hdc) ctx.drawableDC = hdc;
+        if (hdc && !binding.attached) {
+            binding.attached = true;
+            const size = drawableSize(hdc);
+            adoptDrawableExtent(ctx, size.width, size.height);
+        }
 
         // Lazily initialize OpenGL executor once WebGPU backend is available.
         if (!ctx.executor && ctx.backend) {

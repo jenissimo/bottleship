@@ -11,6 +11,7 @@ import { QualityConfig, DEFAULT_QUALITY, mergeQuality } from "./quality-config";
 import { asBufferSource } from "../../dom-buffer";
 import { normalizeNetworkConfig, type NetworkConfig } from "../../network-config";
 import type { ExeRegistryRedirect } from "@bottleship/formats/sdb";
+import { parseCrtBindingMode, type CrtBindingMode } from "./crt-binding";
 
 // OS Version constants
 export const VER_PLATFORM_WIN32_WINDOWS = 0x1;
@@ -60,12 +61,20 @@ const DEFAULT_SCREEN_BACKGROUND = { r: 0, g: 0, b: 0, a: 1 };
 // Standard display modes reported by EnumDisplayModes.
 // Covers common Win95/98-era resolutions at 8, 16, and 32 bpp.
 const DEFAULT_DISPLAY_MODE_SPECS: Array<Omit<DisplayModeConfig, "refreshRate">> = [
-    // 8bpp (256 color) modes — required by many DOS-era ports and older DDraw games
+    // 8bpp (256 color) modes — required by many DOS-era ports and older DDraw games.
+    // Every 16bpp size is here too: an 8bpp title falls back when the larger mode it
+    // offers is not enumerated (RollerCoaster Tycoon turns 1024x768 into 800x600).
     { width: 320, height: 200, bpp: 8 },
     { width: 320, height: 240, bpp: 8 },
+    { width: 512, height: 384, bpp: 8 },
     { width: 640, height: 400, bpp: 8 },
     { width: 640, height: 480, bpp: 8 },
     { width: 800, height: 600, bpp: 8 },
+    { width: 1024, height: 768, bpp: 8 },
+    { width: 1152, height: 864, bpp: 8 },
+    { width: 1280, height: 960, bpp: 8 },
+    { width: 1280, height: 1024, bpp: 8 },
+    { width: 1600, height: 1200, bpp: 8 },
     // 16bpp modes — the sweet spot for most late-90s 3D games
     { width: 320, height: 200, bpp: 16 },
     { width: 320, height: 240, bpp: 16 },
@@ -340,6 +349,13 @@ export class EmulatorConfig {
     // capability (any bundle may declare it); mirrors real per-process x87 precision policy.
     public fpuStrict = false;
 
+    /**
+     * Opt-in: implicit primary presents of a guest that Flips wait for its next Flip
+     * (bounded) instead of being drawn at the next refresh. For titles whose front-buffer
+     * passes after a Flip are only incomplete because emulation stretches them.
+     */
+    public ddrawHoldPresentsUntilFlip = false;
+
     // ANSI code page (GetACP) — default 1252 (Western European)
     public ansiCodePage = 1252;
 
@@ -358,6 +374,10 @@ export class EmulatorConfig {
     // Glide and ddraw wrappers) only run at all under this. Same rule syntax as
     // disabledDlls. Opt-in per bundle while the default order is still HLE-first.
     public appDirDlls: string[] = [];
+
+    // manifest.emulator.crt: one C runtime per process, HLE or the bundle's own msvcrt.dll
+    // (crt-binding.ts). "auto" decides from the CRT imports of every statically known image.
+    public crtBinding: CrtBindingMode = "auto";
 
     // The game's own VirtualRegistry shims, each bound to the exe its database entry names.
     // Every process selects its own set by image name when it starts (the owner for the boot
@@ -610,6 +630,11 @@ export class EmulatorConfig {
             Logger.log(LogCategory.SYSTEM, "EmulatorConfig: strict x87 FPU (relaxed-FPU disabled at boot, fpuStrict=true)");
         }
 
+        if (config.ddrawHoldPresentsUntilFlip) {
+            this.ddrawHoldPresentsUntilFlip = true;
+            Logger.log(LogCategory.SYSTEM, "EmulatorConfig: ddraw implicit presents wait for the next Flip (ddrawHoldPresentsUntilFlip=true)");
+        }
+
         // Apply per-game graphics quality override (layers on top of the global user pref)
         if (config.quality) {
             this.qualityManifest = config.quality as Partial<QualityConfig>;
@@ -640,6 +665,16 @@ export class EmulatorConfig {
                 LogCategory.SYSTEM,
                 `EmulatorConfig: appDirDlls loaded (${this.appDirDlls.length}): ${this.appDirDlls.join(", ")}`
             );
+        }
+
+        if (config.crt !== undefined) {
+            const mode = parseCrtBindingMode(config.crt);
+            if (mode) {
+                this.crtBinding = mode;
+                Logger.log(LogCategory.SYSTEM, `EmulatorConfig: crt binding "${mode}"`);
+            } else {
+                Logger.warn(LogCategory.SYSTEM, `EmulatorConfig: crt "${String(config.crt)}" ignored (auto | hle | native)`);
+            }
         }
 
         if (config.registryRedirects && config.registryRedirects.length > 0) {
@@ -732,8 +767,10 @@ export class EmulatorConfig {
         this.screenBackgroundColor = { ...DEFAULT_SCREEN_BACKGROUND };
         this.skipVideo = false;
         this.fpuStrict = false;
+        this.ddrawHoldPresentsUntilFlip = false;
         this.disabledDlls = [];
         this.appDirDlls = [];
+        this.crtBinding = "auto";
         this.registryRedirects = [];
         this.deleteOnBoot = [];
         this.writeFiles = [];

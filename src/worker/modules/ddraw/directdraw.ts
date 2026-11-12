@@ -69,6 +69,8 @@ import {
     STACK_CLEANUP_DIRECTDRAWENUMERATEA,
     STACK_CLEANUP_DIRECTDRAWENUMERATEEXA,
     STACK_CLEANUP_ENUMDISPLAYMODES,
+    STACK_CLEANUP_SETDISPLAYMODE_V1,
+    STACK_CLEANUP_SETDISPLAYMODE,
     STACK_CLEANUP_ENUMSURFACES,
     DDENUMSURFACES_ALL,
     DDENUMSURFACES_MATCH,
@@ -105,6 +107,7 @@ import { windows as sharedWindows } from "../user32/shared-state";
 import type { WindowInfo } from "../user32/shared-state";
 import { resizeFullscreenWindowToMode } from "../../runtime/windowing/fullscreen-window";
 import { repaintDialogOverlayIfVisible, requestGuestDialogPaint } from "../user32/dialog-paint";
+import { sendDisplayChange } from "../user32/message";
 
 type DDEnumCallback = (lpGUID: number, lpDriverDescription: number, lpDriverName: number, lpContext: number) => number;
 
@@ -115,6 +118,7 @@ type DDEnumCallback = (lpGUID: number, lpDriverDescription: number, lpDriverName
  * distinguish "the title asked for RGB565" from "the title asked for DXT1 and we rewrote it".
  * dwSize is printed because an engine legitimately leaves it zero.
  */
+// @transient(diagnostics)
 const seenPixelFormatRequests = new Set<number>();
 function notePixelFormatRequest(view: DataView, pfAddr: number): void {
     const size = view.getUint32(pfAddr + DDPIXELFORMAT_OFFSETS.size, true);
@@ -205,10 +209,10 @@ function applyDisplayModeChange(system: System, ddrawCtx: DDrawContext, width: n
 
 /**
  * Faithful SetDisplayMode core shared by all DDraw versions. Captures the prior mode on the
- * first exclusive entry (so RestoreDisplayMode can revert), mutates context.display, applies
- * the host resize + coop-window normalization, and — when the mode actually changed —
- * broadcasts WM_DISPLAYCHANGE to all top-level windows (the guest WinDrv keys its
- * windowed/fullscreen reconciliation off this).
+ * first exclusive entry (so RestoreDisplayMode can revert), mutates context.display and
+ * applies the host resize + coop-window normalization. Returns whether the mode actually
+ * changed — the thunk then sends WM_DISPLAYCHANGE (the guest WinDrv keys its
+ * windowed/fullscreen reconciliation off it).
  */
 function applySetDisplayMode(
     system: System,
@@ -217,7 +221,7 @@ function applySetDisplayMode(
     height: number,
     bpp: number,
     refresh: number
-): void {
+): boolean {
     const prevW = ddrawCtx.display.width;
     const prevH = ddrawCtx.display.height;
     const prevBpp = ddrawCtx.display.bpp;
@@ -235,20 +239,17 @@ function applySetDisplayMode(
 
     applyDisplayModeChange(system, ddrawCtx, ddrawCtx.display.width, ddrawCtx.display.height);
 
-    const changed = ddrawCtx.display.width !== prevW
+    return ddrawCtx.display.width !== prevW
         || ddrawCtx.display.height !== prevH
         || ddrawCtx.display.bpp !== prevBpp;
-    if (changed) {
-        system.windowManager.postDisplayChange(ddrawCtx.display.width, ddrawCtx.display.height, ddrawCtx.display.bpp);
-    }
 }
 
 /**
- * Faithful RestoreDisplayMode: revert the current display mode back to the desktop mode,
- * resize the host, and broadcast WM_DISPLAYCHANGE if the mode actually changed. Returns the
- * screen to GDI (the caller also sets gdiSurfaceVisible).
+ * Faithful RestoreDisplayMode: revert the current display mode back to the desktop mode and
+ * resize the host. Returns whether the mode actually changed (the thunk then sends
+ * WM_DISPLAYCHANGE). Returns the screen to GDI (the caller also sets gdiSurfaceVisible).
  */
-export function restoreDisplayModeToDesktop(system: System, ddrawCtx: DDrawContext): void {
+export function restoreDisplayModeToDesktop(system: System, ddrawCtx: DDrawContext): boolean {
     const prevW = ddrawCtx.display.width;
     const prevH = ddrawCtx.display.height;
     const prevBpp = ddrawCtx.display.bpp;
@@ -268,16 +269,18 @@ export function restoreDisplayModeToDesktop(system: System, ddrawCtx: DDrawConte
         || ddrawCtx.display.bpp !== prevBpp;
     Logger.log(LogCategory.DDRAW,
         `RestoreDisplayMode -> desktop ${ddrawCtx.display.width}x${ddrawCtx.display.height}x${ddrawCtx.display.bpp} (changed=${changed})`);
-    if (changed) {
-        system.windowManager.postDisplayChange(ddrawCtx.display.width, ddrawCtx.display.height, ddrawCtx.display.bpp);
-    }
+    return changed;
 }
 
 export const createDirectDrawExports = (context: DDrawContext): Record<string, ThunkImplementation> => {
     const exports: Record<string, ThunkImplementation> = {};
+    // @transient(diagnostics)
     let lastVblankLog = 0;
+    // @transient(diagnostics)
     let vblankWaitCount = 0;
+    // @transient(diagnostics)
     let vblankStatusCount = 0;
+    // @transient(diagnostics)
     let scanlineCount = 0;
 
     const getVTable = (name: string) => (context.vtables as any)[name]?.address;
@@ -1364,8 +1367,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         Logger.log(LogCategory.DDRAW, `IDirectDraw_SetDisplayMode (v1): ${width}x${height} @ ${bpp}bpp ${refresh}Hz`);
 
         const system = System.getInstance();
-        applySetDisplayMode(system, context, width, height, bpp, refresh);
-        return DD_OK;
+        if (!applySetDisplayMode(system, context, width, height, bpp, refresh)) return DD_OK;
+        return sendDisplayChange(ctx, mem, context.display, STACK_CLEANUP_SETDISPLAYMODE_V1, "IDirectDraw_SetDisplayMode", DD_OK);
     };
 
     // v1/v2/v4: WaitForVerticalBlank returns DD_OK synchronously.
@@ -1721,8 +1724,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         Logger.log(LogCategory.SYSTEM, `IDirectDraw7_SetDisplayMode: this=0x${thisPtr.toString(16)}, w=${width}, h=${height}, bpp=${bpp}, refresh=${refresh}, flags=0x${(flags ?? 0).toString(16)}, ret=0x${retAddr.toString(16)}`);
 
         const system = System.getInstance();
-        applySetDisplayMode(system, context, width, height, bpp, refresh);
-        return DD_OK;
+        if (!applySetDisplayMode(system, context, width, height, bpp, refresh)) return DD_OK;
+        return sendDisplayChange(ctx, mem, context.display, STACK_CLEANUP_SETDISPLAYMODE, "IDirectDraw7_SetDisplayMode", DD_OK);
     };
 
     // Internal helper for EnumDisplayModes shared by all DDraw versions.

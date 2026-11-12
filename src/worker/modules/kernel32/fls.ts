@@ -14,11 +14,16 @@ import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 const FLS_OUT_OF_INDEXES = 0xffffffff;
 const MAX_SLOTS = 128;
 
+// @participant(kernel32)
 const allocated = new Set<number>();
+// @participant(kernel32)
 const valuesByThread = new Map<number, Map<number, number>>();
+// @participant(kernel32)
 let nextSlot = 1;
+// @transient(identity of the owning process object)
 let flsOwnerProcess: unknown = null;
 
+// @transient(identity of the owning process object)
 let flsOwnerResetGeneration = -1;
 
 function ensureProcessLocalFls(): void {
@@ -42,6 +47,21 @@ export function resetFlsState(): void {
     valuesByThread.clear();
     nextSlot = 1;
     hypercallDataManager.clearFlsSlots();
+}
+
+export function captureFls(): { allocated: number[]; values: Array<[number, Array<[number, number]>]>; nextSlot: number } {
+    return { allocated: [...allocated], values: [...valuesByThread].map(([tid, v]) => [tid, [...v]]), nextSlot };
+}
+
+export function restoreFls(state: { allocated: number[]; values: Array<[number, Array<[number, number]>]>; nextSlot: number }): void {
+    const process = System.getInstance().process;
+    flsOwnerProcess = process;
+    flsOwnerResetGeneration = process?.resetGeneration ?? 0;
+    allocated.clear();
+    for (const slot of state.allocated) allocated.add(slot);
+    valuesByThread.clear();
+    for (const [tid, v] of state.values) valuesByThread.set(tid, new Map(v));
+    nextSlot = state.nextSlot;
 }
 
 function currentTid(): number {

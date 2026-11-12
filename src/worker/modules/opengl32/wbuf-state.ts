@@ -26,14 +26,15 @@ import { APIRegistry } from "../../core/api-registry";
  * sizes both the ring entry and the trampoline's RET N.
  *
  * Deliberately absent, with the reason:
- *   glLoadIdentity / glUnlockArraysEXT  — zero args; the trampoline table starts at one.
+ *   glUnlockArraysEXT                   — ends the CVA lock; dropping the cache must not be
+ *                                        deferred past a following trap that reads arrays.
  *   glLoadMatrix* / glMultMatrix* / gl*fv — GL dereferences the pointer AT CALL TIME, so a
  *                                        deferred read can see a scratch the guest reused.
  *   glOrtho / glFrustum                 — six GLdoubles = 12 DWORDs, past the 8-arg trampolines.
  *   glViewport / glClear                — append to the command stream, not just context state.
  *   glGet* / glIsEnabled / glGetError / glReadPixels — the guest reads the result.
  *   glTexImage* / glTexSubImage* / glCompressedTex* — variable-size guest data.
- *   glDraw* / glEnd / glArrayElement / SwapBuffers / display-list control — flush points.
+ *   glDraw* / glArrayElement / SwapBuffers / display-list control — flush points.
  */
 const RING_FUNCTIONS: ReadonlyArray<readonly [string, number]> = [
     // --- pure state setters ---
@@ -64,7 +65,12 @@ const RING_FUNCTIONS: ReadonlyArray<readonly [string, number]> = [
     ["glNormalPointer", 3], ["glIndexPointer", 3], ["glEdgeFlagPointer", 2],
     ["glVertexPointer", 4], ["glColorPointer", 4], ["glTexCoordPointer", 4],
     ["glInterleavedArrays", 3],
+    ["glTranslatef", 3], ["glRotatef", 4], ["glScalef", 3],
     ["glLockArraysEXT", 2],
+];
+
+const ZERO_ARG_RING_FUNCTIONS: ReadonlyArray<string> = [
+    "glPushMatrix", "glPopMatrix", "glLoadIdentity", "glEnd",
 ];
 
 /**
@@ -118,6 +124,18 @@ export function registerWriteBufferGLStateFunctions(
 
         dispatcher.registerWriteBufferFunction("opengl32", name, argCount, handler, true /* stdcall */);
         count++;
+    }
+
+    if (typeof dispatcher.registerZeroArgWriteBufferFunction === "function") {
+        for (const name of ZERO_ARG_RING_FUNCTIONS) {
+            const impl = exports[name];
+            if (typeof impl !== "function") continue;
+            if ((apiRegistry.getArgCount("opengl32", name) ?? 0) !== 0) continue;
+            const none: number[] = [];
+            const handler: WriteBufHandler = (mem8) => { impl(null as unknown as X86Context, mem8, none); };
+            dispatcher.registerZeroArgWriteBufferFunction("opengl32", name, handler);
+            count++;
+        }
     }
 
     Logger.log(LogCategory.SYSTEM,

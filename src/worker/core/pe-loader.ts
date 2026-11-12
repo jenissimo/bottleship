@@ -15,6 +15,8 @@ import { hypercallDataManager } from './cpu/hypercall-data';
 import { libHleManager } from './hle-lib/lib-hle-manager';
 import { hookRegistry } from './hooks';
 import { runNativeModulePatchers } from '../modules/native-patchers';
+import { savestatesEnabled } from '../savestate/participant';
+import { sha256HexSync } from '../savestate/sha256';
 import { findDllRule, normalizeDllPathToken } from './dll-rules';
 import { isUnderSystemDirectory } from './hle-system-catalog';
 import { EmulatorConfig } from './emulator-config-manager';
@@ -29,7 +31,14 @@ import { serializeMbwcStubTable, writeMbwcStubDestLimit } from '../modules/kerne
 import { loadDiagnostics } from './diagnostics/load-diagnostics';
 import { writeGuestCode, invalidateGuestCode } from './memory/guest-code';
 import { markGuestPagesDirty, zeroGuestRange } from './memory/guest-page-dirty';
-import { resolveImportBinding, isD3dx9VersionedDll } from './pe-import-binding';
+import {
+    resolveImportBinding, isD3dx9VersionedDll, trapsUnknownImport, bindTimeCallingConvention, uncoveredHleImports,
+    type ImportBindingDeps, type ImportFn,
+} from './pe-import-binding';
+import { planProcessCrt, processCrtBinding, type CrtScanImport } from './crt-binding';
+import { parsePeImports } from '@bottleship/formats/pe';
+import { nameOrdinalImports, readExportNameDirectory, shippedExportNames } from './pe-export-names';
+import { normalizeDllBaseName, resolveThunkedDllAlias } from './dll-aliases';
 import { dllSearchDirectories } from './dll-search-order';
 
 export interface LoadedModule {
@@ -59,6 +68,16 @@ const DLL_PROCESS_ATTACH = 1;
 const DLL_PROCESS_DETACH = 0;
 const DLL_THREAD_ATTACH = 2;
 const DLL_THREAD_DETACH = 3;
+
+export interface InlineStubState {
+    heap: { heapAllocStub: number; heapFreeStub: number; regionBase: number; regionEnd: number } | null;
+    crt: { mallocStub: number; freeStub: number; regionBase: number; regionEnd: number } | null;
+    caseFold: { tolowerStub: number; toupperStub: number; regionBase: number; regionEnd: number } | null;
+    locale: LocaleInlineStubs | null;
+    mbwc: MbwcInlineStubs | null;
+    mbwcDeclined: boolean;
+    math: CrtMathStubs | null;
+}
 
 export class PELoader {
     /**
@@ -285,6 +304,8 @@ export class PELoader {
         'sqrt': 'sqrtStub',
         '_ftol': 'ftolStub',
         '__ftol': 'ftolStub',
+        '_finite': 'finiteStub',
+        '_isnan': 'isnanStub',
     };
 
     /**
@@ -292,11 +313,42 @@ export class PELoader {
      * Collected during loadExecutable → loadDll, consumed by bootloader trampoline.
      */
     private pendingDllInits: DllInitEntry[] = [];
+    private bootImagesLoaded = false;
 
     constructor(getMemory: () => Uint8Array, thunkGenerator: ThunkGenerator, apiRegistry: APIRegistry) {
         this.getMemory = getMemory;
         this.thunkGenerator = thunkGenerator;
         this.apiRegistry = apiRegistry;
+    }
+
+    captureInlineStubs(): InlineStubState {
+        return structuredClone({
+            heap: this.heapInlineStubs, crt: this.crtInlineStubs, caseFold: this.caseFoldInlineStubs,
+            locale: this.localeInlineStubs, mbwc: this.mbwcInlineStubs, mbwcDeclined: this.mbwcStubsDeclined,
+            math: this.mathInlineStubs,
+        });
+    }
+
+    restoreInlineStubs(state: InlineStubState): void {
+        const saved = structuredClone(state);
+        this.heapInlineStubs = saved.heap;
+        this.crtInlineStubs = saved.crt;
+        this.caseFoldInlineStubs = saved.caseFold;
+        this.localeInlineStubs = saved.locale;
+        this.mbwcInlineStubs = saved.mbwc;
+        this.mbwcStubsDeclined = saved.mbwcDeclined;
+        this.mathInlineStubs = saved.math;
+        const scheduler = System.getInstance().scheduler;
+        for (const stubs of [saved.heap, saved.crt]) {
+            if (stubs) scheduler?.registerNonPreemptibleRange(stubs.regionBase, stubs.regionEnd);
+        }
+    }
+
+    async readImageFile(path: string): Promise<Uint8Array | null> {
+        if (!this.vfs) return null;
+        const handle = await this.vfs.open(path, 0x80000000, 3);
+        if (!handle) return null;
+        return this.vfs.read(handle, this.vfs.getFileSize(path));
     }
 
     /**
@@ -426,6 +478,7 @@ export class PELoader {
     }
 
     async loadExecutable(peData: Uint8Array): Promise<LoadedModule> {
+        this.bootImagesLoaded = false;
         const peView = new DataView(peData.buffer, peData.byteOffset, peData.byteLength);
 
         // Verify DOS Header
@@ -529,6 +582,8 @@ export class PELoader {
 
         // Process Imports (now async to support real DLL loading)
         const importDirRVA = peView.getUint32(optHeaderPtr + 104, true);
+        // One C runtime for the whole process, decided before the first import is bound.
+        await this.planProcessCrtBinding(system.executableName || 'exe', peData);
         if (importDirRVA !== 0) {
             await this.processImports(baseAddress, importDirRVA);
         }
@@ -561,6 +616,7 @@ export class PELoader {
         // PE32 optional header offset 72 = SizeOfStackReserve
         const sizeOfStackReserve = peView.getUint32(optHeaderPtr + 72, true);
 
+        this.bootImagesLoaded = true;
         return {
             baseAddress,
             entryPoint: baseAddress + entryPointRVA,
@@ -732,6 +788,7 @@ export class PELoader {
         this.loadingDlls.add(dllNameLower);
 
         let registered = false;
+        const runTime = this.bootImagesLoaded;
         try {
             // Open and read DLL from VFS
             const handle = await this.vfs.open(dllPath, 0x80000000, 3); // GENERIC_READ, OPEN_EXISTING
@@ -836,18 +893,22 @@ export class PELoader {
                 initialized: false,
                 sections
             };
+            if (runTime) module.unsaved = 'has no content hash';
             this.moduleRegistry.register(module);
             registered = true;
+            let hostPatched = false;
 
             // Static Library HLE detection for this DLL's image (same reason as EXE path).
             try {
-                libHleManager.onModuleLoaded(module);
+                if (libHleManager.onModuleLoaded(module)) hostPatched = true;
             } catch (e) {
+                hostPatched = true;
                 Logger.warn(LogCategory.SYSTEM, `[HLE-lib] onModuleLoaded threw on DLL ${dllName}: ${e}`);
             }
             try {
-                hookRegistry.onModuleLoaded(module);
+                if (hookRegistry.onModuleLoaded(module)) hostPatched = true;
             } catch (e) {
+                hostPatched = true;
                 Logger.warn(LogCategory.SYSTEM, `[hooks] onModuleLoaded threw on DLL ${dllName}: ${e}`);
             }
 
@@ -867,7 +928,15 @@ export class PELoader {
             // is isolated by the registry, so one library's patcher cannot fail the DLL load.
             {
                 const system = System.getInstance();
-                if (system.process) runNativeModulePatchers(system.process, module);
+                if (system.process && runNativeModulePatchers(system.process, module)) hostPatched = true;
+            }
+            if (runTime) {
+                if (hostPatched) module.unsaved = 'is patched by host-side hooks';
+                else if (savestatesEnabled()) {
+                    delete module.unsaved;
+                    module.contentHash = sha256HexSync(peData);
+                    if (handle.source !== 'rom') module.imageBytes = peData.slice();
+                }
             }
 
             Logger.warn(LogCategory.SYSTEM,
@@ -877,6 +946,7 @@ export class PELoader {
             // Queue DllMain for bootloader trampoline (runs as x86 code before EXE entry).
             // Runtime LoadLibrary* path can defer this to thunk-dispatcher callback flow.
             if (invokeDllMain && entryPointRVA !== 0) {
+                module.initialized = true;
                 this.pendingDllInits.push({
                     baseAddress,
                     entryPoint: baseAddress + entryPointRVA,
@@ -1154,7 +1224,7 @@ export class PELoader {
     /**
      * Parse PE Export Directory to get exports
      */
-    private parseExportTable(peData: Uint8Array, baseAddress: number): {
+    parseExportTable(peData: Uint8Array, baseAddress: number): {
         exports: Map<string, number>;
         ordinals: Map<number, number>;
     } {
@@ -1291,7 +1361,9 @@ export class PELoader {
         const dllNameLower = dllName.toLowerCase();
         // Only append .dll if the name has no extension at all (e.g. "kernel32" → "kernel32.dll").
         // Preserve non-.dll extensions like .lng, .drv, etc. — Windows LoadLibrary handles any extension.
-        const hasExtension = /\.\w+$/.test(dllNameLower);
+        // A numeric-only suffix is a version, not an extension: callers key modules by the
+        // name with ".dll" stripped, so "lua5.1.dll" arrives here as "lua5.1".
+        const hasExtension = /\.\w*[a-z_]\w*$/.test(dllNameLower);
         const dllFileName = hasExtension ? dllNameLower : `${dllNameLower}.dll`;
 
         // Handle explicitly absolute inputs only (e.g. "C:\foo.dll" or "\foo.dll").
@@ -1300,7 +1372,7 @@ export class PELoader {
         const normalizedInput = dllName.trim().replace(/\//g, "\\");
         const isAbsoluteInput = /^[A-Za-z]:\\/.test(normalizedInput) || normalizedInput.startsWith("\\");
         if (isAbsoluteInput) {
-            const candidateInput = /\.\w+$/i.test(normalizedInput)
+            const candidateInput = /\.\w*[a-z_]\w*$/i.test(normalizedInput)
                 ? normalizedInput
                 : `${normalizedInput}.dll`;
             const candidatePath = this.vfs.resolvePath(candidateInput);
@@ -1356,6 +1428,125 @@ export class PELoader {
         return entry?.kind === 'file' ? entry.path : null;
     }
 
+    /**
+     * Ordinal-only imports of a thunked module take the export name of the DLL the bundle
+     * ships: ordinals differ between builds of the same DLL, so only that build's export
+     * directory says which function an ordinal is. Without a shipped DLL nothing changes.
+     */
+    private async nameOrdinalImportsFromShippedDll(dllNameRaw: string,
+        functions: Array<{ name?: string; ordinal?: number }>, searchDirectories: readonly string[]): Promise<void> {
+        if (!this.vfs || !functions.some(f => f.name === undefined && f.ordinal !== undefined)) return;
+        const moduleName = resolveThunkedDllAlias(dllNameRaw);
+        if (!this.apiRegistry.hasModule(moduleName)) return;
+        let directory = shippedExportNames.get(moduleName);
+        if (!directory) {
+            const path = this.findDllPath(dllNameRaw.toLowerCase(), 0, searchDirectories);
+            if (!path) return;
+            const handle = await this.vfs.open(path, 0x80000000, 3);
+            if (!handle) return;
+            const image = await this.vfs.read(handle, this.vfs.getFileSize(path));
+            const parsed = readExportNameDirectory(image);
+            if (!parsed) return;
+            directory = parsed;
+            shippedExportNames.set(moduleName, directory);
+            Logger.log(LogCategory.SYSTEM, `[PE] ${path}: ${directory.names.size} named exports ` +
+                `(timestamp 0x${directory.timeDateStamp.toString(16)}) resolve ordinal imports of ${moduleName}`);
+        }
+        const named = nameOrdinalImports(functions, directory,
+            (name) => this.apiRegistry.hasExportedFunction(moduleName, name));
+        for (const { ordinal, name } of named) {
+            Logger.log(LogCategory.SYSTEM, `[PE] ${dllNameRaw} ordinal ${ordinal} -> ${name} (shipped export directory)`);
+        }
+    }
+
+    /** What resolveImportBinding needs from the loader, bound to one search order. */
+    private importBindingDeps(searchDirectories: readonly string[], quiet = false): ImportBindingDeps {
+        return {
+            hasThunkedModule: (n) => this.apiRegistry.hasModule(n),
+            findDllPath: (n) => this.findDllPath(n, 0, searchDirectories),
+            appDirRule: (raw) => findDllRule(EmulatorConfig.getInstance().appDirDlls, raw),
+            isUnderSystemDirectory: (p) => isUnderSystemDirectory(normalizeDllPathToken(p)),
+            exportFacts: (thunked, f) => f.name !== undefined
+                ? {
+                    callingConvention: this.apiRegistry.getCallingConvention(thunked, f.name),
+                    argCount: this.apiRegistry.getArgCount(thunked, f.name),
+                    stackCleanupBytes: this.apiRegistry.getStackCleanupBytes(thunked, f.name),
+                    isDataExport: this.thunkGenerator.getDataExportAddress(thunked, f.name) !== undefined,
+                }
+                : { argCount: f.ordinal !== undefined ? this.apiRegistry.getArgCountByOrdinal(thunked, f.ordinal) : undefined },
+            log: quiet ? () => {} : (m) => Logger.log(LogCategory.SYSTEM, m),
+            warn: quiet ? () => {} : (m) => Logger.warn(LogCategory.SYSTEM, m),
+        };
+    }
+
+    /**
+     * C runtime names a bundle may ship. Without any of them on disk there is nothing to
+     * choose between, and the walk (which reads every statically linked DLL) is skipped.
+     */
+    private static readonly SHIPPED_CRT_PROBES = [
+        'msvcrt', 'msvcrtd', 'msvcr70', 'msvcr71', 'msvcr80', 'msvcr90', 'msvcr100', 'msvcr110', 'msvcr120',
+        'msvcp60', 'msvcp70', 'msvcp71', 'msvcp80', 'msvcp90', 'msvcp100', 'msvcp110', 'msvcp120',
+        'ucrtbase', 'vcruntime140',
+    ];
+
+    /**
+     * Decide, once per process, whether each CRT the images import binds to HLE or to the
+     * shipped DLL (crt-binding.ts). Walks the EXE and the real DLLs it links, transitively,
+     * reading them from the VFS; the per-import walk in processImports then follows it.
+     */
+    private async planProcessCrtBinding(exeName: string, exeData: Uint8Array): Promise<void> {
+        processCrtBinding.reset();
+        const mode = EmulatorConfig.getInstance().crtBinding;
+        processCrtBinding.mode = mode;
+        // A/B: dbgFlag('__perModuleCrt', true) BEFORE loading a game restores the old
+        // per-module rule (and with it the mixed bindings) to compare against.
+        if ((globalThis as { __perModuleCrt?: boolean }).__perModuleCrt) {
+            processCrtBinding.disable();
+            Logger.warn(LogCategory.SYSTEM, `[PE] Process CRT binding OFF (__perModuleCrt): binding per module`);
+            return;
+        }
+        if (!this.vfs) return;
+        const searchDirectories = this.getDllSearchDirectories();
+        if (!PELoader.SHIPPED_CRT_PROBES.some(n => this.findDllPath(n, 0, searchDirectories) !== null)) {
+            Logger.log(LogCategory.SYSTEM, `[PE] Process CRT binding: ${exeName} — no shipped C runtime in ` +
+                `${searchDirectories.join(' ')}; nothing to choose between`);
+            return;
+        }
+
+        const deps = this.importBindingDeps(searchDirectories, true);
+        const importsOf = async (image: Uint8Array): Promise<CrtScanImport[]> => {
+            const out: CrtScanImport[] = [];
+            for (const d of parsePeImports(image).dlls) {
+                const functions: ImportFn[] = d.entries.map(e =>
+                    e.name !== undefined ? { name: e.name } : { ordinal: e.ordinal });
+                await this.nameOrdinalImportsFromShippedDll(d.dll, functions, searchDirectories);
+                out.push({ dll: d.dll, functions });
+            }
+            return out;
+        };
+        try {
+            const { choices, importers } = await planProcessCrt(exeName.toLowerCase(), await importsOf(exeData), mode, {
+                readImports: async (raw) => {
+                    const path = this.findDllPath(normalizeDllBaseName(raw), 0, searchDirectories);
+                    if (!path || !this.vfs) return null;
+                    const handle = await this.vfs.open(path, 0x80000000, 3);
+                    if (!handle) return null;
+                    const image = await this.vfs.read(handle, this.vfs.getFileSize(path));
+                    return image.length > 0 ? importsOf(image) : null;
+                },
+                bindAlone: (raw, functions) => resolveImportBinding(raw, functions, deps),
+                uncovered: (raw, functions) => uncoveredHleImports(raw, functions, deps),
+                shipped: (raw) => this.findDllPath(normalizeDllBaseName(raw), 0, searchDirectories) !== null,
+                log: (m) => Logger.log(LogCategory.SYSTEM, m),
+                warn: (m) => Logger.warn(LogCategory.SYSTEM, m),
+            });
+            processCrtBinding.adoptPlan(mode, choices, importers);
+        } catch (e) {
+            // The per-module rule still binds every import; only the one-CRT guarantee is lost.
+            Logger.warn(LogCategory.SYSTEM, `[PE] Process CRT binding walk failed, binding per module: ${e}`);
+        }
+    }
+
     private async processImports(baseAddress: number, importDirRVA: number,
         searchDirectories: readonly string[] = this.getDllSearchDirectories()): Promise<void> {
         let descriptorAddr = baseAddress + importDirRVA;
@@ -1379,23 +1570,27 @@ export class PELoader {
             const iatRVA = this.view.getUint32(descriptorAddr + 16, true); // Import Address Table
 
             const functions = this.parseImportTable(baseAddress, iltRVA || iatRVA);
+            await this.nameOrdinalImportsFromShippedDll(dllNameRaw, functions, searchDirectories);
 
             const { dllName, aliasTarget, isThunked } = resolveImportBinding(dllNameRaw, functions, {
-                hasThunkedModule: (n) => this.apiRegistry.hasModule(n),
-                findDllPath: (n) => this.findDllPath(n, 0, searchDirectories),
-                appDirRule: (raw) => findDllRule(EmulatorConfig.getInstance().appDirDlls, raw),
-                isUnderSystemDirectory: (p) => isUnderSystemDirectory(normalizeDllPathToken(p)),
-                exportFacts: (thunked, f) => f.name !== undefined
-                    ? {
-                        callingConvention: this.apiRegistry.getCallingConvention(thunked, f.name),
-                        argCount: this.apiRegistry.getArgCount(thunked, f.name),
-                        stackCleanupBytes: this.apiRegistry.getStackCleanupBytes(thunked, f.name),
-                        isDataExport: this.thunkGenerator.getDataExportAddress(thunked, f.name) !== undefined,
-                    }
-                    : { argCount: f.ordinal !== undefined ? this.apiRegistry.getArgCountByOrdinal(thunked, f.ordinal) : undefined },
-                log: (m) => Logger.log(LogCategory.SYSTEM, m),
-                warn: (m) => Logger.warn(LogCategory.SYSTEM, m),
+                ...this.importBindingDeps(searchDirectories),
+                processCrtChoice: (raw) => processCrtBinding.choiceFor(raw),
             });
+            const crtChoice = processCrtBinding.choiceFor(dllNameRaw);
+            if (crtChoice !== undefined &&
+                resolveImportBinding(dllNameRaw, functions, this.importBindingDeps(searchDirectories, true)).isThunked !== isThunked) {
+                const image = this.moduleRegistry?.getModuleContainingAddress(baseAddress)?.name ?? `0x${baseAddress.toString(16)}`;
+                processCrtBinding.noteOverride(image, dllNameRaw, crtChoice);
+            }
+            // A CRT name no static image imported: this first binding becomes the process's.
+            processCrtBinding.noteLateBinding(dllNameRaw, isThunked);
+
+            if (loadDiagnostics.noteImportBinding(dllNameRaw, isThunked)) {
+                Logger.warn(LogCategory.SYSTEM,
+                    `[PE] ${dllNameRaw} is now bound ${isThunked ? 'to the HLE module' : 'to the shipped DLL'} here and ` +
+                    `${isThunked ? 'to the shipped DLL' : 'to the HLE module'} for an earlier image: two copies of one ` +
+                    `library in one process (a CRT's heap, FILE table and locale are not shared between them)`);
+            }
 
             // Log ALL DLLs and their functions
             const importedNames = functions.map(f => this.resolveImportName(dllName, f));
@@ -1442,11 +1637,11 @@ export class PELoader {
                         continue;
                     }
 
+                    if (f.name) callingConvention = bindTimeCallingConvention(dllName, callingConvention, argCount);
                     if (argCount === undefined) {
                         Logger.warn(LogCategory.SYSTEM, `[PE] Unknown arg count for ${dllName}:${name}${aliasTarget ? ` (aliased from ${dllNameRaw})` : ''}`);
                         loadDiagnostics.noteUnknownArgCount(dllName, name, aliasTarget ? dllNameRaw : null);
-                        if (aliasTarget) {
-                            // For aliased DLLs, unknown functions get trap stubs instead of throwing
+                        if (trapsUnknownImport(f, aliasTarget !== null)) {
                             unknownFunctions.add(name.toLowerCase());
                             continue;
                         }
@@ -1665,7 +1860,7 @@ export class PELoader {
                         // Unknown function from aliased DLL — use trap stub
                         this.thunkGenerator.writeTrapStub(this.memory);
                         this.view.setUint32(iatAddr, this.thunkGenerator.getTrapStubAddress(), true);
-                        Logger.warn(LogCategory.SYSTEM, `[PE] Trap stub for unknown ${dllName}:${this.resolveImportName(dllName, func)} (from alias ${dllNameRaw})`);
+                        Logger.warn(LogCategory.SYSTEM, `[PE] Trap stub for unknown ${dllName}:${this.resolveImportName(dllName, func)}${aliasTarget ? ` (from alias ${dllNameRaw})` : ' (ordinal import with no table entry)'}`);
                     } else {
                         // Heap slab fast path: override IAT with inline x86 stub when available.
                         // Inline stub's fallback JMPs to the original OUT-trap stub. HEAP_ZERO
@@ -1962,6 +2157,7 @@ export class PELoader {
                 argCount = this.apiRegistry.getArgCountByOrdinal(dllName, f.ordinal);
             }
 
+            if (f.name) callingConvention = bindTimeCallingConvention(dllName, callingConvention, argCount);
             if (argCount === undefined) {
                 Logger.warn(LogCategory.SYSTEM, `[PE] Unknown arg count for ${dllName}:${name}`);
                 loadDiagnostics.noteUnknownArgCount(dllName, name);

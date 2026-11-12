@@ -43,6 +43,19 @@ interface BucketState {
                       // anything below it that a bump re-hands-out was previously written.
 }
 
+export interface MemoryManagerState {
+    allocs: Array<[number, number, RegionKind | null]>;
+    totalAllocated: number;
+    currentBytes: number;
+    peakBytes: number;
+    freeBlocks: Array<[RegionKind, number[][]]>;
+    largeFreeBlocks: Array<[RegionKind, number[][]]>;
+    bucketState: Array<[RegionKind, BucketState]>;
+    sysPoolArena: { next: number; limit: number } | null;
+    sysPoolFree: Array<[number, number[]]>;
+    systemPoolGeneration: number;
+}
+
 const BUCKET_KINDS: RegionKind[] = ['HEAP', 'HEAP_HIGH', 'SURFACE', 'THUNK_CODE', 'THUNK_DATA'];
 
 /** Both halves of the guest heap. HEAP sub-allocations are covered by the layout bucket and
@@ -134,6 +147,40 @@ export class MemoryManager {
     private sysPoolFree: Map<number, number[]> = new Map();
     /** Address-keyed COM pools must expire when this allocator rewinds in place. */
     systemPoolGeneration = 0;
+
+    captureState(): MemoryManagerState {
+        return {
+            allocs: this.allocs.entriesByInsertion().map(e => [e.addr, e.size, e.bucket ?? null]),
+            totalAllocated: this.totalAllocated,
+            currentBytes: this.currentBytes,
+            peakBytes: this.peakBytes,
+            freeBlocks: [...this.freeBlocks].map(([k, v]) => [k, v.map(b => [b.addr, b.size])]),
+            largeFreeBlocks: [...this.largeFreeBlocks].map(([k, v]) => [k, v.map(b => [b.addr, b.size])]),
+            bucketState: [...this.bucketState].map(([k, b]) => [k, { ...b }]),
+            sysPoolArena: this.sysPoolArena ? { ...this.sysPoolArena } : null,
+            sysPoolFree: [...this.sysPoolFree].map(([size, addrs]) => [size, [...addrs]]),
+            systemPoolGeneration: this.systemPoolGeneration,
+        };
+    }
+
+    restoreState(state: MemoryManagerState): void {
+        this.allocs.clear();
+        for (const [addr, size, bucket] of state.allocs) {
+            this.allocs.setSize(addr, size);
+            if (bucket !== null) this.allocs.setBucket(addr, bucket);
+        }
+        this.totalAllocated = state.totalAllocated;
+        this.currentBytes = state.currentBytes;
+        this.peakBytes = state.peakBytes;
+        const blocks = (list: Array<[RegionKind, number[][]]>) =>
+            new Map(list.map(([k, v]) => [k, v.map(([addr, size]) => ({ addr, size }))]));
+        this.freeBlocks = blocks(state.freeBlocks);
+        this.largeFreeBlocks = blocks(state.largeFreeBlocks);
+        this.bucketState = new Map(state.bucketState.map(([k, b]) => [k, { ...b }]));
+        this.sysPoolArena = state.sysPoolArena ? { ...state.sysPoolArena } : null;
+        this.sysPoolFree = new Map(state.sysPoolFree.map(([size, addrs]) => [size, [...addrs]]));
+        this.systemPoolGeneration = state.systemPoolGeneration;
+    }
 
     allocSystemBlock(size: number): number {
         const aligned = this.alignUp(size, 16);
@@ -468,6 +515,10 @@ export class MemoryManager {
         return this.alloc(size, 'HEAP', perms, alignment);
     }
 
+    liveBlockOverlapping(addr: number, size: number, skip: (base: number) => boolean): { addr: number; size: number } | null {
+        return this.allocs.firstOverlapping(addr >>> 0, (addr >>> 0) + size, skip);
+    }
+
     allocAt(addr: number, size: number, kind?: RegionKind, perms?: RegionPerms): number {
         const aligned = this.alignUp(size, 8);
         const finalKind = kind ?? 'HEAP';
@@ -499,7 +550,22 @@ export class MemoryManager {
             skipOverlapCheck: true,
         });
 
-        bucket.next = Math.max(bucket.next, addr + aligned);
+        // A fixed-address claim takes its range out of the address space the anonymous
+        // allocator may still hand out. VirtualAlloc(lpAddress) is how a guest heap grows in
+        // place: it VirtualQuery-walks to a MEM_FREE run next to its own pool — typically a
+        // range an earlier VirtualFree(MEM_RELEASE) put on the released lists — and reserves
+        // exactly there. Left on those lists, the next VirtualAlloc(NULL) is served the same
+        // base, "zeroes" it under the fresh-commit contract and wipes the live pool (Blade of
+        // Darkness: SmartHeap's page ring pointed into the zeroed range, next=0, endless walk).
+        this.claimFromFreeLists(bucketKind, addr, aligned);
+        // Only a claim inside the bump zone (below the high frontier) moves the bump frontier.
+        // One in the top-down zone — above slabTop, carved by allocFromHigh and since
+        // released — must not: pushing `next` past `slabTop` crosses the two frontiers, after
+        // which every bump and every high carve in this bucket reads as exhausted.
+        const ceiling = bucket.slabTop ?? bucket.limit;
+        if (addr < ceiling) {
+            bucket.next = Math.max(bucket.next, Math.min(addr + aligned, ceiling));
+        }
         this.recordAllocation(addr, aligned);
         this.allocs.setBucket(addr, bucketKind);
         this.logLargeEvent('alloc', addr, aligned);
@@ -510,6 +576,25 @@ export class MemoryManager {
         markGuestPagesDirty(addr, aligned);
         maybeInvalidateExecutableRange(finalKind, finalPerms, addr, aligned);
         return addr;
+    }
+
+    /** Remove [addr, addr+size) from both free pools of a bucket, keeping the remainders. */
+    private claimFromFreeLists(bucketKind: RegionKind, addr: number, size: number): void {
+        const end = addr + size;
+        for (const pools of [this.freeBlocks, this.largeFreeBlocks]) {
+            const list = pools.get(bucketKind);
+            if (!list || list.length === 0) continue;
+            let touched = false;
+            const kept: Array<{ addr: number; size: number }> = [];
+            for (const block of list) {
+                const blockEnd = block.addr + block.size;
+                if (blockEnd <= addr || block.addr >= end) { kept.push(block); continue; }
+                touched = true;
+                if (block.addr < addr) kept.push({ addr: block.addr, size: addr - block.addr });
+                if (blockEnd > end) kept.push({ addr: end, size: blockEnd - end });
+            }
+            if (touched) pools.set(bucketKind, kept);
+        }
     }
 
     free(ptr: number): void {

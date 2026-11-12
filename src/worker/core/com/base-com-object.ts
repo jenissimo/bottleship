@@ -18,10 +18,23 @@ export interface IVTable {
     // This interface is for TypeScript typing only
 }
 
+export interface ComBaseState {
+    refCount: number;
+    handle: number;
+    iid: string;
+    vtable: number;
+    ifaceRefs: Array<[number, number]> | null;
+    liveIfaces: number;
+    destroyed: boolean;
+}
+
 /**
  * Базовый класс для всех COM-объектов
  */
 export abstract class BaseComObject implements IVTable {
+    // @transient(true only while restoreComBase builds an object whose handle a savestate already holds)
+    private static restoring = false;
+
     private _refCount: number = 1; // COM objects start with refcount = 1
     private _handle: number = 0;   // Handle in SystemResourceProvider
     private _iid: string;          // Interface ID (GUID)
@@ -37,7 +50,7 @@ export abstract class BaseComObject implements IVTable {
 
         // Register in SystemResourceProvider
         const resourceProvider = SystemResourceProvider.getInstance();
-        this._handle = resourceProvider.registerComObject(this);
+        this._handle = BaseComObject.restoring ? 0 : resourceProvider.registerComObject(this);
         Logger.verbose(LogCategory.COM, `Created COM object ${this.constructor.name} handle=0x${this._handle.toString(16)} iid=${iid}`);
 
         // A per-interface object whose addRef/release was overridden loses the interface
@@ -50,6 +63,32 @@ export abstract class BaseComObject implements IVTable {
                     `the override must forward ifacePtr or the object can never reach zero`);
             }
         }
+    }
+
+    static captureComBase(obj: BaseComObject): ComBaseState {
+        return {
+            refCount: obj._refCount, handle: obj._handle, iid: obj._iid, vtable: obj._vtableAddress,
+            ifaceRefs: obj._ifaceRefs ? [...obj._ifaceRefs] : null, liveIfaces: obj._liveIfaces, destroyed: obj._destroyed,
+        };
+    }
+
+    static restoreComBase<T extends BaseComObject>(build: () => T, s: ComBaseState): T {
+        BaseComObject.restoring = true;
+        let obj: T;
+        try {
+            obj = build();
+        } finally {
+            BaseComObject.restoring = false;
+        }
+        obj._refCount = s.refCount;
+        obj._handle = s.handle;
+        obj._iid = s.iid;
+        obj._vtableAddress = s.vtable;
+        obj._ifaceRefs = s.ifaceRefs ? new Map(s.ifaceRefs) : null;
+        obj._liveIfaces = s.liveIfaces;
+        obj._destroyed = s.destroyed;
+        obj._zeroRefKeptLogged = false;
+        return obj;
     }
 
     /**

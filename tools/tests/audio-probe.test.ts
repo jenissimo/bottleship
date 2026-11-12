@@ -423,6 +423,22 @@ describe("probeAudioStream / mp3", () => {
         expect(sniffAudioContainer(new BufferSource(concat(new Uint8Array(417), mp3Frame(1), wrongRate)))).toBeNull();
     });
 
+    it("does not call a video container mp3 because its audio packets chain", () => {
+        // MPEG-1 program stream (Max Payne movies\intro.mpg): pack header, then audio frames
+        // that a padded-MP3 search would otherwise accept.
+        const frames = concat(mp3Frame(1), mp3Frame(2), mp3Frame(3));
+        const pack = new Uint8Array([0x00, 0x00, 0x01, 0xba, 0x21, 0x00, 0x01, 0x00, 0x05, 0x80, 0x2c, 0x6b]);
+        const ps = concat(pack, frames);
+        expect(sniffAudioContainer(new BufferSource(ps))).toBeNull();
+        expect(probeAudio(new BufferSource(ps))).toBeNull();
+        const es = concat(new Uint8Array([0x00, 0x00, 0x01, 0xb3, 0x14, 0x00, 0xf0, 0x13]), frames);
+        expect(sniffAudioContainer(new BufferSource(es))).toBeNull();
+        const avi = concat(ascii("RIFF"), u32leBytes(4 + frames.length), ascii("AVI "), frames);
+        expect(sniffAudioContainer(new BufferSource(avi))).toBeNull();
+        // The padded-stream case the search exists for is untouched.
+        expect(sniffAudioContainer(new BufferSource(concat(new Uint8Array(12), frames)))).toBe("mp3");
+    });
+
     it("bounds the padded-stream search on large non-audio inputs", () => {
         const src = new CountingSource(concat(new Uint8Array(9000), mp3Frame(1), mp3Frame(2)));
         expect(sniffAudioContainer(src)).toBeNull();

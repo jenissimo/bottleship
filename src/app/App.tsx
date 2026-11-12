@@ -1,6 +1,8 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SessionWorker } from './session-worker';
+import { AudioPauseSync } from "../audio/pause-sync";
 import { ChildSessionSurface } from './child-session-surface';
+import { hardwareKeyText, hardwareKeyVk } from "./hardware-key-vk";
 import { cx } from "../ui/cx";
 import s from "./App.module.css";
 import OpfsTool from '../debug/OpfsTool';
@@ -12,11 +14,23 @@ import MemoryPanel from '../debug/MemoryPanel';
 import ProfilerPanel from '../debug/ProfilerPanel';
 import DebugGPUPanel from '../debug/DebugGPUPanel';
 import FrameAnalysisPanel from '../debug/FrameAnalysisPanel';
+// Dev-only smoke-run checklist. Behind import.meta.env.DEV so a production build drops
+// the chunk entirely (the list needs the dev-only /__wgb/list route anyway).
+const SmokeRunModal = import.meta.env.DEV ? lazy(() => import('../debug/smoke/SmokeRunModal')) : null;
+const SmokePanel = import.meta.env.DEV
+  ? lazy(() => import('../debug/smoke/SmokePanel').then((m) => ({ default: m.SmokePanel })))
+  : null;
+/** Keys typed into a host overlay that takes text (smoke-run note) belong to it, not to
+ *  the guest. Opt-in by `data-host-keys` so every other overlay keeps today's routing. */
+function isHostKeyTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest("[data-host-keys]") !== null;
+}
 import { InputStatusOverlay, type InputStatus } from './InputStatusOverlay';
 import { AudioEngine, AudioPlayEncodedPayload, AudioPlayPayload, AudioUpdatePayload } from "../audio/audio-engine";
 import { getLogClient, sendLogToServer, writeDebugFile, writeDebugFileBase64, rotateLogFile, logArtifactPath } from "../utils/log-client";
 import { bundleLogName } from "../utils/bundle-url";
 import { sessionFromLocation } from "../harness/session";
+import { resolveHostJitPolicy } from "../utils/host-jit-policy";
 import { installHarnessFacade } from "../harness/facade";
 import { getCachedGamepadMeta, initGamepadCache, readLiveGamepad, rescanGamepads } from "../gamepad-cache";
 import GameSelectScreen, { type GameEntry } from "../library/GameSelectScreen";
@@ -36,6 +50,7 @@ import { loadGamesCatalog } from "../games-catalog";
 import { browserPolicyBlock, loadDeploymentConfig } from "../deployment-config";
 import { DEFAULT_QUALITY, mergeQuality, parseStoredQuality, serializeStoredQuality } from "../worker/core/quality-config";
 import type { QualityConfig } from "../worker/core/quality-config";
+import type { InternalScaleSupport } from "../worker/backends/webgpu/shared/internal-resolution";
 import {
   clientToGuestPoint,
   contentRectFromPresentRect,
@@ -183,6 +198,8 @@ let capturePending: { resolve: (blob: Blob) => void; reject: (err: Error) => voi
 let statsPending: { resolve: (stats: Record<string, number>) => void; reject: (err: Error) => void } | null = null;
 let verboseLogPending: { resolve: (text: string) => void; reject: (err: Error) => void } | null = null;
 let audioEngine: AudioEngine | null = null;
+/** Single writer of the engine's pause state: the UI button and the worker's guest_pause_state both go through it. */
+let audioPauseSync: AudioPauseSync | null = null;
 let isRecording = false;
 let recordStart = 0;
 let recordedInputs: InputSample[] = [];
@@ -326,6 +343,10 @@ export default function App() {
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [opfsToolOpen, setOpfsToolOpen] = useState(false);
   const [wgbBrowserOpen, setWgbBrowserOpen] = useState(false);
+  // `?smoke` opens the smoke-run checklist straight away (library or game screen).
+  const [smokeRunOpen, setSmokeRunOpen] = useState(
+    () => import.meta.env.DEV && new URLSearchParams(window.location.search).has("smoke"),
+  );
   const [storageOpen, setStorageOpen] = useState(false);
   /** Chrome-free presentation where the Fullscreen API does not exist (iPhone Safari). */
   const [immersive, setImmersive] = useState(false);
@@ -402,6 +423,10 @@ export default function App() {
   // not implement — see shared/quality-capabilities.ts. Surfaced in QualityPanel so a
   // knob that provably does nothing on this backend reads as such, not as "applied".
   const [unsupportedQualityKeys, setUnsupportedQualityKeys] = useState<ReadonlySet<string>>(new Set());
+  // Whether the active backend applies `internalScale` at all, and what Auto means there —
+  // a different question from "is this key currently a gap" (see QualityPanel). Optimistic
+  // until the first ack, so a panel opened before any backend registered reads as before.
+  const [internalScaleSupport, setInternalScaleSupport] = useState<InternalScaleSupport>({ implemented: true, autoIsNative: false });
   // Keys where the worker's EFFECTIVE config differs from the preference we sent — i.e. the
   // loaded game's manifest is overriding them. Derived from the ack rather than asked for
   // separately: the ack already carries the effective config, and anything else could drift
@@ -1032,6 +1057,13 @@ export default function App() {
       // to logs/debug/ while its PNG went to logs/alpha/debug/ reads a sibling's evidence.
       globalWorker.postMessage({ type: "set_session", session: sessionFromLocation(window.location.search) });
       globalWorker.postMessage({ type: "set_network", network: networkRef.current });
+      const jitPolicy = resolveHostJitPolicy({
+        userAgent: navigator.userAgent,
+        maxTouchPoints: navigator.maxTouchPoints,
+        search: window.location.search,
+      });
+      globalWorker.postMessage({ type: "set_jit_policy", mode: jitPolicy.mode });
+      if (jitPolicy.reason !== "default") console.info(`[bs] JIT ${jitPolicy.mode} (${jitPolicy.reason}); ?jit=1 forces it on`);
 
       // A self re-exec asked us to reload (see the "reexec" message). Hand the worker the
       // launcher's command line BEFORE any bundle load — it replaces the manifest's `args`
@@ -1219,6 +1251,7 @@ export default function App() {
     assertVirtualPad();
     if (!audioEngine) {
       audioEngine = new AudioEngine();
+      audioPauseSync = new AudioPauseSync(audioEngine);
       // Apply the persisted output prefs to the fresh engine (volume/mute are stored
       // and take effect when ensureReady() builds the master gain).
       audioEngine.setMasterVolume(uiSettingsRef.current.masterVolume);
@@ -1309,6 +1342,14 @@ export default function App() {
           audioEngine?.stopAll();
           setExitInfo(null); exitInfoRef.current = null;
         }
+        return;
+      }
+      if (event.data?.type === 'guest_pause_state') {
+        // The guest was paused/resumed from inside the worker (harness, fault, park) or by our
+        // own button echoing back. The guest's real state drives both the indicator and audio.
+        const paused = event.data.paused === true;
+        setIsPaused(paused);
+        void audioPauseSync?.set(paused);
         return;
       }
       //console.log('BottleShip: Worker message received:', event.data?.type);
@@ -1604,9 +1645,8 @@ export default function App() {
         const id = Number(event.data?.payload?.id ?? 0);
         const sab = event.data?.payload?.sab as SharedArrayBuffer | undefined;
         if (id && sab) {
-          // Resume AudioContext immediately — video may start before a user gesture,
-          // but the user likely already clicked (load game) so the gesture is in the past.
-          void audioEngine?.resume();
+          // Unlock if permitted; a late registration must not cancel an intentional pause.
+          void audioEngine?.resumeIfNotPaused();
           audioEngine?.registerBuffer(id, sab);
         }
       }
@@ -1763,6 +1803,13 @@ export default function App() {
       if (event.data?.type === "set_quality") {
         const unsupported = Array.isArray(event.data.unsupported) ? event.data.unsupported : [];
         setUnsupportedQualityKeys(new Set(unsupported));
+        const support = event.data.internalScale as Partial<InternalScaleSupport> | undefined;
+        if (support && typeof support === "object") {
+          setInternalScaleSupport({
+            implemented: !!support.implemented,
+            autoIsNative: !!support.autoIsNative,
+          });
+        }
         const effective = event.data.quality as Partial<QualityConfig> | undefined;
         const pref = qualityRef.current as unknown as Record<string, unknown>;
         setOverriddenQualityKeys(effective
@@ -1990,6 +2037,14 @@ export default function App() {
       const inputView = globalInputView;
       if (!inputView) return;
 
+      // A press that started in a host text overlay is the overlay's, and so is its
+      // release — a lone key-up must not reach the guest (Esc closing a note would
+      // otherwise read as a menu key). A key already held in the game still releases.
+      if (state === 1 ? isHostKeyTarget(event.target) : hostOwnedKeys.has(event.code)) {
+        if (state === 1) hostOwnedKeys.add(event.code); else hostOwnedKeys.delete(event.code);
+        return;
+      }
+
       // F11 = host fullscreen (Element Fullscreen API on the canvas panel). Not forwarded
       // to the guest — browsers reserve F11 for chrome fullscreen, and our hint advertises it.
       if (event.code === "F11") {
@@ -2029,16 +2084,18 @@ export default function App() {
       }
 
       if (!isPausedRef.current && state === 1) {
-        void audioEngine?.resume();
+        void audioEngine?.resumeIfNotPaused();
       }
 
-      const vk = event.keyCode & 0xff;
-      inputDevice.setKey(vk, state === 1, "hw-key");
+      const vk = hardwareKeyVk(event.code, event.keyCode);
+      inputDevice.setKey(vk, state === 1, "hw-key", state === 1 ? hardwareKeyText(event) : undefined);
       inputDevice.commit();
       recordSample(inputView, vk, state);
     };
 
 
+    /** Codes whose key-down went to a host overlay (see isHostKeyTarget). */
+    const hostOwnedKeys = new Set<string>();
     const handleKeyDown = (event: KeyboardEvent) => handleKey(event, 1);
     const handleKeyUp = (event: KeyboardEvent) => handleKey(event, 0);
 
@@ -2066,7 +2123,7 @@ export default function App() {
         // rely on WndProc mouse messages for click handling.
       }
       if (!isPausedRef.current) {
-        void audioEngine?.resume();
+        void audioEngine?.resumeIfNotPaused();
       }
       writePointer(event);
     };
@@ -2209,7 +2266,7 @@ export default function App() {
     document.addEventListener("pointerlockchange", handlePointerLockChange);
     const unlockAudio = () => {
       if (!isPausedRef.current) {
-        void audioEngine?.resume();
+        void audioEngine?.resumeIfNotPaused();
       }
     };
     window.addEventListener("pointerdown", unlockAudio, { passive: true });
@@ -2778,14 +2835,8 @@ export default function App() {
     setIsPaused(newPausedState);
     globalWorker.postMessage({ type: newPausedState ? "pause" : "resume" });
     
-    // Also pause/resume audio engine
-    if (audioEngine) {
-      if (newPausedState) {
-        await audioEngine.pause();
-      } else {
-        await audioEngine.resume();
-      }
-    }
+    // Silence/restore audio at once instead of waiting for the worker's echo.
+    await audioPauseSync?.set(newPausedState);
   }, [isPaused]);
 
   // A running game is not user activity as far as the OS is concerned, so the screen
@@ -2978,6 +3029,7 @@ export default function App() {
       quality={quality}
       onChange={handleQualityChange}
       unsupportedQualityKeys={unsupportedQualityKeys}
+      internalScaleSupport={internalScaleSupport}
       overriddenQualityKeys={overriddenQualityKeys}
       uiSettings={uiSettings}
       onUiChange={handleUiChange}
@@ -3023,6 +3075,7 @@ export default function App() {
             if (!launchBlocked) window.location.assign("?game=dev");
           }}
           onManageStorage={() => setStorageOpen(true)}
+          onSmokeRun={import.meta.env.DEV ? () => setSmokeRunOpen(true) : undefined}
           onOpenSettings={() => setMainSettingsOpen(true)}
           disableSelection={launchBlocked}
           unsupportedMessage={browserUnsupportedMessage}
@@ -3030,6 +3083,11 @@ export default function App() {
         {settingsDrawer}
         <VirtualKeyboardSheet open={oskOpen} onClose={() => setOskOpen(false)} />
         <StorageManagerModal isOpen={storageOpen} onClose={() => setStorageOpen(false)} />
+        {SmokeRunModal && smokeRunOpen && (
+          <Suspense fallback={null}>
+            <SmokeRunModal isOpen onClose={() => setSmokeRunOpen(false)} catalog={gamesCatalog} />
+          </Suspense>
+        )}
         <WgbWizardModal
           isOpen={addGameOpen}
           onClose={() => setAddGameOpen(false)}
@@ -3293,6 +3351,7 @@ export default function App() {
           onOpenFrameAnalysis={() => setFrameAnalysisOpen(true)}
           onOpenStorage={() => setStorageOpen(true)}
           onOpenBundles={import.meta.env.DEV ? () => setWgbBrowserOpen(true) : undefined}
+          onOpenSmokeRun={import.meta.env.DEV ? () => setSmokeRunOpen(true) : undefined}
           onOpenOpfsTool={() => setOpfsToolOpen(true)}
           onOpenRegistryTool={() => setRegistryToolOpen(true)}
           fpuStrictEnabled={fpuStrictEnabled}
@@ -3414,6 +3473,15 @@ export default function App() {
           gameName={gameDisplayName}
           onDismissError={() => setErrorMessage(null)}
         />
+        {SmokePanel && (
+          <Suspense fallback={null}>
+            <SmokePanel
+              hidden={smokeRunOpen}
+              onOpenList={() => setSmokeRunOpen(true)}
+              onReturnFocus={() => canvasRef.current?.focus()}
+            />
+          </Suspense>
+        )}
       </section>
 
       {/* Info strip — catalog games always; destin mode once the WGB manifest name arrives. */}
@@ -3444,6 +3512,15 @@ export default function App() {
           onClose={() => setWgbBrowserOpen(false)}
           onLaunch={handleLaunchBundle}
         />
+      )}
+      {SmokeRunModal && smokeRunOpen && (
+        <Suspense fallback={null}>
+          <SmokeRunModal
+            isOpen
+            onClose={() => { setSmokeRunOpen(false); canvasRef.current?.focus(); }}
+            catalog={gamesCatalog}
+          />
+        </Suspense>
       )}
       <StorageManagerModal isOpen={storageOpen} onClose={() => setStorageOpen(false)} />
       <RegistryTool isOpen={registryToolOpen} onClose={() => setRegistryToolOpen(false)} worker={globalWorker} />

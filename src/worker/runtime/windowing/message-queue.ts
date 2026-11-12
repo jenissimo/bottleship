@@ -6,6 +6,7 @@
  */
 
 import { TimeService } from "../time";
+import type { FieldPolicy } from "../../savestate/participant";
 
 export interface Message {
     hwnd: number;
@@ -35,7 +36,7 @@ let coalesceMouseMoveEnabled = true;
 const QUEUE_SIZE = 256;
 const KEY_STATE_BYTES = 256;
 
-type PendingMessage = {
+export type PendingMessage = {
     wParam: number;
     lParam: number;
     time: number;
@@ -46,6 +47,39 @@ type PendingMessage = {
     extraInfo?: number;
     timerEpoch?: number;
 };
+
+export const PENDING_MESSAGE_FIELDS = {
+    wParam: 'save', lParam: 'save', time: 'save', ptX: 'save', ptY: 'save', targetThreadId: 'save',
+    keyStatePacked: 'save', extraInfo: 'save', timerEpoch: 'save',
+} as const satisfies Record<keyof PendingMessage, FieldPolicy>;
+
+export type QueuedMessageRow = [
+    hwnd: number, message: number, wParam: number, lParam: number, time: number,
+    ptX: number, ptY: number, targetThreadId: number, extraInfo: number, keyState: Uint8Array | null,
+];
+
+export interface TimerPendingState { key: string; hwnd: number; pending: PendingMessage; materialized: boolean }
+
+export interface MessageQueueState {
+    posted: QueuedMessageRow[];
+    input: QueuedMessageRow[];
+    paintPending: Array<[number, PendingMessage]>;
+    timerPending: TimerPendingState[];
+    nextTimerMessage: number;
+    lastMouseMove: Array<[number, PendingMessage]>;
+    moveSetCursor: Array<[number, PendingMessage]>;
+    lastDequeued: [ptX: number, ptY: number, time: number];
+}
+
+function copyPending(p: PendingMessage): PendingMessage {
+    const out = {} as Record<string, unknown>;
+    for (const key of Object.keys(PENDING_MESSAGE_FIELDS) as (keyof PendingMessage)[]) {
+        const v = p[key];
+        if (v === undefined) continue;
+        out[key] = v instanceof Uint8Array ? v.slice() : v;
+    }
+    return out as PendingMessage;
+}
 
 (globalThis as Record<string, any>).h3QueueSetMouseMoveCoalescing = (enabled: boolean): boolean => {
     coalesceMouseMoveEnabled = !!enabled;
@@ -143,6 +177,30 @@ class RingBuffer {
         this.extraInfos[idx] = extraInfo >>> 0;
         this.tail = (this.tail + 1) & this.mask;
         this.count++;
+    }
+
+    captureRows(): QueuedMessageRow[] {
+        const out: QueuedMessageRow[] = [];
+        for (let i = 0; i < this.count; i++) {
+            const idx = (this.head + i) & this.mask;
+            out.push([
+                this.hwnds[idx], this.messages[idx], this.wParams[idx], this.lParams[idx], this.times[idx],
+                this.ptXs[idx], this.ptYs[idx], this.targetThreadIds[idx], this.extraInfos[idx],
+                this.getKeyStateSnapshot(idx) ?? null,
+            ]);
+        }
+        return out;
+    }
+
+    restoreRows(rows: readonly QueuedMessageRow[]): void {
+        if (rows.length > this.capacity) throw new Error(`message queue: ${rows.length} saved entries exceed the capacity ${this.capacity}`);
+        this.head = 0;
+        this.tail = 0;
+        this.count = 0;
+        this.keyStatePresent.fill(0);
+        for (const [hwnd, message, wParam, lParam, time, ptX, ptY, target, extra, keyState] of rows) {
+            this.enqueue(hwnd, message, wParam, lParam, time, ptX, ptY, target, keyState ?? undefined, extra);
+        }
     }
 
     /** Every entry in arrival order, with the thread filter that gates it. Diagnostic only. */
@@ -368,13 +426,44 @@ function nextPowerOfTwo(value: number): number {
 }
 
 export class MessageQueue {
-    // Separate queues for different priority
-    private inputQueue = new RingBuffer(QUEUE_SIZE);  // High priority: mouse, keyboard
+    // USER retrieves posted messages before hardware input (GetMessage docs: sent,
+    // posted, input, WM_PAINT, WM_TIMER). TranslateMessage POSTS its WM_CHAR, so a
+    // character overtakes the WM_KEYUP already waiting in the input queue.
+    private postedQueue = new RingBuffer(QUEUE_SIZE);
+    private inputQueue = new RingBuffer(QUEUE_SIZE);  // hardware: mouse, keyboard
     private paintPending: Map<number, PendingMessage> = new Map(); // hwnd -> pending paint
     // USER synthesizes at most one pending WM_TIMER per (thread, window, id).
     // Keeping ticks as ordinary posts can permanently starve a modal loop's idle path.
     private timerPending: Map<string, { hwnd: number; pending: PendingMessage; materialized: boolean }> = new Map();
     private nextTimerMessage = 1;
+
+    captureState(): MessageQueueState {
+        const rows = (m: Map<number, PendingMessage>): Array<[number, PendingMessage]> => [...m].map(([h, p]) => [h, copyPending(p)]);
+        return {
+            posted: this.postedQueue.captureRows(),
+            input: this.inputQueue.captureRows(),
+            paintPending: rows(this.paintPending),
+            timerPending: [...this.timerPending].map(([key, e]) => ({ key, hwnd: e.hwnd, pending: copyPending(e.pending), materialized: e.materialized })),
+            nextTimerMessage: this.nextTimerMessage,
+            lastMouseMove: rows(this.lastMouseMove),
+            moveSetCursor: rows(this.moveSetCursor),
+            lastDequeued: [this.lastDequeuedPtX, this.lastDequeuedPtY, this.lastDequeuedTime],
+        };
+    }
+
+    restoreState(s: MessageQueueState): void {
+        const map = (rows: Array<[number, PendingMessage]>) => new Map(rows.map(([h, p]) => [h, copyPending(p)]));
+        this.postedQueue.restoreRows(s.posted);
+        this.inputQueue.restoreRows(s.input);
+        this.paintPending = map(s.paintPending);
+        this.timerPending = new Map(s.timerPending.map(e => [e.key, { hwnd: e.hwnd, pending: copyPending(e.pending), materialized: e.materialized }]));
+        this.nextTimerMessage = s.nextTimerMessage;
+        this.lastMouseMove = map(s.lastMouseMove);
+        this.moveSetCursor = map(s.moveSetCursor);
+        [this.lastDequeuedPtX, this.lastDequeuedPtY, this.lastDequeuedTime] = s.lastDequeued;
+        for (const w of this.waiters) w.settled = true;
+        this.waiters = [];
+    }
 
     /** A due timer is generated lazily; a WM_TIMER already returned by PM_NOREMOVE survives cancellation. */
     cancelTimer(hwnd: number, id: number): void {
@@ -497,7 +586,8 @@ export class MessageQueue {
         keyStatePacked?: Uint8Array,
         extraInfo = 0,
         synthesizedTimer = true,
-        timerEpoch = 0
+        timerEpoch = 0,
+        hardware = false
     ): boolean {
         const time = TimeService.getInstance().guestTickMs() | 0;
 
@@ -568,6 +658,8 @@ export class MessageQueue {
             });
             this.drainWaiters();
             return true;
+        } else if (!hardware) {
+            this.postedQueue.enqueue(hwnd, msg, wParam, lParam, time, ptX, ptY, targetThreadId, keyStatePacked, extraInfo);
         } else {
             // Flush any pending mouse move (and its WM_SETCURSOR) before other input
             const pendingSetCursor = this.moveSetCursor.get(hwnd);
@@ -610,6 +702,7 @@ export class MessageQueue {
      */
     snapshot(): Record<string, unknown> {
         return {
+            posted: this.postedQueue.snapshot(),
             input: this.inputQueue.snapshot(),
             mouseMove: [...this.lastMouseMove].map(([hwnd, p]) => ({ hwnd, targetThreadId: p.targetThreadId })),
             mouseSetCursor: [...this.moveSetCursor].map(([hwnd, p]) => ({ hwnd, targetThreadId: p.targetThreadId })),
@@ -618,13 +711,27 @@ export class MessageQueue {
         };
     }
 
+    hasPendingMoveSetCursor(msgMin = 0, msgMax = 0, callerThreadId = 0): boolean {
+        if (this.moveSetCursor.size === 0) return false;
+        if (!(msgMin === 0 && msgMax === 0) && !(WM_MOUSEMOVE >= msgMin && WM_MOUSEMOVE <= msgMax)) return false;
+        for (const [hwnd, pending] of this.moveSetCursor) {
+            if (!this.lastMouseMove.has(hwnd)) continue;
+            if (callerThreadId > 0 && pending.targetThreadId > 0 && pending.targetThreadId !== callerThreadId) continue;
+            return true;
+        }
+        return false;
+    }
+
     dequeue(msgMin = 0, msgMax = 0, callerThreadId = 0): Message | null {
         const noFilter = msgMin === 0 && msgMax === 0;
 
-        // 1. Input queue (keyboard, buttons, etc)
-        const queued = noFilter
-            ? this.inputQueue.dequeue(callerThreadId)
-            : this.inputQueue.dequeueFiltered(msgMin, msgMax, callerThreadId);
+        // 1. Posted, then hardware input (keyboard, buttons, etc)
+        const queued = (noFilter
+            ? this.postedQueue.dequeue(callerThreadId)
+            : this.postedQueue.dequeueFiltered(msgMin, msgMax, callerThreadId))
+            ?? (noFilter
+                ? this.inputQueue.dequeue(callerThreadId)
+                : this.inputQueue.dequeueFiltered(msgMin, msgMax, callerThreadId));
         if (queued) {
             this.trackDequeued(queued, callerThreadId);
             return queued;
@@ -710,9 +817,12 @@ export class MessageQueue {
     peek(msgMin = 0, msgMax = 0, callerThreadId = 0): Message | null {
         const noFilter = msgMin === 0 && msgMax === 0;
 
-        const queued = noFilter
-            ? this.inputQueue.peek(callerThreadId)
-            : this.inputQueue.peekFiltered(msgMin, msgMax, callerThreadId);
+        const queued = (noFilter
+            ? this.postedQueue.peek(callerThreadId)
+            : this.postedQueue.peekFiltered(msgMin, msgMax, callerThreadId))
+            ?? (noFilter
+                ? this.inputQueue.peek(callerThreadId)
+                : this.inputQueue.peekFiltered(msgMin, msgMax, callerThreadId));
         if (queued) {
             return queued;
         }
@@ -777,6 +887,7 @@ export class MessageQueue {
 
     hasMessages(msgMin = 0, msgMax = 0, callerThreadId = 0): boolean {
         const noFilter = msgMin === 0 && msgMax === 0;
+        if (this.postedQueue.hasFiltered(msgMin, msgMax, callerThreadId)) return true;
         if (this.inputQueue.hasFiltered(msgMin, msgMax, callerThreadId)) return true;
         if (this.lastMouseMove.size > 0 && (noFilter || (WM_MOUSEMOVE >= msgMin && WM_MOUSEMOVE <= msgMax))) {
             for (const pending of this.lastMouseMove.values()) {
@@ -912,18 +1023,34 @@ export class MessageQueue {
         for (const [key, entry] of this.timerPending) {
             if (entry.hwnd === (hwnd >>> 0)) this.timerPending.delete(key);
         }
-        // Drain inputQueue entries for this hwnd by dequeuing all and re-enqueuing non-matching
+        // Drain each FIFO for this hwnd by dequeuing all and re-enqueuing non-matching
         // This is O(n) but only called on window destruction, not a hot path
-        const kept: Message[] = [];
-        let msg: Message | null;
-        while ((msg = this.inputQueue.dequeue()) !== null) {
-            if (msg.hwnd !== hwnd) {
-                kept.push(msg);
+        for (const queue of [this.postedQueue, this.inputQueue]) {
+            const kept: Message[] = [];
+            let msg: Message | null;
+            while ((msg = queue.dequeue()) !== null) {
+                if (msg.hwnd !== hwnd) {
+                    kept.push(msg);
+                }
+            }
+            for (const m of kept) {
+                queue.enqueue(m.hwnd, m.message, m.wParam, m.lParam, m.time, m.ptX, m.ptY, m.targetThreadId ?? 0, m.keyStatePacked, m.extraInfo ?? 0);
             }
         }
-        for (const m of kept) {
-            this.inputQueue.enqueue(m.hwnd, m.message, m.wParam, m.lParam, m.time, m.ptX, m.ptY, m.targetThreadId ?? 0, m.keyStatePacked, m.extraInfo ?? 0);
+    }
+
+    removePosted(match: (msg: Message) => boolean): number {
+        const kept: Message[] = [];
+        let removed = 0;
+        let msg: Message | null;
+        while ((msg = this.postedQueue.dequeue()) !== null) {
+            if (match(msg)) removed++;
+            else kept.push(msg);
         }
+        for (const m of kept) {
+            this.postedQueue.enqueue(m.hwnd, m.message, m.wParam, m.lParam, m.time, m.ptX, m.ptY, m.targetThreadId ?? 0, m.keyStatePacked, m.extraInfo ?? 0);
+        }
+        return removed;
     }
 
     /** Put a removed mouse move back as the pending one, unless a newer move replaced it. */
@@ -946,6 +1073,9 @@ export class MessageQueue {
     }
 
     clear(): void {
+        while (this.postedQueue.dequeue()) {
+            // drain
+        }
         while (this.inputQueue.dequeue()) {
             // drain
         }

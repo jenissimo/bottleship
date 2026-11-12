@@ -18,6 +18,7 @@ export interface SrwLockState {
     waitEvent: number;
 }
 
+// @participant(kernel32)
 const locks = new Map<number, SrwLockState>();
 
 export function resetSrwLock(lockPtr: number): void {
@@ -29,6 +30,17 @@ export function resetSrwLock(lockPtr: number): void {
 /** Drop every host-side SRWLOCK record on game switch (guest memory is rewound). */
 export function resetAllSrwLocks(): void {
     locks.clear();
+}
+
+export function captureSrwLocks(): Array<[number, SrwMode, number, number[], number]> {
+    return [...locks].map(([ptr, st]) => [ptr, st.mode, st.exclusiveOwner, [...st.sharedHolders], st.waitEvent]);
+}
+
+export function restoreSrwLocks(state: Array<[number, SrwMode, number, number[], number]>): void {
+    locks.clear();
+    for (const [ptr, mode, exclusiveOwner, shared, waitEvent] of state) {
+        locks.set(ptr, { mode, exclusiveOwner, sharedHolders: new Set(shared), waitEvent });
+    }
 }
 
 function getOrCreate(lockPtr: number): SrwLockState {

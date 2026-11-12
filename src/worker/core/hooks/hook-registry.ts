@@ -101,9 +101,10 @@ class HookRegistry {
     }
 
     /** Entry point from pe-loader. Safe before initialize() and with zero specs — both no-op. */
-    onModuleLoaded(module: LoadedPEModule): void {
-        if (!this.init || this.specs.size === 0) return;
+    onModuleLoaded(module: LoadedPEModule): boolean {
+        if (!this.init || this.specs.size === 0) return false;
         const modName = normModuleName(module.name);
+        let patched = false;
 
         const patchCtx: PatchContext = {
             dispatcher: this.init.dispatcher,
@@ -147,6 +148,7 @@ class HookRegistry {
             });
 
             if (handle) {
+                patched = true;
                 this.patches.set(spec.id, handle);
                 const st = this.stats.get(spec.id)!;
                 st.patched = true;
@@ -158,6 +160,7 @@ class HookRegistry {
                 console.warn(`[hooks] ${spec.id}: applyPatch failed (env not ready?) — will retry on next module load`);
             }
         }
+        return patched;
     }
 
     /** Wrap a spec's scalar/simd handler into a ThunkImplementation with A/B + oracle. */

@@ -163,7 +163,8 @@ export class RenderFrame {
     /** Destination byte offset per queued upload — a partial upload writes only the range
      *  the guest rewrote, so the flush cannot assume 0. Always a multiple of 4. */
     uploadOffsets: number[] = [];
-    temporaryBuffers: GPUBuffer[] = [];
+    /** Resources retained until submission or permanent discard of this frame. */
+    temporaryBuffers: Array<GPUBuffer | GPUTexture> = [];
     /** Buffers acquired from a reuse pool (DrawPrimitiveUP vertex data). Unlike
      *  temporaryBuffers, these are NOT destroyed at frame end — the owner returns
      *  them to its pool after submit (see D3D9Device.submitFrame). */
@@ -418,6 +419,10 @@ export class RenderFrame {
 
     registerTemporaryBuffer(buffer: GPUBuffer): void {
         this.temporaryBuffers.push(buffer);
+    }
+
+    registerTemporaryTexture(texture: GPUTexture): void {
+        this.temporaryBuffers.push(texture);
     }
 
     /** Track a pooled buffer for post-submit reclaim (returned to the pool, not destroyed). */

@@ -15,6 +15,7 @@ import { registerFileIoAttributeExports } from './file-io-attributes';
 import { readStringA, readStringW, encodeFileApiString, setFileApisAnsi, areFileApisAnsi } from './file-io-strings';
 import { MemoryGuard } from '../../core/memory/mem-guard';
 import { Mem } from '../../core/memory/mem-accessor';
+import { objectCodecs } from '../../savestate/object-codecs';
 import { System } from '../../core/system';
 import { Process } from '../../core/process';
 import { VfsFileHandle, VirtualFileSystem } from '../../runtime/filesystem/vfs';
@@ -31,13 +32,17 @@ import { cancelWsaIo, hasWsaSocket, getWsaNativeSocketTable } from '../wsa-stub-
 import { trySocketFileIo, cancelSocketFileIo } from './socket-file-io';
 import { installReadFileEx, cancelFileReadEx } from './file-io-ex';
 
+// @transient(diagnostics)
 const readFileFirstLogged = new Set<number>();
+// @transient(diagnostics)
 let shortReadLogCount = 0;
 // A handle whose file position is driven from two threads is a race the guest can only
 // win by serialising itself: SetFilePointer and ReadFile are separate calls, and our
 // scheduler preempts between them. Reported once per handle — the pair reads the wrong
 // offset and the caller sees plausible-looking garbage, not an error.
+// @transient(diagnostics)
 const readFileLastThread = new Map<number, number>();
+// @transient(diagnostics)
 let sharedHandleLogCount = 0;
 function noteReadFileThread(hFile: number, path: string): void {
     const tid = System.getInstance().scheduler.getCurrentThread()?.id ?? 0;
@@ -195,6 +200,27 @@ function handleFileTime(fileHandle: { vfsHandle?: VfsFileHandle } | null | undef
     const path = fileHandle?.vfsHandle?.path;
     return fileTimeOf(path ? System.getInstance().fileSystem.statEntry(path) : null);
 }
+
+objectCodecs.add({
+    tag: 'kernel32-file',
+    matches: (o: unknown): o is FileHandleWrapper => o instanceof FileHandleWrapper,
+    capture: (o: FileHandleWrapper) => {
+        const h = o.vfsHandle;
+        return { path: h.path, position: h.position, access: h.access, source: h.source, sequential: h.sequentialFlag ?? false };
+    },
+    restore: (d: { path: string; position: number; access: number; source: 'rom' | 'overlay'; sequential: boolean }) => {
+        const handle: VfsFileHandle = { kind: 'file', path: d.path, position: d.position, access: d.access, source: d.source };
+        if (d.sequential) handle.sequentialFlag = true;
+        return new FileHandleWrapper(handle, System.getInstance().fileSystem);
+    },
+});
+
+objectCodecs.add({
+    tag: 'kernel32-console',
+    matches: (o: unknown): o is ConsoleDeviceHandle => o instanceof ConsoleDeviceHandle,
+    capture: (o: ConsoleDeviceHandle) => ({ deviceType: o.deviceType }),
+    restore: (d: { deviceType: 'CONOUT' | 'CONIN' | 'NUL' }) => new ConsoleDeviceHandle(d.deviceType),
+});
 
 /** Record the caller's declared access pattern on the file object. NT takes this at
  *  face value and reads ahead on it; below us it is what tells the block cache that a

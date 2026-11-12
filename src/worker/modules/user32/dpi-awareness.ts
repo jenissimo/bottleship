@@ -47,6 +47,7 @@ export const CONTEXT_UNAWARE_GDISCALED =
     makeContext(DPI_AWARENESS_UNAWARE, 1, USER_DEFAULT_SCREEN_DPI, CONTEXT_FLAG_GDISCALED);
 
 /** DPI_AWARENESS_CONTEXT_UNAWARE (-1) … DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED (-5). */
+// @transient(constant table)
 const PSEUDO_HANDLE_CONTEXTS: ReadonlyMap<number, number> = new Map([
     [0xffffffff, CONTEXT_UNAWARE],
     [0xfffffffe, CONTEXT_SYSTEM_AWARE],
@@ -82,7 +83,9 @@ export function isValidContext(ctx: number, dpi: number): boolean {
 }
 
 /** 0 = never set: the process runs UNAWARE, and the first Set* still succeeds. */
+// @participant(user32)
 let processContext = 0;
+// @participant(user32)
 const threadContexts = new Map<number, number>();
 
 export function resetDpiAwareness(): void {
@@ -282,4 +285,16 @@ export function createDpiExports(base: Record<string, ThunkImplementation>): Rec
     };
 
     return exports;
+}
+
+export interface DpiAwarenessState { processContext: number; threadContexts: Array<[number, number]> }
+
+export function captureDpiAwareness(): DpiAwarenessState {
+    return { processContext, threadContexts: [...threadContexts] };
+}
+
+export function restoreDpiAwareness(s: DpiAwarenessState): void {
+    processContext = s.processContext;
+    threadContexts.clear();
+    for (const [t, c] of s.threadContexts) threadContexts.set(t, c);
 }

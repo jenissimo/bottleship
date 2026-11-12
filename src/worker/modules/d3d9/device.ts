@@ -44,7 +44,7 @@ const resetRefusalLogged = new Map<string, number>();
 import {
     addComRef, getVTables, devices, createComObject, registerComFinalizer,
     releaseComRef, resourceToDevice, deviceToD3D9, deviceCreationParams,
-    deviceBackBufferInfo,
+    deviceBackBufferInfo, D3D9EX_SHADOWED_SETTERS,
 } from './shared-state';
 import { addBindingRef, adoptBindingRef, releaseBindingRef } from './com-refs';
 import {
@@ -715,11 +715,12 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
                     resetShadow?: (dll: string, fn: string) => void;
                 } | undefined;
                 disp?.setShadowOwner?.(devicePtr);
-                disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetRenderState');
-                disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetSamplerState');
-                disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetTexture');
-                disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetVertexShader');
-                disp?.resetShadow?.('d3d9', 'IDirect3DDevice9_SetPixelShader');
+                // Base and IDirect3DDevice9Ex tables alike (the Ex ones exist once an Ex
+                // device was created; resetShadow is a no-op for a table that does not).
+                for (const [fn, exFn] of Object.entries(D3D9EX_SHADOWED_SETTERS)) {
+                    disp?.resetShadow?.('d3d9', fn);
+                    disp?.resetShadow?.('d3d9', exFn);
+                }
             } catch { /* non-fatal */ }
 
             // Return device interface pointer
@@ -1424,14 +1425,19 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         // display mode; a WINDOWED one is a guest of the desktop mode. Answering the
         // bundle's configured resolution either way tells a mode-setting app the screen is
         // a size it is not rendering at.
+        // The desktop side is the CURRENT mode (a ChangeDisplaySettings may have moved it
+        // off the manifest's boot resolution), the same one GetAdapterDisplayMode reports.
         const cfg = EmulatorConfig.getInstance().screenResolution;
+        const current = System.getInstance().emulatedDisplayMode;
+        const desktopWidth = current?.width || cfg.width;
+        const desktopHeight = current?.height || cfg.height;
         const bb = resolveBackBufferGeometry(pDevice);
         const useDeviceMode = !bb.windowed && bb.width > 0 && bb.height > 0;
         const ok =
-            Mem.writeUint32(pMode + 0, (useDeviceMode ? bb.width : cfg.width) >>> 0) &&
-            Mem.writeUint32(pMode + 4, (useDeviceMode ? bb.height : cfg.height) >>> 0) &&
-            Mem.writeUint32(pMode + 8, cfg.refreshRate || 60) &&
-            Mem.writeUint32(pMode + 12, useDeviceMode ? bb.format : formatForBpp(cfg.bpp));
+            Mem.writeUint32(pMode + 0, (useDeviceMode ? bb.width : desktopWidth) >>> 0) &&
+            Mem.writeUint32(pMode + 4, (useDeviceMode ? bb.height : desktopHeight) >>> 0) &&
+            Mem.writeUint32(pMode + 8, current?.refreshRate || cfg.refreshRate || 60) &&
+            Mem.writeUint32(pMode + 12, useDeviceMode ? bb.format : formatForBpp(current?.bpp || cfg.bpp));
         return ok ? D3D_OK : D3DERR_INVALIDCALL;
     };
 

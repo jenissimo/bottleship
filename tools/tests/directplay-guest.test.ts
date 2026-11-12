@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { DirectPlayNetworkApi, packDirectPlayMessage } from "../../src/worker/modules/dplayx/network-api";
+import { DPlayX } from "../../src/worker/modules/dplayx/dplayx";
 import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
 import { DP, DirectPlaySession } from "../../src/worker/modules/dplayx/session";
 import { decodeDatagram, encodeDatagram, encodeTcpFrame, PROTO_TCP, PROTO_UDP, PROTO_DIRECTPLAY, SYN, DATA, TCP_WINDOW, isBroadcastNode } from "../../src/worker/net/netplay-wire";
@@ -574,6 +575,32 @@ test("Lobby connection settings use the native five-argument ABI and own copied 
     expect(read(0x10000)).toBe(40); expect(read(0x10004)).toBe(2); expect(read(0x10008)).toBe(0x10028);
     expect(read(0x10028)).toBe(80); expect(read(0x10050)).toBe(8);
 });
+test("a startup lobby-launch check leaves the module idle for a savestate once the lobby object is released", async () => {
+    const module = new DPlayX() as unknown as { networkApi: DirectPlayNetworkApi; captureSavestate(): unknown };
+    module.networkApi = api;
+    expect(exports["directplaylobbycreatea"]({ esp: 0x9000 } as X86Context, mem, [0, 0x2400, 0, 0, 0])).toBe(DP.OK);
+    primary = read(0x2400); u32(0x2200, 0);
+    await call("GetConnectionSettings", [0, 0, 0x2200], "IDirectPlayLobbyA");
+    expect((api as unknown as { lobbyEndpoint: unknown }).lobbyEndpoint).toBeDefined();
+    expect(() => module.captureSavestate()).toThrow(/^dplayx: not idle, 1 thing\(s\) open: DirectPlayLobby object 0x[0-9a-f]+$/);
+    expect(call("Release", [], "IDirectPlayLobbyA")).toBe(0);
+    expect((api as unknown as { lobbyEndpoint: unknown }).lobbyEndpoint).toBeDefined();
+    expect(module.captureSavestate()).toEqual({});
+});
+test("connection settings set for this process keep refusing a savestate after the lobby object is released", () => {
+    const module = new DPlayX() as unknown as { networkApi: DirectPlayNetworkApi; captureSavestate(): unknown };
+    module.networkApi = api;
+    expect(exports["directplaylobbycreatea"]({ esp: 0x9000 } as X86Context, mem, [0, 0x2400, 0, 0, 0])).toBe(DP.OK);
+    primary = read(0x2400);
+    u32(0x3000, 80); u32(0x3028, 8); bytes(0x3018, "1".repeat(32));
+    u32(0x2300, 40); u32(0x2304, 2); u32(0x2308, 0x3000);
+    bytes(0x2310, "e05ee9367785cf11960c0080c7534e82");
+    expect(call("SetConnectionSettings", [0, 0, 0x2300], "IDirectPlayLobbyA")).toBe(DP.OK);
+    expect(call("Release", [], "IDirectPlayLobbyA")).toBe(0);
+    expect(() => module.captureSavestate()).toThrow("dplayx: not idle, 1 thing(s) open: the lobby record of this process");
+    api.reset();
+    expect(module.captureSavestate()).toEqual({});
+});
 test("synchronous discovery defers all guest callbacks until safe owner-thread continuation", async () => {
     initialize(); u32(0x3000, 80); bytes(0x3018, "1".repeat(32));
     const pending = call("EnumSessions", [0x3000, 1, 0x7000, 0x1234, 2]);
@@ -593,6 +620,35 @@ test("enumeration callback false stops and releases frame storage, player filter
     expect(a).not.toBe(b);
 });
 
+function ansi(ptr: number): string {
+    let text = ""; while (mem[ptr]) text += String.fromCharCode(mem[ptr++]!);
+    return text;
+}
+test("DirectPlayEnumerateA hands each provider a NUL-terminated name, with nothing left over from the previous one", () => {
+    const result = exports["directplayenumeratea"]!({ esp: 0x9000 } as X86Context, mem, [0x7000, 0x8765]) as ThunkResult;
+    expect(result.suspendedForCallback).toBe(true);
+    const names: string[] = [];
+    for (let i = 0; i < 8 && callbacks[i]; i++) {
+        const { args } = callbacks[i]!;
+        expect(args[0]).toBe(args[1]! - 16); // lpguidSP, then lpSPName
+        expect(args.slice(2)).toEqual([6, 0, 0x8765]);
+        names.push(ansi(args[1]!));
+        if (callbacks[i]!.done?.(1) !== null) break;
+        (callbacks[i] as unknown as { enumerationState?: { continueEnumeration(): void } }).enumerationState?.continueEnumeration();
+    }
+    expect(names).toEqual(["Internet TCP/IP Connection For DirectPlay", "IPX Connection For DirectPlay"]);
+});
+test("legacy IDirectPlay EnumPlayers points at the friendly and formal names it packed", async () => {
+    open();
+    mem.set(new TextEncoder().encode("Travis\0"), 0x5000); mem.set(new TextEncoder().encode("Travis Formal\0"), 0x5100);
+    expect(await call("CreatePlayer", [0x4000, 0x5000, 0x5100, 0], "IDirectPlay")).toBe(DP.OK);
+    const result = call("EnumPlayers", [0, 0x7000, 0x8765, 0], "IDirectPlay") as ThunkResult;
+    expect(result.suspendedForCallback).toBe(true);
+    const [id, friendly, formal, , context] = callbacks[0]!.args;
+    expect(id).toBe(read(0x4000)); expect(context).toBe(0x8765);
+    expect(ansi(friendly!)).toBe("Travis"); expect(ansi(formal!)).toBe("Travis Formal");
+    callbacks[0]!.done?.(0);
+});
 test("remote session enumeration keeps player properties available only during callbacks", async () => {
     initialize();
     const client = ((api as any).state(primary).session) as DirectPlaySession;

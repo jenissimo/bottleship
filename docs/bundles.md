@@ -1,6 +1,7 @@
 # Game bundles (`.wgb`)
 
-BottleShip runs a game from a **`.wgb`** bundle — a *store-only* (uncompressed) ZIP that
+BottleShip runs a game from a **`.wgb`** bundle — a *store-only* (uncompressed) ZIP, optionally
+block-compressed (see below), that
 packages a game together with the metadata the engine needs to boot it. This document covers
 the format and the tools for creating and inspecting bundles, plus how to bring your own games.
 
@@ -68,6 +69,56 @@ MATCHING_FILE could identify (NAME `*`) are skipped and reported, as are other s
 VirtualRegistry commands. Per exe, a rule whose target overlaps a source (its own or another
 rule's: a target inside the source, chains, cycles) and a rule on a whole root key (`HKLM`) are
 rejected with a warning, both here and again when the bundle loads.
+
+## Block compression: `wgb-compress`
+
+Block compression is an opt-in step for published bundles; `make-wgb` keeps writing
+store-only bundles, and dev disk bundles have no reason to change.
+
+```bash
+bun tools/wgb-compress.ts game.wgb game.packed.wgb --block-kib 64
+```
+
+- Each member that shrinks by at least 5 % (and 4 KiB) becomes an ordinary ZIP method-8
+  member whose DEFLATE stream is cut with a full flush every 64 KiB of file data
+  (`--block-kib`, a power of two from 4 to 16384). A full flush byte-aligns the stream and
+  clears the history window, so every block decodes on its own. `manifest.json`,
+  `registry.json` and already-compressed payloads (ogg, mp3, flac, bik, bk2, smk, avi, wmv,
+  mpg, xmv, jpg, png, cab, …;
+  `--compress-all` disables the extension list) stay STORED.
+- `wgb-blocks.idx` (STORED) starts with a header: magic `WGBK`, format version, row count
+  and a CRC-32 of the rows; a damaged index is rejected as a whole. Each row names a
+  member by name and local header offset and records its sizes, CRC-32, block shift and
+  the compressed length of every block. A row that no longer matches its member is
+  ignored, and such a member is rejected at mount like any other compressed member.
+- `manifest.json` references the index: `"blockIndex": { "member": "wgb-blocks.idx",
+  "version": 1 }`. An engine that reads another version, or finds the index missing or
+  damaged, refuses the bundle with that reason.
+- The archive stays a standard ZIP that any unzip tool extracts. Decompressed bytes are
+  identical to the input; the tool verifies every member, whole and block by block,
+  before it renames the output into place. Packing uses the pinned pako of
+  `@bottleship/formats`, so the same input gives the same bytes.
+- At run time a range read fetches only the compressed blocks it overlaps, as one range
+  request, and decodes them synchronously through `inflateRawBlock(src, dst)`; decoded
+  blocks are kept in a small LRU (16 MiB by default). Everything below `ZipArchive` (the
+  streaming transport, the sparse OPFS copy, which stays compressed, the strong-ETag check
+  and I/O profiles) keeps working on archive offsets, i.e. on the compressed bytes.
+
+- A synchronous guest read on a packed member is widened only to the end of the block it
+  touches (STORED members keep the 512 KiB window), so a sync read decodes the blocks it
+  needs and no more. A block that fails to decode makes the sync read answer "not
+  available"; the async path then reports the failure to the caller as an I/O error.
+- There is no per-block checksum: like a STORED member, a flipped literal can decode to
+  wrong bytes. Structural damage (a block that does not decode to its length) is caught.
+- Savestates are bound to the manifest and to the bundle's members by name, uncompressed
+  size and CRC-32, not to how they are packed. The manifest's `blockIndex` field and the
+  `manifest.json` and `wgb-blocks.idx` members are left out, so the store-only build of a
+  game and any `wgb-compress`ed build of it (whatever `--block-kib` or `--level`) share
+  their savestates.
+- The packer holds one member and its compressed blocks in RAM at a time; members of
+  2 GiB or more are not supported.
+
+`wgb.ts` edits store-only bundles; edit the store-only source and compress again.
 
 ## Inspecting & patching: `wgb.ts`
 

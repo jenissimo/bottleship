@@ -141,8 +141,10 @@ export interface TabControlState {
     layoutFont: string;
 }
 
+// @refuse(tab controls are not part of a v1 savestate)
 const tabStates = new Map<number, TabControlState>();
 
+// @transient(wiring done once per worker)
 let purgerRegistered = false;
 function ensurePurger(): void {
     if (purgerRegistered) return;
@@ -203,6 +205,7 @@ export function resetTabStatesForTests(): void {
 
 const CONTROL_FONT = '11px "MS Sans Serif", Tahoma, sans-serif';
 
+// @transient(host canvas for text metrics)
 let measureCtx: OffscreenCanvasRenderingContext2D | null = null;
 
 function getMeasureCtx(): OffscreenCanvasRenderingContext2D | null {
@@ -860,3 +863,7 @@ export function formatTabDiagnostic(hwnd: number): string {
 }
 
 export const TAB_ITEM_STRUCT_SIZE = TCITEM_SIZE;
+
+export function tabControlCount(): number {
+    return tabStates.size;
+}

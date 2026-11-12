@@ -137,16 +137,19 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
         const pMode = args[2]; // D3DDISPLAYMODE*
         if (!pMode) return D3DERR_INVALIDCALL;
 
+        // The adapter's CURRENT mode — after a mode-set that mode, not the boot desktop
+        // (see IDirect3D9_GetAdapterDisplayMode).
         const cfg = EmulatorConfig.getInstance().screenResolution;
-        const width = cfg.width || 800;
-        const height = cfg.height || 600;
-        const refreshRate = cfg.refreshRate || 60;
+        const current = System.getInstance().emulatedDisplayMode;
+        const width = current?.width || cfg.width || 800;
+        const height = current?.height || cfg.height || 600;
+        const refreshRate = current?.refreshRate || cfg.refreshRate || 60;
 
         const ok =
             Mem.writeUint32(pMode + 0, width) &&
             Mem.writeUint32(pMode + 4, height) &&
             Mem.writeUint32(pMode + 8, refreshRate) &&
-            Mem.writeUint32(pMode + 12, d3d8FormatForBpp(cfg.bpp));
+            Mem.writeUint32(pMode + 12, d3d8FormatForBpp(current?.bpp || cfg.bpp));
         return ok ? D3D_OK : D3DERR_INVALIDCALL;
     };
 

@@ -354,7 +354,10 @@ function writeQueryVCache(pData: number, count: number): boolean {
  * reached the observed submission serial yet is S_FALSE with no side effect, which is the
  * turn the guest's poll loop repeats until the presentation boundary submits.
  *
- * Every other shape — implicit END, a FLUSH request, device loss, a GPU-backed poll, or an
+ * A split-front FLUSH poll after this generation's one ship is the same S_FALSE: the FLUSH
+ * side effect already ran, so only the first FLUSH of a generation needs the thunk.
+ *
+ * Every other shape — implicit END, a first FLUSH, device loss, a GPU-backed poll, or an
  * observable END — returns null so the caller falls back to the full thunk BEFORE anything
  * is touched. The decision lives here because this module owns the query state machine.
  */
@@ -362,7 +365,7 @@ export function tryFastGetData(queryPtr: number, pData: number, size: number, fl
     const query = queries.get(queryPtr >>> 0);
     if (!query) return null;
     if (query.begun || !query.issued) return null;
-    if ((flags & D3DGETDATA_FLUSH) !== 0) return null;
+    if ((flags & D3DGETDATA_FLUSH) !== 0 && !(query.remote && query.remoteFlushed)) return null;
     if (!pData && size) return null;
     if (query.gpuManager?.isDeviceLost?.()) return null;
     if (deviceCooperativeLevel(query.devicePtr) !== 'ok') return null;

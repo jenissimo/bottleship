@@ -41,7 +41,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
-PROJECT_ROOT = os.path.join(REPO, "tmp", "ghidra_project")
+# Ghidra refuses a project path with an element starting with '.', which every checkout
+# under a `.wt\` worktree has; BS_RE_PROJECT_ROOT moves the cache somewhere dot-free.
+PROJECT_ROOT = os.environ.get("BS_RE_PROJECT_ROOT") or os.path.join(REPO, "tmp", "ghidra_project")
 
 # --- pyGhidra state (lazy, warm) ---
 _pyghidra_started = False

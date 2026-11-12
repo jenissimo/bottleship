@@ -8,10 +8,14 @@ import { WsaStartupCount, makeSocketExports, type WsaProcessState } from "../../
 import { WsaSocketTable, WSA, ipv4Address } from "../../src/worker/modules/wsa-network";
 import type { ThunkImplementation } from "../../src/worker/core/thunking/thunk-dispatcher";
 import type { WsaErrorSetter } from "../../src/worker/modules/wsa-network-api";
+import { clearTimerHandler, getTimerHandler } from "../../src/worker/core/scheduler/timer-wheel";
+import { TimerKind } from "../../src/worker/core/scheduler/types";
+import { createMessageExports } from "../../src/worker/modules/user32/message";
+import { killWindowTimers } from "../../src/worker/modules/user32/shared-state";
 const cleanup:Array<()=>void>=[];
 afterEach(()=>{cleanup.splice(0).reverse().forEach(fn=>fn());});
 const tick=async()=>{await Promise.resolve();await Promise.resolve();await Promise.resolve();};
-function fixture(version=0x101) {
+function fixture(version=0x101,user32:Record<string,ThunkImplementation>|null=createMessageExports()) {
     let memory=new Uint8Array(1024*1024),tid=11,allocation=0x20000,stubId=0;
     const network=new LanNetwork(new Uint8Array([2,0,0,1,2,3])),table=new WsaSocketTable(network),errors=new Map<number,number>();
     const counter=new WsaStartupCount(()=>table.reset());counter.startup(version);
@@ -22,6 +26,7 @@ function fixture(version=0x101) {
     let done!:(value:number)=>number|null,frames=0,stackCleanup=0;
     (owner as any).memory={alloc(size:number){const address=allocation;allocation+=size+16;return address;},free(){}};
     (owner as any).getCurrentMemory=()=>memory;
+    (owner as any).modules=new Map(user32?[["user32",{name:"user32",exports:user32}]]:[]);
     (owner as any).addressSpace={validateRange:(address:number,size:number)=>address>0&&address+size<=memory.length,
         write:(address:number,data:Uint8Array)=>{memory.set(data,address);return data.length;}};
     (owner as any).thunkGenerator={getExportAddress:(name:string)=>addresses.get(name)??0,
@@ -39,7 +44,7 @@ function fixture(version=0x101) {
     const call=(name:string,args:number[]=[])=>api[name]({esp:0x300} as never,memory,args);
     const internal=(name:string)=>registry.get(name)!({} as never,memory,[]);
     const rx=table.socket(2),tx=table.socket(2);table.bind(rx,ipv4Address(network.ipv4,4444));
-    return{table,state,call,internal,rx,tx,memory:()=>memory,done:()=>done(0),frames:()=>frames,cleanup:()=>stackCleanup,
+    return{table,state,call,internal,handler:(name:string)=>registry.get(name),rx,tx,memory:()=>memory,done:()=>done(0),frames:()=>frames,cleanup:()=>stackCleanup,
         thread:(id:number)=>{tid=id;},grow:()=>{const next=new Uint8Array(memory.length*2);next.set(memory);memory=next;},
         send:()=>table.send(tx,Uint8Array.of(1,2,3),ipv4Address(network.ipv4,4444))};
 }
@@ -79,5 +84,31 @@ describe("Winsock 1.1 blocking hook contracts",()=>{
         expect(waiting).toBeInstanceOf(Promise);expect(h.frames()).toBe(0);h.send();expect((await waiting as any).value).toBe(3);
         h.state.counter.startup(0x202);expect(h.state.counter.version).toBe(0x101);h.state.counter.cleanup();expect(h.state.counter.version).toBe(0x101);
         h.state.counter.cleanup();expect(h.state.counter.version).toBe(0x202);
+    });
+    test("the default hook pumps through the session's user32 exports and keeps window timers owned by DestroyWindow",()=>{
+        clearTimerHandler(TimerKind.USER32_TIMER);
+        const user32=createMessageExports(),h=fixture(0x101,user32);
+        const wheel=System.getInstance().scheduler.timerWheel,add=wheel.add,cancel=wheel.cancel,cancelled:number[]=[];
+        let fire:(()=>void)|undefined;
+        wheel.add=(_delay,_periodic,kind,owner,_now,arg=0)=>{fire=()=>getTimerHandler(kind)!(owner,arg,12345);return 12345;};
+        wheel.cancel=(id:number)=>{cancelled.push(id);return true;};
+        cleanup.push(()=>{wheel.add=add;wheel.cancel=cancel;});
+        const mem=new Uint8Array(0x1000),hwnd=0x7abc0084,id=0x84;
+        expect(user32.SetTimer({} as never,mem,[hwnd,id,10,0])).toBe(id);
+        expect(h.call("WSASetBlockingHook",[0x500])).toBeGreaterThan(0);
+        // DestroyWindow's timer teardown must still reach the session's timer map.
+        killWindowTimers(hwnd);
+        expect(cancelled).toEqual([12345]);
+        fire!();
+        expect(System.getInstance().windowManager.peekMessage(true,0x113,0x113)).toBeUndefined();
+        expect(user32.KillTimer({} as never,mem,[hwnd,id])).toBe(0);
+        expect(h.handler("LegacyPeekMessage")).toBe(user32.PeekMessageA);
+        expect(h.handler("LegacyTranslateMessage")).toBe(user32.TranslateMessage);
+        expect(h.handler("LegacyDispatchMessage")).toBe(user32.DispatchMessageA);
+    });
+    test("without registered user32 exports the default hook fails with WSAENOBUFS instead of building a private pump",()=>{
+        const h=fixture(0x101,null);
+        expect(h.call("WSASetBlockingHook",[0x500])).toBe(0);expect(h.state.getError()).toBe(WSA.ENOBUFS);
+        expect(h.handler("LegacyPeekMessage")).toBeUndefined();
     });
 });

@@ -47,11 +47,14 @@ import { ensureAudioStatsSab } from "../audio-stats-sab";
 // Side table for ring buffers — keyed by sample/stream id.
 // `writeBytes` is the PRODUCER's cursor and exists only for streaming rings
 // (FLAG_STREAMING): the worklet owns CTRL_PLAY_CURSOR, we own CTRL_WRITE_CURSOR.
+// @participant(mss32)
 const ringBuffers = new Map<number, {
     sab: SharedArrayBuffer;
     registered: boolean;
     streaming?: boolean;
     writeBytes?: number;
+    /** Decoded image last copied into the data region; a replay of it skips the copy. */
+    copied?: Float32Array;
 }>();
 const RING_CURSOR_STALE_MS = 250;
 
@@ -192,8 +195,7 @@ export function streamingRingPlayCursor(stream: MSSStream): number {
     return getCtrl(entry.sab, CTRL_PLAY_CURSOR);
 }
 
-/** Hand a streaming ring to the mixer. Volume/pan/rate come from the stream. */
-export function startStreamingRing(ctx: MSSContext, stream: MSSStream): void {
+export function armStreamingRing(ctx: MSSContext, stream: MSSStream, playing: boolean): void {
     const entry = ringBuffers.get(stream.id);
     if (!entry?.streaming) return;
     const sab = entry.sab;
@@ -203,7 +205,14 @@ export function startStreamingRing(ctx: MSSContext, stream: MSSStream): void {
     // FLAG_STREAMING wraps the ring; source loops are handled by the producer.
     // The consumer must hold at WRITE_CURSOR instead of replaying unwritten data.
     setCtrl(sab, CTRL_LOOP_MODE, 1);
-    setCtrl(sab, CTRL_STATE, STATE_PLAYING);
+    setCtrl(sab, CTRL_STATE, playing ? STATE_PLAYING : STATE_STOPPED);
+}
+
+/** Hand a streaming ring to the mixer. Volume/pan/rate come from the stream. */
+export function startStreamingRing(ctx: MSSContext, stream: MSSStream): void {
+    const entry = ringBuffers.get(stream.id);
+    if (!entry?.streaming) return;
+    armStreamingRing(ctx, stream, true);
 
     stream.isPlaying = true;
     stream.isPaused = false;
@@ -449,8 +458,12 @@ export function playSample(ctx: MSSContext, sample: MSSSample): void {
     const sab = ensureRingBuffer(sample.id, sample.channels, sample.sampleRate, 32 /* Float32 */, dataBytes);
 
     // Copy decoded Float32 data into SAB data region
-    const dst = new Uint8Array(sab, CTRL_BLOCK_BYTES, dataBytes);
-    dst.set(new Uint8Array(sample.decodedData.buffer, sample.decodedData.byteOffset, dataBytes));
+    const ring = ringBuffers.get(sample.id);
+    if (ring?.copied !== sample.decodedData) {
+        const dst = new Uint8Array(sab, CTRL_BLOCK_BYTES, dataBytes);
+        dst.set(new Uint8Array(sample.decodedData.buffer, sample.decodedData.byteOffset, dataBytes));
+        if (ring) ring.copied = sample.decodedData;
+    }
 
     // Set control fields
     setCtrl(sab, CTRL_DATA_LENGTH, dataBytes);
@@ -569,6 +582,46 @@ export function seekRingBuffer(sample: MSSSample | MSSStream, positionBytes: num
     const sabAlign = Math.max(1, getCtrl(entry.sab, CTRL_BLOCK_ALIGN));
     setCtrl(entry.sab, CTRL_PLAY_CURSOR, frame * sabAlign);
     setCtrl(entry.sab, CTRL_RESERVED, 1); // CTRL_RESET_POSITION
+    return true;
+}
+
+export function pcmRingDataBytes(id: number): number | null {
+    const entry = ringBuffers.get(id);
+    return entry && !entry.streaming ? getCtrl(entry.sab, CTRL_DATA_LENGTH) : null;
+}
+
+export function pcmRingPlayFrame(id: number): number | null {
+    const entry = ringBuffers.get(id);
+    if (!entry || entry.streaming) return null;
+    return Math.floor(getCtrl(entry.sab, CTRL_PLAY_CURSOR) / Math.max(1, getCtrl(entry.sab, CTRL_BLOCK_ALIGN)));
+}
+
+export function pcmRingEnded(id: number): boolean {
+    const entry = ringBuffers.get(id);
+    return !!entry && !entry.streaming && getCtrl(entry.sab, CTRL_STATE) === STATE_STOPPED;
+}
+
+export function restorePcmRing(ctx: MSSContext, voice: MSSSample | MSSStream, frame: number, playing: boolean): boolean {
+    const data = voice.decodedData;
+    if (!data || data.length === 0) return false;
+    const dataBytes = data.byteLength;
+    const sab = ensureRingBuffer(voice.id, voice.channels, voice.sampleRate, 32, dataBytes);
+    new Uint8Array(sab, CTRL_BLOCK_BYTES, dataBytes).set(new Uint8Array(data.buffer, data.byteOffset, dataBytes));
+    const ring = ringBuffers.get(voice.id);
+    if (ring) ring.copied = data;
+    setCtrl(sab, CTRL_DATA_LENGTH, dataBytes);
+    setCtrl(sab, CTRL_VOLUME, volumeToCentibels(mixedVolume127(ctx, voice.volume)));
+    setCtrl(sab, CTRL_PAN, panToCentibels(voice.pan));
+    setCtrl(sab, CTRL_FREQUENCY, voice.playbackRateHz || Math.round(voice.sampleRate * voice.playbackRate));
+    setCtrl(sab, CTRL_LOOP_MODE, loopCountToMode(voice.loopCount));
+    if ("isStopped" in voice) {
+        writeLoopBlock(sab, voice);
+        if (voice.is3D) applySample3D(voice);
+    }
+    const frames = Math.floor(dataBytes / Math.max(1, getCtrl(sab, CTRL_BLOCK_ALIGN)));
+    setCtrl(sab, CTRL_PLAY_CURSOR, (playing && frame < frames ? Math.max(0, frame) : 0) * Math.max(1, getCtrl(sab, CTRL_BLOCK_ALIGN)));
+    setCtrl(sab, CTRL_RESERVED, 1);
+    setCtrl(sab, CTRL_STATE, playing ? STATE_PLAYING : STATE_STOPPED);
     return true;
 }
 

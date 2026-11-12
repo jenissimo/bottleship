@@ -4,11 +4,11 @@ import { ThunkImplementation, ThunkResult, type X86Context } from "../core/thunk
 import { System } from "../core/system";
 import { Logger, LogCategory } from "../core/logger";
 import { InterfaceRegistry, registerStandardDirectXInterfaces } from "../core/com/interface-registry";
-import { ComObjectFactory, BaseComObject } from "../core/com/base-com-object";
-import { lookupHleComClass, releaseHleComServerLoads, leaveComApartment } from "../core/com/hle-com-registry";
+import { ComObjectFactory } from "../core/com/base-com-object";
+import { lookupHleComClass, releaseHleComServerLoads, leaveComApartment, captureHleComServerLoads, restoreHleComServerLoads } from "../core/com/hle-com-registry";
 import { SystemResourceProvider } from "../core/resources/system-resource-provider";
 import { allocateComObject } from "../core/com/com-memory";
-import { installComVtable, ComVtableMethod } from "../core/com/install-com-vtable";
+import { installComVtable, ComVtableMethod, type InstalledComVtable } from "../core/com/install-com-vtable";
 import { tryInprocCoCreateInstance, startInprocFromFactory } from "../core/com/inproc-com";
 import { Mem } from "../core/memory/mem-accessor";
 import { isValidAddress } from "../core/memory/address-guard";
@@ -17,7 +17,10 @@ import { writeGuestCode } from "../core/memory/guest-code";
 import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE } from "../core/cpu/emulator-config";
 import { windows, registerWindowDestroyObserver } from "./user32/shared-state";
 import { DragDropRegistry } from "./ole32-dragdrop";
-import { comApartments, ComApartments } from "../core/com/apartment";
+import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
+import { CaptureRefusal } from "../savestate/object-codecs";
+import type { SaveValue } from "../savestate/value-codec";
+import { comApartments, ComApartments, type ApartmentRow } from "../core/com/apartment";
 
 // COM error codes
 const REGDB_E_CLASSNOTREG = 0x80040154;
@@ -35,6 +38,42 @@ const IID_IMALLOC = "00000002-0000-0000-c000-000000000046";
 
 // BLOWFISH.DLL IBlockCipher::Submit_Key — stdcall, max 56-byte key (Ghidra @ 0x11002011)
 const BF_MAX_KEY_LEN = 0x38;
+
+export const OLE32_FIELDS = {
+    name: 'transient', exports: 'host', process: 'host', iunknownStubs: 'derive', guidState: 'save', guidCounter: 'save',
+    blowfishInstances: 'save', blowfishVtableAddr: 'save', mallocObjAddr: 'save', taskMemSizes: 'save', classRegistrations: 'save',
+    nextClassRegistration: 'save', messageFilter: 'save', dragDropRegistrations: 'save',
+} as const satisfies Record<string, FieldPolicy>;
+
+export interface Ole32State {
+    guidState: number;
+    guidCounter: number;
+    nextClassRegistration: number;
+    messageFilter: number;
+    classRegistrations: Array<[number, string, number, number]>;
+    taskMemSizes: Uint32Array;
+    mallocObjAddr: number;
+    blowfishVtableAddr: number;
+    blowfishInstances: Array<[number, number, Uint32Array]>;
+    dragDropRegistrations: Array<[number, number]>;
+    apartments: ApartmentRow[];
+    comServerLoads: string[];
+}
+
+export const OLE32_SCHEMA = {
+    module: OLE32_FIELDS,
+    classRegistrationRow: ['cookie', 'clsid', 'punk', 'flags'],
+    taskMemRow: ['address', 'bytes'],
+    blowfishRow: ['object', 'refCount', 'boxes'],
+    dragDropRow: ['hwnd', 'dropTarget'],
+    apartmentRow: ['threadId', 'model', 'inits', 'oleInits'],
+    comServerLoadRow: ['module'],
+    state: stateKeys<Ole32State>({
+        guidState: true, guidCounter: true, nextClassRegistration: true, messageFilter: true, classRegistrations: true,
+        taskMemSizes: true, mallocObjAddr: true, blowfishVtableAddr: true, blowfishInstances: true, dragDropRegistrations: true,
+        apartments: true, comServerLoads: true,
+    }),
+};
 
 export class Ole32 implements IModule {
     name = "ole32";
@@ -60,11 +99,70 @@ export class Ole32 implements IModule {
         release: (dropTarget) => this.releaseGuestUnknown(dropTarget),
     });
 
-    // Map: object address in memory -> BaseComObject instance
-    // This allows IUnknown methods to find the object by its memory address
-    private objectAddressMap: Map<number, BaseComObject> = new Map();
+    captureSavestate(): Ole32State {
+        const sizes = new Uint32Array(this.taskMemSizes.size * 2);
+        let i = 0;
+        for (const [address, bytes] of this.taskMemSizes) { sizes[i++] = address; sizes[i++] = bytes; }
+        return {
+            guidState: this.guidState,
+            guidCounter: this.guidCounter,
+            nextClassRegistration: this.nextClassRegistration,
+            messageFilter: this.messageFilter,
+            classRegistrations: [...this.classRegistrations].map(([cookie, r]) => [cookie, r.clsid, r.punk, r.flags]),
+            taskMemSizes: sizes,
+            mallocObjAddr: this.mallocObjAddr,
+            blowfishVtableAddr: this.blowfishVtableAddr,
+            blowfishInstances: [...this.blowfishInstances].map(([object, b]) => [object, b.refCount, b.cipher.captureBoxes()]),
+            dragDropRegistrations: this.dragDropRegistrations.captureState(),
+            apartments: comApartments.captureState(),
+            comServerLoads: captureHleComServerLoads(this.process),
+        };
+    }
+
+    restoreSavestate(s: Ole32State): void {
+        this.mallocObjAddr = 0;
+        if (s.mallocObjAddr) {
+            const vtableAddr = Mem.readUint32(s.mallocObjAddr) ?? 0;
+            if (!vtableAddr || !this.installTaskMalloc(vtableAddr)) throw new Error('ole32: the IMalloc handlers could not be installed');
+            this.mallocObjAddr = s.mallocObjAddr;
+        }
+        this.blowfishVtableAddr = 0;
+        if (s.blowfishVtableAddr) {
+            if (!this.installBlowfishVtable(s.blowfishVtableAddr)) throw new Error('ole32: the Blowfish handlers could not be installed');
+        }
+        this.guidState = s.guidState;
+        this.guidCounter = s.guidCounter;
+        this.nextClassRegistration = s.nextClassRegistration;
+        this.messageFilter = s.messageFilter;
+        this.classRegistrations = new Map(s.classRegistrations.map(([cookie, clsid, punk, flags]) => [cookie, { clsid, punk, flags }]));
+        this.taskMemSizes.clear();
+        for (let i = 0; i + 1 < s.taskMemSizes.length; i += 2) this.taskMemSizes.set(s.taskMemSizes[i]!, s.taskMemSizes[i + 1]!);
+        this.blowfishInstances = new Map(s.blowfishInstances.map(([object, refCount, boxes]) => {
+            const cipher = new BlowfishCipher();
+            cipher.restoreBoxes(boxes);
+            return [object, { refCount, cipher }];
+        }));
+        this.dragDropRegistrations.restoreState(s.dragDropRegistrations);
+        comApartments.restoreState(s.apartments);
+        restoreHleComServerLoads(this.process, s.comServerLoads);
+    }
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'ole32', version: 2, order: 66, covers: ['ole32'], schema: OLE32_SCHEMA as unknown as SaveValue,
+            capture: () => {
+                try {
+                    return this.captureSavestate() as unknown as SaveValue;
+                } catch (e) {
+                    throw e instanceof CaptureRefusal ? e : new CaptureRefusal(e instanceof Error ? e.message : String(e));
+                }
+            },
+            restore: (saved) => this.restoreSavestate(saved as unknown as Ole32State),
+        });
+    }
 
     initialize(process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         this.process = process;
         const system = System.getInstance();
         const interfaceRegistry = InterfaceRegistry.getInstance();
@@ -692,7 +790,13 @@ export class Ole32 implements IModule {
      */
     private ensureTaskMalloc(mem: Uint8Array): number {
         if (this.mallocObjAddr) return this.mallocObjAddr;
+        const installed = this.installTaskMalloc();
+        if (!installed) return 0;
+        this.mallocObjAddr = allocateComObject(this.process.memory, mem, installed.vtableAddr);
+        return this.mallocObjAddr;
+    }
 
+    private installTaskMalloc(existingVtableAddr?: number): InstalledComVtable | null {
         const handlers: Record<string, ThunkImplementation> = {
             Malloc_QueryInterface: (ctx, mem, args) => {
                 const riid = args[1] >>> 0;
@@ -760,16 +864,13 @@ export class Ole32 implements IModule {
             { name: "Malloc_HeapMinimize", argCount: 1, stackCleanupBytes: 4 },
         ];
 
-        const installed = installComVtable(this.process, {
+        return installComVtable(this.process, {
             moduleName: "ole32_imalloc",
             methods,
             handlers,
             logLabel: "IMalloc",
+            existingVtableAddr,
         });
-        if (!installed) return 0;
-
-        this.mallocObjAddr = allocateComObject(this.process.memory, mem, installed.vtableAddr);
-        return this.mallocObjAddr;
     }
 
     /**
@@ -1246,6 +1347,126 @@ export class Ole32 implements IModule {
         return bytes;
     }
 
+    private installBlowfishVtable(existingVtableAddr?: number): boolean {
+        // Register Blowfish thunk implementations
+        this.exports["BF_QueryInterface"] = (ctx, m, args) => {
+            const thisPtr = args[0];
+            const ppvOut = args[2] >>> 0;
+            // Return self for any QI — game only asks for IUnknown or IBlockCipher
+            if (ppvOut) {
+                const v = new DataView(m.buffer, m.byteOffset, m.byteLength);
+                v.setUint32(ppvOut, thisPtr, true);
+            }
+            // AddRef
+            const bf = this.blowfishInstances.get(thisPtr);
+            if (bf) bf.refCount++;
+            return S_OK;
+        };
+        this.exports["BF_AddRef"] = (ctx, m, args) => {
+            const bf = this.blowfishInstances.get(args[0]);
+            if (bf) return ++bf.refCount;
+            return 1;
+        };
+        this.exports["BF_Release"] = (ctx, m, args) => {
+            const bf = this.blowfishInstances.get(args[0]);
+            if (!bf) return 0;
+            if (--bf.refCount <= 0) {
+                this.blowfishInstances.delete(args[0]);
+                return 0;
+            }
+            return bf.refCount;
+        };
+        // HRESULT Submit_Key(LONG length, LPVOID key) — stdcall; real BLOWFISH.DLL @ 0x11002011
+        this.exports["BF_Submit_Key"] = (ctx, m, args) => {
+            const thisPtr = args[0];
+            const keyLen = args[1] | 0;
+            const keyPtr = args[2] >>> 0;
+            const bf = this.blowfishInstances.get(thisPtr);
+            if (!bf) return 0x80004005; // E_FAIL
+            if (!keyPtr) return E_POINTER;
+            if (keyLen < 0 || keyLen > BF_MAX_KEY_LEN) return E_INVALIDARG;
+            const keyData = Mem.readBytes(keyPtr, keyLen);
+            if (!keyData) return E_INVALIDARG;
+            bf.cipher.submitKey(keyData);
+            Logger.log(LogCategory.COM, `Blowfish: Submit_Key len=${keyLen} ptr=0x${keyPtr.toString(16)}`);
+            return S_OK;
+        };
+        // IBlockCipher vtable slots 4–5 (BLOWFISH.DLL @ 0x1100204d / 0x1100206c) — RET 8
+        this.exports["BF_Get_Max_Key_Length"] = (ctx, m, args) => {
+            const outPtr = args[1] >>> 0;
+            if (!outPtr) return E_POINTER;
+            Mem.writeUint32(outPtr, BF_MAX_KEY_LEN);
+            return S_OK;
+        };
+        this.exports["BF_Get_Block_Size"] = (ctx, m, args) => {
+            const outPtr = args[1] >>> 0;
+            if (!outPtr) return E_POINTER;
+            Mem.writeUint32(outPtr, 8);
+            return S_OK;
+        };
+        // HRESULT Encrypt(...) — stdcall RET 16; src @ arg2, dst @ arg3 (BLOWFISH.DLL @ 0x1100208b)
+        this.exports["BF_Encrypt"] = (ctx, m, args) => {
+            const thisPtr = args[0];
+            const dataLen = args[1] | 0;
+            const srcPtr = args[2] >>> 0;
+            const dstPtr = (args[3] >>> 0) || srcPtr;
+            const bf = this.blowfishInstances.get(thisPtr);
+            if (!bf) return 0x80004005;
+            if (!srcPtr || !dstPtr) return E_POINTER;
+            if (dataLen < 0) return E_INVALIDARG;
+            const v = new DataView(m.buffer, m.byteOffset, m.byteLength);
+            bf.cipher.transformBuffer(v, srcPtr, dstPtr, dataLen, true);
+            return S_OK;
+        };
+        // HRESULT Decrypt(...) — stdcall RET 16; src @ arg2, dst @ arg3 (BLOWFISH.DLL @ 0x110020cb)
+        this.exports["BF_Decrypt"] = (ctx, m, args) => {
+            const thisPtr = args[0];
+            const dataLen = args[1] | 0;
+            const srcPtr = args[2] >>> 0;
+            const dstPtr = (args[3] >>> 0) || srcPtr;
+            const bf = this.blowfishInstances.get(thisPtr);
+            if (!bf) return 0x80004005;
+            if (!srcPtr || !dstPtr) return E_POINTER;
+            if (dataLen < 0) return E_INVALIDARG;
+            const v = new DataView(m.buffer, m.byteOffset, m.byteLength);
+            bf.cipher.transformBuffer(v, srcPtr, dstPtr, dataLen, false);
+            return S_OK;
+        };
+
+        const bfHandlers = {
+            BF_QueryInterface: this.exports["BF_QueryInterface"],
+            BF_AddRef: this.exports["BF_AddRef"],
+            BF_Release: this.exports["BF_Release"],
+            BF_Submit_Key: this.exports["BF_Submit_Key"],
+            BF_Get_Max_Key_Length: this.exports["BF_Get_Max_Key_Length"],
+            BF_Get_Block_Size: this.exports["BF_Get_Block_Size"],
+            BF_Encrypt: this.exports["BF_Encrypt"],
+            BF_Decrypt: this.exports["BF_Decrypt"],
+        };
+
+        const bfMethods: ComVtableMethod[] = [
+            { name: "BF_QueryInterface", argCount: 3, stackCleanupBytes: 12 },
+            { name: "BF_AddRef", argCount: 1, stackCleanupBytes: 4 },
+            { name: "BF_Release", argCount: 1, stackCleanupBytes: 4 },
+            { name: "BF_Submit_Key", argCount: 3, stackCleanupBytes: 12 },
+            { name: "BF_Get_Max_Key_Length", argCount: 2, stackCleanupBytes: 8 },
+            { name: "BF_Get_Block_Size", argCount: 2, stackCleanupBytes: 8 },
+            { name: "BF_Encrypt", argCount: 4, stackCleanupBytes: 16 },
+            { name: "BF_Decrypt", argCount: 4, stackCleanupBytes: 16 },
+        ];
+
+        const installed = installComVtable(this.process, {
+            moduleName: "ole32_blowfish",
+            methods: bfMethods,
+            handlers: bfHandlers,
+            logLabel: "Blowfish",
+            existingVtableAddr,
+        });
+        if (!installed) return false;
+        this.blowfishVtableAddr = installed.vtableAddr;
+        return true;
+    }
+
     /**
      * Create a Blowfish COM object (IBlockCipher vtable: QI, AddRef, Release, Submit_Key, Encrypt, Decrypt)
      */
@@ -1253,124 +1474,7 @@ export class Ole32 implements IModule {
         const process = this.process;
         const system = System.getInstance();
 
-        // Create vtable stubs once
-        if (!this.blowfishVtableAddr) {
-            // Register Blowfish thunk implementations
-            this.exports["BF_QueryInterface"] = (ctx, m, args) => {
-                const thisPtr = args[0];
-                const ppvOut = args[2] >>> 0;
-                // Return self for any QI — game only asks for IUnknown or IBlockCipher
-                if (ppvOut) {
-                    const v = new DataView(m.buffer, m.byteOffset, m.byteLength);
-                    v.setUint32(ppvOut, thisPtr, true);
-                }
-                // AddRef
-                const bf = this.blowfishInstances.get(thisPtr);
-                if (bf) bf.refCount++;
-                return S_OK;
-            };
-            this.exports["BF_AddRef"] = (ctx, m, args) => {
-                const bf = this.blowfishInstances.get(args[0]);
-                if (bf) return ++bf.refCount;
-                return 1;
-            };
-            this.exports["BF_Release"] = (ctx, m, args) => {
-                const bf = this.blowfishInstances.get(args[0]);
-                if (!bf) return 0;
-                if (--bf.refCount <= 0) {
-                    this.blowfishInstances.delete(args[0]);
-                    return 0;
-                }
-                return bf.refCount;
-            };
-            // HRESULT Submit_Key(LONG length, LPVOID key) — stdcall; real BLOWFISH.DLL @ 0x11002011
-            this.exports["BF_Submit_Key"] = (ctx, m, args) => {
-                const thisPtr = args[0];
-                const keyLen = args[1] | 0;
-                const keyPtr = args[2] >>> 0;
-                const bf = this.blowfishInstances.get(thisPtr);
-                if (!bf) return 0x80004005; // E_FAIL
-                if (!keyPtr) return E_POINTER;
-                if (keyLen < 0 || keyLen > BF_MAX_KEY_LEN) return E_INVALIDARG;
-                const keyData = Mem.readBytes(keyPtr, keyLen);
-                if (!keyData) return E_INVALIDARG;
-                bf.cipher.submitKey(keyData);
-                Logger.log(LogCategory.COM, `Blowfish: Submit_Key len=${keyLen} ptr=0x${keyPtr.toString(16)}`);
-                return S_OK;
-            };
-            // IBlockCipher vtable slots 4–5 (BLOWFISH.DLL @ 0x1100204d / 0x1100206c) — RET 8
-            this.exports["BF_Get_Max_Key_Length"] = (ctx, m, args) => {
-                const outPtr = args[1] >>> 0;
-                if (!outPtr) return E_POINTER;
-                Mem.writeUint32(outPtr, BF_MAX_KEY_LEN);
-                return S_OK;
-            };
-            this.exports["BF_Get_Block_Size"] = (ctx, m, args) => {
-                const outPtr = args[1] >>> 0;
-                if (!outPtr) return E_POINTER;
-                Mem.writeUint32(outPtr, 8);
-                return S_OK;
-            };
-            // HRESULT Encrypt(...) — stdcall RET 16; src @ arg2, dst @ arg3 (BLOWFISH.DLL @ 0x1100208b)
-            this.exports["BF_Encrypt"] = (ctx, m, args) => {
-                const thisPtr = args[0];
-                const dataLen = args[1] | 0;
-                const srcPtr = args[2] >>> 0;
-                const dstPtr = (args[3] >>> 0) || srcPtr;
-                const bf = this.blowfishInstances.get(thisPtr);
-                if (!bf) return 0x80004005;
-                if (!srcPtr || !dstPtr) return E_POINTER;
-                if (dataLen < 0) return E_INVALIDARG;
-                const v = new DataView(m.buffer, m.byteOffset, m.byteLength);
-                bf.cipher.transformBuffer(v, srcPtr, dstPtr, dataLen, true);
-                return S_OK;
-            };
-            // HRESULT Decrypt(...) — stdcall RET 16; src @ arg2, dst @ arg3 (BLOWFISH.DLL @ 0x110020cb)
-            this.exports["BF_Decrypt"] = (ctx, m, args) => {
-                const thisPtr = args[0];
-                const dataLen = args[1] | 0;
-                const srcPtr = args[2] >>> 0;
-                const dstPtr = (args[3] >>> 0) || srcPtr;
-                const bf = this.blowfishInstances.get(thisPtr);
-                if (!bf) return 0x80004005;
-                if (!srcPtr || !dstPtr) return E_POINTER;
-                if (dataLen < 0) return E_INVALIDARG;
-                const v = new DataView(m.buffer, m.byteOffset, m.byteLength);
-                bf.cipher.transformBuffer(v, srcPtr, dstPtr, dataLen, false);
-                return S_OK;
-            };
-
-            const bfHandlers = {
-                BF_QueryInterface: this.exports["BF_QueryInterface"],
-                BF_AddRef: this.exports["BF_AddRef"],
-                BF_Release: this.exports["BF_Release"],
-                BF_Submit_Key: this.exports["BF_Submit_Key"],
-                BF_Get_Max_Key_Length: this.exports["BF_Get_Max_Key_Length"],
-                BF_Get_Block_Size: this.exports["BF_Get_Block_Size"],
-                BF_Encrypt: this.exports["BF_Encrypt"],
-                BF_Decrypt: this.exports["BF_Decrypt"],
-            };
-
-            const bfMethods: ComVtableMethod[] = [
-                { name: "BF_QueryInterface", argCount: 3, stackCleanupBytes: 12 },
-                { name: "BF_AddRef", argCount: 1, stackCleanupBytes: 4 },
-                { name: "BF_Release", argCount: 1, stackCleanupBytes: 4 },
-                { name: "BF_Submit_Key", argCount: 3, stackCleanupBytes: 12 },
-                { name: "BF_Get_Max_Key_Length", argCount: 2, stackCleanupBytes: 8 },
-                { name: "BF_Get_Block_Size", argCount: 2, stackCleanupBytes: 8 },
-                { name: "BF_Encrypt", argCount: 4, stackCleanupBytes: 16 },
-                { name: "BF_Decrypt", argCount: 4, stackCleanupBytes: 16 },
-            ];
-
-            const installed = installComVtable(process, {
-                moduleName: "ole32_blowfish",
-                methods: bfMethods,
-                handlers: bfHandlers,
-                logLabel: "Blowfish",
-            });
-            if (!installed) return 0;
-            this.blowfishVtableAddr = installed.vtableAddr;
-        }
+        if (!this.blowfishVtableAddr && !this.installBlowfishVtable()) return 0;
 
         // Allocate COM object: [vtablePtr]
         const objAddr = allocateComObject(process.memory, mem, this.blowfishVtableAddr);
@@ -1397,7 +1501,6 @@ export class Ole32 implements IModule {
         releaseHleComServerLoads(this.process, true);
         comApartments.reset();
         this.dragDropRegistrations.reset();
-        this.objectAddressMap.clear();
         this.classRegistrations.clear();
         this.nextClassRegistration = 0x1000;
         this.blowfishInstances.clear();
@@ -1440,6 +1543,25 @@ class BlowfishCipher {
         this.S1.set(BF_S_INIT.subarray(256, 512));
         this.S2.set(BF_S_INIT.subarray(512, 768));
         this.S3.set(BF_S_INIT.subarray(768, 1024));
+    }
+
+    captureBoxes(): Uint32Array {
+        const out = new Uint32Array(18 + 1024);
+        out.set(this.P, 0);
+        out.set(this.S0, 18);
+        out.set(this.S1, 18 + 256);
+        out.set(this.S2, 18 + 512);
+        out.set(this.S3, 18 + 768);
+        return out;
+    }
+
+    restoreBoxes(boxes: Uint32Array): void {
+        if (boxes.length !== 18 + 1024) throw new Error(`ole32: a Blowfish state of ${boxes.length} words`);
+        this.P.set(boxes.subarray(0, 18));
+        this.S0.set(boxes.subarray(18, 18 + 256));
+        this.S1.set(boxes.subarray(18 + 256, 18 + 512));
+        this.S2.set(boxes.subarray(18 + 512, 18 + 768));
+        this.S3.set(boxes.subarray(18 + 768, 18 + 1024));
     }
 
     submitKey(key: Uint8Array): void {
@@ -1526,6 +1648,7 @@ class BlowfishCipher {
 }
 
 // Blowfish initial P-array (digits of pi)
+// @transient(constant Blowfish initial boxes)
 const BF_P_INIT = new Uint32Array([
     0x243F6A88, 0x85A308D3, 0x13198A2E, 0x03707344,
     0xA4093822, 0x299F31D0, 0x082EFA98, 0xEC4E6C89,
@@ -1535,6 +1658,7 @@ const BF_P_INIT = new Uint32Array([
 ]);
 
 // Blowfish initial S-boxes (1024 entries = 4 * 256)
+// @transient(constant Blowfish initial boxes)
 const BF_S_INIT = new Uint32Array([
     // S-box 0
     0xD1310BA6,0x98DFB5AC,0x2FFD72DB,0xD01ADFB7,0xB8E1AFED,0x6A267E96,0xBA7C9045,0xF12C7F99,

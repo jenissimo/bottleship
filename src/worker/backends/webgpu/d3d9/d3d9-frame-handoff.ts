@@ -72,19 +72,29 @@ export class D3D9FrameVehicle {
             this.context = canvas.getContext("webgpu") as GPUCanvasContext | null;
             if (!this.context) return false;
         }
+        const context = this.context;
+        const configure = () => context.configure({
+            device,
+            format,
+            alphaMode: "opaque",
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+        });
         if (resized || this.device !== device || this.format !== format) {
-            this.context.configure({
-                device,
-                format,
-                alphaMode: "opaque",
-                usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
-            });
+            configure();
             this.device = device;
             this.format = format;
         }
+        let target: GPUTexture;
+        try {
+            target = context.getCurrentTexture();
+        } catch (error) {
+            if (!(error instanceof DOMException) || error.name !== "InvalidStateError") throw error;
+            configure();
+            target = context.getCurrentTexture();
+        }
         encoder.copyTextureToTexture(
             { texture: source },
-            { texture: this.context.getCurrentTexture() },
+            { texture: target },
             { width, height, depthOrArrayLayers: 1 },
         );
         this.encoded = true;

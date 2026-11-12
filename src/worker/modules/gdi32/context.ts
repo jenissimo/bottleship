@@ -5,8 +5,9 @@ import { SystemResourceProvider } from "../../core/resources/system-resource-pro
 import { System } from "../../core/system";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { gammaService } from "../../core/gamma-service";
-import { resolveBitmapRgba, bitmapPixelsPopulated, writeBackDibSectionRect } from './bitmap-resolve';
+import { resolveBitmapRgba, bitmapPixelsPopulated, writeBackDibSectionRect, writeDibSectionPixel } from './bitmap-resolve';
 import { asArrayBufferView } from '../../../dom-buffer';
+import { pickDefined, type FieldPolicy } from '../../savestate/participant';
 // Sibling GDI modules take this GDIContext as their `gdi` host and operate on
 // the shared (non-private) state fields.
 import {
@@ -50,7 +51,7 @@ import {
 // A paint DC's clip IS the window's update region (Win32: BeginPaint hands back a DC
 // clipped to it, and rcPaint is that region's bounding box). The region is USER state,
 // so it is read from there rather than duplicated here.
-import { getWindowUpdateRects } from '../user32/paint-region';
+import { getWindowUpdateQuads } from '../user32/paint-region';
 
 export interface GDIObject {
     handle: number;
@@ -133,66 +134,181 @@ interface SavedDcState {
     posY: number;
 }
 
+export interface DcState {
+    brushColor: string;
+    textColor: string;
+    textColorValue: number;
+    bkMode: number;
+    bkColor: string;
+    font: string;
+    fontSize: number; // Cached font size to avoid regex parsing
+    fontQuality: number; // LOGFONT lfQuality of the selected font
+    textEscapement: number; // Rotation angle in tenths of degrees (Windows format)
+    textAlign: number; // TA_* flags (SetTextAlign); 0 = TA_LEFT|TA_TOP|TA_NOUPDATECP
+    appliedFont: string; // The font currently set on the canvas context
+    appliedFillStyle: string; // The fillStyle currently set on the canvas context
+    hBrush: number; // Current selected brush handle
+    hPen: number; // Current selected pen handle
+    hFont: number; // Current selected font handle
+    hBitmap: number; // Current selected bitmap handle (for Memory DC)
+    cachedImageData?: ImageData; // Cache for GetPixel
+    cachedPixels32?: Uint32Array; // Uint32 view of cachedImageData for fast single-read access
+    imageDataDirty: boolean; // Flag to invalidate cache
+    dirty: boolean; // true if canvas has changes that need syncing to surface memory
+    dirtyRect: { x1: number, y1: number, x2: number, y2: number } | null; // Bounding box of changed area for partial GPU uploads
+    /** When set, this memory DC backs an HWND client area; flush to overlay on EndPaint/ReleaseDC. */
+    windowBlit?: { absX: number; absY: number; width: number; height: number };
+    /** HWND this DC was obtained for (GetDC/GetWindowDC/GetDCEx/BeginPaint). Absent on a
+     *  memory/compatible DC, which is exactly the NULL that WindowFromDC must report. */
+    hwnd?: number;
+    /** True until guest draws on this DC (CreateCompatibleDC + untouched blit source). */
+    pristine?: boolean;
+    /** True when this surface DC's canvas was seeded from the surface's CPU pixels at GetDC
+     *  (faithful DDraw GetDC: the DC draws over the surface's own bits). ReleaseDC then writes
+     *  the full canvas back to CPU and keeps the surface CPU-authoritative (no GPU readback). */
+    surfaceSeeded?: boolean;
+    /** Skip next EndPaint flush — WM_PAINT had no real guest pixels (pristine BitBlt). */
+    skipOverlayFlush?: boolean;
+    /** BeginPaint DC: EndPaint owns its publish, so it is never auto-published mid-paint. */
+    paintDc?: boolean;
+    /** Clip region; absent means unbounded (see dc-clip.ts). */
+    clip?: DcClipState;
+    /** SaveDC levels, innermost last (see saveDcState). */
+    saved?: SavedDcState[];
+}
+
+export const GDI_OBJECT_FIELDS = {
+    handle: 'save', type: 'save', data: 'save', escapement: 'save', fontSize: 'save', penStyle: 'save', penWidth: 'save',
+    penColor: 'save', lfHeight: 'save', lfWidth: 'save', lfWeight: 'save', lfItalic: 'save', lfQuality: 'save',
+    lfCharSet: 'save', faceName: 'save',
+} as const satisfies Record<keyof GDIObject, FieldPolicy>;
+
+export const DC_STATE_FIELDS = {
+    brushColor: 'save', textColor: 'save', textColorValue: 'save', bkMode: 'save', bkColor: 'save', font: 'save',
+    fontSize: 'save', fontQuality: 'save', textEscapement: 'save', textAlign: 'save', appliedFont: 'derive',
+    appliedFillStyle: 'derive', hBrush: 'save', hPen: 'save', hFont: 'save', hBitmap: 'save', cachedImageData: 'derive',
+    cachedPixels32: 'derive', imageDataDirty: 'derive', dirty: 'save', dirtyRect: 'save', windowBlit: 'save', hwnd: 'save',
+    pristine: 'save', surfaceSeeded: 'save', skipOverlayFlush: 'save', paintDc: 'save', clip: 'save', saved: 'save',
+} as const satisfies Record<keyof DcState, FieldPolicy>;
+
+export const SAVED_DC_FIELDS = {
+    clip: 'save', hBrush: 'save', hPen: 'save', hFont: 'save', hBitmap: 'save', brushColor: 'save', textColor: 'save',
+    textColorValue: 'save', bkMode: 'save', bkColor: 'save', font: 'save', fontSize: 'save', fontQuality: 'save',
+    textEscapement: 'save', textAlign: 'save', posX: 'save', posY: 'save',
+} as const satisfies Record<keyof SavedDcState, FieldPolicy>;
+
+export interface SavedCanvas { width: number; height: number; pixels: Uint8Array }
+
+export interface SavedDc {
+    hdc: number;
+    state: ReturnType<typeof savedDcState>;
+    canvas: SavedCanvas | null;
+    bitmapHandle: number;
+}
+
+export interface GdiContextState {
+    objects: GDIObject[];
+    nextHdc: number;
+    nextHgdiobj: number;
+    dcs: SavedDc[];
+    currentPos: Array<[number, number, number]>;
+    fontCache: Array<[string, number]>;
+    handleRefs: Array<[number, number]>;
+    bitmapDCs: Array<[number, number]>;
+    bitmapVersions: Array<[number, number]>;
+    dcBitmapSync: Array<[number, number, number]>;
+    stockObjects: Array<[number, number]>;
+    systemPaletteUse: number;
+    overlay: SavedCanvas | null;
+    overlayHasContent: boolean;
+    clientBackings: Array<{ hwnd: number; x: number; y: number; canvas: SavedCanvas }>;
+}
+
+const copyClip = (clip: DcClipState | undefined) => clip ? { region: clip.region ? { ...clip.region, rects: [...clip.region.rects] } : null } : undefined;
+
+function savedDcState(st: DcState) {
+    const out = pickDefined(st, DC_STATE_FIELDS);
+    return {
+        ...out,
+        ...(st.dirtyRect ? { dirtyRect: { ...st.dirtyRect } } : {}),
+        ...(st.windowBlit ? { windowBlit: { ...st.windowBlit } } : {}),
+        ...(st.clip ? { clip: copyClip(st.clip) } : {}),
+        ...(st.saved ? { saved: st.saved.map(l => ({ ...pickDefined(l, SAVED_DC_FIELDS), clip: l.clip ? { ...l.clip, rects: [...l.clip.rects] } : null })) } : {}),
+    };
+}
+
+function readCanvas(ctx: OffscreenCanvasRenderingContext2D): SavedCanvas {
+    const { width, height } = ctx.canvas;
+    const data = ctx.getImageData(0, 0, width, height).data;
+    return { width, height, pixels: new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)) };
+}
+
+function writeCanvas(ctx: OffscreenCanvasRenderingContext2D, saved: SavedCanvas): void {
+    const data = new Uint8ClampedArray(saved.pixels.length);
+    data.set(saved.pixels);
+    ctx.putImageData(new ImageData(data, saved.width, saved.height), 0, 0);
+}
+
+function newCanvasContext(saved: SavedCanvas): OffscreenCanvasRenderingContext2D {
+    const canvas = new OffscreenCanvas(saved.width, saved.height);
+    const ctx = canvas.getContext('2d', { alpha: true, willReadFrequently: true }) as OffscreenCanvasRenderingContext2D | null;
+    if (!ctx) throw new Error(`gdi32: no 2d context for a ${saved.width}x${saved.height} DC`);
+    writeCanvas(ctx, saved);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.strokeStyle = '#000000';
+    ctx.textBaseline = 'top';
+    return ctx;
+}
+
 /**
  * Per-HDC state a sibling module owns (the coordinate mapping) has to die with the DC,
  * and the DC dies here. A hook keeps that module's map out of this class without
  * leaking an entry per BeginPaint.
  */
+// @transient(wiring registered at module init)
 const dcTeardownHooks: ((hdc: number) => void)[] = [];
 export function registerDcTeardown(fn: (hdc: number) => void): void {
     dcTeardownHooks.push(fn);
 }
 
+/**
+ * The DC table. A DC whose selected DIB section has not been mirrored into its canvas yet
+ * (see GDIContext.deferDibSection) is brought up to date by the lookup itself, so every
+ * path that takes a DC's canvas sees current pixels without knowing about the deferral.
+ * `peek` is for the few callers that do not need the pixels (object selection) or bring
+ * the part they need up to date themselves (a blit reading its source rectangle).
+ */
+class DcContextTable extends Map<number, OffscreenCanvasRenderingContext2D> {
+    /** DC (a memory DC, or a bitmap's cache DC) -> the DIB section it is behind on. */
+    readonly stale = new Map<number, number>();
+    materialize: ((hdc: number) => void) | null = null;
+
+    override get(hdc: number): OffscreenCanvasRenderingContext2D | undefined {
+        if (this.stale.size !== 0 && this.stale.has(hdc)) this.materialize?.(hdc);
+        return super.get(hdc);
+    }
+    peek(hdc: number): OffscreenCanvasRenderingContext2D | undefined {
+        return super.get(hdc);
+    }
+    override delete(hdc: number): boolean {
+        this.stale.delete(hdc);
+        return super.delete(hdc);
+    }
+    override clear(): void {
+        this.stale.clear();
+        super.clear();
+    }
+}
+
 export class GDIContext {
     // Host-shared state: gdi-objects/gdi-text/gdi-blit access non-private
     // fields/methods of this class directly — treat them as module-private to gdi32.
-    contexts: Map<number, OffscreenCanvasRenderingContext2D> = new Map();
+    contexts: DcContextTable = this.newContextTable();
     objects: Map<number, GDIObject> = new Map();
     private nextHdc = 0x20000;
     nextHgdiobj = 0x30000;
 
-    hdcStates: Map<number, {
-        brushColor: string;
-        textColor: string;
-        textColorValue: number;
-        bkMode: number;
-        bkColor: string;
-        font: string;
-        fontSize: number; // Cached font size to avoid regex parsing
-        fontQuality: number; // LOGFONT lfQuality of the selected font
-        textEscapement: number; // Rotation angle in tenths of degrees (Windows format)
-        textAlign: number; // TA_* flags (SetTextAlign); 0 = TA_LEFT|TA_TOP|TA_NOUPDATECP
-        appliedFont: string; // The font currently set on the canvas context
-        appliedFillStyle: string; // The fillStyle currently set on the canvas context
-        hBrush: number; // Current selected brush handle
-        hPen: number; // Current selected pen handle
-        hFont: number; // Current selected font handle
-        hBitmap: number; // Current selected bitmap handle (for Memory DC)
-        cachedImageData?: ImageData; // Cache for GetPixel
-        cachedPixels32?: Uint32Array; // Uint32 view of cachedImageData for fast single-read access
-        imageDataDirty: boolean; // Flag to invalidate cache
-        dirty: boolean; // true if canvas has changes that need syncing to surface memory
-        dirtyRect: { x1: number, y1: number, x2: number, y2: number } | null; // Bounding box of changed area for partial GPU uploads
-        /** When set, this memory DC backs an HWND client area; flush to overlay on EndPaint/ReleaseDC. */
-        windowBlit?: { absX: number; absY: number; width: number; height: number };
-        /** HWND this DC was obtained for (GetDC/GetWindowDC/GetDCEx/BeginPaint). Absent on a
-         *  memory/compatible DC, which is exactly the NULL that WindowFromDC must report. */
-        hwnd?: number;
-        /** True until guest draws on this DC (CreateCompatibleDC + untouched blit source). */
-        pristine?: boolean;
-        /** True when this surface DC's canvas was seeded from the surface's CPU pixels at GetDC
-         *  (faithful DDraw GetDC: the DC draws over the surface's own bits). ReleaseDC then writes
-         *  the full canvas back to CPU and keeps the surface CPU-authoritative (no GPU readback). */
-        surfaceSeeded?: boolean;
-        /** Skip next EndPaint flush — WM_PAINT had no real guest pixels (pristine BitBlt). */
-        skipOverlayFlush?: boolean;
-        /** BeginPaint DC: EndPaint owns its publish, so it is never auto-published mid-paint. */
-        paintDc?: boolean;
-        /** Clip region; absent means unbounded (see dc-clip.ts). */
-        clip?: DcClipState;
-        /** SaveDC levels, innermost last (see saveDcState). */
-        saved?: SavedDcState[];
-    }> = new Map();
+    hdcStates: Map<number, DcState> = new Map();
 
     /** Current pen position per HDC (MoveToEx / LineTo). */
     private hdcCurrentPos = new Map<number, { x: number; y: number }>();
@@ -238,6 +354,10 @@ export class GDIContext {
     private overlayDirty: boolean = false;
     private overlayHasContent: boolean = false; // True if overlay has any content to composite
     private overlayClearRepairFn: ((x: number, y: number, w: number, h: number, excludeHwnd: number) => void) | null = null;
+
+    /** System palette usage, one system-wide setting: SYSPAL_STATIC (1) until an app takes
+     *  the static entries with SYSPAL_NOSTATIC (2) / SYSPAL_NOSTATIC256 (3). */
+    systemPaletteUse = 1;
     private overlayDirtyNotifyFn: (() => void) | null = null;
 
     /** After clearOverlayRect, repaint windows whose overlay pixels were cleared. */
@@ -511,7 +631,10 @@ export class GDIContext {
         let entry = this.windowClientBacking.get(hwnd);
         if (!entry || entry.w !== w || entry.h !== h) {
             const canvas = new OffscreenCanvas(w, h);
-            const ctx = canvas.getContext("2d") as OffscreenCanvasRenderingContext2D | null;
+            // Same kind of canvas as the DCs and the overlay it is copied from and to. A
+            // default (GPU-backed) one made every flush an upload of the client image and
+            // every GetDC that seeds from it a read-back.
+            const ctx = canvas.getContext("2d", { willReadFrequently: true }) as OffscreenCanvasRenderingContext2D | null;
             if (!ctx) return;
             entry = { canvas, ctx, x, y, w, h };
             this.windowClientBacking.set(hwnd, entry);
@@ -909,6 +1032,40 @@ export class GDIContext {
         state.windowBlit = { absX, absY, width, height };
     }
 
+    windowDCsFor(hwnd: number): number[] {
+        const out: number[] = [];
+        for (const [hdc, state] of this.hdcStates) {
+            if (state.windowBlit && state.hwnd === hwnd) out.push(hdc);
+        }
+        return out;
+    }
+
+    retargetWindowDC(hdc: number, absX: number, absY: number, width: number, height: number): void {
+        const state = this.hdcStates.get(hdc);
+        const ctx = this.contexts.get(hdc);
+        if (!state?.windowBlit || !ctx) return;
+        const w = Math.max(1, width | 0);
+        const h = Math.max(1, height | 0);
+        const canvas = ctx.canvas as OffscreenCanvas;
+        if (canvas.width !== w || canvas.height !== h) {
+            const keepW = Math.min(canvas.width, w);
+            const keepH = Math.min(canvas.height, h);
+            const kept = keepW > 0 && keepH > 0 ? ctx.getImageData(0, 0, keepW, keepH) : null;
+            canvas.width = w;
+            canvas.height = h;
+            ctx.textBaseline = 'top';
+            if (kept) ctx.putImageData(kept, 0, 0);
+            state.appliedFont = '';
+            state.appliedFillStyle = '';
+            state.cachedImageData = undefined;
+            state.cachedPixels32 = undefined;
+            state.imageDataDirty = true;
+            state.dirty = true;
+            state.dirtyRect = null;
+        }
+        state.windowBlit = { absX, absY, width: w, height: h };
+    }
+
     /**
      * Mark a window DC as belonging to a BeginPaint/EndPaint bracket, and give it the
      * clip such a DC has in Win32: the window's update region. Everything drawn through
@@ -921,12 +1078,10 @@ export class GDIContext {
         state.paintDc = true;
         const hwnd = state.hwnd;
         if (!hwnd) return;
-        const update = getWindowUpdateRects(hwnd);
+        const quads = getWindowUpdateQuads(hwnd);
         // No update region is our own artifact (a directly posted WM_PAINT); it means
         // "repaint everything", which is an unbounded clip, not an empty one.
-        if (update.length === 0) return;
-        const quads: number[] = [];
-        for (const r of update) quads.push(r.left, r.top, r.right, r.bottom);
+        if (quads.length === 0) return;
         this.setClipRegion(hdc, makeClipRegion(quads));
     }
 
@@ -1359,6 +1514,66 @@ export class GDIContext {
         return newHdc;
     }
 
+    private newContextTable(): DcContextTable {
+        const table = new DcContextTable();
+        table.materialize = (hdc) => this.materializeDibSection(hdc);
+        return table;
+    }
+
+    /** A DC's canvas without bringing a deferred DIB section up to date first. */
+    peekContext(hdc: number): OffscreenCanvasRenderingContext2D | undefined {
+        return this.contexts.peek(hdc);
+    }
+
+    /** True while `hdc`'s canvas has not been mirrored from its DIB section's guest bits. */
+    isDibSectionDeferred(hdc: number): boolean {
+        return this.contexts.stale.has(hdc);
+    }
+
+    /**
+     * SelectObject of a DIB section does not mirror the guest bits into the canvases
+     * right away. The software-renderer frame is SelectObject, BitBlt to the window,
+     * deselect: the blit converts the rectangle it reads from the guest bits anyway, so
+     * mirroring the whole section on the select converts every frame twice. The DC and
+     * the bitmap's cache DC are marked instead; the first lookup of either canvas runs
+     * the deferred mirror, with the bits as they are then.
+     */
+    private deferDibSection(hdc: number, bitmapDC: number, hbitmap: number): void {
+        this.contexts.stale.set(hdc, hbitmap);
+        this.contexts.stale.set(bitmapDC, hbitmap);
+    }
+
+    /** The source rectangle of a blit covered the whole section: this DC's canvas is current. */
+    dibSectionCanvasCurrent(hdc: number): void {
+        this.contexts.stale.delete(hdc);
+    }
+
+    private materializeDibSection(hdc: number): void {
+        const stale = this.contexts.stale;
+        const hbitmap = stale.get(hdc);
+        if (hbitmap === undefined) return;
+        const pending: number[] = [];
+        for (const [dc, bmp] of stale) if (bmp === hbitmap) pending.push(dc);
+        for (const dc of pending) stale.delete(dc);
+        const pixels = this.refreshDibSectionCanvas(hbitmap);
+        const bitmapDC = this.bitmapDCCache.get(hbitmap);
+        const bitmapCtx = bitmapDC !== undefined ? this.contexts.peek(bitmapDC) : undefined;
+        for (const dc of pending) {
+            if (dc === bitmapDC || this.hdcStates.get(dc)?.hBitmap !== hbitmap) continue;
+            const ctx = this.contexts.peek(dc);
+            if (!ctx) continue;
+            if (pixels) {
+                ctx.putImageData(new (ImageData as any)(pixels.data, pixels.width, pixels.height), 0, 0);
+            } else if (bitmapCtx) {
+                // The bits could not be read: show the bitmap's last known image, as the
+                // select itself did when its refresh came back empty.
+                ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+                ctx.drawImage(bitmapCtx.canvas, 0, 0);
+            }
+            this.invalidateImageDataCache(dc);
+        }
+    }
+
     /**
      * Re-materialize a DIBSection-backed bitmap's canvas from live guest bits.
      * The app writes DIB bits directly in guest memory (no API call to observe),
@@ -1378,7 +1593,8 @@ export class GDIContext {
             ? fresh.data
             : new Uint8ClampedArray(fresh.data);
         const bitmapDC = this.bitmapDCCache.get(hbitmap);
-        const bitmapCtx = bitmapDC !== undefined ? this.contexts.get(bitmapDC) : undefined;
+        if (bitmapDC !== undefined) this.contexts.stale.delete(bitmapDC);
+        const bitmapCtx = bitmapDC !== undefined ? this.contexts.peek(bitmapDC) : undefined;
         if (bitmapCtx) {
             bitmapCtx.putImageData(new (ImageData as any)(data, fresh.width, fresh.height), 0, 0);
             this.invalidateImageDataCache(bitmapDC!);
@@ -1702,6 +1918,55 @@ export class GDIContext {
     }
 
     /**
+     * SetPixel: one pixel, on its own path. A per-pixel loop that alternates with GetPixel
+     * (flood fill, a hand-drawn effect) must not pay for the surface on every step, so the
+     * GetPixel cache is updated in place instead of being dropped, and a DIB section gets
+     * the pixel written into its guest bits directly instead of through a canvas read-back.
+     * Returns the colour now at the pixel as a COLORREF, or CLR_INVALID outside the DC or
+     * its clip region.
+     */
+    setPixel(hdc: number, x: number, y: number, color: number): number {
+        const state = this.hdcStates.get(hdc);
+        const ctx = this.contexts.get(hdc);
+        if (!state || !ctx?.canvas) return 0xFFFFFFFF;
+        const { width, height } = ctx.canvas;
+        if ((x >>> 0) >= width || (y >>> 0) >= height) return 0xFFFFFFFF;
+        const clipRects = state.clip?.region?.rects;
+        if (clipRects) {
+            let visible = false;
+            for (let i = 0; i < clipRects.length && !visible; i += 4) {
+                visible = x >= clipRects[i]! && y >= clipRects[i + 1]! && x < clipRects[i + 2]! && y < clipRects[i + 3]!;
+            }
+            if (!visible) return 0xFFFFFFFF;
+        }
+
+        const requested = color & 0x00FFFFFF;
+        const stored = writeDibSectionPixel(state.hBitmap, x, y, requested & 0xFF, (requested >>> 8) & 0xFF, requested >>> 16);
+        const set = stored ?? requested;
+
+        if (ctx === this.overlayCtx) this.setOverlayDirty(true);
+        const css = this.colorToCss(set);
+        ctx.fillStyle = css;
+        state.appliedFillStyle = css;
+        ctx.fillRect(x, y, 1, 1);
+        const linkedBitmap = (ctx.canvas as any).__bitmapCanvas;
+        if (linkedBitmap) {
+            const bitmapCtx = linkedBitmap.getContext('2d');
+            if (bitmapCtx) {
+                bitmapCtx.fillStyle = css;
+                bitmapCtx.fillRect(x, y, 1, 1);
+            }
+        }
+
+        if (state.cachedPixels32 && !state.imageDataDirty) {
+            state.cachedPixels32[y * width + x] = (0xFF000000 | set) >>> 0;
+        }
+        this.expandDirtyRect(hdc, x, y, 1, 1);
+        this.markDirty(hdc);
+        return set;
+    }
+
+    /**
      * Get pixel buffer for HDC - used by FastPath to avoid Map lookups on every call.
      * Returns cached Uint32Array pixel data and dimensions.
      */
@@ -1775,7 +2040,8 @@ export class GDIContext {
     }
 
     selectObject(hdc: number, hgdiobj: number): number {
-        const ctx = this.contexts.get(hdc);
+        // Selecting an object needs the DC, not its pixels.
+        const ctx = this.contexts.peek(hdc);
         if (!ctx) {
             Logger.warn(LogCategory.GDI32, `selectObject: Invalid HDC 0x${hdc.toString(16)}`);
             return 0;
@@ -1822,6 +2088,8 @@ export class GDIContext {
                 if (state.hBitmap === hgdiobj) {
                     return previousHandle; // Already selected, return previous handle
                 }
+                // The DC is about to show another bitmap: what it owed the old one is moot.
+                this.contexts.stale.delete(hdc);
 
                 // Stock default bitmap = deselect current bitmap
                 if (hgdiobj === GDIContext.DEFAULT_BITMAP_HANDLE) {
@@ -1835,7 +2103,7 @@ export class GDIContext {
                 // Create or reuse bitmap DC (now cached via bitmapDCCache)
                 const bitmapDC = this.createBitmapDC(hgdiobj);
                 if (bitmapDC) {
-                    const bitmapCtx = this.contexts.get(bitmapDC);
+                    const bitmapCtx = this.contexts.peek(bitmapDC);
                     if (bitmapCtx) {
                         const userObj = obj.data;
                         const bitmapWidth = userObj.width || bitmapCtx.canvas.width;
@@ -1857,7 +2125,7 @@ export class GDIContext {
                         // observe, no version bump) — re-materialize from live memory
                         // on every select so reads see the current surface.
                         const isDibSection = !!(userObj.bitsPtr && userObj.dibStride);
-                        const dibPixels = isDibSection ? this.refreshDibSectionCanvas(hgdiobj) : null;
+                        if (isDibSection) this.deferDibSection(hdc, bitmapDC, hgdiobj);
 
                         // PERFORMANCE OPTIMIZATION: Track bitmap versions to skip redundant drawImage
                         // Only copy bitmap content if the bitmap has changed since last sync
@@ -1869,12 +2137,9 @@ export class GDIContext {
                             syncState.hbitmap !== hgdiobj ||
                             syncState.version !== bitmapVersion;
 
-                        if (dibPixels) {
-                            // The refresh already converted the whole bitmap; going through
-                            // the bitmap canvas again would be a second full-surface copy.
-                            ctx.putImageData(
-                                new (ImageData as any)(dibPixels.data, dibPixels.width, dibPixels.height), 0, 0);
-                            this.invalidateImageDataCache(hdc);
+                        if (isDibSection) {
+                            // Deferred: the canvas is filled from the guest bits when it is
+                            // first looked up, or rectangle by rectangle by a blit reading it.
                             this.dcBitmapSyncState.set(hdc, { hbitmap: hgdiobj, version: bitmapVersion });
                         } else if (needsSync) {
                             // Copy bitmap content to memory DC
@@ -2364,6 +2629,94 @@ export class GDIContext {
         return latest;
     }
 
+    captureState(): GdiContextState {
+        if (this.linkedSurfaces.size > 0) throw new Error('gdi32: a DirectDraw surface DC is open');
+        if (this.overlayPublishDepth > 0) throw new Error('gdi32: a guest paint sequence is in flight');
+        if (this.bitmapImageBitmapCache.size > 0) throw new Error('gdi32: a bitmap is still being decoded');
+        // The canvases are saved as they are, and "still owed its DIB section" is not part
+        // of the image: settle every deferred mirror first.
+        for (const hdc of [...this.contexts.stale.keys()]) this.materializeDibSection(hdc);
+        const objects = [...this.objects.values()].map(o => {
+            const data = o.data as { tileCanvas?: unknown } | null;
+            if (data && typeof data === 'object' && 'tileCanvas' in data) throw new Error('gdi32: pattern brushes are not part of a v1 savestate');
+            return pickDefined(o, GDI_OBJECT_FIELDS) as GDIObject;
+        });
+        const dcs: SavedDc[] = [];
+        for (const [hdc, ctx] of this.contexts) {
+            const st = this.hdcStates.get(hdc);
+            if (!st) throw new Error(`gdi32: DC 0x${hdc.toString(16)} has no state`);
+            const onOverlay = ctx === this.overlayCtx;
+            if (!onOverlay && ctx.canvas === this.screenCanvas) throw new Error('gdi32: a DC on the screen canvas is not part of a v1 savestate');
+            dcs.push({
+                hdc, state: savedDcState(st), canvas: onOverlay ? null : readCanvas(ctx),
+                bitmapHandle: ((ctx as unknown as { __bitmapHandle?: number }).__bitmapHandle) ?? 0,
+            });
+        }
+        return {
+            objects,
+            nextHdc: this.nextHdc,
+            nextHgdiobj: this.nextHgdiobj,
+            dcs,
+            currentPos: [...this.hdcCurrentPos].map(([h, p]) => [h, p.x, p.y]),
+            fontCache: [...this.fontCache.entries()],
+            handleRefs: [...this.handleRefs],
+            bitmapDCs: [...this.bitmapDCCache],
+            bitmapVersions: [...this.bitmapVersions],
+            dcBitmapSync: [...this.dcBitmapSyncState].map(([h, v]) => [h, v.hbitmap, v.version]),
+            stockObjects: [...this.stockObjects],
+            systemPaletteUse: this.systemPaletteUse,
+            overlay: this.overlayCtx ? readCanvas(this.overlayCtx) : null,
+            overlayHasContent: this.overlayHasContent,
+            clientBackings: [...this.windowClientBacking].map(([hwnd, e]) => ({ hwnd, x: e.x, y: e.y, canvas: readCanvas(e.ctx) })),
+        };
+    }
+
+    restoreState(s: GdiContextState): void {
+        if (this.bitmapImageBitmapCache.size > 0) throw new Error('gdi32: a bitmap is still being decoded');
+        if (s.overlay) {
+            if (!this.overlayCtx || !this.overlayCanvas) throw new Error('gdi32: no overlay canvas to restore into');
+            if (this.overlayCanvas.width !== s.overlay.width || this.overlayCanvas.height !== s.overlay.height) {
+                this.resizeOverlay(s.overlay.width, s.overlay.height);
+            }
+            writeCanvas(this.overlayCtx!, s.overlay);
+        }
+        this.overlayHasContent = s.overlayHasContent;
+        this.overlayDirty = true;
+        this.objects = new Map(s.objects.map(o => [o.handle, { ...o }]));
+        this.nextHdc = s.nextHdc;
+        this.nextHgdiobj = s.nextHgdiobj;
+        this.contexts = this.newContextTable();
+        this.hdcStates = new Map();
+        for (const dc of s.dcs) {
+            const ctx = dc.canvas ? newCanvasContext(dc.canvas) : this.overlayCtx;
+            if (!ctx) throw new Error(`gdi32: DC 0x${dc.hdc.toString(16)} draws on an overlay this worker does not have`);
+            if (dc.bitmapHandle) (ctx as unknown as { __bitmapHandle?: number }).__bitmapHandle = dc.bitmapHandle;
+            this.contexts.set(dc.hdc, ctx);
+            const st = savedDcState(dc.state as DcState) as DcState;
+            st.appliedFont = '';
+            st.appliedFillStyle = '';
+            st.imageDataDirty = true;
+            this.hdcStates.set(dc.hdc, st);
+        }
+        this.hdcCurrentPos = new Map(s.currentPos.map(([h, x, y]) => [h, { x, y }]));
+        this.fontCache.clear();
+        for (const [key, h] of [...s.fontCache].reverse()) this.fontCache.set(key, h);
+        this.handleRefs = new Map(s.handleRefs.map(([h, n]) => [h, n]));
+        this.bitmapDCCache = new Map(s.bitmapDCs.map(([b, h]) => [b, h]));
+        this.bitmapVersions = new Map(s.bitmapVersions.map(([b, v]) => [b, v]));
+        this.dcBitmapSyncState = new Map(s.dcBitmapSync.map(([h, b, v]) => [h, { hbitmap: b, version: v }]));
+        this.stockObjects = new Map(s.stockObjects.map(([id, h]) => [id, h]));
+        this.systemPaletteUse = s.systemPaletteUse;
+        this.windowClientBacking = new Map(s.clientBackings.map(b => {
+            const ctx = newCanvasContext(b.canvas);
+            return [b.hwnd, { canvas: ctx.canvas as OffscreenCanvas, ctx, x: b.x, y: b.y, w: b.canvas.width, h: b.canvas.height }];
+        }));
+        this.linkedSurfaces.clear();
+        this.colorCache.clear();
+        this.bitmapImageBitmapCache.clear();
+        this.bitmapImageBitmapReady.clear();
+    }
+
     reset(): void {
         this.contexts.clear();
         this.objects.clear();
@@ -2385,6 +2738,7 @@ export class GDIContext {
         this.windowClientBacking.clear();
         this.nextHdc = 0x20000;
         this.nextHgdiobj = 0x30000;
+        this.systemPaletteUse = 1;
         this.clearOverlay();
         this.overlayDirty = false;
         this.overlayHasContent = false;

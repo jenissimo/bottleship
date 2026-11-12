@@ -1,5 +1,5 @@
 /** Host socket objects outlive individual guest descriptors and issuing processes. */
-import { WsaSocketTable, WsaFailure, WSA, type WsaIoPurpose } from "./wsa-network";
+import { WsaSocketTable, WsaFailure, WSA, describeWsaSocket, type WsaIoPurpose } from "./wsa-network";
 import type { WsaActorIdentity, WsaActorNotification } from "./wsa-actor-protocol";
 import type { UdpHostLease } from "../net/udp-host-lease-rpc";
 type State = ReturnType<WsaSocketTable["get"]>;
@@ -211,6 +211,18 @@ export class WsaActorKernel {
             } catch (error) { this.table.closesocket(physical); throw error; }
         }
         if (command === "reset") { for (const alias of [...context.aliases.values()]) if(alias.imported)this.release(alias); return null; }
+        if (command === "openForSavestate") {
+            const hex = (value: number) => "0x" + (value >>> 0).toString(16);
+            const open = [...context.aliases.values()].map(alias => this.table.isValid(alias.physical)
+                ? describeWsaSocket(alias.id, this.table.get(alias.physical)) : `socket ${hex(alias.id)} (stale)`);
+            for (const lease of context.nativeIo.values()) open.push(`${lease.purpose} operation on socket ${hex(lease.id)}`);
+            return { count: open.length, open: open.slice(0, 8), nextHandle: this.nextHandle };
+        }
+        if (command === "advanceHandles") {
+            const next = args[0] as number;
+            if (Number.isInteger(next) && next > this.nextHandle && next <= 0x80000000) this.nextHandle = next;
+            return null;
+        }
         if (command === "isValid") { const alias = context.aliases.get((args[0] as number) >>> 0); return !!alias && this.table.isValid(alias.physical); }
         if (command === "accept") return this.accept(identity, args[0] as number);
         if (command === "acceptOwned") {

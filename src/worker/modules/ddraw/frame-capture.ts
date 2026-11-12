@@ -58,6 +58,7 @@ import {
 import { MAX_FFP_STAGES } from "../../backends/webgpu/ddraw/ffp-stages";
 
 /** Fog range render states carry float BITS in the DWORD slot. */
+// @transient(host scratch)
 const dwordBitsScratch = new DataView(new ArrayBuffer(4));
 function dwordToFloat(d: number): number {
     dwordBitsScratch.setUint32(0, d >>> 0, true);
@@ -131,22 +132,33 @@ function readSrcVertex(view: DataView, memLen: number, base: number, L: FvfLayou
 }
 
 // Module-level capture state
+// @transient(diagnostic frame capture)
 let captureActive = false;
+// @transient(diagnostic frame capture)
 let captureBuffer: CapturedDrawCall[] = [];
+// @transient(diagnostic frame capture)
 let clearBuffer: CapturedClear[] = [];
+// @transient(diagnostic frame capture)
 let captureResolve: ((frame: CapturedFrame) => void) | null = null;
+// @transient(diagnostic frame capture)
 let captureReject: ((e: Error) => void) | null = null;
+// @transient(diagnostic frame capture)
 let captureFrameId = 0;
 // Backend of the producer recording this frame (set by recordDrawCall/recordRawDraw).
+// @transient(diagnostic frame capture)
 let captureBackend = "ddraw";
 /** Only this producer's frame boundary may end the capture (undefined = any). */
+// @transient(diagnostic frame capture)
 let captureWantBackend: string | undefined;
 /** A capture armed between draw calls first sees the tail of the frame already in
  * progress. Discard that boundary so the returned capture always starts at a real
  * frame boundary and includes the following frame's Clear/draw sequence. */
+// @transient(diagnostic frame capture)
 let captureNeedsFrameBoundary = false;
 /** Frame ends skipped because they carried nothing — reported, never silently dropped. */
+// @transient(diagnostic frame capture)
 let captureSkippedEmpty = 0;
+// @transient(diagnostic frame capture)
 let captureSkippedFiltered = 0;
 /** How many empty frame ends to wait through before giving up and reporting one. */
 const MAX_EMPTY_FRAME_ENDS = 8;
@@ -154,7 +166,9 @@ const MAX_EMPTY_FRAME_ENDS = 8;
  *  and what to restore the ambient `__captureVertsMax`/`__captureIndexedVertsMax` globals to
  *  when it ends — so a `captureFrame({maxIndexedVerts})` call cannot leak its override into
  *  the next, unrelated capture. */
+// @transient(diagnostic frame capture)
 let captureConfig: { maxVerts: number; maxIndexedVerts: number; minDraws?: number; minRenderTargets?: number } | undefined;
+// @transient(diagnostic frame capture)
 let captureConfigRestore: { maxVerts: number | undefined; maxIndexedVerts: number | undefined } | undefined;
 
 export function isCapturing(): boolean {
@@ -275,6 +289,7 @@ export function recordRawDraw(partial: Partial<CapturedDrawCall> & { backend: st
  *  not a capture is armed. The draw-scrub bisect numbers its draws against this, so a
  *  scrub cut and a capture index name the same draw by construction. RenderService's
  *  present serial is NOT this boundary — the GDI presenter advances it too. */
+// @transient(diagnostic frame capture)
 let frameBoundarySerial = 0;
 
 export function getFrameBoundarySerial(): number {
@@ -412,6 +427,7 @@ export type RecordDrawCallParams = {
     vertexSourceValid?: boolean;
     rtState: DirectDrawSurfaceState;
     texStateObj: DirectDrawSurfaceState | null;
+    textureHandle?: number;
     texStateObj1: DirectDrawSurfaceState | null;
     stageTextures?: readonly (DirectDrawSurfaceState | null)[] | null;
     renderStates: Int32Array | Uint32Array | number[];
@@ -568,6 +584,7 @@ export function recordDrawCall(p: RecordDrawCallParams): void {
 
     // Build tex0 info
     const tex0 = p.texStateObj ? {
+        handle: p.textureHandle,
         surfacePtr: p.texStateObj.surfacePtr,
         width: p.texStateObj.width,
         height: p.texStateObj.height,

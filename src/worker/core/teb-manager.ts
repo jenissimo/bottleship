@@ -44,8 +44,14 @@ const TEB_SIZE = 4096;          // One page per TEB
 // A 32-bit NT 5.x PEB is 0x210 bytes. Anything we place at PEB+offset below that lands inside a
 // real field (0x100 is in the middle of GdiHandleBuffer), so the header proper is reserved whole.
 const PEB_SIZE = 0x230;
-const TLS_MINIMUM_AVAILABLE = 64;
-const TLS_ARRAY_SIZE = TLS_MINIMUM_AVAILABLE * 4; // 64 slots * 4 bytes each
+/** Every index TlsAlloc can hand out: TLS_MINIMUM_AVAILABLE (64) + TLS_EXPANSION_SLOTS (1024),
+ *  as on NT. The per-thread array TEB+0x2C points at holds ALL of them, so it is the one
+ *  storage for every slot: the JS TlsGetValue/TlsSetValue, the WASM fast paths (which serve
+ *  0..63 and decline the rest to JS) and guest code that indexes fs:[2Ch] directly (implicit
+ *  TLS, the libgcc SjLj splice in hle-lib/native-leaves.ts) all read and write it, and no
+ *  index that exists can land past its end. */
+export const TLS_INDEX_LIMIT = 64 + 1024;
+const TLS_ARRAY_SIZE = TLS_INDEX_LIMIT * 4;
 
 import { currentProcessId } from './process-identity';
 
@@ -91,6 +97,10 @@ export interface PebLoaderModule {
 
 interface MemoryManager {
     alloc(size: number, kind?: string, perms?: string): number;
+}
+
+interface MemoryReleaser {
+    free(ptr: number): void;
 }
 
 export class TebManager {
@@ -308,6 +318,17 @@ export class TebManager {
         return tebAddress;
     }
 
+    captureState(): { peb: number; params: number; tebs: number[][]; tls: number[][] } {
+        return { peb: this.pebAddress, params: this.processParametersAddress, tebs: [...this.tebMap], tls: [...this.tlsArrayMap] };
+    }
+
+    restoreState(state: { peb: number; params: number; tebs: number[][]; tls: number[][] }): void {
+        this.pebAddress = state.peb;
+        this.processParametersAddress = state.params;
+        this.tebMap = new Map(state.tebs.map(([t, a]) => [t, a]));
+        this.tlsArrayMap = new Map(state.tls.map(([t, a]) => [t, a]));
+    }
+
     /**
      * Get TEB address for a thread.
      */
@@ -355,23 +376,52 @@ export class TebManager {
     }
 
     /**
-     * Sync a TLS slot value to guest memory.
+     * Store a TLS slot value in the thread's guest TLS array — the storage for every index,
+     * shared with the WASM TlsGetValue/TlsSetValue hypercalls (0..63). Returns false when
+     * the slot is not array-backed (index out of range, or no array for the thread).
      */
-    syncTlsSlot(threadId: number, index: number, value: number): void {
-        if (index < 0 || index >= TLS_MINIMUM_AVAILABLE) return;
+    syncTlsSlot(threadId: number, index: number, value: number): boolean {
+        if (index < 0 || index >= TLS_INDEX_LIMIT) return false;
         const tlsAddr = this.tlsArrayMap.get(threadId);
-        if (tlsAddr === undefined) return;
+        if (tlsAddr === undefined) return false;
+        const view = this.getView();
+        if (!view) return false;
+        view.setUint32(tlsAddr + index * 4, value >>> 0, true);
+        return true;
+    }
+
+    /** A TLS slot value from the thread's guest TLS array; undefined when not array-backed. */
+    readTlsSlot(threadId: number, index: number): number | undefined {
+        if (index < 0 || index >= TLS_INDEX_LIMIT) return undefined;
+        const tlsAddr = this.tlsArrayMap.get(threadId);
+        if (tlsAddr === undefined) return undefined;
+        const view = this.getView();
+        if (!view) return undefined;
+        return view.getUint32(tlsAddr + index * 4, true);
+    }
+
+    /** TlsFree: the slot reads as 0 in every thread when the index is handed out again. */
+    clearTlsSlotAllThreads(index: number): void {
+        if (index < 0 || index >= TLS_INDEX_LIMIT) return;
         const view = this.getView();
         if (!view) return;
-        view.setUint32(tlsAddr + index * 4, value >>> 0, true);
+        for (const tlsAddr of this.tlsArrayMap.values()) view.setUint32(tlsAddr + index * 4, 0, true);
     }
 
     /**
-     * Free a thread's TEB (just removes from tracking; memory freed by process cleanup).
+     * Give a reaped thread's TEB and TLS array back to the allocator. The entries leave both
+     * maps first, so the walks over them (clearTlsSlotAllThreads, syncLastError, …) can never
+     * reach a block the allocator may already have handed to someone else, and a second call
+     * for the same thread frees nothing. Returns whether anything was released.
      */
-    freeTeb(threadId: number): void {
+    releaseTeb(threadId: number, memory: MemoryReleaser): boolean {
+        const teb = this.tebMap.get(threadId);
+        const tls = this.tlsArrayMap.get(threadId);
         this.tebMap.delete(threadId);
         this.tlsArrayMap.delete(threadId);
+        if (tls !== undefined) memory.free(tls);
+        if (teb !== undefined) memory.free(teb);
+        return teb !== undefined || tls !== undefined;
     }
 
     /**

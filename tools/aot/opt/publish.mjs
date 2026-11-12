@@ -181,6 +181,10 @@ const manifest = {
         lowering: lowered.passes.length ? "optimizing" : "conservative",
         passes: lowered.passes,
         ir_version: 1,
+        ...(lowered.passes.includes("stack-load-forwarding") ? {
+            stack_forwarding: lowered.stack_forwarding,
+            stack_forwarding_slots: lowered.stack_forwarding_slots,
+        } : {}),
     },
     jit_flags: job.jitConfig,
     relaxed_fpu: job.relaxedFpu,
@@ -219,6 +223,10 @@ console.log(JSON.stringify({
     lifted_sha256: lowered.lifted_sha256,
     loop_bound: lowered.loop_bound,
     passes: lowered.passes,
+    ...(lowered.passes.includes("stack-load-forwarding") ? {
+        stack_forwarding: lowered.stack_forwarding,
+        stack_forwarding_slots: lowered.stack_forwarding_slots,
+    } : {}),
     caveat: "an adapter run measures kernel, guards and materialization against the real "
         + "dispatcher; it does not measure production publication lookup or live invalidation",
 }, null, 2));

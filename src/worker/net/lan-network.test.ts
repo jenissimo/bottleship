@@ -4,6 +4,15 @@ import { LanNetwork, type LanDatagram } from "./lan-network";
 import { BROADCAST_NODE, PROTO_UDP, PROTO_IPX, PROTO_TCP, encodeDatagram } from "./netplay-wire";
 
 describe("virtual LAN adapter", () => {
+    test("default addresses share one /16 and never end in the network or broadcast octet", () => {
+        for (let i = 0; i < 512; i++) {
+            const { node, ipv4 } = new LanNetwork();
+            expect(Array.from(node.subarray(0, 4))).toEqual([2, 0, 0, 1]);
+            expect(Array.from(ipv4.subarray(0, 2))).toEqual([10, 1]);
+            expect(node[5]).toBeGreaterThanOrEqual(1);
+            expect(node[5]).toBeLessThanOrEqual(254);
+        }
+    });
     test("local loopback and broadcast work offline with protocol isolation and copied payloads", () => {
         const net = new LanNetwork(Uint8Array.of(2, 0, 0, 1, 2, 3));
         const udp: LanDatagram[] = [], ipx: LanDatagram[] = [];

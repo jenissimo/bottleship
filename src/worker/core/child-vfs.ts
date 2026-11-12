@@ -24,6 +24,30 @@ const asyncMethods = new Set(['open', 'createDirectory', 'deleteFile', 'removeDi
 
 type RemoteHandle = VfsFileHandle & { childHandle: number };
 type Request = { method: string; args: unknown[] };
+
+const CREATE_ALWAYS = 2;
+const TRUNCATE_EXISTING = 5;
+const FILE_BEGIN = 0, FILE_CURRENT = 1;
+/** The dispatch has not answered the request; serve it as usual. */
+const NOT_ANSWERED = Symbol('not answered');
+
+/**
+ * A child's truncating open of a file that has contents, not yet published.
+ *
+ * Truncating at open and writing at the first WriteFile are two separate round trips from
+ * the child, and the parent's threads run in between. UE2's render probe child truncates
+ * Game.ini at exit while the parent polls for its Detected.ini, and the parent read an empty
+ * Game.ini, saved its now-empty config over it and failed to start (HP Chamber of Secrets:
+ * "Can't find 'ini:Engine.Engine.GameEngine'"). On Windows the gap is microseconds.
+ *
+ * So the truncation waits, with the child's file pointer kept here, until the child uses the
+ * file again. Then truncation and that use (normally the first write) run in one synchronous
+ * step on this thread, which is the parent's. Until then every other process sees the old
+ * contents; after it, the new ones; never the empty file in between. The child itself sees an
+ * empty file all along. A child's CloseHandle doesn't reach this server, so a handle the child
+ * never writes is truncated when the child exits.
+ */
+interface DeferredTruncation { path: string; access: number; disposition: number; position: number }
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -57,6 +81,7 @@ export function createChildVfsServer(vfs: VirtualFileSystem, buffer: SharedArray
     let nextHandle = 1;
     let closed = false;
     const pending = new Map<Promise<void>, string>();
+    const deferred = new Map<number, DeferredTruncation>();
     const pack = (value: unknown): unknown => {
         if (value instanceof Uint8Array) return { childBytes: Array.from(value) };
         if (value && typeof value === 'object' && (value as VfsFileHandle).kind === 'file'
@@ -69,28 +94,116 @@ export function createChildVfsServer(vfs: VirtualFileSystem, buffer: SharedArray
         }
         return value;
     };
+    /** Publishes a deferred truncation; synchronous unless the overlay can't open it now. */
+    const commit = (id: number): VfsFileHandle | Promise<VfsFileHandle> => {
+        const d = deferred.get(id)!;
+        deferred.delete(id);
+        const place = (handle: VfsFileHandle | null): VfsFileHandle => {
+            if (!handle) throw new Error(`Child VFS: truncating ${d.path} failed`);
+            if (d.position) vfs.setPosition(handle, d.position, FILE_BEGIN);
+            handles.set(id, handle);
+            return handle;
+        };
+        const now = vfs.openSync(d.path, d.access, d.disposition);
+        return now ? place(now) : vfs.open(d.path, d.access, d.disposition).then(place);
+    };
+    const commitPath = (path: string): Promise<unknown> | null => {
+        const key = vfs.resolvePath(path).toLowerCase();
+        const waits: Promise<unknown>[] = [];
+        for (const [id, d] of [...deferred]) {
+            if (d.path.toLowerCase() !== key) continue;
+            const done = commit(id);
+            if (done instanceof Promise) waits.push(done);
+        }
+        return waits.length ? Promise.all(waits) : null;
+    };
+    /**
+     * What a request does to the deferred truncations: answered on the spot (the child's own
+     * view of its still-empty file), or the truncations it touches are published first. Stays
+     * synchronous whenever it can, so a publish and the write after it share one step.
+     */
+    const settleDeferred = (method: string, args: unknown[]): unknown => {
+        const first = args[0];
+        if (first && typeof first === 'object' && 'childHandle' in first) {
+            const id = (first as RemoteHandle).childHandle;
+            const d = deferred.get(id);
+            if (!d) return NOT_ANSWERED;
+            if (method === 'tell') return d.position;
+            if (method === 'read' || method === 'readSync') return { childBytes: [] };
+            if (method === 'setPosition') {
+                const offset = Number(args[1]) || 0;
+                const from = Number(args[2]) || FILE_BEGIN;
+                // FILE_END of the empty file is FILE_BEGIN; clamped at 0 like VFS.setPosition.
+                const next = from === FILE_CURRENT ? d.position + offset : offset;
+                d.position = Math.max(0, next);
+                return d.position;
+            }
+            const done = commit(id);
+            return done instanceof Promise ? done.then(() => NOT_ANSWERED) : NOT_ANSWERED;
+        }
+        if (deferred.size && pathMethods.has(method) && typeof first === 'string') {
+            // The child's own view: the file it truncated exists and is empty.
+            if (method === 'getFileSize' || method === 'fileExists') {
+                const key = vfs.resolvePath(first).toLowerCase();
+                for (const d of deferred.values()) {
+                    if (d.path.toLowerCase() === key) return method === 'fileExists' ? true : 0;
+                }
+                return NOT_ANSWERED;
+            }
+            const done = commitPath(first);
+            if (done) return done.then(() => NOT_ANSWERED);
+        }
+        return NOT_ANSWERED;
+    };
+    const deferTruncation = (path: string, access: number, disposition: number): unknown => {
+        const full = vfs.resolvePath(path);
+        const id = nextHandle++;
+        deferred.set(id, { path: full, access, disposition, position: 0 });
+        return { childHandle: id, kind: 'file', path: full, access, source: 'overlay', position: 0 };
+    };
+    /** One request's answer. No await before the write unless an open has to go async. */
+    const serve = async (method: string, args: unknown[]): Promise<unknown> => {
+        if (!methods.has(method)) throw new Error(`Unsupported child VFS operation: ${method}`);
+        let settled = settleDeferred(method, args);
+        if (settled instanceof Promise) settled = await settled;
+        if (settled !== NOT_ANSWERED) return settled;
+        const decoded = args.map(arg => {
+            if (arg && typeof arg === 'object' && 'childHandle' in arg) {
+                const handle = handles.get((arg as RemoteHandle).childHandle);
+                if (!handle) throw new Error('Invalid child file handle');
+                return handle;
+            }
+            return arg;
+        });
+        // A cold compressed ROM read may need async I/O, even for a synchronous guest API.
+        const target = method === 'readSync' ? 'read' : method;
+        const fn = vfs[target as keyof VirtualFileSystem] as (...args: unknown[]) => unknown;
+        const opening = method === 'open' || method === 'openSync';
+        if (['write', 'writeSync', 'truncateAt', 'deleteFile', 'removeDirectory',
+            'createDirectory', 'createDirectorySync', 'ensureParentDirsSync', 'ensureDirTreeSync'].includes(method)
+            || (opening && decoded[2] !== 3)) {
+            const value = decoded[0];
+            onMutation?.(typeof value === 'string' ? value : (value as VfsFileHandle).path);
+        }
+        if (opening && (decoded[2] === CREATE_ALWAYS || decoded[2] === TRUNCATE_EXISTING)
+            && vfs.getFileSize(String(decoded[0])) > 0) {
+            return deferTruncation(String(decoded[0]), Number(decoded[1]), Number(decoded[2]));
+        }
+        // A child's WriteFile lands like the parent's own (kernel32 WriteFile fast path):
+        // a copy into the cache, persistence deferred. Waiting on the OPFS commit instead
+        // leaves a CREATE_ALWAYS-truncated file empty to every other process for the
+        // commit's milliseconds.
+        if (method === 'write' || method === 'writeSync') {
+            const [handle, data] = decoded as [VfsFileHandle, Uint8Array];
+            const buffered = vfs.writeSync(handle, data);
+            return buffered >= 0 ? buffered : await vfs.write(handle, data);
+        }
+        return pack(await fn.apply(vfs, decoded));
+    };
     const dispatch = async ({ method, args }: Request): Promise<void> => {
         let response: { value?: unknown; error?: string };
         try {
-            if (!methods.has(method)) throw new Error(`Unsupported child VFS operation: ${method}`);
-            const decoded = args.map(arg => {
-                if (arg && typeof arg === 'object' && 'childHandle' in arg) {
-                    const handle = handles.get((arg as RemoteHandle).childHandle);
-                    if (!handle) throw new Error('Invalid child file handle');
-                    return handle;
-                }
-                return arg;
-            });
-            // A cold compressed ROM read may need async I/O, even for a synchronous guest API.
-            const target = method === 'readSync' ? 'read' : method;
-            const fn = vfs[target as keyof VirtualFileSystem] as (...args: unknown[]) => unknown;
-            if (['write', 'writeSync', 'truncateAt', 'deleteFile', 'removeDirectory',
-                'createDirectory', 'createDirectorySync', 'ensureParentDirsSync', 'ensureDirTreeSync'].includes(method)
-                || ((method === 'open' || method === 'openSync') && decoded[2] !== 3)) {
-                const value = decoded[0];
-                onMutation?.(typeof value === 'string' ? value : (value as VfsFileHandle).path);
-            }
-            response = { value: pack(await fn.apply(vfs, decoded)) };
+            response = { value: await serve(method, args) };
         } catch (error) {
             response = { error: String(error) };
         }
@@ -130,6 +243,14 @@ export function createChildVfsServer(vfs: VirtualFileSystem, buffer: SharedArray
                     `Child VFS server close: ${pending.size} dispatch(es) still in flight after ` +
                     `${CHILD_VFS_CLOSE_BUDGET_MS}ms [${[...new Set(pending.values())].join(', ')}] — ` +
                     `releasing the child anyway; their writes may land after its handle signals`);
+            }
+            // Files the child truncated and never wrote: their truncation is due now.
+            for (const id of [...deferred.keys()]) {
+                try {
+                    await commit(id);
+                } catch (error) {
+                    Logger.warn(LogCategory.SYSTEM, `Child VFS server close: ${error}`);
+                }
             }
             handles.clear();
         },

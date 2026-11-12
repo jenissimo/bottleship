@@ -210,6 +210,53 @@ function packShape(
     return perElement * elements;
 }
 
+function packFloatRegisters(param: EffectParameter, ct: CtabType, out: Float32Array): boolean {
+    if (param.type !== EffectParamType.Float) return false;
+    if (param.paramClass === EffectParamClass.Struct || param.paramClass === EffectParamClass.Object) return false;
+    const value = param.value;
+    if (value.byteOffset & 3) return false;
+    const elements = Math.max(1, param.elements);
+    if (elements !== Math.max(1, ct.elements)) return false;
+    const rows = Math.max(1, param.rows);
+    const columns = Math.max(1, param.columns);
+    if (rows > 4 || columns > 4) return false;
+    const srcPerElement = rows * columns;
+    const sourceComponents = value.byteLength >>> 2;
+    if (elements * srcPerElement > sourceComponents) return false;
+    const src = new Float32Array(value.buffer, value.byteOffset, sourceComponents);
+
+    if (ct.class === ParameterClass.Scalar || ct.class === ParameterClass.Vector) {
+        const perElement = ct.class === ParameterClass.Vector ? 1 : Math.max(1, ct.rows) * Math.max(1, ct.columns);
+        const count = Math.min(Math.max(rows, columns), perElement * 4);
+        for (let e = 0; e < elements; e++) {
+            const dst = e * perElement * 4;
+            const from = e * srcPerElement;
+            for (let k = 0; k < count; k++) out[dst + k] = src[from + k]!;
+        }
+        return true;
+    }
+
+    if (ct.class !== ParameterClass.MatrixRows && ct.class !== ParameterClass.MatrixColumns) return false;
+    const byColumn = ct.class === ParameterClass.MatrixColumns;
+    const perElement = byColumn ? Math.max(1, ct.columns) : Math.max(1, ct.rows);
+    const transpose = byColumn
+        ? param.paramClass === EffectParamClass.MatrixRows
+        : param.paramClass === EffectParamClass.MatrixColumns;
+    const major = byColumn ? columns : rows;
+    const minor = byColumn ? rows : columns;
+    const majorCount = Math.min(major, perElement);
+    for (let e = 0; e < elements; e++) {
+        const dst = e * perElement * 4;
+        const from = e * srcPerElement;
+        for (let i = 0; i < majorCount; i++) {
+            for (let j = 0; j < minor; j++) {
+                out[dst + i * 4 + j] = src[from + (transpose ? i + j * major : i * minor + j)]!;
+            }
+        }
+    }
+    return true;
+}
+
 /**
  * Pack `param`'s current value for the registers `constant` occupies, or null when it cannot
  * feed them — a sampler, an object, a type or element count the two do not agree on, or a
@@ -231,6 +278,15 @@ export function packParameter(param: EffectParameter, constant: CtabConstant): C
         // An integer register feeds rep/loop as (count, initial, STEP, unused); d3dx leaves the
         // step at 1 in components a constant does not supply, and a step of 0 never terminates.
         for (let r = 0; r < footprint; r++) out[r * 4 + 2] = 1;
+    }
+
+    if (set === RegisterSet.Float4 && packFloatRegisters(param, constant.type, out as Float32Array)) {
+        const registers = Math.min(footprint, constant.registerCount);
+        return {
+            registerSet: set,
+            registerIndex: constant.registerIndex,
+            floats: (registers < footprint ? out.subarray(0, registers * 4) : out) as Float32Array,
+        };
     }
 
     const ctx: PackContext = {

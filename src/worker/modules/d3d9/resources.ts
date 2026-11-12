@@ -1886,6 +1886,85 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
+    // @transient(a back-buffer lock lives from LockRect to UnlockRect on a device that no savestate participant captures)
+    const backBufferLocks = new Map<number, { shadow: number; readOnly: boolean }>();
+    const D3DPRESENTFLAG_LOCKABLE_BACKBUFFER = 0x1;
+    const BACKBUFFER_LOCK_READONLY = 0x10;
+
+    const lockableBackBuffer = (pSurface: number, meta: { texturePtr?: number }): boolean => {
+        if (meta.texturePtr) return false;
+        const chain = getSwapChainForSurface(pSurface);
+        return !!chain && (chain.params.flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) !== 0;
+    };
+
+    const createBackBufferShadow = (device: D3D9Device, meta: { format: number; width: number; height: number }): number => {
+        const devicePtr = resolveDevicePtr(device);
+        const texVt = getVTables()['IDirect3DTexture9']?.address;
+        if (!devicePtr || !texVt) return 0;
+        const texPtr = createComObject(texVt);
+        if (device.createTexture(texPtr, meta.width, meta.height, 1, meta.format, D3DUSAGE_RENDERTARGET, D3DPOOL_DEFAULT) === 0) {
+            releaseComRef(texPtr);
+            return 0;
+        }
+        resourceToDevice.set(texPtr, device);
+        textureMeta.set(texPtr, {
+            width: meta.width, height: meta.height, levels: 1,
+            usage: D3DUSAGE_RENDERTARGET, pool: D3DPOOL_DEFAULT, format: meta.format,
+        });
+        ensureBaseTextureState(texPtr, 1, D3DUSAGE_RENDERTARGET);
+        registerTextureFinalizer(texPtr, devicePtr);
+        return texPtr;
+    };
+
+    const shadowEndpoint = (texPtr: number, meta: { width: number; height: number }) => ({
+        texturePtr: texPtr, face: -1, width: meta.width, height: meta.height, multiSampleType: 0, offscreenPlain: false,
+    });
+
+    const lockBackBuffer = (device: D3D9Device, pSurface: number, meta: { format: number; width: number; height: number },
+        pLockedRect: number, pRect: number, flags: number, mem: Uint8Array): number | Promise<number> => {
+        if (backBufferLocks.has(pSurface)) return D3DERR_INVALIDCALL;
+        const shadow = createBackBufferShadow(device, meta);
+        if (!shadow) return D3DERR_INVALIDCALL;
+        const full = { left: 0, top: 0, right: meta.width, bottom: meta.height };
+        const fail = (): number => {
+            releaseComRef(shadow);
+            return D3DERR_INVALIDCALL;
+        };
+        const lock = (copied: boolean): number | Promise<number> => {
+            if (!copied) return fail();
+            const plan = planTextureLock(device, shadow, 0, meta.width, meta.height, true, pRect, flags);
+            if (!plan) return fail();
+            const finish = (): number => {
+                const hr = completeTextureLock(device, shadow, 0, plan, meta.format, meta.width, meta.height, pRect, pLockedRect, mem);
+                if (hr !== D3D_OK) return fail();
+                backBufferLocks.set(pSurface, { shadow, readOnly: (flags & BACKBUFFER_LOCK_READONLY) !== 0 });
+                return hr;
+            };
+            return plan.pending ? plan.pending.then(finish) : finish();
+        };
+        const copy = device.stretchRect(null, shadowEndpoint(shadow, meta), full, full, false);
+        return typeof copy === 'boolean' ? lock(copy) : copy.then(lock);
+    };
+
+    const unlockBackBuffer = (device: D3D9Device, pSurface: number, meta: { width: number; height: number },
+        mem: Uint8Array): number | Promise<number> => {
+        const active = backBufferLocks.get(pSurface);
+        if (!active) return D3DERR_INVALIDCALL;
+        backBufferLocks.delete(pSurface);
+        finishTextureUnlock(device, active.shadow, 0, mem);
+        if (active.readOnly) {
+            releaseComRef(active.shadow);
+            return D3D_OK;
+        }
+        const full = { left: 0, top: 0, right: meta.width, bottom: meta.height };
+        const done = (ok: boolean): number => {
+            releaseComRef(active.shadow);
+            return ok ? D3D_OK : D3DERR_INVALIDCALL;
+        };
+        const copy = device.stretchRect(shadowEndpoint(active.shadow, meta), null, full, full, false);
+        return typeof copy === 'boolean' ? done(copy) : copy.then(done);
+    };
+
     exports['IDirect3DSurface9_LockRect'] = (_ctx, mem, args) => {
         const pSurface = args[0];
         const pLockedRect = args[1];
@@ -1896,6 +1975,9 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const device = resourceToDevice.get(pSurface);
         if (meta?.texturePtr && textureWriteLog.selected(meta.texturePtr)) {
             textureWriteLog.record(meta.texturePtr, 'surface-lock-request', { surface: pSurface, level: meta.level ?? 0, flags, lockable: meta.lockable ?? null, caller: Mem.readUint32(_ctx.esp) });
+        }
+        if (meta && device && pLockedRect && lockableBackBuffer(pSurface, meta)) {
+            return lockBackBuffer(device, pSurface >>> 0, meta, pLockedRect, pRect, flags, mem);
         }
         if (!meta || !device || !meta.texturePtr || meta.lockable === false || !pLockedRect) {
             return D3DERR_INVALIDCALL;
@@ -1941,6 +2023,9 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
 
         const meta = surfaceMeta.get(pSurface);
         const device = resourceToDevice.get(pSurface);
+        if (meta && device && !meta.texturePtr && backBufferLocks.has(pSurface >>> 0)) {
+            return unlockBackBuffer(device, pSurface >>> 0, meta, mem);
+        }
         if (!meta || !device || !meta.texturePtr) {
             return D3DERR_INVALIDCALL;
         }

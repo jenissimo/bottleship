@@ -60,7 +60,9 @@ export interface CxxThrowRecord {
     /** raw thrown-object pointer, used only for short-window dedup of the same throw. */
     valuePtrRaw?: number;
 }
+// @transient(diagnostics)
 const cxxThrowRing: CxxThrowRecord[] = [];
+// @transient(diagnostics)
 let cxxThrowSeq = 0;
 const CXX_RING_MAX = 64;
 export function getCxxThrowRing(): CxxThrowRecord[] { return cxxThrowRing; }
@@ -117,6 +119,7 @@ export function captureCxxThrow(mem: Uint8Array, thunkEsp: number, thrownObjPtr:
 
 // EncodePointer/DecodePointer cookie — module-scope so fast path can access it.
 // Must NOT be zero! See comment in exceptionExports below.
+// @participant(kernel32)
 let pointerCookie = 0;
 const getPointerCookie = (): number => {
     if (pointerCookie === 0) {
@@ -124,6 +127,14 @@ const getPointerCookie = (): number => {
     }
     return pointerCookie;
 };
+
+export function capturePointerCookie(): number {
+    return pointerCookie;
+}
+
+export function restorePointerCookie(cookie: number): void {
+    pointerCookie = cookie;
+}
 
 /** New process ⇒ fresh EncodePointer cookie (Process.reset reuses the Process object). */
 export function resetPointerCookie(): void {

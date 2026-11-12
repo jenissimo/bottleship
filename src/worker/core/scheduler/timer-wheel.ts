@@ -18,14 +18,56 @@ export interface TimerEntry {
     fireAt: number;        // Absolute time (ms)
     intervalMs: number;    // 0 = one-shot, >0 = periodic
     kind: TimerKind;
-    callback: () => void;
+    owner: number;
+    arg: number;
     cancelled: boolean;
     heapIndex: number;     // -1 while popped/active, otherwise index in heap
 }
 
 /** Minimum timer resolution — prevents timer storms */
 const COALESCE_MS = 1;
-const TIMER_KIND_COUNT = TimerKind.DMUSIC_SYNTH + 1;
+const TIMER_KIND_COUNT = TimerKind.MIDI_SYNTH + 1;
+
+export const TIMER_PHASE_EVERY = 0;
+export const TIMER_PHASE_DUE = 1;
+
+export type TimerHandler = (owner: number, arg: number, timerId: number) => void;
+
+/** @transient(behaviour, not data: each kind's owner module installs its handler when it is created) */
+const timerHandlers: (TimerHandler | undefined)[] = [];
+
+/**
+ * Install the one handler for `kind`. A kind has a single owner, so a second, different
+ * handler is a bug (a factory that ran twice would silently strand the first one's
+ * timers): it is logged and the first handler stays. Owners that are rebuilt on purpose
+ * use replaceTimerHandler.
+ */
+export function setTimerHandler(kind: TimerKind, handler: TimerHandler): void {
+    const current = timerHandlers[kind];
+    if (current && current !== handler) {
+        Logger.error(LogCategory.THREAD, `TimerWheel: kind ${kind} already has a handler; the new one is ignored`);
+        return;
+    }
+    timerHandlers[kind] = handler;
+}
+
+export function replaceTimerHandler(kind: TimerKind, handler: TimerHandler): void {
+    timerHandlers[kind] = handler;
+}
+
+/** Drop the handler of `kind` so a deliberately rebuilt owner (a test fixture) can install its own. */
+export function clearTimerHandler(kind: TimerKind): void {
+    timerHandlers[kind] = undefined;
+}
+
+export function getTimerHandler(kind: TimerKind): TimerHandler | undefined {
+    return timerHandlers[kind];
+}
+
+function isWinmmPaced(kind: TimerKind): boolean {
+    return kind === TimerKind.WINMM_TIMER || kind === TimerKind.JOYSTICK_CAPTURE
+        || kind === TimerKind.WAVEOUT_COMPLETION;
+}
 /**
  * Coarser floor for winmm timeSetEvent timers (TimerKind.WINMM_TIMER).
  *
@@ -46,13 +88,18 @@ export class TimerWheel {
     private activeCallbacks = new Map<number, TimerEntry>();
     private nextId = 1;
     private _firedCount = 0;
+    private readonly boundHandlers: (TimerHandler | undefined)[] = [];
+
+    bind(kind: TimerKind, handler: TimerHandler): void {
+        this.boundHandlers[kind] = handler;
+    }
     /** DIAG: per-kind fired tally (index by TimerKind). Confirms the WINMM storm. */
     private _firedByKind: number[] = new Array(TIMER_KIND_COUNT).fill(0);
 
     /**
      * Add a timer. Returns timer ID for cancellation.
      */
-    add(delayMs: number, periodic: boolean, kind: TimerKind, callback: () => void, nowMs: number): number {
+    add(delayMs: number, periodic: boolean, kind: TimerKind, owner: number, nowMs: number, arg = 0): number {
         const clamped = this.clampDelay(delayMs, kind);
         const id = this.nextId++;
         const entry: TimerEntry = {
@@ -60,7 +107,8 @@ export class TimerWheel {
             fireAt: nowMs + clamped,
             intervalMs: periodic ? clamped : 0,
             kind,
-            callback,
+            owner,
+            arg,
             cancelled: false,
             heapIndex: -1,
         };
@@ -137,7 +185,9 @@ export class TimerWheel {
             // timer isolation.
             this.activeCallbacks.set(top.id, top);
             try {
-                top.callback();
+                const handler = this.boundHandlers[top.kind] ?? timerHandlers[top.kind];
+                if (handler) handler(top.owner, top.arg, top.id);
+                else Logger.error(LogCategory.THREAD, `TimerWheel: no handler for kind=${top.kind} (id=${top.id})`);
             } catch (e) {
                 Logger.error(LogCategory.THREAD, `TimerWheel: callback threw (kind=${top.kind}, id=${top.id}): ${e}`);
             } finally {
@@ -194,6 +244,26 @@ export class TimerWheel {
         return this.heap.length;
     }
 
+    captureState(): { nextId: number; entries: number[][] } {
+        if (this.activeCallbacks.size > 0) throw new Error('timer wheel: captured while a timer callback runs');
+        const entries: number[][] = [];
+        for (const e of this.entries.values()) {
+            if (!e.cancelled) entries.push([e.id, e.fireAt, e.intervalMs, e.kind, e.owner, e.arg]);
+        }
+        entries.sort((a, b) => a[0] - b[0]);
+        return { nextId: this.nextId, entries };
+    }
+
+    restoreState(state: { nextId: number; entries: number[][] }): void {
+        this.reset();
+        for (const [id, fireAt, intervalMs, kind, owner, arg] of state.entries) {
+            const entry: TimerEntry = { id, fireAt, intervalMs, kind: kind as TimerKind, owner, arg, cancelled: false, heapIndex: -1 };
+            this.entries.set(id, entry);
+            this._heapPush(entry);
+        }
+        this.nextId = state.nextId;
+    }
+
     reset(): void {
         for (const entry of this.entries.values()) {
             entry.cancelled = true;
@@ -208,7 +278,7 @@ export class TimerWheel {
     }
 
     private clampDelay(delayMs: number, kind: TimerKind): number {
-        const floor = kind === TimerKind.WINMM_TIMER ? WINMM_COALESCE_MS : COALESCE_MS;
+        const floor = isWinmmPaced(kind) ? WINMM_COALESCE_MS : COALESCE_MS;
         return Math.max(delayMs, floor);
     }
 

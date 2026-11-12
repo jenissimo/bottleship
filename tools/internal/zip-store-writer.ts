@@ -21,7 +21,7 @@ export const U16_MAX = 0xffff;
 export const COPY_CHUNK = 16 * 1024 * 1024;
 
 /** `dosStamp` is the packed `date << 16 | time` (UTC, see zip/dos-time.ts); 0 = no date. */
-export interface OutEntry { nameBuf: Buffer; size: number; crc: number; offset: number; dosStamp?: number }
+export interface OutEntry { nameBuf: Buffer; size: number; crc: number; offset: number; dosStamp?: number; method?: number; compressedSize?: number }
 
 const CRC_TABLE = (() => {
     const t = new Uint32Array(256);
@@ -48,17 +48,17 @@ export function crc32(data: Uint8Array): number {
     return crc32Final(crc32Update(data));
 }
 
-export function lfhFor(nameBuf: Buffer, size: number, crc: number, dosStamp = 0): Buffer {
-    const needsZip64 = size > U32_MAX;
+export function lfhFor(nameBuf: Buffer, size: number, crc: number, dosStamp = 0, method = 0, compressedSize = size): Buffer {
+    const needsZip64 = size > U32_MAX || compressedSize > U32_MAX;
     const extra = needsZip64 ? 20 : 0; // ZIP64 extra: header(4) + uncompressed(8) + compressed(8)
     const lfh = Buffer.alloc(30 + nameBuf.length + extra);
     lfh.writeUInt32LE(LFH_SIG, 0);
     lfh.writeUInt16LE(needsZip64 ? 45 : 20, 4); // version needed (4.5 for ZIP64)
-    lfh.writeUInt16LE(0, 8);                    // Store
+    lfh.writeUInt16LE(method, 8);
     lfh.writeUInt16LE(dosStamp & 0xffff, 10);
     lfh.writeUInt16LE(dosStamp >>> 16, 12);
     lfh.writeUInt32LE(crc, 14);
-    lfh.writeUInt32LE(needsZip64 ? U32_MAX : size, 18); // compressed
+    lfh.writeUInt32LE(needsZip64 ? U32_MAX : compressedSize, 18); // compressed
     lfh.writeUInt32LE(needsZip64 ? U32_MAX : size, 22); // uncompressed
     lfh.writeUInt16LE(nameBuf.length, 26);
     lfh.writeUInt16LE(extra, 28);
@@ -68,13 +68,14 @@ export function lfhFor(nameBuf: Buffer, size: number, crc: number, dosStamp = 0)
         lfh.writeUInt16LE(0x0001, e);
         lfh.writeUInt16LE(16, e + 2);
         lfh.writeBigUInt64LE(BigInt(size), e + 4);
-        lfh.writeBigUInt64LE(BigInt(size), e + 12);
+        lfh.writeBigUInt64LE(BigInt(compressedSize), e + 12);
     }
     return lfh;
 }
 
 export function cdhFor(e: OutEntry): Buffer {
-    const bigSize = e.size > U32_MAX;
+    const compressedSize = e.compressedSize ?? e.size;
+    const bigSize = e.size > U32_MAX || compressedSize > U32_MAX;
     const bigOff = e.offset > U32_MAX;
     const zFields = (bigSize ? 16 : 0) + (bigOff ? 8 : 0);
     const extra = zFields ? 4 + zFields : 0;
@@ -82,11 +83,11 @@ export function cdhFor(e: OutEntry): Buffer {
     cdh.writeUInt32LE(CDH_SIG, 0);
     cdh.writeUInt16LE(bigSize || bigOff ? 45 : 20, 4); // version made by
     cdh.writeUInt16LE(bigSize || bigOff ? 45 : 20, 6); // version needed
-    cdh.writeUInt16LE(0, 10); // Store
+    cdh.writeUInt16LE(e.method ?? 0, 10);
     cdh.writeUInt16LE((e.dosStamp ?? 0) & 0xffff, 12);
     cdh.writeUInt16LE((e.dosStamp ?? 0) >>> 16, 14);
     cdh.writeUInt32LE(e.crc, 16);
-    cdh.writeUInt32LE(bigSize ? U32_MAX : e.size, 20); // compressed
+    cdh.writeUInt32LE(bigSize ? U32_MAX : compressedSize, 20); // compressed
     cdh.writeUInt32LE(bigSize ? U32_MAX : e.size, 24); // uncompressed
     cdh.writeUInt16LE(e.nameBuf.length, 28);
     cdh.writeUInt16LE(extra, 30);
@@ -97,7 +98,7 @@ export function cdhFor(e: OutEntry): Buffer {
         cdh.writeUInt16LE(0x0001, p);
         cdh.writeUInt16LE(zFields, p + 2);
         p += 4;
-        if (bigSize) { cdh.writeBigUInt64LE(BigInt(e.size), p); cdh.writeBigUInt64LE(BigInt(e.size), p + 8); p += 16; }
+        if (bigSize) { cdh.writeBigUInt64LE(BigInt(e.size), p); cdh.writeBigUInt64LE(BigInt(compressedSize), p + 8); p += 16; }
         if (bigOff) { cdh.writeBigUInt64LE(BigInt(e.offset), p); p += 8; }
     }
     return cdh;
@@ -126,6 +127,30 @@ export class ZipStoreWriter {
         this.raw(lfhFor(nameBuf, data.length, crc));
         this.raw(data);
         this.cd.push({ nameBuf, size: data.length, crc, offset: entryOffset });
+    }
+
+    addDeflated(name: string, parts: readonly Uint8Array[], size: number, crc: number, dosStamp = 0): number {
+        const nameBuf = Buffer.from(name, "utf8");
+        const entryOffset = this.offset;
+        let compressedSize = 0;
+        for (const part of parts) compressedSize += part.byteLength;
+        this.raw(lfhFor(nameBuf, size, crc, dosStamp, 8, compressedSize));
+        for (const part of parts) {
+            writeSync(this.fd, part, 0, part.byteLength);
+            this.offset += part.byteLength;
+        }
+        this.cd.push({ nameBuf, size, crc, offset: entryOffset, dosStamp, method: 8, compressedSize });
+        return entryOffset;
+    }
+
+    addStored(name: string, data: Uint8Array, dosStamp = 0, knownCrc?: number): void {
+        const nameBuf = Buffer.from(name, "utf8");
+        const entryOffset = this.offset;
+        const crc = knownCrc ?? crc32(data);
+        this.raw(lfhFor(nameBuf, data.length, crc, dosStamp));
+        writeSync(this.fd, data, 0, data.byteLength);
+        this.offset += data.byteLength;
+        this.cd.push({ nameBuf, size: data.length, crc, offset: entryOffset, dosStamp });
     }
 
     /**

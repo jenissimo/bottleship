@@ -47,7 +47,7 @@ function installGpuTextureUsage(): void {
 }
 
 describe("D3D9 multisample resources", () => {
-    test("depth rebinding preserves accumulated color and retires only replaced owned depth", () => {
+    test("depth rebinding preserves accumulated color and keeps the owned depth for the way back", () => {
         installGpuTextureUsage();
         const { device, textures } = makeMockDevice();
         const cache = new D3D9MultisampleTargetCache(device as unknown as GPUDevice, {
@@ -71,15 +71,34 @@ describe("D3D9 multisample resources", () => {
         expect(textures).toHaveLength(4);
         expect(textures.every(texture => !texture.destroyed)).toBe(true);
         cache.flushGarbage();
-        expect(textures.map(texture => texture.destroyed)).toEqual([false, false, true, false]);
+        // The replaced owned depth is kept, not retired: going back to it must not allocate.
+        expect(textures.map(texture => texture.destroyed)).toEqual([false, false, false, false]);
         const third = cache.acquire(desc)!;
         expect(third.colorTexture).toBe(first.colorTexture);
         expect(third.resolveTexture).toBe(first.resolveTexture);
-        expect(third.depthTexture).not.toBe(first.depthTexture);
+        expect(third.depthTexture).toBe(first.depthTexture);
+        expect(third.depthView).toBe(first.depthView);
+        expect(textures).toHaveLength(4);
         cache.flushGarbage();
         expect(externalDepth.destroyed).toBe(false);
+        // Alternating many times still allocates nothing.
+        for (let i = 0; i < 5; i++) {
+            cache.acquire({ ...desc, depthTexture: externalDepth as unknown as GPUTexture,
+                depthView: externalDepth.createView() as GPUTextureView });
+            cache.acquire(desc);
+            cache.flushGarbage();
+        }
+        expect(textures).toHaveLength(4);
+        // A size change drops the kept depth along with the target's.
+        cache.acquire({ ...desc, depthTexture: externalDepth as unknown as GPUTexture,
+            depthView: externalDepth.createView() as GPUTextureView });
+        const resized = cache.acquire({ ...desc, width: 32, height: 32 })!;
+        expect(resized.depthTexture).not.toBe(first.depthTexture);
+        cache.flushGarbage();
+        expect(textures[2]!.destroyed).toBe(true);
         cache.destroy();
-        expect(textures.map(texture => texture.destroyed)).toEqual([true, true, true, false, true]);
+        expect(externalDepth.destroyed).toBe(false);
+        expect(textures.filter(texture => texture !== externalDepth).every(texture => texture.destroyed)).toBe(true);
     });
 
     test("creates matching 2x color/depth attachments and a single-sample resolve target", () => {

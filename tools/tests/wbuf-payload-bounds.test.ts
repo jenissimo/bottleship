@@ -76,3 +76,58 @@ describe("WBUF upload batches without Present", () => {
         expect(bounded.capacity).toBeLessThanOrEqual(2 * BATCH_LIMIT);
     });
 });
+
+describe("WBUF payload with a tail", () => {
+    test("head and tail land as one entry whose length covers both", () => {
+        const d = new ThunkDispatcher({ add_listener: () => {} } as never, {} as never) as any;
+        d.cachedMem8 = new Uint8Array(64);
+        d.cachedMem32 = new Uint32Array(d.cachedMem8.buffer);
+        d.isDataViewValid = () => true;
+        d.writeBufCapacity = 64;
+        const id = d.registerQueuePayloadHandler(() => { throw new Error("remote queue replayed locally"); });
+        const shipped: number[][] = [];
+        d.setWbufSplitClient({
+            armed: () => true,
+            ship: (bytes: Uint8Array, end: number) => {
+                const words = new Uint32Array(bytes.buffer, bytes.byteOffset, end / 4);
+                for (let off = 0; off < end;) {
+                    expect(words[off / 4]).toBe(id);
+                    const length = words[off / 4 + 5]!;
+                    shipped.push([...bytes.subarray(off + 24, off + 24 + length)]);
+                    off += 24 + Math.ceil(length / 4) * 4;
+                }
+                return true;
+            },
+        });
+        const head = new Uint8Array([9, 1, 2, 3, 4, 5, 6]);
+        const tail = new Uint8Array(301).map((_, i) => (i * 3) & 0xff);
+        expect(d.enqueuePayloadById(id, 1, 0, 0, 0, head, 1, 5, tail)).toBe(true);
+        expect(d.enqueuePayloadById(id, 2, 0, 0, 0, head, 0, 3)).toBe(true);
+        d.executeWbufQueue();
+        expect(shipped).toEqual([[1, 2, 3, 4, 5, ...tail], [9, 1, 2]]);
+    });
+
+    test("a tail detached by the flush that makes room is rejected, not queued as empty", () => {
+        const d = new ThunkDispatcher({ add_listener: () => {} } as never, {} as never) as any;
+        d.cachedMem8 = new Uint8Array(64);
+        d.cachedMem32 = new Uint32Array(d.cachedMem8.buffer);
+        d.isDataViewValid = () => true;
+        d.writeBufCapacity = 64;
+        const id = d.registerQueuePayloadHandler(() => { throw new Error("remote queue replayed locally"); });
+        const guest = new ArrayBuffer(4096);
+        let shipped = 0;
+        d.setWbufSplitClient({
+            armed: () => true,
+            ship: () => { shipped++; guest.transfer(); return true; },
+        });
+        const head = new Uint8Array(8);
+        const big = new Uint8Array(9 * 1024 * 1024);
+        expect(d.enqueuePayloadById(id, 1, 0, 0, 0, head, 0, 8, big)).toBe(true);
+        const endBefore = d.wbufQueueEnd;
+        expect(endBefore).toBeGreaterThan(0);
+        const tail = new Uint8Array(guest, 0, 1024);
+        expect(d.enqueuePayloadById(id, 2, 0, 0, 0, head, 0, 8, tail)).toBe(false);
+        expect(shipped).toBe(1);
+        expect(d.wbufQueueEnd).toBe(0);
+    });
+});

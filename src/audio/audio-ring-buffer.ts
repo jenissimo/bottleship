@@ -117,6 +117,12 @@ export const FLAG_CIRCULAR = 1;
 /** Streaming flag: worklet outputs silence when caught up to write cursor instead of wrapping */
 export const FLAG_STREAMING = 2;
 
+/** Frames BEHIND its read head the ring mixer still reads: its band-limited interpolator's
+ *  window (bottleship-audio-worklet.ts) spans this many frames either side of the head. A
+ *  producer refilling what the head has passed must leave these alone, or the next render
+ *  quantum interpolates across data from another lap. */
+export const MIX_HISTORY_FRAMES = 8;
+
 // ─── Listener SAB field indices (Int32Array element offsets) ─────────────────
 
 export const LCTRL_POS_X = 0;

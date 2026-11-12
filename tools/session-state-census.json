@@ -1,0 +1,1350 @@
+{
+  "src/worker/backends/webgpu/buffer-upload.ts": [
+    "windowStartMs"
+  ],
+  "src/worker/backends/webgpu/d3d8/d3d8-device-adapter.ts": [
+    "static D3D8DeviceAdapter.nextSourceId"
+  ],
+  "src/worker/backends/webgpu/d3d8/d3d8-sampler.ts": [
+    "lodBiasBitsScratch",
+    "lodBiasFloatScratch"
+  ],
+  "src/worker/backends/webgpu/d3d8/ffp-vertex-synth.ts": [
+    "IDENTITY",
+    "worldViewScratch"
+  ],
+  "src/worker/backends/webgpu/d3d9/arena-pipeline-identity.ts": [
+    "identityWordCache"
+  ],
+  "src/worker/backends/webgpu/d3d9/d3d9-blend.ts": [
+    "_biasBuf",
+    "_biasView"
+  ],
+  "src/worker/backends/webgpu/d3d9/d3d9-com-objects.ts": [
+    "pixelShaderComObjects",
+    "vertexDeclComObjects",
+    "vertexShaderComObjects"
+  ],
+  "src/worker/backends/webgpu/d3d9/d3d9-device.ts": [
+    "EMPTY_COMPARISON_SAMPLERS",
+    "FFP_CONSUMED_USAGES",
+    "FFP_IDENTITY_MATRIX",
+    "NO_GUEST_MEMORY",
+    "dwordFloatBits",
+    "dwordFloatScratch",
+    "dwordFloatValue",
+    "prefixViews"
+  ],
+  "src/worker/backends/webgpu/d3d9/d3d9-pipeline-memo.ts": [
+    "checked",
+    "firstMismatch",
+    "hits",
+    "mismatch"
+  ],
+  "src/worker/backends/webgpu/d3d9/d3d9-sampler.ts": [
+    "_bitCastF32",
+    "_bitCastU32"
+  ],
+  "src/worker/backends/webgpu/d3d9/d3d9-wasm-arena.ts": [
+    "arenaVerifyDrainEnabled",
+    "d3d9WasmArena",
+    "d3dWasmPathEnabled",
+    "wasmBlocksEnabled"
+  ],
+  "src/worker/backends/webgpu/d3d9/ffp-combiner.ts": [
+    "FFP_IMPLEMENTED_OPS"
+  ],
+  "src/worker/backends/webgpu/d3d9/ffp-lighting.ts": [
+    "D3D_ALPHALESS_FORMATS",
+    "IDENTITY4"
+  ],
+  "src/worker/backends/webgpu/d3d9/multisample.ts": [
+    "activeMsaaCapabilityContract",
+    "nextObjectId",
+    "objectIds"
+  ],
+  "src/worker/backends/webgpu/d3d9/raster-emulation.ts": [
+    "SUPPORTED_SAMPLE_COUNTS"
+  ],
+  "src/worker/backends/webgpu/d3d9/shader/census.ts": [
+    "FLOW_OPS",
+    "TEX_OPS"
+  ],
+  "src/worker/backends/webgpu/d3d9/shader/link/ffp-vertex-lighting.ts": [
+    "IDENTITY"
+  ],
+  "src/worker/backends/webgpu/d3d9/shader/link/index.ts": [
+    "samplerTypeMaskCache"
+  ],
+  "src/worker/backends/webgpu/d3d9/shader/passes/uniformity.ts": [
+    "EXPLICIT_DERIVATIVE_OPS",
+    "IMPLICIT_SAMPLE_OPS"
+  ],
+  "src/worker/backends/webgpu/d3d9/shader/sm-enums.ts": [
+    "NO_DST"
+  ],
+  "src/worker/backends/webgpu/d3d9/swvp.ts": [
+    "SWVP_SUPPORTED_OPS"
+  ],
+  "src/worker/backends/webgpu/ddraw/bind-group-manager.ts": [
+    "lodBiasBitsScratch",
+    "lodBiasFloatScratch"
+  ],
+  "src/worker/backends/webgpu/ddraw/compute/vertex-converter.ts": [
+    "diagnosticLoggedFVFs",
+    "warnedFVFs"
+  ],
+  "src/worker/backends/webgpu/ddraw/draw-cost-profiler.ts": [
+    "NESTED",
+    "drawCostProfiler"
+  ],
+  "src/worker/backends/webgpu/ddraw/dword-float.ts": [
+    "_dwordBuf",
+    "_dwordView"
+  ],
+  "src/worker/backends/webgpu/ddraw/pipeline-factory.ts": [
+    "degradedBlendStatesSeen"
+  ],
+  "src/worker/backends/webgpu/ddraw/shader-generator.ts": [
+    "FFP_D3D8_IMPLEMENTED_OPS"
+  ],
+  "src/worker/backends/webgpu/pixel-center.ts": [
+    "pixelCentreVersionF32",
+    "pixelCentreVersionU32"
+  ],
+  "src/worker/backends/webgpu/postfx/registry.ts": [
+    "COLOR_GRADE"
+  ],
+  "src/worker/backends/webgpu/shared/capability-generation.ts": [
+    "generation"
+  ],
+  "src/worker/backends/webgpu/shared/dx-format-check-log.ts": [
+    "seenOkKeys",
+    "totalCalls",
+    "verboseEnabled"
+  ],
+  "src/worker/backends/webgpu/shared/dx-format-support.ts": [
+    "BUMPMAP_FORMATS",
+    "D3D9_ONLY_FORMATS",
+    "D3D9_UNSUPPORTED_FORMATS",
+    "DEPTH_STENCIL_COMMON",
+    "DEPTH_STENCIL_D3D9_ONLY",
+    "FORMAT_CONVERSION_SOURCE_BACKBUFFERS",
+    "FORMAT_CONVERSION_TARGETS",
+    "SRGB_READ_FORMATS",
+    "SRGB_WRITE_FORMATS",
+    "SUPPORTED_FOURCC_FORMATS",
+    "refusedCreates",
+    "refusedFormats",
+    "refusedFourCCs",
+    "warnedCreates"
+  ],
+  "src/worker/backends/webgpu/shared/dxt-kernel.ts": [
+    "failure",
+    "initialization",
+    "kernel",
+    "variant"
+  ],
+  "src/worker/backends/webgpu/shared/float-format-policy.ts": [
+    "activeFloatCapabilityContract"
+  ],
+  "src/worker/backends/webgpu/shared/gpu-memory-census.ts": [
+    "instrumented",
+    "largeBuffers"
+  ],
+  "src/worker/backends/webgpu/shared/present-geometry.ts": [
+    "onChange",
+    "published"
+  ],
+  "src/worker/backends/webgpu/shared/quality-capabilities.ts": [
+    "UNIVERSAL_QUALITY_KEYS",
+    "VIDEO_QUALITY_KEYS",
+    "active",
+    "backendListeners",
+    "warnedGaps"
+  ],
+  "src/worker/backends/webgpu/shared/texture-converter.ts": [
+    "warnedUnknownFormats"
+  ],
+  "src/worker/backends/webgpu/shared/texture-formats.ts": [
+    "FLOAT32_BITS",
+    "FLOAT32_SCRATCH"
+  ],
+  "src/worker/backends/webgpu/shared/vertex-streams.ts": [
+    "instanceExpansionScratch",
+    "zeroBuffers"
+  ],
+  "src/worker/backends/webgpu/shared/volume-policy.ts": [
+    "D3D9_VOLUME_UPLOAD_FORMATS",
+    "activeVolumeCapabilityContract"
+  ],
+  "src/worker/backends/webgpu/shared/webgpu-capability-limits.ts": [
+    "activeLimits"
+  ],
+  "src/worker/backends/webgpu/webgpu-backend.ts": [
+    "OVERLAY_DEST_SCRATCH"
+  ],
+  "src/worker/core/api-registry.ts": [
+    "static APIRegistry.instance"
+  ],
+  "src/worker/core/audio/directmusic/synth.ts": [
+    "decodedWaves",
+    "preparedInstruments"
+  ],
+  "src/worker/core/audio/vfs-audio-source.ts": [
+    "EMPTY"
+  ],
+  "src/worker/core/audio/virtual-cd.ts": [
+    "MUSIC_DIR_NAMES",
+    "static VirtualCdAudio.instance"
+  ],
+  "src/worker/core/boot-timer.ts": [
+    "_dumped",
+    "_marks"
+  ],
+  "src/worker/core/child-process.ts": [
+    "CHILD_DRAIN_BUDGET_MS",
+    "active",
+    "applyChildRegistry",
+    "bootContext",
+    "childProcessHistory",
+    "nextChildBootId",
+    "nextRegistryRelay",
+    "publishSession",
+    "registryRelays",
+    "sessionFinished",
+    "unfinished"
+  ],
+  "src/worker/core/child-vfs.ts": [
+    "CHILD_VFS_CLOSE_BUDGET_MS",
+    "asyncMethods",
+    "decoder",
+    "encoder",
+    "methods",
+    "pathMethods"
+  ],
+  "src/worker/core/com/base-com-object.ts": [
+    "static ComObjectFactory.registry"
+  ],
+  "src/worker/core/com/com-memory.ts": [
+    "crossOwnerReuse",
+    "doubleFrees",
+    "freeBlocks",
+    "lifecycle",
+    "lifecycleSeq",
+    "ownerPools",
+    "poolArenaGeneration",
+    "poolArenaOwner",
+    "releasedBlocks",
+    "releasedVtableAddr",
+    "vtableLabel",
+    "vtableOwner",
+    "warnedNoTrap"
+  ],
+  "src/worker/core/com/com-ref-trace.ts": [
+    "armed",
+    "dropped",
+    "limit",
+    "opts",
+    "ring",
+    "seq"
+  ],
+  "src/worker/core/com/hle-com-registry.ts": [
+    "registrations"
+  ],
+  "src/worker/core/com/interface-registry.ts": [
+    "static InterfaceRegistry.instance"
+  ],
+  "src/worker/core/cpu/aot-cache.ts": [
+    "aotCache"
+  ],
+  "src/worker/core/cpu/cpu-views.ts": [
+    "EMPTY_I32",
+    "EMPTY_U16",
+    "EMPTY_U32",
+    "EMPTY_U8",
+    "cachedBuffer",
+    "cachedViews",
+    "growthCount",
+    "growthEvents",
+    "lastSeenBuffer",
+    "lastSeenBytes",
+    "ledgerSince"
+  ],
+  "src/worker/core/cpu/emulator-config.ts": [
+    "VIDEO_DLL_NAMES"
+  ],
+  "src/worker/core/cpu/hypercall-data.ts": [
+    "BULK_MEMORY_HANDLERS",
+    "WASM_WRITE_HANDLERS",
+    "handlerIdNames",
+    "hypercallDataManager"
+  ],
+  "src/worker/core/cpu/preemption-manager.ts": [
+    "preemptionManager"
+  ],
+  "src/worker/core/debug/dbg-commands.ts": [
+    "eaglTokenMarkState",
+    "readTlbMark",
+    "slabCanaryBand"
+  ],
+  "src/worker/core/debug/debug-session.ts": [
+    "debugSession"
+  ],
+  "src/worker/core/debug/execution-graph.ts": [
+    "executionGraph"
+  ],
+  "src/worker/core/debug/hp-freeze-watchdog.ts": [
+    "hpFreezeWatchdog"
+  ],
+  "src/worker/core/debug/io-trace-ring.ts": [
+    "ioTraceRing"
+  ],
+  "src/worker/core/debug/race-detector.ts": [
+    "raceDetector"
+  ],
+  "src/worker/core/device-cursor.ts": [
+    "activeDevice",
+    "cursors"
+  ],
+  "src/worker/core/diagnostics/api-census.ts": [
+    "HRESULT_MODULES",
+    "SILENT_STUBS",
+    "VERIFIED_PARAMETERLESS",
+    "apiCensus"
+  ],
+  "src/worker/core/diagnostics/get-proc-address-registry.ts": [
+    "getProcAddressRegistry"
+  ],
+  "src/worker/core/diagnostics/load-diagnostics.ts": [
+    "loadDiagnostics"
+  ],
+  "src/worker/core/diagnostics/module-handle-miss-registry.ts": [
+    "moduleHandleMissRegistry"
+  ],
+  "src/worker/core/diagnostics/stub-registry.ts": [
+    "stubRegistry"
+  ],
+  "src/worker/core/diagnostics/system-event-log.ts": [
+    "systemEventLog"
+  ],
+  "src/worker/core/emulator-config-manager.ts": [
+    "MULTIBYTE_CODEPAGES",
+    "decoderCache",
+    "encoderCache",
+    "static EmulatorConfig.instance"
+  ],
+  "src/worker/core/fpu-helper.ts": [
+    "_cvtBuf",
+    "_cvtF64",
+    "_cvtU32",
+    "wasmViewBuffer",
+    "wasmViewBytes",
+    "wasmViewDv"
+  ],
+  "src/worker/core/frame-pacer.ts": [
+    "framePacer"
+  ],
+  "src/worker/core/frame-profiler.ts": [
+    "frameProfiler"
+  ],
+  "src/worker/core/frame-spike-classes.ts": [
+    "PARK_THUNKS"
+  ],
+  "src/worker/core/frame-variance-diagnostics.ts": [
+    "frameVarianceDiagnostics"
+  ],
+  "src/worker/core/gamma-service.ts": [
+    "gammaService"
+  ],
+  "src/worker/core/gpu-error-log.ts": [
+    "distinctDropped",
+    "forwarder",
+    "messages"
+  ],
+  "src/worker/core/gpu/gpu-device-lifecycle.ts": [
+    "gpuDeviceLifecycle"
+  ],
+  "src/worker/core/gpu/gpu-device-loss-contract.ts": [
+    "acknowledged",
+    "lostCount",
+    "sources"
+  ],
+  "src/worker/core/guest-time-steps.ts": [
+    "guestTimeSteps"
+  ],
+  "src/worker/core/hle-dll-versions.ts": [
+    "OS_VERSIONED_DLLS"
+  ],
+  "src/worker/core/hle-lib/lib-detector.ts": [
+    "lastScanMiss"
+  ],
+  "src/worker/core/hle-lib/lib-hle-manager.ts": [
+    "libHleManager"
+  ],
+  "src/worker/core/hle-lib/lib-registry.ts": [
+    "libRegistry"
+  ],
+  "src/worker/core/hle-lib/libs/eagl/descriptor.ts": [
+    "CONVERTER_PATTERN"
+  ],
+  "src/worker/core/hle-lib/libs/eagl/token-dispatch.ts": [
+    "armPollTimer",
+    "armed",
+    "cfgAddr",
+    "cfgGeneration",
+    "class6DeclineByDesc",
+    "class6DeclineLastMode",
+    "class6DeclineProbe",
+    "class6Declines",
+    "structuralBailDone",
+    "tokenTableBase"
+  ],
+  "src/worker/core/hle-lib/libs/psx-adpcm/kernel.ts": [
+    "coefTables",
+    "scratch"
+  ],
+  "src/worker/core/hle-lib/libs/zlib/descriptor.ts": [
+    "declineCount",
+    "traceCount"
+  ],
+  "src/worker/core/hle-module-images.ts": [
+    "attachHooks",
+    "exportsByLowerName",
+    "exportsByName",
+    "loadedNames",
+    "ordinalsByName",
+    "owner",
+    "ownerGeneration",
+    "redirectByAddress",
+    "retainedNames",
+    "slotByName"
+  ],
+  "src/worker/core/hle-system-catalog.ts": [
+    "FORCE_NATIVE_PACKAGE_LOAD",
+    "HLE_SYSTEM_DLL_NAMES",
+    "VIRTUAL_SYSTEM_DIRECTORY_PATHS"
+  ],
+  "src/worker/core/hooks/hook-registry.ts": [
+    "hookRegistry"
+  ],
+  "src/worker/core/hooks/native-module-patchers.ts": [
+    "dispatched",
+    "patchers"
+  ],
+  "src/worker/core/host-task.ts": [
+    "fallbackPort",
+    "fallbackQueue"
+  ],
+  "src/worker/core/lock-tracker.ts": [
+    "lockTracker"
+  ],
+  "src/worker/core/logger.ts": [
+    "Logger"
+  ],
+  "src/worker/core/memory/address-space.ts": [
+    "WRITE_MAP_FAST_KINDS"
+  ],
+  "src/worker/core/memory/fault-recorder.ts": [
+    "PREFIXES",
+    "faultRecorder"
+  ],
+  "src/worker/core/memory/guest-code.ts": [
+    "auditCovered",
+    "invalidatedBytes",
+    "invalidatedRanges",
+    "pending"
+  ],
+  "src/worker/core/memory/guest-memory.ts": [
+    "_borrowProbe",
+    "_borrows",
+    "_bypass",
+    "_lastBuffer",
+    "_lastPlain",
+    "_lastRaw",
+    "_staleGuardEnabled"
+  ],
+  "src/worker/core/memory/guest-page-commit.ts": [
+    "commitNotifier",
+    "committedProbe",
+    "resetNotifier"
+  ],
+  "src/worker/core/memory/guest-page-dirty.ts": [
+    "dirtyBits",
+    "trackedBuffer",
+    "trackedLength",
+    "trackedOffset"
+  ],
+  "src/worker/core/memory/js-write-trap.ts": [
+    "jsWriteTrap"
+  ],
+  "src/worker/core/memory/lease-registry.ts": [
+    "leaseRegistry"
+  ],
+  "src/worker/core/memory/mem-accessor.ts": [
+    "static Mem.cachedFloatMem",
+    "static Mem.cachedFloatView",
+    "static Mem.dataRoutes",
+    "static Mem.getRegion",
+    "static Mem.memoryGetter",
+    "static Mem.nextWatchHandle",
+    "static Mem.validateRange",
+    "static Mem.watchRanges"
+  ],
+  "src/worker/core/memory/mem-guard.ts": [
+    "static MemoryGuard.enabled",
+    "static MemoryGuard.mode"
+  ],
+  "src/worker/core/memory/mem-write-trap.ts": [
+    "memWriteTrap"
+  ],
+  "src/worker/core/memory/memory-event-buffer.ts": [
+    "memoryEventBuffer"
+  ],
+  "src/worker/core/memory/memory-fault.ts": [
+    "THUNK_FAULT_KINDS"
+  ],
+  "src/worker/core/memory/memory-watch.ts": [
+    "memoryWatch"
+  ],
+  "src/worker/core/memory/stack-write-guard.ts": [
+    "currentTidProvider",
+    "hitEsp",
+    "hitFound",
+    "hitHi",
+    "hitLo",
+    "hitState",
+    "hitTid",
+    "provider",
+    "scratchAddr",
+    "scratchEnd",
+    "totalViolations",
+    "violations"
+  ],
+  "src/worker/core/memory/thunk-checksum.ts": [
+    "thunkChecksumManager"
+  ],
+  "src/worker/core/module-callback-queue.ts": [
+    "nextQueue"
+  ],
+  "src/worker/core/pe-export-names.ts": [
+    "shippedExportNames"
+  ],
+  "src/worker/core/pe-import-binding.ts": [
+    "HLE_ONLY_DLLS"
+  ],
+  "src/worker/core/pe-loader.ts": [
+    "static PELoader.CRT_MATH_MODULES",
+    "static PELoader.CRT_SLAB_MODULES",
+    "static PELoader.DLL_FORCE_STUB",
+    "static PELoader.DLL_PARTIAL_HLE"
+  ],
+  "src/worker/core/pointer-policy.ts": [
+    "clipRect",
+    "exclusiveMouseOwners"
+  ],
+  "src/worker/core/process-identity.ts": [
+    "allocator",
+    "currentProcessId",
+    "parentPid"
+  ],
+  "src/worker/core/process-ipc.ts": [
+    "guestLifetimeStarted",
+    "ipc"
+  ],
+  "src/worker/core/process-network.ts": [
+    "namespace"
+  ],
+  "src/worker/core/process.ts": [
+    "static MemoryManager.largeAllocBacktraces"
+  ],
+  "src/worker/core/profiler.ts": [
+    "profiler"
+  ],
+  "src/worker/core/resources/system-resource-provider.ts": [
+    "static SystemResourceProvider.instance"
+  ],
+  "src/worker/core/scheduler/sync-objects.ts": [
+    "syncRing",
+    "syncRingWrite"
+  ],
+  "src/worker/core/scheduler/types.ts": [
+    "_validTransitions"
+  ],
+  "src/worker/core/seh-dispatch.ts": [
+    "activeCatchRecords",
+    "activeExceptions",
+    "currentThrowRecord",
+    "cxxExceptionRing",
+    "cxxSeq",
+    "sehDispatchTrace",
+    "sehDispatchWindows",
+    "sehUnwindTrace"
+  ],
+  "src/worker/core/session-state.ts": [
+    "sessionState"
+  ],
+  "src/worker/core/stats-overlay.ts": [
+    "statsOverlay"
+  ],
+  "src/worker/core/system.ts": [
+    "static System.instance"
+  ],
+  "src/worker/core/thunking/thunk-dispatcher.ts": [
+    "WBUF_NO_FENCE_MODULES",
+    "WBUF_TRANSPORT_SAFE_MODULES"
+  ],
+  "src/worker/core/thunking/winapi-call-ring.ts": [
+    "NOISY_NAMES"
+  ],
+  "src/worker/core/tools/seh-chain-repair.ts": [
+    "records"
+  ],
+  "src/worker/core/worker-time-accounting.ts": [
+    "workerTime"
+  ],
+  "src/worker/emulator.worker.ts": [
+    "__wasmTrapReported",
+    "_prefetchController",
+    "bootArgsOverride",
+    "childBoot",
+    "childFrameClock",
+    "childImageReady",
+    "childRegistryReady",
+    "childSessionTransport",
+    "childStartupGate",
+    "gameSessionActive",
+    "gdiLastGuestPresentSerial",
+    "gdiPresentDiagLogged",
+    "gdiPresentKickPending",
+    "gdiPresentRafId",
+    "heartbeatInterval",
+    "hleReady",
+    "hleReadyResolved",
+    "isPaused",
+    "lastBundlePayload",
+    "lastLoopInsn",
+    "lastLoopTick",
+    "lastMainLoopDelay",
+    "lastMainLoopDelayAtMs",
+    "loadBundleChain",
+    "loopStallTicks",
+    "networkConnecting",
+    "networkRevision",
+    "pendingBundle",
+    "pendingInheritedObjects",
+    "pendingPeData",
+    "pendingReExecArgs",
+    "pendingReExecImage",
+    "pendingReExecPatches",
+    "pendingRegistryDown",
+    "pendingStop",
+    "placeholderActive",
+    "preparedPendingBundle",
+    "reExecRequestCount",
+    "reExecRequests",
+    "registryFlushInterval",
+    "registrySaveGeneration",
+    "registrySaveTimeout",
+    "resolveChildImageReady",
+    "resolveHleReady",
+    "schedulerInterval",
+    "sessionNetworkReady",
+    "tickBeforeCount",
+    "tickHealCount"
+  ],
+  "src/worker/harness/api-breaks.ts": [
+    "apiBreaks"
+  ],
+  "src/worker/harness/audio-sleep-probe.ts": [
+    "audioSleepProbe"
+  ],
+  "src/worker/harness/break-events.ts": [
+    "breakEvents"
+  ],
+  "src/worker/harness/cmds/census.ts": [
+    "PREFIX_BYTES",
+    "armEpoch",
+    "armedAtMs",
+    "kernelMark",
+    "mark",
+    "retiredAcc",
+    "textureMark"
+  ],
+  "src/worker/harness/cmds/code-scene.ts": [
+    "EXIT_POINT_KINDS"
+  ],
+  "src/worker/harness/cmds/codegen.ts": [
+    "slots"
+  ],
+  "src/worker/harness/cmds/crossings.ts": [
+    "armed",
+    "costArea",
+    "loopPages"
+  ],
+  "src/worker/harness/cmds/dbg.ts": [
+    "auditHashes"
+  ],
+  "src/worker/harness/cmds/dispatch.ts": [
+    "armEpoch",
+    "armedAtMs",
+    "mark",
+    "retiredAcc"
+  ],
+  "src/worker/harness/cmds/fadeprobe.ts": [
+    "armed",
+    "lastTexture",
+    "matches",
+    "opts",
+    "samples"
+  ],
+  "src/worker/harness/cmds/idle.ts": [
+    "mark"
+  ],
+  "src/worker/harness/cmds/input.ts": [
+    "RECORDABLE_INPUT",
+    "pendingRelease"
+  ],
+  "src/worker/harness/cmds/io.ts": [
+    "mark"
+  ],
+  "src/worker/harness/cmds/logs.ts": [
+    "logMarks"
+  ],
+  "src/worker/harness/cmds/perf.ts": [
+    "countedRanges",
+    "countedWindow",
+    "windowBaseline"
+  ],
+  "src/worker/harness/cmds/render-boundary.ts": [
+    "mark"
+  ],
+  "src/worker/harness/cmds/time.ts": [
+    "virtualTimeSourcesBusy"
+  ],
+  "src/worker/harness/cmds/transitions.ts": [
+    "region",
+    "sentinel",
+    "states"
+  ],
+  "src/worker/harness/commands.ts": [
+    "installed"
+  ],
+  "src/worker/harness/dlg.ts": [
+    "CLICKABLE_CLASSES"
+  ],
+  "src/worker/harness/eip-breaks.ts": [
+    "eipBreaks"
+  ],
+  "src/worker/harness/event-bus.ts": [
+    "harnessBus"
+  ],
+  "src/worker/harness/guest-trace.ts": [
+    "guestTrace"
+  ],
+  "src/worker/harness/log-hub.ts": [
+    "logHub"
+  ],
+  "src/worker/harness/recorder.ts": [
+    "recorder"
+  ],
+  "src/worker/harness/service.ts": [
+    "NEEDS_LIVE_GUEST",
+    "harnessService"
+  ],
+  "src/worker/harness/symbol-map.ts": [
+    "symbolMap"
+  ],
+  "src/worker/modules/a3d/a3d.ts": [
+    "KNOWN_A3D_IIDS"
+  ],
+  "src/worker/modules/audio-stats-sab.ts": [
+    "masterStatsSab",
+    "statsSab"
+  ],
+  "src/worker/modules/avifil32.ts": [
+    "nextAviFileHandle",
+    "nextAviHandle"
+  ],
+  "src/worker/modules/crt-cbsearch.ts": [
+    "sharedBsearchCodeAddr",
+    "sharedBsearchGeneration"
+  ],
+  "src/worker/modules/crt-file-codec.ts": [
+    "fileDecoders",
+    "reversePages"
+  ],
+  "src/worker/modules/crt-qsort.ts": [
+    "sharedQsortCodeAddr",
+    "sharedQsortGeneration"
+  ],
+  "src/worker/modules/crt-scanf.ts": [
+    "warnedUnsupported"
+  ],
+  "src/worker/modules/d3d8/device-lifecycle.ts": [
+    "deviceInScene"
+  ],
+  "src/worker/modules/d3d8/factory.ts": [
+    "loggedD3D8AdapterIdentifier"
+  ],
+  "src/worker/modules/d3d8/resources.ts": [
+    "createResourcesExports.bitmapLockReadOnly",
+    "createResourcesExports.mipScratchBuffers"
+  ],
+  "src/worker/modules/d3d8/shared-state.ts": [
+    "comRefCounts",
+    "deviceBackBufferSurfaces",
+    "deviceBoundDepthStencil",
+    "deviceClipStatus",
+    "deviceRenderTargetOverride",
+    "deviceWindowed",
+    "devices",
+    "implicitDepthStencils",
+    "resourceToDevice",
+    "surfaceInfo",
+    "textureD3DFormat",
+    "textureLevelSurfaces",
+    "textureMeta",
+    "vtables"
+  ],
+  "src/worker/modules/d3d8/state.ts": [
+    "loggedViewportOverflow"
+  ],
+  "src/worker/modules/d3d9/caps.ts": [
+    "BASE_CAPS9_MAX_TEXTURE_ASPECT_RATIO",
+    "BASE_CAPS9_MAX_TEXTURE_HEIGHT",
+    "BASE_CAPS9_MAX_TEXTURE_WIDTH"
+  ],
+  "src/worker/modules/d3d9/com-refs.ts": [
+    "bindingRefsHeld",
+    "comBindingRefs",
+    "comDisposers",
+    "comFinalizers",
+    "comParents",
+    "comRefCounts",
+    "guestStoreLive",
+    "guestStorePinned",
+    "guestUnreadable",
+    "oracleChecked",
+    "oracleFirst",
+    "oracleMismatch",
+    "parentDetached"
+  ],
+  "src/worker/modules/d3d9/d3d9-perf.ts": [
+    "apiMuted",
+    "droppedDrawTotal",
+    "ffpAlphaOps",
+    "ffpColorOps",
+    "materialEverSet",
+    "rbAuditArmed",
+    "rbEpoch",
+    "rbFrames",
+    "rbLedgerBytes",
+    "rbLedgerWrites",
+    "rbPatchedWriteBuffer",
+    "rbPatchedWriteTexture",
+    "rbQueriesServed",
+    "rbQueueBytes",
+    "rbQueueWrites",
+    "rbRing",
+    "rbRingSerial",
+    "rbSlot",
+    "rbTotals",
+    "stateBlockByType",
+    "stateBlockOps",
+    "warnedDropReasons"
+  ],
+  "src/worker/modules/d3d9/device.ts": [
+    "createDeviceExports.colorFillDropped",
+    "createDeviceExports.stretchRectFailures",
+    "resetRefusalLogged",
+    "rtFastPathGeneration"
+  ],
+  "src/worker/modules/d3d9/ex.ts": [
+    "extendedD3D9Objects",
+    "extendedDevices",
+    "maxFrameLatencies"
+  ],
+  "src/worker/modules/d3d9/guest-addref-stub.ts": [
+    "boundDispatcher",
+    "checked",
+    "displaced",
+    "firstDisplaced",
+    "firstMismatch",
+    "mismatch",
+    "mode",
+    "pendingVtable",
+    "unpredicted"
+  ],
+  "src/worker/modules/d3d9/guest-release-stub.ts": [
+    "RING_BARRIER_INTERFACES",
+    "boundDispatcher",
+    "checked",
+    "displaced",
+    "firstDisplaced",
+    "firstMismatch",
+    "installedIface",
+    "mismatch",
+    "mode",
+    "pendingVtable",
+    "unpredicted",
+    "zeroChecked",
+    "zeroMismatch"
+  ],
+  "src/worker/modules/d3d9/query-manager.ts": [
+    "TRANSIENT_FALLBACK_REASONS"
+  ],
+  "src/worker/modules/d3d9/query.ts": [
+    "deviceSubmissionSerial",
+    "queries",
+    "reportedRemoteQueryErrors"
+  ],
+  "src/worker/modules/d3d9/render-state-class.ts": [
+    "CLASS",
+    "NAMES",
+    "unclassifiedCounts",
+    "unclassifiedTotal"
+  ],
+  "src/worker/modules/d3d9/resource-contract.ts": [
+    "opaqueUnknownRefs",
+    "priorities",
+    "privateData"
+  ],
+  "src/worker/modules/d3d9/resource-ids.ts": [
+    "bits",
+    "hits",
+    "idCapacity",
+    "idKind",
+    "idPtr",
+    "invalidated",
+    "keys",
+    "kindMismatch",
+    "mask",
+    "minted",
+    "misses",
+    "nextId",
+    "probeMissing",
+    "probes",
+    "rehashes",
+    "staleHits",
+    "used",
+    "vals"
+  ],
+  "src/worker/modules/d3d9/resource-registry.ts": [
+    "cubeFaceSurfaces",
+    "deviceBackBufferSurfaces",
+    "deviceBoundDepthStencil",
+    "deviceBoundRenderTarget",
+    "deviceSlotRefs",
+    "indexBufferMeta",
+    "surfaceDescWords",
+    "surfaceMeta",
+    "textureLevelSurfaces",
+    "textureMeta",
+    "vertexBufferMeta"
+  ],
+  "src/worker/modules/d3d9/resources.ts": [
+    "GETDC_COMPATIBLE_FORMATS",
+    "activeBufferLocks",
+    "activeCubeLocks",
+    "activeLockReadOnly",
+    "createResourcesExports.AUTOGEN_BYTE_FORMAT_BPP",
+    "createResourcesExports.baseTextureState",
+    "cubeTextureFactory"
+  ],
+  "src/worker/modules/d3d9/shader-validator.ts": [
+    "validators"
+  ],
+  "src/worker/modules/d3d9/shared-state.ts": [
+    "d3d9TextureUploads",
+    "deviceClipStatus",
+    "deviceToD3D9",
+    "devices",
+    "resourceToDevice",
+    "splitReplayDepth",
+    "stateBlocks",
+    "twinStateBlocks",
+    "vtables"
+  ],
+  "src/worker/modules/d3d9/split.ts": [
+    "FENCES",
+    "READBACK_FENCES",
+    "UNSUPPORTED",
+    "blockPointers",
+    "stream"
+  ],
+  "src/worker/modules/d3d9/state-block-shadow-window.ts": [
+    "elided",
+    "openWindows",
+    "windows"
+  ],
+  "src/worker/modules/d3d9/state.ts": [
+    "createStateExports.processVerticesWarned",
+    "createStateExports.recordingDevices"
+  ],
+  "src/worker/modules/d3d9/swapchain.ts": [
+    "deviceChains",
+    "devicePresentation",
+    "records",
+    "surfaceChains"
+  ],
+  "src/worker/modules/d3d9/texture-write-log.ts": [
+    "textureWriteLog"
+  ],
+  "src/worker/modules/d3d9/volume-resources.ts": [
+    "volumeLevelObjects",
+    "volumeLevelParents",
+    "volumeTextureResources"
+  ],
+  "src/worker/modules/d3d9/volume.ts": [
+    "createVolumeExports.baseTextureState",
+    "volumeLockFlags",
+    "volumeTextureFactory"
+  ],
+  "src/worker/modules/d3dx9/buffer.ts": [
+    "bufferVtable",
+    "buffers"
+  ],
+  "src/worker/modules/d3dx9/compile-shader.ts": [
+    "profileStrings",
+    "warnedLegacy"
+  ],
+  "src/worker/modules/d3dx9/constant-table.ts": [
+    "tableVtable",
+    "tables"
+  ],
+  "src/worker/modules/d3dx9/effect-apply.ts": [
+    "deferredByInstance",
+    "expressionResult",
+    "expressionScratch",
+    "parametersByName",
+    "pointerScratch",
+    "preshaders",
+    "shaderCaches",
+    "warnedOnce",
+    "zeroUploadCensus"
+  ],
+  "src/worker/modules/d3dx9/effect-pool.ts": [
+    "groupOf",
+    "poolVtable",
+    "pools"
+  ],
+  "src/worker/modules/d3dx9/effect-preshader.ts": [
+    "argScratch",
+    "indexScratch",
+    "lastError"
+  ],
+  "src/worker/modules/d3dx9/effect-shader-preshader.ts": [
+    "noFloatOutput",
+    "noGuestMemory"
+  ],
+  "src/worker/modules/d3dx9/effect-state.ts": [
+    "effectStampCounter",
+    "instances",
+    "objectParamStamps",
+    "valueBlockStamps"
+  ],
+  "src/worker/modules/d3dx9/effect-values.ts": [
+    "paramWriteCensus",
+    "pendingSourceCaller",
+    "pendingSourcePtr",
+    "writtenParams"
+  ],
+  "src/worker/modules/d3dx9/effects.ts": [
+    "HANDLE_RETURNING",
+    "createEffectExports.annotationReads",
+    "createEffectExports.annotationViews",
+    "createEffectExports.guestStrings",
+    "createEffectExports.scratch",
+    "createEffectExports.shaderBytes",
+    "dumpSeq",
+    "effectAnnotationReadCensus",
+    "effectVtable",
+    "loggedSkipLists",
+    "warnedNoSaveState"
+  ],
+  "src/worker/modules/d3dx9/image-decode.ts": [
+    "NUMERIC_FOURCC_FORMATS"
+  ],
+  "src/worker/modules/d3dx9/index.ts": [
+    "warnedStubs"
+  ],
+  "src/worker/modules/d3dx9/math.ts": [
+    "f32ScratchBuffer",
+    "f32ScratchF32",
+    "f32ScratchU32"
+  ],
+  "src/worker/modules/d3dx9/shader-asm.ts": [
+    "BLOCK_CLOSE",
+    "BLOCK_OPEN"
+  ],
+  "src/worker/modules/d3dx9/shaders.ts": [
+    "warnedColorCode",
+    "warnedNoCtab"
+  ],
+  "src/worker/modules/d3dx9/textures.ts": [
+    "infoAnswersLogged",
+    "substitutedFormats"
+  ],
+  "src/worker/modules/dpnet/executor.ts": [
+    "executors"
+  ],
+  "src/worker/modules/dpnet/send-operations.ts": [
+    "pools"
+  ],
+  "src/worker/modules/dpnlobby/broker.ts": [
+    "brokers"
+  ],
+  "src/worker/modules/dpnlobby/peer-bridge.ts": [
+    "providers"
+  ],
+  "src/worker/modules/ffmpeg/avcodec-abi.ts": [
+    "lastRefusal"
+  ],
+  "src/worker/modules/ffmpeg/native-patch.ts": [
+    "state"
+  ],
+  "src/worker/modules/galaxy/gog-sdk.ts": [
+    "ZERO_SRET",
+    "apiInitialized",
+    "galaxyInstance",
+    "lastCallFailed",
+    "singletons",
+    "slotReturns",
+    "stringPool",
+    "vtables"
+  ],
+  "src/worker/modules/galaxy/playback.ts": [
+    "ringBuffers"
+  ],
+  "src/worker/modules/glide2x/draw.ts": [
+    "floatBitsBuffer",
+    "floatBitsView",
+    "triRing",
+    "triRingCount",
+    "vertexFloats"
+  ],
+  "src/worker/modules/glide2x/fast-path.ts": [
+    "triF32",
+    "triScratch",
+    "triU32"
+  ],
+  "src/worker/modules/glide2x/frame-capture.ts": [
+    "armed",
+    "pending",
+    "withVertices"
+  ],
+  "src/worker/modules/glide2x/hardware.ts": [
+    "createHardwareExports.hwConfigView"
+  ],
+  "src/worker/modules/glide2x/lfb.ts": [
+    "lfbInfoView"
+  ],
+  "src/worker/modules/glide2x/presenter.ts": [
+    "EXPAND_5",
+    "EXPAND_6",
+    "lut16ByMode"
+  ],
+  "src/worker/modules/glide2x/state.ts": [
+    "floatReinterpretBuffer",
+    "floatReinterpretView"
+  ],
+  "src/worker/modules/glide2x/texture.ts": [
+    "texFloatBitsBuffer",
+    "texFloatBitsView",
+    "texInfoView"
+  ],
+  "src/worker/modules/glu32.ts": [
+    "_dv",
+    "_dvBuf",
+    "_tempMat",
+    "nextQuadricId",
+    "quadrics"
+  ],
+  "src/worker/modules/iphlpapi.ts": [
+    "ZERO_BLOCK"
+  ],
+  "src/worker/modules/msvfw32-mciwnd.ts": [
+    "states"
+  ],
+  "src/worker/modules/msvfw32.ts": [
+    "nextDrawDibHandle"
+  ],
+  "src/worker/modules/openal/openal.ts": [
+    "audioIdCounter"
+  ],
+  "src/worker/modules/openal/spatial.ts": [
+    "listenerViews"
+  ],
+  "src/worker/modules/opengl32/client-arrays.ts": [
+    "_cvaIdx",
+    "_cvaStage",
+    "_gatherScratch",
+    "_idxMax",
+    "_idxMin",
+    "_indexScratch",
+    "_mvpScratch",
+    "_views",
+    "_viewsBuffer",
+    "_viewsOffset"
+  ],
+  "src/worker/modules/opengl32/frame-capture.ts": [
+    "armed",
+    "last"
+  ],
+  "src/worker/modules/opengl32/immediate.ts": [
+    "_f32ab",
+    "_f32dv",
+    "_mvpScratch",
+    "transformDiagCount"
+  ],
+  "src/worker/modules/opengl32/matrix.ts": [
+    "_f32ab",
+    "_f32dv",
+    "_mulResult",
+    "_tempMat"
+  ],
+  "src/worker/modules/opengl32/query.ts": [
+    "queryWarned"
+  ],
+  "src/worker/modules/opengl32/state.ts": [
+    "KNOWN_CAPS",
+    "_f32ab",
+    "_f32dv",
+    "_f64ab",
+    "_f64dv",
+    "warned"
+  ],
+  "src/worker/modules/opengl32/texture.ts": [
+    "_f32ab",
+    "_f32dv",
+    "createTextureExports.texUploadDiagCount"
+  ],
+  "src/worker/modules/opengl32/wgl.ts": [
+    "createWglExports.contexts",
+    "createWglExports.currentHdc",
+    "createWglExports.currentHglrc",
+    "createWglExports.nextHglrc",
+    "createWglExports.threadBindings"
+  ],
+  "src/worker/modules/quartz/com-objects.ts": [
+    "static FilterGraphObject.nextAudioId"
+  ],
+  "src/worker/modules/win32-text.ts": [
+    "gdiMetricsCache",
+    "metricProbeCtx"
+  ],
+  "src/worker/modules/wsa-actor-kernel.ts": [
+    "cached",
+    "mutable",
+    "omitted",
+    "operations"
+  ],
+  "src/worker/modules/wsa-actor-table.ts": [
+    "commands"
+  ],
+  "src/worker/modules/wsa-actor-worker.ts": [
+    "started"
+  ],
+  "src/worker/modules/wsa-stub-shared.ts": [
+    "LOOPBACK_ADDR_BYTES"
+  ],
+  "src/worker/net/configure-netplay.ts": [
+    "currentState"
+  ],
+  "src/worker/net/lan-network.ts": [
+    "IPX_NETNUM",
+    "lanNetwork"
+  ],
+  "src/worker/net/relay-link.ts": [
+    "clientIds"
+  ],
+  "src/worker/render/d3d9-render-client.ts": [
+    "client",
+    "renderWorkerFailed"
+  ],
+  "src/worker/render/d3d9-render-worker.ts": [
+    "argCounts",
+    "chain",
+    "gpuSnapshot",
+    "handlerTable",
+    "handlersByName",
+    "makeTwin",
+    "pendingGpuErrors",
+    "perfSnapshot",
+    "presentCanvas",
+    "queryDrainScheduled",
+    "renderBackend",
+    "replayer",
+    "unknownIds"
+  ],
+  "src/worker/runtime/archive/unpack-buffered.ts": [
+    "initPromise"
+  ],
+  "src/worker/runtime/boot-status.ts": [
+    "active",
+    "lastName",
+    "lastPostTs"
+  ],
+  "src/worker/runtime/desktop-background.ts": [
+    "desktopBackground"
+  ],
+  "src/worker/runtime/dialog-bridge.ts": [
+    "nextId",
+    "pending",
+    "pendingText"
+  ],
+  "src/worker/runtime/filesystem/io-read-policy.ts": [
+    "policy"
+  ],
+  "src/worker/runtime/filesystem/io-worker.ts": [
+    "ctl",
+    "data",
+    "lastDiskError",
+    "meta",
+    "runtime",
+    "shuttingDown"
+  ],
+  "src/worker/runtime/filesystem/path-policy.ts": [
+    "DEFAULT_PATH_POLICY"
+  ],
+  "src/worker/runtime/filesystem/registry.ts": [
+    "IMPLICIT_EMPTY_KEYS",
+    "VALID_REG_TYPES"
+  ],
+  "src/worker/runtime/filesystem/save-export.ts": [
+    "activeSyncProvider"
+  ],
+  "src/worker/runtime/filesystem/vfs.ts": [
+    "vfsTraceRecords"
+  ],
+  "src/worker/runtime/filesystem/wgb-build.ts": [
+    "_lzmaWasm"
+  ],
+  "src/worker/runtime/filesystem/wgb-cache.ts": [
+    "static WgbCache.cacheDir",
+    "static WgbCache.currentSource",
+    "static WgbCache.currentSourceKey",
+    "static WgbCache.lruChain"
+  ],
+  "src/worker/runtime/input/input-manager.ts": [
+    "EXTENDED_VK",
+    "MODIFIER_VK",
+    "SIDE_MODIFIER_VK"
+  ],
+  "src/worker/runtime/time.ts": [
+    "static TimeService.fastPathGetTickCount",
+    "static TimeService.fastPathQueryPerformanceCounter",
+    "static TimeService.fastPathQueryPerformanceFrequency",
+    "static TimeService.instance"
+  ],
+  "src/worker/runtime/windowing/message-queue.ts": [
+    "coalesceMouseMoveEnabled"
+  ],
+  "src/worker/tools/api-coverage.ts": [
+    "FORCE_STUB_DLLS"
+  ],
+  "src/worker/worker-handlers/audio-bridge.ts": [
+    "hostAudioStats"
+  ]
+}
