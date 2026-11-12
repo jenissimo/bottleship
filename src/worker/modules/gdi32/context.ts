@@ -631,7 +631,10 @@ export class GDIContext {
         let entry = this.windowClientBacking.get(hwnd);
         if (!entry || entry.w !== w || entry.h !== h) {
             const canvas = new OffscreenCanvas(w, h);
-            const ctx = canvas.getContext("2d") as OffscreenCanvasRenderingContext2D | null;
+            // Same kind of canvas as the DCs and the overlay it is copied from and to. A
+            // default (GPU-backed) one made every flush an upload of the client image and
+            // every GetDC that seeds from it a read-back.
+            const ctx = canvas.getContext("2d", { willReadFrequently: true }) as OffscreenCanvasRenderingContext2D | null;
             if (!ctx) return;
             entry = { canvas, ctx, x, y, w, h };
             this.windowClientBacking.set(hwnd, entry);

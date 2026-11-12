@@ -66,8 +66,9 @@ class FakeContext {
 }
 class FakeCanvas {
     context: FakeContext;
+    options: unknown;
     constructor(public width: number, public height: number) { this.context = new FakeContext(this); }
-    getContext() { return this.context; }
+    getContext(_kind?: string, options?: unknown) { this.options ??= options ?? null; return this.context; }
 }
 
 beforeEach(() => {
@@ -295,5 +296,22 @@ describe('everything else still sees the bits', () => {
         try { gdi.captureState(); } catch { /* the fake canvas cannot be serialised; the mirror runs before that */ }
         expect(gdi.contexts.stale.size).toBe(0);
         expect(rgbaAt(mem, 2, 1)).toEqual([11, 22, 33]);
+    });
+});
+
+describe('the window side of the frame', () => {
+    test('the retained client image is a read-back canvas like the DC it is copied from', () => {
+        const W = 8, H = 4, HWND = 0x10001;
+        const overlay = new FakeCanvas(W, H);
+        (gdi as any).overlayCanvas = overlay; (gdi as any).overlayCtx = overlay.context;
+        const window = memoryDc(W, H);
+        gdi.attachWindowBlit(window, 0, 0, W, H);
+        ctxOf(window).fillStyle = 'rgb(7, 8, 9)'; ctxOf(window).fillRect(0, 0, W, H);
+        gdi.markDirty(window);
+        expect(gdi.flushWindowMemoryDCToOverlay(window, [], HWND, null)).toBe(true);
+        const backing = gdi.getWindowClientBackingCanvas(HWND) as unknown as FakeCanvas;
+        expect(backing.options).toEqual({ willReadFrequently: true });
+        expect([...backing.context.pixels.subarray(0, 3)]).toEqual([7, 8, 9]);
+        expect([...overlay.context.pixels.subarray(0, 3)]).toEqual([7, 8, 9]);
     });
 });
