@@ -7,6 +7,8 @@ import { ModuleRegistry, type LoadedPEModule } from "../../src/worker/core/modul
 import { System } from "../../src/worker/core/system";
 import { ThunkGenerator } from "../../src/worker/core/thunking/thunk-generator";
 import { registerNativeModulePatcher } from "../../src/worker/core/hooks/native-module-patchers";
+import { libHleManager } from "../../src/worker/core/hle-lib/lib-hle-manager";
+import { NATIVE_LEAVES } from "../../src/worker/core/hle-lib/native-leaves";
 import type { VirtualFileSystem } from "../../src/worker/runtime/filesystem/vfs";
 import { exports as kernel32, captureModuleRefs, restoreModuleRefs } from "../../src/worker/modules/kernel32/module/module";
 import {
@@ -568,6 +570,36 @@ describe("what a savestate still cannot carry is refused by name at capture", ()
         for (const m of [on, off]) expect([m.name, Boolean(m.contentHash) !== Boolean(m.unsaved)]).toEqual([m.name, true]);
         const boot = a.registry.getByName("boot.dll")!;
         expect([boot.contentHash, boot.unsaved]).toEqual([undefined, undefined]);
+    });
+
+    test("a CRT leaf replaced in place is guest code in the saved RAM: the image stays saveable and comes back replaced", async () => {
+        const leaf = NATIVE_LEAVES[0]!;
+        const LEAF_RVA = 0x1a00;
+        const withLeaf = image({ imports: "GetTickCount", tag: 7 });
+        withLeaf.set(leaf.body, LEAF_RVA - 0x1000 + 0x200);
+        const a = await booted({ ...FILES(), "C:\\APP\\plugin.dll": withLeaf });
+        const manager = libHleManager as unknown as { init: unknown };
+        const before = manager.init;
+        libHleManager.initialize({ dispatcher: {}, thunkGenerator: a.generator, getMemory: () => a.memory } as never);
+        try {
+            const plugin = (await a.loader.loadDll("plugin.dll"))!;
+            const at = plugin.baseAddress + LEAF_RVA;
+            expect(libHleManager.getNativeLeafSites().map(s => [s.name, s.address])).toContainEqual([leaf.name, at]);
+            expect([...a.memory.subarray(at, at + leaf.replacement.length)]).toEqual([...leaf.replacement]);
+            expect(plugin.unsaved).toBeUndefined();
+            expect(plugin.contentHash).toBeDefined();
+            const { state } = capture(a);
+
+            const b = await booted({ ...FILES(), "C:\\APP\\plugin.dll": withLeaf });
+            b.memory.set(a.memory);
+            await restoreInto(b, state);
+            expect(b.registry.getByBase(plugin.baseAddress)!.name).toBe("plugin");
+            expect([...b.memory.subarray(at, at + leaf.replacement.length)]).toEqual([...leaf.replacement]);
+            expect(snapshot(b)).toBe(bytes(state));
+        } finally {
+            libHleManager.resetOnGameSwitch();
+            manager.init = before;
+        }
     });
 
     test("the same hook on a start image is not a refusal", async () => {
