@@ -47,6 +47,22 @@ export interface ColorKeyBlitConfig {
  * - vec4f colorKeyHigh: r, g, b, unused (16 bytes)
  */
 const UNIFORM_SIZE = 48;
+const UNIFORM_FLOATS = UNIFORM_SIZE / 4;
+
+/**
+ * Blits between two submits each read their own slot of the uniform ring, addressed by a
+ * dynamic offset. A slot is written again RING_SLOTS blits later, so no more than that many
+ * blits may sit in unsubmitted encoders at once. Both callers submit after every blit today.
+ */
+const RING_SLOTS = 256;
+
+/** Epsilon for colorkey comparison (1/255 for quantization tolerance). */
+const COLOR_KEY_EPSILON = 1.0 / 255.0;
+
+interface CachedBindGroups {
+    point: GPUBindGroup | null;
+    linear: GPUBindGroup | null;
+}
 
 /**
  * Colorkey blit pipeline manager.
@@ -68,6 +84,17 @@ export class ColorKeyBlitPipeline {
     private uniformBuffer: GPUBuffer | null = null;
     private vertexBuffer: GPUBuffer | null = null;
 
+    /** Byte distance between two ring slots: UNIFORM_SIZE rounded up to the device's
+     *  uniform offset alignment. */
+    private slotStride = 256;
+    private nextSlot = 0;
+    /** One blit's uniforms; written to the ring slot and reused by the next blit. */
+    private readonly uniformScratch = new Float32Array(UNIFORM_FLOATS);
+    private readonly dynamicOffset = [0];
+    /** Bind groups by source view. They hold the view, so the map must not: an entry
+     *  goes when the surface's view is replaced or destroyed. */
+    private bindGroups = new WeakMap<GPUTextureView, CachedBindGroups>();
+
     constructor(device: GPUDevice, queue: GPUQueue) {
         this.device = device;
         this.queue = queue;
@@ -86,7 +113,7 @@ export class ColorKeyBlitPipeline {
                 {
                     binding: 0,
                     visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                    buffer: { type: "uniform" },
+                    buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: UNIFORM_SIZE },
                 },
                 // binding 1: source texture
                 {
@@ -122,9 +149,12 @@ export class ColorKeyBlitPipeline {
             addressModeV: "clamp-to-edge",
         });
 
-        // Create uniform buffer
+        // Uniform ring: one slot per blit, so blits recorded into the same encoder do not
+        // share (and overwrite) their parameters.
+        const alignment = Math.max(1, this.device.limits?.minUniformBufferOffsetAlignment ?? 256);
+        this.slotStride = Math.ceil(UNIFORM_SIZE / alignment) * alignment;
         this.uniformBuffer = this.device.createBuffer({
-            size: UNIFORM_SIZE,
+            size: this.slotStride * RING_SLOTS,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -203,36 +233,25 @@ export class ColorKeyBlitPipeline {
 
         const pipeline = this.getPipelineForFormat(config.dstFormat);
 
-        // Calculate normalized UV coordinates for source texture sampling
-        const srcU0 = config.srcRect.left / config.srcWidth;
-        const srcV0 = config.srcRect.top / config.srcHeight;
-        const srcU1 = config.srcRect.right / config.srcWidth;
-        const srcV1 = config.srcRect.bottom / config.srcHeight;
+        // This blit's uniforms, in its own ring slot.
+        const u = this.uniformScratch;
+        // srcRect (UV coordinates)
+        u[0] = config.srcRect.left / config.srcWidth;
+        u[1] = config.srcRect.top / config.srcHeight;
+        u[2] = config.srcRect.right / config.srcWidth;
+        u[3] = config.srcRect.bottom / config.srcHeight;
+        // colorKeyLow (r, g, b, epsilon)
+        u[4] = config.colorKeyLow.r; u[5] = config.colorKeyLow.g; u[6] = config.colorKeyLow.b;
+        u[7] = COLOR_KEY_EPSILON;
+        // colorKeyHigh (r, g, b, enableFlag)
+        u[8] = config.colorKeyHigh.r; u[9] = config.colorKeyHigh.g; u[10] = config.colorKeyHigh.b;
+        u[11] = config.enableColorKey !== false ? 1 : 0;
+        const offset = this.nextSlot * this.slotStride;
+        this.nextSlot = (this.nextSlot + 1) % RING_SLOTS;
+        this.queue.writeBuffer(this.uniformBuffer, offset, u);
+        this.dynamicOffset[0] = offset;
 
-        // Epsilon for colorkey comparison (1/255 for quantization tolerance)
-        const epsilon = 1.0 / 255.0;
-
-        // Write uniform data
-        const enableColorKey = config.enableColorKey !== false;
-        const uniformData = new Float32Array([
-            // srcRect (UV coordinates)
-            srcU0, srcV0, srcU1, srcV1,
-            // colorKeyLow (r, g, b, epsilon)
-            config.colorKeyLow.r, config.colorKeyLow.g, config.colorKeyLow.b, epsilon,
-            // colorKeyHigh (r, g, b, enableFlag)
-            config.colorKeyHigh.r, config.colorKeyHigh.g, config.colorKeyHigh.b, enableColorKey ? 1 : 0,
-        ]);
-        this.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
-
-        // Create bind group for this blit
-        const bindGroup = this.device.createBindGroup({
-            layout: this.bindGroupLayout,
-            entries: [
-                { binding: 0, resource: { buffer: this.uniformBuffer } },
-                { binding: 1, resource: config.srcView },
-                { binding: 2, resource: config.filter === "linear" ? this.linearSampler : this.pointSampler },
-            ],
-        });
+        const bindGroup = this.bindGroupFor(config.srcView, config.filter === "linear");
 
         // Begin render pass with loadOp: "load" to preserve existing destination pixels
         const renderPass = encoder.beginRenderPass({
@@ -246,7 +265,7 @@ export class ColorKeyBlitPipeline {
         });
 
         renderPass.setPipeline(pipeline);
-        renderPass.setBindGroup(0, bindGroup);
+        renderPass.setBindGroup(0, bindGroup, this.dynamicOffset);
         renderPass.setVertexBuffer(0, this.vertexBuffer);
 
         // Set viewport and scissor to destination rect for correct clipping
@@ -276,6 +295,26 @@ export class ColorKeyBlitPipeline {
         );
     }
 
+    private bindGroupFor(srcView: GPUTextureView, linear: boolean): GPUBindGroup {
+        let cached = this.bindGroups.get(srcView);
+        if (!cached) {
+            cached = { point: null, linear: null };
+            this.bindGroups.set(srcView, cached);
+        }
+        const existing = linear ? cached.linear : cached.point;
+        if (existing) return existing;
+        const created = this.device.createBindGroup({
+            layout: this.bindGroupLayout!,
+            entries: [
+                { binding: 0, resource: { buffer: this.uniformBuffer!, size: UNIFORM_SIZE } },
+                { binding: 1, resource: srcView },
+                { binding: 2, resource: linear ? this.linearSampler! : this.pointSampler! },
+            ],
+        });
+        if (linear) cached.linear = created; else cached.point = created;
+        return created;
+    }
+
     /**
      * Release GPU resources
      */
@@ -290,6 +329,8 @@ export class ColorKeyBlitPipeline {
         }
         this.pointSampler = null;
         this.linearSampler = null;
+        // The cached bind groups reference the ring that was just destroyed.
+        this.bindGroups = new WeakMap();
         this.shaderModule = null;
         this.bindGroupLayout = null;
         this.pipelineLayout = null;
