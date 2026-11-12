@@ -234,6 +234,39 @@ function emitScissorColorClear(ctx: OpenGLContext): void {
     ctx.frameSnapshot.vertexCount += 6;
 }
 
+function setViewport(ctx: OpenGLContext, x: number, y: number, w: number, h: number): void {
+    ctx.viewportX = x;
+    ctx.viewportY = y;
+    ctx.viewportW = w;
+    ctx.viewportH = h;
+    const stream = ctx.commands;
+    const i = stream.alloc(GLDrawCommandType.VIEWPORT) * CMD_I32;
+    stream.i32[i + CI_VP_X] = x;
+    stream.i32[i + CI_VP_Y] = y;
+    stream.i32[i + CI_VP_W] = w;
+    stream.i32[i + CI_VP_H] = h;
+}
+
+/**
+ * A context made current for the first time takes its drawable's extent as viewport and
+ * scissor box (GL 1.1 spec 2.10.1 and 4.1.2: "when a GL context is first attached to a
+ * window, width and height are set to the dimensions of that window"). A title that never
+ * calls glViewport relies on exactly this. Rectangles the guest has set stay as they are:
+ * the HLE keeps one GL state for every context of the process.
+ */
+export function adoptDrawableExtent(ctx: OpenGLContext, width: number, height: number): void {
+    if (!ctx.viewportFromGuest && (ctx.viewportW !== width || ctx.viewportH !== height
+        || ctx.viewportX !== 0 || ctx.viewportY !== 0)) {
+        setViewport(ctx, 0, 0, width, height);
+    }
+    if (!ctx.scissorFromGuest) {
+        ctx.scissorX = 0;
+        ctx.scissorY = 0;
+        ctx.scissorW = width;
+        ctx.scissorH = height;
+    }
+}
+
 export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImplementation> {
     function validPixelStore(pname: number, param: number): boolean {
         const alignment = pname === GL_PACK_ALIGNMENT || pname === GL_UNPACK_ALIGNMENT;
@@ -313,23 +346,14 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
             ctx.scissorY = args[1] | 0;
             ctx.scissorW = args[2] | 0;
             ctx.scissorH = args[3] | 0;
+            ctx.scissorFromGuest = true;
             return 0;
         },
 
         // Viewport
         glViewport: (_c, _m, args) => {
-            ctx.viewportX = args[0] | 0;
-            ctx.viewportY = args[1] | 0;
-            ctx.viewportW = args[2] | 0;
-            ctx.viewportH = args[3] | 0;
-            {
-                const stream = ctx.commands;
-                const i = stream.alloc(GLDrawCommandType.VIEWPORT) * CMD_I32;
-                stream.i32[i + CI_VP_X] = ctx.viewportX;
-                stream.i32[i + CI_VP_Y] = ctx.viewportY;
-                stream.i32[i + CI_VP_W] = ctx.viewportW;
-                stream.i32[i + CI_VP_H] = ctx.viewportH;
-            }
+            setViewport(ctx, args[0] | 0, args[1] | 0, args[2] | 0, args[3] | 0);
+            ctx.viewportFromGuest = true;
             return 0;
         },
 

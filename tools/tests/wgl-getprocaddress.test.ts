@@ -22,6 +22,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { GLCommandStream } from "../../src/worker/modules/opengl32/context";
 import { createWglExports } from "../../src/worker/modules/opengl32/wgl";
 import { resolveHleExportAddress } from "../../src/worker/core/thunking/export-resolver";
 
@@ -61,8 +62,11 @@ function makeHarness(stubs: Record<string, number>, unimplemented: readonly stri
     const ctx: any = {
         process: { getCurrentMemory: () => mem, dispatcher },
         stringCache: new Map(),
+        commands: new GLCommandStream(),
     };
-    const api = createWglExports(ctx);
+    // The first wglMakeCurrent sizes the viewport from the drawable; a fixed size keeps
+    // this harness free of the window table as well.
+    const api = createWglExports(ctx, () => ({ width: 640, height: 480 }));
     const call = (name: string, ...args: number[]) =>
         (api[name]!({ esp: 0 } as any, mem, args as any) as number) >>> 0;
 

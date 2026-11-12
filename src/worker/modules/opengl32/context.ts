@@ -476,6 +476,10 @@ export interface OpenGLContext {
     viewportY: number;
     viewportW: number;
     viewportH: number;
+    /** The guest has called glViewport / glScissor. Until it does, the rectangle is the
+     *  drawable's extent, taken when a context is first made current (see wgl.ts). */
+    viewportFromGuest: boolean;
+    scissorFromGuest: boolean;
     depthRangeNear: number;
     depthRangeFar: number;
 
@@ -752,6 +756,7 @@ export function createOpenGLContext(process: Process): OpenGLContext {
         enableFlags: new Set(),
 
         viewportX: 0, viewportY: 0, viewportW: 640, viewportH: 480,
+        viewportFromGuest: false, scissorFromGuest: false,
         depthRangeNear: 0, depthRangeFar: 1,
 
         clearR: 0, clearG: 0, clearB: 0, clearA: 0,
