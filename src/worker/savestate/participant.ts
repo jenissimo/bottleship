@@ -10,6 +10,12 @@ export interface CpuOverride {
 
 export interface CaptureContext {
     ref(obj: unknown, where: string): number;
+    /**
+     * Hands an array to the save and returns the name to store in its place, as a whole string.
+     * The array is hashed and written after the guest has resumed, so it must not change once
+     * handed over: pass a copy of anything the running guest can still write. Nothing detects a
+     * violation: the save would be consistent with itself and hold bytes from after the resume.
+     */
     blob(bytes: Uint8Array): string;
     patchRam(address: number, bytes: readonly number[]): void;
     overrideCpu(regs: CpuOverride): void;

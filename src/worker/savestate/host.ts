@@ -271,12 +271,14 @@ export async function deleteSlot(slot: string): Promise<{ removedChunks: number 
 
 /**
  * `ms.paused` runs from the halt request to the guest's release, which happens once RAM is copied
- * (`ms.ramCopy`). `ms.ramHash` (hashing the copies) and `ms.store` (compressing and writing) run
- * after the release, while the guest is running again.
+ * (`ms.ramCopy`); it starts with the wait for a safe point (`ms.halt`) and the participants'
+ * preparation (`ms.prepare`), and the rest of it is the captures listed in `captureMs`. `ms.ramHash` (hashing the copies), `ms.blobHash` (hashing the arrays participants
+ * handed over that no earlier save had hashed) and `ms.store` (compressing and writing) run after
+ * the release, while the guest is running again.
  */
 export interface SaveReport {
     name: string; bytes: number; chunkBytes: number; chunkWrites: number;
-    ms: { paused: number; ramCopy: number; ramHash: number; store: number }; sections: Record<string, number>; captureMs: Record<string, number>; ram: unknown;
+    ms: { paused: number; halt: number; prepare: number; ramCopy: number; ramHash: number; blobHash: number; store: number }; sections: Record<string, number>; captureMs: Record<string, number>; ram: unknown;
 }
 
 export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, permanentBlockers: () => string[] = () => []): Promise<SaveReport> {
@@ -291,6 +293,7 @@ export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, p
         const t = target(await overlayDigest());
         const t0 = performance.now();
         const safe = await halt();
+        const haltedAt = performance.now();
         let resumedAt = 0;
         const resume = (): void => {
             if (resumedAt !== 0) return;
@@ -314,7 +317,7 @@ export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, p
         const t2 = performance.now();
         return {
             name, bytes: result.bytes.length, chunkBytes, chunkWrites: result.ram.written,
-            ms: { paused: Math.round(resumedAt - t0), ramCopy: Math.round(result.ramCopyMs), ramHash: Math.round(result.ramHashMs), store: Math.round(t2 - t1) }, sections: result.sections, captureMs: result.captureMs, ram: result.ram,
+            ms: { paused: Math.round(resumedAt - t0), halt: Math.round(haltedAt - t0), prepare: Math.round(result.prepareMs), ramCopy: Math.round(result.ramCopyMs), ramHash: Math.round(result.ramHashMs), blobHash: Math.round(result.blobHashMs), store: Math.round(t2 - t1) }, sections: result.sections, captureMs: result.captureMs, ram: result.ram,
         };
     });
 }

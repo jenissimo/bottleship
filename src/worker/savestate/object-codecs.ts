@@ -1,6 +1,6 @@
 import type { SaveValue } from './value-codec';
 import type { RestoreContext } from './participant';
-import { blobHash } from './blobs';
+import { blobHash, knownBlobHash, type PendingBlobs } from './blobs';
 
 export interface ObjectCodec<T = unknown> {
     readonly tag: string;
@@ -41,12 +41,13 @@ export interface ObjectGraph {
     blob(bytes: Uint8Array): string;
 }
 
-export function newObjectGraph(): ObjectGraph {
+export function newObjectGraph(pending?: PendingBlobs): ObjectGraph {
     const ids = new Map<unknown, number>();
     const objects: Array<[string, SaveValue]> = [];
     const blobs = new Map<string, Uint8Array>();
     const blob = (bytes: Uint8Array): string => {
-        const hash = blobHash(bytes);
+        const hash = pending ? knownBlobHash(bytes) : blobHash(bytes);
+        if (hash === undefined) return pending!.token(bytes);
         if (!blobs.has(hash)) blobs.set(hash, bytes);
         return hash;
     };
