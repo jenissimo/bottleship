@@ -77,7 +77,6 @@ test("desktop traversal keeps topmost and ordinary windows in their own groups",
     const ordinaryA = create(), ordinaryB = create();
     const topA = create(), topB = create();
     for (const hwnd of [topA, topB]) {
-        windows.get(hwnd)!.exStyle = 8;
         wm.setWindowZOrder(hwnd, -1);
     }
     expect(get(ordinaryA, 0)).toBe(ordinaryB);

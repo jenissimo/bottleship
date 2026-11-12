@@ -245,11 +245,12 @@ export function registerWindowQueryExports(exports: Record<string, ThunkImplemen
                 result = getChildZOrderSibling(hWnd, 'prev');
             } else if (uCmd === 0 /* GW_HWNDFIRST */ || uCmd === 1 /* GW_HWNDLAST */) {
                 // Owned popups have a parent field but share the desktop Z-order.
+                const wm = System.getInstance().windowManager;
+                const topmost = (wm.getWindow(hWnd)?.exStyle ?? window.exStyle ?? 0) & 0x8;
                 const siblings = (window.style & 0x40000000 /* WS_CHILD */) !== 0
                     ? windows.get(window.parent ?? 0)?.children ?? []
-                    : System.getInstance().windowManager.getZOrder().filter(hwnd =>
-                        ((windows.get(hwnd)?.exStyle ?? 0) & 0x8 /* WS_EX_TOPMOST */) ===
-                        ((window.exStyle ?? 0) & 0x8));
+                    : wm.getZOrder().filter(hwnd =>
+                        ((wm.getWindow(hwnd)?.exStyle ?? 0) & 0x8 /* WS_EX_TOPMOST */) === topmost);
                 result = siblings.length > 0 ? (uCmd === 0 ? siblings[0]! : siblings[siblings.length - 1]!) : 0;
             }
         }
