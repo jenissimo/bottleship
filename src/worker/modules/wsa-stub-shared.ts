@@ -233,8 +233,7 @@ function hostentImage(base: number, result: WsaResolvedName): Uint8Array {
     return image;
 }
 export function createDnsStubs(process: Process, setLastError: WsaErrorSetter): DnsStubs {
-    const scratch = new Map<number, { generation: number; ptr: number }>();
-    const table = getWsaProcessState(process).table;
+    const state = getWsaProcessState(process), scratch = state.buffers.hostent, table = state.table;
     const buffer = (): number => {
         const tid = System.getInstance().scheduler?.getCurrentThreadId?.() ?? 0;
         const old = scratch.get(tid);
@@ -344,22 +343,21 @@ export interface ProtoServStubs {
  * shortcut.
  */
 export function createProtoServStubs(process: Process, setLastError: (code: number) => void): ProtoServStubs {
-    let protoBufAddr = 0;
-    let servBufAddr = 0;
+    const buffers = getWsaProcessState(process).buffers;
     const PROTOENT_SCRATCH = 64;
     const SERVENT_SCRATCH = 96;
 
     const ensureProtoBuf = (): number => {
-        if (protoBufAddr) return protoBufAddr;
+        if (buffers.protoent) return buffers.protoent;
         const addr = process.memory.alloc(PROTOENT_SCRATCH, "THUNK_DATA", "rw");
-        if (addr) protoBufAddr = addr >>> 0;
-        return protoBufAddr;
+        if (addr) buffers.protoent = addr >>> 0;
+        return buffers.protoent;
     };
     const ensureServBuf = (): number => {
-        if (servBufAddr) return servBufAddr;
+        if (buffers.servent) return buffers.servent;
         const addr = process.memory.alloc(SERVENT_SCRATCH, "THUNK_DATA", "rw");
-        if (addr) servBufAddr = addr >>> 0;
-        return servBufAddr;
+        if (addr) buffers.servent = addr >>> 0;
+        return buffers.servent;
     };
 
     // protoent: +0 p_name(char*) +4 p_aliases(char**) +8 p_proto(short); struct size 12 (padded).
@@ -495,7 +493,7 @@ const NI_NAMEREQD = 0x04;
  */
 export function createAddrInfoStubs(process: Process, setLastError: WsaErrorSetter): AddrInfoStubs {
     /** head addrinfo -> every guest block allocated for that chain, in allocation order. */
-    const chains = new Map<number, number[]>();
+    const chains = getWsaProcessState(process).buffers.addrinfo;
 
     const parsePort = (service: string, hints: { socktype: number }): number | null => {
         if (!service) return 0;
@@ -754,7 +752,12 @@ function packServentInto(mem: Uint8Array, buf: number, buflen: number, entry: Se
     return total;
 }
 
+// @participant(winsock)
 let nextAsyncTaskHandle = 1;
+export function wsaAsyncTaskCounter(next?: number): number {
+    if (next !== undefined) nextAsyncTaskHandle = next;
+    return nextAsyncTaskHandle;
+}
 
 /** Task handles just need to be a nonzero, caller-opaque token — real apps only ever pass
  *  them back to WSACancelAsyncRequest or compare against the WM_* message's wParam. */
@@ -783,6 +786,7 @@ export interface AsyncLookupStubs {
     WSAAsyncGetServByName: ThunkImplementation;
     WSAAsyncGetServByPort: ThunkImplementation;
 }
+export interface WsaAsyncLookups extends AsyncLookupStubs { pending(): number[]; }
 
 /**
  * WSAAsyncGetXxx — real Winsock always hands back a nonzero task handle immediately and
@@ -793,8 +797,10 @@ export interface AsyncLookupStubs {
  * which is what the previous always-fail stubs did (task handle 0 => caller treats it as an
  * immediate startup failure instead of draining the real error via the message).
  */
-const asyncLookupStates = new WeakMap<Process, AsyncLookupStubs>();
-export function createAsyncLookupStubs(setLastError: WsaErrorSetter, owner?: Process): AsyncLookupStubs {
+// @refuse(the winsock participant refuses while an asynchronous lookup is pending or its completion is unpublished)
+const asyncLookupStates = new WeakMap<Process, WsaAsyncLookups>();
+export function wsaAsyncLookupsPending(process: Process): number[] { return asyncLookupStates.get(process)?.pending() ?? []; }
+export function createAsyncLookupStubs(setLastError: WsaErrorSetter, owner?: Process): WsaAsyncLookups {
     const process = owner ?? System.getInstance().process;
     if (process) {
         const old = asyncLookupStates.get(process);
@@ -802,6 +808,7 @@ export function createAsyncLookupStubs(setLastError: WsaErrorSetter, owner?: Pro
     }
     const table = process ? getWsaProcessState(process).table : null;
     const tasks = new Map<number, { controller: AbortController; generation: number }>();
+    const publishing = new Map<number, number>();
     const enqueue = (hWnd: number, wMsg: number, buf: number, buflen: number,
         query: (signal: AbortSignal) => Uint8Array | Promise<Uint8Array>): number => {
         if (!process || !table) { setLastError(WSAENETDOWN); return 0; }
@@ -817,7 +824,9 @@ export function createAsyncLookupStubs(setLastError: WsaErrorSetter, owner?: Pro
             const required = image?.length ?? 0;
             if (image && required > buflen) { image = undefined; error = WSAENOBUFS; }
             if (image && (!buf || !process.addressSpace.validateRange(buf, image.length, "w"))) { image = undefined; error = WSAEFAULT; }
+            publishing.set(task, process.resetGeneration);
             process.enqueueCompletion(image ? dataWrites(buf, image) : [], published => {
+                publishing.delete(task);
                 if (generation !== table.generation) return;
                 postAsyncLookupCompletion(hWnd, wMsg, task, required, published ? error : WSAEFAULT);
             });
@@ -893,7 +902,11 @@ export function createAsyncLookupStubs(setLastError: WsaErrorSetter, owner?: Pro
         tasks.delete(args[0]); request.controller.abort(); setLastError(0); return 0;
     };
     const result = { WSAAsyncGetHostByName, WSAAsyncGetHostByAddr, WSAAsyncGetProtoByName,
-        WSAAsyncGetProtoByNumber, WSAAsyncGetServByName, WSAAsyncGetServByPort, WSACancelAsyncRequest };
+        WSAAsyncGetProtoByNumber, WSAAsyncGetServByName, WSAAsyncGetServByPort, WSACancelAsyncRequest,
+        pending: () => {
+            for (const [task, generation] of publishing) if (generation !== process?.resetGeneration) publishing.delete(task);
+            return [...tasks.keys(), ...publishing.keys()];
+        } };
     if (process) asyncLookupStates.set(process, result);
     return result;
 }
@@ -948,8 +961,17 @@ export class WsaStartupCount {
     reset(): void {
         this.count = 0; this.negotiatedVersion = 0x0202;
     }
+
+    captureState(): { startups: number; version: number } {
+        return { startups: this.count, version: this.negotiatedVersion };
+    }
+
+    restoreState(startups: number, version: number): void {
+        this.count = startups; this.negotiatedVersion = version;
+    }
 }
 
+// @transient(fallback counter for exports built without a process; both modules pass the counter of their process state)
 export const wsaStartupCount = new WsaStartupCount();
 
 /** WSACleanup against a startup count, with Winsock's error reporting. */
@@ -1029,14 +1051,23 @@ export function makeSocketExports(
     return sockets;
 }
 
+export interface WsaGuestBuffers {
+    hostent: Map<number, { generation: number; ptr: number }>;
+    protoent: number;
+    servent: number;
+    addrinfo: Map<number, number[]>;
+}
 export interface WsaProcessState {
     table: WsaSocketTable;
     counter: WsaStartupCount;
+    buffers: WsaGuestBuffers;
     setError: WsaErrorSetter;
     getError(): number;
     reset(): void;
 }
+// @participant(winsock)
 const processStates = new WeakMap<Process, WsaProcessState>();
+// @transient(host view of socket handles for the kernel handle table; rebuilt on the first lookup)
 const nativeHandleProviders = new WeakMap<Process, { table: WsaSocketTable; provider: import('../core/resources/system-resource-provider').ExternalHandleProvider }>();
 /** Kernel calls can use an authenticated OS descriptor before loading a Winsock DLL. */
 export function getWsaNativeSocketTable(process: Process, socket: number): WsaSocketTable | undefined {
@@ -1089,8 +1120,12 @@ export function getWsaProcessState(process: Process): WsaProcessState {
         const tid = thread(), generation = epoch, owner = System.getInstance().scheduler, sink = table.blockingErrorSink;
         return code => { if (generation === epoch) { if (sink) sink(code); else owner.setLastErrorForThread(tid, code); } };
     };
-    const state: WsaProcessState = { table, counter, setError, getError: () => System.getInstance().scheduler.getLastError(),
-        reset: () => { epoch++; table.reset(); counter.reset(); } };
+    const buffers: WsaGuestBuffers = { hostent: new Map(), protoent: 0, servent: 0, addrinfo: new Map() };
+    const state: WsaProcessState = { table, counter, buffers, setError, getError: () => System.getInstance().scheduler.getLastError(),
+        reset: () => {
+            epoch++; table.reset(); counter.reset();
+            buffers.hostent.clear(); buffers.protoent = buffers.servent = 0; buffers.addrinfo.clear();
+        } };
     processStates.set(process, state);
     return state;
 }

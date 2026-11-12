@@ -93,6 +93,13 @@ interface SocketState {
 interface Binding { port: number; proto: number; endpoint: LanEndpoint; sockets: Set<number>; }
 export const FD_READ = 1, FD_WRITE = 2, FD_OOB = 4, FD_ACCEPT = 8, FD_CONNECT = 16, FD_CLOSE = 32;
 
+export interface WsaOpenForSavestate { count: number; open: string[]; nextHandle: number; }
+export function describeWsaSocket(handle: number, s: { af: number; type: number; state: string; local: WsaAddress | null }): string {
+    const kind = s.af === 6 ? "IPX" : s.type === 1 ? "TCP" : s.type === 2 ? "UDP" : "RAW";
+    const port = s.local ? ` port ${s.local.port}` : "";
+    const detail = s.state === "listening" ? `, listening on${port}` : s.state === "connected" || s.state === "connecting" ? `, ${s.state}` : s.local ? `, bound to${port}` : "";
+    return `socket 0x${(handle >>> 0).toString(16)} (${kind}${detail})`;
+}
 /** An issued operation may outlive its numeric handle; this lease never adds an OS handle reference. */
 export interface WsaNativeIoLease { readonly table: WsaSocketTable; release(): void; }
 export type WsaIoPurpose = "data" | "connect" | "accept" | "acceptTarget" | "disconnect" | "transmit";
@@ -239,6 +246,13 @@ export class WsaSocketTable {
         this.changed();
     }
     get generation(): number { return this.epoch; }
+    openForSavestate(): WsaOpenForSavestate {
+        const open = [...this.sockets.values()].map(s => describeWsaSocket(s.id, s));
+        return { count: open.length, open: open.slice(0, 8), nextHandle: this.nextId };
+    }
+    advanceHandles(next: number): void {
+        if (Number.isInteger(next) && next > this.nextId && next <= 0x80000000) this.nextId = next;
+    }
     /** Kernel handle I/O bypasses Winsock context attachment; direct tables already own their handles. */
     get nativeHandleView(): WsaSocketTable { return this; }
     /** Stable file-object identity for alias-scoped kernel cancellation; no handle is imported. */

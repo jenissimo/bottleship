@@ -84,7 +84,12 @@ export function publishWsaWrites(writes: readonly DeferredWrite[]): boolean {
     }
     return true;
 }
+// @refuse(the winsock participant refuses while a provider holds an unfinished overlapped request)
 const providers = new WeakMap<WsaSocketTable, WsaOverlapped>();
+export function wsaOverlappedOpenForSavestate(table: WsaSocketTable): string[] {
+    const tables = new Set([table, table.nativeHandleView]);
+    return [...tables].flatMap(key => providers.get(key)?.openForSavestate() ?? []);
+}
 export function getWsaOverlapped(table: WsaSocketTable, process: Process): WsaOverlapped {
     let provider = providers.get(table);
     if (!provider) { provider = new WsaOverlapped(table, process); providers.set(table, provider); }
@@ -96,6 +101,11 @@ export class WsaOverlapped {
     private pumpScheduled = false;
     constructor(readonly table: WsaSocketTable, readonly process: Process) {
         table.subscribe(() => this.pump());
+    }
+    openForSavestate(): string[] {
+        const hex = (value: number) => "0x" + (value >>> 0).toString(16);
+        return [...this.requests.values()].filter(r => !r.done || r.publishing || r.deferredStatus || r.waiters.length > 0)
+            .map(r => `overlapped request ${hex(r.overlapped)} on socket ${hex(r.socket)}`);
     }
     private isCurrent(request: Request): boolean {
         return request.processGeneration === this.process.resetGeneration && request.nativeGeneration === this.table.nativeIoGeneration &&

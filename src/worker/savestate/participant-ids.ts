@@ -32,6 +32,7 @@ export const PARTICIPANT_IDS = [
     'version',
     'comdlg32',
     'smackw32',
+    'winsock',
     'dispatcher',
     'loaded-modules',
     'cpu',
