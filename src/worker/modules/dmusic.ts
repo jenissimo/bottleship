@@ -50,11 +50,12 @@ import {
     CLSID_DirectMusicComposer, CLSID_DirectMusicLoader, CLSID_DirectMusicPerformance, CLSID_DirectMusicSegment,
     CLSID_DirectMusicStyle, CLSID_DirectMusicSynth, CollectionObject, ComposerObject, DirectMusicObject, DMusicObject,
     IID_IDirectMusicCollection, IID_IDirectMusicGetLoader, IID_IDirectMusicStyle, IID_IUnknown, LoadableObject,
-    LoaderObject, PerformanceObject, PortObject, SegmentObject, SegmentStateObject, StyleObject, TrackObject,
+    LoaderObject, type ObjectSource, PerformanceObject, PortObject, SegmentObject, SegmentStateObject, StyleObject, TrackObject,
 } from "./dmusic-objects";
 import { createSinkBuffer, DirectSoundSink, sinkBufferBytes, soundReference, writeWaveFormat } from "./dmusic-sink";
 import { registerDMusicParticipant } from "./dmusic-savestate";
 import { savestatesEnabled } from "../savestate/participant";
+import { sha256HexSync } from "../savestate/sha256";
 
 const S_OK = 0;
 const S_FALSE = 1;
@@ -133,6 +134,23 @@ const SYNTH_PUMP_MS = 10;
 const DEFAULT_COLLECTION_PATHS = ["C:\\WINDOWS\\SYSTEM32\\DRIVERS\\GM.DLS", "C:\\WINDOWS\\SYSTEM\\GM.DLS"];
 /** The most a loadable object reads from its stream. */
 const MAX_OBJECT_BYTES = 64 * 1024 * 1024;
+
+type FoundReference = (ref: ObjectReference) => DMusicObject | null;
+
+interface LoadPlan {
+    styles: ObjectReference[];
+    collections: ObjectReference[];
+    build(found: FoundReference): boolean;
+}
+
+function waveKey(bytes: Uint8Array): string {
+    let h1 = 0x811c9dc5, h2 = 0x9e3779b9;
+    for (let i = 0; i < bytes.length; i++) {
+        h1 = Math.imul(h1 ^ bytes[i]!, 0x01000193);
+        h2 = Math.imul(h2 ^ bytes[i]!, 0x85ebca6b) ^ (h2 >>> 13);
+    }
+    return `${bytes.length}:${h1 >>> 0}:${h2 >>> 0}`;
+}
 
 function validPointer(ptr: number, size: number, perms: "r" | "w" | "rw"): boolean {
     const mem = Mem.getView();
@@ -490,67 +508,125 @@ export class DMusic implements IModule {
         }
     }
 
+    private holdReferences(obj: LoadableObject): void {
+        if (!obj.onDestroy) {
+            obj.onDestroy = () => { for (const target of obj.references.splice(0)) target.release(); };
+        }
+    }
+
     private *loadContents(obj: LoadableObject, stream: number): GuestRoutine {
         const bytes = yield* this.readStream(stream);
         if (!bytes) return DMUS_E_LOADER_FAILEDOPEN;
         obj.loaded = false;
+        obj.source = null;
+        obj.resolved = [];
         for (const target of obj.references.splice(0)) target.release();
-        if (!obj.onDestroy) {
-            obj.onDestroy = () => { for (const target of obj.references.splice(0)) target.release(); };
-        }
-        let partial = false;
+        this.holdReferences(obj);
+        const plan = this.planLoad(obj, bytes);
+        if (typeof plan === "number") return plan;
+        const styles = yield* this.resolveReferences(stream, plan.styles, IID_IDirectMusicStyle, obj);
+        const collections = yield* this.resolveReferences(stream, plan.collections, IID_IDirectMusicCollection, obj);
+        const found: FoundReference = (ref) => styles.get(ref) ?? collections.get(ref) ?? null;
+        const partial = plan.build(found);
+        obj.resolved = [...plan.styles, ...plan.collections].map(found);
+        if (savestatesEnabled()) obj.source = { bytes };
+        obj.loaded = true;
+        Logger.log(LogCategory.COM,
+            `[DMusic] loaded ${obj.constructor.name} "${obj.identity.name || obj.fileName}" (${bytes.length} bytes)${partial ? " — partial" : ""}`);
+        return partial ? DMUS_S_PARTIALLOAD : S_OK;
+    }
 
-        const bandsOf = function* (this: DMusic, bands: Band[]): Generator<GuestCall, LoadedBand[], number> {
-            const refs = bands.flatMap((b) => b.instruments.map((i) => i.collection).filter((c): c is ObjectReference => !!c));
-            const found = yield* this.resolveReferences(stream, refs, IID_IDirectMusicCollection, obj);
-            return bands.map((band) => loadBand(band, (ref) => {
-                const collection = (found.get(ref) as CollectionObject | null | undefined)?.collection ?? null;
-                if (!collection) partial = true;
-                return collection;
-            }));
-        }.bind(this);
+    private planLoad(obj: LoadableObject, bytes: Uint8Array): LoadPlan | number {
+        let partial = false;
+        const collectionsOf = (bands: Band[]): ObjectReference[] =>
+            bands.flatMap((b) => b.instruments.map((i) => i.collection).filter((c): c is ObjectReference => !!c));
+        const loadBands = (bands: Band[], found: FoundReference): LoadedBand[] => bands.map((band) => loadBand(band, (ref) => {
+            const target = found(ref);
+            const collection = target instanceof CollectionObject ? target.collection : null;
+            if (!collection) partial = true;
+            return collection;
+        }));
 
         if (obj instanceof CollectionObject) {
             obj.collection = parseDls(bytes);
             if (!obj.collection) return DMUS_E_LOADER_FORMATNOTSUPPORTED;
             obj.identity = obj.collection.identity;
-        } else if (obj instanceof BandObject) {
-            obj.file = parseBand(bytes);
-            if (!obj.file) return DMUS_E_LOADER_FORMATNOTSUPPORTED;
-            obj.identity = obj.file.identity;
-            obj.band = (yield* bandsOf([obj.file]))[0]!;
-        } else if (obj instanceof StyleObject) {
-            obj.style = parseStyle(bytes);
-            if (!obj.style) return DMUS_E_LOADER_FORMATNOTSUPPORTED;
-            obj.identity = obj.style.identity;
-            obj.bands = yield* bandsOf(obj.style.bands);
-        } else if (obj instanceof SegmentObject) {
+            return { styles: [], collections: [], build: () => partial };
+        }
+        if (obj instanceof BandObject) {
+            const file = obj.file = parseBand(bytes);
+            if (!file) return DMUS_E_LOADER_FORMATNOTSUPPORTED;
+            obj.identity = file.identity;
+            return {
+                styles: [], collections: collectionsOf([file]),
+                build: (found) => {
+                    obj.band = loadBands([file], found)[0]!;
+                    return partial;
+                },
+            };
+        }
+        if (obj instanceof StyleObject) {
+            const style = obj.style = parseStyle(bytes);
+            if (!style) return DMUS_E_LOADER_FORMATNOTSUPPORTED;
+            obj.identity = style.identity;
+            return {
+                styles: [], collections: collectionsOf(style.bands),
+                build: (found) => {
+                    obj.bands = loadBands(style.bands, found);
+                    return partial;
+                },
+            };
+        }
+        if (obj instanceof SegmentObject) {
             const file = parseSegment(bytes);
             if (!file) return DMUS_E_LOADER_FORMATNOTSUPPORTED;
             obj.file = file;
             obj.identity = file.identity;
-            const styleRefs = file.tracks.flatMap((t) => t.kind === "style" ? t.items.map((i) => i.style) : []);
-            const styles = yield* this.resolveReferences(stream, styleRefs, IID_IDirectMusicStyle, obj);
             const bandItems = file.tracks.flatMap((t) => t.kind === "band" ? t.items : []);
-            const bands = yield* bandsOf(bandItems.map((i) => i.band));
-            const loadedByBand = new Map(bandItems.map((item, i) => [item.band, bands[i]!]));
-            obj.segment = buildSegment(file,
-                (ref) => {
-                    const style = (styles.get(ref) as StyleObject | null | undefined)?.style ?? null;
-                    if (!style) partial = true;
-                    return style;
+            return {
+                styles: file.tracks.flatMap((t) => t.kind === "style" ? t.items.map((i) => i.style) : []),
+                collections: collectionsOf(bandItems.map((i) => i.band)),
+                build: (found) => {
+                    const bands = loadBands(bandItems.map((i) => i.band), found);
+                    const loadedByBand = new Map(bandItems.map((item, i) => [item.band, bands[i]!]));
+                    const segment = buildSegment(file,
+                        (ref) => {
+                            const target = found(ref);
+                            const style = target instanceof StyleObject ? target.style : null;
+                            if (!style) partial = true;
+                            return style;
+                        },
+                        () => null);
+                    // buildSegment resolved no collections; the bands it made are replaced by the loaded ones.
+                    for (const entry of segment.bands) entry.band = loadedByBand.get(entry.band.band) ?? entry.band;
+                    obj.segment = segment;
+                    obj.tracks = file.tracks.map((t) => ({ classId: t.classId, group: t.group, object: null }));
+                    obj.commandEdits.clear();
+                    return partial;
                 },
-                () => null);
-            // buildSegment resolved no collections; the bands it made are replaced by the loaded ones.
-            for (const entry of obj.segment.bands) entry.band = loadedByBand.get(entry.band.band) ?? entry.band;
-            obj.tracks = file.tracks.map((t) => ({ classId: t.classId, group: t.group, object: null }));
-        } else {
-            return E_NOTIMPL;
+            };
         }
+        return E_NOTIMPL;
+    }
+
+    private rebuildContents(obj: LoadableObject, source: ObjectSource, bytes: Uint8Array, resolved: Array<DMusicObject | null>): boolean {
+        if (obj instanceof SegmentObject && isRiffWave(bytes)) {
+            return !!this.waveSegment(bytes, "file" in source ? null : waveKey(bytes), obj.fileName, obj);
+        }
+        if (obj instanceof SegmentObject && "file" in source) {
+            const gm = resolved[0];
+            return gm instanceof CollectionObject && !!this.midiSegment(bytes, obj.fileName, () => gm, obj);
+        }
+        const plan = this.planLoad(obj, bytes);
+        const refs = typeof plan === "number" ? [] : [...plan.styles, ...plan.collections];
+        if (typeof plan === "number" || refs.length !== resolved.length) return false;
+        const byReference = new Map(refs.map((ref, i) => [ref, resolved[i] ?? null]));
+        for (const target of resolved) if (target && !obj.references.includes(target)) obj.references.push(target);
+        this.holdReferences(obj);
+        plan.build((ref) => byReference.get(ref) ?? null);
+        obj.resolved = resolved;
         obj.loaded = true;
-        Logger.log(LogCategory.COM,
-            `[DMusic] loaded ${obj.constructor.name} "${obj.identity.name || obj.fileName}" (${bytes.length} bytes)${partial ? " — partial" : ""}`);
-        return partial ? DMUS_S_PARTIALLOAD : S_OK;
+        return true;
     }
 
     private registerObjectExports(): void {
@@ -646,6 +722,8 @@ export class DMusic implements IModule {
             defaultGmCollection: () => this.defaultGmCollection(),
             releaseDirectSound: (dm) => this.setDirectSound(dm, 0),
             wireLoader: (loader) => this.wireLoader(loader),
+            readFile: (path) => this.readSystemFile([path]),
+            rebuildContents: (obj, source, bytes, resolved) => this.rebuildContents(obj, source, bytes, resolved),
         });
     }
 
@@ -731,7 +809,7 @@ export class DMusic implements IModule {
 
     private readonly decodedWaves = new Map<string, WaveData>();
 
-    private waveSegment(bytes: Uint8Array, key: string | null, fileName: string): SegmentObject | null {
+    private waveSegment(bytes: Uint8Array, key: string | null, fileName: string, into?: SegmentObject): SegmentObject | null {
         if ((globalThis as { __dmusicWaveSegments?: boolean }).__dmusicWaveSegments === false) return null;
         let wave = key ? this.decodedWaves.get(key) ?? null : null;
         if (!wave) {
@@ -742,7 +820,7 @@ export class DMusic implements IModule {
                 this.decodedWaves.set(key, wave);
             }
         }
-        const obj = new SegmentObject();
+        const obj = into ?? new SegmentObject();
         obj.segment = PerfSegment.fromWave(wave);
         obj.identity = { objectId: "", name: fileName, versionMS: 0, versionLS: 0, hasVersion: false };
         obj.fileName = fileName;
@@ -756,30 +834,33 @@ export class DMusic implements IModule {
         if (!data || length < 12 || length > MAX_OBJECT_BYTES || !validPointer(data, length, "r")) return null;
         const bytes = Mem.readBytes(data, length);
         if (!bytes || !isRiffWave(bytes)) return null;
-        let h1 = 0x811c9dc5, h2 = 0x9e3779b9;
-        for (let i = 0; i < bytes.length; i++) {
-            h1 = Math.imul(h1 ^ bytes[i]!, 0x01000193);
-            h2 = Math.imul(h2 ^ bytes[i]!, 0x85ebca6b) ^ (h2 >>> 13);
-        }
-        return this.waveSegment(bytes, `${length}:${h1 >>> 0}:${h2 >>> 0}`, "");
+        const obj = this.waveSegment(bytes, waveKey(bytes), "");
+        if (obj && savestatesEnabled()) obj.source = { bytes: bytes.slice() };
+        return obj;
     }
 
-    private objectFromFile(loader: LoaderObject, bytes: Uint8Array, fileName: string): LoadableObject | null {
-        if (isRiffWave(bytes)) return this.waveSegment(bytes, null, fileName);
-        if (!isStandardMidiFile(bytes)) return null;
+    private objectFromFile(loader: LoaderObject, bytes: Uint8Array, fileName: string, path: string): LoadableObject | null {
+        const obj = isRiffWave(bytes) ? this.waveSegment(bytes, null, fileName)
+            : isStandardMidiFile(bytes) ? this.midiSegment(bytes, fileName, () => this.defaultCollection(loader)) : null;
+        if (obj && savestatesEnabled()) obj.source = { file: path, length: bytes.length, hash: sha256HexSync(bytes) };
+        return obj;
+    }
+
+    private midiSegment(bytes: Uint8Array, fileName: string, collection: () => CollectionObject, into?: SegmentObject): SegmentObject | null {
         const gmRef = {
             validData: DMUS_OBJ_OBJECT, classId: "", objectId: GUID_DefaultGMCollection, name: "", category: "",
             fileName: "", versionMS: 0, versionLS: 0,
         };
         const file = smfToSegment(bytes, fileName, gmRef);
         if (!file) return null;
-        const gm = this.defaultCollection(loader);
-        const obj = new SegmentObject();
+        const gm = collection();
+        const obj = into ?? new SegmentObject();
         obj.file = file;
         obj.identity = { ...file.identity };
         obj.fileName = fileName;
         obj.segment = buildSegment(file, () => null, (ref) => ref.objectId === GUID_DefaultGMCollection ? gm.collection : null);
         obj.tracks = file.tracks.map((t) => ({ classId: t.classId, group: t.group, object: null }));
+        obj.resolved = [gm];
         obj.loaded = true;
         return obj;
     }
@@ -832,7 +913,7 @@ export class DMusic implements IModule {
                 const cached = loader.cache.get(key);
                 if (cached) return this.queryInterface(cached, guidAt(a[2]! >>> 0), ppv);
                 const bytes = this.readSystemFile([full]);
-                const obj = bytes ? this.objectFromFile(loader, bytes, name) : null;
+                const obj = bytes ? this.objectFromFile(loader, bytes, name, full) : null;
                 Logger.log(LogCategory.COM, `[DMusic] system loader GetObject("${full}") -> ${obj ? "loaded" : "DMUS_E_LOADER_FAILEDOPEN"}`);
                 if (!obj) return DMUS_E_LOADER_FAILEDOPEN;
                 const hr = this.queryInterface(obj, guidAt(a[2]! >>> 0), ppv);
@@ -1476,7 +1557,12 @@ export class DMusic implements IModule {
                 // DMUS_COMMAND_PARAM { BYTE bCommand, bGrooveLevel, bGrooveRange }
                 const bytes = param ? Mem.readBytes(param, 3) : null;
                 if (!bytes) return E_POINTER;
-                return obj.segment.setCommand(a[4]! | 0, bytes[0]!, bytes[1]!, bytes[2]!) ? S_OK : DMUS_E_TRACK_NOT_FOUND;
+                const time = a[4]! | 0;
+                const edit: [number, number, number] = [bytes[0]!, bytes[1]!, bytes[2]!];
+                if (!obj.segment.setCommand(time, ...edit)) return DMUS_E_TRACK_NOT_FOUND;
+                obj.commandEdits.delete(time);
+                obj.commandEdits.set(time, edit);
+                return S_OK;
             }
             // Bands hold their instruments already; downloading them to the port is nothing more.
             if (type === GUID_Download || type === GUID_Unload) return obj.segment.bands.length > 0 ? S_OK : DMUS_E_TRACK_NOT_FOUND;

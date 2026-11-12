@@ -1,5 +1,6 @@
 import { decodeSavestate, type Savestate } from './container';
 import { referencedChunks } from './ram';
+import { savedBlobs } from './blobs';
 import type { ChunkStore } from './chunk-store';
 
 export interface Dir {
@@ -127,12 +128,18 @@ export class SlotStore {
 
     async collectGarbage(): Promise<number> {
         const manifests = [];
+        const blobs: string[] = [];
         for (const name of (await this.slots.list()).filter(n => n.endsWith(STATE))) {
             const bytes = await this.slots.read(name);
             if (!bytes) continue;
-            try { manifests.push(decodeSavestate(bytes).header.ram); } catch { return 0; }
+            try {
+                const state = decodeSavestate(bytes);
+                manifests.push(state.header.ram);
+                for (const [hash] of savedBlobs(state)) blobs.push(hash);
+            } catch { return 0; }
         }
         const keep = referencedChunks(manifests);
+        for (const hash of blobs) keep.add(hash);
         let removed = 0;
         for (const hash of await this.chunks.list()) {
             if (!keep.has(hash)) { await this.chunks.delete(hash); removed++; }

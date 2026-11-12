@@ -6,6 +6,7 @@ import {
 } from './container';
 import { encodeValue, type SaveValue } from './value-codec';
 import { CaptureRefusal, newObjectGraph, restoreObjectGraph } from './object-codecs';
+import { BLOBS, loadBlobs, missingBlobs, savedBlobs, type BlobList } from './blobs';
 
 const OBJECTS = '$objects';
 
@@ -19,6 +20,7 @@ export interface SavestateTarget {
 
 export interface CaptureRun extends CaptureContext {
     readonly objects: Array<[string, SaveValue]>;
+    readonly blobs: ReadonlyMap<string, Uint8Array>;
     readonly ramPatches: readonly RamPatch[];
 }
 
@@ -28,8 +30,10 @@ export function newCaptureRun(): CaptureRun {
     let cpu: CpuOverride | null = null;
     return {
         objects: graph.objects,
+        blobs: graph.blobs,
         ramPatches,
         ref: (obj, where) => graph.ref(obj, where),
+        blob: (bytes) => graph.blob(bytes),
         patchRam: (address, bytes) => { ramPatches.push({ address, bytes: [...bytes] }); },
         overrideCpu: (regs) => {
             if (cpu) throw new CaptureRefusal('savestate: two threads claim the live CPU');
@@ -43,6 +47,7 @@ export interface CaptureResult {
     bytes: Uint8Array;
     manifest: RamManifest;
     pending: Map<string, Uint8Array>;
+    blobs: BlobList;
     ram: RamCaptureStats;
     sections: Record<string, number>;
     captureMs: Record<string, number>;
@@ -75,9 +80,12 @@ export async function captureSession(
         sizes[p.id] = enc.json.length + enc.blobs.reduce((n, b) => n + b.length, 0);
     }
     sections.set(OBJECTS, run.objects as unknown as SaveValue);
+    const blobs: BlobList = [...run.blobs].map(([hash, bytes]) => [hash, bytes.byteLength] as [string, number]).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+    if (blobs.length > 0) sections.set(BLOBS, blobs);
     const t0 = performance.now();
     const snap = snapshotRam(target.guestMemory(), known, run.ramPatches);
     const ramHashMs = performance.now() - t0;
+    for (const [hash, bytes] of run.blobs) if (!known.has(hash)) snap.pending.set(hash, bytes);
     stillReady();
     const state: Savestate = {
         header: {
@@ -86,7 +94,7 @@ export async function captureSession(
         },
         sections,
     };
-    return { bytes: encodeSavestate(state), manifest: snap.manifest, pending: snap.pending, ram: snap.stats, sections: sizes, captureMs, ramHashMs };
+    return { bytes: encodeSavestate(state), manifest: snap.manifest, pending: snap.pending, blobs, ram: snap.stats, sections: sizes, captureMs, ramHashMs };
 }
 
 export interface LoadCheck { ok: boolean; reasons: string[]; overlayChanged: boolean; state: Savestate }
@@ -110,8 +118,9 @@ export async function missingChunks(manifest: RamManifest, store: ChunkStore): P
 }
 
 /**
- * Nothing is written until every chunk the manifest names is present. After the first write,
- * any failure is a RestoreFailed: the guest is half restored and must not run.
+ * Nothing is written until every chunk the manifest names is present and every blob is read
+ * and verified. After the first write, any failure is a RestoreFailed: the guest is half
+ * restored and must not run.
  */
 export async function restoreSession(
     target: SavestateTarget, state: Savestate, store: ChunkStore, participants: ParticipantRegistry = savestateParticipants,
@@ -119,16 +128,22 @@ export async function restoreSession(
     validateRamManifest(state.header.ram, target.guestMemory().length);
     const missing = await missingChunks(state.header.ram, store);
     if (missing.length > 0) throw new Error(`savestate: ${missing.length} RAM chunk(s) are missing, e.g. ${missing[0]}`);
+    const list = savedBlobs(state);
+    const missingBlob = await missingBlobs(list, store);
+    if (missingBlob.length > 0) throw new Error(`savestate: ${missingBlob.length} blob(s) are missing, e.g. ${missingBlob[0]}`);
+    const blobs = await loadBlobs(list, store);
     try {
-        await restoreWritten(target, state, store, participants);
+        await restoreWritten(target, state, store, participants, blobs);
     } catch (e) {
         throw new RestoreFailed(e instanceof Error ? e.message : String(e));
     }
 }
 
-async function restoreWritten(target: SavestateTarget, state: Savestate, store: ChunkStore, participants: ParticipantRegistry): Promise<void> {
+async function restoreWritten(
+    target: SavestateTarget, state: Savestate, store: ChunkStore, participants: ParticipantRegistry, blobs: ReadonlyMap<string, Uint8Array>,
+): Promise<void> {
     await restoreRam(target.guestMemory(), state.header.ram, store);
-    const ctx = restoreObjectGraph((state.sections.get(OBJECTS) ?? []) as unknown as Array<[string, SaveValue]>);
+    const ctx = restoreObjectGraph((state.sections.get(OBJECTS) ?? []) as unknown as Array<[string, SaveValue]>, blobs);
     for (const p of participants.all()) {
         const value = state.sections.get(p.id);
         if (value === undefined) throw new Error(`savestate: no section for participant ${p.id}`);

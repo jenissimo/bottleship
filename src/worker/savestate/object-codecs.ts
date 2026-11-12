@@ -1,10 +1,11 @@
 import type { SaveValue } from './value-codec';
 import type { RestoreContext } from './participant';
+import { blobHash } from './blobs';
 
 export interface ObjectCodec<T = unknown> {
     readonly tag: string;
     matches(obj: unknown): obj is T;
-    capture(obj: T, ref: (o: unknown, where: string) => number): unknown;
+    capture(obj: T, ref: (o: unknown, where: string) => number, blob: (bytes: Uint8Array) => string): unknown;
     restore(data: never, ctx: RestoreContext): T;
     link?(obj: T, data: never, ctx: RestoreContext): void;
 }
@@ -35,14 +36,24 @@ export class CaptureRefusal extends Error {}
 
 export interface ObjectGraph {
     objects: Array<[string, SaveValue]>;
+    blobs: Map<string, Uint8Array>;
     ref(obj: unknown, where: string): number;
+    blob(bytes: Uint8Array): string;
 }
 
 export function newObjectGraph(): ObjectGraph {
     const ids = new Map<unknown, number>();
     const objects: Array<[string, SaveValue]> = [];
+    const blobs = new Map<string, Uint8Array>();
+    const blob = (bytes: Uint8Array): string => {
+        const hash = blobHash(bytes);
+        if (!blobs.has(hash)) blobs.set(hash, bytes);
+        return hash;
+    };
     const graph: ObjectGraph = {
         objects,
+        blobs,
+        blob,
         ref(obj: unknown, where: string): number {
             const known = ids.get(obj);
             if (known !== undefined) return known;
@@ -55,16 +66,23 @@ export function newObjectGraph(): ObjectGraph {
             const id = objects.length;
             ids.set(obj, id);
             objects.push([codec.tag, null]);
-            objects[id] = [codec.tag, codec.capture(obj, (o, w) => graph.ref(o, `${where} > ${w}`)) as SaveValue];
+            objects[id] = [codec.tag, codec.capture(obj, (o, w) => graph.ref(o, `${where} > ${w}`), blob) as SaveValue];
             return id;
         },
     };
     return graph;
 }
 
-export function restoreObjectGraph(objects: Array<[string, SaveValue]>): RestoreContext {
+export function restoreObjectGraph(
+    objects: Array<[string, SaveValue]>, blobs: ReadonlyMap<string, Uint8Array> = new Map(),
+): RestoreContext {
     const live = new Map<number, unknown>();
     const ctx: RestoreContext = {
+        blob(hash: string): Uint8Array {
+            const bytes = blobs.get(hash);
+            if (!bytes) throw new Error(`savestate: blob ${hash} is missing`);
+            return bytes;
+        },
         object(ref: number): unknown {
             if (live.has(ref)) return live.get(ref);
             const entry = objects[ref];

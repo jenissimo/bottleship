@@ -275,6 +275,7 @@ export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, p
         await writeRamChunks(result.pending, store.chunkStore);
         let chunkBytes = 0;
         for (const [, hash] of result.manifest.chunks) chunkBytes += await store.chunkStore.size(hash);
+        for (const [hash] of result.blobs) chunkBytes += await store.chunkStore.size(hash);
         await store.save(name, result.bytes, chunkBytes);
         const t2 = performance.now();
         return {
