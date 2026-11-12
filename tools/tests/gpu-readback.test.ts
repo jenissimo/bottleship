@@ -12,8 +12,8 @@ import { describe, expect, test } from "bun:test";
 // injects (used only as bitflag constants — createBuffer(usage) — never inspected by our
 // fakes below) don't exist. Real workers always have them; this just fills the gap so the
 // module under test can be imported and exercised the same way its real callers use it.
-(globalThis as unknown as { GPUBufferUsage: unknown }).GPUBufferUsage ??= { COPY_DST: 1, MAP_READ: 2 };
-(globalThis as unknown as { GPUMapMode: unknown }).GPUMapMode ??= { READ: 1 };
+import { useWebGpuFlags } from "./helpers/scoped-globals";
+useWebGpuFlags("GPUBufferUsage", "GPUMapMode");
 
 import { readGpuTextureRgba, readGpuTextureStats } from "../../src/worker/backends/webgpu/shared/gpu-readback";
 

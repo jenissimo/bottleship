@@ -20,7 +20,7 @@ import { System } from "../../src/worker/core/system";
 import { kernel32Module } from "../../src/worker/api/kernel32.api";
 import { kernelbaseModule } from "../../src/worker/api/kernelbase.api";
 import { resolveThunkedDllAlias } from "../../src/worker/core/dll-aliases";
-import { exports as kernel32 } from "../../src/worker/modules/kernel32/module/module";
+import { exports as kernel32, resetModuleRefs } from "../../src/worker/modules/kernel32/module/module";
 import { Kernelbase, kernelbaseOwnExports } from "../../src/worker/modules/kernelbase";
 
 const NAME = 0x10000;       // guest scratch for strings
@@ -65,6 +65,10 @@ beforeAll(() => {
 afterAll(() => {
     (preemptionManager as unknown as { wasmExports: unknown }).wasmExports = savedExports;
     (System.getInstance() as any).process = savedProcess;
+    // The LoadLibrary calls above left kernel32's module references keyed to our fake
+    // process; a later kernel32 capture would carry them (and its restore cannot re-take
+    // the HLE image references once the images below are reset).
+    resetModuleRefs();
     resetGuestCodeInvalidationState();
     resetHleModuleImages();
 });

@@ -7,7 +7,7 @@
  * surviving pump fires into the next guest loaded into the same worker, where its
  * frame does not exist.
  */
-import { describe, expect, test, beforeEach, spyOn } from 'bun:test';
+import { describe, expect, test, afterAll, beforeAll, beforeEach, spyOn } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import {
     activeDialogs,
@@ -20,6 +20,16 @@ import { createDialogExports } from '../../src/worker/modules/user32/dialog';
 import { System } from '../../src/worker/core/system';
 
 const tick = (ms = 20) => new Promise<void>(r => setTimeout(r, ms));
+
+// runDialog installs a stub process on the process-wide System. Put the previous one back:
+// a later file that looks a COM object up by address would otherwise call
+// `process.getCurrentMemory()` on this stub, which has none.
+let savedProcess: unknown;
+beforeAll(() => { savedProcess = System.getInstance().process; });
+afterAll(() => {
+    resetDialogPumps();
+    (System.getInstance() as unknown as { process: unknown }).process = savedProcess;
+});
 
 describe('modal dialog pump lifetime', () => {
     beforeEach(() => resetDialogPumps());

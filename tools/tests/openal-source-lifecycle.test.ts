@@ -20,6 +20,7 @@
 
 import { test, expect, beforeEach } from "bun:test";
 import { OpenAL } from "../../src/worker/modules/openal/openal";
+import { preserveGlobals } from "./helpers/scoped-globals";
 import {
     getCtrl, setCtrl, CTRL_PLAY_CURSOR, CTRL_WRITE_CURSOR, CTRL_BLOCK_BYTES,
     CTRL_FLAGS, FLAG_STREAMING, CTRL_LOOP_MODE,
@@ -80,6 +81,7 @@ function streamSab(src: number): SharedArrayBuffer {
     return s.stream.sab as SharedArrayBuffer;
 }
 
+preserveGlobals("postMessage");
 beforeEach(() => {
     (globalThis as any).postMessage = () => { /* audio_register/unregister sink */ };
     mem = new Uint8Array(MEM_BYTES);

@@ -7,8 +7,9 @@
  * geometry drawn before the switch stopped occluding geometry drawn after it.
  */
 import { describe, expect, test } from "bun:test";
-// Node has no WebGPU globals; DepthManager only reads the usage bit constants.
-(globalThis as any).GPUTextureUsage ??= { RENDER_ATTACHMENT: 0x10, COPY_SRC: 0x01 };
+import { useWebGpuFlags } from "./helpers/scoped-globals";
+// Bun has no WebGPU globals; DepthManager only reads the usage bit constants.
+useWebGpuFlags("GPUTextureUsage");
 
 const { DepthManager } = await import("../../src/worker/backends/webgpu/ddraw/depth-manager");
 

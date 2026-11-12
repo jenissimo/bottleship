@@ -39,36 +39,50 @@ function deferEngineHash() {
     return hash;
 }
 
-// snapshot must copy both pages before awaiting the capture-time engine hash.
-{
-    const memory = new Uint8Array(PAGE * 4); memory[0] = 0x11; memory[PAGE] = 0x22;
-    install(memory);
-    const hash = deferEngineHash();
-    const run = aotCache.snapshot();
-    memory[0] = 0xAA; memory[PAGE] = 0xBB;
-    hash.resolve("engine");
-    const result = await run;
-    assert(result.units === 1, "coherent snapshot refused");
-    const pages = (aotCache as any).units[0].pages;
-    assert(pages.length === 2, "multi-page metadata was not captured");
-    const hashes = await Promise.all([new Uint8Array([0x11, ...new Uint8Array(PAGE - 1)]), new Uint8Array([0x22, ...new Uint8Array(PAGE - 1)])]
-        .map(async bytes => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))).map(x => x.toString(16).padStart(2, "0")).join("")));
-    assert(pages[0].sha === hashes[0] && pages[1].sha === hashes[1], "snapshot was torn by post-yield memory mutation");
-}
+// install() replaces globals and deferEngineHash() an aotCache method; `bun test` runs every file
+// in one process, so both go back when this file is done, pass or fail.
+const replacedGlobals = ["System", "preemption", "__wasmDump"].map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)] as const);
+const ownFingerprint = Object.getOwnPropertyDescriptor(aotCache, "engineFingerprint");
+try {
+    // snapshot must copy both pages before awaiting the capture-time engine hash.
+    {
+        const memory = new Uint8Array(PAGE * 4); memory[0] = 0x11; memory[PAGE] = 0x22;
+        install(memory);
+        const hash = deferEngineHash();
+        const run = aotCache.snapshot();
+        memory[0] = 0xAA; memory[PAGE] = 0xBB;
+        hash.resolve("engine");
+        const result = await run;
+        assert(result.units === 1, "coherent snapshot refused");
+        const pages = (aotCache as any).units[0].pages;
+        assert(pages.length === 2, "multi-page metadata was not captured");
+        const hashes = await Promise.all([new Uint8Array([0x11, ...new Uint8Array(PAGE - 1)]), new Uint8Array([0x22, ...new Uint8Array(PAGE - 1)])]
+            .map(async bytes => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))).map(x => x.toString(16).padStart(2, "0")).join("")));
+        assert(pages[0].sha === hashes[0] && pages[1].sha === hashes[1], "snapshot was torn by post-yield memory mutation");
+    }
 
-// version() must bind the pre-yield fingerprint to the copied pages. With the old object-literal
-// order (`engine: await ...` before fingerprint reads), both reads would observe 2 and this would
-// wrongly accept. Do not replace aotCache.version here: that would mask the ordering regression.
-{
-    const memory = new Uint8Array(PAGE * 4); memory[0] = 0x33; memory[PAGE] = 0x44;
-    const identity = install(memory, { lo: 1, hi: 0, abi: 1, mask: 0x01FB_FDEF });
-    const hash = deferEngineHash();
-    const run = aotCache.snapshot();
-    identity.lo = 2;
-    hash.resolve("engine");
-    const result = await run;
-    assert(result.units === 0 && (aotCache as any).units.length === 0,
-        "post-boundary JIT fingerprint change relabeled captured bytes");
+    // version() must bind the pre-yield fingerprint to the copied pages. With the old object-literal
+    // order (`engine: await ...` before fingerprint reads), both reads would observe 2 and this would
+    // wrongly accept. Do not replace aotCache.version here: that would mask the ordering regression.
+    {
+        const memory = new Uint8Array(PAGE * 4); memory[0] = 0x33; memory[PAGE] = 0x44;
+        const identity = install(memory, { lo: 1, hi: 0, abi: 1, mask: 0x01FB_FDEF });
+        const hash = deferEngineHash();
+        const run = aotCache.snapshot();
+        identity.lo = 2;
+        hash.resolve("engine");
+        const result = await run;
+        assert(result.units === 0 && (aotCache as any).units.length === 0,
+            "post-boundary JIT fingerprint change relabeled captured bytes");
+    }
+} finally {
+    for (const [key, descriptor] of replacedGlobals) {
+        if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+        else delete (globalThis as any)[key];
+    }
+    if (ownFingerprint) Object.defineProperty(aotCache, "engineFingerprint", ownFingerprint);
+    else delete (aotCache as any).engineFingerprint;
+    aotCache.clear();
 }
 
 console.log("PASS aot-cache-versioning: coherent-copy + production-version identity-refusal");

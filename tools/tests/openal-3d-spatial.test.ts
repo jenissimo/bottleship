@@ -20,6 +20,7 @@ import {
     AL_DEFAULT_SPEED_OF_SOUND, type SpatialParams,
 } from "../../src/audio/spatializer";
 import { OpenAL } from "../../src/worker/modules/openal/openal";
+import { preserveGlobals } from "./helpers/scoped-globals";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import {
     getCtrl, i32ToFloat,
@@ -330,6 +331,7 @@ function lctrlF(field: number): number {
     return i32ToFloat(lctrlI(field));
 }
 
+preserveGlobals("postMessage");
 beforeEach(() => {
     (globalThis as any).postMessage = () => { /* audio_register / audio_listener_sab sink */ };
     mem = new Uint8Array(MEM_BYTES);

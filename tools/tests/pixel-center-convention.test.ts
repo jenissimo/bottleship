@@ -29,6 +29,9 @@ import {
     type FfpUniformParams,
 } from "../../src/worker/backends/webgpu/d3d9/ffp-lighting";
 import { D3DFVF_XYZRHW, D3DFVF_DIFFUSE } from "../../src/worker/modules/ddraw/constants";
+import { useWebGpuFlags } from "./helpers/scoped-globals";
+
+useWebGpuFlags("GPUShaderStage");
 
 // The convention is the DEFAULT; the flag is a kill-switch, so `setFlag(true)` here means
 // "convention on" = flag absent, and `setFlag(false)` means "restore the old behaviour".
@@ -44,7 +47,6 @@ const VP_H = 480;
 
 /** Identity-ish stand-ins for the GPU objects VertexConverter's constructor touches. */
 function makeConverter(): VertexConverter {
-    (globalThis as Record<string, unknown>).GPUShaderStage ??= { COMPUTE: 4 };
     const device = {
         limits: { maxBufferSize: 1 << 20 },
         createBindGroupLayout: () => ({}),

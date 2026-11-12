@@ -10,7 +10,7 @@
  * that is rendering perfectly.
  */
 
-import { describe, expect, test, beforeEach } from "bun:test";
+import { afterEach, describe, expect, test, beforeEach } from "bun:test";
 import { ddrawShowsContent } from "../../src/worker/modules/ddraw/gdi-visibility";
 import { DirectDrawClipperObject, DirectDrawSurfaceObject } from "../../src/worker/modules/ddraw/com-objects";
 import { windows as sharedWindows } from "../../src/worker/modules/user32/shared-state";
@@ -36,6 +36,14 @@ class FakeSurface {
 }
 Object.setPrototypeOf(FakeSurface.prototype, DirectDrawSurfaceObject.prototype);
 
+/** A real clipper registers itself in the process-wide COM table; one left there is seen by
+ *  every later file that walks that table (a savestate capture refuses on it). */
+const clippers: DirectDrawClipperObject[] = [];
+afterEach(() => {
+    for (const clipper of clippers.splice(0)) clipper.forceRelease();
+    sharedWindows.clear();
+});
+
 function context(opts: {
     coopHwnd: number;
     flags: number;
@@ -44,6 +52,7 @@ function context(opts: {
     presented?: boolean;
 }): DDrawContext {
     const clipper = new DirectDrawClipperObject(0);
+    clippers.push(clipper);
     clipper.setHwnd(opts.clipperHwnd ?? 0);
     const surface = new FakeSurface(opts.clipperAttached === false ? undefined : CLIPPER_HANDLE);
     return {

@@ -9,9 +9,9 @@
 
 import { describe, expect, test } from "bun:test";
 import { D3D9Device } from "../../src/worker/backends/webgpu/d3d9/d3d9-device";
+import { useWebGpuFlags } from "./helpers/scoped-globals";
 
-(globalThis as unknown as { GPUBufferUsage: unknown }).GPUBufferUsage ??=
-    { MAP_READ: 1, MAP_WRITE: 2, COPY_SRC: 4, COPY_DST: 8, INDEX: 16, VERTEX: 32, UNIFORM: 64, STORAGE: 128 };
+useWebGpuFlags("GPUBufferUsage");
 
 const VB = 3;
 const SIZE = 4096;

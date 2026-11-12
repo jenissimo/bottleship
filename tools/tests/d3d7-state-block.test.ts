@@ -3,8 +3,9 @@
  * the device, and ApplyStateBlock replays only the states that were recorded. Applying a
  * whole zero-filled snapshot instead wipes every render/stage state and texture binding.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { SystemResourceProvider } from "../../src/worker/core/resources/system-resource-provider";
+import { System } from "../../src/worker/core/system";
 import { BaseComObject } from "../../src/worker/core/com/base-com-object";
 import { Direct3DDevice7Object } from "../../src/worker/modules/ddraw/com-objects";
 import {
@@ -45,6 +46,13 @@ class TestTexture extends BaseComObject {
 }
 
 describe("IDirect3DDevice7 recorded state blocks", () => {
+    // The addresses below are bare handles with no guest memory behind them. With a process
+    // installed, getComObjectByAddress checks guard bytes in that process's memory, so pin
+    // "no process" here instead of inheriting whatever an earlier file left on System.
+    let savedProcess: System["process"] = null;
+    beforeEach(() => { savedProcess = System.getInstance().process; System.getInstance().process = null; });
+    afterEach(() => { System.getInstance().process = savedProcess; });
+
     test("recorded texture survives release until its state block is deleted", () => {
         const rp = SystemResourceProvider.getInstance();
         const device = new Direct3DDevice7Object(0);

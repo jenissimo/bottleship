@@ -6,7 +6,7 @@
  * WaitOnAddress that returns at once whatever the value. The tests pin the Windows
  * contract, including the parts only a second thread can observe.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { Scheduler } from "../../src/worker/core/scheduler/scheduler";
 import { ThreadState, WAIT_TIMEOUT, type Thread } from "../../src/worker/core/scheduler/types";
 import { System } from "../../src/worker/core/system";
@@ -63,6 +63,19 @@ function call(table: Record<string, any>, name: string, ...args: number[]): numb
 function raw(table: Record<string, any>, name: string, ...args: number[]): any {
     return table[name]!(ctx(), mem, args);
 }
+
+// System is process-wide: put back the scheduler and process this file replaces, or every
+// later file runs against this file's fake process.
+let saved: { scheduler: unknown; process: unknown };
+beforeAll(() => {
+    const system = System.getInstance() as any;
+    saved = { scheduler: system.scheduler, process: system.process };
+});
+afterAll(() => {
+    const system = System.getInstance() as any;
+    system.scheduler = saved.scheduler;
+    system.process = saved.process;
+});
 
 beforeEach(() => {
     mem = new Uint8Array(0x10000);

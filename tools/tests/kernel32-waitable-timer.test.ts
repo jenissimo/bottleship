@@ -3,7 +3,7 @@
  * units), positive an absolute FILETIME. Read unsigned, every relative due time becomes
  * ~1.8e15 ms and the waiter (a frame limiter's WaitForSingleObject(INFINITE)) never wakes.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { Scheduler } from "../../src/worker/core/scheduler/scheduler";
 import { ThreadState, type Thread } from "../../src/worker/core/scheduler/types";
 import { System } from "../../src/worker/core/system";
@@ -49,6 +49,19 @@ function firesIn(): number {
 function signaled(handle: number): boolean {
     return !!(System.getInstance().resourceProvider.getKernelObject(handle) as any).signaled;
 }
+
+// System is process-wide: put back the scheduler and process this file replaces, or every
+// later file runs against a fake process with a 64 KiB memory and no real methods.
+let saved: { scheduler: unknown; process: unknown };
+beforeAll(() => {
+    const system = System.getInstance() as any;
+    saved = { scheduler: system.scheduler, process: system.process };
+});
+afterAll(() => {
+    const system = System.getInstance() as any;
+    system.scheduler = saved.scheduler;
+    system.process = saved.process;
+});
 
 beforeEach(() => {
     mem = new Uint8Array(0x10000);

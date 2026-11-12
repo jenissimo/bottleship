@@ -4,6 +4,7 @@ import { DDrawWebGPUExecutor } from "../../src/worker/backends/webgpu/ddraw/ddra
 import { D3DCLEAR_ZBUFFER, D3DCLEAR_STENCIL } from "../../src/worker/modules/ddraw/constants";
 import { setAuthorityCpu, setAuthorityGpu, surfaceSyncManager } from "../../src/worker/modules/ddraw/surface-sync";
 import type { RenderSurface } from "../../src/worker/modules/ddraw/com-objects";
+import { useWebGpuFlags } from "./helpers/scoped-globals";
 
 const W = 4, H = 2, PTR = 0x1000;
 
@@ -25,9 +26,8 @@ describe("a GPU readback that finishes after the guest wrote the surface lands n
         saved = system.process;
         mem.fill(0);
         system.process = { getCurrentMemory: () => mem };
-        (globalThis as Record<string, unknown>).GPUMapMode = { READ: 1 };
-        (globalThis as Record<string, unknown>).GPUBufferUsage ??= { MAP_READ: 1, COPY_DST: 8 };
     });
+    useWebGpuFlags("GPUMapMode", "GPUBufferUsage");
     afterEach(() => { system.process = saved; });
 
     function gpu(fill: number) {

@@ -4,9 +4,10 @@
  * both are shown here failing the way they would if the registry lost them.
  */
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
     nativeModulePatcherIds, registerNativeModulePatcher, runNativeModulePatchers,
+    unregisterNativeModulePatcher,
 } from "../../src/worker/core/hooks/native-module-patchers";
 import type { LoadedPEModule } from "../../src/worker/core/module-registry";
 import type { Process } from "../../src/worker/core/process";
@@ -16,6 +17,11 @@ const moduleNamed = (name: string): LoadedPEModule => ({
     exports: new Map(), ordinalExports: new Map(), isRealDll: true, initialized: true,
 });
 const fakeProcess = {} as Process;
+
+// The registry is process-global: an entry left behind here ("t-throws" throws on EVERY module)
+// marks each later real DLL load in the same `bun test` run as patched.
+const registeredHere = ["t-throws", "t-after", "t-picky", "t-always", "t-dup"];
+afterEach(() => { for (const id of registeredHere) unregisterNativeModulePatcher(id); });
 
 describe("native module patch registry", () => {
     test("a throwing entry does not stop later entries and does not propagate", () => {
@@ -54,5 +60,14 @@ describe("native module patch registry", () => {
         runNativeModulePatchers(fakeProcess, moduleNamed("x"));
         expect(seen).toEqual(["second"]);
         expect(nativeModulePatcherIds().filter((i) => i === "t-dup")).toHaveLength(1);
+    });
+
+    test("unregistering an id takes the entry out of the registry", () => {
+        const seen: string[] = [];
+        registerNativeModulePatcher({ id: "t-always", patch: (_p, m) => { seen.push(m.name); } });
+        unregisterNativeModulePatcher("t-always");
+        runNativeModulePatchers(fakeProcess, moduleNamed("gone"));
+        expect(seen).toEqual([]);
+        expect(nativeModulePatcherIds()).not.toContain("t-always");
     });
 });

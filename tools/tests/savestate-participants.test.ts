@@ -15,6 +15,7 @@ import { STATELESS_MODULES } from "../../src/worker/savestate/stateless-modules"
 import { checkLoadedModules, registerCoreParticipants, touchedModules } from "../../src/worker/savestate/core-participants";
 import { ParticipantRegistry, savestateParticipants, schemaHash, uncoveredModules } from "../../src/worker/savestate/participant";
 import { captureKernel32State, restoreKernel32State } from "../../src/worker/modules/kernel32/savestate";
+import { resetModuleRefs } from "../../src/worker/modules/kernel32/module/module";
 import { namedObjects } from "../../src/worker/modules/kernel32/named-objects";
 import { captureAtoms } from "../../src/worker/modules/kernel32/atom";
 import { consoleScreenBuffers } from "../../src/worker/modules/kernel32/console-screen-buffer";
@@ -105,6 +106,7 @@ function resetKernel32Session(): void {
     resetProcessStartupInfo();
     setFileApisAnsi(true);
     consoleScreenBuffers.reset();
+    resetModuleRefs();
 }
 
 function mkThread(id: number, state: ThreadState): Thread {

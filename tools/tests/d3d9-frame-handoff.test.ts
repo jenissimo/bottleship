@@ -21,10 +21,9 @@ import {
 import { D3D9BackendExecutor } from "../../src/worker/backends/webgpu/d3d9/d3d9-backend-executor";
 import type { OverlayCompositePlan } from "../../src/worker/modules/user32/dialog-overlay";
 import type { VideoPlanePlan } from "../../src/worker/video/video-routing-types";
+import { useWebGpuFlags } from "./helpers/scoped-globals";
 
-(globalThis as { GPUTextureUsage?: Record<string, number> }).GPUTextureUsage ??= {
-    COPY_SRC: 0x01, COPY_DST: 0x02, TEXTURE_BINDING: 0x04, STORAGE_BINDING: 0x08, RENDER_ATTACHMENT: 0x10,
-};
+useWebGpuFlags("GPUTextureUsage");
 
 type Any = any; // eslint-disable-line @typescript-eslint/no-explicit-any
 

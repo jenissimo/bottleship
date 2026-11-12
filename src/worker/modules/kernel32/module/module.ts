@@ -88,6 +88,15 @@ function ensureProcessLocalCaches(): void {
     hleLibraryReferences.clear();
 }
 
+/** Drop the per-process module caches and references now, whatever process they were keyed
+ *  to; the next caller re-keys them to the current process. For a host (or a test) that swaps
+ *  `System.process` out from under kernel32 and must not leave the old process's
+ *  LoadLibrary references to be captured by whoever comes next. */
+export function resetModuleRefs(): void {
+    cacheOwnerProcess = undefined;
+    ensureProcessLocalCaches();
+}
+
 export interface ModuleRefState {
     pinned: number[];
     dynamicRefs: Array<[number, number]>;

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { RingBufferManager } from "../../src/worker/backends/webgpu/ddraw/ring-buffer-manager";
 import { DEFAULT_RING_BUFFER_CONFIG, DEFAULT_STORAGE_BUFFER_CONFIG, DEFAULT_UNIFORM_BUFFER_CONFIG } from "../../src/worker/backends/webgpu/ddraw/types";
+import { useWebGpuFlags } from "./helpers/scoped-globals";
 
-const g = globalThis as Record<string, unknown>;
-g.GPUBufferUsage ??= { MAP_READ: 1, MAP_WRITE: 2, COPY_SRC: 4, COPY_DST: 8, INDEX: 0x10, VERTEX: 0x20, UNIFORM: 0x40, STORAGE: 0x80, INDIRECT: 0x100, QUERY_RESOLVE: 0x200 };
+useWebGpuFlags("GPUBufferUsage");
 
 interface FakeBuffer { id: number; size: number; usage: number; label?: string; destroyed: boolean; bytes: Uint8Array; destroy(): void }
 
