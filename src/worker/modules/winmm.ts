@@ -520,6 +520,11 @@ export interface PlaySoundState {
     pcm: Uint8Array;
 }
 
+type StoredWinMMState = Omit<WinMMState, 'waveOut' | 'playSound'> & {
+    waveOut: Array<Omit<WaveOutState, 'tail'> & { tail: string }>;
+    playSound: (Omit<PlaySoundState, 'pcm'> & { pcm: string }) | null;
+};
+
 export const WINMM_SCHEMA = {
     module: WINMM_FIELDS,
     periodRow: ['periodMs', 'refCount'],
@@ -538,6 +543,7 @@ export const WINMM_SCHEMA = {
     waveFormat: stateKeys<WaveFormat>({ channels: true, sampleRate: true, avgBytesPerSec: true, blockAlign: true, bitsPerSample: true }),
     waveDone: stateKeys<WaveDoneState>({ callback: true, args: true }),
     waveDoneArgs: ['hwo', 'WOM_DONE', 'dwInstance', 'WAVEHDR', '0'],
+    blobs: ['waveOut.tail', 'playSound.pcm'],
     waveHeader: stateKeys<PendingWaveBuffer>({ pwh: true, data: true, length: true, endOffset: true }),
     playSound: stateKeys<PlaySoundState>({
         id: true, channels: true, sampleRate: true, bitsPerSample: true, loop: true, playCursor: true, pcm: true,
@@ -721,7 +727,7 @@ export class WinMM implements IModule {
         for (const device of this.waveOutDevices.values()) {
             if (device.registered) self.postMessage({ type: "audio_unregister", payload: { id: device.id } });
         }
-        const mem = this.guestMemory();
+        const mem = s.waveOut.length > 0 ? this.guestMemory() : null;
         this.waveOutDevices = new Map(s.waveOut.map(st => [st.fields.id, this.restoreWaveOut(st, mem)]));
         this.stopPlaySound();
         if (s.playSound) this.restorePlaySound(s.playSound);
@@ -1632,14 +1638,28 @@ export class WinMM implements IModule {
     registerSavestate(): () => void {
         return savestateParticipants.add({
             id: 'winmm', version: 3, order: 63, covers: ['winmm'], schema: WINMM_SCHEMA as unknown as SaveValue,
-            capture: () => {
+            capture: (ctx) => {
+                let state: WinMMState;
                 try {
-                    return this.captureSavestate() as unknown as SaveValue;
+                    state = this.captureSavestate();
                 } catch (e) {
                     throw e instanceof CaptureRefusal ? e : new CaptureRefusal(e instanceof Error ? e.message : String(e));
                 }
+                const stored: StoredWinMMState = {
+                    ...state,
+                    waveOut: state.waveOut.map(d => ({ ...d, tail: d.tail.length > 0 ? ctx.blob(d.tail) : '' })),
+                    playSound: state.playSound && { ...state.playSound, pcm: ctx.blob(state.playSound.pcm) },
+                };
+                return stored as unknown as SaveValue;
             },
-            restore: (saved) => this.restoreSavestate(saved as unknown as WinMMState),
+            restore: (saved, ctx) => {
+                const stored = saved as unknown as StoredWinMMState;
+                this.restoreSavestate({
+                    ...stored,
+                    waveOut: stored.waveOut.map(d => ({ ...d, tail: d.tail ? ctx.blob(d.tail) : EMPTY_BYTES })),
+                    playSound: stored.playSound && { ...stored.playSound, pcm: ctx.blob(stored.playSound.pcm) },
+                });
+            },
         });
     }
 

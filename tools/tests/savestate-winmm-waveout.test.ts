@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { decodeValue, encodeValue, type SaveValue } from "../../src/worker/savestate/value-codec";
 import { savestateParticipants, schemaHash } from "../../src/worker/savestate/participant";
-import { CaptureRefusal } from "../../src/worker/savestate/object-codecs";
+import { CaptureRefusal, newObjectGraph, restoreObjectGraph } from "../../src/worker/savestate/object-codecs";
 import { System } from "../../src/worker/core/system";
 import { WinMM, WAVEOUT_DEVICE_FIELDS, WINMM_SCHEMA, type WaveOutDevice, type WinMMState } from "../../src/worker/modules/winmm";
 import {
@@ -582,9 +582,63 @@ describe("winmm participant", () => {
         try {
             const p = savestateParticipants.all().find(x => x.id === "winmm")!;
             expect(p.version).toBe(3);
-            expect(schemaHash(WINMM_SCHEMA as unknown as SaveValue)).toBe("7fc9b4a7c279e9a7");
+            expect(schemaHash(WINMM_SCHEMA as unknown as SaveValue)).toBe("13a32abfc6563265");
             (w.mmioHandles as Map<number, unknown>).set(1, {});
             expect(() => p.capture({} as never)).toThrow(CaptureRefusal);
+        } finally {
+            off();
+            if (before) savestateParticipants.add(before);
+        }
+    });
+
+    test("the ring tail and the PlaySound audio are stored as blobs, once per content, and come back through the participant", () => {
+        const r = rig();
+        for (let i = 0; i < 3; i++) r.write(r.w, i);
+        r.play(r.w, LEN - 2000);
+        r.poll(r.w);
+        const inner = r.w.captureSavestate();
+        const before = savestateParticipants.all().find(x => x.id === "winmm");
+        const off = r.w.registerSavestate();
+        try {
+            const p = savestateParticipants.all().find(x => x.id === "winmm")!;
+            const graph = newObjectGraph();
+            const stored = p.capture(graph as never) as unknown as { waveOut: Array<{ tail: unknown }>; playSound: unknown };
+            expect(typeof stored.waveOut[0]!.tail).toBe("string");
+            expect([...graph.blobs.get(stored.waveOut[0]!.tail as string)!]).toEqual([...inner.waveOut[0]!.tail]);
+            const again = p.capture(graph as never) as unknown as { waveOut: Array<{ tail: unknown }> };
+            expect(again.waveOut[0]!.tail).toBe(stored.waveOut[0]!.tail);
+            expect(graph.blobs.size).toBe(1);
+
+            const original = r.ring(r.w, LEN - 2000, 3 * LEN);
+            const fresh = moduleOn(r.mem);
+            const offFresh = fresh.registerSavestate();
+            try {
+                const q = savestateParticipants.all().find(x => x.id === "winmm")!;
+                void q.restore(throughCodec(stored as unknown as SaveValue), restoreObjectGraph([], graph.blobs));
+                expect(r.ring(fresh, LEN - 2000, 3 * LEN)).toEqual(original);
+                expect(() => q.restore(throughCodec(stored as unknown as SaveValue), restoreObjectGraph([], new Map()))).toThrow("missing");
+            } finally {
+                offFresh();
+            }
+
+            const idle = new WinMM() as Module;
+            const offIdle = idle.registerSavestate();
+            try {
+                const q = savestateParticipants.all().find(x => x.id === "winmm")!;
+                const empty = newObjectGraph();
+                const saved = q.capture(empty as never);
+                expect(empty.blobs.size).toBe(0);
+                const target = new WinMM() as Module;
+                target.guestMemory = () => { throw new Error("guest memory is not needed without waveOut devices"); };
+                const offTarget = target.registerSavestate();
+                try {
+                    void savestateParticipants.all().find(x => x.id === "winmm")!.restore(throughCodec(saved), restoreObjectGraph([], empty.blobs));
+                } finally {
+                    offTarget();
+                }
+            } finally {
+                offIdle();
+            }
         } finally {
             off();
             if (before) savestateParticipants.add(before);
