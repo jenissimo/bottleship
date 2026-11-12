@@ -58,6 +58,40 @@ test('returning to a live parent restores current shared audio buffers and its t
     } finally { r.endpoint.terminate(); r.channel.port2.close(); }
 });
 
+test('returning to a live parent restores its pointer space and present rect, not the child\'s', async () => {
+    const r = rig();
+    try {
+        const parentSize = { type: 'app_resize', width: 640, height: 480 };
+        const parentRect = { type: 'present_rect', x: 0, y: 0, w: 640, h: 480, outW: 640, outH: 480 };
+        r.fromRoot({ type: 'app_resize', width: 320, height: 200 });
+        r.fromRoot(parentSize);
+        r.fromRoot(parentRect);
+        r.promote();
+        r.channel.port2.postMessage({ type: 'app_resize', width: 1024, height: 768 });
+        r.channel.port2.postMessage({ type: 'present_rect', x: 0, y: 96, w: 1024, h: 576, outW: 1024, outH: 768 });
+        await until(() => r.output.some(m => m.type === 'present_rect' && m.w === 1024));
+        const before = r.output.length;
+        r.channel.port2.postMessage({ type: 'process_exit', exitCode: 0 });
+        await until(() => r.output.some(m => m.type === 'child_session_reset'));
+        const restored = r.output.slice(before);
+        expect(restored.filter(m => m.type === 'app_resize')).toEqual([parentSize]);
+        expect(restored.filter(m => m.type === 'present_rect')).toEqual([parentRect]);
+    } finally { r.endpoint.terminate(); r.channel.port2.close(); }
+});
+
+test('a parent that has itself exited gets no geometry replay', async () => {
+    const r = rig();
+    try {
+        r.fromRoot({ type: 'app_resize', width: 640, height: 480 });
+        r.promote();
+        r.fromRoot({ type: 'process_exit', exitCode: 0 });
+        const before = r.output.length;
+        r.channel.port2.postMessage({ type: 'process_exit', exitCode: 0 });
+        await until(() => r.output.some(m => m.type === 'child_session_reset'));
+        expect(r.output.slice(before).some(m => m.type === 'app_resize')).toBe(false);
+    } finally { r.endpoint.terminate(); r.channel.port2.close(); }
+});
+
 test("a promoted child that exits hands the channel back to the root", async () => {
     const r = rig();
     try {
