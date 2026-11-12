@@ -278,22 +278,106 @@ describe("winmm waveOut savestate", () => {
         expect(r.position(fresh, TIME_BYTES)).toBe(3 * LEN);
     });
 
-    test("a completion callback that is queued or running refuses the capture by name", () => {
+    function feeding() {
+        const r = rig(CALLBACK_FUNCTION);
+        const SMALL = 4000;
+        const wakes: number[] = [];
+        (system.scheduler as Record<string, unknown>).setEvent = (h: number) => { wakes.push(h); };
+        r.w.timerWakeEvent = 0x66;
+        for (let i = 0; i < 4; i++) r.write(r.w, i, SMALL);
+        let played = 0;
+        const step = (m: Module, delivered: number[]) => {
+            played += 1000;
+            r.play(m, played % 131072);
+            r.poll(m);
+            for (;;) {
+                const cb = (m.shiftPendingCallback as () => { args?: number[]; callbackAddr: number } | undefined).call(m);
+                if (!cb) break;
+                expect(cb.callbackAddr).toBe(CALLBACK);
+                expect(cb.args!.slice(0, 3)).toEqual([r.hwo, WOM_DONE, INSTANCE]);
+                const index = (cb.args![3]! - HDR) / 0x20;
+                delivered.push(index);
+                expect(r.write(m, index, SMALL)).toBe(0);
+            }
+        };
+        const until = (m: Module, delivered: number[], queued: number) => {
+            for (let i = 0; i < 400 && r.done(m).length < queued; i++) {
+                played += 1000;
+                r.play(m, played % 131072);
+                r.poll(m);
+                if (r.done(m).length < queued) step(m, delivered);
+            }
+        };
+        return { r, step, until, wakes, rewind: (to: number) => { played = to; }, at: () => played };
+    }
+
+    test("a title that refeeds in WOM_DONE saves while a completion is queued; it is delivered once and the chain goes on", () => {
+        const f = feeding();
+        const lead: number[] = [];
+        for (let i = 0; i < 9; i++) f.step(f.r.w, lead);
+        f.until(f.r.w, lead, 1);
+        expect(f.r.done(f.r.w).length).toBe(1);
+        const queuedHeader = (f.r.done(f.r.w)[0]![3]! - HDR) / 0x20;
+        const state = f.r.w.captureSavestate();
+        expect(state.waveDone).toEqual([{ callback: CALLBACK, args: [f.r.hwo, WOM_DONE, INSTANCE, f.r.header(queuedHeader), 0] }]);
+        expect(state.waveOut[0]!.fields.pendingBuffers.map(p => p.pwh)).not.toContain(f.r.header(queuedHeader));
+        const at = f.at();
+        const guestThen = f.r.mem.slice(0, 0x1000);
+
+        const original: number[] = [];
+        for (let i = 0; i < 60; i++) f.step(f.r.w, original);
+        expect(original[0]).toBe(queuedHeader);
+        expect(original.length).toBeGreaterThan(12);
+        for (let i = 0; i < original.length; i++) expect(original[i]).toBe((queuedHeader + i) % 4);
+
+        f.rewind(at);
+        f.r.mem.set(guestThen, 0);
+        f.wakes.length = 0;
+        const fresh = f.r.reload(state);
+        fresh.timerWakeEvent = 0x66;
+        expect(f.wakes).toEqual([0x66]);
+        expect(f.r.done(fresh)).toEqual([[f.r.hwo, WOM_DONE, INSTANCE, f.r.header(queuedHeader), 0]]);
+        expect(bytes(fresh.captureSavestate())).toBe(bytes(state));
+        const restored: number[] = [];
+        for (let i = 0; i < 60; i++) f.step(fresh, restored);
+        expect(restored).toEqual(original);
+
+        f.rewind(at);
+        f.r.mem.set(guestThen, 0);
+        const lost = f.r.reload({ ...state, waveDone: [] });
+        const broken: number[] = [];
+        for (let i = 0; i < 60; i++) f.step(lost, broken);
+        expect(broken).not.toContain(queuedHeader);
+        expect(new Set(broken).size).toBe(3);
+        expect(broken).not.toEqual(original);
+    });
+
+    test("a restore without a queued completion does not wake the callback thread", () => {
+        const f = feeding();
+        f.r.drain(f.r.w);
+        f.wakes.length = 0;
+        f.r.reload(f.r.w.captureSavestate());
+        expect(f.wakes).toEqual([]);
+    });
+
+    test("a queued timer or posted callback still refuses, also next to a queued completion", () => {
         const r = rig(CALLBACK_FUNCTION);
         for (let i = 0; i < 3; i++) r.write(r.w, i);
         r.play(r.w, LEN);
         r.poll(r.w);
         expect(r.done(r.w).length).toBe(1);
-        expect(() => r.w.captureSavestate()).toThrow("winmm: a waveOut completion callback (WOM_DONE) is queued or running; try saving again");
-        const running = (r.w.pendingTimerCallbacks as Queued[])[0];
-        r.drain(r.w);
         expect(() => r.w.captureSavestate()).not.toThrow();
-        r.w.dispatchingPosted = running;
-        expect(() => r.w.captureSavestate()).toThrow("WOM_DONE");
-        r.w.dispatchingPosted = null;
+        const refusal = "winmm: a multimedia timer callback is queued or running; try saving again";
         (r.w.pendingTimerCallbacks as Queued[]).push({ timerId: 3 });
-        expect(() => r.w.captureSavestate()).toThrow("multimedia timer callback");
-        expect(() => r.w.captureSavestate()).not.toThrow("WOM_DONE");
+        expect(() => r.w.captureSavestate()).toThrow(refusal);
+        (r.w.pendingTimerCallbacks as Queued[]).pop();
+        (r.w.pendingTimerCallbacks as Array<Record<string, unknown>>).push({ timerId: 0, args: [r.hwo, WOM_DONE, 0, 0, 0], onReturn: () => undefined });
+        expect(() => r.w.captureSavestate()).toThrow(refusal);
+        (r.w.pendingTimerCallbacks as Queued[]).pop();
+        r.w.dispatchingPosted = { timerId: 0 };
+        expect(() => r.w.captureSavestate()).toThrow(refusal);
+        r.w.dispatchingPosted = null;
+        expect(() => r.w.captureSavestate()).not.toThrow();
     });
 
     test("a single buffer the guest keeps rewriting is refilled from guest memory as it is now", () => {
@@ -498,7 +582,7 @@ describe("winmm participant", () => {
         try {
             const p = savestateParticipants.all().find(x => x.id === "winmm")!;
             expect(p.version).toBe(3);
-            expect(schemaHash(WINMM_SCHEMA as unknown as SaveValue)).toBe("b915fc71f23babed");
+            expect(schemaHash(WINMM_SCHEMA as unknown as SaveValue)).toBe("7fc9b4a7c279e9a7");
             (w.mmioHandles as Map<number, unknown>).set(1, {});
             expect(() => p.capture({} as never)).toThrow(CaptureRefusal);
         } finally {
