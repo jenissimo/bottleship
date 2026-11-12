@@ -30,6 +30,13 @@ class BlockingHooks {
             this.tasks.clear();
         });
     }
+    openForSavestate(): string[] {
+        const hex = (value: number) => "0x" + (value >>> 0).toString(16);
+        return [
+            ...[...this.tasks.keys()].map(tid => `blocking call of thread ${tid}`),
+            ...[...this.hooks].map(([tid, hook]) => `blocking hook ${hex(hook)} of thread ${tid}`),
+        ];
+    }
     private thread(): number { return System.getInstance().scheduler.getCurrentThreadId(); }
     private error(code: number, value = -1): number { this.state.setError(code); return value; }
     private usable(): boolean {
@@ -175,7 +182,9 @@ class BlockingHooks {
         };
     }
 }
+// @refuse(the winsock participant refuses while a blocking hook is installed or a hooked call is in flight)
 const instances=new WeakMap<WsaProcessState,BlockingHooks>();
+export function wsaBlockingOpenForSavestate(state:WsaProcessState):string[]{return instances.get(state)?.openForSavestate()??[];}
 /** Both Winsock DLLs share per-thread hooks and one negotiated application version. */
 export function installWsaBlockingHooks(exports:Record<string,ThunkImplementation>, descriptor:ModuleDescriptor, state:WsaProcessState, process:Process):void {
     let hooks=instances.get(state);if(!hooks){hooks=new BlockingHooks(state,process);instances.set(state,hooks);}

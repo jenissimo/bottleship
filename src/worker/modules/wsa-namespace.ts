@@ -12,7 +12,11 @@ interface Query {
     generation: number; closed: boolean; consumed: boolean; host?: NamespaceHost; resolving?: Promise<NamespaceHost>;
 }
 interface NamespaceState { generation: number; next: number; queries: Map<number, Query>; }
+// @refuse(the winsock participant refuses while a lookup handle is open; the handle counter restarts with no handle alive)
 const states = new WeakMap<WsaSocketTable, NamespaceState>();
+export function wsaNamespaceOpenForSavestate(table: WsaSocketTable): string[] {
+    return [...states.get(table)?.queries.keys() ?? []].map(handle => `service lookup 0x${handle.toString(16)}`);
+}
 const DNS_PROVIDER = Uint8Array.of(0x8c,0x8f,0x51,0x4d,0x42,0x53,0x41,0x4c,0x92,0x4e,0x42,0x53,0x44,0x4e,0x53,1);
 const SAME = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((value, i) => value === b[i]);
 const fail = (code: number): never => { throw new WsaFailure(code); };

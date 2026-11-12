@@ -2,7 +2,12 @@ import type {Process} from '../core/process';
 import type {ApcCallbackLifetime} from '../core/scheduler/types';
 import {WsaFailure,WSA} from './wsa-network';
 
+// @refuse(the winsock participant refuses while a control APC is reserved)
 const owners=new WeakMap<Process,{generation:number;active:number}>();
+export function wsaControlApcsOpenForSavestate(process:Process):string[]{
+    const pool=owners.get(process);
+    return pool&&pool.generation===process.resetGeneration&&pool.active>0?[`${pool.active} control APC(s)`]:[];
+}
 const MAX_CONTROL_APCS=256;
 /** A synchronous provider control APC exposes a separate zeroed internal OVERLAPPED. */
 export function reserveControlApc(process:Process):ApcCallbackLifetime {

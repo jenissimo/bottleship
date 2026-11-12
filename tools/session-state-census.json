@@ -1252,25 +1252,8 @@
   "src/worker/modules/wsa-actor-worker.ts": [
     "started"
   ],
-  "src/worker/modules/wsa-blocking.ts": [
-    "instances"
-  ],
-  "src/worker/modules/wsa-control-apc.ts": [
-    "owners"
-  ],
-  "src/worker/modules/wsa-namespace.ts": [
-    "states"
-  ],
-  "src/worker/modules/wsa-overlapped.ts": [
-    "providers"
-  ],
   "src/worker/modules/wsa-stub-shared.ts": [
-    "LOOPBACK_ADDR_BYTES",
-    "asyncLookupStates",
-    "nativeHandleProviders",
-    "nextAsyncTaskHandle",
-    "processStates",
-    "wsaStartupCount"
+    "LOOPBACK_ADDR_BYTES"
   ],
   "src/worker/net/configure-netplay.ts": [
     "currentState"
