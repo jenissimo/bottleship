@@ -192,7 +192,6 @@ describe("user32 module state", () => {
             ['list view', () => getOrCreateListViewState(control.handle), 'list view controls'],
             ['tab', () => getOrCreateTabState(control.handle), 'tab controls'],
             ['rich edit', () => setRichEditContent(control, 'x', []), 'rich edit controls'],
-            ['edit', () => setEditControlText(control, 'x'), 'edit controls'],
         ];
         expect(() => captureUser32State()).not.toThrow();
         for (const [, arm, message] of cases) {
@@ -202,6 +201,20 @@ describe("user32 module state", () => {
             resetListViewStatesForTests();
             expect(() => captureUser32State()).not.toThrow();
         }
+    });
+
+    test("an edit control no longer refuses: its state is part of the user32 capture and comes back through it", () => {
+        resetUser32Stores();
+        const control = windowInfo(0x20061, { isSystemControl: true });
+        windows.set(control.handle, control);
+        setEditControlText(control, 'x');
+        const saved = structuredClone(captureUser32State());
+        expect(saved.editControls.map(([hwnd]) => hwnd)).toEqual([control.handle]);
+        purgeControlState(control.handle);
+        expect(captureUser32State().editControls).toEqual([]);
+        restoreUser32State(saved);
+        expect(captureUser32State().editControls).toEqual(saved.editControls);
+        purgeControlState(control.handle);
     });
 
     test("the participant turns a refusal into a CaptureRefusal", () => {

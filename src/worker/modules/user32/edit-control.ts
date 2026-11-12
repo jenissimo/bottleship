@@ -6,6 +6,7 @@
  * (Wine edit.c) for the single-line core; multiline is line-split basic.
  */
 
+import { pickSaved, type FieldPolicy } from '../../savestate/participant';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
 import { WindowInfo, windows, registerControlStatePurger } from './shared-state';
@@ -107,8 +108,24 @@ interface EditState {
     undoInsertCount: number;
 }
 
-// @refuse(edit controls are not part of a v1 savestate)
+export const EDIT_STATE_FIELDS = {
+    selStart: 'save', selEnd: 'save', limit: 'save', modified: 'save', passwordChar: 'save', scrollX: 'save', scrollTop: 'save',
+    lineCacheKey: 'derive', lineCache: 'derive', undoText: 'save', undoPos: 'save', undoInsertCount: 'save',
+} as const satisfies Record<keyof EditState, FieldPolicy>;
+
+export type SavedEditState = Omit<EditState, 'lineCacheKey' | 'lineCache'>;
+
+// @participant(user32)
 const editStates = new Map<number, EditState>();
+
+export function captureEditControls(): Array<[number, SavedEditState]> {
+    return [...editStates].sort((a, b) => a[0] - b[0]).map(([hwnd, state]) => [hwnd, pickSaved(state, EDIT_STATE_FIELDS)]);
+}
+
+export function restoreEditControls(saved: ReadonlyArray<readonly [number, SavedEditState]>): void {
+    editStates.clear();
+    for (const [hwnd, state] of saved) editStates.set(hwnd, { ...state, lineCacheKey: '', lineCache: [] });
+}
 
 // Registered lazily: shared-state sits in an import cycle with this module
 // (shared-state → owner-draw → controls → edit-control), so a top-level call
