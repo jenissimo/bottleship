@@ -89,27 +89,28 @@ const exports: Record<string, (ctx: unknown, m: Uint8Array, a: number[]) => numb
 const process = {
     getModule: (name: string) => (name === "dsound" ? { exports } : undefined),
     getCurrentMemory: () => undefined,
-    memory: { alloc: (size: number) => { const p = nextAlloc; nextAlloc += size; return p; }, free: () => undefined },
+    memory: {
+        alloc: (size: number) => { const p = nextAlloc; nextAlloc += size; made.alloc!++; return p; },
+        free: () => { made.free!++; },
+    },
 };
 
-beforeAll(() => {
-    for (const key of ["process", "fileSystem", "scheduler"]) saved[key] = system[key];
-});
-afterAll(() => {
-    Object.assign(system, saved);
-    TimeService.getInstance().setMode("realtime");
-    resetGmBankForTests();
-    MidiSynthOutput.discard();
-});
+const MEM_KEYS = ["memoryGetter", "validateRange", "getRegion", "dataRoutes"] as const;
+const memStatics = Mem as unknown as Record<string, unknown>;
+const savedMem: Record<string, unknown> = {};
+
+afterAll(() => { TimeService.getInstance().setMode("realtime"); });
 
 beforeEach(async () => {
+    for (const key of ["process", "fileSystem", "scheduler"]) saved[key] = system[key];
+    for (const key of MEM_KEYS) savedMem[key] = memStatics[key];
     mem = new Uint8Array(DATA + SIZE + 0x100);
     view = new DataView(mem.buffer);
     Mem.bind(() => mem);
     play = 0;
     nextAlloc = 0x20000;
     bankOnDisk = true;
-    made = { device: 0, buffer: 0, deviceRelease: 0, bufferRelease: 0, play: 0, stop: 0 };
+    made = { device: 0, buffer: 0, deviceRelease: 0, bufferRelease: 0, play: 0, stop: 0, alloc: 0, free: 0 };
     armed.clear();
     system.process = process;
     system.fileSystem = {
@@ -130,7 +131,13 @@ beforeEach(async () => {
     resetGmBankForTests();
     expect((await loadGmBank())?.instruments.length).toBe(2);
 });
-afterEach(() => { fetchSpy?.mockRestore(); });
+afterEach(() => {
+    fetchSpy?.mockRestore();
+    MidiSynthOutput.discard();
+    resetGmBankForTests();
+    Object.assign(system, saved);
+    for (const key of MEM_KEYS) memStatics[key] = savedMem[key];
+});
 
 function rig(flags = 0) {
     const calls: number[][] = [];
@@ -350,6 +357,23 @@ describe("winmm MIDI output savestate", () => {
         expect(MidiSynthOutput.active()).toBeNull();
         expect(made).toMatchObject({ buffer: 1, stop: 1, bufferRelease: 1 });
         expect(armed.size).toBe(0);
+    });
+
+    test("fifty rounds of open and close leave no buffer, timer, allocation or output behind", () => {
+        const midi = new WinmmMidiOut({ callFunction: () => undefined });
+        for (let round = 0; round < 50; round++) {
+            expect(midi.open(PHMO, 0xffffffff, 0, 0, 0)).toBe(0);
+            const h = view.getUint32(PHMO, true);
+            midi.shortMessage(h, msg(0x90, 60, 100));
+            pump();
+            if (round % 2) expect(midi.restoreState(throughCodec(midi.captureState()))).toBeUndefined();
+            expect(midi.close(h)).toBe(0);
+        }
+        expect(midi.openCount()).toBe(0);
+        expect(MidiSynthOutput.active()).toBeNull();
+        expect(armed.size).toBe(0);
+        expect(made).toMatchObject({ device: 50, deviceRelease: 50, buffer: 50, bufferRelease: 50, play: 50, stop: 50 });
+        expect(made.free).toBe(made.alloc);
     });
 
     test("no open handle: the state is empty and a restore drops an output left open", () => {
