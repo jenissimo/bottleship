@@ -223,3 +223,44 @@ describe("captureSession lets the guest go before it hashes", () => {
         expect(resumed).toBe(0);
     });
 });
+
+describe("a section holds what its participant captured while the guest was halted", () => {
+    interface Live { counter: number; queue: number[]; pixels: Uint8Array; nested: { name: string } }
+
+    function rig() {
+        const live: Live = { counter: 1, queue: [1, 2, 3], pixels: Uint8Array.from([5, 6, 7]), nested: { name: "before" } };
+        const reg = new ParticipantRegistry();
+        reg.add({
+            id: "time", version: 1,
+            capture: () => live as never,
+            restore: () => undefined,
+        });
+        const resume = (): void => {
+            live.counter = 2;
+            live.queue.push(4);
+            live.pixels[0] = 99;
+            live.nested.name = "after";
+        };
+        return { live, reg, resume };
+    }
+
+    test("state the guest changes after it resumes does not reach the container", async () => {
+        const r = rig();
+        const result = await captureSession(target(guest(4, 3)), new Set(), () => undefined, r.reg, r.resume);
+        expect(r.live.counter).toBe(2);
+        const saved = decodeSavestate(result.bytes).sections.get("time") as unknown as Live;
+        expect(saved.counter).toBe(1);
+        expect(saved.queue).toEqual([1, 2, 3]);
+        expect([...saved.pixels]).toEqual([5, 6, 7]);
+        expect(saved.nested).toEqual({ name: "before" });
+    });
+
+    test("the reported section size is the size of what was written", async () => {
+        const r = rig();
+        const result = await captureSession(target(guest(4, 3)), new Set(), () => undefined, r.reg, r.resume);
+        const again = rig();
+        const quiet = await captureSession(target(guest(4, 3)), new Set(), () => undefined, again.reg);
+        expect(result.sections).toEqual(quiet.sections);
+        expect(decodeSavestate(result.bytes).sections.get("time")).toEqual(decodeSavestate(quiet.bytes).sections.get("time"));
+    });
+});

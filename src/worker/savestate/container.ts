@@ -1,4 +1,4 @@
-import { decodeValue, encodeValue, type SaveValue } from './value-codec';
+import { decodeValue, encodeValue, type EncodedValue, type SaveValue } from './value-codec';
 import { validateRamManifest, type RamManifest } from './ram';
 
 export const CONTAINER_MAGIC = 0x56535342;
@@ -68,8 +68,7 @@ class Reader {
     get done(): boolean { return this.off === this.buf.byteLength; }
 }
 
-function writeValue(w: Writer, value: SaveValue): void {
-    const { json, blobs } = encodeValue(value);
+function writeEncoded(w: Writer, { json, blobs }: EncodedValue): void {
     w.text(json);
     w.u32(blobs.length);
     for (const b of blobs) w.blob(b);
@@ -84,14 +83,25 @@ function readValue(r: Reader): SaveValue {
 }
 
 export function encodeSavestate(state: Savestate): Uint8Array {
+    const sections = new Map<string, EncodedValue>();
+    for (const [name, value] of state.sections) sections.set(name, encodeValue(value));
+    return encodeSavestateSections(state.header, sections);
+}
+
+/**
+ * Writes a container from sections that are already encoded. A capture encodes each section
+ * while the guest is halted, because a section value may still share arrays and records with
+ * the running state; the container itself is put together after the guest has resumed.
+ */
+export function encodeSavestateSections(header: SavestateHeader, sections: ReadonlyMap<string, EncodedValue>): Uint8Array {
     const w = new Writer();
     w.u32(CONTAINER_MAGIC);
     w.u32(CONTAINER_VERSION);
-    writeValue(w, state.header as unknown as SaveValue);
-    w.u32(state.sections.size);
-    for (const [name, value] of state.sections) {
+    writeEncoded(w, encodeValue(header as unknown as SaveValue));
+    w.u32(sections.size);
+    for (const [name, value] of sections) {
         w.text(name);
-        writeValue(w, value);
+        writeEncoded(w, value);
     }
     return w.finish();
 }
