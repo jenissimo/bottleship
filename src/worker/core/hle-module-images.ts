@@ -137,6 +137,10 @@ export function retainHleModuleLoaded(dllName: string, attach = true): HleModule
     } };
 }
 
+export function boundHleModules(): string[] {
+    return [...loadedNames].sort();
+}
+
 /** Has this process loaded the module, or does it only have an image? See loadedNames. */
 export function isHleModuleLoaded(dllName: string): boolean {
     const raw = normalizeDllBaseName(dllName);

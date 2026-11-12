@@ -35,6 +35,8 @@ export interface LoadedPEModule {
     initialized: boolean;
     /** PE Sections (for debugging/diagnostics) */
     sections?: PESection[];
+    contentHash?: string;
+    unsaved?: string;
 }
 
 export interface PESection {
@@ -367,6 +369,16 @@ export class ModuleRegistry {
      */
     isLoaded(name: string): boolean {
         return this.getByName(name) !== undefined;
+    }
+
+    captureLayout(): { nextDllBase: number; freeDllRanges: Array<[number, number]> } {
+        return { nextDllBase: this.nextDllBase, freeDllRanges: this.freeDllRanges.map(r => [r.base, r.size]) };
+    }
+
+    restoreLayout(nextDllBase: number, freeDllRanges: ReadonlyArray<readonly [number, number]>): void {
+        this.nextDllBase = nextDllBase;
+        this.freeDllRanges = freeDllRanges.map(([base, size]) => ({ base, size }));
+        this.spanIndex = null;
     }
 
     /**

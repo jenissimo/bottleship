@@ -342,6 +342,7 @@ describe("schema pin and mutation", () => {
         for (const u of undo) u();
         expect(schemas).toEqual({
             "kernel32": { version: 4, schemaHash: "6bbba5ed115386df" },
+            "module-images": { version: 1, schemaHash: "eb8a15faafb2e682" },
             "time": { version: 1, schemaHash: "728d1b2522148901" },
             "address-space": { version: 1, schemaHash: "a1c4ce059654c36f" },
             "memory-manager": { version: 1, schemaHash: "4a5dbc8ebbd40e94" },

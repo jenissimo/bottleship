@@ -5,6 +5,7 @@ export const PARTICIPANT_IDS = [
     'kernel32-memory',
     'thunk-generator',
     'kernel32',
+    'module-images',
     'msvcrt',
     'resources',
     'hypercall-page',

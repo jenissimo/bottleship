@@ -15,6 +15,7 @@ import { ModuleRegistry, type LoadedPEModule } from "../../src/worker/core/modul
 import { System } from "../../src/worker/core/system";
 import { kernel32Module } from "../../src/worker/api/kernel32.api";
 import { exports as kernel32, registerFastPathModuleFunctions } from "../../src/worker/modules/kernel32/module/module";
+import { captureModuleImages, restoreModuleImages } from "../../src/worker/savestate/participants/module-images";
 
 const NAME = 0x10000, OUT = 0x10800, ESP = 0x11000, EXE = 0x400000;
 let mem: Uint8Array;
@@ -153,6 +154,23 @@ describe("GetModuleHandle observes loaded HLE images without loading them", () =
         call("FreeLibrary", [second.value]);
         expect(lookup("GetModuleHandleA", "dinput8.dll")).toBe(0);
         expect(lookup("GetModuleHandleA", "dinput.dll")).toBe(hleImageBase("dinput"));
+    });
+    test("a savestate pins again the HLE modules that images bound, and leaves LoadLibrary references to kernel32", async () => {
+        markHleModuleLoaded("ws2_32.dll");
+        await call("LoadLibraryA", [writeName("dinput8.dll", false)]);
+        const tls = System.getInstance().implicitTlsEntries;
+        const saved = structuredClone(captureModuleImages(process.moduleRegistry));
+        expect(saved.hleBound).toEqual(["ws2_32"]);
+        process.resetGeneration++;
+        materializeHleModuleImages(process);
+        expect(isHleModuleLoaded("ws2_32")).toBe(false);
+        restoreModuleImages(saved, new Map(), process.moduleRegistry, {} as never);
+        System.getInstance().implicitTlsEntries = tls;
+        expect(isHleModuleLoaded("ws2_32")).toBe(true);
+        expect(isHleModuleLoaded("dinput8")).toBe(false);
+        expect(captureModuleImages(process.moduleRegistry).hleBound).toEqual(saved.hleBound);
+        markHleModuleLoaded("user32.dll");
+        expect(captureModuleImages(process.moduleRegistry).hleBound).toEqual(["user32", "ws2_32"]);
     });
     test("the fast path declines an unloaded image without changing loader membership", () => {
         expect(fast("ws2_32.dll")).toBeNull();

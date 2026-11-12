@@ -15,6 +15,8 @@ import { hypercallDataManager } from './cpu/hypercall-data';
 import { libHleManager } from './hle-lib/lib-hle-manager';
 import { hookRegistry } from './hooks';
 import { runNativeModulePatchers } from '../modules/native-patchers';
+import { savestatesEnabled } from '../savestate/participant';
+import { sha256HexSync } from '../savestate/sha256';
 import { findDllRule, normalizeDllPathToken } from './dll-rules';
 import { isUnderSystemDirectory } from './hle-system-catalog';
 import { EmulatorConfig } from './emulator-config-manager';
@@ -301,11 +303,24 @@ export class PELoader {
      * Collected during loadExecutable → loadDll, consumed by bootloader trampoline.
      */
     private pendingDllInits: DllInitEntry[] = [];
+    private bootImagesLoaded = false;
 
     constructor(getMemory: () => Uint8Array, thunkGenerator: ThunkGenerator, apiRegistry: APIRegistry) {
         this.getMemory = getMemory;
         this.thunkGenerator = thunkGenerator;
         this.apiRegistry = apiRegistry;
+    }
+
+    private inlineStubKey(): string {
+        return JSON.stringify([this.heapInlineStubs, this.crtInlineStubs, this.caseFoldInlineStubs,
+            this.localeInlineStubs, this.mbwcInlineStubs, this.mbwcStubsDeclined, this.mathInlineStubs]);
+    }
+
+    async readImageFile(path: string): Promise<Uint8Array | null> {
+        if (!this.vfs) return null;
+        const handle = await this.vfs.open(path, 0x80000000, 3);
+        if (!handle) return null;
+        return this.vfs.read(handle, this.vfs.getFileSize(path));
     }
 
     /**
@@ -435,6 +450,7 @@ export class PELoader {
     }
 
     async loadExecutable(peData: Uint8Array): Promise<LoadedModule> {
+        this.bootImagesLoaded = false;
         const peView = new DataView(peData.buffer, peData.byteOffset, peData.byteLength);
 
         // Verify DOS Header
@@ -572,6 +588,7 @@ export class PELoader {
         // PE32 optional header offset 72 = SizeOfStackReserve
         const sizeOfStackReserve = peView.getUint32(optHeaderPtr + 72, true);
 
+        this.bootImagesLoaded = true;
         return {
             baseAddress,
             entryPoint: baseAddress + entryPointRVA,
@@ -743,6 +760,7 @@ export class PELoader {
         this.loadingDlls.add(dllNameLower);
 
         let registered = false;
+        const runTime = this.bootImagesLoaded;
         try {
             // Open and read DLL from VFS
             const handle = await this.vfs.open(dllPath, 0x80000000, 3); // GENERIC_READ, OPEN_EXISTING
@@ -849,6 +867,8 @@ export class PELoader {
             };
             this.moduleRegistry.register(module);
             registered = true;
+            const stubCount = (): number => this.thunkGenerator.getAllStubs().length;
+            let hookStubs = -stubCount();
 
             // Static Library HLE detection for this DLL's image (same reason as EXE path).
             try {
@@ -866,11 +886,15 @@ export class PELoader {
             // Native DLLs importing thunked modules (kernel32, user32, dinput, etc.)
             // get HLE thunk stubs patched into their IAT.
             const importDirRVA = peView.getUint32(optHeaderPtr + 104, true);
+            hookStubs += stubCount();
+            const inlineStubs = this.inlineStubKey();
             if (importDirRVA !== 0) {
                 Logger.warn(LogCategory.SYSTEM,
                     `[PE] === Processing imports for NATIVE DLL "${dllNameLower}" (base=0x${baseAddress.toString(16)}) ===`);
                 await this.processImports(baseAddress, importDirRVA, dependencyDirectories);
             }
+            const emittedInlineStubs = this.inlineStubKey() !== inlineStubs;
+            hookStubs -= stubCount();
 
             // Real-DLL export patchers (HLE replacements for a library the game ships), AFTER
             // imports: they patch function BODIES rather than the packed 5-byte export thunks,
@@ -879,6 +903,13 @@ export class PELoader {
             {
                 const system = System.getInstance();
                 if (system.process) runNativeModulePatchers(system.process, module);
+            }
+            hookStubs += stubCount();
+            if (runTime) {
+                if (hookStubs !== 0) module.unsaved = 'is patched by host-side hooks';
+                else if (emittedInlineStubs) module.unsaved = 'made the loader emit its inline stubs';
+                else if (savestatesEnabled()) module.contentHash = sha256HexSync(peData);
+                else module.unsaved = 'has no content hash';
             }
 
             Logger.warn(LogCategory.SYSTEM,
@@ -1166,7 +1197,7 @@ export class PELoader {
     /**
      * Parse PE Export Directory to get exports
      */
-    private parseExportTable(peData: Uint8Array, baseAddress: number): {
+    parseExportTable(peData: Uint8Array, baseAddress: number): {
         exports: Map<string, number>;
         ordinals: Map<number, number>;
     } {

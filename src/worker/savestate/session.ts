@@ -118,8 +118,8 @@ export async function missingChunks(manifest: RamManifest, store: ChunkStore): P
 }
 
 /**
- * Nothing is written until every chunk the manifest names is present and every blob is read
- * and verified. After the first write, any failure is a RestoreFailed: the guest is half
+ * Nothing is written until every chunk the manifest names is present, every blob is read
+ * and verified, and every participant has verified its section. After the first write, any failure is a RestoreFailed: the guest is half
  * restored and must not run.
  */
 export async function restoreSession(
@@ -132,6 +132,10 @@ export async function restoreSession(
     const missingBlob = await missingBlobs(list, store);
     if (missingBlob.length > 0) throw new Error(`savestate: ${missingBlob.length} blob(s) are missing, e.g. ${missingBlob[0]}`);
     const blobs = await loadBlobs(list, store);
+    for (const p of participants.all()) {
+        const value = state.sections.get(p.id);
+        if (value !== undefined) await p.verify?.(value);
+    }
     try {
         await restoreWritten(target, state, store, participants, blobs);
     } catch (e) {

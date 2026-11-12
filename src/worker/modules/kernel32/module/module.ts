@@ -97,11 +97,6 @@ export interface ModuleRefState {
 }
 
 export function captureModuleRefs(): ModuleRefState {
-    for (const base of dynamicLoadRefs.keys()) {
-        if (hleModuleNameByBase(base) === undefined) {
-            throw new Error(`kernel32: a DLL loaded at run time (0x${base.toString(16)}) is not part of a v1 savestate`);
-        }
-    }
     return {
         pinned: [...pinnedModuleBases],
         dynamicRefs: [...dynamicLoadRefs],
