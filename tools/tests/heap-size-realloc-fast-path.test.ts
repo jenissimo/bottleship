@@ -21,7 +21,9 @@ import {
     resetHeapSlab,
     heapZeroGrowStats,
     resetHeapZeroGrowStats,
+    registerFastPathHeapFunctions,
 } from "../../src/worker/modules/kernel32/memory";
+import type { FastPathImplementation } from "../../src/worker/core/thunking/thunk-dispatcher";
 
 const MEM_SIZE = 0x02000000;         // 32 MB
 const SLAB_BASE = 0x01C00000;        // 4 MB slab, ending exactly at MEM_SIZE
@@ -277,6 +279,29 @@ describe("HeapSize / HeapReAlloc fast path == slow path", () => {
         expect([...mem.subarray(grown, grown + 64)]).toEqual(new Array(64).fill(0x5A));
         for (let i = 64; i < 512; i++) {
             expect(`+${i}:${mem[grown + i]}`).toBe(`+${i}:0`);
+        }
+    });
+
+    // ── HeapAlloc ─────────────────────────────────────────────────────────────
+    // All live zero-size allocations must be independently freeable on either tier.
+    test("a zero-byte HeapAlloc returns distinct live blocks, on both tiers", () => {
+        const fastPaths: Record<string, FastPathImplementation> = {};
+        registerFastPathHeapFunctions({
+            registerFastPath: (_dll: string, name: string, fn: FastPathImplementation) => { fastPaths[name] = fn; },
+        } as any);
+        pushArgs([HHEAP, 0, 0]);
+        const fastA = fastPaths["HeapAlloc"]!(cpu.reg32[4], view, mem, new Uint32Array(mem.buffer), cpu) as number;
+        const fastB = fastPaths["HeapAlloc"]!(cpu.reg32[4], view, mem, new Uint32Array(mem.buffer), cpu) as number;
+        const slow = (memExports["HeapAlloc"] as any)(ctx, mem, [HHEAP, 0, 0]) as number;
+
+        for (const ptr of [fastA, fastB, slow]) {
+            expect(ptr).toBeGreaterThan(0);
+            expect(fastSize(ptr)).not.toBe(SIZE_T_MINUS_ONE);
+        }
+        expect(new Set([fastA, fastB, slow]).size).toBe(3);
+        expect(lastError).toBe(0);
+        for (const ptr of [fastA, fastB, slow]) {
+            expect((memExports["HeapFree"] as any)(ctx, mem, [HHEAP, 0, ptr])).toBe(1);
         }
     });
 });
