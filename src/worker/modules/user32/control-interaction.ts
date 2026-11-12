@@ -29,6 +29,7 @@ import {
     isButtonSystemControl,
     isGroupBoxSystemControl,
     getComboDropdownRect,
+    paintOpenComboDropdown,
     listVisibleCount,
     listVisibleCountOf,
     clampListTopIndex,
@@ -424,7 +425,13 @@ function repaintHost(
 ): void {
     const repainted = [control.handle, ...(alsoChanged ?? [])];
     if (repainted.every((h) => windows.get(h)?.wndProcSubclassed)) {
-        for (const h of repainted) requestSubclassedControlPaint(windows.get(h));
+        for (const h of repainted) {
+            const win = windows.get(h);
+            requestSubclassedControlPaint(win);
+            // The combo's WM_PAINT draws the closed box only; its open list is the
+            // ComboLBox popup, which USER paints itself, synchronously.
+            if (win) paintOpenComboDropdown(win);
+        }
         return;
     }
     // A control inside a dialog composited over a DDraw flip chain needs the FULL

@@ -1588,6 +1588,37 @@ function paintComboBox(
     }
 }
 
+/**
+ * Stamp an open combobox's drop-down list NOW, on its own.
+ *
+ * On Windows the list is a separate ComboLBox popup with USER's own (never subclassed)
+ * class proc, and CBDropDown shows it with `RedrawWindow(hWndLBox, RDW_UPDATENOW)` —
+ * it is painted before the click that opened it returns, whatever the combo's own
+ * wndproc is (Wine combo.c CBDropDown). Ours is not a window: it is stamped by
+ * paintChildControls after the siblings. A SUBCLASSED combo is repainted through its
+ * own WM_PAINT instead (requestSubclassedControlPaint), and that class proc paints
+ * the closed box only — so without this the list waited for an unrelated parent
+ * repaint to appear at all.
+ */
+export function paintOpenComboDropdown(combo: WindowInfo): boolean {
+    if (!combo.isSystemControl || normalizeSystemControlClass(combo.systemControlClass) !== 'combobox') return false;
+    if (!listControlStates.get(combo.handle)?.dropdownOpen || !isEffectivelyVisible(combo)) return false;
+    const gdi = System.getInstance().gdiContext;
+    const hdc = gdi?.createOverlayDC?.();
+    if (!hdc) return false;
+    const ctx = gdi.getDC(hdc);
+    if (ctx) {
+        paintComboDropdown(ctx, combo);
+        gdi.setOverlayDirty(true);
+        if (paintTraceEnabled) {
+            const r = getComboDropdownRect(combo);
+            logChromeStamp(combo.handle, `combolbox ${r.w}x${r.h}`);
+        }
+    }
+    gdi.releaseDC(hdc);
+    return !!ctx;
+}
+
 /** Painted after all siblings so the open list overlaps controls below the combo. */
 function paintComboDropdown(ctx: OffscreenCanvasRenderingContext2D, child: WindowInfo): void {
     const state = listControlStates.get(child.handle);
