@@ -42,5 +42,7 @@ Sources for the demo covers added in October 2026:
 | `crimson-skies-box.jpg` | Crimson Skies (2000), North American PC box | [LaunchBox PC cover scan](https://images.launchbox-app.com/07f38c0b-fdf9-41a3-a791-c34f30d906de.jpg) |
 
 | `lotr-return-of-the-king-box.jpg` | The Lord of the Rings: The Return of the King (2003), original cover artwork | [Wikipedia cover scan](https://upload.wikimedia.org/wikipedia/en/4/40/Rotkboxart2.jpg) |
+| `gta1-box.jpg` | Grand Theft Auto (1997), original cover artwork | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/12170/library_600x900.jpg) |
+| `gta2-box.jpg` | Grand Theft Auto 2 (1999), original cover artwork | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/12180/library_600x900.jpg) |
 
 Artwork remains copyright of its respective owners.
