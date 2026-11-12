@@ -63,9 +63,6 @@ describe("winmm", () => {
 
     test("refuses open devices and queued callbacks", () => {
         const w = winmm();
-        (w.waveOutDevices as Map<number, unknown>).set(1, {});
-        expect(() => w.captureSavestate()).toThrow("waveOut");
-        (w.waveOutDevices as Map<number, unknown>).clear();
         (w.mmioHandles as Map<number, unknown>).set(1, {});
         expect(() => w.captureSavestate()).toThrow("MMIO");
         (w.mmioHandles as Map<number, unknown>).clear();
@@ -73,14 +70,11 @@ describe("winmm", () => {
         expect(() => w.captureSavestate()).toThrow("timer callback");
     });
 
-    test("refuses an open MCI device, a playing PlaySound sound and a running timer callback", () => {
+    test("refuses an open MCI device and a running timer callback", () => {
         const w = winmm();
         w.mci = { openDeviceCount: () => 1 };
         expect(() => w.captureSavestate()).toThrow("MCI");
         w.mci = null;
-        w.playSoundSab = new SharedArrayBuffer(8);
-        expect(() => w.captureSavestate()).toThrow("PlaySound");
-        w.playSoundSab = null;
         w.dispatchingTimerCallback = (w.timers as Map<number, unknown>).get(3);
         expect(() => w.captureSavestate()).toThrow("timer callback");
         w.dispatchingTimerCallback = null;
@@ -100,11 +94,22 @@ describe("winmm", () => {
                 nextTimerId: 12, periodRefCounts: [[5, 3]], nextWaveOutId: 7, nextMMIOHandle: 0x99, nextPlaySoundId: 4,
                 timerThreadId: 21, timerThreadHandle: 0x88, timerWakeEvent: 0x77,
                 joystick: { thresholds: joystick.thresholds.map((t, i) => t + i + 1), captures: joystick.captures.map((_, i) => i === 0 ? { hwnd: 0x20001, changedOnly: true, timerId: 4, x: 1, y: 2, z: 3, buttons: 5, primed: true } : null) },
+                waveOut: [{
+                    fields: {
+                        id: 0x20000003, format: { channels: 2, sampleRate: 11025, avgBytesPerSec: 22050, blockAlign: 2, bitsPerSample: 8 },
+                        callback: 0x403000, instance: 6, flags: 0x30000, isPlaying: true, positionBytes: 0, writeOffset: 12,
+                        pendingBuffers: [{ pwh: 0x1100, data: 0x1000, length: 8, endOffset: 12 }], lastPlayCursor: 2, playedBytes: 2,
+                        completionPollerId: 41, guestLpData: 0, guestBufferLength: 0, multiBuffer: true,
+                    },
+                    writeCursor: 12, dataLength: 131072, loopMode: -1, volume: -300, pan: 40, tail: new Uint8Array([9, 8]),
+                }],
+                playSound: { id: 0x50000002, channels: 1, sampleRate: 8000, bitsPerSample: 8, loop: true, playCursor: 3, pcm: new Uint8Array([1, 2, 3, 4, 5, 6]) },
             };
             expect(Object.keys(values).sort()).toEqual(Object.keys(winmm().captureSavestate()).sort());
             for (const [field, value] of Object.entries(values) as Array<[keyof WinMMState, unknown]>) {
                 const saved = { ...winmm().captureSavestate(), [field]: value } as WinMMState;
-                const fresh = new WinMM();
+                const fresh = new WinMM() as WinMM & Internals;
+                fresh.guestMemory = () => new Uint8Array(0x2000);
                 resetWinmmJoystick();
                 fresh.restoreSavestate(structuredClone(saved));
                 expect({ field, value: bytes(fresh.captureSavestate()[field]) }).toEqual({ field, value: bytes(value) });
@@ -121,7 +126,7 @@ describe("winmm", () => {
     });
 
     test("WinMMState keys", () => {
-        const keys: Array<keyof WinMMState> = ["timers", "nextTimerId", "periodRefCounts", "nextWaveOutId", "nextMMIOHandle", "nextPlaySoundId", "timerThreadId", "timerThreadHandle", "timerWakeEvent", "joystick"];
+        const keys: Array<keyof WinMMState> = ["timers", "nextTimerId", "periodRefCounts", "nextWaveOutId", "nextMMIOHandle", "nextPlaySoundId", "timerThreadId", "timerThreadHandle", "timerWakeEvent", "joystick", "waveOut", "playSound"];
         expect(Object.keys(winmm().captureSavestate()).sort()).toEqual([...keys].sort());
     });
 });
