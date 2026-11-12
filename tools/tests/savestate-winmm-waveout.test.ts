@@ -28,6 +28,7 @@ const armed = new Map<number, number>();
 const system = System.getInstance() as unknown as Record<string, unknown>;
 let savedSelf: PropertyDescriptor | undefined;
 let savedScheduler: unknown;
+let savedProcess: unknown;
 let nextWheel = 500;
 
 beforeAll(() => {
@@ -42,19 +43,20 @@ beforeAll(() => {
             },
         },
     });
-    savedScheduler = system.scheduler;
 });
 
 afterAll(() => {
     if (savedSelf) Object.defineProperty(globalThis, "self", savedSelf);
     else Reflect.deleteProperty(globalThis, "self");
-    system.scheduler = savedScheduler;
 });
 
 beforeEach(() => {
     rings.clear();
     posted.length = 0;
     armed.clear();
+    savedScheduler = system.scheduler;
+    savedProcess = system.process;
+    system.process = null;
     system.scheduler = {
         timerWheel: {
             add: (_ms: number, _periodic: boolean, _kind: number, owner: number) => { armed.set(++nextWheel, owner); return nextWheel; },
@@ -63,7 +65,10 @@ beforeEach(() => {
         notifyWinmmTimerThread: () => undefined,
     };
 });
-afterEach(() => { system.scheduler = savedScheduler; });
+afterEach(() => {
+    system.scheduler = savedScheduler;
+    system.process = savedProcess;
+});
 
 const bytes = (v: unknown) => {
     const e = encodeValue(v as SaveValue);
@@ -354,6 +359,34 @@ describe("winmm waveOut savestate", () => {
             .toThrow(`winmm: a queued buffer of waveOut device 0x${r.hwo.toString(16)} at 0x${DATA.toString(16)} (${LEN} bytes) is not in guest memory`);
     });
 
+    test("fifty rounds of open, write, reset and close leave no ring, poller or device behind", () => {
+        const r = rig(CALLBACK_FUNCTION);
+        r.call(r.w, "waveOutClose", [r.hwo]);
+        r.drain(r.w);
+        const count = () => ({ rings: rings.size, pollers: armed.size, devices: (r.w.waveOutDevices as Map<number, unknown>).size, queued: r.done(r.w).length });
+        const before = count();
+        expect(before).toEqual({ rings: 0, pollers: 0, devices: 0, queued: 0 });
+        for (let round = 0; round < 50; round++) {
+            expect(r.call(r.w, "waveOutOpen", [PHWO, 0, PWFX, CALLBACK, INSTANCE, CALLBACK_FUNCTION])).toBe(0);
+            const hwo = r.v.getUint32(PHWO, true);
+            for (let i = 0; i < 3; i++) {
+                r.v.setUint32(r.header(i), DATA + i * LEN, true);
+                r.v.setUint32(r.header(i) + 4, LEN, true);
+                r.v.setUint32(r.header(i) + 16, WHDR_PREPARED, true);
+                expect(r.call(r.w, "waveOutWrite", [hwo, r.header(i), 32])).toBe(0);
+            }
+            if (round % 2) {
+                const fresh = r.w.captureSavestate();
+                r.w.restoreSavestate(throughCodec(fresh));
+            }
+            expect(r.call(r.w, "waveOutReset", [hwo])).toBe(0);
+            expect(r.call(r.w, "waveOutClose", [hwo])).toBe(0);
+            r.drain(r.w);
+        }
+        expect(count()).toEqual(before);
+        expect(posted.filter(m => m.type === "audio_register").length - posted.filter(m => m.type === "audio_unregister").length).toBe(0);
+    });
+
     test("a restore replaces the devices that are open, unregisters their rings and leaves the restored timer wheel alone", () => {
         const r = rig();
         r.write(r.w, 0);
@@ -459,9 +492,8 @@ describe("winmm PlaySound savestate", () => {
 
 describe("winmm participant", () => {
     test("version 3 with a pinned schema, and a refusal reaches the caller as a CaptureRefusal", () => {
-        const g = globalThis as { __savestates?: unknown };
-        const had = g.__savestates;
         const w = new WinMM() as Module;
+        const before = savestateParticipants.all().find(x => x.id === "winmm");
         const off = w.registerSavestate();
         try {
             const p = savestateParticipants.all().find(x => x.id === "winmm")!;
@@ -471,7 +503,7 @@ describe("winmm participant", () => {
             expect(() => p.capture({} as never)).toThrow(CaptureRefusal);
         } finally {
             off();
-            g.__savestates = had;
+            if (before) savestateParticipants.add(before);
         }
     });
 });
