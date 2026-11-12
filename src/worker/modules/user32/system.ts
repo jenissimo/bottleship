@@ -1726,7 +1726,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         Logger.verbose(LogCategory.USER32, `${apiName}: Registered handle=0x${handle.toString(16)} for "${filename}"`);
         
         // Only attempt to load if it's a bitmap and we have a filename
-        if (type !== IMAGE_BITMAP || name <= 0xFFFF || !filename || !isBmp) {
+        // LR_LOADFROMFILE names a file whatever its extension is: the loader reads the
+        // BITMAPFILEHEADER, not the name. (A ".bmp" name without the flag is still tried
+        // as a file, as before.)
+        if (type !== IMAGE_BITMAP || name <= 0xFFFF || !filename || !(isBmp || isFileLoad)) {
             Logger.verbose(LogCategory.USER32, `${apiName}: Skipping load - type=${type} name<=0xFFFF=${name <= 0xFFFF} filename="${filename}" isBmp=${isBmp}`);
             resourceData.loading = false;
             return handle;
