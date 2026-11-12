@@ -13,6 +13,7 @@ import { Mem } from "../core/memory/mem-accessor";
 import type { Vc6LocaleSnapshot } from "./crt-cpp-locale-vc6";
 import { System } from "../core/system";
 import { shutdownProcess } from "./kernel32/process/process";
+import { exports as fileIo } from "./kernel32/file-io";
 import { VfsFileHandle, type VirtualFileSystem } from "../runtime/filesystem/vfs";
 import {
     fpuGetST, fpuPop, fpuPush, fpuSetST0,
@@ -2114,6 +2115,7 @@ export class Msvcrt implements IModule {
         if (h === undefined) return;
         this.fdHandles.delete(fd);
         if (this.handleFds.get(h) === fd) this.handleFds.delete(h);
+        fileIo.CloseHandle!(null as never, null as never, [h]);
     }
 
     private read(ctx: any, mem: Uint8Array, fd: number, buffer: number, count: number): number | Promise<ThunkResult> {

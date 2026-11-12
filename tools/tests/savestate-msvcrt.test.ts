@@ -6,6 +6,7 @@ import { resetCrtConvStatics } from "../../src/worker/modules/crt-conv";
 import { openFindHandleCount, restoreVc9IoStatics } from "../../src/worker/modules/crt-vc9-io";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { System } from "../../src/worker/core/system";
+import { exports as fileIo } from "../../src/worker/modules/kernel32/file-io";
 import { CaptureRefusal } from "../../src/worker/savestate/object-codecs";
 import { ParticipantRegistry, savestateParticipants, uncoveredModules } from "../../src/worker/savestate/participant";
 import { coverageModules, touchedModules } from "../../src/worker/savestate/core-participants";
@@ -61,7 +62,7 @@ function played(): Msvcrt & Internals {
 beforeEach(() => {
     const system = System.getInstance();
     oldScheduler = system.scheduler;
-    system.scheduler = { getCurrentThread: () => ({ id: 1 }), isMainThread: (id: number) => id === 1 } as never;
+    system.scheduler = { getCurrentThread: () => ({ id: 1 }), isMainThread: (id: number) => id === 1, setLastError: () => undefined } as never;
     mem = new Uint8Array(0x40000);
     Mem.bind(() => mem);
     resetCrtTimeStatics();
@@ -189,6 +190,46 @@ describe("msvcrt participant", () => {
         expect((crt.fdHandles as Map<number, number>).size).toBe(0);
         expect((crt.handleFds as Map<number, number>).size).toBe(0);
         expect(() => crt.captureSavestate()).not.toThrow();
+    });
+
+    test("_close closes the Win32 handle behind an _open_osfhandle descriptor", () => {
+        const crt = played();
+        const system = System.getInstance();
+        const flushed: string[] = [];
+        const oldFlush = system.fileSystem.flushFile;
+        system.fileSystem.flushFile = async (path: string) => { flushed.push(path); };
+        let closed = 0;
+        const h = system.resourceProvider.registerFileHandle({ vfsHandle: { path: "C:\\log.txt", source: "overlay", position: 0 }, close: () => { closed++; } });
+        try {
+            const fd = crt.exports["_open_osfhandle"]!({}, mem, [h, 0]);
+            expect(crt.exports["_close"]!({}, mem, [fd])).toBe(0);
+            expect(system.resourceProvider.getFileHandle(h)).toBeFalsy();
+            expect(closed).toBe(1);
+            expect(flushed).toEqual(["C:\\log.txt"]);
+            expect(fileIo.CloseHandle!({} as never, mem, [h])).toBe(0);
+        } finally {
+            system.fileSystem.flushFile = oldFlush;
+            system.resourceProvider.unregisterFileHandle(h);
+        }
+    });
+
+    test("fclose on an _fdopen stream closes the Win32 handle behind its descriptor", () => {
+        const crt = played();
+        const system = System.getInstance();
+        mem.set([0x72, 0], 0x3000);
+        let closed = 0;
+        const h = system.resourceProvider.registerFileHandle({ vfsHandle: { path: "C:\\log.txt", source: "rom", position: 0 }, close: () => { closed++; } });
+        try {
+            const fd = crt.exports["_open_osfhandle"]!({}, mem, [h, 0]);
+            const fp = crt.exports["_fdopen"]!({}, mem, [fd, 0x3000]);
+            expect(fp).not.toBe(0);
+            expect(crt.exports["fclose"]!({}, mem, [fp])).toBe(0);
+            expect(system.resourceProvider.getFileHandle(h)).toBeFalsy();
+            expect(closed).toBe(1);
+            expect(fileIo.CloseHandle!({} as never, mem, [h])).toBe(0);
+        } finally {
+            system.resourceProvider.unregisterFileHandle(h);
+        }
     });
 
     test("refuses while a _findfirst search is open and saves again once it is closed", () => {
