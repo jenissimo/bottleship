@@ -110,7 +110,10 @@ function sizeWindowToMovie(
         width + frame.padSide * 2, height + frame.padTop + frame.padBottom,
         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
     ]);
-    mci()?.executeString(`put ${alias} destination at ${frame.padSide} ${frame.padTop} ${width} ${height}`);
+    // A child's stored rectangle includes its border; a top-level window's is its client area.
+    const child = ((win.style >>> 0) & 0x40000000) !== 0;
+    mci()?.executeString(
+        `put ${alias} destination at ${child ? frame.padSide : 0} ${child ? frame.padTop : 0} ${width} ${height}`);
 }
 
 /** MCIWNDM_OPEN: returns 0 or the MCI error, which is also what MCIWNDM_GETERROR reports. */
