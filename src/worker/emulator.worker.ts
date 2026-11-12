@@ -2938,6 +2938,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(netapi32.name, netapi32);
       process.registerModule(imagehlp.name, imagehlp);
       const dbghelp = new DbgHelp(process);
+      dbghelp.initialize(process);
       process.registerModule(dbghelp.name, dbghelp);
       process.registerModule(ifc20.name, ifc20);
       process.registerModule(gdiplus.name, gdiplus);

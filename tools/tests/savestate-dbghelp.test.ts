@@ -5,6 +5,9 @@ import { captureStackWalks, resetStackWalks } from "../../src/worker/modules/dbg
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { System } from "../../src/worker/core/system";
 import { savestateParticipants } from "../../src/worker/savestate/participant";
+import { coverageRefusal } from "../../src/worker/savestate/session";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 const bytes = (v: unknown) => {
     const e = encodeValue(v as SaveValue);
@@ -139,6 +142,35 @@ describe("dbghelp participant", () => {
         step(a);
         a.reset();
         expect(a.captureSavestate()).toEqual({ stackWalks: [] });
+    });
+
+    test("a module that is only loaded is covered once the worker's boot sequence has run on it", () => {
+        const flag = globalThis as { __savestates?: unknown };
+        const touched = { touchedModules: () => ["dbghelp"] };
+        const before = savestateParticipants.all().find(p => p.id === "dbghelp");
+        expect(coverageRefusal(touched)).toBe("savestate: no participant captures dbghelp");
+        flag.__savestates = true;
+        try {
+            const booted = new DbgHelp({} as never);
+            booted.initialize({} as never);
+            expect(coverageRefusal(touched)).toBeNull();
+            const mine = savestateParticipants.all().find(p => p.id === "dbghelp")!;
+            expect(mine.capture({} as never)).toEqual({ stackWalks: [] });
+            savestateParticipants.add(mine)();
+            if (before) savestateParticipants.add(before);
+        } finally {
+            delete flag.__savestates;
+        }
+        expect(coverageRefusal(touched)).toBe("savestate: no participant captures dbghelp");
+    });
+
+    test("the worker initializes every module it registers, so none is loaded without its participant", () => {
+        const worker = readFileSync(join(import.meta.dir, "..", "..", "src", "worker", "emulator.worker.ts"), "utf8");
+        const registered = [...worker.matchAll(/process\.registerModule\((\w+)\.name, \1\)/g)].map(m => m[1]!);
+        const initialized = new Set([...worker.matchAll(/(\w+)\.initialize\(process\)/g)].map(m => m[1]!));
+        expect(registered).toContain("dbghelp");
+        expect(registered.length).toBeGreaterThan(40);
+        expect(registered.filter(name => !initialized.has(name))).toEqual([]);
     });
 
     test("the registered participant covers dbghelp and has a pinned schema", () => {
