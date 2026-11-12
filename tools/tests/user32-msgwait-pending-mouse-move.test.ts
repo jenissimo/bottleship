@@ -26,6 +26,41 @@ const move = (q: MessageQueue, x: number, y: number, thread = 0) =>
     q.enqueue(HWND, WM_MOUSEMOVE, 0, (y << 16) | x, x, y, thread);
 
 describe("MessageQueue.takeNewMouseMove", () => {
+    test("a pending move restored into a fresh queue is reported once", () => {
+        const saved = new MessageQueue();
+        move(saved, 10, 20, 1);
+        saved.enqueue(HWND2, WM_MOUSEMOVE, 0, (40 << 16) | 30, 30, 40, 1);
+        expect(saved.takeNewMouseMove(1)).toBe(true);
+        const q = new MessageQueue();
+        q.restoreState(saved.captureState());
+        expect(q.hasMessages(0, 0, 1)).toBe(true);
+        expect([q.takeNewMouseMove(1), q.takeNewMouseMove(1), q.takeNewMouseMove(1)]).toEqual([true, false, false]);
+        move(q, 11, 20, 1);
+        expect([q.takeNewMouseMove(1), q.takeNewMouseMove(1)]).toEqual([true, false]);
+    });
+
+    test("a restore into the live queue forgets what a thread saw later on", () => {
+        const q = new MessageQueue();
+        move(q, 10, 20, 1);
+        const state = q.captureState();
+        for (let i = 0; i < 50; i++) move(q, 10 + i, 20, 1);
+        expect(q.takeNewMouseMove(1)).toBe(true);
+        q.restoreState(state);
+        expect([q.takeNewMouseMove(1), q.takeNewMouseMove(1)]).toEqual([true, false]);
+    });
+
+    test("a restore without a pending move leaves nothing to report and no numbers behind", () => {
+        const empty = new MessageQueue().captureState();
+        const q = new MessageQueue();
+        move(q, 10, 20, 1);
+        expect(q.takeNewMouseMove(1)).toBe(true);
+        q.restoreState(empty);
+        expect(q.takeNewMouseMove(1)).toBe(false);
+        const inner = q as unknown as { moveSeq: Map<number, number>; seenMoveSeq: Map<number, number> };
+        expect(inner.moveSeq.size).toBe(0);
+        expect(inner.seenMoveSeq.size).toBe(0);
+    });
+
     test("nothing pending is not new input", () => {
         expect(new MessageQueue().takeNewMouseMove(1)).toBe(false);
     });

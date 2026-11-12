@@ -459,6 +459,11 @@ export class MessageQueue {
         this.timerPending = new Map(s.timerPending.map(e => [e.key, { hwnd: e.hwnd, pending: copyPending(e.pending), materialized: e.materialized }]));
         this.nextTimerMessage = s.nextTimerMessage;
         this.lastMouseMove = map(s.lastMouseMove);
+        // The numbers are not part of the state. Every restored pending move is new to
+        // every thread: unnumbered, it would be pending and never reported.
+        this.moveSeq.clear();
+        this.seenMoveSeq.clear();
+        for (const hwnd of this.lastMouseMove.keys()) this.noteMoveQueued(hwnd);
         this.moveSetCursor = map(s.moveSetCursor);
         [this.lastDequeuedPtX, this.lastDequeuedPtY, this.lastDequeuedTime] = s.lastDequeued;
         for (const w of this.waiters) w.settled = true;
@@ -716,7 +721,8 @@ export class MessageQueue {
     // it was told about (takeNewMouseMove) or looked at (peek/dequeue with a filter that
     // admits WM_MOUSEMOVE). Numbers, not the move's contents: a thread with pending moves
     // on two of its windows must not be told about them alternately forever.
-    // Not saved: after a load the worst case is one move reported twice.
+    // Not saved: restoreState numbers the restored pending moves afresh and forgets what
+    // each thread saw, so a restored move is reported once more.
     private moveSeq: Map<number, number> = new Map();
     private nextMoveSeq = 1;
     private seenMoveSeq: Map<number, number> = new Map();
