@@ -13,7 +13,7 @@ import { OpenGLPipelineConfig, pipelineConfigKey } from "./opengl-pipeline-facto
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
 import { registerBackendQualitySupport } from "../shared/quality-capabilities";
 import { resolveInternalScaleFactor } from "../shared/internal-resolution";
-import { readbackSourceRect, resolveReadback } from "./opengl-readback";
+import { colorSeedPixels, readbackSourceRect, resolveReadback } from "./opengl-readback";
 import { scissorRect, viewportRect } from "./opengl-render-space";
 import { registerGpuDeviceObserver } from "../../../core/gpu/gpu-device-lifecycle";
 import {
@@ -337,7 +337,7 @@ export class OpenGLBackendExecutor {
         this.uniformCursor = 0;
         this.vertexUploadCursor = 0;
 
-        this.applyColorSeed(queue, renderW, renderH, scale);
+        this.applyColorSeed(queue, renderW, renderH);
 
         const encoder = device.createCommandEncoder();
         let renderPass: GPURenderPassEncoder | null = null;
@@ -811,30 +811,17 @@ export class OpenGLBackendExecutor {
         this.colorSeed = width > 0 && height > 0 && rgba.length === width * height * 4 ? { rgba, width, height } : null;
     }
 
-    private applyColorSeed(queue: GPUQueue, renderW: number, renderH: number, scale: number): void {
+    private applyColorSeed(queue: GPUQueue, renderW: number, renderH: number): void {
         const seed = this.colorSeed;
         if (!seed) return;
         this.colorSeed = null;
         const texture = this.offscreenTexture;
-        if (!texture || scale !== 1 || seed.width !== renderW || seed.height !== renderH) return;
-        const bgra = this.targetFormat === "bgra8unorm";
-        const rowBytes = seed.width * 4;
-        const out = new Uint8Array(seed.rgba.length);
-        for (let row = 0; row < seed.height; row++) {
-            const src = (seed.height - 1 - row) * rowBytes;
-            const dst = row * rowBytes;
-            for (let px = 0; px < rowBytes; px += 4) {
-                out[dst + px] = seed.rgba[src + px + (bgra ? 2 : 0)];
-                out[dst + px + 1] = seed.rgba[src + px + 1];
-                out[dst + px + 2] = seed.rgba[src + px + (bgra ? 0 : 2)];
-                out[dst + px + 3] = seed.rgba[src + px + 3];
-            }
-        }
+        if (!texture) return;
         queue.writeTexture(
             { texture },
-            out,
-            { bytesPerRow: rowBytes },
-            { width: seed.width, height: seed.height, depthOrArrayLayers: 1 },
+            colorSeedPixels(seed.rgba, seed.width, seed.height, renderW, renderH, this.targetFormat === "bgra8unorm"),
+            { bytesPerRow: renderW * 4 },
+            { width: renderW, height: renderH, depthOrArrayLayers: 1 },
         );
         this.offscreenInitialized = true;
     }
