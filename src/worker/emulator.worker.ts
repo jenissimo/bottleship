@@ -2260,7 +2260,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         };
         let entries: BundleEntryKey[] = [];
         try {
-          entries = bundle.archive.listEntries().map((e) => ({ name: e.name, size: e.uncompressedSize, compressedSize: e.compressedSize, crc32: e.crc32 }));
+          entries = bundle.archive.listEntries().map((e) => ({ name: e.name, size: e.uncompressedSize, crc32: e.crc32 }));
         } catch { entries = []; }
         savestateStep = "identity";
         await noteBootIdentity({
