@@ -1552,6 +1552,19 @@ export class InputManager {
         this.lastSeq = -1;
     }
 
+    captureHeldButtons(): number {
+        return this.lastButtons & 7;
+    }
+
+    restoreHeldButtons(buttons: number): void {
+        this.lastButtons = buttons & 7;
+        this.currentButtons = buttons & 7;
+        this.keyStates[0x01] = (buttons & 1) ? 0x80 : 0x00;
+        this.keyStates[0x02] = (buttons & 2) ? 0x80 : 0x00;
+        this.keyStates[0x04] = (buttons & 4) ? 0x80 : 0x00;
+        this.lastSeq = -1;
+    }
+
     captureDInputBuffers(): DInputBufferState {
         const lane = (size: number, seq: number, events: DInputBufferedEvent[], overflowed: boolean): DInputBufferLane =>
             ({ size, seq, events: events.map(e => ({ ...e })), overflowed });
