@@ -16,6 +16,7 @@ import { registerGpuDeviceObserver } from '../../../core/gpu/gpu-device-lifecycl
 import { registerDDrawSurfaceSource } from '../../../modules/ddraw/surface-device-loss';
 import type { RenderActive } from '../../../runtime/runtime-services';
 import { createRenderTarget } from '../shared/surface-factory';
+import { createPresentPlan, resolvePresentPlan, type PresentRegion } from '../shared/present-region';
 import { decodeD3DTextureToRgba8, getD3DTextureLayout, D3DFMT_P8, D3DFMT_A8P8 } from '../shared/texture-formats';
 import { TexturePaletteStore } from '../shared/texture-palette-store';
 import { D3DTEXF_NONE, D3DTEXF_POINT } from './d3d8-sampler';
@@ -295,6 +296,9 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     /** D3DPRESENT_PARAMETERS.Windowed, from CreateDevice and every Reset. */
     private deviceIsWindowed = true;
     setWindowed(windowed: boolean): void { this.deviceIsWindowed = windowed; }
+    /** D3DPRESENT_PARAMETERS.hDeviceWindow (or the focus window): where a Present without
+     *  hDestWindowOverride goes. */
+    presentWindow = 0;
     /** RenderActive: a fullscreen device owns the display like a DDraw flip chain. */
     get presentsExclusiveFullscreen(): boolean { return !this.deviceIsWindowed; }
 
@@ -998,10 +1002,13 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         this.flushProgrammablePending();
         // Windowed @ +28 (d3d8): only a fullscreen Reset sets the display mode.
         this.setWindowed(view.getUint32(pPresentationParameters + 28, true) !== 0);
+        const resetDeviceWindow = view.getUint32(pPresentationParameters + 24, true) >>> 0;
+        if (resetDeviceWindow) this.presentWindow = resetDeviceWindow;
         System.getInstance().requestHostResize(width, height, {
             modeSet: this.presentsExclusiveFullscreen,
         });
         this.renderTarget = createRenderTarget(width, height);
+        this.dropPresentComposite();
         this.rtOverride = null;
         this.viewport = sanitizeViewport({ x: 0, y: 0, width, height, minZ: 0, maxZ: 1 }, width, height);
         this.depthStencilSurfacePtr = 0;
@@ -2329,7 +2336,52 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         this.renderer.clear(rt, flags, color, z, vp, undefined, stencil);
     }
 
-    async present(): Promise<number> {
+    // The client-area image of a Present that names a source or destination rectangle:
+    // the back buffer's source rectangle stretched onto the destination rectangle, at the
+    // destination window's client size. One surface, reused; replaced when the client
+    // size changes and dropped with the back buffer (Reset) or the device.
+    private presentComposite: RenderSurface | null = null;
+    private readonly presentPlan = createPresentPlan();
+    private readonly presentCompositeDst = { left: 0, top: 0, right: 0, bottom: 0 };
+
+    private dropPresentComposite(): void {
+        const old = this.presentComposite;
+        if (!old) return;
+        this.presentComposite = null;
+        this.renderer.invalidateSurfaceCache(old);
+        old.gpuTexture?.destroy();
+        old.gpuTexture = undefined;
+        old.gpuTextureView = undefined;
+    }
+
+    /** The surface this Present shows: the back buffer, or the composed client image. */
+    private resolvePresentSource(region: PresentRegion | undefined): RenderSurface {
+        if (!region) return this.renderTarget;
+        const plan = resolvePresentPlan(this.renderTarget.width, this.renderTarget.height, region, this.presentPlan);
+        if (plan.identity) return this.renderTarget;
+        // Outside the destination rectangle the client area stays black. A fresh texture
+        // is black, so a rectangle that moves while leaving part of the area uncovered
+        // takes a fresh one instead of a clear every frame.
+        const d = plan.dst, k = this.presentCompositeDst;
+        const moved = !plan.covers && (k.left !== d.left || k.top !== d.top || k.right !== d.right || k.bottom !== d.bottom);
+        let composite = this.presentComposite;
+        if (!composite || moved || composite.width !== plan.clientWidth || composite.height !== plan.clientHeight) {
+            this.dropPresentComposite();
+            composite = this.presentComposite = createRenderTarget(plan.clientWidth, plan.clientHeight);
+            k.left = d.left; k.top = d.top; k.right = d.right; k.bottom = d.bottom;
+        }
+        if (!plan.empty) {
+            // The copy samples the finished frame: batched draws and a deferred clear of
+            // the back buffer have to be in front of it, and neither is recorded yet.
+            this.renderer.flush();
+            this.renderer.blitWithShaderCopy(this.renderTarget, composite, plan.src, plan.dst);
+        } else {
+            this.renderer.clear(composite, 1 /* D3DCLEAR_TARGET */, 0xff000000, 1.0);
+        }
+        return composite;
+    }
+
+    async present(region?: PresentRegion): Promise<number> {
         // Reset draw diagnostic counter each frame
         if (this.drawDiagCount > 0 && this.drawDiagMaxPerFrame > 0) {
             Logger.warn(LogCategory.SYSTEM, `[D3D8-DIAG] Frame ${this.drawDiagFrame}: ${this.drawDiagCount} draws logged`);
@@ -2368,7 +2420,9 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             if (device && queue && context) {
                 this.renderer.syncSurfaceFromMemory(this.renderTarget);
             }
-            const sourceView = this.renderTarget.gpuTextureView;
+            const presentSource = device && queue && context
+                ? this.resolvePresentSource(region) : this.renderTarget;
+            const sourceView = presentSource.gpuTextureView;
             if (!device || !queue || !context || !sourceView) {
                 Logger.warn(
                     LogCategory.SYSTEM,
@@ -2421,7 +2475,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                 true, // nearest-neighbor: pixel-perfect present (no bilinear stretch)
                 // The render target is guest-sized and the canvas is host-sized; without both
                 // the post-fx chain reads src===out and aspect/integer scaling silently vanish.
-                { srcW: this.renderTarget.width, srcH: this.renderTarget.height,
+                { srcW: presentSource.width, srcH: presentSource.height,
                   outW: canvasTex.width, outH: canvasTex.height, toCanvas: true },
             );
 
