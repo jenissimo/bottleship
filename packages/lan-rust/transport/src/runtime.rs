@@ -102,6 +102,8 @@ struct Connection {
     ingress: Arc<Budget>,
     output: Arc<Budget>,
     encoded: Arc<Budget>,
+    control: Arc<Budget>,
+    notices: Mutex<HashMap<(Option<ConnId>, bottleship_lan_core::wire::Node), Weak<ReleaseState>>>,
     cancel: CancellationToken,
 }
 #[derive(Debug)]
@@ -116,6 +118,8 @@ struct Shared {
     tcp_budget: Arc<Budget>,
     ingress: Arc<Budget>,
     output: Arc<Budget>,
+    control: Arc<Budget>,
+    reservations: Mutex<HashMap<ConnId, Weak<Leases>>>,
     shutdown: CancellationToken,
 }
 #[derive(Clone, Debug)]
@@ -170,6 +174,7 @@ struct OutputLease {
     _leases: Vec<Lease>,
     ticket: Arc<ReleaseState>,
     connection: Weak<Connection>,
+    _session_hold: Option<Arc<Leases>>,
 }
 impl Drop for OutputLease {
     fn drop(&mut self) {
@@ -288,7 +293,7 @@ impl TransportHandle {
             sessions: self.shared.session_budget.used().records,
             tcp_connections: self.shared.tcp_budget.used().records,
             ingress: self.shared.ingress.used(),
-            output: self.shared.output.used(),
+            output: {let a=self.shared.output.used();let b=self.shared.control.used();Usage{records:a.records+b.records,bytes:a.bytes+b.bytes}},
         }
     }
     pub fn abort(&self, id: ConnId, reason: impl Into<String>) -> Option<CloseReceipt> {
@@ -314,28 +319,38 @@ impl TransportHandle {
         if !c.live.load(Ordering::Acquire) || c.state.lock().unwrap().phase != 3 {
             return Err(reject("Namespace not active"));
         }
+        let notice = match &event.event {
+            ServerEvent::Json{name:"peerLeft",args}=>args.first().and_then(|v|v.get("node")).and_then(bottleship_lan_core::wire::node),
+            _=>None,
+        };
+        let mut notices = c.notices.lock().unwrap();
+        notices.retain(|_,ticket|ticket.upgrade().is_some_and(|t|!t.released.load(Ordering::Acquire)));
+        if let Some(node)=notice {
+            if let Some(ticket)=notices.get(&(event.sender,node)).and_then(Weak::upgrade) {
+                return Ok(DeliveryTicket(ticket));
+            }
+        }
         let measured = codec::measure(&event.event).map_err(|_| reject("Invalid output event"))?;
         // Reserve before JSON serialization or the opaque Engine.IO queue.
         let logical = measured.logical.max(event.retained_bytes);
-        let a = c
-            .output
-            .try_acquire(1, logical)
-            .ok_or_else(|| reject("Output record/byte budget exhausted"))?;
-        let b = c
-            .encoded
-            .try_acquire(0, measured.encoded_bound)
-            .ok_or_else(|| reject("Encoded output budget exhausted"))?;
-        let d = self
-            .shared
-            .output
-            .try_acquire(1, logical.saturating_add(measured.encoded_bound))
-            .ok_or_else(|| reject("Global output budget exhausted"))?;
+        let leases=if notice.is_some() {
+            let size=logical.saturating_add(measured.encoded_bound);
+            vec![c.control.try_acquire(1,size).ok_or_else(||reject("Control budget exhausted"))?,
+                 self.shared.control.try_acquire(1,size).ok_or_else(||reject("Global control budget exhausted"))?]
+        } else {
+            vec![c.output.try_acquire(1,logical).ok_or_else(||reject("Output record/byte budget exhausted"))?,
+                 c.encoded.try_acquire(0,measured.encoded_bound).ok_or_else(||reject("Encoded output budget exhausted"))?,
+                 self.shared.output.try_acquire(1,logical.saturating_add(measured.encoded_bound)).ok_or_else(||reject("Global output budget exhausted"))?]
+        };
         let encoded = codec::encode(&event.event).map_err(|_| reject("Invalid output event"))?;
         let ticket = Arc::new(ReleaseState::default());
         let owner = Arc::new(OutputLease {
-            _leases: vec![a, b, d],
+            _leases: leases,
             ticket: ticket.clone(),
             connection: Arc::downgrade(&c),
+            // Pending departure notices retain the departing session's admission
+            // credit. Reconnect churn cannot fill a recipient's control reserve.
+            _session_hold: if notice.is_some() {event.sender.and_then(|id|self.shared.reservations.lock().unwrap().get(&id).and_then(Weak::upgrade))} else {None},
         });
         let socket = c
             .socket
@@ -344,6 +359,7 @@ impl TransportHandle {
         socket
             .emit_tracked(encoded.header.into(), encoded.binary, owner)
             .map_err(|_| reject("Engine output queue refused"))?;
+        if let Some(node)=notice {notices.insert((event.sender,node),Arc::downgrade(&ticket));}
         Ok(DeliveryTicket(ticket))
     }
     fn request_shutdown(&self) -> Vec<Arc<Connection>> {
@@ -441,6 +457,7 @@ impl Handler {
                         _leases: vec![a, b, d],
                         ticket: ticket.clone(),
                         connection: Arc::downgrade(&c),
+                        _session_hold: None,
                     });
                     if socket
                         .emit_tracked(message.into(), Default::default(), owner)
@@ -516,6 +533,8 @@ impl EngineIoHandler for Handler {
             ingress: Budget::new(self.0.config.ingress_records, self.0.config.ingress_bytes),
             output: Budget::new(self.0.config.output_records, self.0.config.output_bytes),
             encoded: Budget::new(usize::MAX, self.0.config.encoded_output_bytes),
+            control: Budget::new(self.0.config.max_connections+64, (self.0.config.max_connections+64)*4096),
+            notices: Mutex::new(HashMap::new()),
             cancel: CancellationToken::new(),
         });
         *ctx.tcp.bound.lock().unwrap() = Some(id);
@@ -526,6 +545,9 @@ impl EngineIoHandler for Handler {
                 return;
             }
             *socket.data.0.lock().unwrap() = Some(c.clone());
+            {let mut reservations=self.0.reservations.lock().unwrap();
+             reservations.retain(|_,r|r.strong_count()>0);
+             reservations.insert(id,Arc::downgrade(c.reservation.lock().unwrap().as_ref().unwrap()));}
             all.insert(id, c.clone());
             self.0.retiring.lock().unwrap().insert(id, c.clone());
             self.0
@@ -567,7 +589,7 @@ impl EngineIoHandler for Handler {
             // Polling body Bytes may still be owned by Hyper until the TCP tasks have ended.
             loop {
                 let changed = c.changed.notified();
-                if c.output.used().records == 0 {
+                if c.output.used().records == 0 && c.control.used().records == 0 {
                     break;
                 }
                 changed.await;
@@ -788,12 +810,14 @@ pub async fn bind(address: SocketAddr, config: Config) -> io::Result<BoundTransp
         tcp_budget: Budget::new(config.max_tcp_connections, usize::MAX),
         ingress: Budget::new(config.global_ingress_records, config.global_ingress_bytes),
         output: Budget::new(config.global_output_records, config.global_output_bytes),
+        control: Budget::new(config.max_connections*(config.max_connections+64),config.max_connections*(config.max_connections+64)*4096),
+        reservations: Mutex::new(HashMap::new()),
         shutdown: CancellationToken::new(),
         config: config.clone(),
     });
     let mut engine = EngineIoConfig::default();
     engine.req_path = "/socket.io".into();
-    engine.max_buffer_size = config.output_records + 4;
+    engine.max_buffer_size = config.output_records + config.max_connections + 64 + 4;
     engine.max_payload = 100000;
     engine.ws_max_message_size = codec::MAX_BINARY.max(codec::MAX_JSON) + 16;
     engine.ws_max_frame_size = engine.ws_max_message_size;
@@ -898,6 +922,8 @@ mod ordering_tests {
             tcp_budget: Budget::new(1, 1),
             ingress: Budget::new(16, 4096),
             output: Budget::new(16, 4096),
+            control: Budget::new(16, 4096),
+            reservations: Mutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
         });
         let c = Arc::new(Connection {
@@ -917,6 +943,8 @@ mod ordering_tests {
             ingress: Budget::new(16, 4096),
             output: Budget::new(16, 4096),
             encoded: Budget::new(16, 4096),
+            control: Budget::new(16, 4096),
+            notices: Mutex::new(HashMap::new()),
             cancel: CancellationToken::new(),
         });
         shared.all.lock().unwrap().insert(1, c.clone());

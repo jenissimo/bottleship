@@ -114,4 +114,12 @@ Reconnect ownership is a bounded cache, retained for at most `reconnectGraceMs`.
 
 A port slot includes active generations and release tombstones across relay, multicast and native operations. Reusing a slot with a newer generation does not consume another credit. Tombstones stay until connection retirement, preserving rejection of delayed traffic. Exceeding either budget retires the creating connection and refunds all its credits. Global and per-peer limits bound retained state even when clients send release messages without ever opening a port.
 
+## Message and connection admission
+
+Every application event consumes one `maxFramesPerSecond` credit before decoding, including unknown events, malformed requests, DNS and cancellation. `maxBytesPerSecond` includes UTF-8 JSON, binary arguments, event names and frame envelopes. The shared per-connection window is one second; messages are charged once. Invalid transport framing retires that transport immediately.
+
+Both servers cap Engine.IO sessions before room authentication (`maxConnections: 256`), raw TCP connections (`maxTcpConnections: 1024`) and unauthenticated session lifetime (`authorizationTimeoutMs: 5000`). An incomplete handshake retains capacity until timeout or close.
+
+Reliable relay congestion retires the sending participant. The recipient remains connected; UDP still drops at capacity. Departure notices have a separate bounded control reserve and identical notices coalesce only within the same source connection. Queued departures retain the departing session's admission credit until output drain, preventing reconnect churn from growing control state without bound. A slow recipient can therefore temporarily retain admission capacity; its normal transport heartbeat timeout eventually retires it.
+
 TLS terminates at the deployment's HTTPS/WSS proxy; keep the cleartext backend inaccessible from the internet. Origin lists are additional browser restrictions, not authentication. The relay does not validate game coordinates, damage or resources: authoritative gameplay validation belongs to the game server.

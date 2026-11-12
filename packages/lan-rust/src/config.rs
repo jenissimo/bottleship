@@ -24,6 +24,8 @@ pub struct ServerConfig {
     pub room_access: bottleship_lan_core::access::RoomAccessConfig,
     /// Additional process-wide Rust resource limits, independent of per-room limits.
     pub max_connections: usize,
+    pub max_tcp_connections: usize,
+    pub authorization_timeout_ms: u64,
     pub max_native_participants: usize,
     pub max_dns_operations: usize,
     pub dns_timeout_ms: u64,
@@ -41,6 +43,8 @@ impl Default for ServerConfig {
             gateway: GatewayConfig::default(),
             room_access: Default::default(),
             max_connections: 256,
+            max_tcp_connections: 1024,
+            authorization_timeout_ms: 5000,
             max_native_participants: 256,
             max_dns_operations: 64,
             dns_timeout_ms: 10000,
@@ -57,6 +61,8 @@ impl ServerConfig {
             || self.host.len() > 253
             || self.max_connections == 0
             || self.max_connections > 65536
+            || !(1..=65536).contains(&self.max_tcp_connections)
+            || !(100..=60000).contains(&self.authorization_timeout_ms)
             || self.max_native_participants == 0
             || self.max_native_participants > 65536
             || self.max_dns_operations == 0

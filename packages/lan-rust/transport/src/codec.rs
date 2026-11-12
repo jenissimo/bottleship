@@ -28,6 +28,10 @@ pub fn header(s: &str) -> Result<Header, CodecError> {
         return Err(CodecError("Invalid Socket.IO header size"));
     }
     let kind = s.as_bytes()[0];
+    if !matches!(kind, b'0' | b'1' | b'2' | b'5') {
+        return Err(CodecError("Unsupported Socket.IO packet"));
+    }
+    // The accepted leading byte is ASCII, hence byte 1 is a UTF-8 boundary.
     let mut rest = &s[1..];
     let mut attachments = 0;
     if kind == b'5' {

@@ -17,7 +17,9 @@ const key=Buffer.from(vector.keyBase64,"base64"),signer=new RoomAccess({},key);
 const directory=await mkdtemp(join(tmpdir(),"bottleship-access-"));
 const udp=createSocket("udp4");await new Promise<void>(r=>udp.bind(0,"127.0.0.1",r));
 const nativePort=udp.address().port;
-const config={host:"127.0.0.1",port:0,roomAccess:{inviteKeyEnv:testKey,rooms:{lobby:{visibility:"public" as const}}},
+const config={host:"127.0.0.1",port:0,maxRooms:2,maxPeersPerRoom:2,maxOfflineRooms:1,
+    maxBindingsPerPeer:3,maxBindingEntries:5,maxFramesPerSecond:5,maxBufferedFrames:2,maxBufferedBytes:4096,
+    roomAccess:{inviteKeyEnv:testKey,defaultVisibility:"public" as const,rooms:{locked:{visibility:"private" as const}}},
     gateway:{routes:[{id:"echo",host:"127.0.0.1",address:"203.0.113.10",names:["echo.test"],ports:[nativePort],protocols:["udp" as const]}]}};
 const configPath=join(directory,"server.json");await writeFile(configPath,JSON.stringify(config));
 const child=spawn(resolve(binary),["--config",configPath],{stdio:["pipe","pipe","pipe"],env:{...process.env,[testKey]:vector.keyBase64}});
@@ -41,6 +43,42 @@ function client(port:number,room:string,invite?:string,node=1){
     clients.push(c);return c;
 }
 let currentTransport:"polling"|"websocket"="websocket";
+async function joined(port:number,room:string,node:number){
+    const c=client(port,room,undefined,node),r=event(c,"ready");c.connect();await r;return c;
+}
+async function floodClose(c:Socket) {
+    const closed=event(c,"disconnect");for(let i=0;i<6;i++)c.emit("unknown",i);await closed;
+}
+async function resourceChecks(port:number) {
+    const live=await joined(port,"live",10);
+    for(let i=0;i<12;i++){const c=await joined(port,"flood-"+i,11);await floodClose(c);}
+    const legitimate=await joined(port,"legitimate",12);await floodClose(legitimate);
+    assert(live.connected,"offline rooms must not retire active participants");
+    const attacker=await joined(port,"live",13),closed=event(attacker,"disconnect");
+    for(let i=1;i<=4;i++)attacker.emit("releasePort",1,1000+i,1);await closed;
+    const next=await joined(port,"live",14);
+    for(let i=1;i<=3;i++)next.emit("releasePort",1,2000+i,1);
+    const barrier=event(next,"resolved");next.emit("resolve",1,{host:"unknown.test",family:4});await barrier;
+    assert(next.connected,"port-state credits must be refunded");await floodClose(next);
+    for(const name of ["unknown","cancelResolve","resolve"]) {
+        const c=await joined(port,"live",15),done=event(c,"disconnect");
+        for(let i=1;i<=6;i++)c.emit(name,i,...(name==="resolve"?[{host:null}]:[]));await done;
+        assert(live.connected,"rate overflow must isolate its sender");
+    }
+    const base="http://127.0.0.1:"+port+"/socket.io/?EIO=4&transport=polling";
+    const open=await(await fetch(base)).text(),sid=JSON.parse(open.slice(1)).sid,url=base+"&sid="+encodeURIComponent(sid);
+    const auth={version:1,room:"slow",clientId:"synthetic-slow-receiver",node:[2,0,0,0,0,20]};
+    assert.equal((await fetch(url,{method:"POST",body:"40"+JSON.stringify(auth)})).status,200);
+    assert((await(await fetch(url)).text()).includes("ready"));
+    const sender=await joined(port,"slow",21),gone=event(sender,"disconnect");
+    const frame=encodeDatagram(2,Uint8Array.from(auth.node),4000,5000,new Uint8Array(512));
+    for(let i=0;i<4;i++)sender.emit("frame",frame);await gone;
+    assert((await(await fetch(url)).text()).includes("peerLeft"),"reserved departure behind a full data queue");
+    const third=await joined(port,"slow",22);third.emit("frame",frame);
+    assert((await(await fetch(url)).text()).includes("frame"),"slow receiver must accept later traffic");
+    for(const c of clients.splice(0))c.disconnect();
+    await fetch(url,{method:"POST",body:"1"});
+}
 try{
     const rustPort=await readyRust;
     process.env[testKey]=vector.keyBase64;
@@ -60,6 +98,8 @@ try{
             assert.deepEqual(Array.from(await finite(received,"Native UDP")),[7,8,9]);
             for(const c of clients.splice(0))c.disconnect();
             console.log(implementation+" "+transport+": private admission, scoped UDP and denied anonymous DNS passed");
+            await resourceChecks(port);
+            console.log(implementation+" "+transport+": offline quotas, binding budget, all-message rate and sender isolation passed");
         }
     }
 }finally{

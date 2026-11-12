@@ -133,7 +133,7 @@ fn broadcast_excludes_sender_and_other_rooms() {
     assert!(matches!(e.as_slice(), [Effect::Emit { to: 2, .. }]));
 }
 #[test]
-fn reliable_rejection_retires_both_but_udp_does_not() {
+fn sr08_reliable_rejection_retires_only_sender_but_udp_does_not() {
     let mut c = plain();
     c.join(1, &auth(1, "a"), 0).unwrap();
     c.join(2, &auth(2, "a"), 0).unwrap();
@@ -152,13 +152,13 @@ fn reliable_rejection_retires_both_but_udp_does_not() {
         reliable: true,
         now_ms: 0,
     });
-    assert_eq!(c.participant_count(), 0);
-    assert_eq!(
-        e.iter()
-            .filter(|e| matches!(e, Effect::Disconnect { .. }))
-            .count(),
-        2
-    );
+    assert_eq!(c.participant_count(), 1);
+    assert!(c.connection_node(2).is_some());
+    assert!(e.iter().any(|e|matches!(e,Effect::Disconnect{connection:1,..})));
+    assert!(!e.iter().any(|e|matches!(e,Effect::Disconnect{connection:2,..})));
+    // Even a failed departure notice cannot cascade into the recipient.
+    c.apply(Command::DeliveryRejected{to:2,source:Some(1),reliable:true,now_ms:0});
+    assert!(c.connection_node(2).is_some());
 }
 #[test]
 fn replaced_connection_cannot_retire_successor() {

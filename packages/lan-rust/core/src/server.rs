@@ -434,6 +434,7 @@ impl Core {
                 if !self.participants.contains_key(&connection) {
                     return effects;
                 }
+                if !self.rate(connection, wire::message_size(&name, &args), now_ms, &mut effects) { return effects; }
                 match wire::decode_event(&name,&args){
      Ok(event)=>self.input(connection,event,now_ms,&mut effects),
      Err(DecodeError::Fatal(_))=>self.disconnect(connection,now_ms,"Invalid LAN event",&mut effects),
@@ -449,7 +450,7 @@ impl Core {
                 event,
                 now_ms,
             } => {
-                if self.participants.contains_key(&connection) {
+                if self.participants.contains_key(&connection) && self.rate(connection, event.rate_size(), now_ms, &mut effects) {
                     self.input(connection, event, now_ms, &mut effects)
                 }
             }
@@ -461,22 +462,8 @@ impl Core {
                 now_ms,
             } => {
                 if reliable {
-                    self.disconnect(
-                        to,
-                        now_ms,
-                        "Reliable output capacity exceeded",
-                        &mut effects,
-                    );
-                    if let Some(source) = source {
-                        if source != to {
-                            self.disconnect(
-                                source,
-                                now_ms,
-                                "Reliable destination failed",
-                                &mut effects,
-                            )
-                        }
-                    }
+                    // A sender cannot retire another participant by filling its output.
+                    self.disconnect(source.unwrap_or(to), now_ms, "Reliable output capacity exceeded", &mut effects);
                 }
             }
             Command::GatewayEvent { connection, event } => {
@@ -551,9 +538,6 @@ impl Core {
         now_ms: u64,
         effects: &mut Vec<Effect>,
     ) -> bool {
-        if !self.rate(connection, 64, now_ms, effects) {
-            return false;
-        }
         let p = self.participants.get_mut(&connection).unwrap();
         if id == 0 || id <= p.last_udp_request {
             self.disconnect(connection, now_ms, "UDP request identity reused", effects);
@@ -589,10 +573,7 @@ impl Core {
                 datagram,
                 generation,
             } => {
-                if !self.rate(connection, 12 + datagram.payload.len(), now_ms, effects) {
-                    return;
-                }
-                if datagram.proto == 1 {
+                        if datagram.proto == 1 {
                     self.participants
                         .get_mut(&connection)
                         .unwrap()
@@ -710,10 +691,7 @@ impl Core {
                 port,
                 generation,
             } => {
-                if !self.rate(connection, 16, now_ms, effects) {
-                    return;
-                }
-                let p = self.participants.get_mut(&connection).unwrap();
+                        let p = self.participants.get_mut(&connection).unwrap();
                 if proto == 1 {
                     p.multicast_bindings.release(proto, port, generation);
                 }
@@ -881,10 +859,7 @@ impl Core {
                 })
             }
             InboundEvent::CancelUdpPeer { id } => {
-                if !self.rate(connection, 16, now_ms, effects) {
-                    return;
-                }
-                let p = self.participants.get_mut(&connection).unwrap();
+                        let p = self.participants.get_mut(&connection).unwrap();
                 let operations: Vec<_> = p
                     .pending
                     .iter()
@@ -915,10 +890,7 @@ impl Core {
                 }
             }
             InboundEvent::ReleaseUdpPeer { id } => {
-                if !self.rate(connection, 16, now_ms, effects) {
-                    return;
-                }
-                if let Some(active) = self
+                        if let Some(active) = self
                     .participants
                     .get_mut(&connection)
                     .unwrap()
@@ -1300,7 +1272,7 @@ impl Core {
                     recipient,
                     json_event("peerLeft", vec![json!({"node":p.join.node})]),
                     true,
-                    None,
+                    Some(connection),
                 ));
             }
         }

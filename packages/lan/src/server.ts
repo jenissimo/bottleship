@@ -1,4 +1,5 @@
-import { createServer, type Server as HttpServer } from "node:http";
+import { createServer, type IncomingMessage, type Server as HttpServer } from "node:http";
+import type {Socket as TcpSocket} from "node:net";
 import { Server, type Socket } from "socket.io";
 import { GatewayRoutes, NativeGateway, type GatewayOptions } from "./gateway";
 import { NetResolveError } from "./resolve";
@@ -17,6 +18,9 @@ export interface LanServerOptions {
     port?: number;
     allowedOrigins?: string[] | "*";
     transports?: ("polling" | "websocket")[];
+    maxConnections?: number;
+    maxTcpConnections?: number;
+    authorizationTimeoutMs?: number;
     maxRooms?: number;
     maxPeersPerRoom?: number;
     maxBufferedFrames?: number;
@@ -42,11 +46,13 @@ export interface LanServer {
 }
 export function createLanServer(options: LanServerOptions = {}): LanServer {
     const limits = {
+        maxConnections:256,maxTcpConnections:1024,authorizationTimeoutMs:5000,
         maxRooms: 128, maxPeersPerRoom: 64, maxBufferedFrames: 64, maxBufferedBytes: 1024 * 1024,
         maxFramesPerSecond: 2000, maxBytesPerSecond: 4 * 1024 * 1024, reconnectGraceMs: 60_000,
         maxOfflineRooms:32, maxOfflinePeersPerRoom:16, maxBindingsPerPeer:1024, maxBindingEntries:16384, ...options,
     };
     for (const [key,min,max] of [
+        ["maxConnections",1,65536],["maxTcpConnections",1,65536],["authorizationTimeoutMs",100,60000],
         ["maxRooms",1,65536],["maxPeersPerRoom",1,4096],["maxBufferedFrames",1,65536],["maxBufferedBytes",1,1073741824],
         ["maxFramesPerSecond",1,0xffffffff],["maxBytesPerSecond",1,Number.MAX_SAFE_INTEGER],["reconnectGraceMs",0,86400000],
         ["maxOfflineRooms",0,65536],["maxOfflinePeersPerRoom",0,4096],["maxBindingsPerPeer",1,65536],["maxBindingEntries",1,1048576],
@@ -66,15 +72,51 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
     const allowedOrigins = options.allowedOrigins ?? "*";
     const originAllowed = (origin: string | undefined): boolean =>
         !origin || allowedOrigins === "*" || allowedOrigins.includes(origin);
+    const tcpConnections=new Set<TcpSocket>();
+    http.maxConnections=limits.maxTcpConnections;
+    http.headersTimeout=5000;http.requestTimeout=10000;http.keepAliveTimeout=5000;
+    http.on("connection",socket=>{
+        if(tcpConnections.size>=limits.maxTcpConnections){socket.destroy();return;}
+        tcpConnections.add(socket);socket.once("close",()=>tcpConnections.delete(socket));
+        socket.setTimeout(5000,()=>socket.destroy());
+    });
+    http.on("request",request=>request.socket.setTimeout(0));
+    type Session={id:number;closed:boolean;holds:number;authorized:boolean;timer?:ReturnType<typeof setTimeout>};
+    const sessions=new Map<PeerSocket["conn"],Session>();
+    const handshakes=new Map<IncomingMessage,{timer:ReturnType<typeof setTimeout>;onClose:()=>void}>();
+    const releaseHandshake=(request:IncomingMessage)=>{
+        const pending=handshakes.get(request);if(!pending)return;
+        clearTimeout(pending.timer);request.socket.off("close",pending.onClose);handshakes.delete(request);
+    };
+    let nextSession=0;
+    const releaseSession=(conn:PeerSocket["conn"],s:Session)=>{
+        if(s.closed&&s.holds===0)sessions.delete(conn);
+    };
     const io = new Server<ClientEvents, ServerEvents>(http, {
         path: SOCKET_PATH,
         transports: options.transports ?? ["polling", "websocket"],
         cors: { origin: (origin, callback) => callback(null, originAllowed(origin)), credentials: false },
-        allowRequest: (request, callback) => callback(null, originAllowed(request.headers.origin)),
+        allowRequest: (request, callback) => {
+            if(!originAllowed(request.headers.origin)){callback("Origin denied",false);return;}
+            if(sessions.size+handshakes.size>=limits.maxConnections){callback("LAN connection limit reached",false);return;}
+            const timer=setTimeout(()=>{releaseHandshake(request);request.socket.destroy();},limits.authorizationTimeoutMs);
+            const onClose=()=>releaseHandshake(request);
+            timer.unref();handshakes.set(request,{timer,onClose});request.socket.once("close",onClose);
+            callback(null,true);
+        },
+        connectTimeout:limits.authorizationTimeoutMs,
         maxHttpBufferSize: Math.ceil(MAX_FRAME_SIZE * 4 / 3) + 2048,
         perMessageDeflate: false,
         httpCompression: false,
         connectionStateRecovery: undefined,
+    });
+    io.engine.on("connection",conn=>{
+        conn.request.socket.setTimeout(0);
+        releaseHandshake(conn.request);
+        const s:Session={id:++nextSession,closed:false,holds:0,authorized:false};
+        sessions.set(conn,s);
+        s.timer=setTimeout(()=>{if(!s.authorized)conn.close(true);},limits.authorizationTimeoutMs);s.timer.unref();
+        conn.once("close",()=>{s.closed=true;if(s.timer)clearTimeout(s.timer);releaseSession(conn,s);});
     });
     function evictOfflinePeer(room:Room):boolean {
         const offline=[...room.peers.entries()].filter(([,p])=>!p.socket);
@@ -96,16 +138,26 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
         }
         while([...rooms.values()].filter(r=>[...r.peers.values()].every(p=>!p.socket)).length>limits.maxOfflineRooms)evictOfflineRoom();
     }
-    const pending = new WeakMap<PeerSocket, { frames: number; bytes: number }>();
+    const pending = new WeakMap<PeerSocket, { frames: number; bytes: number; notices:Map<string,()=>void> }>();
     function congested(socket: PeerSocket, frameSize: number): boolean {
         const queue = pending.get(socket);
         return !!queue && (queue.frames >= limits.maxBufferedFrames || queue.bytes + frameSize > limits.maxBufferedBytes);
     }
-    function notifyPeerLeft(socket: PeerSocket, node: Uint8Array): void {
+    function notifyPeerLeft(socket: PeerSocket, node: Uint8Array, source?:PeerSocket): void {
         if (!socket.connected) return;
-        if (congested(socket, 64)) { socket.disconnect(true); return; }
-        const queue = pending.get(socket);
-        if (queue) { queue.frames++; queue.bytes += 64; }
+        const queue=pending.get(socket);if(!queue)return;
+        const owner=source&&sessions.get(source.conn);
+        const key=(owner?.id??"offline")+":"+nodeKey(node);
+        if(queue.notices.has(key))return;
+        // Separate from data credits. Departures retain their original admission
+        // credit until drain, bounding reconnect churn as well as queued notices.
+        if(queue.notices.size>=limits.maxConnections+64){
+            (source??socket).disconnect(true);return;
+        }
+        if(owner)owner.holds++;
+        queue.notices.set(key,()=>{
+            if(owner&&source){owner.holds--;releaseSession(source.conn,owner);}
+        });
         socket.emit("peerLeft", { node: Array.from(node) });
     }
     io.use((socket, next) => {
@@ -146,6 +198,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
         next();
     });
     io.on("connection", socket => {
+        const session=sessions.get(socket.conn);if(session){session.authorized=true;if(session.timer)clearTimeout(session.timer);}
         const { room, lease, admission } = socket.data as { room: Room; lease: Lease; admission: Admission };
         const allowedRoutes = new Set(admission.gateway.routes);
         const portSlots=new Set<number>();
@@ -156,7 +209,23 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             portSlots.add(key);bindingEntries++;return true;
         };
         const expiration = Number.isFinite(admission.expiresAt) ? setTimeout(() => socket.disconnect(true), Math.max(0, admission.expiresAt * 1000 - Date.now())) : undefined;
+        let windowStart = Date.now(), frames = 0, bytes = 0;
+        const withinLimits = (size: number): boolean => {
+            const now = Date.now();
+            if (now - windowStart >= 1000) { windowStart = now; frames = 0; bytes = 0; }
+            if (++frames > limits.maxFramesPerSecond || (bytes += size) > limits.maxBytesPerSecond) {
+                socket.disconnect(true); return false;
+            }
+            return true;
+        };
         socket.use((packet, next) => {
+            let size=0;
+            try {
+                if(typeof packet[0]!=="string"){socket.disconnect(true);return;}
+                size=Buffer.byteLength(packet[0])+2;
+                for(const arg of packet.slice(1)) size+=1+(asBytes(arg)?.byteLength ?? Buffer.byteLength(JSON.stringify(arg)??"null"));
+            } catch {socket.disconnect(true);return;}
+            if(!withinLimits(size))return;
             if (admission.expiresAt <= Math.floor(Date.now() / 1000)) { socket.disconnect(true); return; }
             const [event,...args]=packet;
             if(event==="releasePort" && !reservePort(args[0],args[1]))return;
@@ -169,9 +238,10 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             next();
         });
         socket.emit("ready", { version: PROTOCOL_VERSION, node: Array.from(lease.node), ipv4: Array.from(nodeToIpv4(lease.node)), gatewayIpv4: gatewayRoutes.advertisedIpv4For(allowedRoutes), gatewayIpv6: gatewayRoutes.advertisedIpv6For(allowedRoutes), udpMulticast4V1: true });
-        const queue = { frames: 0, bytes: 0 };
+        const queue = { frames: 0, bytes: 0, notices:new Map<string,()=>void>() };
         pending.set(socket, queue);
-        socket.conn.on("drain", () => { queue.frames = 0; queue.bytes = 0; });
+        const releaseNotices=()=>{for(const release of queue.notices.values())release();queue.notices.clear();};
+        socket.conn.on("drain", () => { queue.frames = 0; queue.bytes = 0; releaseNotices(); });
         const emitGateway = (frame: Uint8Array<ArrayBuffer>, reliable: boolean, bindingGeneration?: number): boolean => {
             if (!socket.connected) return false;
             if (congested(socket, frame.byteLength)) {
@@ -218,7 +288,6 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             for(const owner of tcpOwners)if(owner.bindingRetiredBy(port,generation,inclusive))closeTcpOwner(owner,true);
         };
         socket.on("openTcpHost",(id,request)=>{
-            if(!withinLimits(128))return;
             if(!Number.isInteger(id)||id<1||id>0xffffffff||id<=lastTcpHostRequest){socket.disconnect(true);return;}
             lastTcpHostRequest=id;
             if(!validTcpHostOpenRequest(request)){tcpReply(id,{error:{code:10022,message:"Invalid TCP Host request"}});return;}
@@ -279,13 +348,11 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             });
         });
         socket.on("cancelTcpHost",id=>{
-            if(!withinLimits(16))return;
             const p=tcpPending.get(id);
             if(p){tcpPending.delete(id);p.controller.abort();closeTcpOwner(p.owner,true);}
             for(const [leaseId,a] of tcpActive)if(a.requestId===id){tcpActive.delete(leaseId);closeTcpOwner(a.owner,false);}
         });
         socket.on("releaseTcpHost",leaseId=>{
-            if(!withinLimits(16))return;
             const a=tcpActive.get(leaseId);if(!a)return;
             tcpActive.delete(leaseId);closeTcpOwner(a.owner,false);
         });
@@ -304,7 +371,6 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             for(const [id,lease]of udpLeases)if(matches(lease.request)){udpLeases.delete(id);lease.release();}
         };
         socket.on("leaseUdpPeer",(id,request)=>{
-            if(!withinLimits(64))return;
             if(!Number.isInteger(id)||id<1||id>0xffffffff||id<=lastUdpRequest){socket.disconnect(true);return;}
             lastUdpRequest=id;
             if(!validUdpPeerLeaseRequest(request)){udpReply(id,{error:{code:10022,message:"Invalid UDP peer request"}});return;}
@@ -325,13 +391,11 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             }).finally(()=>udpPending.delete(id));
         });
         socket.on("cancelUdpPeer",id=>{
-            if(!withinLimits(16))return;
             udpPending.get(id)?.controller.abort();
             // An ACK may already be queued when cancellation arrives.
             for(const [leaseId,lease]of udpLeases)if(lease.requestId===id){udpLeases.delete(leaseId);lease.release();}
         });
         socket.on("releaseUdpPeer",id=>{
-            if(!withinLimits(16))return;
             const lease=udpLeases.get(id);if(!lease)return;udpLeases.delete(id);lease.release();
         });
         const resolving = new Map<number, { cancelled: boolean }>();
@@ -366,18 +430,9 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             if (!previous || generation > previous.generation) udpBindings.set(port, {generation, released: false});
             return true;
         };
-        let windowStart = Date.now(), frames = 0, bytes = 0;
-        const withinLimits = (size: number): boolean => {
-            const now = Date.now();
-            if (now - windowStart >= 1000) { windowStart = now; frames = 0; bytes = 0; }
-            if (++frames > limits.maxFramesPerSecond || (bytes += size) > limits.maxBytesPerSecond) {
-                socket.disconnect(true); return false;
-            }
-            return true;
-        };
         socket.on("releasePort", (proto, port, generation) => {
             if (!isProtocol(proto) || !validPort(port) || !validBindingGeneration(generation)) { socket.disconnect(true); return; }
-            if (withinLimits(16)) {
+            {
                 if (proto === PROTO_UDP && generation >= (udpBindings.get(port)?.generation ?? 0)) udpBindings.set(port, {generation, released: true});
                 if(proto===PROTO_TCP && generation >= (tcpBindings.get(port)?.generation ?? 0)) {
                     tcpBindings.set(port,{generation,released:true});retireTcp(port,generation,true);
@@ -389,7 +444,6 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             const frame = asBytes(input);
             const datagram = frame && decodeDatagram(frame);
             if (!frame || !datagram || (generation !== undefined && !validBindingGeneration(generation))) { socket.disconnect(true); return; }
-            if (!withinLimits(frame.byteLength)) return;
             datagram.bindingGeneration = generation;
             if(generation!==undefined)retireUdpLeases(datagram.proto,datagram.srcPort,generation,false);
             const multicast = datagram.multicast4;
@@ -428,11 +482,12 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             const unreliable = isDatagramProtocol(datagram.proto);
             if (!unreliable && destination && !destination.socket) notifyPeerLeft(socket, destination.node);
             const deliver = (peer: Lease): void => {
+                if (!socket.connected) return;
                 const recipient = peer.socket;
                 if (!recipient || recipient === socket) return;
                 if (congested(recipient, forwarded.byteLength)) {
                     // Reliable streams must fail visibly instead of silently losing a frame.
-                    if (!unreliable) { recipient.disconnect(true); socket.disconnect(true); }
+                    if (!unreliable) socket.disconnect(true);
                     return;
                 }
                 const queued = pending.get(recipient)!;
@@ -444,8 +499,10 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             else if (destination) deliver(destination);
         });
         socket.on("disconnect", () => {
+            releaseNotices();
             if (expiration !== undefined) clearTimeout(expiration);
             bindingEntries-=portSlots.size;portSlots.clear();
+            udpBindings.clear();tcpBindings.clear();
             for(const pending of tcpPending.values())pending.controller.abort();
             tcpPending.clear();tcpActive.clear();
             for(const owner of tcpOwners)closeTcpOwner(owner,true);
@@ -456,7 +513,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             if (lease.socket === socket) {
                 lease.socket = null;
                 lease.expiresAt = Date.now() + limits.reconnectGraceMs;
-                for (const peer of room.peers.values()) if (peer.socket) notifyPeerLeft(peer.socket, lease.node);
+                for (const peer of room.peers.values()) if (peer.socket) notifyPeerLeft(peer.socket, lease.node, socket);
                 prune();
             }
         });
@@ -482,6 +539,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
         },
         close: () => new Promise<void>(resolve => {
             clearInterval(cleanup);
+            for(const request of handshakes.keys())releaseHandshake(request);
             io.close(() => { rooms.clear(); resolve(); });
             http.closeAllConnections();
         }),

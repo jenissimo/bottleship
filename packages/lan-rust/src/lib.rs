@@ -111,7 +111,8 @@ impl LanServer {
         let core = Core::new(config.limits.clone(), routes, access, epoch)?;
         let mut wire = transport::Config::default();
         wire.max_connections = config.max_connections;
-        wire.max_tcp_connections = config.max_connections.saturating_mul(4).max(64);
+        wire.max_tcp_connections = config.max_tcp_connections;
+        wire.authorization_timeout = Duration::from_millis(config.authorization_timeout_ms);
         wire.origins = config.origins();
         wire.allow_polling = config.transports.iter().any(|t| t == "polling");
         wire.allow_websocket = config.transports.iter().any(|t| t == "websocket");
