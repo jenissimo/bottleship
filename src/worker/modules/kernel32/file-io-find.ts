@@ -8,6 +8,7 @@ import { System } from '../../core/system';
 import { readStringA, readStringW, encodeFileApiString } from './file-io-strings';
 import { fileTimeOf } from '../../runtime/filesystem/file-time';
 import type { VfsEntry } from '../../runtime/filesystem/vfs';
+import { objectCodecs } from '../../savestate/object-codecs';
 
 const INVALID_HANDLE_VALUE = -1;
 const ERROR_FILE_NOT_FOUND = 2;
@@ -122,6 +123,27 @@ const fillFindDataW = (mem: Uint8Array, addr: number, entry: any) => {
     }
     view.setUint16(addr + 44 + name.length * 2, 0, true);
 };
+
+interface FindHandle { kind: 'find'; entries: VfsEntry[]; index: number }
+type SavedFindEntry = [path: string, name: string, kind: VfsEntry['kind'], size: number, source: VfsEntry['source'], modified: number];
+
+objectCodecs.add<FindHandle>({
+    tag: 'kernel32-find',
+    matches: (o: unknown): o is FindHandle => typeof o === 'object' && o !== null
+        && (o as { kind?: unknown }).kind === 'find' && Array.isArray((o as { entries?: unknown }).entries),
+    capture: (o) => ({
+        remaining: o.entries.slice(o.index).map((e): SavedFindEntry => [e.path, e.name, e.kind, e.size, e.source, e.modified ?? -1]),
+    }),
+    restore: (d: { remaining: SavedFindEntry[] }): FindHandle => ({
+        kind: 'find',
+        index: 0,
+        entries: d.remaining.map(([path, name, kind, size, source, modified]) => {
+            const entry: VfsEntry = { path, name, kind, size, source };
+            if (modified >= 0) entry.modified = modified;
+            return entry;
+        }),
+    }),
+});
 
 export function registerFileIoFindExports(exports: Record<string, ThunkImplementation>): void {
     exports['FindFirstFileA'] = (ctx, mem, args) => {
