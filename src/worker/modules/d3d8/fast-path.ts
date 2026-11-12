@@ -184,7 +184,7 @@ export function registerFastPathD3D8Functions(dispatcher: HleDispatcher): void {
             return device.setVertexShaderHandle(token);
         }, { trivial: true });
 
-    // IDirect3DDevice8_SetViewport(this, pViewport) — capture-at-call (sanitize vs active RT).
+    // IDirect3DDevice8_SetViewport(this, pViewport) — capture-at-call (fit-checked against the active RT).
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetViewport',
         (esp: number, view: DataView, mem: Uint8Array): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));

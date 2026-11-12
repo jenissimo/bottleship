@@ -26,19 +26,25 @@ function bmp2x2(): Uint8Array {
     return b;
 }
 
+interface LoadedObject {
+    width: number; height: number; pixels: Uint8Array | null; bitCount?: number; loading: boolean;
+}
+
 async function load(path: string, flags: number, files: Record<string, Uint8Array>) {
-    const memory = new Uint8Array(0x400);
     const NAME = 0x20000;
     const big = new Uint8Array(NAME + 0x200);
     for (let i = 0; i < path.length; i++) big[NAME + i] = path.charCodeAt(i);
-    void memory;
-    const objects: any[] = [];
+    const objects: LoadedObject[] = [];
     const opened: string[] = [];
+    const released: number[] = [];
+    let lastError = 0;
     const fake = {
         resourceProvider: {
-            registerUserObject: (o: any) => { objects.push(o); return 0x5000 + objects.length; },
+            registerUserObject: (o: LoadedObject) => { objects.push(o); return 0x5000 + objects.length; },
             getUserObject: (h: number) => objects[h - 0x5001],
+            unregisterUserObject: (h: number) => { released.push(h); return objects[h - 0x5001]; },
         },
+        scheduler: { setLastError: (e: number) => { lastError = e; } },
         fileSystem: {
             open: async (p: string) => { opened.push(p); return files[p] ? { path: p, source: 'test' } : null; },
             getFileSize: (p: string) => files[p]?.length ?? 0,
@@ -48,8 +54,10 @@ async function load(path: string, flags: number, files: Record<string, Uint8Arra
     };
     const system = spyOn(System, 'getInstance').mockReturnValue(fake as unknown as System);
     try {
-        const handle = await (createSystemExports().LoadImageA as any)({}, big, [0, NAME, IMAGE_BITMAP, 0, 0, flags]);
-        return { handle, object: objects[0], opened };
+        const loadImage = createSystemExports().LoadImageA as unknown as
+            (ctx: unknown, mem: Uint8Array, args: number[]) => Promise<number>;
+        const handle = await loadImage({}, big, [0, NAME, IMAGE_BITMAP, 0, 0, flags]);
+        return { handle, object: objects[0], opened, released, lastError };
     } finally { system.mockRestore(); }
 }
 
@@ -70,10 +78,35 @@ describe('LoadImage from a file', () => {
         expect((await load('art\\a.bmp', 0, files)).object.pixels).toBeTruthy();
     });
 
-    test('a file that is not a bitmap yields a handle without pixels and no throw', async () => {
+    test('LR_LOADFROMFILE on a file that is not a bitmap returns NULL and keeps no handle', async () => {
         const r = await load('data\\readme.dat', LR_LOADFROMFILE, { 'data/readme.dat': new Uint8Array(64) });
         expect(r.opened).toEqual(['data/readme.dat']);
-        expect(r.object.pixels).toBeNull();
+        expect(r.handle).toBe(0);
+        expect(r.released).toEqual([0x5001]);
         expect(r.object.loading).toBe(false);
+    });
+
+    test('LR_LOADFROMFILE on a missing file returns NULL with ERROR_FILE_NOT_FOUND', async () => {
+        const r = await load('data\\Missing.pbm', LR_LOADFROMFILE, {});
+        expect(r.opened).toEqual(['data/Missing.pbm']);
+        expect(r.handle).toBe(0);
+        expect(r.released).toEqual([0x5001]);
+        expect(r.lastError).toBe(2);
+    });
+
+    test('a title that probes names until one loads gets the one that exists', async () => {
+        const files = { 'gfx/logo.pbm': bmp2x2() };
+        const first = await load('gfx\\logo.bmp', LR_LOADFROMFILE, files);
+        const second = await load('gfx\\logo.pbm', LR_LOADFROMFILE, files);
+        expect(first.handle).toBe(0);
+        expect(second.handle).not.toBe(0);
+        expect(second.object.pixels).toBeTruthy();
+    });
+
+    test('a missing .bmp name without the flag keeps its pixel-less handle', async () => {
+        const r = await load('art\\gone.bmp', 0, {});
+        expect(r.handle).not.toBe(0);
+        expect(r.released).toEqual([]);
+        expect(r.object.pixels).toBeNull();
     });
 });
