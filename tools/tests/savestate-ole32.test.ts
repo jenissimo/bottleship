@@ -7,6 +7,7 @@ import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { savestateParticipants } from "../../src/worker/savestate/participant";
 import { System } from "../../src/worker/core/system";
 import { comVtableOwner, registerComVtableOwner } from "../../src/worker/core/com/com-memory";
+import { registerHleComServer } from "../../src/worker/core/com/hle-com-registry";
 
 const bytes = (v: unknown) => {
     const e = encodeValue(v as SaveValue);
@@ -17,6 +18,7 @@ type Handler = (ctx: unknown, mem: Uint8Array, args: number[]) => number;
 type Internals = Record<string, unknown> & { exports: Record<string, Handler> };
 
 let memory: Uint8Array;
+let servers = new Map<string, { held: boolean }>();
 
 interface Booted { ole: Ole32 & Internals; handlers: Map<string, Record<string, Handler>>; generator: ThunkGenerator; allocs: () => number }
 
@@ -35,6 +37,17 @@ function boot(thunks?: ThunkGeneratorState, heapStart = 0x100000): Booted {
         thunkGenerator: generator,
         getCurrentMemory: () => memory,
     };
+    for (const name of ["dplayx", "dpnet", "quartz"]) {
+        const server = {
+            descriptor: { name }, held: false,
+            get holdsLoaderReference() { return this.held; },
+            acquireLoaderReference() { this.held = true; return true; },
+            releaseLoaderReference() { this.held = false; },
+            releaseUnusedLoaderReference() { this.held = false; },
+        };
+        registerHleComServer(ole.process as never, server as never, [{ clsid: `00000000-0000-0000-0000-${name.padStart(12, "0")}`, interfaces: [] }]);
+        servers.set(name, server);
+    }
     return { ole, handlers, generator, allocs: () => allocs };
 }
 
@@ -49,6 +62,7 @@ function used(): Booted {
     (ole.taskMemSizes as Map<number, number>).set(0x500000, 32).set(0x500040, 8);
     (ole.dragDropRegistrations as { restoreState(rows: Array<[number, number]>): void }).restoreState([[0x10001, 0x404000]]);
     comApartments.restoreState([[1, "sta", 2, 1], [5, "mta", 1, 0]]);
+    servers.get("dplayx")!.held = true;
     return b;
 }
 
@@ -84,7 +98,7 @@ describe("ole32 participant", () => {
             classRegistrations: [[0x1005, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", 0x406000, 4]],
             taskMemSizes: new Uint32Array([0x600000, 16]), mallocObjAddr: 0, blowfishVtableAddr: 0,
             blowfishInstances: [[0x700000, 3, boxes]], dragDropRegistrations: [[0x10002, 0x407000], [0x10003, 0x408000]],
-            apartments: [[2, "mta", 1, 0]],
+            apartments: [[2, "mta", 1, 0]], comServerLoads: ["dpnet", "quartz"],
         };
         expect(Object.keys(values).sort()).toEqual(Object.keys(base).sort());
         for (const [field, value] of Object.entries(values) as Array<[keyof Ole32State, unknown]>) {
@@ -205,7 +219,7 @@ describe("ole32 participant", () => {
         const undo = ole.registerSavestate();
         try {
             expect(savestateParticipants.coveredModules().has("ole32")).toBe(true);
-            expect(savestateParticipants.schemas().ole32).toEqual({ version: 1, schemaHash: "a4e706e575999367" });
+            expect(savestateParticipants.schemas().ole32).toEqual({ version: 2, schemaHash: "0f1a20eac3ad8590" });
         } finally {
             undo();
         }

@@ -89,17 +89,25 @@ describe("dplayx idle participant", () => {
         expect(() => module.captureSavestate()).toThrow("6 thing(s) open: DirectPlay object 0x2000, DirectPlay object 0x2004, DirectPlay object 0x2008, DirectPlay object 0x200c, …");
     });
 
-    test("a locked class factory or a COM-held load refuses the save", () => {
+    test("a locked class factory refuses the save", () => {
         const { module, server } = idle();
         server.locks = 2;
         expect(server.lockCount).toBe(2);
         expect(() => module.captureSavestate()).toThrow("class factory is locked 2 time(s)");
         server.locks = 0;
+        expect(module.captureSavestate()).toEqual({});
+    });
+
+    test("a COM-held load alone does not refuse the save; an open object still does", () => {
+        const { module, api, server } = idle();
         server.loaderReference = { release: () => undefined };
         expect(server.holdsLoaderReference).toBe(true);
-        expect(() => module.captureSavestate()).toThrow("COM holds the module loaded");
-        server.loaderReference = undefined;
         expect(module.captureSavestate()).toEqual({});
+        (api.states as Map<number, unknown>).set(0x1040, {});
+        expect(() => module.captureSavestate()).toThrow("dplayx: not idle, 1 thing(s) open: DirectPlay object 0x1040");
+        (api.states as Map<number, unknown>).clear();
+        server.locks = 1;
+        expect(() => module.captureSavestate()).toThrow("class factory is locked 1 time(s)");
     });
 
     test("a restore into a session that is not idle fails", () => {

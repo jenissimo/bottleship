@@ -148,7 +148,6 @@ export class DPlayX implements IModule {
             throw new Error(`dplayx: not idle, ${open.length} thing(s) open: ${open.slice(0, 4).join(', ')}${open.length > 4 ? ', …' : ''}`);
         }
         if ((this.comServer?.lockCount ?? 0) > 0) throw new Error(`dplayx: the class factory is locked ${this.comServer.lockCount} time(s) (IClassFactory::LockServer)`);
-        if (this.comServer?.holdsLoaderReference) throw new Error('dplayx: COM holds the module loaded for a class it activated');
         return {};
     }
 

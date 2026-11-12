@@ -41,12 +41,12 @@ export class HleComServer {
     get lockCount(): number { return this.locks; }
     get holdsLoaderReference(): boolean { return this.loaderReference !== undefined; }
     /** COM loads the registered server before asking it to accept the requested IID. */
-    acquireLoaderReference(): boolean {
+    acquireLoaderReference(attach = true): boolean {
         if (isBlockedByDisabledDlls(this.descriptor.name)) return false;
         const generation = this.process.resetGeneration ?? 0;
         if (this.loaderReference && this.loaderGeneration === generation) return true;
         this.releaseLoaderReference();
-        this.loaderReference = retainHleModuleLoaded(this.descriptor.name);
+        this.loaderReference = retainHleModuleLoaded(this.descriptor.name, attach);
         this.loaderGeneration = generation;
         return this.loaderReference !== undefined;
     }
