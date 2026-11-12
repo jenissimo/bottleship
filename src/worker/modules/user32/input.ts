@@ -77,6 +77,7 @@ export interface User32InputState {
     ddeLastError: Array<[number, number]>;
     ddeClientOnly: number[];
     heldKeys: number[];
+    heldButtons: number;
 }
 
 export function createInputExports(): Record<string, ThunkImplementation> {
@@ -107,10 +108,10 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     // @participant(user32-input)
     const ddeClientOnly = new Set<number>();
     if (savestatesEnabled()) savestateParticipants.add({
-        id: 'user32-input', version: 2, order: 42,
+        id: 'user32-input', version: 3, order: 42,
         schema: stateKeys<User32InputState>({
             windowProperties: true, nextDdeInstance: true, nextDdeStringHandle: true, nextDdeConv: true,
-            ddeStrings: true, ddeServices: true, ddeLastError: true, ddeClientOnly: true, heldKeys: true,
+            ddeStrings: true, ddeServices: true, ddeLastError: true, ddeClientOnly: true, heldKeys: true, heldButtons: true,
         }),
         capture: () => {
             if (ddeInstances.size > 0 || ddeConversations.size > 0) throw new CaptureRefusal('user32: DDE conversations are not part of a v1 savestate');
@@ -122,12 +123,14 @@ export function createInputExports(): Record<string, ThunkImplementation> {
                 ddeLastError: [...ddeLastError],
                 ddeClientOnly: [...ddeClientOnly],
                 heldKeys: System.getInstance().inputManager.captureHeldKeys(),
+                heldButtons: System.getInstance().inputManager.captureHeldButtons(),
             };
             return state as unknown as SaveValue;
         },
         restore: (saved) => {
             const s = saved as unknown as User32InputState;
             System.getInstance().inputManager.restoreHeldKeys(s.heldKeys);
+            System.getInstance().inputManager.restoreHeldButtons(s.heldButtons);
             windowProperties.clear();
             for (const [h, props] of s.windowProperties) windowProperties.set(h, new Map(props));
             nextDdeInstance = s.nextDdeInstance;

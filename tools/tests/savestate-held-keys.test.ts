@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { InputManager } from "../../src/worker/runtime/input/input-manager";
-import { INPUT_BUFFER_SIZE, KEY_BITFIELD_BASE, beginInputWrite, endInputWrite } from "../../src/input/sab-layout";
+import { INPUT_BUFFER_SIZE, INPUT_INDEX, KEY_BITFIELD_BASE, beginInputWrite, endInputWrite } from "../../src/input/sab-layout";
 
 const WM_KEYDOWN = 0x100, WM_KEYUP = 0x101;
 const VK_UP = 0x26, VK_A = 0x41;
+const WM_LBUTTONDOWN = 0x201, WM_LBUTTONUP = 0x202, WM_RBUTTONUP = 0x205, WM_MBUTTONUP = 0x208;
+
 
 function rig() {
     const posted: Array<{ msg: number; wParam: number }> = [];
@@ -23,7 +25,8 @@ function rig() {
     const im = new InputManager(wm as never);
     im.setInputBuffer(sab);
     const keys = () => posted.filter(p => p.msg === WM_KEYDOWN || p.msg === WM_KEYUP);
-    return { im, view, keys };
+    const buttons = () => posted.filter(p => p.msg >= WM_LBUTTONDOWN && p.msg <= WM_MBUTTONUP).map(p => p.msg);
+    return { im, view, keys, buttons };
 }
 
 function publishKeys(view: Int32Array, vks: readonly number[]): void {
@@ -32,6 +35,55 @@ function publishKeys(view: Int32Array, vks: readonly number[]): void {
     for (const vk of vks) view[KEY_BITFIELD_BASE + (vk >> 5)]! |= 1 << (vk & 31);
     endInputWrite(view);
 }
+
+function publishButtons(view: Int32Array, buttons: number): void {
+    beginInputWrite(view);
+    view[INPUT_INDEX.buttons] = buttons;
+    endInputWrite(view);
+}
+
+describe("mouse buttons held at capture", () => {
+    test("are captured from what the last poll reported to the window", () => {
+        const a = rig();
+        expect(a.im.captureHeldButtons()).toBe(0);
+        publishButtons(a.view, 3);
+        a.im.poll();
+        expect(a.im.captureHeldButtons()).toBe(3);
+        publishButtons(a.view, 2);
+        a.im.poll();
+        expect(a.im.captureHeldButtons()).toBe(2);
+    });
+
+    test("get their button-up from the first poll of a host that does not hold them", () => {
+        const b = rig();
+        b.im.restoreHeldButtons(3);
+        expect(b.im.captureHeldButtons()).toBe(3);
+        expect(b.buttons()).toEqual([]);
+        b.im.poll();
+        expect(b.buttons()).toEqual([WM_LBUTTONUP, WM_RBUTTONUP]);
+        expect(b.im.captureHeldButtons()).toBe(0);
+        b.im.poll();
+        expect(b.buttons().length).toBe(2);
+    });
+
+    test("a button the host still holds stays down without a second button-down", () => {
+        const b = rig();
+        publishButtons(b.view, 1);
+        b.im.restoreHeldButtons(3);
+        b.im.poll();
+        expect(b.buttons()).toEqual([WM_RBUTTONUP]);
+        expect(b.im.captureHeldButtons()).toBe(1);
+    });
+
+    test("buffered DirectInput gets the release too, baselined after the buttons are back", () => {
+        const b = rig();
+        const lane = { size: 0, seq: 0, events: [], overflowed: false };
+        b.im.restoreHeldButtons(1);
+        b.im.restoreDInputBuffers({ mouse: { ...lane, size: 16 }, keyboard: lane, gamepad: lane });
+        b.im.poll();
+        expect(b.im.drainDInputMouseEvents(16).map(e => [e.dwOfs, e.dwData])).toEqual([[12, 0]]);
+    });
+});
 
 describe("keys held at capture", () => {
     test("are captured from what the host last reported", () => {
