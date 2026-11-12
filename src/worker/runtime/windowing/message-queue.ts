@@ -711,6 +711,35 @@ export class MessageQueue {
         };
     }
 
+    // The pending move each thread was last told about by takeNewMouseMove (its guest
+    // time and point). Not saved: after a load the worst case is one move reported twice.
+    private reportedMoves: Map<number, { time: number; ptX: number; ptY: number }> = new Map();
+
+    /**
+     * Is there a coalesced mouse move for `callerThreadId` that this thread has not been
+     * told about yet? Answers true once per pending move and thread.
+     *
+     * This is the "new input" MsgWaitForMultipleObjects waits for. A coalesced move
+     * deliberately wakes nobody when it is queued, so a thread that pumps only when that
+     * wait reports input would otherwise never retrieve one - and never be sent the
+     * WM_SETCURSOR that travels with it.
+     */
+    takeNewMouseMove(callerThreadId: number): boolean {
+        if (this.lastMouseMove.size === 0) return false;
+        for (const pending of this.lastMouseMove.values()) {
+            if (callerThreadId !== 0 && pending.targetThreadId !== 0 && pending.targetThreadId !== callerThreadId) continue;
+            const seen = this.reportedMoves.get(callerThreadId);
+            if (seen && seen.time === pending.time && seen.ptX === pending.ptX && seen.ptY === pending.ptY) continue;
+            if (seen) {
+                seen.time = pending.time; seen.ptX = pending.ptX; seen.ptY = pending.ptY;
+            } else {
+                this.reportedMoves.set(callerThreadId, { time: pending.time, ptX: pending.ptX, ptY: pending.ptY });
+            }
+            return true;
+        }
+        return false;
+    }
+
     hasPendingMoveSetCursor(msgMin = 0, msgMax = 0, callerThreadId = 0): boolean {
         if (this.moveSetCursor.size === 0) return false;
         if (!(msgMin === 0 && msgMax === 0) && !(WM_MOUSEMOVE >= msgMin && WM_MOUSEMOVE <= msgMax)) return false;
@@ -1080,6 +1109,7 @@ export class MessageQueue {
             // drain
         }
         this.lastMouseMove.clear();
+        this.reportedMoves.clear();
         this.moveSetCursor.clear();
         this.timerPending.clear();
         this.paintPending.clear();

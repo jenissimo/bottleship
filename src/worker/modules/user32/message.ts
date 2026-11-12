@@ -54,6 +54,7 @@ const WM_MOUSELAST = 0x020e;
 const MWMO_WAITALL = 0x0001;
 const MWMO_ALERTABLE = 0x0002;
 const MWMO_INPUTAVAILABLE = 0x0004;
+const QS_MOUSEMOVE = 0x0002;
 const MAXIMUM_WAIT_OBJECTS = 64;
 const WAIT_OBJECT_0 = 0;
 const ERROR_INVALID_PARAMETER = 87;
@@ -1246,6 +1247,13 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         system.inputManager.poll(true);
         if ((dwFlags & MWMO_INPUTAVAILABLE) !== 0
             && system.windowManager.hasMessages(0, 0, currentThreadId)) {
+            return inputResult;
+        }
+        // A mouse move the thread has not been told about is new input even when it was
+        // queued before this call: nothing wakes a waiter for a coalesced move, and the
+        // poll above is usually what queued it.
+        if ((dwWakeMask & QS_MOUSEMOVE) !== 0 && !(waitAll && nCount > 0)
+            && system.windowManager.takeNewMouseMove(currentThreadId)) {
             return inputResult;
         }
 
