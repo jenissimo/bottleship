@@ -24,6 +24,7 @@ interface FontCache {
     /** measure(ab) - advance(a) - advance(b), keyed a * 0x10000 + b. */
     kern: Map<number, number>;
     cellHeight: number | undefined;
+    baselineDrop: number | undefined;
     metrics: MeasuredTextMetrics | undefined;
 }
 
@@ -37,7 +38,7 @@ export function invalidateTextExtentCache(): void {
 function cacheFor(font: string): FontCache {
     let c = caches.get(font);
     if (!c) {
-        c = { advance: new Map(), kern: new Map(), cellHeight: undefined, metrics: undefined };
+        c = { advance: new Map(), kern: new Map(), cellHeight: undefined, baselineDrop: undefined, metrics: undefined };
         caches.set(font, c);
     }
     return c;
@@ -86,6 +87,30 @@ export function fontCellHeight(ctx: TextMeasurer): number | undefined {
         c.cellHeight = Math.ceil(m.fontBoundingBoxAscent + m.fontBoundingBoxDescent);
     }
     return c.cellHeight;
+}
+
+/**
+ * How far the alphabetic baseline sits below the canvas 'top' baseline for this font, or
+ * undefined when the canvas can't say. TextOut draws with textBaseline 'top', so this is
+ * the distance TA_BASELINE has to lift the draw origin. Measured once per canvas font; the
+ * context's own textBaseline is put back.
+ */
+export function fontBaselineDrop(ctx: TextMeasurer): number | undefined {
+    const c = cacheFor(ctx.font);
+    if (c.baselineDrop === undefined) {
+        const baseline = ctx.textBaseline;
+        try {
+            ctx.textBaseline = 'alphabetic';
+            const alphabetic = ctx.measureText("Wg").fontBoundingBoxAscent;
+            ctx.textBaseline = 'top';
+            const top = ctx.measureText("Wg").fontBoundingBoxAscent;
+            if (alphabetic === undefined || top === undefined) return undefined;
+            c.baselineDrop = alphabetic - top;
+        } finally {
+            ctx.textBaseline = baseline;
+        }
+    }
+    return c.baselineDrop;
 }
 
 /** What GetTextMetrics derives from measuring a font (the rest of TEXTMETRIC is constant). */
