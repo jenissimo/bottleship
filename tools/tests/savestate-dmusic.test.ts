@@ -42,6 +42,17 @@ function host(released: DirectMusicObject[] = []): DMusicHost {
         },
         readFile: () => null,
         rebuildContents: () => false,
+        rebuildMade: () => false,
+        adoptCollection: () => undefined,
+        collectionObject: () => null,
+        wirePerformance: () => undefined,
+        wirePort: () => undefined,
+        wireState: () => undefined,
+        wirePath: () => undefined,
+        newSink: () => { throw new Error("no sink in this test"); },
+        newEngine: () => { throw new Error("no engine in this test"); },
+        moduleState: () => ({ performances: [], ports: [], pathOutputs: [], messages: [], pumpTimer: null }),
+        restoreModuleState: () => undefined,
     };
 }
 
@@ -110,28 +121,25 @@ describe("dmusic objects", () => {
         expect(again).toBe(first);
     });
 
-    test("objects that play music are refused by name, and so is a loaded object without its source", () => {
+    test("a loaded object without its source is refused by name, also through a loader's cache", () => {
         registerDMusicCodecs(host());
-        const named: Array<[unknown, string]> = [
-            [new PerformanceObject(), "a DirectMusic performance"], [new PortObject(), "a DirectMusic port"],
-            [new SegmentStateObject(), "a DirectMusic segment state"],
-        ];
-        for (const [obj, what] of named) {
-            expect(() => newObjectGraph().ref(obj, "x")).toThrow(CaptureRefusal);
-            expect(() => newObjectGraph().ref(obj, "x")).toThrow(`dmusic: ${what} is not part of a v1 savestate`);
-        }
         const loaded = new CollectionObject();
         loaded.fileName = "music.dls";
         loaded.loaded = true;
+        expect(() => newObjectGraph().ref(loaded, "x")).toThrow(CaptureRefusal);
         expect(() => newObjectGraph().ref(loaded, "x")).toThrow("dmusic: a DLS collection that was not loaded from a stream, memory or a file");
-        const dm = new DirectMusicObject();
-        dm.ports.add(new PortObject());
-        expect(() => newObjectGraph().ref(dm, "x")).toThrow("port");
         const cachingLoader = new LoaderObject();
         const cached = new SegmentObject();
         cached.loaded = true;
         cachingLoader.cache.set("c:\\game\\song.mid", cached);
         expect(() => newObjectGraph().ref(cachingLoader, "x")).toThrow("dmusic: a DirectMusic segment that was not loaded");
+    });
+
+    test("an unused performance, a segment state without a state and DirectMusic with a port's owner link round-trip", () => {
+        const dm = new DirectMusicObject();
+        const { first, again, restored } = roundTrip([new PerformanceObject(), new SegmentStateObject(), dm]);
+        expect(again).toBe(first);
+        expect(restored.map(o => (o as object).constructor)).toEqual([PerformanceObject, SegmentStateObject, DirectMusicObject]);
     });
 
     test("objects created but not loaded, and a track, round-trip", () => {
@@ -175,22 +183,15 @@ describe("dmusic module", () => {
         expect(fresh.identity.objectId).toBe(GUID_DEFAULT_GM_COLLECTION);
     });
 
-    test("an idle module saves; a performance, port, loading object, message or running pump refuses", () => {
+    test("the module refuses only while an object is loading", () => {
         const d = new DMusic() as DMusic & Fields;
         expect(d.savestateRefusal()).toBeNull();
         (d.performances as Set<unknown>).add({});
-        expect(d.savestateRefusal()).toContain("performance or port");
-        (d.performances as Set<unknown>).clear();
         (d.ports as Set<unknown>).add({});
-        expect(d.savestateRefusal()).toContain("performance or port");
-        (d.ports as Set<unknown>).clear();
-        (d.loading as Set<unknown>).add({});
-        expect(d.savestateRefusal()).toContain("still loading");
-        (d.loading as Set<unknown>).clear();
         (d.messages as Map<number, unknown>).set(1, null);
-        expect(d.savestateRefusal()).toContain("messages");
-        (d.messages as Map<number, unknown>).clear();
         d.pumpTimer = 3;
-        expect(d.savestateRefusal()).toContain("pump");
+        expect(d.savestateRefusal()).toBeNull();
+        (d.loading as Set<unknown>).add({});
+        expect(d.savestateRefusal()).toBe("dmusic: an object is still loading; try saving again");
     });
 });

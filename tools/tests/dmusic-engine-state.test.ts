@@ -5,7 +5,7 @@ import type { PartRef, Style, StyleNote, StylePart, StylePattern, TimeSignature 
 import { loadBand } from "../../src/worker/core/audio/directmusic/build";
 import {
     capturePerfSegmentState, DMUS_SEGF_MEASURE, DMUS_SEGF_QUEUE, DMUS_SEGF_SECONDARY, PerfSegment, type PerfSegmentState,
-    type PerfSegmentStateData, Performance, type PerformanceData, restorePerfSegmentState,
+    linkPerfSegmentState, type PerfSegmentStateData, Performance, type PerformanceData, restorePerfSegmentState,
 } from "../../src/worker/core/audio/directmusic/performance";
 import { DlsSynth, SYNTH_STATE_KEYS, type SynthData } from "../../src/worker/core/audio/directmusic/synth";
 import { decodeValue, encodeValue, type SaveValue } from "../../src/worker/savestate/value-codec";
@@ -131,17 +131,10 @@ class Rig {
 
     static restore(saved: Saved, segments: PerfSegment[], collections: DlsCollection[]): Rig {
         const rig = new Rig(segments, collections);
-        const made = new Map<number, PerfSegmentState>();
-        const stateOf = (ref: number): PerfSegmentState => {
-            let s = made.get(ref);
-            if (!s) {
-                const [segment, data] = saved.states[ref]!;
-                made.set(ref, s = restorePerfSegmentState(segments[segment]!, data, stateOf, () => rig));
-            }
-            return s;
-        };
+        const stateOf = (ref: number): PerfSegmentState => rig.known[ref]!;
         const collectionOf = (ref: number): DlsCollection | null => collections[ref] ?? null;
-        saved.states.forEach((_, ref) => { rig.known[ref] = stateOf(ref); });
+        for (const [segment, data] of saved.states) rig.known.push(restorePerfSegmentState(segments[segment]!, data));
+        saved.states.forEach(([, data], ref) => linkPerfSegmentState(rig.known[ref]!, data, stateOf, () => rig));
         rig.perf.restoreState(saved.engine, stateOf, collectionOf);
         rig.synth.restoreState(saved.synth, collectionOf);
         rig.notes.push(...saved.notes);

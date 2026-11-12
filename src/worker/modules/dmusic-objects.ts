@@ -168,6 +168,7 @@ export class SegmentStateObject extends DMusicObject {
     };
     state: PerfSegmentState | null = null;
     segment: SegmentObject | null = null;
+    performance: PerformanceObject | null = null;
 }
 
 export class AudioPathObject extends DMusicObject {
@@ -210,6 +211,7 @@ export class PortObject extends DMusicObject {
     sink: DirectSoundSink | null = null;
     active = false;
     performance: PerformanceObject | null = null;
+    owner: DirectMusicObject | null = null;
 }
 
 export class StyleObject extends LoadableObject {

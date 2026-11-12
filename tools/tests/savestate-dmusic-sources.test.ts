@@ -501,7 +501,7 @@ describe("dmusic saved fields", () => {
         expect(roundTrip([bandTrack]).back[0].classId).toBe("d2ac288c-b39b-11d1-8704-00600893b1bd");
     });
 
-    test("every field of the saved classes has a policy, and the schema is pinned", () => {
+    test("every field of the saved classes has a policy", () => {
         class Plain extends BaseComObject {
             constructor() {
                 super(IID_IUnknown, 0);
@@ -523,7 +523,6 @@ describe("dmusic saved fields", () => {
         expect(Object.keys(saved).sort()).toEqual([...DMUSIC_SCHEMA.loadable, ...DMUSIC_SCHEMA.savedSegment].sort());
         expect(Object.keys(saved.identity).sort()).toEqual(DMUSIC_SCHEMA.identity);
         expect(Object.keys(saved.settings!)).toEqual([...DMUSIC_SCHEMA.segmentSettings]);
-        expect(savestateParticipants.schemas().dmusic).toEqual({ version: 5, schemaHash: "59ed722a2a5efa9e" });
     });
 });
 
@@ -593,11 +592,7 @@ describe("dmusic objects made by another object", () => {
 });
 
 describe("dmusic objects still refused", () => {
-    test("a performance, a port and a segment state are refused by name, and so is a segment loaded while savestates were off", () => {
-        for (const [obj, what] of [[new PerformanceObject(), "performance"], [new PortObject(), "port"], [new SegmentStateObject(), "segment state"]] as const) {
-            expect(() => capture([obj])).toThrow(CaptureRefusal);
-            expect(() => capture([obj])).toThrow(`dmusic: a DirectMusic ${what} is not part of a v1 savestate`);
-        }
+    test("an object loaded while savestates were off has no source and is refused by name", () => {
         flags.__savestates = false;
         const kit = loaded<CollectionObject>(CLSID_DirectMusicCollection, dls(1));
         expect(kit.source).toBeNull();

@@ -264,15 +264,12 @@ export function capturePerfSegmentState(
     };
 }
 
-export function restorePerfSegmentState(
-    segment: PerfSegment, d: PerfSegmentStateData, stateOf: (ref: number) => PerfSegmentState, outputOf: (ref: number) => object,
-): PerfSegmentState {
+export function restorePerfSegmentState(segment: PerfSegment, d: PerfSegmentStateData): PerfSegmentState {
     const s = new PerfSegmentState(segment, d.primary, d.startTime);
     s.base = d.base;
     s.repeatsLeft = d.repeatsLeft;
     s.started = d.started;
     s.ended = d.ended;
-    s.queued = d.queued === NONE ? null : stateOf(d.queued);
     s.fresh = d.fresh;
     s.stopAt = d.stopAt ?? undefined;
     const fixed = segment.fixedPattern;
@@ -293,8 +290,14 @@ export function restorePerfSegmentState(
     for (const [key, variation] of d.sequentialVariation) s.sequentialVariation.set(key, variation);
     s.grooveLevel = d.grooveLevel;
     s.wavePosition = d.wavePosition;
-    s.output = d.output === NONE ? null : outputOf(d.output);
     return s;
+}
+
+export function linkPerfSegmentState(
+    s: PerfSegmentState, d: PerfSegmentStateData, stateOf: (ref: number) => PerfSegmentState, outputOf: (ref: number) => object,
+): void {
+    s.queued = d.queued === NONE ? null : stateOf(d.queued);
+    s.output = d.output === NONE ? null : outputOf(d.output);
 }
 
 export interface PerformanceData {

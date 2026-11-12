@@ -207,6 +207,7 @@ export class DMusic implements IModule {
     private readonly performances = new Set<PerformanceObject>();
     private readonly loading = new Set<LoadableObject>();
     private pumpTimer: number | null = null;
+    private collectionObjects = new WeakMap<DlsCollection, CollectionObject>();
 
     constructor() {
         setTimerHandler(TimerKind.DMUSIC_SYNTH, () => this.pump());
@@ -339,7 +340,7 @@ export class DMusic implements IModule {
             case CLSID_DirectMusicPerformance: {
                 const perf = new PerformanceObject();
                 this.performances.add(perf);
-                perf.onDestroy = () => { this.closePerformance(perf); this.performances.delete(perf); };
+                this.wirePerformance(perf);
                 obj = perf;
                 break;
             }
@@ -552,6 +553,7 @@ export class DMusic implements IModule {
         if (obj instanceof CollectionObject) {
             obj.collection = parseDls(bytes);
             if (!obj.collection) return DMUS_E_LOADER_FORMATNOTSUPPORTED;
+            this.collectionObjects.set(obj.collection, obj);
             obj.identity = obj.collection.identity;
             return { styles: [], collections: [], build: () => partial };
         }
@@ -783,16 +785,35 @@ export class DMusic implements IModule {
             readFile: (path) => this.readSystemFile([path]),
             rebuildContents: (obj, source, bytes, resolved) => this.rebuildContents(obj, source, bytes, resolved),
             rebuildMade: (obj, origin, made) => this.rebuildMade(obj, origin, made),
+            adoptCollection: (obj) => { if (obj.collection) this.collectionObjects.set(obj.collection, obj); },
+            collectionObject: (collection) => {
+                const obj = this.collectionObjects.get(collection);
+                return obj?.collection === collection ? obj : null;
+            },
+            wirePerformance: (perf) => this.wirePerformance(perf),
+            wirePort: (port) => this.wirePort(port),
+            wireState: (obj) => this.wireState(obj),
+            wirePath: (path) => this.wirePath(path),
+            newSink: (buffer, channels, sampleRate) => new DirectSoundSink(this.process, buffer, channels, sampleRate ?? DMusic.PATH_RATE),
+            newEngine: (perf, port) => this.newEngine(perf, port),
+            moduleState: () => ({
+                performances: [...this.performances], ports: [...this.ports], pathOutputs: [...this.pathOutputs],
+                messages: [...this.messages], pumpTimer: this.pumpTimer,
+            }),
+            restoreModuleState: (state) => {
+                for (const [set, list] of [[this.performances, state.performances], [this.ports, state.ports], [this.pathOutputs, state.pathOutputs]] as const) {
+                    (set as Set<DMusicObject>).clear();
+                    for (const obj of list) (set as Set<DMusicObject>).add(obj);
+                }
+                this.messages.clear();
+                for (const [ptr, obj] of state.messages) this.messages.set(ptr, obj);
+                this.pumpTimer = state.pumpTimer;
+            },
         });
     }
 
     savestateRefusal(): string | null {
-        if (this.performances.size > 0 || this.ports.size > 0) return 'dmusic: a DirectMusic performance or port is not part of a v1 savestate';
-        if (this.loading.size > 0) return 'dmusic: an object is still loading';
-        if (this.messages.size > 0) return 'dmusic: performance messages are still allocated';
-        if (this.pumpTimer !== null) return 'dmusic: the synth pump is running';
-        if (this.pathOutputs.size > 0) return 'dmusic: an audio path with its own buffer is not part of a savestate';
-        return null;
+        return this.loading.size > 0 ? 'dmusic: an object is still loading; try saving again' : null;
     }
 
     // ── system loader ───────────────────────────────────────────────────────────
@@ -807,6 +828,7 @@ export class DMusic implements IModule {
         obj.identity.objectId = GUID_DefaultGMCollection;
         obj.identity.name = "GM";
         obj.collection = this.defaultGmCollection();
+        this.collectionObjects.set(obj.collection, obj);
         obj.loaded = true;
         loader.defaultCollection = obj;
         return obj;
@@ -1049,15 +1071,30 @@ export class DMusic implements IModule {
         if (obj && obj.refCount > 0) return obj;
         obj = new SegmentStateObject();
         obj.state = state;
-        const made = obj;
-        obj.onDestroy = () => {
-            if (perf.stateObjects.get(state) === made) perf.stateObjects.delete(state);
-            obj.segment?.release();
-            obj.segment = null;
-        };
+        obj.performance = perf;
+        this.wireState(obj);
         perf.stateObjects.set(state, obj);
         // The performance owns the creation reference until the state ends or it closes.
         return obj;
+    }
+
+    private wireState(obj: SegmentStateObject): void {
+        obj.onDestroy = () => {
+            const state = obj.state;
+            if (state && obj.performance?.stateObjects.get(state) === obj) obj.performance.stateObjects.delete(state);
+            obj.segment?.release();
+            obj.segment = null;
+        };
+    }
+
+    private wirePerformance(perf: PerformanceObject): void {
+        perf.onDestroy = () => { this.closePerformance(perf); this.performances.delete(perf); };
+    }
+
+    private newEngine(perf: PerformanceObject, port: PortObject): Performance {
+        const engine = new Performance(port.synth);
+        engine.onNotification = (type, state, time) => this.notify(perf, type, state, time);
+        return engine;
     }
 
     /** Hand a state object to the guest at `ppOut` (optional); the guest owns that reference. */
@@ -1137,10 +1174,9 @@ export class DMusic implements IModule {
         port.addRef();
         port.performance = perf;
         perf.port = port;
-        const engine = new Performance(port.synth);
+        const engine = this.newEngine(perf, port);
         engine.setMasterTempo(perf.masterTempo);
         port.synth.setMasterVolume(perf.masterVolume);
-        engine.onNotification = (type, state, time) => this.notify(perf, type, state, time);
         perf.engine = engine;
     }
 
@@ -1163,20 +1199,25 @@ export class DMusic implements IModule {
         port.voices = voices;
         port.synth = new DlsSynth(sampleRate, voices);
         this.setDirectSound(port, dm?.directSound ?? 0);
+        port.owner = dm;
         dm?.ports.add(port);
         this.ports.add(port);
+        this.wirePort(port);
+        return port;
+    }
+
+    private wirePort(port: PortObject): void {
         port.onDestroy = () => {
             this.activatePort(port, false);
             this.releasePortOutput(port);
             this.setDirectSound(port, 0);
             this.ports.delete(port);
-            dm?.ports.delete(port);
+            port.owner?.ports.delete(port);
             if (port.performance?.port === port) {
                 port.performance.port = null;
                 port.performance.engine = null;
             }
         };
-        return port;
     }
 
     private createDirectMusic(): DirectMusicObject {
@@ -2141,6 +2182,12 @@ export class DMusic implements IModule {
         path.sink = sink;
         path.channels = channels;
         this.pathOutputs.add(path);
+        this.wirePath(path);
+        this.startPump();
+        return true;
+    }
+
+    private wirePath(path: AudioPathObject): void {
         path.onDestroy = () => {
             const perf = path.performance;
             if (perf?.engine) {
@@ -2154,8 +2201,6 @@ export class DMusic implements IModule {
             if (path.buffer) soundReference(this.process, path.buffer, true, false);
             path.buffer = 0;
         };
-        this.startPump();
-        return true;
     }
 
     private renderPath(path: AudioPathObject, pcm: Int16Array, frames: number): void {
