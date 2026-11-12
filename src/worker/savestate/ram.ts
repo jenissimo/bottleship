@@ -151,26 +151,26 @@ export async function readChunk(store: ChunkStore, hash: string, size: number, w
 }
 
 /**
- * Writes each chunk as soon as it is verified, so at most one chunk is held at a time. A
+ * Writes each chunk as soon as it is verified, so at most one chunk per lane is held at a time. A
  * failed restore leaves the guest half-written: load happens only into a fresh worker, which
  * is discarded when a load fails.
  */
 export async function restoreRam(mem: Uint8Array, manifest: RamManifest, store: ChunkStore): Promise<void> {
     validateRamManifest(manifest, mem.length);
     let next = 0;
-    const zeroUpTo = (end: number) => {
-        if (end > next) zeroGuestRange(mem, next, end - next);
-    };
-    for (const [index, hash] of manifest.chunks) {
+    for (const [index] of manifest.chunks) {
+        const base = index * RAM_CHUNK_SIZE;
+        if (base > next) zeroGuestRange(mem, next, base - next);
+        next = base + Math.min(RAM_CHUNK_SIZE, mem.length - base);
+    }
+    if (mem.length > next) zeroGuestRange(mem, next, mem.length - next);
+    await inLanes(manifest.chunks, STORE_LANES, async ([index, hash]) => {
         const base = index * RAM_CHUNK_SIZE;
         const size = Math.min(RAM_CHUNK_SIZE, mem.length - base);
         const bytes = await readChunk(store, hash, size);
-        zeroUpTo(base);
         mem.set(bytes, base);
         markGuestPagesDirty(base, size);
-        next = base + size;
-    }
-    zeroUpTo(mem.length);
+    });
 }
 
 export function referencedChunks(manifests: Iterable<RamManifest>): Set<string> {

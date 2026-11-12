@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { MemoryChunkStore, sha256Hex } from "../../src/worker/savestate/chunk-store";
-import { RAM_CHUNK_SIZE, STORE_LANES, inLanes, readChunk, writeRamChunks } from "../../src/worker/savestate/ram";
+import { RAM_CHUNK_SIZE, STORE_LANES, inLanes, readChunk, restoreRam, snapshotRam, writeRamChunks } from "../../src/worker/savestate/ram";
 
 const tick = () => new Promise<void>(r => setTimeout(r, 1));
 
@@ -104,5 +104,31 @@ describe("savestate store lanes", () => {
             expect(store.active).toBe(0);
         }
         expect(store.chunks.size).toBe(3);
+    });
+
+    test("a restore reads its chunks side by side and gives the same memory as the snapshot, gaps zeroed", async () => {
+        class SlowReads extends MemoryChunkStore {
+            active = 0; most = 0;
+            override async get(hash: string): Promise<Uint8Array | null> {
+                this.active++; this.most = Math.max(this.most, this.active);
+                await tick();
+                this.active--;
+                return super.get(hash);
+            }
+        }
+        const mem = new Uint8Array(48 * RAM_CHUNK_SIZE);
+        for (let c = 0; c < 48; c++) if (c % 3 !== 1) for (let k = 0; k < RAM_CHUNK_SIZE; k += 61) mem[c * RAM_CHUNK_SIZE + k] = (c * 7 + k) & 0xff || 1;
+        const snap = snapshotRam(mem, new Set());
+        expect(snap.manifest.chunks.length).toBe(32);
+        const store = new SlowReads();
+        await writeRamChunks(snap.pending, store);
+        const fresh = new Uint8Array(mem.length).fill(0xee);
+        await restoreRam(fresh, snap.manifest, store);
+        expect(store.most).toBe(STORE_LANES);
+        expect(Buffer.from(fresh).equals(Buffer.from(mem))).toBe(true);
+
+        await store.delete(snap.manifest.chunks[10]![1]);
+        const err = await restoreRam(new Uint8Array(mem.length), snap.manifest, store).catch(e => e as Error);
+        expect((err as Error).message).toContain("is missing");
     });
 });
