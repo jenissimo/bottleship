@@ -1745,7 +1745,7 @@ export default function App() {
         // SetCursorPos moves the GUEST's cursor, so it applies whatever transport the host
         // happens to be using: Pointer Lock must not be observable by the guest, and gating
         // the warp on it would make a WinAPI contract depend on a host decision.
-        inputDevice.setPointerAbsolute(Number(event.data.x) | 0, Number(event.data.y) | 0);
+        inputDevice.warpPointer(Number(event.data.x) | 0, Number(event.data.y) | 0);
         inputDevice.commit({ immediate: true });
       }
       if (event.data?.type === "device_cursor_pos") {

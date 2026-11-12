@@ -150,6 +150,20 @@ test('a destroyed window stops driving the view, and a reused handle does not in
     expect(System.getInstance().hostView).toEqual({ x: 0, y: 0, width: 560, height: 400 });
 });
 
+test('while DirectDraw holds the display exclusively a shown window does not replace the mode\'s view', () => {
+    const system = System.getInstance() as unknown as { ddrawContext: unknown };
+    const savedDdraw = system.ddrawContext;
+    system.ddrawContext = { cooperative: { exclusive: true } };
+    try {
+        System.getInstance().requestHostResize(640, 480, { modeSet: false });
+        published.length = 0;
+        makeWindow(HWND, 0, 4, 23, 632, 453);
+        call('ShowWindow', [HWND, SW_SHOW]);
+        expect(published).toEqual([]);
+        expect(System.getInstance().hostView).toEqual({ x: 0, y: 0, width: 640, height: 480 });
+    } finally { system.ddrawContext = savedDdraw; }
+});
+
 test('popups and children do not publish a view when shown', () => {
     makeWindow(HWND, WS_POPUP >>> 0, 30, 30, 200, 100);
     call('ShowWindow', [HWND, SW_SHOW]);

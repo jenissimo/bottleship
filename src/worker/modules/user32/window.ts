@@ -1948,7 +1948,10 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 }
             }
 
-            if (show && !isChild && !(live.style & WS_POPUP)) {
+            // While DirectDraw holds the display exclusively the mode set is the view,
+            // whatever rectangle the window has.
+            if (show && !isChild && !(live.style & WS_POPUP)
+                && !System.getInstance().ddrawContext?.cooperative?.exclusive) {
                 System.getInstance().requestHostViewOfWindow(hWnd, live.x, live.y, live.width, live.height);
             }
             if (isAnimateControlWindow(live)) onAnimateShowWindow(hWnd, nCmdShow);

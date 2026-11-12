@@ -223,6 +223,18 @@ export class VirtualInputDevice {
     }
 
     /**
+     * The guest moved its own pointer (SetCursorPos). The position is a screen coordinate
+     * the guest chose and reads back, so it is not confined to the shown part of the
+     * screen: only host samples are (setPointerAbsolute, addPointerRelative).
+     */
+    warpPointer(x: number, y: number): void {
+        if (x === this.cursorX && y === this.cursorY) return;
+        this.cursorX = x;
+        this.cursorY = y;
+        this.dirty = true;
+    }
+
+    /**
      * Relative motion. Advances the clamped virtual cursor AND feeds the DirectInput
      * accumulators with the RAW delta — DInput reports device deltas, not screen
      * ones, so these two must not share a scale factor. The accumulators are

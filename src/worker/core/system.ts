@@ -865,7 +865,11 @@ export class System {
      * host maps its pointer onto this rectangle and publishes SCREEN coordinates, so a
      * view that does not start at the screen origin needs nothing from the cursor path.
      */
-    public hostView: HostView | null = null;
+    private hostViewRect: HostView | null = null;
+
+    get hostView(): HostView | null {
+        return this.hostViewRect;
+    }
 
     /** The window whose client rectangle is the host view, or 0 when a size was published. */
     get hostViewOwner(): number {
@@ -882,10 +886,13 @@ export class System {
         this.publishHostView(x, y, width, height, hwnd);
     }
 
-    /** The shown window moved or resized: publish only when the rectangle really changed. */
+    /**
+     * The shown window moved or resized. The caller reports real changes only; the
+     * comparison is a guard so that a caller which does not cannot republish per frame.
+     */
     followHostViewWindow(hwnd: number, x: number, y: number, width: number, height: number): void {
         if (hwnd === 0 || hwnd !== this.hostViewWindow) return;
-        const v = this.hostView;
+        const v = this.hostViewRect;
         if (v && v.x === x && v.y === y && v.width === width && v.height === height) return;
         this.publishHostView(x, y, width, height, hwnd);
     }
@@ -897,8 +904,8 @@ export class System {
 
     private publishHostView(x: number, y: number, width: number, height: number, hwnd: number): void {
         this.hostViewWindow = hwnd;
-        this.hostView = { x, y, width, height };
-        if (this.hostResize) this.hostResize(this.hostView);
+        this.hostViewRect = { x, y, width, height };
+        if (this.hostResize) this.hostResize(this.hostViewRect);
     }
 
     /**

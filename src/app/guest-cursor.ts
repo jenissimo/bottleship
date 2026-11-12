@@ -35,6 +35,23 @@ export interface CursorGeometry {
   spaceHeight: number;
 }
 
+/**
+ * Where the cursor element goes, relative to its containing block, for a pointer at the
+ * guest SCREEN position `pos`: the canvas shows the rectangle of the screen that starts at
+ * (spaceLeft, spaceTop), so that origin is taken off before scaling.
+ */
+export function cursorPlacement(
+  geo: CursorGeometry, pos: { x: number; y: number }, hotspotX: number, hotspotY: number,
+): { scaleX: number; scaleY: number; x: number; y: number } {
+  const scaleX = geo.width / Math.max(1, geo.spaceWidth);
+  const scaleY = geo.height / Math.max(1, geo.spaceHeight);
+  return {
+    scaleX, scaleY,
+    x: geo.left - geo.originLeft + (pos.x - geo.spaceLeft - hotspotX) * scaleX,
+    y: geo.top - geo.originTop + (pos.y - geo.spaceTop - hotspotY) * scaleY,
+  };
+}
+
 /** Harness-visible: "is the pointer the user sees where the guest thinks it is". */
 export interface GuestCursorStatus {
   drawn: boolean;
@@ -258,15 +275,12 @@ export class GuestCursorRenderer {
     // One scale for both: the bitmap and the SAB position are authored in the same guest
     // screen. Scaling the shape WITH the canvas is the faithful choice — the guest's
     // screen is our canvas, and a 32px cursor covered 32 of its pixels.
-    const scaleX = geo.width / Math.max(1, geo.spaceWidth);
-    const scaleY = geo.height / Math.max(1, geo.spaceHeight);
+    const { scaleX, scaleY, x, y } = cursorPlacement(geo, pos, shape.hotspotX, shape.hotspotY);
     const width = Math.max(1, Math.round(shape.width * scaleX));
     const height = Math.max(1, Math.round(shape.height * scaleY));
     const dpr = window.devicePixelRatio || 1;
     this.rasterize(el, shape, width, height, dpr);
 
-    const x = geo.left - geo.originLeft + (pos.x - geo.spaceLeft - shape.hotspotX) * scaleX;
-    const y = geo.top - geo.originTop + (pos.y - geo.spaceTop - shape.hotspotY) * scaleY;
     el.style.transform = `translate3d(${x}px, ${y}px, 0)`;
     if (el.style.display !== "block") el.style.display = "block";
 

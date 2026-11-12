@@ -213,6 +213,21 @@ describe("pointer bounds are a rectangle of the guest screen", () => {
         expect(device.getCursor()).toEqual({ x: 599, y: 439 });
     });
 
+    test("a guest warp is not confined to the rectangle; the next host sample is", () => {
+        const { device } = makeDevice();
+        device.setPointerBounds(VIEW);
+        // SetCursorPos to the screen origin and to the screen centre while the view is elsewhere.
+        device.warpPointer(0, 0);
+        expect(device.getCursor()).toEqual({ x: 0, y: 0 });
+        device.warpPointer(620, 470);
+        expect(device.getCursor()).toEqual({ x: 620, y: 470 });
+        device.setPointerAbsolute(620, 470);
+        expect(device.getCursor()).toEqual({ x: 600, y: 440 });
+        device.warpPointer(10, 10);
+        device.addPointerRelative(1, 1);
+        expect(device.getCursor()).toEqual({ x: 40, y: 40 });
+    });
+
     test("a rectangle at the origin confines as a plain size did", () => {
         const { device } = makeDevice();
         device.setPointerAbsolute(-5, 700);

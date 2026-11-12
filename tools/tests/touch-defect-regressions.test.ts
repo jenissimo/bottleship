@@ -149,6 +149,15 @@ describe("the driver decides what belongs to the guest", () => {
         expect(far.y).toBeGreaterThan(438); expect(far.y).toBeLessThanOrEqual(439);
     });
 
+    test("the recognizer's clamp box is the view, wherever on the screen it is", () => {
+        const view = { x: 40, y: 40, width: 560, height: 400 };
+        const r = rig(view);
+        r.panel.fire("pointerdown", pev(1, 420, 290));
+        r.panel.fire("pointerup", pev(1, 420, 290, PLAIN, 30));
+        const cfg = (r.driver as unknown as { recognizer: { cfg: Record<string, number> } }).recognizer.cfg;
+        expect([cfg.minX, cfg.minY, cfg.maxX, cfg.maxY]).toEqual([40, 40, 599, 439]);
+    });
+
     test("a tap on a data-touch-reserved overlay reaches neither the guest nor the widgets", () => {
         const r = rig();
         r.panel.fire("pointerdown", pev(1, 420, 290, RESERVED));
@@ -204,7 +213,7 @@ describe("BindingPresser.releaseAll defers its publish when asked", () => {
     // unplug — DIERR_INPUTLOST on every acquired DirectInput joystick, on every tab hide.
     // Asserted against the REAL presser and the real device: a hand-rolled stand-in would
     // pass whatever the production path did.
-    function rig(space = { x: 0, y: 0, width: 640, height: 480 }) {
+    function rig() {
         const view = new Int32Array(INPUT_BUFFER_SIZE / 4);
         let publishes = 0;
         inputDevice.attach(view, () => { publishes++; });
