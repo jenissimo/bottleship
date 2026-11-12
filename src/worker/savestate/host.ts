@@ -269,6 +269,11 @@ export async function deleteSlot(slot: string): Promise<{ removedChunks: number 
     });
 }
 
+/**
+ * `ms.paused` runs from the halt request to the guest's release, which happens once RAM is copied
+ * (`ms.ramCopy`). `ms.ramHash` (hashing the copies) and `ms.store` (compressing and writing) run
+ * after the release, while the guest is running again.
+ */
 export interface SaveReport {
     name: string; bytes: number; chunkBytes: number; chunkWrites: number;
     ms: { paused: number; ramCopy: number; ramHash: number; store: number }; sections: Record<string, number>; captureMs: Record<string, number>; ram: unknown;

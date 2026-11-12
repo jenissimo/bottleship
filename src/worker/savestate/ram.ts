@@ -106,6 +106,18 @@ export function snapshotRam(mem: Uint8Array, known: ReadonlySet<string>, patches
 }
 
 export const RAM_COPY_BUDGET = 256 * 1024 * 1024;
+export const RAM_COPY_BUDGET_UNKNOWN_DEVICE = 64 * 1024 * 1024;
+
+/**
+ * How much non-zero RAM a save may copy during the halt. A device that reports its memory
+ * gets a sixteenth of it, at most RAM_COPY_BUDGET; one that does not (WebKit, where an
+ * allocation that does not fit ends the process instead of throwing) gets the small cap.
+ * The rest of the RAM is hashed in place during the halt.
+ */
+export function ramCopyBudget(deviceMemoryGb: unknown = (globalThis as { navigator?: { deviceMemory?: unknown } }).navigator?.deviceMemory): number {
+    if (typeof deviceMemoryGb !== 'number' || !(deviceMemoryGb > 0)) return RAM_COPY_BUDGET_UNKNOWN_DEVICE;
+    return Math.min(RAM_COPY_BUDGET, Math.floor(deviceMemoryGb * 1024 * 1024 * 1024 / 16));
+}
 
 export interface RamCopy {
     length: number;
@@ -121,7 +133,7 @@ export interface RamCopy {
  * resumes. Past `budget` copied bytes, or when a copy cannot be allocated, the remaining
  * chunks are hashed here and copied only if the store does not have them, as snapshotRam does.
  */
-export function copyRam(mem: Uint8Array, known: ReadonlySet<string>, patches: readonly RamPatch[] = [], budget = RAM_COPY_BUDGET): RamCopy {
+export function copyRam(mem: Uint8Array, known: ReadonlySet<string>, patches: readonly RamPatch[] = [], budget = ramCopyBudget()): RamCopy {
     const count = Math.ceil(mem.length / RAM_CHUNK_SIZE);
     const patched = patchesByChunk(mem, patches);
     const out: RamCopy = { length: mem.length, chunks: [], pending: new Map(), stats: { chunks: count, knownZero: 0, scannedZero: 0, written: 0, reused: 0 }, copied: 0 };
@@ -134,7 +146,11 @@ export function copyRam(mem: Uint8Array, known: ReadonlySet<string>, patches: re
         const view = mem.subarray(base, base + size);
         if (!fix && isAllZero(view)) { out.stats.scannedZero++; continue; }
         let bytes: Uint8Array | null = null;
-        if (!inline || fix) {
+        if (fix) {
+            try { bytes = mem.slice(base, base + size); } catch (e) {
+                throw new Error(`ram: the patched chunk at 0x${base.toString(16)} could not be copied (${e instanceof Error ? e.message : String(e)}); try saving again`);
+            }
+        } else if (!inline) {
             try { bytes = mem.slice(base, base + size); } catch { inline = true; }
         }
         if (bytes && fix) {
@@ -157,24 +173,19 @@ export function copyRam(mem: Uint8Array, known: ReadonlySet<string>, patches: re
 
 /** Hashes the chunks copyRam copied and keeps only those the store does not have yet. */
 export async function hashRamCopy(copy: RamCopy, known: ReadonlySet<string>): Promise<RamSnapshot> {
-    const hashes = new Array<string>(copy.chunks.length);
-    await inLanes(copy.chunks.map((_, at) => at), STORE_LANES, async (at) => {
-        const entry = copy.chunks[at]!;
-        hashes[at] = entry[2] ?? await sha256Hex(entry[1]!);
-    });
-    const manifest: RamManifest = { chunkSize: RAM_CHUNK_SIZE, length: copy.length, chunks: [] };
     const pending = copy.pending;
     const stats = copy.stats;
-    for (let at = 0; at < copy.chunks.length; at++) {
-        const entry = copy.chunks[at]!;
-        const hash = hashes[at]!;
-        manifest.chunks.push([entry[0], hash]);
+    await inLanes(copy.chunks, STORE_LANES, async (entry) => {
         const bytes = entry[1];
+        if (!bytes) return;
+        const hash = await sha256Hex(bytes);
+        entry[2] = hash;
         entry[1] = null;
-        if (!bytes) continue;
-        if (known.has(hash) || pending.has(hash)) { stats.reused++; continue; }
+        if (known.has(hash) || pending.has(hash)) { stats.reused++; return; }
         pending.set(hash, bytes);
-    }
+    });
+    const manifest: RamManifest = { chunkSize: RAM_CHUNK_SIZE, length: copy.length, chunks: [] };
+    for (const entry of copy.chunks) manifest.chunks.push([entry[0], entry[2]!]);
     stats.written = pending.size;
     return { manifest, pending, stats };
 }

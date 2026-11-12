@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { MemoryChunkStore } from "../../src/worker/savestate/chunk-store";
-import { copyRam, hashRamCopy, RAM_CHUNK_SIZE, restoreRam, snapshotRam, writeRamChunks, type RamPatch } from "../../src/worker/savestate/ram";
+import { copyRam, hashRamCopy, RAM_CHUNK_SIZE, RAM_COPY_BUDGET, RAM_COPY_BUDGET_UNKNOWN_DEVICE, ramCopyBudget, restoreRam, snapshotRam, STORE_LANES, writeRamChunks, type RamPatch } from "../../src/worker/savestate/ram";
 import { ParticipantRegistry } from "../../src/worker/savestate/participant";
 import { captureSession, restoreSession, type SavestateTarget } from "../../src/worker/savestate/session";
 import { decodeSavestate, type CompatibilityKey } from "../../src/worker/savestate/container";
@@ -97,6 +97,65 @@ describe("RAM is copied while the guest is halted and hashed afterwards", () => 
         expect(copy.chunks.filter(c => c[1] !== null).length).toBe(2);
         expect(copy.chunks.filter(c => c[2] !== null).length).toBeGreaterThan(3);
         expect(plain(await hashRamCopy(copy, new Set()))).toEqual(want);
+    });
+
+    test("a patched chunk whose copy cannot be allocated fails the save instead of saving it unpatched", async () => {
+        const mem = guest(10, 5);
+        const patch: RamPatch = { address: 2 * RAM_CHUNK_SIZE + 7, bytes: [0xaa, 0xbb] };
+        const want = plain(snapshotRam(mem, new Set(), [patch]));
+        const real = mem.slice.bind(mem);
+        for (const failing of [true, false]) {
+            let calls = 0;
+            (mem as { slice: typeof mem.slice }).slice = (...a) => { if (failing && ++calls === 2) throw new RangeError("Array buffer allocation failed"); return real(...a); };
+            try {
+                if (failing) {
+                    expect(() => copyRam(mem, new Set(), [patch])).toThrow("ram: the patched chunk at 0x20000 could not be copied (Array buffer allocation failed); try saving again");
+                    calls = 0;
+                    expect(() => copyRam(mem, new Set(), [patch], 0)).toThrow("could not be copied");
+                } else {
+                    expect(plain(await hashRamCopy(copyRam(mem, new Set(), [patch], 0), new Set()))).toEqual(want);
+                }
+            } finally {
+                delete (mem as { slice?: unknown }).slice;
+            }
+        }
+        let calls = 0;
+        let resumed = 0;
+        (mem as { slice: typeof mem.slice }).slice = (...a) => { if (++calls === 2) throw new RangeError("Array buffer allocation failed"); return real(...a); };
+        const reg = new ParticipantRegistry();
+        reg.add({ id: "cpu", version: 1, order: 99, capture: (ctx) => { ctx.patchRam(patch.address, patch.bytes); return null; }, restore: () => undefined });
+        const err = await captureSession(target(mem), new Set(), () => undefined, reg, () => { resumed++; }).catch(e => e);
+        delete (mem as { slice?: unknown }).slice;
+        expect(String((err as Error).message)).toContain("could not be copied");
+        expect(resumed).toBe(0);
+    });
+
+    test("a copy is dropped inside its lane as soon as its hash is known, not after all hashes", async () => {
+        const mem = guest(64, 13);
+        const known = new Set(snapshotRam(mem, new Set()).manifest.chunks.map(([, hash]) => hash));
+        const copy = copyRam(mem, known);
+        const total = copy.chunks.length;
+        expect(total).toBeGreaterThan(40);
+        const digest = crypto.subtle.digest.bind(crypto.subtle);
+        const live: number[] = [];
+        crypto.subtle.digest = ((...a: Parameters<typeof digest>) => { live.push(copy.chunks.filter(c => c[1] !== null).length); return digest(...a); }) as typeof digest;
+        try {
+            const snap = await hashRamCopy(copy, known);
+            expect(snap.pending.size).toBe(0);
+            expect(snap.stats.reused).toBe(total);
+        } finally {
+            crypto.subtle.digest = digest;
+        }
+        expect(live.length).toBe(total);
+        expect(live[0]).toBe(total);
+        expect(live[live.length - 1]).toBeLessThanOrEqual(STORE_LANES);
+    });
+
+    test("the copy budget follows the device: a sixteenth of reported memory up to the cap, the small cap when nothing is reported", () => {
+        expect(ramCopyBudget(8)).toBe(RAM_COPY_BUDGET);
+        expect(ramCopyBudget(2)).toBe(128 * 1024 * 1024);
+        expect(ramCopyBudget(0.5)).toBe(32 * 1024 * 1024);
+        for (const unknown of [undefined, null, 0, NaN, "8"]) expect(ramCopyBudget(unknown)).toBe(RAM_COPY_BUDGET_UNKNOWN_DEVICE);
     });
 
     test("a patched chunk that becomes zero is left out, and a bad patch is refused", async () => {
