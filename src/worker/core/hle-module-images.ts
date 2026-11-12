@@ -119,13 +119,13 @@ function runAttach(dllName: string): void {
 }
 
 /** Hold one loader reason. A retired process' release cannot touch a new image epoch. */
-export function retainHleModuleLoaded(dllName: string): HleModuleLoadReference | undefined {
+export function retainHleModuleLoaded(dllName: string, attach = true): HleModuleLoadReference | undefined {
     if (hleImageBase(dllName) === undefined) return undefined;
     const names = slotKeys(dllName).filter(name => slotByName.has(name));
     const attached = !isHleModuleLoaded(dllName);
     const counts = retainedNames;
     for (const name of names) counts.set(name, (counts.get(name) ?? 0) + 1);
-    if (attached && isHleModuleLoaded(dllName)) runAttach(dllName);
+    if (attach && attached && isHleModuleLoaded(dllName)) runAttach(dllName);
     let released = false;
     return { release() {
         if (released) return;
