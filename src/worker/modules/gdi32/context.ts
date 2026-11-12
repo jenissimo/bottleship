@@ -271,10 +271,39 @@ export function registerDcTeardown(fn: (hdc: number) => void): void {
     dcTeardownHooks.push(fn);
 }
 
+/**
+ * The DC table. A DC whose selected DIB section has not been mirrored into its canvas yet
+ * (see GDIContext.deferDibSection) is brought up to date by the lookup itself, so every
+ * path that takes a DC's canvas sees current pixels without knowing about the deferral.
+ * `peek` is for the few callers that do not need the pixels (object selection) or bring
+ * the part they need up to date themselves (a blit reading its source rectangle).
+ */
+class DcContextTable extends Map<number, OffscreenCanvasRenderingContext2D> {
+    /** DC (a memory DC, or a bitmap's cache DC) -> the DIB section it is behind on. */
+    readonly stale = new Map<number, number>();
+    materialize: ((hdc: number) => void) | null = null;
+
+    override get(hdc: number): OffscreenCanvasRenderingContext2D | undefined {
+        if (this.stale.size !== 0 && this.stale.has(hdc)) this.materialize?.(hdc);
+        return super.get(hdc);
+    }
+    peek(hdc: number): OffscreenCanvasRenderingContext2D | undefined {
+        return super.get(hdc);
+    }
+    override delete(hdc: number): boolean {
+        this.stale.delete(hdc);
+        return super.delete(hdc);
+    }
+    override clear(): void {
+        this.stale.clear();
+        super.clear();
+    }
+}
+
 export class GDIContext {
     // Host-shared state: gdi-objects/gdi-text/gdi-blit access non-private
     // fields/methods of this class directly — treat them as module-private to gdi32.
-    contexts: Map<number, OffscreenCanvasRenderingContext2D> = new Map();
+    contexts: DcContextTable = this.newContextTable();
     objects: Map<number, GDIObject> = new Map();
     private nextHdc = 0x20000;
     nextHgdiobj = 0x30000;
@@ -602,7 +631,10 @@ export class GDIContext {
         let entry = this.windowClientBacking.get(hwnd);
         if (!entry || entry.w !== w || entry.h !== h) {
             const canvas = new OffscreenCanvas(w, h);
-            const ctx = canvas.getContext("2d") as OffscreenCanvasRenderingContext2D | null;
+            // Same kind of canvas as the DCs and the overlay it is copied from and to. A
+            // default (GPU-backed) one made every flush an upload of the client image and
+            // every GetDC that seeds from it a read-back.
+            const ctx = canvas.getContext("2d", { willReadFrequently: true }) as OffscreenCanvasRenderingContext2D | null;
             if (!ctx) return;
             entry = { canvas, ctx, x, y, w, h };
             this.windowClientBacking.set(hwnd, entry);
@@ -1482,6 +1514,66 @@ export class GDIContext {
         return newHdc;
     }
 
+    private newContextTable(): DcContextTable {
+        const table = new DcContextTable();
+        table.materialize = (hdc) => this.materializeDibSection(hdc);
+        return table;
+    }
+
+    /** A DC's canvas without bringing a deferred DIB section up to date first. */
+    peekContext(hdc: number): OffscreenCanvasRenderingContext2D | undefined {
+        return this.contexts.peek(hdc);
+    }
+
+    /** True while `hdc`'s canvas has not been mirrored from its DIB section's guest bits. */
+    isDibSectionDeferred(hdc: number): boolean {
+        return this.contexts.stale.has(hdc);
+    }
+
+    /**
+     * SelectObject of a DIB section does not mirror the guest bits into the canvases
+     * right away. The software-renderer frame is SelectObject, BitBlt to the window,
+     * deselect: the blit converts the rectangle it reads from the guest bits anyway, so
+     * mirroring the whole section on the select converts every frame twice. The DC and
+     * the bitmap's cache DC are marked instead; the first lookup of either canvas runs
+     * the deferred mirror, with the bits as they are then.
+     */
+    private deferDibSection(hdc: number, bitmapDC: number, hbitmap: number): void {
+        this.contexts.stale.set(hdc, hbitmap);
+        this.contexts.stale.set(bitmapDC, hbitmap);
+    }
+
+    /** The source rectangle of a blit covered the whole section: this DC's canvas is current. */
+    dibSectionCanvasCurrent(hdc: number): void {
+        this.contexts.stale.delete(hdc);
+    }
+
+    private materializeDibSection(hdc: number): void {
+        const stale = this.contexts.stale;
+        const hbitmap = stale.get(hdc);
+        if (hbitmap === undefined) return;
+        const pending: number[] = [];
+        for (const [dc, bmp] of stale) if (bmp === hbitmap) pending.push(dc);
+        for (const dc of pending) stale.delete(dc);
+        const pixels = this.refreshDibSectionCanvas(hbitmap);
+        const bitmapDC = this.bitmapDCCache.get(hbitmap);
+        const bitmapCtx = bitmapDC !== undefined ? this.contexts.peek(bitmapDC) : undefined;
+        for (const dc of pending) {
+            if (dc === bitmapDC || this.hdcStates.get(dc)?.hBitmap !== hbitmap) continue;
+            const ctx = this.contexts.peek(dc);
+            if (!ctx) continue;
+            if (pixels) {
+                ctx.putImageData(new (ImageData as any)(pixels.data, pixels.width, pixels.height), 0, 0);
+            } else if (bitmapCtx) {
+                // The bits could not be read: show the bitmap's last known image, as the
+                // select itself did when its refresh came back empty.
+                ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+                ctx.drawImage(bitmapCtx.canvas, 0, 0);
+            }
+            this.invalidateImageDataCache(dc);
+        }
+    }
+
     /**
      * Re-materialize a DIBSection-backed bitmap's canvas from live guest bits.
      * The app writes DIB bits directly in guest memory (no API call to observe),
@@ -1501,7 +1593,8 @@ export class GDIContext {
             ? fresh.data
             : new Uint8ClampedArray(fresh.data);
         const bitmapDC = this.bitmapDCCache.get(hbitmap);
-        const bitmapCtx = bitmapDC !== undefined ? this.contexts.get(bitmapDC) : undefined;
+        if (bitmapDC !== undefined) this.contexts.stale.delete(bitmapDC);
+        const bitmapCtx = bitmapDC !== undefined ? this.contexts.peek(bitmapDC) : undefined;
         if (bitmapCtx) {
             bitmapCtx.putImageData(new (ImageData as any)(data, fresh.width, fresh.height), 0, 0);
             this.invalidateImageDataCache(bitmapDC!);
@@ -1947,7 +2040,8 @@ export class GDIContext {
     }
 
     selectObject(hdc: number, hgdiobj: number): number {
-        const ctx = this.contexts.get(hdc);
+        // Selecting an object needs the DC, not its pixels.
+        const ctx = this.contexts.peek(hdc);
         if (!ctx) {
             Logger.warn(LogCategory.GDI32, `selectObject: Invalid HDC 0x${hdc.toString(16)}`);
             return 0;
@@ -1994,6 +2088,8 @@ export class GDIContext {
                 if (state.hBitmap === hgdiobj) {
                     return previousHandle; // Already selected, return previous handle
                 }
+                // The DC is about to show another bitmap: what it owed the old one is moot.
+                this.contexts.stale.delete(hdc);
 
                 // Stock default bitmap = deselect current bitmap
                 if (hgdiobj === GDIContext.DEFAULT_BITMAP_HANDLE) {
@@ -2007,7 +2103,7 @@ export class GDIContext {
                 // Create or reuse bitmap DC (now cached via bitmapDCCache)
                 const bitmapDC = this.createBitmapDC(hgdiobj);
                 if (bitmapDC) {
-                    const bitmapCtx = this.contexts.get(bitmapDC);
+                    const bitmapCtx = this.contexts.peek(bitmapDC);
                     if (bitmapCtx) {
                         const userObj = obj.data;
                         const bitmapWidth = userObj.width || bitmapCtx.canvas.width;
@@ -2029,7 +2125,7 @@ export class GDIContext {
                         // observe, no version bump) — re-materialize from live memory
                         // on every select so reads see the current surface.
                         const isDibSection = !!(userObj.bitsPtr && userObj.dibStride);
-                        const dibPixels = isDibSection ? this.refreshDibSectionCanvas(hgdiobj) : null;
+                        if (isDibSection) this.deferDibSection(hdc, bitmapDC, hgdiobj);
 
                         // PERFORMANCE OPTIMIZATION: Track bitmap versions to skip redundant drawImage
                         // Only copy bitmap content if the bitmap has changed since last sync
@@ -2041,12 +2137,9 @@ export class GDIContext {
                             syncState.hbitmap !== hgdiobj ||
                             syncState.version !== bitmapVersion;
 
-                        if (dibPixels) {
-                            // The refresh already converted the whole bitmap; going through
-                            // the bitmap canvas again would be a second full-surface copy.
-                            ctx.putImageData(
-                                new (ImageData as any)(dibPixels.data, dibPixels.width, dibPixels.height), 0, 0);
-                            this.invalidateImageDataCache(hdc);
+                        if (isDibSection) {
+                            // Deferred: the canvas is filled from the guest bits when it is
+                            // first looked up, or rectangle by rectangle by a blit reading it.
                             this.dcBitmapSyncState.set(hdc, { hbitmap: hgdiobj, version: bitmapVersion });
                         } else if (needsSync) {
                             // Copy bitmap content to memory DC
@@ -2540,6 +2633,9 @@ export class GDIContext {
         if (this.linkedSurfaces.size > 0) throw new Error('gdi32: a DirectDraw surface DC is open');
         if (this.overlayPublishDepth > 0) throw new Error('gdi32: a guest paint sequence is in flight');
         if (this.bitmapImageBitmapCache.size > 0) throw new Error('gdi32: a bitmap is still being decoded');
+        // The canvases are saved as they are, and "still owed its DIB section" is not part
+        // of the image: settle every deferred mirror first.
+        for (const hdc of [...this.contexts.stale.keys()]) this.materializeDibSection(hdc);
         const objects = [...this.objects.values()].map(o => {
             const data = o.data as { tileCanvas?: unknown } | null;
             if (data && typeof data === 'object' && 'tileCanvas' in data) throw new Error('gdi32: pattern brushes are not part of a v1 savestate');
@@ -2589,7 +2685,7 @@ export class GDIContext {
         this.objects = new Map(s.objects.map(o => [o.handle, { ...o }]));
         this.nextHdc = s.nextHdc;
         this.nextHgdiobj = s.nextHgdiobj;
-        this.contexts = new Map();
+        this.contexts = this.newContextTable();
         this.hdcStates = new Map();
         for (const dc of s.dcs) {
             const ctx = dc.canvas ? newCanvasContext(dc.canvas) : this.overlayCtx;

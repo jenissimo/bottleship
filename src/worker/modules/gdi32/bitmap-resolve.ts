@@ -45,6 +45,8 @@ interface BitmapUserObj {
     /** BI_BITFIELDS red/green/blue masks; absent for BI_RGB. */
     dibMasks?: readonly number[];
     isTopDown?: boolean;
+    /** Conversion buffer of the last blit that read this bitmap (resolveDibSectionRectRgba, reuse). */
+    rectScratch?: Uint8ClampedArray;
     loading?: boolean;
     compatibleBitmap?: boolean;
     compatibleEmpty?: boolean;
@@ -149,6 +151,85 @@ function readDibSectionRgba(
     return out;
 }
 
+// @transient(lookup tables derived from a mask layout / a colour table; rebuilt on demand)
+const dib16Luts = new Map<string, Uint32Array>();
+// @transient(scratch for the 8 bpp colour table in canvas byte order)
+const dib8Lut = new Uint32Array(256);
+
+/** 16 bpp pixel value -> canvas RGBA word (little-endian R,G,B,A), for one mask layout. */
+function dib16Lut(masks: readonly [number, number, number]): Uint32Array {
+    const key = masks.join(',');
+    let lut = dib16Luts.get(key);
+    if (!lut) {
+        const decoder = new Dib16Decoder(masks);
+        const px = new Uint8ClampedArray(4);
+        lut = new Uint32Array(65536);
+        for (let v = 0; v < 65536; v++) {
+            decoder.write(v, px, 0);
+            lut[v] = (0xff000000 | (px[2]! << 16) | (px[1]! << 8) | px[0]!) >>> 0;
+        }
+        if (dib16Luts.size >= 4) dib16Luts.clear();
+        dib16Luts.set(key, lut);
+    }
+    return lut;
+}
+
+/**
+ * The 32, 16 and 8 bpp rectangle conversions a whole word at a time: one store per pixel
+ * instead of four, and for 32 bpp one load. Same pixels as the byte loops below, which
+ * stay for the other depths and for an output buffer that is not word-aligned. Needs a
+ * little-endian host, which every WebAssembly target is.
+ */
+function convertDibRectFast(
+    obj: BitmapUserObj, mem: Uint8Array, out: Uint8ClampedArray,
+    x: number, y: number, w: number, h: number, bw: number, bh: number, bpp: number,
+): boolean {
+    if (bpp !== 32 && bpp !== 16 && bpp !== 8) return false;
+    if ((out.byteOffset & 3) !== 0) return false;
+    if (obj.bitsPtr! + obj.dibStride! * bh > mem.length) return false;
+    const out32 = new Uint32Array(out.buffer, out.byteOffset, w * h);
+    const rowOf = (row: number) => obj.bitsPtr! + (obj.dibTopDown ? y + row : bh - 1 - (y + row)) * obj.dibStride!;
+    if (bpp === 32) {
+        const aligned = ((mem.byteOffset + obj.bitsPtr! + x * 4) & 3) === 0 && (obj.dibStride! & 3) === 0;
+        const mem32 = aligned ? new Uint32Array(mem.buffer, mem.byteOffset, mem.byteLength >>> 2) : null;
+        for (let row = 0, di = 0; row < h; row++) {
+            if (mem32) {
+                let si = (rowOf(row) + x * 4) >>> 2;
+                for (let c = 0; c < w; c++, si++, di++) {
+                    const v = mem32[si]!;
+                    const rgb = (v & 0x0000ff00) | ((v & 0xff) << 16) | ((v >>> 16) & 0xff);
+                    out32[di] = (((v >>> 24) || 255) << 24 | rgb) >>> 0;
+                }
+            } else {
+                let so = rowOf(row) + x * 4;
+                for (let c = 0; c < w; c++, so += 4, di++) {
+                    out32[di] = (((mem[so + 3]! || 255) << 24) | (mem[so]! << 16) | (mem[so + 1]! << 8) | mem[so + 2]!) >>> 0;
+                }
+            }
+        }
+        return true;
+    }
+    if (bpp === 16) {
+        const lut = dib16Lut(dibColorMasks(16, obj.dibMasks));
+        for (let row = 0, di = 0; row < h; row++) {
+            let so = rowOf(row) + x * 2;
+            for (let c = 0; c < w; c++, so += 2, di++) out32[di] = lut[mem[so]! | (mem[so + 1]! << 8)]!;
+        }
+        return true;
+    }
+    const palette = obj.dibPalette;
+    if (!palette || palette.length === 0) return false;
+    for (let i = 0; i < 256; i++) {
+        const c = i < palette.length ? palette[i]! : 0xff000000;
+        dib8Lut[i] = ((c & 0xff000000) | ((c & 0xff) << 16) | (c & 0xff00) | ((c >>> 16) & 0xff)) >>> 0;
+    }
+    for (let row = 0, di = 0; row < h; row++) {
+        let so = rowOf(row) + x;
+        for (let c = 0; c < w; c++, so++, di++) out32[di] = dib8Lut[mem[so]!]!;
+    }
+    return true;
+}
+
 /**
  * Read a sub-rect of a DIBSection's guest bits as RGBA (blit-source liveness:
  * the app writes bits directly, so blits must see the CURRENT bytes, but only
@@ -162,6 +243,7 @@ export function resolveDibSectionRectRgba(
     ry: number,
     rw: number,
     rh: number,
+    reuse = false,
 ): { data: Uint8ClampedArray; x: number; y: number; width: number; height: number } | null {
     mem = toPlainGuestMemory(mem);
     const obj = unwrapBitmapObj(hBitmap);
@@ -171,7 +253,17 @@ export function resolveDibSectionRectRgba(
     const w = Math.min(rw | 0, bw - x), h = Math.min(rh | 0, bh - y);
     if (w <= 0 || h <= 0) return null;
     const bpp = obj.dibBpp ?? 32;
-    const out = new Uint8ClampedArray(w * h * 4);
+    // `reuse`: the caller consumes the pixels before the next call for this bitmap (a
+    // blit's putImageData), so the buffer is the bitmap's own and lives as long as it
+    // does — a renderer blitting its frame every tick allocates nothing per frame.
+    let out: Uint8ClampedArray;
+    if (reuse && obj.rectScratch?.length === w * h * 4) {
+        out = obj.rectScratch;
+    } else {
+        out = new Uint8ClampedArray(w * h * 4);
+        if (reuse) obj.rectScratch = out;
+    }
+    if (convertDibRectFast(obj, mem, out, x, y, w, h, bw, bh, bpp)) return { data: out, x, y, width: w, height: h };
     const palette = obj.dibPalette;
     const decoder16 = bpp === 16 ? new Dib16Decoder(dibColorMasks(16, obj.dibMasks)) : null;
     for (let row = 0; row < h; row++) {
