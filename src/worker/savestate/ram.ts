@@ -119,15 +119,15 @@ export async function captureRam(
     return { manifest: snap.manifest, stats: snap.stats };
 }
 
-async function readChunk(store: ChunkStore, hash: string, size: number): Promise<Uint8Array> {
+export async function readChunk(store: ChunkStore, hash: string, size: number, what = 'ram: chunk'): Promise<Uint8Array> {
     const file = await store.get(hash);
-    if (!file) throw new Error(`ram: chunk ${hash} is missing`);
+    if (!file) throw new Error(`${what} ${hash} is missing`);
     let bytes: Uint8Array;
     if (file[0] === CODEC_RAW && file.byteLength === size + 1) bytes = file.subarray(1);
     else if (file[0] === CODEC_DEFLATE_RAW) {
-        try { bytes = await inflate(file.subarray(1), size); } catch { throw new Error(`ram: chunk ${hash} is corrupt`); }
-    } else throw new Error(`ram: chunk ${hash} is corrupt`);
-    if (bytes.byteLength !== size || await sha256Hex(bytes) !== hash) throw new Error(`ram: chunk ${hash} is corrupt`);
+        try { bytes = await inflate(file.subarray(1), size); } catch { throw new Error(`${what} ${hash} is corrupt`); }
+    } else throw new Error(`${what} ${hash} is corrupt`);
+    if (bytes.byteLength !== size || await sha256Hex(bytes) !== hash) throw new Error(`${what} ${hash} is corrupt`);
     return bytes;
 }
 

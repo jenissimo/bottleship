@@ -10,6 +10,7 @@ export interface CpuOverride {
 
 export interface CaptureContext {
     ref(obj: unknown, where: string): number;
+    blob(bytes: Uint8Array): string;
     patchRam(address: number, bytes: readonly number[]): void;
     overrideCpu(regs: CpuOverride): void;
     cpuOverride(): CpuOverride | null;
@@ -17,6 +18,7 @@ export interface CaptureContext {
 
 export interface RestoreContext {
     object(ref: number): unknown;
+    blob(hash: string): Uint8Array;
 }
 
 export type FieldPolicy = 'save' | 'derive' | 'host' | 'transient';
