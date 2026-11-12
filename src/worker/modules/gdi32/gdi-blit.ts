@@ -46,11 +46,30 @@ function syncDibSourceDc(
     const hBmp = srcState?.hBitmap;
     if (!hBmp || hBmp === DEFAULT_BITMAP_HANDLE || !srcCtx) return;
     const mem = System.getInstance().process?.getCurrentMemory?.();
-    if (!mem) return;
-    const fresh = resolveDibSectionRectRgba(hBmp, mem, xSrc, ySrc, width, height);
-    if (!fresh) return;
-    srcCtx.putImageData(new (ImageData as any)(fresh.data, fresh.width, fresh.height), fresh.x, fresh.y);
+    const fresh = mem ? resolveDibSectionRectRgba(hBmp, mem, xSrc, ySrc, width, height, true) : null;
+    if (!fresh) {
+        // Nothing was converted (a mirrored blit, a rectangle off the bitmap): a canvas
+        // still waiting for its deferred mirror gets it now, as a plain lookup would.
+        if (gdi.isDibSectionDeferred(hdcSrc)) gdi.contexts.get(hdcSrc);
+        return;
+    }
+    srcCtx.putImageData(rectImage(fresh.data, fresh.width, fresh.height), fresh.x, fresh.y);
     gdi.invalidateImageDataCache(hdcSrc);
+    if (fresh.x === 0 && fresh.y === 0 && fresh.width === srcCtx.canvas.width && fresh.height === srcCtx.canvas.height) {
+        gdi.dibSectionCanvasCurrent(hdcSrc);
+    }
+}
+
+// @transient(ImageData wrappers of the per-bitmap conversion buffers; keyed weakly, so one dies with its buffer)
+const rectImages = new WeakMap<Uint8ClampedArray, { image: ImageData; width: number }>();
+
+/** The ImageData over a reused conversion buffer; one per buffer, not one per blit. */
+function rectImage(data: Uint8ClampedArray, width: number, height: number): ImageData {
+    const cached = rectImages.get(data);
+    if (cached && cached.width === width) return cached.image;
+    const image = new (ImageData as any)(data, width, height) as ImageData;
+    rectImages.set(data, { image, width });
+    return image;
 }
 
 /** DC color CSS → [r,g,b] via the shared parser (COLORREF is 0x00BBGGRR). */
@@ -218,7 +237,10 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
                        rop !== PATCOPY && rop !== PATINVERT && rop !== DSTINVERT;
 
     const destCtx = gdi.contexts.get(hdcDest);
-    const srcCtx = gdi.contexts.get(hdcSrc);
+    // A source DC whose DIB section is still deferred stays deferred: every path below
+    // reads only the source rectangle, which syncDibSourceDc converts from the guest
+    // bits. Looking the canvas up the usual way would convert the whole section first.
+    const srcCtx = needsSource && hdcSrc !== hdcDest ? gdi.peekContext(hdcSrc) : gdi.contexts.get(hdcSrc);
 
     // Validate HDCs - source is only required for ROPs that use it
     if (!destCtx || (needsSource && !srcCtx)) {
