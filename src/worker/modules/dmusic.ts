@@ -513,7 +513,10 @@ export class DMusic implements IModule {
 
     private holdReferences(obj: LoadableObject): void {
         if (!obj.onDestroy) {
-            obj.onDestroy = () => { for (const target of obj.references.splice(0)) target.release(); };
+            obj.onDestroy = () => {
+                for (const target of obj.references.splice(0)) target.release();
+                obj.resolved = [];
+            };
         }
     }
 
@@ -531,8 +534,10 @@ export class DMusic implements IModule {
         const collections = yield* this.resolveReferences(stream, plan.collections, IID_IDirectMusicCollection, obj);
         const found: FoundReference = (ref) => styles.get(ref) ?? collections.get(ref) ?? null;
         const partial = plan.build(found);
-        obj.resolved = [...plan.styles, ...plan.collections].map(found);
-        if (savestatesEnabled()) obj.source = { bytes };
+        if (savestatesEnabled()) {
+            obj.resolved = [...plan.styles, ...plan.collections].map(found);
+            obj.source = { bytes };
+        }
         obj.loaded = true;
         Logger.log(LogCategory.COM,
             `[DMusic] loaded ${obj.constructor.name} "${obj.identity.name || obj.fileName}" (${bytes.length} bytes)${partial ? " — partial" : ""}`);
@@ -657,7 +662,7 @@ export class DMusic implements IModule {
 
     private makeFrom(origin: LoadableObject, made: MadeSource): LoadableObject | null {
         const obj = this.buildMade(origin, made);
-        return obj && this.madeBy(obj, origin, made);
+        return obj && savestatesEnabled() ? this.madeBy(obj, origin, made) : obj;
     }
 
     private rebuildMade(obj: LoadableObject, origin: DMusicObject | null, made: MadeSource): boolean {
@@ -788,7 +793,7 @@ export class DMusic implements IModule {
             adoptCollection: (obj) => { if (obj.collection) this.collectionObjects.set(obj.collection, obj); },
             collectionObject: (collection) => {
                 const obj = this.collectionObjects.get(collection);
-                return obj?.collection === collection ? obj : null;
+                return obj && obj.collection === collection && obj.refCount > 0 ? obj : null;
             },
             wirePerformance: (perf) => this.wirePerformance(perf),
             wirePort: (port) => this.wirePort(port),
@@ -941,7 +946,7 @@ export class DMusic implements IModule {
         obj.fileName = fileName;
         obj.segment = buildSegment(file, () => null, (ref) => ref.objectId === GUID_DefaultGMCollection ? gm.collection : null);
         obj.tracks = file.tracks.map((t) => ({ classId: t.classId, group: t.group, object: null }));
-        obj.resolved = [gm];
+        if (into || savestatesEnabled()) obj.resolved = [gm];
         obj.loaded = true;
         return obj;
     }
@@ -1093,6 +1098,7 @@ export class DMusic implements IModule {
 
     private newEngine(perf: PerformanceObject, port: PortObject): Performance {
         const engine = new Performance(port.synth);
+        if (savestatesEnabled()) engine.seedRandom(Math.random() * 0x100000000);
         engine.onNotification = (type, state, time) => this.notify(perf, type, state, time);
         return engine;
     }
@@ -1661,8 +1667,10 @@ export class DMusic implements IModule {
                 const time = a[4]! | 0;
                 const edit: [number, number, number] = [bytes[0]!, bytes[1]!, bytes[2]!];
                 if (!obj.segment.setCommand(time, ...edit)) return DMUS_E_TRACK_NOT_FOUND;
-                obj.commandEdits.delete(time);
-                obj.commandEdits.set(time, edit);
+                if (savestatesEnabled()) {
+                    obj.commandEdits.delete(time);
+                    obj.commandEdits.set(time, edit);
+                }
                 return S_OK;
             }
             // Bands hold their instruments already; downloading them to the port is nothing more.
@@ -1908,25 +1916,28 @@ export class DMusic implements IModule {
             const fromState = perf.engine.primaryState();
             const from = fromState ? perf.stateObjects.get(fromState)?.segment ?? null : null;
             const result = perf.engine.autoTransition(to?.segment ?? null, a[3]! & 0xffff, a[4]! >>> 0);
+            const saving = savestatesEnabled();
             if (result.transition && result.transitionState) {
-                const transition = this.wrapSegment(result.transition, "Transition")!;
+                // The transition segment is a COM object only for a caller that takes it.
+                const transition = ppTransSeg || saving ? this.wrapSegment(result.transition, "Transition") : null;
                 const style = result.transition.styles[0]!.style;
                 const index = from?.segment?.fixedPattern?.style === style ? FIXED_STYLE
                     : from?.segment?.styles.findIndex((item) => item.style === style) ?? -1;
-                if (from && from.segment === fromState?.segment && index !== -1) {
+                if (saving && transition && from && from.segment === fromState?.segment && index !== -1) {
                     const command = result.transition.commands![0]!;
                     this.madeBy(transition, from, {
                         made: "transition", style: index, tempo: result.transition.tempos[0]!.tempo, command: command.command,
                         grooveLevel: command.grooveLevel,
                     });
                 }
-                this.holdStateSegment(this.stateObject(perf, result.transitionState), transition);
-                if (ppTransSeg) this.publish(transition, ppTransSeg);
-                else transition.release();
+                if (saving && transition) this.holdStateSegment(this.stateObject(perf, result.transitionState), transition);
+                if (transition && ppTransSeg) this.publish(transition, ppTransSeg);
+                else transition?.release();
                 this.publishState(perf, result.transitionState, transition, ppTransState);
             }
-            if (result.toState && to) this.holdStateSegment(this.stateObject(perf, result.toState), to);
+            if (saving && result.toState && to) this.holdStateSegment(this.stateObject(perf, result.toState), to);
             this.publishState(perf, result.toState, to, ppToState);
+            if (saving) this.releaseEndedStates(perf);
             return S_OK;
         };
     }

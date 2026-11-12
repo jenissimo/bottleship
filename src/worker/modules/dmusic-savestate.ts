@@ -1,11 +1,12 @@
 import type { DlsCollection } from "@bottleship/formats/dmusic/dls";
 import type { ObjectIdentity } from "@bottleship/formats/dmusic/reference";
 import {
-    capturePerfSegmentState, linkPerfSegmentState, type Performance, type PerformanceData, type PerfSegmentState, type PerfSegmentStateData,
+    capturePerfSegmentState, linkPerfSegmentState, type Performance, PerfStateError, type PerformanceData, type PerfSegmentState, type PerfSegmentStateData,
     restorePerfSegmentState,
 } from "../core/audio/directmusic/performance";
 import { DlsSynth, SYNTH_STATE_KEYS, type SynthData } from "../core/audio/directmusic/synth";
 import { BaseComObject, type ComBaseState } from "../core/com/base-com-object";
+import { Logger, LogCategory } from "../core/logger";
 import { CaptureRefusal, objectCodecs } from "../savestate/object-codecs";
 import { savestateParticipants, stateKeys, type FieldPolicy, type RestoreContext } from "../savestate/participant";
 import { sha256HexSync } from "../savestate/sha256";
@@ -305,7 +306,7 @@ function named<T>(run: () => T): T {
     try {
         return run();
     } catch (e) {
-        throw e instanceof CaptureRefusal ? e : new CaptureRefusal(`dmusic: ${e instanceof Error ? e.message : String(e)}`);
+        throw e instanceof PerfStateError ? new CaptureRefusal(`dmusic: ${e.message}`) : e;
     }
 }
 
@@ -417,12 +418,17 @@ export function registerDMusicCodecs(host: DMusicHost): void {
     objectCodecs.add<PortObject>({
         tag: 'dmusic-port',
         matches: (o): o is PortObject => o instanceof PortObject,
-        capture: (o, ref): SavedPort => ({
-            ...base(o), sampleRate: o.sampleRate, audioChannels: o.audioChannels, voices: o.voices, channelGroups: o.channelGroups,
-            directSound: o.directSound, buffer: o.buffer, ownsBuffer: o.ownsBuffer, active: o.active,
-            owner: optional(o.owner, ref, 'DirectMusic'), performance: optional(o.performance, ref, 'performance'),
-            synth: o.synth.captureState(collectionRef(ref)), sink: o.sink?.captureState() ?? null,
-        }),
+        capture: (o, ref): SavedPort => {
+            const synth = o.synth.captureState(collectionRef(ref));
+            const unsaved = o.synth.activeVoiceCount - synth.voices.length;
+            if (unsaved > 0) Logger.warn(LogCategory.COM, `[DMusic] savestate: ${unsaved} sounding voice(s) have no instrument to name and are not saved`);
+            return {
+                ...base(o), sampleRate: o.sampleRate, audioChannels: o.audioChannels, voices: o.voices, channelGroups: o.channelGroups,
+                directSound: o.directSound, buffer: o.buffer, ownsBuffer: o.ownsBuffer, active: o.active,
+                owner: optional(o.owner, ref, 'DirectMusic'), performance: optional(o.performance, ref, 'performance'),
+                synth, sink: o.sink?.captureState() ?? null,
+            };
+        },
         restore: (d: SavedPort) => {
             const port = rebuild(() => new PortObject(), d);
             port.sampleRate = d.sampleRate;
@@ -444,7 +450,8 @@ export function registerDMusicCodecs(host: DMusicHost): void {
         link: (port, d: SavedPort, ctx) => {
             port.owner = d.owner === NONE ? null : ctx.object(d.owner) as DirectMusicObject;
             port.performance = d.performance === NONE ? null : ctx.object(d.performance) as PerformanceObject;
-            port.synth.restoreState(d.synth, collectionOf(ctx));
+            const dropped = port.synth.restoreState(d.synth, collectionOf(ctx));
+            if (dropped > 0) Logger.warn(LogCategory.COM, `[DMusic] savestate: ${dropped} saved voice(s) dropped, their instrument is not ready`);
         },
     });
     objectCodecs.add<SegmentStateObject>({

@@ -237,6 +237,8 @@ export interface PerfSegmentStateData {
 const NONE = -1;
 const FIXED = -2;
 
+export class PerfStateError extends Error {}
+
 function partState(ref: PartRef, part: StylePart, variation: number): PartState {
     return {
         ref, part, variation,
@@ -253,7 +255,7 @@ export function capturePerfSegmentState(
         : s.segment.styles.findIndex((item) => item.style === s.patternStyle);
     const pattern = !s.pattern ? NONE : s.pattern === fixed?.pattern ? FIXED : s.patternStyle?.patterns.indexOf(s.pattern) ?? NONE;
     if ((s.patternStyle && patternStyle === NONE) || (s.pattern && pattern === NONE)) {
-        throw new Error("directmusic: a playing pattern is not part of its segment");
+        throw new PerfStateError("directmusic: a playing pattern is not part of its segment");
     }
     return {
         primary: s.primary, startTime: s.startTime, base: s.base, repeatsLeft: s.repeatsLeft, started: s.started, ended: s.ended,
@@ -326,13 +328,8 @@ interface PendingEvent {
 export class Performance {
     readonly synth: DlsSynth;
     /** Random source; replaceable so a test can make pattern and variation choices repeatable. */
-    random: () => number = () => {
-        let t = this.randomState = (this.randomState + 0x6d2b79f5) >>> 0;
-        t = Math.imul(t ^ (t >>> 15), t | 1);
-        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-        return ((t ^ (t >>> 14)) >>> 0) / 0x100000000;
-    };
-    randomState = (Math.random() * 0x100000000) >>> 0;
+    random: () => number = Math.random;
+    randomState = 0;
     /** Segment notifications: (DMUS_NOTIFICATION_SEG*, state, music time it happens at). */
     onNotification: ((type: number, state: PerfSegmentState, time: number) => void) | null = null;
     /** Instruments a band takes from the default (GM) collection resolve here. */
@@ -351,6 +348,16 @@ export class Performance {
         this.synth = synth;
     }
 
+    seedRandom(seed: number): void {
+        this.randomState = seed >>> 0;
+        this.random = () => {
+            let t = this.randomState = (this.randomState + 0x6d2b79f5) >>> 0;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 0x100000000;
+        };
+    }
+
     captureState(stateRef: (state: PerfSegmentState) => number, collectionRef: (collection: DlsCollection | null) => number): PerformanceData {
         return {
             now: this.now, tempo: this.tempo, masterTempo: this.masterTempo, randomState: this.randomState,
@@ -366,7 +373,7 @@ export class Performance {
         this.now = d.now;
         this.tempo = d.tempo;
         this.masterTempo = d.masterTempo;
-        this.randomState = d.randomState;
+        this.seedRandom(d.randomState);
         this.states = d.states.map(stateOf);
         this.events = d.events.map(([time, kind, channel, a, b, owner]) => (
             { time, kind: kind as PendingEvent["kind"], channel, a, b, owner: owner === NONE ? null : stateOf(owner) }));
@@ -436,7 +443,8 @@ export class Performance {
         const state = new PerfSegmentState(segment, !secondary, start);
         if (!secondary) {
             // A primary segment not yet started is superseded by this one.
-            this.states = this.states.filter((s) => !(s.primary && !s.started));
+            for (const s of this.states) if (s.primary && !s.started) this.finish(s, DMUS_NOTIFICATION_SEGABORT, this.now);
+            this.states = this.states.filter((s) => !s.ended);
         }
         this.states.push(state);
         return state;
@@ -451,7 +459,7 @@ export class Performance {
         for (const s of this.states) {
             if (s.ended) continue;
             if (state ? s !== state : segment ? s.segment !== segment : false) continue;
-            s.queued = null;
+            this.dropQueued(s, this.now);
             if (at <= this.now || !s.started) this.finish(s, DMUS_NOTIFICATION_SEGABORT, Math.max(this.now, s.startTime));
             else s.stopAt = at;
         }
@@ -630,7 +638,6 @@ export class Performance {
         if (s.primary) {
             for (const other of this.states) {
                 if (other !== s && other.primary && other.started && !other.ended) {
-                    other.queued = null;
                     this.finish(other, DMUS_NOTIFICATION_SEGABORT, s.startTime);
                 }
             }
@@ -647,11 +654,19 @@ export class Performance {
         for (const e of this.events) if (e.owner === s && e.kind === "off" && e.time > at) e.time = at;
         if (s.started) this.onNotification?.(notification, s, at);
         const next = s.queued;
-        s.queued = null;
         if (next && notification === DMUS_NOTIFICATION_SEGEND) {
+            s.queued = null;
             next.startTime = at;
             this.states.push(next);
+        } else {
+            this.dropQueued(s, at);
         }
+    }
+
+    private dropQueued(s: PerfSegmentState, at: number): void {
+        const next = s.queued;
+        s.queued = null;
+        if (next && next !== s) this.finish(next, DMUS_NOTIFICATION_SEGABORT, at);
     }
 
     /**

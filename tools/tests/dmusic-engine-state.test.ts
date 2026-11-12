@@ -146,7 +146,7 @@ function playing(): { a: Rig; segments: PerfSegment[]; collections: DlsCollectio
     const w = world();
     const segments = [w.song, w.next, w.wave, w.sting], collections = [w.dls];
     const a = new Rig(segments, collections);
-    a.perf.randomState = SEED;
+    a.perf.seedRandom(SEED);
     a.perf.playSegment(w.song, 0);
     a.perf.playSegment(w.wave, DMUS_SEGF_SECONDARY);
     a.run(20000);

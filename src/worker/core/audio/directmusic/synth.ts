@@ -324,7 +324,7 @@ export class DlsSynth {
         };
     }
 
-    restoreState(d: SynthData, collectionOf: (ref: number) => DlsCollection | null): void {
+    restoreState(d: SynthData, collectionOf: (ref: number) => DlsCollection | null): number {
         this.masterGain = d.masterGain;
         this.noteCounter = d.noteCounter;
         [this.stats.notes, this.stats.noInstrument, this.stats.noRegion] = d.stats;
@@ -337,6 +337,7 @@ export class DlsSynth {
             ch.update();
         }
         for (const v of this.voices) v.active = false;
+        let dropped = 0;
         for (const saved of d.voices) {
             const v = this.voices[saved.slot];
             const collection = collectionOf(saved.collection);
@@ -344,7 +345,10 @@ export class DlsSynth {
             const inst = collection ? findInstrument(collection, patch) : null;
             const wanted = inst?.regions[saved.region];
             const region = collection && inst && wanted ? prepareInstrument(collection, inst).regions.find((r) => r.region === wanted) : undefined;
-            if (!v || !region) continue;
+            if (!v || !region) {
+                dropped++;
+                continue;
+            }
             VOICE_VALUES.forEach((key, i) => { v[key] = saved.values[i]!; });
             VOICE_FLAGS.forEach((key, i) => { v[key] = saved.flags[i]!; });
             v.channel = this.channel(v.channelId);
@@ -352,6 +356,7 @@ export class DlsSynth {
             v.region = region;
             v.active = true;
         }
+        return dropped;
     }
 
     /** Master volume in hundredths of a decibel, as GUID_PerfMasterVolume gives it. */

@@ -474,7 +474,10 @@ describe("dmusic with music playing", () => {
         expect(snap.section.messages).toHaveLength(1);
         expect(snap.section.messages[0]![0]).toBe(s.message);
         expect(snap.section.pathOutputs).toHaveLength(1);
+        const before = { heap: nextHeap, com: nextCom, buffers: sound.buffers.size, next: sound.next, guest: mem.slice() };
         const back = restore(snap);
+        expect({ heap: nextHeap, com: nextCom, buffers: sound.buffers.size, next: sound.next }).toEqual({ heap: before.heap, com: before.com, buffers: before.buffers, next: before.next });
+        expect(mem).toEqual(before.guest);
         expect(again(back)).toBe(first(snap));
         const perf2 = restoredOf(back, PerformanceObject), port2 = restoredOf(back, PortObject);
         const find = (live: DMusicObject): DMusicObject => restoredAt!.get(ptrOf(live)) as DMusicObject;
@@ -693,5 +696,122 @@ describe("dmusic refusals that remain", () => {
         expect(channel.collection).toBe(-1);
         const back = restore(snap);
         expect(restoredOf(back, PortObject).synth.activeVoiceCount).toBe(0);
+    });
+});
+
+describe("dmusic object lifetimes", () => {
+    const transitions = (perf: PerformanceObject, composer: ComposerObject, to: SegmentObject, count: number, gap: number): void => {
+        for (let i = 0; i < count; i++) {
+            expect(call("IDirectMusicComposer8_AutoTransition", [ptrOf(composer), ptrOf(perf), ptrOf(to), 2, 0x20, 0, 0, 0, 0])).toBe(0);
+            ticks(gap);
+        }
+    };
+    const segments = (): number => ours().filter(o => o instanceof SegmentObject).length;
+
+    for (const [gap, count] of [[0, 50], [30, 5]] as const) {
+        test(`without savestates, ${count} AutoTransitions ${gap} ticks apart with NULL outs leave no state object and no reference behind`, () => {
+            flags.__savestates = false;
+            const c = content();
+            const { perf } = audio();
+            const composer = make<ComposerObject>(CLSID_DirectMusicComposer);
+            play(perf, c.song, 0);
+            ticks(70);
+            const before = { song: c.song.refCount, other: c.other.refCount, segments: segments() };
+            expect(before).toMatchObject({ song: 2, other: 1 });
+            transitions(perf, composer, c.other, count, gap);
+            ticks(2000);
+            expect(perf.stateObjects.size).toBe(0);
+            expect({ song: c.song.refCount, other: c.other.refCount, segments: segments() }).toEqual(before);
+            expect(perf.engine!.primaryState()!.segment).toBe(c.other.segment!);
+        });
+
+        test(`with savestates, ${count} AutoTransitions ${gap} ticks apart keep only the playing state and its segment`, () => {
+            const c = content();
+            const { perf } = audio();
+            const composer = make<ComposerObject>(CLSID_DirectMusicComposer);
+            play(perf, c.song, 0);
+            ticks(70);
+            const before = { song: c.song.refCount, other: c.other.refCount, segments: segments() };
+            transitions(perf, composer, c.other, count, gap);
+            ticks(2000);
+            expect(perf.engine!.activeStates()).toHaveLength(1);
+            expect([...perf.stateObjects.keys()]).toEqual([perf.engine!.primaryState()!]);
+            expect({ song: c.song.refCount, other: c.other.refCount, segments: segments() }).toEqual({ ...before, other: before.other + 1 });
+            call("IDirectMusicPerformance8_Stop", [ptrOf(perf), 0, 0, 0, 0]);
+            expect(perf.stateObjects.size).toBe(0);
+            expect(c.other.refCount).toBe(before.other);
+        });
+    }
+
+    for (const saving of [false, true]) {
+        test(`fifty times over, what is made and released leaves counts as they were (savestates ${saving ? "on" : "off"})`, () => {
+            flags.__savestates = saving;
+            const c = content();
+            const { perf, port } = audio();
+            const composer = make<ComposerObject>(CLSID_DirectMusicComposer);
+            expect(call("IDirectMusicStyle8_GetDefaultBand", [ptrOf(c.race), OUT])).toBe(0);
+            const band = at<DMusicObject>(view().getUint32(OUT, true));
+            const counts = () => ({
+                objects: ours().length, kit: c.kit.refCount, race: c.race.refCount, song: c.song.refCount, other: c.other.refCount,
+                band: band.refCount, states: perf.stateObjects.size, playing: perf.engine!.activeStates().length,
+            });
+            const before = counts();
+            for (let i = 0; i < 50; i++) {
+                writeWide(NAME_AT, "Sting");
+                expect(call("IDirectMusicStyle8_GetMotif", [ptrOf(c.race), NAME_AT, OUT])).toBe(0);
+                const motif = at<SegmentObject>(view().getUint32(OUT, true));
+                expect(c.race.refCount).toBe(before.race + (saving ? 1 : 0));
+                motif.release();
+            }
+            expect(counts()).toEqual(before);
+            for (let i = 0; i < 50; i++) {
+                expect(call("IDirectMusicBand_CreateSegment", [ptrOf(band), OUT])).toBe(0);
+                at<SegmentObject>(view().getUint32(OUT, true)).release();
+                expect(call("IDirectMusicStyle8_GetDefaultBand", [ptrOf(c.race), OUT])).toBe(0);
+                at<DMusicObject>(view().getUint32(OUT, true)).release();
+            }
+            expect(counts()).toEqual(before);
+            for (let i = 0; i < 50; i++) {
+                play(perf, c.song, 0).release();
+                ticks(3);
+                expect(call("IDirectMusicPerformance8_Stop", [ptrOf(perf), 0, 0, 0, 0])).toBe(0);
+            }
+            expect(counts()).toEqual(before);
+            for (let i = 0; i < 50; i++) play(perf, i % 2 ? c.song : c.other, DMUS_SEGF_MEASURE).release();
+            ticks(400);
+            expect(counts()).toEqual({ ...before, objects: before.objects + 1, song: before.song + 1, states: 1, playing: 1 });
+            transitions(perf, composer, c.other, 50, 0);
+            ticks(600);
+            expect(counts()).toEqual({ ...before, objects: before.objects + (saving ? 1 : 0), other: before.other + (saving ? 1 : 0), states: saving ? 1 : 0, playing: 1 });
+            call("IDirectMusicPerformance8_Stop", [ptrOf(perf), 0, 0, 0, 0]);
+            ticks(3);
+            expect(counts()).toEqual(before);
+            expect(port.synth.stats.notes).toBeGreaterThan(0);
+        });
+    }
+
+    test("without savestates nothing is recorded: no source, no origin reference, no command log, and the host's random source", () => {
+        flags.__savestates = false;
+        const c = content();
+        const { perf } = audio();
+        expect([c.kit, c.race, c.song, c.effect, c.sting].map(o => o.source)).toEqual([null, null, null, null, null]);
+        expect(c.sting.references).toEqual([]);
+        mem.set(guidBytes("d2ac289d-b39b-11d1-8704-00600893b1bd"), GUID_AT);
+        mem.set([1, 40, 0], NAME_AT);
+        expect(call("IDirectMusicSegment8_SetParam", [ptrOf(c.song), GUID_AT, 1, 0, 0, NAME_AT])).toBe(0);
+        expect(c.song.commandEdits.size).toBe(0);
+        expect(perf.engine!.random).toBe(Math.random);
+        flags.__savestates = true;
+        expect(call("IDirectMusicSegment8_SetParam", [ptrOf(c.song), GUID_AT, 1, 0, 0, NAME_AT])).toBe(0);
+        expect(c.song.commandEdits.size).toBe(1);
+    });
+
+    test("a collection that was released is not named for an instrument still on a channel", () => {
+        const s = scene();
+        const refs = s.kit.refCount;
+        for (let i = 0; i < refs; i++) s.kit.release();
+        expect(s.kit.refCount).toBe(0);
+        const channel = of<SavedPort>(capture(ours().filter(o => o !== s.kit)), "dmusic-port").synth.channels.find(ch => ch.id === 7)!;
+        expect(channel.collection).toBe(-1);
     });
 });
