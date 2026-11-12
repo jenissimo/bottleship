@@ -1,7 +1,7 @@
 import { System } from '../core/system';
 import { Logger, LogCategory } from '../core/logger';
 import { OpfsChunkStore, sha256Hex } from './chunk-store';
-import { writeRamChunks } from './ram';
+import { inLanes, STORE_LANES, writeRamChunks } from './ram';
 import { captureSession, checkSavestate, coverageRefusal, restoreSession, RestoreFailed, type SavestateTarget } from './session';
 import { CaptureRefusal } from './object-codecs';
 import type { ChunkStore } from './chunk-store';
@@ -272,10 +272,12 @@ export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, p
             safe.release();
         }
         const t1 = performance.now();
-        await writeRamChunks(result.pending, store.chunkStore);
+        const sizes = await writeRamChunks(result.pending, store.chunkStore);
+        const unsized = [...new Set([...result.manifest.chunks.map(([, hash]) => hash), ...result.blobs.map(([hash]) => hash)])].filter(hash => !sizes.has(hash));
+        await inLanes(unsized, 4 * STORE_LANES, async (hash) => { sizes.set(hash, await store.chunkStore.size(hash)); });
         let chunkBytes = 0;
-        for (const [, hash] of result.manifest.chunks) chunkBytes += await store.chunkStore.size(hash);
-        for (const [hash] of result.blobs) chunkBytes += await store.chunkStore.size(hash);
+        for (const [, hash] of result.manifest.chunks) chunkBytes += sizes.get(hash) ?? 0;
+        for (const [hash] of result.blobs) chunkBytes += sizes.get(hash) ?? 0;
         await store.save(name, result.bytes, chunkBytes);
         const t2 = performance.now();
         return {

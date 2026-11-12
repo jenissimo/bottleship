@@ -100,15 +100,34 @@ export function snapshotRam(mem: Uint8Array, known: ReadonlySet<string>, patches
     return { manifest, pending, stats };
 }
 
-export async function writeRamChunks(pending: Map<string, Uint8Array>, store: ChunkStore, compress = true): Promise<void> {
-    for (const [hash, bytes] of pending) {
+export const STORE_LANES = 16;
+
+export async function inLanes<T>(items: readonly T[], lanes: number, run: (item: T) => Promise<void>): Promise<void> {
+    let next = 0;
+    let failed: unknown;
+    let stop = false;
+    const lane = async (): Promise<void> => {
+        while (!stop && next < items.length) {
+            const item = items[next++]!;
+            try { await run(item); } catch (e) { if (!stop) { stop = true; failed = e; } }
+        }
+    };
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(lanes, items.length)) }, lane));
+    if (stop) throw failed;
+}
+
+export async function writeRamChunks(pending: Map<string, Uint8Array>, store: ChunkStore, compress = true): Promise<Map<string, number>> {
+    const sizes = new Map<string, number>();
+    await inLanes([...pending], STORE_LANES, async ([hash, bytes]) => {
         const body = compress ? await deflate(bytes) : bytes;
         const file = new Uint8Array(body.byteLength + 1);
         file[0] = compress ? CODEC_DEFLATE_RAW : CODEC_RAW;
         file.set(body, 1);
         await store.put(hash, file);
+        sizes.set(hash, file.byteLength);
         pending.delete(hash);
-    }
+    });
+    return sizes;
 }
 
 export async function captureRam(
