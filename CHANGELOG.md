@@ -1,5 +1,170 @@
 # Changelog
 
+## 0.8 — 2026-11-12
+
+This release covers changes merged since 0.7 on October 8, 2026. The compatibility list
+grows from 53 to 85 entries, including Half-Life 2, Red Alert 3, Deus Ex, Unreal Tournament
+GOTY, Empire Earth and GTA 1/2. LAN multiplayer arrives for Winsock and DirectPlay 1–4/8
+games through a self-hosted relay. The savestate foundation covers every major module,
+behind a developer flag. Other additions are a General MIDI synthesizer and performance
+work on Direct3D 9 and GDI. The public demo catalog now contains 48 entries.
+
+Read the [0.8 release notes](docs/releases/0.8.md) for the newly compatible games,
+multiplayer coverage and limitations, contributors and what comes next. The dated entries
+below summarize the changes by theme.
+
+### Newly compatible games
+
+- Maintainer-confirmed: Half-Life 2 (20th Anniversary), Command & Conquer: Red Alert 3,
+  Deus Ex: GOTY, Sid Meier's Pirates! (2004), The Longest Journey, Empires: Dawn of the
+  Modern World (GOG; boots, random map reaches gameplay), Neighbours from Hell (Russian
+  Buka disc), Heroes of Might and Magic II Gold (GOG), Grand Theft Auto (1997) and Grand
+  Theft Auto 2 (Rockstar Classics freeware), Unreal Tournament GOTY (v432).
+- Contributor bring-ups: Empire Earth 2.00 and The Art of Conquest 1.00 (single player),
+  Star Wars Episode I: Battle for Naboo, Shrek 2, Colin McRae Rally 2.0, RollerCoaster
+  Tycoon Deluxe, Safari Biathlon, Command & Conquer and Red Alert (Win95 editions), Heart
+  of Empty, Bigfoot 4x4 Challenge, Stabilo Boss Mania, Amore, Beavis and Butt-Head in
+  Hock-A-Loogie, and the freeware T-32K, I'm OK, Zep's Dreamland and Echoes.
+- Booting, not yet playable end to end: Diner Dash, Gravity Bone. The full Midtown
+  Madness 2 runtime is imported; its gameplay is unverified.
+
+See [compatibility](docs/compatibility.md) for the observed stage of each title.
+
+### Multiplayer
+
+- Virtual LAN over the `bottleship-lan` relay (`packages/lan-rust`): **Settings → Network**,
+  room names and invite links. Each player gets a stable virtual IPv4/IPX address. Default
+  addresses share one /16.
+- Winsock (`wsock32`, `ws2_32`): TCP and UDP over IPv4/IPv6, broadcast, IPv4 multicast and
+  IPX datagrams.
+- DirectPlay 1–4 (`dplayx`) and DirectPlay 8 (`dpnet`) between BottleShip players:
+  enumeration, host/join, players, groups, chat, messages and lobbies. An optional server
+  gateway connects to real Windows DirectPlay 8 games.
+- Played or checked: Heroes III, Worms Armageddon, Quake II, Serious Sam, Re-Volt,
+  Cossacks, GTA 1 (two-tab DirectPlay match), GTA 2 (Manager with lobby chat), Unreal
+  Tournament GOTY (listen server and client) and Empire Earth's LAN lobby.
+- Not yet: a public relay server (run your own; see [multiplayer](docs/multiplayer.md)),
+  online services and master servers, joining real Windows DirectPlay 4 games, secure
+  sessions, NAT traversal, SPX, and reconnecting in place.
+- Multiplayer is new and lightly tested so far; LAN testing and reports are welcome.
+- The next minor release completes multiplayer with a deployed demo server.
+
+## 2026-11-09 – 2026-11-12
+
+- Savestates: participants for msvcrt, ole32 (including module loads that COM holds),
+  oleaut32, dbghelp, comctl32, comdlg32, version, smackw32, binkw32, mss32, msacm32,
+  DirectMusic (objects saved as their source, playback continues after a load), winmm
+  (open waveOut devices, PlaySound), Winsock and DirectPlay (idle state). DDE
+  conversations, open FindFirstFile handles and DLLs loaded at run time are now saved.
+  Keys and mouse buttons held at capture are released after a load. Anything that cannot
+  be saved refuses the save by name. The bundle content hash ignores compressed sizes.
+- Direct3D 9: SetStreamSource, SetIndices and SetStreamSourceFreq ride the write ring.
+  Large buffers are enqueued without a copy, and guest vertex/index storage is 16-byte
+  aligned. Getters and MultiplyTransform have fast paths. Fixed MultiplyTransform order and
+  pre-transformed draws in sub-viewports. D3DX9 CommitChanges sends only written
+  parameters. Fixed effect pools, member writes and volume DDS uploads.
+- Half-Life 2's 3D menu frame time drops from about 128 to 88 ms. The changes are shared
+  HLE boundary and GPU-process work. JIT-compiled stores into their own code page now exit
+  and replay in the interpreter.
+- GDI: a DIB section blitted to a window is converted once. TextOut and DrawText draw over
+  a DIB section's current bits. Fixed baseline alignment, text metrics, counted strings,
+  SetPixel and CreateDIBitmap.
+- USER32 and input: GetInputState, IsCharAlpha and its relatives, and typed characters
+  from the host keyboard layout. Right-hand modifier keys are separate keys. A pointer the
+  guest keeps warping back is hidden. The app deactivates when its last active window
+  goes away (Neverwinter Nights, #234). Subclassed combobox drop-downs paint at once.
+- Audio: band-limited resampling for low-rate sources (NFS Porsche menu music). Fixed
+  DirectSound refills across the play cursor, device release, SetFrequency original rate,
+  stopped-buffer status and LOCSOFTWARE, plus the cursor step cap (HP1). OpenAL ALC 1.1
+  queries. A guest pause silences audio.
+- kernel32: fibers with guarded pooled stacks, GetPrivateProfileSection with BOM
+  profiles, VirtualAlloc over a live heap block, GetShortPathNameW, external manifests and
+  DLL_PROCESS_DETACH. Version-like DLL names (`lua5.1`) load correctly. `_close` reports
+  failures as the CRT does.
+- DirectDraw/D3D7: depth-only Clear and late readbacks no longer overwrite newer pixels.
+  Clear with a NULL rect array clears the viewport. 8-bit modes are offered at every
+  16-bit size. Blt and pixel-format validation are cheaper. OpenGL: a first-time current
+  context takes its drawable's viewport.
+- VFS path classification and normalization are memoized. `_finite`/`_isnan` bind to
+  native micro-thunks. The libgcc SjLj frame registration uses the TEB TLS slot directly.
+- Tools: `bench-v86` function-tier ceiling probes, and a recorded negative result for AOT
+  stack-load forwarding. The harness reads DirectDraw textures by guest handle.
+
+## 2026-11-04 – 2026-11-08
+
+- Savestates (issue #66): a session-state registry with a census, timer and wait
+  completions as data, and named readiness blockers. Also a RAM chunk store and container
+  format, core and kernel32 participants with field policies, and loading into a fresh
+  worker at entry. Slots and save/load verbs sit behind a developer flag. Participants
+  for user32/gdi32, ddraw, winmm, dsound, dinput and DirectMusic follow. A restore must
+  load the same modules.
+- Multiplayer fixes for GTA 1/2: USER timers in modal dialogs, DirectPlay name
+  termination, lobby chat, empty class names and combobox heights. Also a `dplayState`
+  harness verb. Winsock's default blocking hook reuses the session's USER32 exports.
+  Multiplayer citations were rebased on public protocol specifications.
+- Bring-ups: GTA 1 and GTA 2, Unreal Tournament GOTY, Heroes II Gold (WinG over GDI, CD
+  audio TOC), RollerCoaster Tycoon Deluxe, and contributor freeware and late-90s titles.
+- Fixes: Deus Ex first run (modal dialog pump on its own thread), Alice Greenfingers
+  (inherited handles), Blade of Darkness (fixed-address VirtualAlloc), Racer cutscene
+  audio, Max Payne intro (MPEG program streams, video plane above GDI), Quake II sound
+  latency, HP Chamber of Secrets startup race and voice-over, Half-Life Day One New Game
+  (DDSD_PITCH), The Longest Journey (TransformVertices, `fscanf`), Empires (one CRT per
+  process, `_ismbcalpha`, `_mbs*` fast paths) and Cossacks GOG Video Player.
+- MIDI: SoundFont 2/3 banks as DLS collections, a General MIDI synth behind `midiOut`, the
+  MCI sequencer, and the default DirectMusic GM collection from that bank. DirectMusic
+  loads Standard MIDI Files and WAVE files as segments.
+- USER32: window state and message fixes, DDE connections, accelerators, CreateIcon and
+  cursors from resources, WM_SIZE/WM_MOVE on first show and WM_ENABLE. Posted messages are
+  delivered before hardware input.
+- kernel32: WinExec over CreateProcess. CreateProcess resolves bare command lines, keeps
+  their spacing, carries STARTUPINFO and reports start errors. Atom tables are
+  reference-counted and indexed, and directory enumeration reports `.` and `..`. New fast
+  paths for GetCurrentThread, TlsSetValue and NtQueryInformationThread. Ordinal imports
+  resolve through the shipped DLL or get a trap stub.
+- DirectDraw: an Unlock merges into pending dirty regions, implicit primary presents latch
+  to the display refresh, and `dwBackBufferCount` is honored only with its flag. D3D9:
+  stencil needs STENCILENABLE, released textures live until submit, lockable back buffers
+  work, and the Firefox canvas is reconfigured. Display modes match on D3D8/9. GDI:
+  GetDIBits reads DIB sections of every depth. OpenGL: fog by eye-space distance.
+- Audio: Miles raw PCM sound images and AIL timers on the pump thread. DirectSound
+  primary buffers per device, Restore and GetCurrentPosition, and winmm timer periods and
+  waveOutReset. Pause intent survives automatic resumes.
+- Bundles and import: block-indexed DEFLATE WGB members that keep range streaming.
+  `make-wgb --copy` and `--sdb` VirtualRegistry shims. ZIP SFX and InstallShield 5 volumes,
+  Unreal `.uz`, `iso-to-wgb --raw` and `unshield-extract --install-layout`. Local disk
+  bundles use a metadata ETag, and dev disk bundles stream without an OPFS copy.
+- Mobile: iOS/iPadOS 27 defaults to the JIT without tail calls (#46). Guest RAM is zeroed
+  lazily and GPU rings start small. Movement keys are choosable, with per-orientation
+  phone layouts. The harness gains a remote bridge for iPhone Safari and a footprint verb.
+- The internal-resolution label shows the scale the backend renders at. A smoke
+  checklist was added for manual regression passes.
+
+## 2026-10-09 – 2026-11-02
+
+- Multiplayer: a virtual LAN stack with a bounded Rust relay, Winsock TCP/UDP, multicast
+  and IPX, and DirectPlay 4 and 8 sessions and lobbies. A native conformance suite
+  (`tools/lan-conformance`) and user and development guides are included.
+- Added Star Wars Episode I: Battle for Naboo, the Midtown Madness 2 trial, the Crimson
+  Skies trial and The Lord of the Rings: The Return of the King demo to the public catalog.
+  Empire Earth and The Art of Conquest work in single player, and Shrek 2, Safari Biathlon,
+  Diner Dash and Neighbours from Hell were brought up. Half-Life 2, Red Alert 3, Deus Ex,
+  Pirates! and The Longest Journey were confirmed working.
+- DirectMusic segments, styles, bands and DLS collections render into DirectSound. MCIWnd
+  plays video in its window. D3D3/7 strided draws, IDirect3DDevice3::SetLightState,
+  DirectShow multimedia streaming and GDI write-back into 16/24-bit DIB sections were
+  added. Fonts install into the Windows Fonts folder at boot.
+- D3D8: fixed-function vertex lighting with pixel shaders, CPU-written back buffers and
+  viewport/fog for pixel-shader draws. D3D7 state blocks record instead of applying zeros.
+  App-directory DLLs take precedence over HLE aliases.
+- Empires: resource loading and x87 precision fixes. Miles stream drain, resampling and
+  seek/loop blocks were fixed. Padded MPEG audio is recognized.
+- Import: Inno 5.1–5.2, InstallShield file-group destinations, Unicode RAR4 names and
+  RAR29 solid history, LZX cabinets, loose MSI media and nested ISO images. Installer file
+  times are kept with `make-wgb --file-times`.
+- The setup wizard adds *Language for non-Unicode programs*. New imports default to
+  1024 × 768, 32-bit color and 128 MB. The support menu is replaced by a GitHub contribution
+  button.
+
 ## 0.7 — 2026-10-08
 
 This release covers changes merged into `main` since October 5, 2026. Compatibility
