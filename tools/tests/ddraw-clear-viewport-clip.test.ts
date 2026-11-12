@@ -8,7 +8,7 @@ import { clipClearRectsToViewport } from "../../src/worker/backends/webgpu/ddraw
 import { DDrawWebGPUExecutor } from "../../src/worker/backends/webgpu/ddraw/ddraw-backend-executor";
 import { createDeviceExports } from "../../src/worker/modules/ddraw/d3d/device-impl";
 import { createViewportExports } from "../../src/worker/modules/ddraw/d3d/viewport-impl";
-import { D3DCLEAR_TARGET } from "../../src/worker/modules/ddraw/constants";
+import { D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER } from "../../src/worker/modules/ddraw/constants";
 
 const FULL = { x1: 0, y1: 0, x2: 640, y2: 480 };
 
@@ -110,6 +110,16 @@ describe("the D3D Clear entry points pass the viewport along with their rects", 
         const exports = createDeviceExports(context as never, {} as never, {} as never);
         exports["IDirect3DDevice7_Clear"]!(null as never, mem, [DEVICE, 1, RECTS, D3DCLEAR_TARGET, BLACK, 0, 0]);
         expect(calls).toEqual([{ viewport: { x: 0, y: 0, width: 640, height: 59 }, rects: [FULL] }]);
+    });
+
+    test("IDirect3DDevice7::Clear with a count but a NULL rect array clears the whole viewport", () => {
+        const full = { x: 0, y: 0, width: 640, height: 480, minZ: 0, maxZ: 1 };
+        const { context, calls, mem } = apiContext({
+            [DEVICE]: { getRenderTarget: () => RT, getViewportData: () => full }, [RT]: rtObject,
+        });
+        const exports = createDeviceExports(context as never, {} as never, {} as never);
+        exports["IDirect3DDevice7_Clear"]!(null as never, mem, [DEVICE, 1, 0, D3DCLEAR_ZBUFFER, 0, 0x3f800000, 0]);
+        expect(calls).toEqual([{ viewport: { x: 0, y: 0, width: 640, height: 480 }, rects: undefined }]);
     });
 
     test("IDirect3DViewport3::Clear", () => {

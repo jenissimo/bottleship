@@ -327,9 +327,12 @@ export const createDeviceExports = (
         const dvZ = new Float32Array(zBuf.buffer)[0];
         const validDepth = (typeof dvZ === "number" && !isNaN(dvZ) && isFinite(dvZ)) ? dvZ : 1.0;
 
+        // A count with a NULL rect array is the whole viewport, as it is for a count of 0
+        // (and as IDirect3DDevice9::Clear treats it). Reading the "rect" at guest address 0
+        // yields an empty one, and the clear would do nothing.
         let rects: Array<{ x1: number; y1: number; x2: number; y2: number }> | undefined;
         const n = Math.min(dwCount >>> 0, 256);
-        if (n > 0 && lpRects != null && lpRects >= 0 && lpRects + n * 16 <= mem.length) {
+        if (n > 0 && lpRects && lpRects >= 0 && lpRects + n * 16 <= mem.length) {
             rects = [];
             const view = getDataView(mem); // OPTIMIZED: Use cached DataView
             for (let i = 0; i < n; i++) {
