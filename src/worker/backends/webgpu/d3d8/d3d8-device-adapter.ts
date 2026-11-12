@@ -450,6 +450,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     private *ownedSurfaces(): Iterable<{ state: DirectDrawSurfaceState }> {
         yield { state: this.renderTarget };
         if (this.rtOverride) yield { state: this.rtOverride };
+        if (this.presentComposite) yield { state: this.presentComposite };
         for (const surf of this.texSurfaces.values()) yield { state: surf };
     }
 
@@ -2359,25 +2360,36 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         if (!region) return this.renderTarget;
         const plan = resolvePresentPlan(this.renderTarget.width, this.renderTarget.height, region, this.presentPlan);
         if (plan.identity) return this.renderTarget;
-        // Outside the destination rectangle the client area stays black. A fresh texture
-        // is black, so a rectangle that moves while leaving part of the area uncovered
-        // takes a fresh one instead of a clear every frame.
-        const d = plan.dst, k = this.presentCompositeDst;
-        const moved = !plan.covers && (k.left !== d.left || k.top !== d.top || k.right !== d.right || k.bottom !== d.bottom);
+        // `painted` is the part of the composite that holds a picture; all zero = black
+        // all over, which is also what a fresh texture is. Outside the destination
+        // rectangle the client area is black, so a rectangle that leaves another part
+        // painted than this frame covers takes one clear first.
+        const d = plan.dst, painted = this.presentCompositeDst;
         let composite = this.presentComposite;
-        if (!composite || moved || composite.width !== plan.clientWidth || composite.height !== plan.clientHeight) {
+        if (!composite || composite.width !== plan.clientWidth || composite.height !== plan.clientHeight) {
             this.dropPresentComposite();
             composite = this.presentComposite = createRenderTarget(plan.clientWidth, plan.clientHeight);
-            k.left = d.left; k.top = d.top; k.right = d.right; k.bottom = d.bottom;
+            painted.left = painted.top = painted.right = painted.bottom = 0;
         }
-        if (!plan.empty) {
-            // The copy samples the finished frame: batched draws and a deferred clear of
-            // the back buffer have to be in front of it, and neither is recorded yet.
-            this.renderer.flush();
-            this.renderer.blitWithShaderCopy(this.renderTarget, composite, plan.src, plan.dst);
-        } else {
+        const black = painted.right <= painted.left || painted.bottom <= painted.top;
+        if (plan.empty) {
+            // Also when the texture is gone (device loss): the clear brings it back.
+            if (!black || !composite.gpuTextureView) {
+                this.renderer.clear(composite, 1 /* D3DCLEAR_TARGET */, 0xff000000, 1.0);
+            }
+            painted.left = painted.top = painted.right = painted.bottom = 0;
+            return composite;
+        }
+        const same = painted.left === d.left && painted.top === d.top && painted.right === d.right && painted.bottom === d.bottom;
+        if (!plan.covers && !black && !same) {
             this.renderer.clear(composite, 1 /* D3DCLEAR_TARGET */, 0xff000000, 1.0);
         }
+        painted.left = d.left; painted.top = d.top; painted.right = d.right; painted.bottom = d.bottom;
+        // The copy samples the finished frame: batched draws and a deferred clear of the
+        // back buffer have to be in front of it, and neither is recorded yet. The same
+        // flush carries out the composite's own clear before the copy lands on it.
+        this.renderer.flush();
+        this.renderer.blitWithShaderCopy(this.renderTarget, composite, plan.src, plan.dst);
         return composite;
     }
 

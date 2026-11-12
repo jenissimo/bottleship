@@ -112,7 +112,14 @@ async function presentWith(regions: Array<PresentRegion | undefined>) {
         renderer: {
             syncSurfaceFromMemory: () => {},
             flush: () => events.push('flush'),
-            clear: () => events.push('clear'),
+            clear: (target: RenderSurface) => {
+                if (!target.gpuTextureView) {
+                    const name = `composite${++made}`;
+                    target.gpuTexture = { destroy: () => destroyed.push(name) } as unknown as GPUTexture;
+                    target.gpuTextureView = { name } as unknown as GPUTextureView;
+                }
+                events.push('clear');
+            },
             invalidateSurfaceCache: () => events.push('invalidate'),
             blitWithShaderCopy: (src: RenderSurface, dst: RenderSurface, s: object, d: object) => {
                 expect(src).toBe(back);
@@ -129,11 +136,19 @@ async function presentWith(regions: Array<PresentRegion | undefined>) {
             sampleFrameStats: () => {}, postSubmitCleanup: () => {},
         },
     }) as D3D8DeviceAdapter;
-    const system = spyOn(System, 'getInstance').mockReturnValue(fakeSystem as unknown as System);
-    try {
-        for (const r of regions) expect(await adapter.present(r)).toBe(0);
-    } finally { system.mockRestore(); }
-    return { events, shown, blits, destroyed, made: () => made, adapter };
+    const run = async (more: Array<PresentRegion | undefined>) => {
+        const system = spyOn(System, 'getInstance').mockReturnValue(fakeSystem as unknown as System);
+        try {
+            for (const r of more) expect(await adapter.present(r)).toBe(0);
+        } finally { system.mockRestore(); }
+    };
+    await run(regions);
+    return { events, shown, blits, destroyed, made: () => made, adapter, run };
+}
+
+async function presentAgain(r: Awaited<ReturnType<typeof presentWith>>, regions: Array<PresentRegion | undefined>) {
+    await r.run(regions);
+    return r;
 }
 
 describe('D3D8 Present with rectangles', () => {
@@ -168,12 +183,69 @@ describe('D3D8 Present with rectangles', () => {
         expect(r.shown.at(-1)).toEqual({ name: 'composite2', srcW: 1120, srcH: 800 });
     });
 
-    test('a destination rectangle that moves while leaving the area uncovered takes a fresh composite', async () => {
-        const a = region(null, rect(0, 0, 400, 300), 800, 600);
-        const b = region(null, rect(100, 100, 500, 400), 800, 600);
-        const r = await presentWith([a, a, b]);
-        expect(r.made()).toBe(2);
-        expect(r.destroyed).toEqual(['composite1']);
+    const frame = (events: string[], n: number) => {
+        const out: string[][] = [[]];
+        for (const e of events) { out.at(-1)!.push(e); if (e === 'submit') out.push([]); }
+        return out[n];
+    };
+    const sub = region(null, rect(0, 0, 400, 300), 800, 600);
+    const moved = region(null, rect(100, 100, 500, 400), 800, 600);
+    const full = region(rect(0, 0, 320, 240), rect(0, 0, 800, 600), 800, 600);
+    const none = region(rect(10, 10, 10, 50), null, 800, 600);
+
+    test('a destination rectangle that stays put on a fresh composite needs no clear', async () => {
+        const r = await presentWith([sub, sub, sub]);
+        expect(r.made()).toBe(1);
+        expect(r.events.includes('clear')).toBe(false);
+    });
+
+    test('a destination rectangle that moves clears the composite once and keeps its texture', async () => {
+        const r = await presentWith([sub, sub, moved, moved]);
+        expect(r.made()).toBe(1);
+        expect(r.destroyed).toEqual([]);
+        expect(frame(r.events, 1)).toEqual(['flush', 'blit', 'display', 'submit']);
+        expect(frame(r.events, 2)).toEqual(['clear', 'flush', 'blit', 'display', 'submit']);
+        expect(frame(r.events, 3)).toEqual(['flush', 'blit', 'display', 'submit']);
+    });
+
+    test('an uncovered rectangle after a covering one starts from black again', async () => {
+        const r = await presentWith([sub, full, sub, sub]);
+        expect(r.made()).toBe(1);
+        expect(frame(r.events, 1)).toEqual(['flush', 'blit', 'display', 'submit']);
+        expect(frame(r.events, 2)).toEqual(['clear', 'flush', 'blit', 'display', 'submit']);
+        expect(frame(r.events, 3)).toEqual(['flush', 'blit', 'display', 'submit']);
+    });
+
+    test('a present that lands nowhere shows a black client area, cleared once', async () => {
+        const r = await presentWith([none, none, sub, none, none]);
+        expect(r.made()).toBe(1);
+        expect(frame(r.events, 0)).toEqual(['clear', 'display', 'submit']);
+        expect(frame(r.events, 1)).toEqual(['display', 'submit']);
+        expect(frame(r.events, 2)).toEqual(['flush', 'blit', 'display', 'submit']);
+        expect(frame(r.events, 3)).toEqual(['clear', 'display', 'submit']);
+        expect(frame(r.events, 4)).toEqual(['display', 'submit']);
+        expect(r.shown.map(x => x.name)).toEqual(Array(5).fill('composite1'));
+    });
+
+    test('the composite is one of the surfaces the device owns, and comes back after a device loss', async () => {
+        const r = await presentWith([sub]);
+        const inner = r.adapter as unknown as {
+            presentComposite: RenderSurface; rtOverride: null; texSurfaces: Map<number, RenderSurface>;
+            ownedSurfaces(): Iterable<{ state: RenderSurface }>;
+        };
+        inner.rtOverride = null; inner.texSurfaces = new Map();
+        const owned = [...inner.ownedSurfaces()].map(o => o.state);
+        expect(owned).toContain(inner.presentComposite);
+        // What the device-loss walk does to every owned surface.
+        inner.presentComposite.gpuTexture = undefined;
+        inner.presentComposite.gpuTextureView = undefined;
+        const again = await presentAgain(r, [sub, none]);
+        expect(again.blits.at(-1)!.to).toBe('composite2');
+        expect(again.shown.map(x => x.name).slice(-2)).toEqual(['composite2', 'composite2']);
+        inner.presentComposite.gpuTexture = undefined;
+        inner.presentComposite.gpuTextureView = undefined;
+        const blank = await presentAgain(r, [none]);
+        expect(blank.shown.at(-1)!.name).toBe('composite3');
     });
 
     test('Reset drops the composite with the back buffer', async () => {
@@ -189,11 +261,12 @@ describe('IDirect3DDevice8_Present reads its rectangles', () => {
     const memory = new Uint8Array(0x1000);
     afterEach(() => { devices.delete(DEVICE); });
 
-    const call = (pSrc: number, pDst: number, hwnd: number, client: { w: number; h: number } | null) => {
+    const call = (pSrc: number, pDst: number, hwnd: number, client: { w: number; h: number } | null, fullscreen = false) => {
         Mem.bind(() => memory);
         const seen: Array<PresentRegion | undefined> = [];
         devices.set(DEVICE, {
             presentWindow: 0x30,
+            presentsExclusiveFullscreen: fullscreen,
             present: (r?: PresentRegion) => { seen.push(r ? JSON.parse(JSON.stringify(r)) : undefined); return Promise.resolve(0); },
         } as unknown as D3D8DeviceAdapter);
         const asked: number[] = [];
@@ -233,5 +306,12 @@ describe('IDirect3DDevice8_Present reads its rectangles', () => {
         expect(a.seen[0]).toMatchObject({ hasSrc: true, hasDst: false, clientWidth: 800, clientHeight: 600 });
         const b = call(0x100, 0, 0, null);
         expect(b.seen[0]).toMatchObject({ clientWidth: 0, clientHeight: 0 });
+    });
+
+    test('a fullscreen device presents onto its back buffer whatever size its window has', () => {
+        put(0x100, 0, 0, 320, 240);
+        const r = call(0x100, 0, 0x55, { w: 800, h: 600 }, true);
+        expect(r.asked).toEqual([]);
+        expect(r.seen[0]).toMatchObject({ hasSrc: true, hasDst: false, clientWidth: 0, clientHeight: 0 });
     });
 });

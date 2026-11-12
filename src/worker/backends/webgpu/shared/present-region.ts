@@ -10,6 +10,10 @@
  * The host shows the destination window's client area, so a present that is not "whole
  * back buffer onto whole client area" has to be composed at client size first. `identity`
  * says when that is unnecessary.
+ *
+ * The source rectangle is in back-buffer texels and the destination rectangle in client
+ * pixels. They are the guest's own units as long as the back buffer is allocated at its
+ * declared size; a backend that supersamples it has to scale the source rectangle first.
  */
 export interface PresentRect { left: number; top: number; right: number; bottom: number }
 

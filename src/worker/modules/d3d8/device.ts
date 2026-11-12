@@ -14,6 +14,7 @@ import { writeDeviceCaps8 } from './caps';
 import { deviceCooperativeLevel } from '../../core/gpu/gpu-device-loss-contract';
 import { System } from '../../core/system';
 import { createPresentRegion, type PresentRect } from '../../backends/webgpu/shared/present-region';
+import { deviceWindowClientExtent } from '../../runtime/windowing/fullscreen-window';
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
@@ -113,10 +114,12 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         if (!pSourceRect && !pDestRect) return device.present();
         presentRegion.hasSrc = readPresentRect(pSourceRect, presentRegion.src);
         presentRegion.hasDst = readPresentRect(pDestRect, presentRegion.dst);
-        const hwnd = (args[3] >>> 0) || device.presentWindow;
-        const client = hwnd ? System.getInstance().windowManager.getWindow(hwnd) : undefined;
-        presentRegion.clientWidth = client ? client.rect.w : 0;
-        presentRegion.clientHeight = client ? client.rect.h : 0;
+        // A NULL destination is the destination window's client area for a windowed
+        // device and the back buffer for a fullscreen one (a zero client size says so).
+        const client = device.presentsExclusiveFullscreen
+            ? null : deviceWindowClientExtent((args[3] >>> 0) || device.presentWindow);
+        presentRegion.clientWidth = client ? client.width : 0;
+        presentRegion.clientHeight = client ? client.height : 0;
         return device.present(presentRegion);
     };
 
