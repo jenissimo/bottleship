@@ -66,8 +66,61 @@ describe("winmm", () => {
         (w.mmioHandles as Map<number, unknown>).set(1, {});
         expect(() => w.captureSavestate()).toThrow("MMIO");
         (w.mmioHandles as Map<number, unknown>).clear();
-        (w.pendingTimerCallbacks as unknown[]).push({});
-        expect(() => w.captureSavestate()).toThrow("timer callback");
+        (w.pendingTimerCallbacks as unknown[]).push({ callbackAddr: 1, timerId: 0, dwUser: 0, onReturn: () => undefined });
+        expect(() => w.captureSavestate()).toThrow("winmm: a posted callback with a completion is queued or running; try saving again");
+    });
+
+    test("queued timer callbacks are saved in order: a live timer by its id, an expired one-shot with its record, and both are delivered after a restore", () => {
+        const w = winmm();
+        const live = (w.timers as Map<number, Record<string, unknown>>).get(3)!;
+        const oneShot = { wTimerID: 9, wheelId: 0, isPeriodic: false, mode: 0, callbackOrEvent: 0x402000, dwUser: 5, delayMs: 30 };
+        const queue = w.pendingTimerCallbacks as unknown[];
+        queue.push({ callbackAddr: 0x401000, timerId: 3, dwUser: 9, sourceTimer: live });
+        queue.push({ callbackAddr: 0x402000, timerId: 9, dwUser: 5, sourceTimer: oneShot });
+        queue.push({ callbackAddr: 0x403000, timerId: 0x20000003, dwUser: 6, args: [0x20000003, 0x3bd, 6, 0x1100, 0] });
+        queue.push({ callbackAddr: 0x401000, timerId: 3, dwUser: 9, sourceTimer: live });
+        w.dispatchingTimerCallback = live;
+        const saved = w.captureSavestate();
+        expect(saved.queued).toEqual([
+            { callback: 0x401000, timerId: 3, dwUser: 9, args: null, timer: 3, expired: null },
+            { callback: 0x402000, timerId: 9, dwUser: 5, args: null, timer: null, expired: oneShot },
+            { callback: 0x403000, timerId: 0x20000003, dwUser: 6, args: [0x20000003, 0x3bd, 6, 0x1100, 0], timer: null, expired: null },
+            { callback: 0x401000, timerId: 3, dwUser: 9, args: null, timer: 3, expired: null },
+        ]);
+        const fresh = new WinMM() as WinMM & Internals;
+        fresh.restoreSavestate(structuredClone(saved));
+        expect(bytes(fresh.captureSavestate())).toBe(bytes(saved));
+        expect(fresh.dispatchingTimerCallback).toBeNull();
+        const restoredLive = (fresh.timers as Map<number, unknown>).get(3);
+        const order: Array<[number, unknown]> = [];
+        for (;;) {
+            const cb = (fresh.shiftPendingCallback as () => { callbackAddr: number; sourceTimer?: unknown; args?: number[] } | undefined).call(fresh);
+            if (!cb) break;
+            order.push([cb.callbackAddr, cb.sourceTimer === restoredLive ? "live" : cb.sourceTimer ? (cb.sourceTimer as { wTimerID: number }).wTimerID : cb.args?.[1]]);
+        }
+        expect(order).toEqual([[0x401000, "live"], [0x402000, 9], [0x403000, 0x3bd], [0x401000, "live"]]);
+        expect((fresh.timers as Map<number, unknown>).has(9)).toBe(false);
+
+        const broken = structuredClone(saved);
+        broken.timers = [];
+        expect(() => (new WinMM() as WinMM & Internals).restoreSavestate(broken)).toThrow("winmm: the queued callback of timer 3 names a timer the snapshot does not have");
+    });
+
+    test("fifty rounds of queue, capture and restore keep the queue at its saved length and leave no running callback behind", () => {
+        let w = winmm();
+        for (let round = 0; round < 50; round++) {
+            (w.pendingTimerCallbacks as unknown[]).push({ callbackAddr: 0x401000, timerId: 3, dwUser: 9, sourceTimer: (w.timers as Map<number, unknown>).get(3) });
+            const saved = w.captureSavestate();
+            expect(saved.queued.length).toBe(1);
+            const fresh = new WinMM() as WinMM & Internals;
+            fresh.restoreSavestate(structuredClone(saved));
+            expect((fresh.shiftPendingCallback as () => unknown).call(fresh)).toBeDefined();
+            expect((fresh.shiftPendingCallback as () => unknown).call(fresh)).toBeUndefined();
+            expect(fresh.hasPendingCallbacks()).toBe(false);
+            w = fresh;
+        }
+        expect((w.timers as Map<number, unknown>).size).toBe(1);
+        expect(w.captureSavestate().queued).toEqual([]);
     });
 
     test("refuses an open MCI device and a running timer callback", () => {
@@ -76,10 +129,13 @@ describe("winmm", () => {
         expect(() => w.captureSavestate()).toThrow("MCI");
         w.mci = null;
         w.dispatchingTimerCallback = (w.timers as Map<number, unknown>).get(3);
-        expect(() => w.captureSavestate()).toThrow("timer callback");
+        w.hasActiveTimerCallbackInFlight = () => true;
+        expect(() => w.captureSavestate()).toThrow("winmm: a multimedia timer callback is running; try saving again");
+        w.hasActiveTimerCallbackInFlight = () => false;
+        expect(() => w.captureSavestate()).not.toThrow();
         w.dispatchingTimerCallback = null;
         w.dispatchingPosted = true;
-        expect(() => w.captureSavestate()).toThrow("timer callback");
+        expect(() => w.captureSavestate()).toThrow("posted callback");
     });
 
     test("every instance field has a policy", () => {
@@ -103,7 +159,7 @@ describe("winmm", () => {
                     },
                     writeCursor: 12, dataLength: 131072, loopMode: -1, volume: -300, pan: 40, tail: new Uint8Array([9, 8]),
                 }],
-                waveDone: [{ callback: 0x403000, args: [0x20000003, 0x3bd, 6, 0x1100, 0] }],
+                queued: [{ callback: 0x403000, timerId: 0x20000003, dwUser: 6, args: [0x20000003, 0x3bd, 6, 0x1100, 0], timer: null, expired: null }],
                 playSound: { id: 0x50000002, channels: 1, sampleRate: 8000, bitsPerSample: 8, loop: true, playCursor: 3, pcm: new Uint8Array([1, 2, 3, 4, 5, 6]) },
             };
             expect(Object.keys(values).sort()).toEqual(Object.keys(winmm().captureSavestate()).sort());
@@ -127,7 +183,7 @@ describe("winmm", () => {
     });
 
     test("WinMMState keys", () => {
-        const keys: Array<keyof WinMMState> = ["timers", "nextTimerId", "periodRefCounts", "nextWaveOutId", "nextMMIOHandle", "nextPlaySoundId", "timerThreadId", "timerThreadHandle", "timerWakeEvent", "joystick", "waveOut", "playSound", "waveDone"];
+        const keys: Array<keyof WinMMState> = ["timers", "nextTimerId", "periodRefCounts", "nextWaveOutId", "nextMMIOHandle", "nextPlaySoundId", "timerThreadId", "timerThreadHandle", "timerWakeEvent", "joystick", "waveOut", "playSound", "queued"];
         expect(Object.keys(winmm().captureSavestate()).sort()).toEqual([...keys].sort());
     });
 });

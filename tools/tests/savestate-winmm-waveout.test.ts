@@ -319,7 +319,7 @@ describe("winmm waveOut savestate", () => {
         expect(f.r.done(f.r.w).length).toBe(1);
         const queuedHeader = (f.r.done(f.r.w)[0]![3]! - HDR) / 0x20;
         const state = f.r.w.captureSavestate();
-        expect(state.waveDone).toEqual([{ callback: CALLBACK, args: [f.r.hwo, WOM_DONE, INSTANCE, f.r.header(queuedHeader), 0] }]);
+        expect(state.queued).toEqual([{ callback: CALLBACK, timerId: f.r.hwo, dwUser: INSTANCE, args: [f.r.hwo, WOM_DONE, INSTANCE, f.r.header(queuedHeader), 0], timer: null, expired: null }]);
         expect(state.waveOut[0]!.fields.pendingBuffers.map(p => p.pwh)).not.toContain(f.r.header(queuedHeader));
         const at = f.at();
         const guestThen = f.r.mem.slice(0, 0x1000);
@@ -344,7 +344,7 @@ describe("winmm waveOut savestate", () => {
 
         f.rewind(at);
         f.r.mem.set(guestThen, 0);
-        const lost = f.r.reload({ ...state, waveDone: [] });
+        const lost = f.r.reload({ ...state, queued: [] });
         const broken: number[] = [];
         for (let i = 0; i < 60; i++) f.step(lost, broken);
         expect(broken).not.toContain(queuedHeader);
@@ -360,17 +360,20 @@ describe("winmm waveOut savestate", () => {
         expect(f.wakes).toEqual([]);
     });
 
-    test("a queued timer or posted callback still refuses, also next to a queued completion", () => {
+    test("a queued timer callback is saved next to a queued completion; a posted callback with a completion still refuses", () => {
         const r = rig(CALLBACK_FUNCTION);
         for (let i = 0; i < 3; i++) r.write(r.w, i);
         r.play(r.w, LEN);
         r.poll(r.w);
         expect(r.done(r.w).length).toBe(1);
         expect(() => r.w.captureSavestate()).not.toThrow();
-        const refusal = "winmm: a multimedia timer callback is queued or running; try saving again";
-        (r.w.pendingTimerCallbacks as Queued[]).push({ timerId: 3 });
-        expect(() => r.w.captureSavestate()).toThrow(refusal);
+        (r.w.pendingTimerCallbacks as Array<Record<string, unknown>>).push({ callbackAddr: 0x405000, timerId: 3, dwUser: 1 });
+        const state = r.w.captureSavestate();
+        expect(state.queued.map(q => [q.callback, q.args?.[1] ?? null])).toEqual([[CALLBACK, WOM_DONE], [0x405000, null]]);
+        const fresh = r.reload(state);
+        expect((fresh.pendingTimerCallbacks as Queued[]).map(cb => cb.timerId)).toEqual([r.hwo, 3]);
         (r.w.pendingTimerCallbacks as Queued[]).pop();
+        const refusal = "winmm: a posted callback with a completion is queued or running; try saving again";
         (r.w.pendingTimerCallbacks as Array<Record<string, unknown>>).push({ timerId: 0, args: [r.hwo, WOM_DONE, 0, 0, 0], onReturn: () => undefined });
         expect(() => r.w.captureSavestate()).toThrow(refusal);
         (r.w.pendingTimerCallbacks as Queued[]).pop();
@@ -575,14 +578,14 @@ describe("winmm PlaySound savestate", () => {
 });
 
 describe("winmm participant", () => {
-    test("version 3 with a pinned schema, and a refusal reaches the caller as a CaptureRefusal", () => {
+    test("version 4 with a pinned schema, and a refusal reaches the caller as a CaptureRefusal", () => {
         const w = new WinMM() as Module;
         const before = savestateParticipants.all().find(x => x.id === "winmm");
         const off = w.registerSavestate();
         try {
             const p = savestateParticipants.all().find(x => x.id === "winmm")!;
-            expect(p.version).toBe(3);
-            expect(schemaHash(WINMM_SCHEMA as unknown as SaveValue)).toBe("13a32abfc6563265");
+            expect(p.version).toBe(4);
+            expect(schemaHash(WINMM_SCHEMA as unknown as SaveValue)).toBe("ba7e04ce47a12de4");
             (w.mmioHandles as Map<number, unknown>).set(1, {});
             expect(() => p.capture({} as never)).toThrow(CaptureRefusal);
         } finally {

@@ -421,7 +421,7 @@ export interface WinMMState {
     joystick: JoystickState;
     waveOut: WaveOutState[];
     playSound: PlaySoundState | null;
-    waveDone: WaveDoneState[];
+    queued: QueuedCallbackState[];
 }
 
 export const WINMM_FIELDS = {
@@ -505,9 +505,13 @@ export interface WaveOutState {
     tail: Uint8Array;
 }
 
-export interface WaveDoneState {
+export interface QueuedCallbackState {
     callback: number;
-    args: number[];
+    timerId: number;
+    dwUser: number;
+    args: number[] | null;
+    timer: number | null;
+    expired: WinMMTimer | null;
 }
 
 export interface PlaySoundState {
@@ -531,7 +535,7 @@ export const WINMM_SCHEMA = {
     state: stateKeys<WinMMState>({
         timers: true, nextTimerId: true, periodRefCounts: true, nextWaveOutId: true, nextMMIOHandle: true,
         nextPlaySoundId: true, timerThreadId: true, timerThreadHandle: true, timerWakeEvent: true, joystick: true,
-        waveOut: true, playSound: true, waveDone: true,
+        waveOut: true, playSound: true, queued: true,
     }),
     joystick: stateKeys<JoystickState>({ thresholds: true, captures: true }),
     joyCapture: stateKeys<JoyCapture>({ hwnd: true, changedOnly: true, timerId: true, x: true, y: true, z: true, buttons: true, primed: true }),
@@ -541,8 +545,7 @@ export const WINMM_SCHEMA = {
         fields: true, writeCursor: true, dataLength: true, loopMode: true, volume: true, pan: true, tail: true,
     }),
     waveFormat: stateKeys<WaveFormat>({ channels: true, sampleRate: true, avgBytesPerSec: true, blockAlign: true, bitsPerSample: true }),
-    waveDone: stateKeys<WaveDoneState>({ callback: true, args: true }),
-    waveDoneArgs: ['hwo', 'WOM_DONE', 'dwInstance', 'WAVEHDR', '0'],
+    queued: stateKeys<QueuedCallbackState>({ callback: true, timerId: true, dwUser: true, args: true, timer: true, expired: true }),
     blobs: ['waveOut.tail', 'playSound.pcm'],
     waveHeader: stateKeys<PendingWaveBuffer>({ pwh: true, data: true, length: true, endOffset: true }),
     playSound: stateKeys<PlaySoundState>({
@@ -585,9 +588,11 @@ export class WinMM implements IModule {
         if ((this.mci?.openDeviceCount() ?? 0) > 0) throw new Error('winmm: open MCI devices are not part of a v1 savestate');
         if ((this.midiOut?.openCount() ?? 0) > 0) throw new Error('winmm: open MIDI output handles are not part of a v1 savestate');
         const queued = this.pendingTimerCallbacks.slice(this.pendingTimerHead);
-        const waveDone = queued.every(cb => !cb.sourceTimer && !cb.onReturn && cb.args?.[1] === WOM_DONE);
-        if (!waveDone || this.dispatchingTimerCallback || this.dispatchingPosted) {
-            throw new Error('winmm: a multimedia timer callback is queued or running; try saving again');
+        if (queued.some(cb => cb.onReturn) || this.dispatchingPosted) {
+            throw new Error('winmm: a posted callback with a completion is queued or running; try saving again');
+        }
+        if (this.dispatchingTimerCallback && this.hasActiveTimerCallbackInFlight()) {
+            throw new Error('winmm: a multimedia timer callback is running; try saving again');
         }
         for (const [wheelId, t] of this.timersByWheel) {
             if (t.wheelId !== wheelId || this.timers.get(t.wTimerID) !== t) throw new Error(`winmm: timer ${t.wTimerID} is not indexed by its wheel id`);
@@ -605,7 +610,15 @@ export class WinMM implements IModule {
             joystick: captureWinmmJoystick(),
             waveOut: [...this.waveOutDevices.values()].map(d => this.captureWaveOut(d)),
             playSound: this.capturePlaySound(),
-            waveDone: queued.map(cb => ({ callback: cb.callbackAddr, args: [...cb.args!] })),
+            queued: queued.map((cb): QueuedCallbackState => {
+                const t = cb.sourceTimer;
+                const live = t !== undefined && this.timers.get(t.wTimerID) === t;
+                return {
+                    callback: cb.callbackAddr, timerId: cb.timerId, dwUser: cb.dwUser, args: cb.args ? [...cb.args] : null,
+                    timer: live ? t.wTimerID : null,
+                    expired: t !== undefined && !live ? pickDefined(t, WINMM_TIMER_FIELDS) : null,
+                };
+            }),
         };
     }
 
@@ -731,12 +744,27 @@ export class WinMM implements IModule {
         this.waveOutDevices = new Map(s.waveOut.map(st => [st.fields.id, this.restoreWaveOut(st, mem)]));
         this.stopPlaySound();
         if (s.playSound) this.restorePlaySound(s.playSound);
-        this.pendingTimerCallbacks = s.waveDone.map(d => ({ callbackAddr: d.callback, timerId: d.args[0]!, dwUser: d.args[2]!, args: [...d.args] }));
+        const expired = new Map<string, WinMMTimer>();
+        this.pendingTimerCallbacks = s.queued.map((q): PendingTimerCallback => {
+            const cb: PendingTimerCallback = { callbackAddr: q.callback, timerId: q.timerId, dwUser: q.dwUser };
+            if (q.args) cb.args = [...q.args];
+            if (q.timer !== null) {
+                const live = this.timers.get(q.timer);
+                if (!live) throw new Error(`winmm: the queued callback of timer ${q.timer} names a timer the snapshot does not have`);
+                cb.sourceTimer = live;
+            } else if (q.expired) {
+                const key = `${q.expired.wTimerID}:${q.expired.wheelId}`;
+                let timer = expired.get(key);
+                if (!timer) expired.set(key, timer = { ...q.expired });
+                cb.sourceTimer = timer;
+            }
+            return cb;
+        });
         this.pendingTimerHead = 0;
         this.dispatchingPosted = null;
         this.dispatchingTimerCallback = null;
         System.getInstance().scheduler?.notifyWinmmTimerThread(this.timerThreadId, this.timerWakeEvent);
-        if (s.waveDone.length > 0 && this.timerWakeEvent) System.getInstance().scheduler?.setEvent(this.timerWakeEvent);
+        if (s.queued.length > 0 && this.timerWakeEvent) System.getInstance().scheduler?.setEvent(this.timerWakeEvent);
     }
 
     private publishTimerResolution(): void {
@@ -1637,7 +1665,7 @@ export class WinMM implements IModule {
 
     registerSavestate(): () => void {
         return savestateParticipants.add({
-            id: 'winmm', version: 3, order: 63, covers: ['winmm'], schema: WINMM_SCHEMA as unknown as SaveValue,
+            id: 'winmm', version: 4, order: 63, covers: ['winmm'], schema: WINMM_SCHEMA as unknown as SaveValue,
             capture: (ctx) => {
                 let state: WinMMState;
                 try {
