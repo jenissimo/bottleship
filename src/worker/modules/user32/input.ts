@@ -14,6 +14,7 @@ import {
     getWindowByHandle,
 } from './shared-state';
 import { GUEST_INPUT_FLAG } from '../../../input/sab-layout';
+import type { CursorState } from '../../runtime/input/input-manager';
 
 const WS_DISABLED_ACCEL = 0x08000000;
 const WS_MINIMIZE_ACCEL = 0x20000000;
@@ -77,6 +78,7 @@ export interface User32InputState {
     ddeClientOnly: number[];
     heldKeys: number[];
     heldButtons: number;
+    cursor: CursorState;
     ddeInstances: number[];
     ddeConversations: number[];
 }
@@ -109,11 +111,11 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     // @participant(user32-input)
     const ddeClientOnly = new Set<number>();
     if (savestatesEnabled()) savestateParticipants.add({
-        id: 'user32-input', version: 4, order: 42,
+        id: 'user32-input', version: 5, order: 42,
         schema: stateKeys<User32InputState>({
             windowProperties: true, nextDdeInstance: true, nextDdeStringHandle: true, nextDdeConv: true,
             ddeStrings: true, ddeServices: true, ddeLastError: true, ddeClientOnly: true, heldKeys: true, heldButtons: true,
-            ddeInstances: true, ddeConversations: true,
+            ddeInstances: true, ddeConversations: true, cursor: true,
         }),
         capture: () => {
             const state: User32InputState = {
@@ -125,6 +127,7 @@ export function createInputExports(): Record<string, ThunkImplementation> {
                 ddeClientOnly: [...ddeClientOnly],
                 heldKeys: System.getInstance().inputManager.captureHeldKeys(),
                 heldButtons: System.getInstance().inputManager.captureHeldButtons(),
+                cursor: System.getInstance().inputManager.captureCursor(),
                 ddeInstances: [...ddeInstances],
                 ddeConversations: [...ddeConversations],
             };
@@ -134,6 +137,8 @@ export function createInputExports(): Record<string, ThunkImplementation> {
             const s = saved as unknown as User32InputState;
             System.getInstance().inputManager.restoreHeldKeys(s.heldKeys);
             System.getInstance().inputManager.restoreHeldButtons(s.heldButtons);
+            System.getInstance().inputManager.restoreCursor(s.cursor);
+            self.postMessage({ type: "set_cursor_pos", x: s.cursor.x | 0, y: s.cursor.y | 0 });
             windowProperties.clear();
             for (const [h, props] of s.windowProperties) windowProperties.set(h, new Map(props));
             nextDdeInstance = s.nextDdeInstance;

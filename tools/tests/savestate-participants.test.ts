@@ -359,7 +359,7 @@ describe("schema pin and mutation", () => {
             "message-queue": { version: 1, schemaHash: "58fb335bdd9764ed" },
             "user32": { version: 2, schemaHash: "32eb51b29591ecf8" },
             "user32-timers": { version: 1, schemaHash: "e6c18e508aea7e24" },
-            "user32-input": { version: 4, schemaHash: "5665463c4f60f14e" },
+            "user32-input": { version: 5, schemaHash: "f6f9a5ba9190e0b0" },
             "user32-system": { version: 1, schemaHash: "b93e806912786ec3" },
             "user32-accelerators": { version: 1, schemaHash: "4ab3bf298a09550d" },
             "gdi32": { version: 2, schemaHash: "ac40fa0b81963b47" },
