@@ -18,7 +18,6 @@ import { GUEST_INPUT_FLAG } from '../../../input/sab-layout';
 const WS_DISABLED_ACCEL = 0x08000000;
 const WS_MINIMIZE_ACCEL = 0x20000000;
 import { savestateParticipants, savestatesEnabled, stateKeys } from '../../savestate/participant';
-import { CaptureRefusal } from '../../savestate/object-codecs';
 import type { SaveValue } from '../../savestate/value-codec';
 import { ACCEL_WM_COMMAND, copyAccelerators, createAccelerators, destroyAcceleratorTable, findAcceleratorFor, loadAccelerators, registerAcceleratorParticipant } from './accelerators';
 import { isSentinelWndProc } from './dialog';
@@ -78,6 +77,8 @@ export interface User32InputState {
     ddeClientOnly: number[];
     heldKeys: number[];
     heldButtons: number;
+    ddeInstances: number[];
+    ddeConversations: number[];
 }
 
 export function createInputExports(): Record<string, ThunkImplementation> {
@@ -95,7 +96,7 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     let nextDdeStringHandle = 1;
     // @participant(user32-input)
     let nextDdeConv = 1;
-    // @refuse(DDE conversations are not part of a v1 savestate)
+    // @participant(user32-input)
     const ddeInstances = new Set<number>();
     // @participant(user32-input)
     const ddeLastError = new Map<number, number>();
@@ -103,18 +104,18 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     const ddeStrings = new Map<number, string>();
     // @participant(user32-input)
     const ddeServices = new Map<string, Set<number>>();
-    // @refuse(DDE conversations are not part of a v1 savestate)
+    // @participant(user32-input)
     const ddeConversations = new Set<number>();
     // @participant(user32-input)
     const ddeClientOnly = new Set<number>();
     if (savestatesEnabled()) savestateParticipants.add({
-        id: 'user32-input', version: 3, order: 42,
+        id: 'user32-input', version: 4, order: 42,
         schema: stateKeys<User32InputState>({
             windowProperties: true, nextDdeInstance: true, nextDdeStringHandle: true, nextDdeConv: true,
             ddeStrings: true, ddeServices: true, ddeLastError: true, ddeClientOnly: true, heldKeys: true, heldButtons: true,
+            ddeInstances: true, ddeConversations: true,
         }),
         capture: () => {
-            if (ddeInstances.size > 0 || ddeConversations.size > 0) throw new CaptureRefusal('user32: DDE conversations are not part of a v1 savestate');
             const state: User32InputState = {
                 windowProperties: [...windowProperties].map(([h, props]) => [h, [...props]]),
                 nextDdeInstance, nextDdeStringHandle, nextDdeConv,
@@ -124,6 +125,8 @@ export function createInputExports(): Record<string, ThunkImplementation> {
                 ddeClientOnly: [...ddeClientOnly],
                 heldKeys: System.getInstance().inputManager.captureHeldKeys(),
                 heldButtons: System.getInstance().inputManager.captureHeldButtons(),
+                ddeInstances: [...ddeInstances],
+                ddeConversations: [...ddeConversations],
             };
             return state as unknown as SaveValue;
         },
@@ -137,7 +140,9 @@ export function createInputExports(): Record<string, ThunkImplementation> {
             nextDdeStringHandle = s.nextDdeStringHandle;
             nextDdeConv = s.nextDdeConv;
             ddeInstances.clear();
+            for (const inst of s.ddeInstances) ddeInstances.add(inst);
             ddeConversations.clear();
+            for (const conv of s.ddeConversations) ddeConversations.add(conv);
             ddeClientOnly.clear();
             for (const inst of s.ddeClientOnly) ddeClientOnly.add(inst);
             ddeLastError.clear();
