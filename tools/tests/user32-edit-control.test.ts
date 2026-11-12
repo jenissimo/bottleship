@@ -7,7 +7,7 @@
 import { describe, expect, test } from "bun:test";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { System } from "../../src/worker/core/system";
-import { handleEditMessage } from "../../src/worker/modules/user32/edit-control";
+import { EDIT_STATE_FIELDS, captureEditControls, editControlCount, handleEditMessage, resetEditStatesForTests, restoreEditControls } from "../../src/worker/modules/user32/edit-control";
 import { isContentChangingMessage } from "../../src/worker/modules/user32/dialog-control-messages";
 import type { WindowInfo } from "../../src/worker/modules/user32/shared-state";
 
@@ -299,5 +299,61 @@ describe("control repaint gating", () => {
     test("WM_SETTEXT is a content change for any control class", () => {
         expect(isContentChangingMessage(button(), WM_SETTEXT)).toBe(true);
         expect(isContentChangingMessage(edit(""), WM_SETTEXT)).toBe(true);
+    });
+});
+
+describe("savestate", () => {
+    const getSel = (win: WindowInfo): [number, number] => {
+        const r = send(win, EM_GETSEL, 0x100, 0x104)!;
+        return [r & 0xffff, r >>> 16];
+    };
+    const scene = (): WindowInfo => {
+        resetEditStatesForTests();
+        const win = edit("hello world");
+        send(win, EM_LIMITTEXT, 40);
+        send(win, EM_SETSEL, 6, 11);
+        type(win, "there");
+        send(win, EM_SETSEL, 2, 4);
+        return win;
+    };
+
+    test("selection, limit, modify flag and the undo record come back; undo after a restore puts the old text back", () => {
+        const win = scene();
+        expect(win.title).toBe("hello there");
+        const saved = structuredClone(captureEditControls());
+        expect(saved.length).toBe(1);
+        expect(Object.keys(saved[0]![1]).sort()).toEqual(Object.keys(EDIT_STATE_FIELDS).filter(k => EDIT_STATE_FIELDS[k as keyof typeof EDIT_STATE_FIELDS] === "save").sort());
+        const selection = getSel(win), modified = send(win, EM_GETMODIFY), canUndo = send(win, EM_CANUNDO);
+        expect(modified).toBe(1);
+        expect(canUndo).toBe(1);
+
+        resetEditStatesForTests();
+        expect(send(win, EM_CANUNDO)).toBe(0);
+        restoreEditControls(saved);
+        expect(captureEditControls()).toEqual(saved);
+        expect(getSel(win)).toEqual(selection);
+        expect(send(win, EM_GETMODIFY)).toBe(modified);
+        expect(send(win, EM_CANUNDO)).toBe(canUndo);
+        send(win, WM_UNDO);
+        expect(win.title).toBe("hello world");
+        const over = "x".repeat(60);
+        send(win, EM_SETSEL, 0, -1);
+        type(win, over);
+        expect(win.title.length).toBe(40);
+    });
+
+    test("every field of an edit state has a policy, and fifty rounds leave one state per control", () => {
+        const win = scene();
+        const live = (System.getInstance(), captureEditControls());
+        expect(live.length).toBe(1);
+        expect(EDIT_STATE_FIELDS.lineCache).toBe("derive");
+        for (let round = 0; round < 50; round++) {
+            const saved = structuredClone(captureEditControls());
+            restoreEditControls(saved);
+            send(win, EM_SETSEL, round % 5, 5);
+        }
+        expect(editControlCount()).toBe(1);
+        restoreEditControls([]);
+        expect(editControlCount()).toBe(0);
     });
 });

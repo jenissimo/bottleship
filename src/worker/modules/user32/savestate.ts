@@ -29,7 +29,7 @@ import { pendingDialogCommandFor } from './dialog';
 import { pendingChromeDeadlineCount } from './dialog-paint';
 import { activeDialogs } from './modal-dialog-state';
 import { animateControlCount } from './animate-control';
-import { editControlCount } from './edit-control';
+import { EDIT_STATE_FIELDS, captureEditControls, restoreEditControls, type SavedEditState } from './edit-control';
 import { listViewControlCount } from './list-view-control';
 import { richEditControlCount } from './rich-edit-control';
 import { tabControlCount } from './tab-control';
@@ -51,6 +51,7 @@ export interface User32State {
     windowPos: WindowPosState;
     systemCursors: Array<[number, number]>;
     wheelScrollLines: number;
+    editControls: Array<[number, SavedEditState]>;
 }
 
 const keys = <T>(k: Record<keyof T, true>) => stateKeys<T>(k);
@@ -63,8 +64,9 @@ export const USER32_SCHEMA = {
     state: keys<User32State>({
         windows: true, classes: true, paintRegions: true, hooks: true, menus: true, scrollBars: true, placements: true,
         deviceNotify: true, powerNotify: true, dpi: true, mouseInPointer: true, drawItemScratch: true, notifyScratch: true,
-        windowPos: true, systemCursors: true, wheelScrollLines: true,
+        windowPos: true, systemCursors: true, wheelScrollLines: true, editControls: true,
     }),
+    editControl: EDIT_STATE_FIELDS,
     windows: keys<User32WindowState>({
         windows: true, buttonCheckStates: true, listControlStates: true, trackbarStates: true, controlImageHandles: true,
         clipboard: true, clipboardOpenOwner: true, clipboardSequence: true, cursorDisplayCount: true, cursorClipRect: true,
@@ -114,7 +116,7 @@ export const MESSAGE_QUEUE_SCHEMA = {
 
 function refuseUnsupported(): void {
     const controls: Array<[string, number]> = [
-        ['animation', animateControlCount()], ['rich edit', richEditControlCount()], ['edit', editControlCount()],
+        ['animation', animateControlCount()], ['rich edit', richEditControlCount()],
         ['list view', listViewControlCount()], ['tab', tabControlCount()],
     ];
     for (const [name, count] of controls) {
@@ -146,6 +148,7 @@ export function captureUser32State(): User32State {
         windowPos: captureWindowPosState(),
         systemCursors: captureSystemCursorHandles(),
         wheelScrollLines: getWheelScrollLines(),
+        editControls: captureEditControls(),
     };
 }
 
@@ -165,6 +168,7 @@ export function restoreUser32State(s: User32State): void {
     restoreWindowPosState(s.windowPos);
     restoreSystemCursorHandles(s.systemCursors);
     setWheelScrollLines(s.wheelScrollLines);
+    restoreEditControls(s.editControls);
     restoreUser32Windows(s.windows);
 }
 
@@ -189,7 +193,7 @@ export function registerUser32Participants(): void {
         restore: (s) => System.getInstance().windowManager.restoreQueueState(s as unknown as MessageQueueState),
     });
     savestateParticipants.add({
-        id: 'user32', version: 2, order: 40, covers: ['user32'], schema: USER32_SCHEMA as unknown as SaveValue,
+        id: 'user32', version: 3, order: 40, covers: ['user32'], schema: USER32_SCHEMA as unknown as SaveValue,
         capture: () => refusing(captureUser32State) as unknown as SaveValue,
         restore: (s) => restoreUser32State(s as unknown as User32State),
     });
