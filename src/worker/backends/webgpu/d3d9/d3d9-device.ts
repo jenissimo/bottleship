@@ -112,6 +112,7 @@ import { pixelShaderComObjects, vertexDeclComObjects, vertexShaderComObjects } f
 // renderSpace only: the windowed regime is exactly where the guest picture space and the
 // guest POINTER space stop coinciding, so the verb has to be able to print both.
 import { windows as sharedUserWindows, getVirtualScreenRect } from "../../../modules/user32/shared-state";
+import { requestWindowedDeviceHostView } from "../../../runtime/windowing/fullscreen-window";
 import { getPresentRect } from "../shared/present-geometry";
 import { Op, opName } from "./shader/sm-enums";
 import { VS_FLOAT_REGISTER_COUNT } from "./shader/vs-codegen";
@@ -2290,13 +2291,18 @@ export class D3D9Device {
      * BackBufferWidth/Height of 0 means "use focus-window client area" (windowed)
      * in real D3D9 — only override host/viewport when an explicit size was given.
      */
+    private publishBackBufferView(width: number, height: number, fullscreen: boolean): void {
+        if (fullscreen) System.getInstance().requestHostResize(width, height, { modeSet: true });
+        else requestWindowedDeviceHostView(this.deviceWindowHwnd, width, height);
+    }
+
     setBackBufferSize(width: number, height: number, fullscreen = false, hwnd = 0): void {
         this.deviceWindowHwnd = hwnd >>> 0;
         this.deviceIsWindowed = !fullscreen;
         if (width > 0 && height > 0) {
             // Only a fullscreen device's backbuffer IS the display mode; a windowed one is a
             // size inside the desktop and must not be published as SM_CXSCREEN.
-            if (this.role !== "render") System.getInstance().requestHostResize(width, height, { modeSet: fullscreen });
+            if (this.role !== "render") this.publishBackBufferView(width, height, fullscreen);
             this.backendExecutor.setGuestBackbufferSize(width, height);
             this.viewport = { x: 0, y: 0, width, height, minZ: 0, maxZ: 1 };
         }
@@ -6631,7 +6637,7 @@ export class D3D9Device {
 
         // Only a FULLSCREEN device sets the display mode. A windowed device's backbuffer is a
         // size inside the desktop; publishing it would make SM_CXSCREEN report the window.
-        if (this.role !== "render") System.getInstance().requestHostResize(width, height, { modeSet: windowed === 0 });
+        if (this.role !== "render") this.publishBackBufferView(width, height, windowed === 0);
         this.deviceIsWindowed = windowed !== 0;
         this.backendExecutor.setGuestBackbufferSize(width, height);
         this.viewport = { x: 0, y: 0, width, height, minZ: 0, maxZ: 1 };

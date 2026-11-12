@@ -9,6 +9,7 @@ import { System, type HostView } from '../../src/worker/core/system';
 import { Mem } from '../../src/worker/core/memory/mem-accessor';
 import { windows, type WindowInfo } from '../../src/worker/modules/user32/shared-state';
 import { createWindowExports } from '../../src/worker/modules/user32/window';
+import { requestWindowedDeviceHostView } from '../../src/worker/runtime/windowing/fullscreen-window';
 
 const WS_VISIBLE = 0x10000000;
 const WS_POPUP = 0x80000000;
@@ -29,10 +30,13 @@ let savedProcess: unknown;
 let savedMemGetter: unknown;
 let exports: ReturnType<typeof createWindowExports>;
 
-function makeWindow(handle: number, style: number, x: number, y: number, w: number, h: number): WindowInfo {
+function makeWindow(
+    handle: number, style: number, x: number, y: number, w: number, h: number, extra: Partial<WindowInfo> = {},
+): WindowInfo {
     const win = {
         handle, title: 'view', style, x, y, width: w, height: h,
         children: [], wndProc: 0, userData: 0, visible: (style & WS_VISIBLE) !== 0,
+        ...extra,
     } as WindowInfo;
     windows.set(handle, win);
     return win;
@@ -152,4 +156,21 @@ test('popups and children do not publish a view when shown', () => {
     makeWindow(OTHER, WS_CHILD, 5, 5, 50, 20);
     call('ShowWindow', [OTHER, SW_SHOW]);
     expect(published).toEqual([]);
+});
+
+test('a windowed device publishes its back buffer at the device window\'s screen origin', () => {
+    makeWindow(OTHER, 0, 69, 76, 502, 349);
+    makeWindow(HWND, WS_CHILD, 3, 5, 496, 340, { parent: OTHER });
+    requestWindowedDeviceHostView(HWND, 640, 480);
+    expect(published).toEqual([{ x: 72, y: 81, width: 640, height: 480 }]);
+    // The back buffer is not a window's client rectangle, so no window drives it afterwards.
+    expect(System.getInstance().hostViewOwner).toBe(0);
+});
+
+test('a windowed device whose window is unknown publishes at the screen origin', () => {
+    requestWindowedDeviceHostView(0x7777, 800, 600);
+    requestWindowedDeviceHostView(0, 320, 240);
+    expect(published).toEqual([
+        { x: 0, y: 0, width: 800, height: 600 }, { x: 0, y: 0, width: 320, height: 240 },
+    ]);
 });

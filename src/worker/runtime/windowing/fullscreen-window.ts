@@ -15,7 +15,7 @@
 
 import { System } from "../../core/system";
 import { Logger, LogCategory } from "../../core/logger";
-import { windows as sharedWindows } from "../../modules/user32/shared-state";
+import { getAbsoluteWindowPosition, windows as sharedWindows } from "../../modules/user32/shared-state";
 import { activateTopLevelWindow } from "../../modules/user32/activation-messages";
 
 const WM_SIZE = 0x0005;
@@ -94,6 +94,18 @@ export function deviceWindowClientExtent(hwnd: number): { width: number; height:
         return { width: winObj.rect.w | 0, height: winObj.rect.h | 0 };
     }
     return null;
+}
+
+/**
+ * A WINDOWED device's back buffer is shown where its device window's client area is: the
+ * host view gets the back-buffer size at that window's screen origin, so the pointer,
+ * which is reported as a screen position, lands on the picture. A fullscreen device is a
+ * mode set and goes through System.requestHostResize instead.
+ */
+export function requestWindowedDeviceHostView(hwnd: number, width: number, height: number): void {
+    const win = hwnd ? sharedWindows.get(hwnd >>> 0) : undefined;
+    const origin = win ? getAbsoluteWindowPosition(win) : null;
+    System.getInstance().requestHostViewAt(origin?.x ?? 0, origin?.y ?? 0, width, height);
 }
 
 /**
