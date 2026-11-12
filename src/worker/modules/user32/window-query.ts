@@ -7,7 +7,7 @@
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
-import { WindowInfo, windows, getChildZOrderSibling } from './shared-state';
+import { WindowInfo, windows, getChildZOrderSibling, getZOrderWindow } from './shared-state';
 import { getWindowClass } from './class';
 import { System } from '../../core/system';
 
@@ -243,6 +243,8 @@ export function registerWindowQueryExports(exports: Record<string, ThunkImplemen
                 result = getChildZOrderSibling(hWnd, 'next');
             } else if (uCmd === 3 /* GW_HWNDPREV */) {
                 result = getChildZOrderSibling(hWnd, 'prev');
+            } else if (uCmd === 0 /* GW_HWNDFIRST */ || uCmd === 1 /* GW_HWNDLAST */) {
+                result = getZOrderWindow(hWnd, uCmd === 0 ? 'first' : 'last');
             }
         }
         Logger.verbose(LogCategory.USER32, `GetWindow(0x${hWnd.toString(16)}, ${uCmd}) -> 0x${result.toString(16)}`);

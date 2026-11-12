@@ -127,9 +127,9 @@ describe('child Z-order helpers', () => {
     beforeEach(() => {
         windows.clear();
         windows.set(PARENT, { ...mkWin(PARENT), children: [A, B, C] });
-        windows.set(A, { ...mkWin(A), parent: PARENT });
-        windows.set(B, { ...mkWin(B), parent: PARENT });
-        windows.set(C, { ...mkWin(C), parent: PARENT });
+        windows.set(A, { ...mkWin(A), style: 0x40000000, parent: PARENT });
+        windows.set(B, { ...mkWin(B), style: 0x40000000, parent: PARENT });
+        windows.set(C, { ...mkWin(C), style: 0x40000000, parent: PARENT });
     });
 
     // Windows sends WM_PAINT down the sibling list from the head (Wine server
