@@ -271,7 +271,7 @@ export async function deleteSlot(slot: string): Promise<{ removedChunks: number 
 
 export interface SaveReport {
     name: string; bytes: number; chunkBytes: number; chunkWrites: number;
-    ms: { paused: number; ramHash: number; store: number }; sections: Record<string, number>; captureMs: Record<string, number>; ram: unknown;
+    ms: { paused: number; ramCopy: number; ramHash: number; store: number }; sections: Record<string, number>; captureMs: Record<string, number>; ram: unknown;
 }
 
 export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, permanentBlockers: () => string[] = () => []): Promise<SaveReport> {
@@ -286,11 +286,17 @@ export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, p
         const t = target(await overlayDigest());
         const t0 = performance.now();
         const safe = await halt();
+        let resumedAt = 0;
+        const resume = (): void => {
+            if (resumedAt !== 0) return;
+            resumedAt = performance.now();
+            safe.release();
+        };
         let result;
         try {
-            result = await captureSession(t, known, () => safe.stillReady());
+            result = await captureSession(t, known, () => safe.stillReady(), undefined, resume);
         } finally {
-            safe.release();
+            resume();
         }
         const t1 = performance.now();
         const sizes = await writeRamChunks(result.pending, store.chunkStore);
@@ -303,7 +309,7 @@ export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, p
         const t2 = performance.now();
         return {
             name, bytes: result.bytes.length, chunkBytes, chunkWrites: result.ram.written,
-            ms: { paused: Math.round(t1 - t0), ramHash: Math.round(result.ramHashMs), store: Math.round(t2 - t1) }, sections: result.sections, captureMs: result.captureMs, ram: result.ram,
+            ms: { paused: Math.round(resumedAt - t0), ramCopy: Math.round(result.ramCopyMs), ramHash: Math.round(result.ramHashMs), store: Math.round(t2 - t1) }, sections: result.sections, captureMs: result.captureMs, ram: result.ram,
         };
     });
 }
