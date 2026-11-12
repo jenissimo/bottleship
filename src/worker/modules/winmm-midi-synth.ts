@@ -1,12 +1,13 @@
 import { currentGmBank, loadGmBank, onGmBank } from "../core/audio/gm-bank";
-import { MidiRouter } from "../core/audio/midi-router";
+import { MidiRouter, type MidiRouterData } from "../core/audio/midi-router";
 import { Logger, LogCategory } from "../core/logger";
 import type { Process } from "../core/process";
 import { setTimerHandler } from "../core/scheduler/timer-wheel";
 import { TimerKind } from "../core/scheduler/types";
 import { System } from "../core/system";
 import { TimeService } from "../runtime/time";
-import { createSinkBuffer, DirectSoundSink, soundReference } from "./dmusic-sink";
+import type { FieldPolicy } from "../savestate/participant";
+import { createSinkBuffer, DirectSoundSink, soundReference, type SinkData } from "./dmusic-sink";
 
 const SAMPLE_RATE = 44100;
 const CHANNELS = 2;
@@ -16,8 +17,21 @@ const PUMP_MS = 10;
 // @transient(the timer handler is registered once per worker and only dispatches to the current output)
 let pumpHandlerSet = false;
 
+export interface MidiOutputData {
+    buffer: number;
+    sink: SinkData | null;
+    pumpTimer: number;
+    pumpAgeMs: number;
+    router: MidiRouterData;
+}
+
+export const MIDI_OUTPUT_FIELDS = {
+    router: 'save', process: 'host', buffer: 'save', sink: 'save', pumpTimer: 'save', lastPumpMs: 'save', users: 'derive',
+    unsubscribe: 'host', left: 'transient', right: 'transient', tickers: 'transient',
+} as const satisfies Record<string, FieldPolicy>;
+
 export class MidiSynthOutput {
-    // @transient(bound to its process: acquire replaces an output left from another session, and an open one refuses a savestate in winmm)
+    // @participant(winmm)
     private static current: MidiSynthOutput | null = null;
     readonly router = new MidiRouter(SAMPLE_RATE, MAX_VOICES);
     private readonly process: Process;
@@ -55,6 +69,56 @@ export class MidiSynthOutput {
         return MidiSynthOutput.current;
     }
 
+    static discard(): void {
+        const old = MidiSynthOutput.current;
+        old?.unsubscribe?.();
+        if (old) old.unsubscribe = null;
+        old?.tickers.clear();
+        MidiSynthOutput.current = null;
+    }
+
+    captureState(): MidiOutputData {
+        if (this.tickers.size > 0) throw new Error('winmm: a MIDI sequencer is playing through the synthesizer, which is not part of a v1 savestate');
+        const now = TimeService.getInstance().nowMs();
+        return {
+            buffer: this.buffer,
+            sink: this.sink?.captureState() ?? null,
+            pumpTimer: this.pumpTimer ?? -1,
+            pumpAgeMs: now - this.lastPumpMs,
+            router: this.router.captureState(now),
+        };
+    }
+
+    static restore(process: Process, d: MidiOutputData, users: number): MidiSynthOutput {
+        MidiSynthOutput.discard();
+        const out = new MidiSynthOutput(process);
+        const now = TimeService.getInstance().nowMs();
+        out.buffer = d.buffer;
+        if (d.sink) {
+            out.sink = new DirectSoundSink(process, d.buffer, CHANNELS, SAMPLE_RATE);
+            out.sink.restoreState(d.sink);
+        }
+        out.pumpTimer = d.pumpTimer < 0 ? null : d.pumpTimer;
+        out.lastPumpMs = now - d.pumpAgeMs;
+        out.users = users;
+        out.attachBank();
+        out.router.restoreState(d.router, now);
+        MidiSynthOutput.current = out;
+        return out;
+    }
+
+    private attachBank(): void {
+        const bank = currentGmBank();
+        if (bank) this.router.setBank(bank);
+        else {
+            this.unsubscribe = onGmBank((b) => {
+                this.router.setBank(b);
+                Logger.log(LogCategory.SYSTEM, `[MIDI] General MIDI bank ready (${b.instruments.length} instruments)`);
+            });
+            void loadGmBank();
+        }
+    }
+
     release(): void {
         if (--this.users > 0) return;
         this.shutdown();
@@ -75,15 +139,7 @@ export class MidiSynthOutput {
             this.buffer = 0;
             return false;
         }
-        const bank = currentGmBank();
-        if (bank) this.router.setBank(bank);
-        else {
-            this.unsubscribe = onGmBank((b) => {
-                this.router.setBank(b);
-                Logger.log(LogCategory.SYSTEM, `[MIDI] General MIDI bank ready (${b.instruments.length} instruments)`);
-            });
-            void loadGmBank();
-        }
+        this.attachBank();
         this.lastPumpMs = TimeService.getInstance().nowMs();
         this.pumpTimer = System.getInstance().scheduler?.timerWheel.add(
             PUMP_MS, true, TimerKind.MIDI_SYNTH, 0, this.lastPumpMs) ?? null;

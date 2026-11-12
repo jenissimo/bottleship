@@ -1,11 +1,19 @@
 import { type DlsCollection, F_INSTRUMENT_DRUMS } from "@bottleship/formats/dmusic/dls";
-import { DlsSynth } from "./directmusic/synth";
+import { DlsSynth, type SynthData } from "./directmusic/synth";
 
 const DRUM_CHANNEL = 9;
 
 interface QueuedEvent { at: number; status: number; data1: number; data2: number }
 
 export interface MidiChannelState { program: number; bankMsb: number; bankLsb: number }
+
+export interface MidiRouterData {
+    channels: MidiChannelState[];
+    queue: QueuedEvent[];
+    volume: number;
+    bank: boolean;
+    synth: SynthData;
+}
 
 export class MidiRouter {
     readonly synth: DlsSynth;
@@ -17,6 +25,23 @@ export class MidiRouter {
     constructor(sampleRate: number, maxVoices: number) {
         this.synth = new DlsSynth(sampleRate, maxVoices);
         this.resetChannels();
+    }
+
+    captureState(now: number): MidiRouterData {
+        return {
+            channels: this.channels.map((c) => ({ ...c })),
+            queue: this.queue.map((e) => ({ ...e, at: e.at - now })),
+            volume: this.volume,
+            bank: this.bank !== null,
+            synth: this.synth.captureState((c) => (c ? 1 : 0)),
+        };
+    }
+
+    restoreState(d: MidiRouterData, now: number): void {
+        d.channels.forEach((c, i) => Object.assign(this.channels[i]!, c));
+        this.queue = d.queue.map((e) => ({ ...e, at: e.at + now }));
+        this.volume = d.volume;
+        this.synth.restoreState(d.synth, (ref) => (ref ? this.bank : null));
     }
 
     get pending(): number {

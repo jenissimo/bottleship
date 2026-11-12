@@ -3,7 +3,11 @@ import { Process } from "../core/process";
 import { type HleDispatcher, ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { captureWinmmJoystick, registerWinmmJoystickExports, resetWinmmJoystick, restoreWinmmJoystick, type JoyCapture, type JoystickState } from "./winmm-joystick";
 import { registerWinmmCapsExports } from "./winmm-caps";
-import { registerWinmmMidiOutExports, WinmmMidiOut } from "./winmm-midi";
+import { MIDI_FIRST_HANDLE, MIDI_HANDLE_FIELDS, MIDI_OUT_FIELDS, registerWinmmMidiOutExports, WinmmMidiOut, type MidiOutState } from "./winmm-midi";
+import { MIDI_OUTPUT_FIELDS, type MidiOutputData } from "./winmm-midi-synth";
+import type { MidiChannelState, MidiRouterData } from "../core/audio/midi-router";
+import { SYNTH_STATE_KEYS } from "../core/audio/directmusic/synth";
+import type { SinkData } from "./dmusic-sink";
 import { prefetchGmBankSources } from "../core/audio/gm-bank";
 import { registerWinmmMciExports } from "./winmm-mci";
 import type { WinmmMci } from "./winmm-mci";
@@ -80,6 +84,8 @@ const JOYERR_UNPLUGGED = 167;
 
 // waveOut callback messages
 const WOM_DONE = 0x3BD;
+const MOM_OPEN = 0x3C7;
+const MOM_DONE = 0x3C9;
 
 // waveOut callback type flags
 const CALLBACK_NULL = 0x00000000;
@@ -422,11 +428,12 @@ export interface WinMMState {
     waveOut: WaveOutState[];
     playSound: PlaySoundState | null;
     queued: QueuedCallbackState[];
+    midiOut: MidiOutState | null;
 }
 
 export const WINMM_FIELDS = {
     name: 'transient', exports: 'host', timers: 'save', timersByWheel: 'derive', nextTimerId: 'save', mmioHandles: 'transient',
-    dbgLastMmioInfo: 'transient', dbgMmioInfoCount: 'transient', nextMMIOHandle: 'save', mci: 'transient', midiOut: 'transient', periodRefCounts: 'save',
+    dbgLastMmioInfo: 'transient', dbgMmioInfoCount: 'transient', nextMMIOHandle: 'save', mci: 'transient', midiOut: 'save', periodRefCounts: 'save',
     waveOutDevices: 'save', nextWaveOutId: 'save', playSoundId: 'save', nextPlaySoundId: 'save', playSoundSab: 'host',
     timerThreadId: 'save', timerThreadHandle: 'save', timerWakeEvent: 'save', pendingTimerCallbacks: 'save',
     dispatchingPosted: 'transient', pendingTimerHead: 'transient', dispatchingTimerCallback: 'transient', dbgTimerStats: 'transient',
@@ -535,7 +542,7 @@ export const WINMM_SCHEMA = {
     state: stateKeys<WinMMState>({
         timers: true, nextTimerId: true, periodRefCounts: true, nextWaveOutId: true, nextMMIOHandle: true,
         nextPlaySoundId: true, timerThreadId: true, timerThreadHandle: true, timerWakeEvent: true, joystick: true,
-        waveOut: true, playSound: true, queued: true,
+        waveOut: true, playSound: true, queued: true, midiOut: true,
     }),
     joystick: stateKeys<JoystickState>({ thresholds: true, captures: true }),
     joyCapture: stateKeys<JoyCapture>({ hwnd: true, changedOnly: true, timerId: true, x: true, y: true, z: true, buttons: true, primed: true }),
@@ -547,6 +554,16 @@ export const WINMM_SCHEMA = {
     waveFormat: stateKeys<WaveFormat>({ channels: true, sampleRate: true, avgBytesPerSec: true, blockAlign: true, bitsPerSample: true }),
     queued: stateKeys<QueuedCallbackState>({ callback: true, timerId: true, dwUser: true, args: true, timer: true, expired: true }),
     blobs: ['waveOut.tail', 'playSound.pcm'],
+    midiOut: MIDI_OUT_FIELDS,
+    midiOutState: stateKeys<MidiOutState>({ nextHandle: true, handles: true, output: true }),
+    midiHandle: MIDI_HANDLE_FIELDS,
+    midiOutput: MIDI_OUTPUT_FIELDS,
+    midiOutputState: stateKeys<MidiOutputData>({ buffer: true, sink: true, pumpTimer: true, pumpAgeMs: true, router: true }),
+    midiRouter: stateKeys<MidiRouterData>({ channels: true, queue: true, volume: true, bank: true, synth: true }),
+    midiChannel: stateKeys<MidiChannelState>({ program: true, bankMsb: true, bankLsb: true }),
+    midiEvent: ['at', 'data1', 'data2', 'status'],
+    midiSynth: SYNTH_STATE_KEYS,
+    midiSink: stateKeys<SinkData>({ bufferBytes: true, scratch: true, writeOffset: true, playing: true, silentBytes: true }),
     waveHeader: stateKeys<PendingWaveBuffer>({ pwh: true, data: true, length: true, endOffset: true }),
     playSound: stateKeys<PlaySoundState>({
         id: true, channels: true, sampleRate: true, bitsPerSample: true, loop: true, playCursor: true, pcm: true,
@@ -586,8 +603,11 @@ export class WinMM implements IModule {
     captureSavestate(): WinMMState {
         if (this.mmioHandles.size > 0) throw new Error('winmm: open MMIO handles are not part of a v1 savestate');
         if ((this.mci?.openDeviceCount() ?? 0) > 0) throw new Error('winmm: open MCI devices are not part of a v1 savestate');
-        if ((this.midiOut?.openCount() ?? 0) > 0) throw new Error('winmm: open MIDI output handles are not part of a v1 savestate');
         const queued = this.pendingTimerCallbacks.slice(this.pendingTimerHead);
+        const inCallback = this.dispatchingPosted ? [...queued, this.dispatchingPosted] : queued;
+        if (inCallback.some(cb => cb.args !== undefined && cb.args[1]! >= MOM_OPEN && cb.args[1]! <= MOM_DONE)) {
+            throw new Error('winmm: a MIDI output callback (MOM_OPEN, MOM_CLOSE or MOM_DONE) is queued or running; try saving again');
+        }
         if (queued.some(cb => cb.onReturn) || this.dispatchingPosted) {
             throw new Error('winmm: a posted callback with a completion is queued or running; try saving again');
         }
@@ -619,6 +639,7 @@ export class WinMM implements IModule {
                     expired: t !== undefined && !live ? pickDefined(t, WINMM_TIMER_FIELDS) : null,
                 };
             }),
+            midiOut: this.midiOut?.captureState() ?? null,
         };
     }
 
@@ -724,7 +745,7 @@ export class WinMM implements IModule {
         this.playSoundSab = sab;
     }
 
-    restoreSavestate(s: WinMMState): void {
+    restoreSavestate(s: WinMMState): void | Promise<void> {
         this.timers = new Map(s.timers.map(t => [t.wTimerID, { ...t }]));
         this.timersByWheel = new Map([...this.timers.values()].filter(t => t.wheelId).map(t => [t.wheelId, t]));
         this.nextTimerId = s.nextTimerId;
@@ -765,6 +786,8 @@ export class WinMM implements IModule {
         this.dispatchingTimerCallback = null;
         System.getInstance().scheduler?.notifyWinmmTimerThread(this.timerThreadId, this.timerWakeEvent);
         if (s.queued.length > 0 && this.timerWakeEvent) System.getInstance().scheduler?.setEvent(this.timerWakeEvent);
+        if (s.midiOut && s.midiOut.handles.length > 0 && !this.midiOut) throw new Error('winmm: MIDI output handles cannot be restored before the module is initialized');
+        return this.midiOut?.restoreState(s.midiOut ?? { nextHandle: MIDI_FIRST_HANDLE, handles: [], output: null });
     }
 
     private publishTimerResolution(): void {
@@ -1665,7 +1688,7 @@ export class WinMM implements IModule {
 
     registerSavestate(): () => void {
         return savestateParticipants.add({
-            id: 'winmm', version: 4, order: 63, covers: ['winmm'], schema: WINMM_SCHEMA as unknown as SaveValue,
+            id: 'winmm', version: 5, order: 63, covers: ['winmm'], schema: WINMM_SCHEMA as unknown as SaveValue,
             capture: (ctx) => {
                 let state: WinMMState;
                 try {
@@ -1682,7 +1705,7 @@ export class WinMM implements IModule {
             },
             restore: (saved, ctx) => {
                 const stored = saved as unknown as StoredWinMMState;
-                this.restoreSavestate({
+                return this.restoreSavestate({
                     ...stored,
                     waveOut: stored.waveOut.map(d => ({ ...d, tail: d.tail ? ctx.blob(d.tail) : EMPTY_BYTES })),
                     playSound: stored.playSound && { ...stored.playSound, pcm: ctx.blob(stored.playSound.pcm) },

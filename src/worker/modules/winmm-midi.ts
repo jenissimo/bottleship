@@ -1,9 +1,10 @@
-import { gmBankAvailable } from "../core/audio/gm-bank";
+import { currentGmBank, gmBankAvailable, loadGmBank } from "../core/audio/gm-bank";
 import { Logger, LogCategory } from "../core/logger";
 import { Mem } from "../core/memory/mem-accessor";
 import { System } from "../core/system";
 import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
-import { MidiSynthOutput } from "./winmm-midi-synth";
+import { pickDefined, type FieldPolicy } from "../savestate/participant";
+import { MidiSynthOutput, type MidiOutputData } from "./winmm-midi-synth";
 
 const MMSYSERR_NOERROR = 0;
 const MMSYSERR_BADDEVICEID = 2;
@@ -15,6 +16,7 @@ const MMSYSERR_INVALPARAM = 11;
 const MIDIERR_UNPREPARED = 64;
 const MIDIERR_STILLPLAYING = 65;
 const MIDI_MAPPER = 0xffffffff;
+export const MIDI_FIRST_HANDLE = 0x5d000;
 
 const CALLBACK_TYPEMASK = 0x00070000;
 const CALLBACK_NULL = 0x00000000;
@@ -48,11 +50,52 @@ interface MidiOutHandle {
     instance: number;
 }
 
+export const MIDI_HANDLE_FIELDS = {
+    handle: 'save', output: 'derive', flags: 'save', callback: 'save', instance: 'save',
+} as const satisfies Record<keyof MidiOutHandle, FieldPolicy>;
+
+export const MIDI_OUT_FIELDS = {
+    handles: 'save', nextHandle: 'save', host: 'host',
+} as const satisfies Record<string, FieldPolicy>;
+
+export interface MidiOutState {
+    nextHandle: number;
+    handles: Array<Omit<MidiOutHandle, 'output'>>;
+    output: MidiOutputData | null;
+}
+
 export class WinmmMidiOut {
     readonly handles = new Map<number, MidiOutHandle>();
-    private nextHandle = 0x5d000;
+    private nextHandle = MIDI_FIRST_HANDLE;
 
     constructor(private readonly host: MidiCallbackHost) {}
+
+    captureState(): MidiOutState {
+        const handles = [...this.handles.values()];
+        const output = handles[0]?.output ?? null;
+        if (handles.some(h => h.output !== output)) throw new Error('winmm: MIDI output handles play through more than one synthesizer');
+        return {
+            nextHandle: this.nextHandle,
+            handles: handles.map(h => pickDefined(h, MIDI_HANDLE_FIELDS)),
+            output: output ? output.captureState() : null,
+        };
+    }
+
+    restoreState(d: MidiOutState): void | Promise<void> {
+        this.nextHandle = d.nextHandle;
+        this.handles.clear();
+        MidiSynthOutput.discard();
+        const saved = d.output;
+        if (!saved || d.handles.length === 0) return;
+        const process = System.getInstance().process;
+        if (!process) throw new Error('winmm: MIDI output handles cannot be restored without a process');
+        const finish = (): void => {
+            const output = MidiSynthOutput.restore(process, saved, d.handles.length);
+            for (const h of d.handles) this.handles.set(h.handle, { ...h, output });
+        };
+        if (saved.router.bank && !currentGmBank()) return loadGmBank().then(finish);
+        finish();
+    }
 
     openCount(): number {
         return this.handles.size;
