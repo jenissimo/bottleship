@@ -5,9 +5,12 @@ import { sha256HexSync } from './sha256';
 
 export const BLOBS = '$blobs';
 
+/** Lanes for hashing blobs after the release: the platform digest copies its input, so each lane can hold one more copy of a large array. */
+export const BLOB_HASH_LANES = 4;
+
 export type BlobList = Array<[hash: string, length: number]>;
 
-/** @transient(memo of content hashes by array identity: a blob's bytes never change once handed over) */
+/** @transient(memo of content hashes by array identity: a blob's bytes never change once handed over; an entry is written during a capture or, for a deferred hash, after the guest has resumed) */
 const hashes = new WeakMap<Uint8Array, string>();
 
 export function blobHash(bytes: Uint8Array): string {

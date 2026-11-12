@@ -1,12 +1,12 @@
 import { savestateParticipants, uncoveredModules, type CaptureContext, type CpuOverride, type ParticipantRegistry } from './participant';
-import { copyRam, hashRamCopy, restoreRam, STORE_LANES, validateRamManifest, type RamCaptureStats, type RamManifest, type RamPatch } from './ram';
+import { copyRam, hashRamCopy, restoreRam, validateRamManifest, type RamCaptureStats, type RamManifest, type RamPatch } from './ram';
 import type { ChunkStore } from './chunk-store';
 import {
     decodeSavestate, encodeSavestateSections, incompatibilities, type CompatibilityKey, type Savestate,
 } from './container';
 import { encodeValue, type EncodedValue, type SaveValue } from './value-codec';
 import { CaptureRefusal, newObjectGraph, restoreObjectGraph } from './object-codecs';
-import { BLOBS, PendingBlobs, loadBlobs, missingBlobs, savedBlobs, type BlobList } from './blobs';
+import { BLOBS, BLOB_HASH_LANES, PendingBlobs, loadBlobs, missingBlobs, savedBlobs, type BlobList } from './blobs';
 
 const OBJECTS = '$objects';
 
@@ -102,7 +102,7 @@ export async function captureSession(
     const t2 = performance.now();
     const held = new Map(run.blobs);
     if (later.size > 0) {
-        for (const [hash, bytes] of await later.hash(STORE_LANES)) if (!held.has(hash)) held.set(hash, bytes);
+        for (const [hash, bytes] of await later.hash(BLOB_HASH_LANES)) if (!held.has(hash)) held.set(hash, bytes);
         for (const [name, enc] of sections) {
             enc.json = later.resolve(enc.json, name);
             if (name in sizes) sizes[name] = enc.json.length + enc.blobs.reduce((n, b) => n + b.length, 0);
