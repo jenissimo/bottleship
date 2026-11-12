@@ -143,6 +143,15 @@ describe("user images", () => {
         }
     });
 
+    test("the conversion buffer of a blitted DIB section is not saved and does not refuse", () => {
+        const record: UserImageRecord = { ...icon(), type: "BITMAP", bitsPtr: 0x1000, dibBpp: 32, rectScratch: new Uint8ClampedArray(8).fill(7) };
+        const saved = captureUserImage(record);
+        expect("rectScratch" in saved).toBe(false);
+        const { rectScratch, ...rest } = record;
+        expect(rectScratch!.length).toBe(8);
+        expect(restoreUserImage(structuredClone(saved))).toEqual(rest);
+    });
+
     test("refuse a field without a policy and an image still loading", () => {
         expect(() => captureUserImage({ ...icon(), mystery: 1 } as unknown as UserImageRecord)).toThrow(CaptureRefusal);
         expect(() => captureUserImage({ ...icon(), loading: true })).toThrow("still loading");
