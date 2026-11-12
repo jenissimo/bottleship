@@ -11,12 +11,9 @@
  */
 import { buildZip, crc32 } from "@bottleship/formats/wgb/zip-build";
 import { ZipArchive, BufferSource } from "@bottleship/formats/zip";
-import { getContainerDir, SHADOW_INDEX_FILE } from "./container-store";
+import { getContainerDir, PERSISTENT_ROOT_FILES, SHADOW_INDEX_FILE } from "./container-store";
 import { Logger, LogCategory } from "../../core/logger";
 import { asWriteChunk } from "../../../dom-buffer";
-
-/** Files at the container root that are part of the persistent layer (besides the overlay/ tree). */
-const ROOT_PERSIST_FILES = ["registry.json", "meta.json", SHADOW_INDEX_FILE];
 
 /** Recursively collect every file under a directory handle into `out` keyed by posix relpath. */
 async function collectDir(dir: FileSystemDirectoryHandle, prefix: string, out: Map<string, Uint8Array>): Promise<void> {
@@ -40,7 +37,7 @@ export async function exportContainer(gameId: string): Promise<Uint8Array | null
     if (!container) return null;
 
     const files = new Map<string, Uint8Array>();
-    for (const name of ROOT_PERSIST_FILES) {
+    for (const name of PERSISTENT_ROOT_FILES) {
         try {
             const fh = await container.getFileHandle(name);
             const f = await fh.getFile();
@@ -81,11 +78,20 @@ export async function importContainer(gameId: string, zipBytes: Uint8Array): Pro
     const archive = new ZipArchive(new BufferSource(zipBytes));
     await archive.init();
     let written = 0;
+    let hasShadowIndex = false;
     for (const entry of archive.listEntries()) {
         if (entry.isDirectory) continue;
         const data = await archive.readEntry(entry);
-        await writeContainerFile(container, entry.name.replace(/\\/g, "/"), data);
+        const rel = entry.name.replace(/\\/g, "/").split("/").filter(Boolean).join("/");
+        await writeContainerFile(container, rel, data);
+        if (rel === SHADOW_INDEX_FILE) hasShadowIndex = true;
         written++;
+    }
+    // Older exports carry no shadow index: do not retain tombstones from the previous save.
+    // Remove it only after all archive entries have been restored successfully.
+    if (!hasShadowIndex) {
+        try { await container.removeEntry(SHADOW_INDEX_FILE); }
+        catch (err) { if ((err as DOMException).name !== "NotFoundError") throw err; }
     }
     Logger.log(LogCategory.SYSTEM, `save-import: "${gameId}" ← ${written} files`);
     return written;
