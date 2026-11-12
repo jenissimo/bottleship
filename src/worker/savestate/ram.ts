@@ -61,14 +61,7 @@ export function validateRamManifest(manifest: unknown, guestLength?: number): Ra
     return m as RamManifest;
 }
 
-/**
- * Hashes the guest's non-zero chunks and copies only those the store does not have yet, so
- * the memory held afterwards follows the delta. It runs in one turn, so nothing can change
- * guest RAM between the participants' records and this; writing the pending chunks
- * (writeRamChunks) can run after the guest resumes.
- */
-export function snapshotRam(mem: Uint8Array, known: ReadonlySet<string>, patches: readonly RamPatch[] = []): RamSnapshot {
-    const count = Math.ceil(mem.length / RAM_CHUNK_SIZE);
+function patchesByChunk(mem: Uint8Array, patches: readonly RamPatch[]): Map<number, Array<[number, number]>> {
     const patched = new Map<number, Array<[number, number]>>();
     for (const { address, bytes } of patches) {
         for (let k = 0; k < bytes.length; k++) {
@@ -80,6 +73,18 @@ export function snapshotRam(mem: Uint8Array, known: ReadonlySet<string>, patches
             list.push([a - i * RAM_CHUNK_SIZE, bytes[k]! & 0xff]);
         }
     }
+    return patched;
+}
+
+/**
+ * Hashes the guest's non-zero chunks and copies only those the store does not have yet, so
+ * the memory held afterwards follows the delta. It runs in one turn, so nothing can change
+ * guest RAM between the participants' records and this; writing the pending chunks
+ * (writeRamChunks) can run after the guest resumes.
+ */
+export function snapshotRam(mem: Uint8Array, known: ReadonlySet<string>, patches: readonly RamPatch[] = []): RamSnapshot {
+    const count = Math.ceil(mem.length / RAM_CHUNK_SIZE);
+    const patched = patchesByChunk(mem, patches);
     const manifest: RamManifest = { chunkSize: RAM_CHUNK_SIZE, length: mem.length, chunks: [] };
     const stats: RamCaptureStats = { chunks: count, knownZero: 0, scannedZero: 0, written: 0, reused: 0 };
     const pending = new Map<string, Uint8Array>();
@@ -96,6 +101,91 @@ export function snapshotRam(mem: Uint8Array, known: ReadonlySet<string>, patches
         if (known.has(hash) || pending.has(hash)) { stats.reused++; continue; }
         pending.set(hash, bytes);
     }
+    stats.written = pending.size;
+    return { manifest, pending, stats };
+}
+
+export const RAM_COPY_BUDGET = 256 * 1024 * 1024;
+export const RAM_COPY_BUDGET_UNKNOWN_DEVICE = 64 * 1024 * 1024;
+
+/**
+ * How much non-zero RAM a save may copy during the halt. A device that reports its memory
+ * gets a sixteenth of it, at most RAM_COPY_BUDGET; one that does not (WebKit, where an
+ * allocation that does not fit ends the process instead of throwing) gets the small cap.
+ * The rest of the RAM is hashed in place during the halt.
+ */
+export function ramCopyBudget(deviceMemoryGb: unknown = (globalThis as { navigator?: { deviceMemory?: unknown } }).navigator?.deviceMemory): number {
+    if (typeof deviceMemoryGb !== 'number' || !(deviceMemoryGb > 0)) return RAM_COPY_BUDGET_UNKNOWN_DEVICE;
+    return Math.min(RAM_COPY_BUDGET, Math.floor(deviceMemoryGb * 1024 * 1024 * 1024 / 16));
+}
+
+export interface RamCopy {
+    length: number;
+    chunks: Array<[index: number, bytes: Uint8Array | null, hash: string | null]>;
+    pending: Map<string, Uint8Array>;
+    stats: RamCaptureStats;
+    copied: number;
+}
+
+/**
+ * The part of a RAM snapshot that has to run while the guest is halted: it copies the
+ * non-zero chunks and leaves their hashing to hashRamCopy, which can run after the guest
+ * resumes. Past `budget` copied bytes, or when a copy cannot be allocated, the remaining
+ * chunks are hashed here and copied only if the store does not have them, as snapshotRam does.
+ */
+export function copyRam(mem: Uint8Array, known: ReadonlySet<string>, patches: readonly RamPatch[] = [], budget = ramCopyBudget()): RamCopy {
+    const count = Math.ceil(mem.length / RAM_CHUNK_SIZE);
+    const patched = patchesByChunk(mem, patches);
+    const out: RamCopy = { length: mem.length, chunks: [], pending: new Map(), stats: { chunks: count, knownZero: 0, scannedZero: 0, written: 0, reused: 0 }, copied: 0 };
+    let inline = budget <= 0;
+    for (let i = 0; i < count; i++) {
+        const base = i * RAM_CHUNK_SIZE;
+        const size = Math.min(RAM_CHUNK_SIZE, mem.length - base);
+        const fix = patched.get(i);
+        if (!fix && isGuestRangeKnownZero(mem, base, size)) { out.stats.knownZero++; continue; }
+        const view = mem.subarray(base, base + size);
+        if (!fix && isAllZero(view)) { out.stats.scannedZero++; continue; }
+        let bytes: Uint8Array | null = null;
+        if (fix) {
+            try { bytes = mem.slice(base, base + size); } catch (e) {
+                throw new Error(`ram: the patched chunk at 0x${base.toString(16)} could not be copied (${e instanceof Error ? e.message : String(e)}); try saving again`);
+            }
+        } else if (!inline) {
+            try { bytes = mem.slice(base, base + size); } catch { inline = true; }
+        }
+        if (bytes && fix) {
+            for (const [off, b] of fix) bytes[off] = b;
+            if (isAllZero(bytes)) { out.stats.scannedZero++; continue; }
+        }
+        if (bytes && !inline) {
+            out.chunks.push([i, bytes, null]);
+            out.copied += size;
+            if (out.copied >= budget) inline = true;
+            continue;
+        }
+        const hash = sha256HexSync(bytes ?? view);
+        out.chunks.push([i, null, hash]);
+        if (known.has(hash) || out.pending.has(hash)) { out.stats.reused++; continue; }
+        out.pending.set(hash, bytes ?? mem.slice(base, base + size));
+    }
+    return out;
+}
+
+/** Hashes the chunks copyRam copied and keeps only those the store does not have yet. */
+export async function hashRamCopy(copy: RamCopy, known: ReadonlySet<string>): Promise<RamSnapshot> {
+    const pending = copy.pending;
+    const stats = copy.stats;
+    await inLanes(copy.chunks, STORE_LANES, async (entry) => {
+        const bytes = entry[1];
+        if (!bytes) return;
+        const hash = await sha256Hex(bytes);
+        entry[2] = hash;
+        entry[1] = null;
+        if (known.has(hash) || pending.has(hash)) { stats.reused++; return; }
+        pending.set(hash, bytes);
+    });
+    const manifest: RamManifest = { chunkSize: RAM_CHUNK_SIZE, length: copy.length, chunks: [] };
+    for (const entry of copy.chunks) manifest.chunks.push([entry[0], entry[2]!]);
     stats.written = pending.size;
     return { manifest, pending, stats };
 }

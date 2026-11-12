@@ -1,10 +1,10 @@
 import { savestateParticipants, uncoveredModules, type CaptureContext, type CpuOverride, type ParticipantRegistry } from './participant';
-import { restoreRam, snapshotRam, validateRamManifest, type RamCaptureStats, type RamManifest, type RamPatch } from './ram';
+import { copyRam, hashRamCopy, restoreRam, validateRamManifest, type RamCaptureStats, type RamManifest, type RamPatch } from './ram';
 import type { ChunkStore } from './chunk-store';
 import {
-    decodeSavestate, encodeSavestate, incompatibilities, type CompatibilityKey, type Savestate,
+    decodeSavestate, encodeSavestateSections, incompatibilities, type CompatibilityKey, type Savestate,
 } from './container';
-import { encodeValue, type SaveValue } from './value-codec';
+import { encodeValue, type EncodedValue, type SaveValue } from './value-codec';
 import { CaptureRefusal, newObjectGraph, restoreObjectGraph } from './object-codecs';
 import { BLOBS, loadBlobs, missingBlobs, savedBlobs, type BlobList } from './blobs';
 
@@ -51,6 +51,7 @@ export interface CaptureResult {
     ram: RamCaptureStats;
     sections: Record<string, number>;
     captureMs: Record<string, number>;
+    ramCopyMs: number;
     ramHashMs: number;
 }
 
@@ -62,12 +63,13 @@ export function coverageRefusal(target: Pick<SavestateTarget, 'touchedModules'>,
 export async function captureSession(
     target: SavestateTarget, known: ReadonlySet<string>, stillReady: () => void = () => undefined,
     participants: ParticipantRegistry = savestateParticipants,
+    captured: () => void = () => undefined,
 ): Promise<CaptureResult> {
     const refusal = coverageRefusal(target, participants);
     if (refusal) throw new CaptureRefusal(refusal);
     for (const p of participants.all()) await p.prepare?.();
     stillReady();
-    const sections = new Map<string, SaveValue>();
+    const sections = new Map<string, EncodedValue>();
     const sizes: Record<string, number> = {};
     const captureMs: Record<string, number> = {};
     const run = newCaptureRun();
@@ -75,26 +77,23 @@ export async function captureSession(
         const started = performance.now();
         const value = p.capture(run);
         captureMs[p.id] = Math.round((performance.now() - started) * 10) / 10;
-        sections.set(p.id, value);
         const enc = encodeValue(value);
+        sections.set(p.id, enc);
         sizes[p.id] = enc.json.length + enc.blobs.reduce((n, b) => n + b.length, 0);
     }
-    sections.set(OBJECTS, run.objects as unknown as SaveValue);
+    sections.set(OBJECTS, encodeValue(run.objects as unknown as SaveValue));
     const blobs: BlobList = [...run.blobs].map(([hash, bytes]) => [hash, bytes.byteLength] as [string, number]).sort((a, b) => (a[0] < b[0] ? -1 : 1));
-    if (blobs.length > 0) sections.set(BLOBS, blobs);
+    if (blobs.length > 0) sections.set(BLOBS, encodeValue(blobs));
     const t0 = performance.now();
-    const snap = snapshotRam(target.guestMemory(), known, run.ramPatches);
-    const ramHashMs = performance.now() - t0;
-    for (const [hash, bytes] of run.blobs) if (!known.has(hash)) snap.pending.set(hash, bytes);
+    const copy = copyRam(target.guestMemory(), known, run.ramPatches);
+    const t1 = performance.now();
     stillReady();
-    const state: Savestate = {
-        header: {
-            key: target.compatibilityKey(), overlay: target.overlayState(),
-            createdAt: Date.now(), gameId: target.gameId(), ram: snap.manifest,
-        },
-        sections,
-    };
-    return { bytes: encodeSavestate(state), manifest: snap.manifest, pending: snap.pending, blobs, ram: snap.stats, sections: sizes, captureMs, ramHashMs };
+    const header = { key: target.compatibilityKey(), overlay: target.overlayState(), createdAt: Date.now(), gameId: target.gameId() };
+    captured();
+    const snap = await hashRamCopy(copy, known);
+    const ramHashMs = performance.now() - t1;
+    for (const [hash, bytes] of run.blobs) if (!known.has(hash)) snap.pending.set(hash, bytes);
+    return { bytes: encodeSavestateSections({ ...header, ram: snap.manifest }, sections), manifest: snap.manifest, pending: snap.pending, blobs, ram: snap.stats, sections: sizes, captureMs, ramCopyMs: t1 - t0, ramHashMs };
 }
 
 export interface LoadCheck { ok: boolean; reasons: string[]; overlayChanged: boolean; state: Savestate }
