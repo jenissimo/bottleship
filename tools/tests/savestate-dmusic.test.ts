@@ -40,6 +40,8 @@ function host(released: DirectMusicObject[] = []): DMusicHost {
             };
             return loader;
         },
+        readFile: () => null,
+        rebuildContents: () => false,
     };
 }
 
@@ -108,26 +110,37 @@ describe("dmusic objects", () => {
         expect(again).toBe(first);
     });
 
-    test("objects that play or load music are refused by name", () => {
+    test("objects that play music are refused by name, and so is a loaded object without its source", () => {
         registerDMusicCodecs(host());
         const named: Array<[unknown, string]> = [
             [new PerformanceObject(), "a DirectMusic performance"], [new PortObject(), "a DirectMusic port"],
-            [new SegmentObject(), "a DirectMusic segment"], [new SegmentStateObject(), "a DirectMusic segment state"],
-            [new StyleObject(), "a DirectMusic style"], [new BandObject(), "a DirectMusic band"], [new TrackObject(), "a DirectMusic track"],
+            [new SegmentStateObject(), "a DirectMusic segment state"],
         ];
         for (const [obj, what] of named) {
             expect(() => newObjectGraph().ref(obj, "x")).toThrow(CaptureRefusal);
-            expect(() => newObjectGraph().ref(obj, "x")).toThrow(what);
+            expect(() => newObjectGraph().ref(obj, "x")).toThrow(`dmusic: ${what} is not part of a v1 savestate`);
         }
         const loaded = new CollectionObject();
         loaded.fileName = "music.dls";
-        expect(() => newObjectGraph().ref(loaded, "x")).toThrow("a loaded DLS collection");
+        loaded.loaded = true;
+        expect(() => newObjectGraph().ref(loaded, "x")).toThrow("dmusic: a DLS collection that was not loaded from a stream, memory or a file");
         const dm = new DirectMusicObject();
         dm.ports.add(new PortObject());
         expect(() => newObjectGraph().ref(dm, "x")).toThrow("port");
         const cachingLoader = new LoaderObject();
-        cachingLoader.cache.set("c:\\game\\song.mid", new SegmentObject());
-        expect(() => newObjectGraph().ref(cachingLoader, "x")).toThrow("a DirectMusic segment");
+        const cached = new SegmentObject();
+        cached.loaded = true;
+        cachingLoader.cache.set("c:\\game\\song.mid", cached);
+        expect(() => newObjectGraph().ref(cachingLoader, "x")).toThrow("dmusic: a DirectMusic segment that was not loaded");
+    });
+
+    test("objects created but not loaded, and a track, round-trip", () => {
+        const track = new TrackObject();
+        track.classId = "d2ac2894-b39b-11d1-8704-00600893b1bd";
+        const { first, again, restored } = roundTrip([new SegmentObject(), new StyleObject(), new BandObject(), new CollectionObject(), track]);
+        expect(again).toBe(first);
+        expect(restored.map(o => (o as object).constructor)).toEqual([SegmentObject, StyleObject, BandObject, CollectionObject, TrackObject]);
+        expect((restored[4] as TrackObject).classId).toBe(track.classId);
     });
 
     test("every field of the saved objects has a policy", () => {

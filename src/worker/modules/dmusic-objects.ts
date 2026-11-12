@@ -73,6 +73,8 @@ export abstract class DMusicObject extends BaseComObject {
     }
 }
 
+export type ObjectSource = { bytes: Uint8Array } | { file: string; length: number; hash: string };
+
 const LOADABLE = { [IID_IDirectMusicObject]: "IDirectMusicObject", [IID_IPersistStream]: "IDirectMusicPersistStream", [IID_IPersist]: "IDirectMusicPersistStream" };
 
 /** A segment, style, band or collection: created empty, filled by IPersistStream::Load. */
@@ -84,6 +86,8 @@ export abstract class LoadableObject extends DMusicObject {
     loaded = false;
     /** Objects this one refers to, held for as long as it lives. */
     readonly references: DMusicObject[] = [];
+    source: ObjectSource | null = null;
+    resolved: Array<DMusicObject | null> = [];
 }
 
 export class LoaderObject extends DMusicObject {
@@ -144,6 +148,7 @@ export class SegmentObject extends LoadableObject {
     segment: PerfSegment | null = null;
     file: Segment | null = null;
     tracks: SegmentTrackInfo[] = [];
+    readonly commandEdits = new Map<number, [command: number, grooveLevel: number, grooveRange: number]>();
 }
 
 export class SegmentStateObject extends DMusicObject {
