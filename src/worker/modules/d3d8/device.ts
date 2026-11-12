@@ -6,6 +6,7 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory, LogLevel } from '../../core/logger';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { Mem } from '../../core/memory/mem-accessor';
+import { isValidAddress } from '../../core/memory/address-guard';
 import { sanitizeViewport } from '../../backends/webgpu/ddraw/types';
 import { devices, deviceBoundDepthStencil, addComRef, isComObjectLive, deviceRenderTargetOverride, surfaceInfo } from './shared-state';
 import { ensureBackBufferSurface } from './device-lifecycle';
@@ -70,7 +71,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
-    exports['IDirect3DDevice8_Clear'] = (_ctx, _mem, args) => {
+    exports['IDirect3DDevice8_Clear'] = (_ctx, mem, args) => {
         const device = devices.get(args[0]);
         if (!device) return D3DERR_INVALIDCALL;
 
@@ -87,6 +88,25 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         if (Flags & 2) parts.push('ZBUFFER');
         if (Flags & 4) parts.push('STENCIL');
         Logger.log(LogCategory.SYSTEM, `D3D8 Clear flags=${parts.join('|')||Flags} color=0x${(Color>>>0).toString(16)} z=${Z.toFixed(2)}`);
+        const count = args[1] >>> 0;
+        const pRects = args[2] >>> 0;
+        // A NULL array clears the viewport; a non-NULL empty array clears nothing.
+        if (pRects) {
+            if (count === 0) return D3D_OK;
+            if (pRects > mem.byteLength || count > Math.floor((mem.byteLength - pRects) / 16) ||
+                !isValidAddress(mem, pRects, count * 16, "r")) return D3DERR_INVALIDCALL;
+            const rects: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
+            for (let i = 0; i < count; i++) {
+                const p = pRects + i * 16;
+                const x1 = Mem.readInt32(p), y1 = Mem.readInt32(p + 4);
+                const x2 = Mem.readInt32(p + 8), y2 = Mem.readInt32(p + 12);
+                if (x1 === null || y1 === null || x2 === null || y2 === null) return D3DERR_INVALIDCALL;
+                if (x2 > x1 && y2 > y1) rects.push({ x1, y1, x2, y2 });
+            }
+            if (!rects.length) return D3D_OK;
+            device.clear(Flags, Color, Z, Stencil, rects);
+            return D3D_OK;
+        }
         device.clear(Flags, Color, Z, Stencil);
         return D3D_OK;
     };

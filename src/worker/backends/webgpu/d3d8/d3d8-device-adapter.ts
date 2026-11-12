@@ -2322,11 +2322,12 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         return 0;
     }
 
-    clear(flags: number, color: number, z: number, stencil: number): void {
+    clear(flags: number, color: number, z: number, stencil: number,
+        rects?: Array<{ x1: number; y1: number; x2: number; y2: number }>): void {
         this.flushProgrammablePending();
         const rt = this.activeRenderTarget;
         const vp = sanitizeViewport(this.viewport, rt.width, rt.height);
-        this.renderer.clear(rt, flags, color, z, vp, undefined, stencil);
+        this.renderer.clear(rt, flags, color, z, vp, rects, stencil);
     }
 
     async present(): Promise<number> {
