@@ -66,8 +66,34 @@ interface WalkFrame { pc: number; ret: number; frame: number; stack: number; }
 interface WalkState { frames: WalkFrame[]; index: number; lastPc: number; }
 
 /** Per-STACKFRAME-buffer walk position. Bounded: a handful of live walks is already odd. */
+// @participant(dbghelp)
 const walks = new Map<number, WalkState>();
 const MAX_LIVE_WALKS = 32;
+
+export type StackWalkRow = [framePtr: number, index: number, lastPc: number, frames: Uint32Array];
+
+export function captureStackWalks(): StackWalkRow[] {
+    return [...walks].map(([framePtr, state]) => [
+        framePtr, state.index, state.lastPc,
+        Uint32Array.from(state.frames.flatMap(f => [f.pc, f.ret, f.frame, f.stack])),
+    ]);
+}
+
+export function restoreStackWalks(rows: readonly StackWalkRow[]): void {
+    const next = new Map<number, WalkState>();
+    for (const [framePtr, index, lastPc, words] of rows) {
+        if (words.length % 4 !== 0) throw new Error(`dbghelp: a stack walk of ${words.length} words is not a list of frames`);
+        const frames: WalkFrame[] = [];
+        for (let i = 0; i < words.length; i += 4) frames.push({ pc: words[i]!, ret: words[i + 1]!, frame: words[i + 2]!, stack: words[i + 3]! });
+        next.set(framePtr, { frames, index, lastPc });
+    }
+    walks.clear();
+    for (const [framePtr, state] of next) walks.set(framePtr, state);
+}
+
+export function resetStackWalks(): void {
+    walks.clear();
+}
 
 /**
  * The module base an address belongs to. ModuleRegistry covers PE images the guest
