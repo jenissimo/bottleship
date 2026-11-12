@@ -167,8 +167,11 @@ export async function writePendingLoad(storage: SavestateStorage, game: string, 
 
 export async function requestLoadOnNextBoot(slot: string): Promise<void> {
     const game = gameDir();
-    if (!(await (await gameStore(game)).read(checkSlotName(slot)))) throw new Error(`savestate: slot ${slot} is empty`);
-    await writePendingLoad(opfsStorage, game, slot, Date.now());
+    checkSlotName(slot);
+    await withGameLock(game, async () => {
+        if (!(await (await gameStore(game)).read(slot))) throw new Error(`savestate: slot ${slot} is empty`);
+        await writePendingLoad(opfsStorage, game, slot, Date.now());
+    });
 }
 
 export type PendingLoadOutcome =
@@ -235,18 +238,22 @@ export function lastLoad(): LastLoad | null {
 export async function listSlots(): Promise<{ gameId: string; game: string; slots: SlotInfo[] }> {
     const game = gameDir();
     const t = target('');
-    const list = await (await gameStore(game)).list((state) => {
+    const list = await withGameLock(game, async () => (await gameStore(game)).list((state) => {
         const reasons = incompatibilities(state.header.key, t.compatibilityKey());
         if (state.header.gameId !== t.gameId()) reasons.unshift('other game');
         return reasons;
-    });
+    }));
     return { gameId: t.gameId(), game, slots: list };
 }
 
 export async function deleteSlot(slot: string): Promise<{ removedChunks: number }> {
     const game = gameDir();
     checkSlotName(slot);
-    return withGameLock(game, async () => ({ removedChunks: await (await gameStore(game)).remove(slot) }));
+    return withGameLock(game, async () => {
+        const store = await gameStore(game);
+        await store.chunkStore.sweep?.();
+        return { removedChunks: await store.remove(slot) };
+    });
 }
 
 export interface SaveReport {
@@ -261,6 +268,7 @@ export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, p
     if (early) throw new CaptureRefusal(early);
     return withGameLock(game, async () => {
         const store = await gameStore(game);
+        await store.chunkStore.sweep?.();
         const known = new Set(await store.chunkStore.list());
         const t = target(await overlayDigest());
         const t0 = performance.now();

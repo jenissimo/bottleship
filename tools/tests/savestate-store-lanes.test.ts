@@ -205,7 +205,7 @@ describe("packed chunk store", () => {
         expect(dir.files.size).toBe(0);
     });
 
-    test("leftovers are cleaned at open: a pack without an index, an index without its pack, a broken index, and the loose chunk files of the layout before packs", async () => {
+    test("opening removes nothing; leftovers go in sweep: a pack without an index, an index without its pack, a broken index", async () => {
         const dir = new MemoryPackDir();
         const store = await PackedChunkStore.open(dir);
         const pending = await chunks(3);
@@ -213,18 +213,142 @@ describe("packed chunk store", () => {
         await writeRamChunks(pending, store);
         const pack = packsOf(dir)[0]!;
         dir.files.set("pabc-1.pack", new Uint8Array(10));
-        dir.files.set("pabc-2.pack.idx", new TextEncoder().encode(JSON.stringify({ v: 1, pack: "pabc-2.pack", chunks: [] })));
+        dir.files.set("pabc-2.pack.idx", new TextEncoder().encode(JSON.stringify({ v: 1, pack: "pabc-2.pack", bytes: 0, chunks: [] })));
         dir.files.set("pabc-3.pack", new Uint8Array(4));
         dir.files.set("pabc-3.pack.idx", new TextEncoder().encode("{not json"));
-        const loose: string[] = [];
-        for (let i = 0; i < 40; i++) { loose.push(await sha256Hex(new Uint8Array([1, 2, i]))); dir.files.set(loose[i]!, new Uint8Array([0, 1, 2, 3])); }
         dir.files.set("notes.txt", new Uint8Array(1));
+        const before = [...dir.files.keys()].sort();
         const reopened = await PackedChunkStore.open(dir);
-        expect([...dir.files.keys()].sort()).toEqual(["notes.txt", pack, pack + ".idx"].sort());
+        expect([...dir.files.keys()].sort()).toEqual(before);
         expect((await reopened.list()).sort()).toEqual(hashes.slice().sort());
-        expect(await reopened.has(loose[0]!)).toBe(false);
-        expect(await reopened.get(loose[0]!)).toBeNull();
-        expect(await reopened.size(loose[0]!)).toBe(0);
+        expect(await reopened.sweep()).toEqual({ removed: 4, migrated: 0 });
+        expect([...dir.files.keys()].sort()).toEqual(["notes.txt", pack, pack + ".idx"].sort());
+        expect(await reopened.sweep()).toEqual({ removed: 0, migrated: 0 });
+    });
+
+    test("a pack whose index is not written yet survives another open, and the save that owns it completes", async () => {
+        const dir = new MemoryPackDir();
+        const saving = await PackedChunkStore.open(dir);
+        const pending = await chunks(4);
+        const hashes = [...pending.keys()];
+        const write = dir.write.bind(dir);
+        let release!: () => void;
+        const gate = new Promise<void>(r => { release = r; });
+        let listed: string[] | null = null;
+        dir.write = async (name, bytes) => {
+            if (name.endsWith(".idx")) {
+                listed = await (await PackedChunkStore.open(dir)).list();
+                await gate;
+            }
+            await write(name, bytes);
+        };
+        const done = writeRamChunks(pending, saving);
+        await new Promise(r => setTimeout(r, 5));
+        expect(packsOf(dir).length).toBe(1);
+        release();
+        await done;
+        expect(listed).toEqual([]);
+        const after = await PackedChunkStore.open(dir);
+        expect((await after.list()).sort()).toEqual(hashes.slice().sort());
+        for (const hash of hashes) expect((await readChunk(after, hash, RAM_CHUNK_SIZE)).byteLength).toBe(RAM_CHUNK_SIZE);
+    });
+
+    test("a save whose index cannot be written adopts nothing and leaves one orphan pack that the next sweep removes", async () => {
+        const dir = new MemoryPackDir();
+        const store = await PackedChunkStore.open(dir);
+        const pending = await chunks(3);
+        const hashes = [...pending.keys()];
+        const write = dir.write.bind(dir);
+        dir.write = async (name, bytes) => { if (name.endsWith(".idx")) throw new Error("quota"); await write(name, bytes); };
+        expect(await writeRamChunks(pending, store).catch(e => (e as Error).message)).toBe("quota");
+        expect(pending.size).toBe(3);
+        expect(await store.has(hashes[0]!)).toBe(false);
+        expect(await store.list()).toEqual([]);
+        dir.write = write;
+        const next = await PackedChunkStore.open(dir);
+        expect(await next.list()).toEqual([]);
+        expect(await next.sweep()).toEqual({ removed: 1, migrated: 0 });
+        expect(dir.files.size).toBe(0);
+        await writeRamChunks(pending, next);
+        expect((await next.list()).sort()).toEqual(hashes.slice().sort());
+    });
+
+    test("loose chunk files of the layout before packs stay readable and are moved into a pack by sweep; a failed move keeps them", async () => {
+        const dir = new MemoryPackDir();
+        const body = new Map<string, Uint8Array>();
+        for (let i = 0; i < 40; i++) {
+            const file = new Uint8Array([0, 1, 2, i]);
+            const hash = await sha256Hex(new Uint8Array([9, i]));
+            body.set(hash, file);
+            dir.files.set(hash, file);
+        }
+        const hashes = [...body.keys()];
+        const store = await PackedChunkStore.open(dir);
+        expect((await store.list()).sort()).toEqual(hashes.slice().sort());
+        expect(await store.has(hashes[3]!)).toBe(true);
+        expect(await store.size(hashes[3]!)).toBe(4);
+        expect([...(await store.get(hashes[3]!))!]).toEqual([...body.get(hashes[3]!)!]);
+        expect(dir.files.size).toBe(40);
+
+        const write = dir.write.bind(dir);
+        dir.write = async () => { throw new Error("quota"); };
+        expect(await store.sweep().catch(e => (e as Error).message)).toBe("quota");
+        dir.write = write;
+        expect([...(await store.get(hashes[3]!))!]).toEqual([...body.get(hashes[3]!)!]);
+        for (const hash of hashes) expect(dir.files.has(hash)).toBe(true);
+
+        const again = await PackedChunkStore.open(dir);
+        expect((await again.sweep()).migrated).toBe(40);
+        expect(packsOf(dir).length).toBe(1);
+        expect([...dir.files.keys()].filter(n => /^[0-9a-f]{64}$/.test(n))).toEqual([]);
+        const reopened = await PackedChunkStore.open(dir);
+        for (const hash of hashes) expect([...(await reopened.get(hash))!]).toEqual([...body.get(hash)!]);
+        await reopened.delete(hashes[0]!);
+        expect(await reopened.has(hashes[0]!)).toBe(false);
+    });
+
+    test("a reopened store still knows a pack's real size, so a pack that is mostly dead is compacted", async () => {
+        const dir = new MemoryPackDir();
+        const store = await PackedChunkStore.open(dir);
+        const items: Array<[string, Uint8Array]> = [];
+        for (let i = 0; i < 10; i++) items.push([await sha256Hex(new Uint8Array([7, i])), new Uint8Array(1000).fill(i + 1)]);
+        await store.putMany(items);
+        const pack = packsOf(dir)[0]!;
+        expect(dir.files.get(pack)!.byteLength).toBe(10000);
+        await store.deleteMany(items.slice(6).map(([hash]) => hash));
+        expect(packsOf(dir)).toEqual([pack]);
+        const reopened = await PackedChunkStore.open(dir);
+        await reopened.deleteMany(items.slice(3, 6).map(([hash]) => hash));
+        expect(packsOf(dir).length).toBe(1);
+        expect(packsOf(dir)[0]).not.toBe(pack);
+        expect(dir.files.get(packsOf(dir)[0]!)!.byteLength).toBe(3000);
+        const last = await PackedChunkStore.open(dir);
+        for (const [hash, bytes] of items.slice(0, 3)) expect([...(await last.get(hash))!]).toEqual([...bytes]);
+    });
+
+    test("a compaction that cannot write keeps the old pack readable for the next open", async () => {
+        const dir = new MemoryPackDir();
+        const store = await PackedChunkStore.open(dir);
+        const items: Array<[string, Uint8Array]> = [];
+        for (let i = 0; i < 4; i++) items.push([await sha256Hex(new Uint8Array([5, i])), new Uint8Array(100).fill(i + 1)]);
+        await store.putMany(items);
+        const write = dir.write.bind(dir);
+        dir.write = async () => { throw new Error("quota"); };
+        expect(await store.deleteMany(items.slice(1).map(([hash]) => hash)).catch(e => (e as Error).message)).toBe("quota");
+        dir.write = write;
+        const reopened = await PackedChunkStore.open(dir);
+        expect([...(await reopened.get(items[0]![0]))!]).toEqual([...items[0]![1]]);
+    });
+
+    test("a save larger than the pack limit is split into several packs", async () => {
+        const dir = new MemoryPackDir();
+        const store = await PackedChunkStore.open(dir, 2500);
+        const items: Array<[string, Uint8Array]> = [];
+        for (let i = 0; i < 7; i++) items.push([await sha256Hex(new Uint8Array([3, i])), new Uint8Array(1000).fill(i + 1)]);
+        await store.putMany(items);
+        expect(packsOf(dir).map(n => dir.files.get(n)!.byteLength).sort()).toEqual([1000, 2000, 2000, 2000]);
+        const reopened = await PackedChunkStore.open(dir, 2500);
+        for (const [hash, bytes] of items) expect([...(await reopened.get(hash))!]).toEqual([...bytes]);
     });
 
     test("fifty saves and collections leave only what the last manifest names", async () => {
