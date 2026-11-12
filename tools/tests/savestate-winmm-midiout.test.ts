@@ -439,6 +439,16 @@ describe("winmm MIDI output savestate", () => {
     });
 });
 
+describe("MIDI output field policies", () => {
+    test("every instance field of the device table and of the synthesizer output has a policy", () => {
+        const r = rig();
+        expect(Object.keys(r.midi).sort()).toEqual(Object.keys(MIDI_OUT_FIELDS).sort());
+        expect(Object.keys(r.output).sort()).toEqual(Object.keys(MIDI_OUTPUT_FIELDS).sort());
+        expect(Object.keys(r.midi.handles.get(r.h)!).sort()).toEqual(Object.keys(MIDI_HANDLE_FIELDS).sort());
+        expect(r.midi.close(r.h)).toBe(0);
+    });
+});
+
 describe("winmm participant with MIDI output", () => {
     function module(): WinMM & Internals {
         const w = new WinMM() as WinMM & Internals;
@@ -488,11 +498,18 @@ describe("winmm participant with MIDI output", () => {
         expect(queued(fresh)).toEqual([[h, MOM_CLOSE, INSTANCE, 0, 0]]);
     });
 
-    test("negative control: a queued multimedia timer callback keeps its own refusal", () => {
+    test("a queued multimedia timer callback is saved next to the MIDI state and does not refuse", () => {
         const w = module();
         (w.pendingTimerCallbacks as unknown[]).push({ callbackAddr: 1, timerId: 3, dwUser: 0 });
-        expect(() => w.captureSavestate()).toThrow("multimedia timer callback");
-        expect(() => w.captureSavestate()).not.toThrow("MIDI");
+        const state = w.captureSavestate();
+        expect(state.queued).toEqual([{ callback: 1, timerId: 3, dwUser: 0, args: null, timer: null, expired: null }]);
+        expect(state.midiOut!.handles).toEqual([]);
+    });
+
+    test("only a callback the MIDI device posted refuses as one: another posted callback whose second argument is in the MOM range is saved", () => {
+        const w = module();
+        (w.pendingTimerCallbacks as unknown[]).push({ callbackAddr: 1, timerId: 0, dwUser: 0, args: [7, MOM_DONE, 0, 0, 0] });
+        expect(w.captureSavestate().queued).toEqual([{ callback: 1, timerId: 0, dwUser: 0, args: [7, MOM_DONE, 0, 0, 0], timer: null, expired: null }]);
     });
 
     test("an open MCI device still refuses", () => {
@@ -515,7 +532,7 @@ describe("winmm participant with MIDI output", () => {
         const stored = savestateParticipants.all().find(x => x.id === "winmm")!.capture(graph as never);
         offSource();
         const inner = w.captureSavestate();
-        expect(inner.waveDone).toEqual([{ callback: CALLBACK, args: [0x20000001, WOM_DONE, INSTANCE, HDR, 0] }]);
+        expect(inner.queued).toEqual([{ callback: CALLBACK, timerId: 0x20000001, dwUser: INSTANCE, args: [0x20000001, WOM_DONE, INSTANCE, HDR, 0], timer: null, expired: null }]);
         expect(inner.midiOut!.handles.map(x => x.handle)).toEqual([h]);
 
         const fresh = module();
@@ -531,12 +548,12 @@ describe("winmm participant with MIDI output", () => {
         }
     });
 
-    test("version 4 with a pinned schema", () => {
+    test("version 5 with a pinned schema", () => {
         const w = new WinMM();
         const off = w.registerSavestate();
         try {
-            expect(savestateParticipants.all().find(x => x.id === "winmm")!.version).toBe(4);
-            expect(schemaHash(WINMM_SCHEMA as unknown as SaveValue)).toBe("b4123d23bf913087");
+            expect(savestateParticipants.all().find(x => x.id === "winmm")!.version).toBe(5);
+            expect(schemaHash(WINMM_SCHEMA as unknown as SaveValue)).toBe("2bb8fff2cd33ccfe");
         } finally {
             off();
         }

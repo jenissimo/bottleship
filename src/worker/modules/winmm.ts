@@ -84,8 +84,6 @@ const JOYERR_UNPLUGGED = 167;
 
 // waveOut callback messages
 const WOM_DONE = 0x3BD;
-const MOM_OPEN = 0x3C7;
-const MOM_DONE = 0x3C9;
 
 // waveOut callback type flags
 const CALLBACK_NULL = 0x00000000;
@@ -449,6 +447,8 @@ export interface PendingTimerCallback {
     args?: number[];
     /** Runs once the guest callback has returned (a thread-pool callback instance ending). */
     onReturn?: () => void;
+    /** Posted by the MIDI output device (MOM_OPEN, MOM_CLOSE, MOM_DONE). */
+    midi?: true;
 }
 
 export interface WaveFormat {
@@ -605,7 +605,7 @@ export class WinMM implements IModule {
         if ((this.mci?.openDeviceCount() ?? 0) > 0) throw new Error('winmm: open MCI devices are not part of a v1 savestate');
         const queued = this.pendingTimerCallbacks.slice(this.pendingTimerHead);
         const inCallback = this.dispatchingPosted ? [...queued, this.dispatchingPosted] : queued;
-        if (inCallback.some(cb => cb.args !== undefined && cb.args[1]! >= MOM_OPEN && cb.args[1]! <= MOM_DONE)) {
+        if (inCallback.some(cb => cb.midi === true)) {
             throw new Error('winmm: a MIDI output callback (MOM_OPEN, MOM_CLOSE or MOM_DONE) is queued or running; try saving again');
         }
         if (queued.some(cb => cb.onReturn) || this.dispatchingPosted) {
@@ -2256,7 +2256,7 @@ export class WinMM implements IModule {
         this.midiOut = new WinmmMidiOut({
             callFunction: (callbackAddr, args) => {
                 this.ensureTimerThread();
-                this.enqueueTimerCallback({ callbackAddr, timerId: 0, dwUser: args[2] ?? 0, args });
+                this.enqueueTimerCallback({ callbackAddr, timerId: 0, dwUser: args[2] ?? 0, args, midi: true });
             },
         });
         registerWinmmMidiOutExports(this.exports, this.midiOut);
