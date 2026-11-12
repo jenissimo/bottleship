@@ -994,6 +994,11 @@ export class WindowManager {
     }
 
     // Legacy compatibility
+    /** See MessageQueue.takeNewMouseMove. */
+    takeNewMouseMove(callerThreadId: number): boolean {
+        return this.messageQueue.takeNewMouseMove(callerThreadId);
+    }
+
     hasPendingMoveSetCursor(msgMin = 0, msgMax = 0, callerThreadId = 0): boolean {
         return this.messageQueue.hasPendingMoveSetCursor(msgMin, msgMax, callerThreadId);
     }
