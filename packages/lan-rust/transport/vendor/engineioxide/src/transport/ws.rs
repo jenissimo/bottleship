@@ -213,7 +213,7 @@ where
 {
     while let Some(msg) = rx.try_next().await? {
         match msg {
-            Message::Text(msg) => match Packet::parse(socket.protocol, ws_bytes_to_str(msg))? {
+            Message::Text(msg) => match super::parse_packet(socket.protocol, ws_bytes_to_str(msg))? {
                 Packet::Close => {
                     #[cfg(feature = "tracing")]
                     tracing::debug!("[sid={}] closing session", socket.id);
@@ -377,7 +377,7 @@ where
         Some(Ok(Message::Text(d))) => d,
         _ => Err(Error::Upgrade)?,
     };
-    match Packet::parse(socket.protocol, ws_bytes_to_str(msg))? {
+    match super::parse_packet(socket.protocol, ws_bytes_to_str(msg))? {
         Packet::PingUpgrade => {
             #[cfg(feature = "tracing")]
             tracing::debug!("received first ping upgrade");
@@ -402,7 +402,7 @@ where
             Err(Error::Upgrade)?
         }
     };
-    match Packet::parse(socket.protocol, ws_bytes_to_str(msg))? {
+    match super::parse_packet(socket.protocol, ws_bytes_to_str(msg))? {
         Packet::Upgrade => {
             #[cfg(feature = "tracing")]
             tracing::debug!("ws upgraded successfully")

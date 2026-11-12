@@ -717,6 +717,36 @@ async fn sr07_unicode_packet_retires_only_sender_and_returns_all_credits() {
     assert_eq!(handle.metrics().ingress.records,0);
     assert_eq!(handle.metrics().output.records,0);
 }
+static CHAR_BOUNDARY_PANICS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[tokio::test]
+async fn sr07_multibyte_engine_packet_type_is_rejected_without_panic_on_both_transports() {
+    // engineioxide-core slices value[1..6] for six-byte Engine.IO packets before it
+    // checks the type byte. Count that panic explicitly: a panicking connection task
+    // may otherwise look like an ordinary close.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if info.to_string().contains("char boundary") {
+            CHAR_BOUNDARY_PANICS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        previous(info)
+    }));
+    let mut server=bind("127.0.0.1:0".parse().unwrap(),Config::default()).await.unwrap();
+    let (mut attacker,id)=websocket(&mut server).await;
+    attacker.send(Message::Text("\u{e9}abcd".into())).await.unwrap();
+    let closed=item(&mut server).await;
+    assert_eq!(closed.connection,id);assert!(matches!(closed.kind,IncomingKind::Closed{..}));drop(closed);
+    let (sid,polled)=polling(&mut server).await;
+    let path=format!("/socket.io/?EIO=4&transport=polling&sid={sid}");
+    let (status,_)=request(server.address,"POST",&path,"\u{e9}abcd",None).await;
+    assert_eq!(status,400);
+    let closed=item(&mut server).await;
+    assert_eq!(closed.connection,polled);assert!(matches!(closed.kind,IncomingKind::Closed{..}));drop(closed);
+    let (mut healthy,healthy_id)=websocket(&mut server).await;
+    assert!(server.handle.is_live(healthy_id));
+    healthy.close(None).await.unwrap();drop(item(&mut server).await);
+    server.shutdown().await;
+    assert_eq!(CHAR_BOUNDARY_PANICS.load(std::sync::atomic::Ordering::SeqCst),0);
+}
 #[tokio::test]
 async fn sr08_data_exhaustion_preserves_reserved_departure_capacity_and_session_credit() {
     let mut server=bind("127.0.0.1:0".parse().unwrap(),Config{output_records:1,max_connections:2,..Default::default()}).await.unwrap();
