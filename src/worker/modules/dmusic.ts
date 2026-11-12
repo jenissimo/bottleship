@@ -50,7 +50,7 @@ import {
     CLSID_DirectMusicComposer, CLSID_DirectMusicLoader, CLSID_DirectMusicPerformance, CLSID_DirectMusicSegment,
     CLSID_DirectMusicStyle, CLSID_DirectMusicSynth, CollectionObject, ComposerObject, DirectMusicObject, DMusicObject,
     IID_IDirectMusicCollection, IID_IDirectMusicGetLoader, IID_IDirectMusicStyle, IID_IUnknown, LoadableObject,
-    LoaderObject, type ObjectSource, PerformanceObject, PortObject, SegmentObject, SegmentStateObject, StyleObject, TrackObject,
+    LoaderObject, type MadeSource, type ObjectSource, PerformanceObject, PortObject, SegmentObject, SegmentStateObject, StyleObject, TrackObject,
 } from "./dmusic-objects";
 import { createSinkBuffer, DirectSoundSink, sinkBufferBytes, soundReference, writeWaveFormat } from "./dmusic-sink";
 import { registerDMusicParticipant } from "./dmusic-savestate";
@@ -135,6 +135,8 @@ const DEFAULT_COLLECTION_PATHS = ["C:\\WINDOWS\\SYSTEM32\\DRIVERS\\GM.DLS", "C:\
 /** The most a loadable object reads from its stream. */
 const MAX_OBJECT_BYTES = 64 * 1024 * 1024;
 
+const FIXED_STYLE = -2;
+
 type FoundReference = (ref: ObjectReference) => DMusicObject | null;
 
 interface LoadPlan {
@@ -205,6 +207,7 @@ export class DMusic implements IModule {
     private readonly performances = new Set<PerformanceObject>();
     private readonly loading = new Set<LoadableObject>();
     private pumpTimer: number | null = null;
+    private collectionObjects = new WeakMap<DlsCollection, CollectionObject>();
 
     constructor() {
         setTimerHandler(TimerKind.DMUSIC_SYNTH, () => this.pump());
@@ -337,7 +340,7 @@ export class DMusic implements IModule {
             case CLSID_DirectMusicPerformance: {
                 const perf = new PerformanceObject();
                 this.performances.add(perf);
-                perf.onDestroy = () => { this.closePerformance(perf); this.performances.delete(perf); };
+                this.wirePerformance(perf);
                 obj = perf;
                 break;
             }
@@ -510,7 +513,10 @@ export class DMusic implements IModule {
 
     private holdReferences(obj: LoadableObject): void {
         if (!obj.onDestroy) {
-            obj.onDestroy = () => { for (const target of obj.references.splice(0)) target.release(); };
+            obj.onDestroy = () => {
+                for (const target of obj.references.splice(0)) target.release();
+                obj.resolved = [];
+            };
         }
     }
 
@@ -528,8 +534,10 @@ export class DMusic implements IModule {
         const collections = yield* this.resolveReferences(stream, plan.collections, IID_IDirectMusicCollection, obj);
         const found: FoundReference = (ref) => styles.get(ref) ?? collections.get(ref) ?? null;
         const partial = plan.build(found);
-        obj.resolved = [...plan.styles, ...plan.collections].map(found);
-        if (savestatesEnabled()) obj.source = { bytes };
+        if (savestatesEnabled()) {
+            obj.resolved = [...plan.styles, ...plan.collections].map(found);
+            obj.source = { bytes };
+        }
         obj.loaded = true;
         Logger.log(LogCategory.COM,
             `[DMusic] loaded ${obj.constructor.name} "${obj.identity.name || obj.fileName}" (${bytes.length} bytes)${partial ? " — partial" : ""}`);
@@ -550,6 +558,7 @@ export class DMusic implements IModule {
         if (obj instanceof CollectionObject) {
             obj.collection = parseDls(bytes);
             if (!obj.collection) return DMUS_E_LOADER_FORMATNOTSUPPORTED;
+            this.collectionObjects.set(obj.collection, obj);
             obj.identity = obj.collection.identity;
             return { styles: [], collections: [], build: () => partial };
         }
@@ -607,6 +616,62 @@ export class DMusic implements IModule {
             };
         }
         return E_NOTIMPL;
+    }
+
+    private buildMade(origin: DMusicObject | null, made: MadeSource, into?: LoadableObject): LoadableObject | null {
+        if (made.made === "band-segment") {
+            if (!(origin instanceof BandObject) || !origin.band) return null;
+            return this.wrapSegment(PerfSegment.band(origin.band), origin.identity.name, into);
+        }
+        if (made.made === "transition") {
+            const from = origin instanceof SegmentObject ? origin.segment : null;
+            const style = made.style === FIXED_STYLE ? from?.fixedPattern?.style : from?.styles[made.style]?.style;
+            return style ? this.wrapSegment(PerfSegment.transition(style, made.tempo, made.command, made.grooveLevel), "Transition", into) : null;
+        }
+        if (!(origin instanceof StyleObject) || !origin.style) return null;
+        if (made.made === "style-band") {
+            const loaded = origin.bands[made.index];
+            if (!loaded || (into && !(into instanceof BandObject))) return null;
+            const band = into ?? new BandObject();
+            band.band = loaded;
+            band.file = loaded.band;
+            band.identity = { ...loaded.band.identity };
+            band.loaded = true;
+            return band;
+        }
+        const motif = origin.style.motifs[made.index];
+        if (!motif) return null;
+        const segment = PerfSegment.motif(origin.style, motif);
+        // A motif with a band of its own installs it as it starts.
+        if (motif.band) {
+            const pool = origin.bands.flatMap((b) => b.band.instruments.map((inst, i) => ({ inst, collection: b.collections[i] ?? null })));
+            segment.bands = [{ time: 0, band: loadBand(motif.band, (ref) =>
+                pool.find((p) => p.inst.collection?.fileName === ref.fileName && p.collection)?.collection ?? null) }];
+        }
+        return this.wrapSegment(segment, motif.name, into);
+    }
+
+    private madeBy<T extends LoadableObject>(obj: T, origin: LoadableObject, made: MadeSource): T {
+        origin.addRef();
+        obj.references.push(origin);
+        this.holdReferences(obj);
+        obj.resolved = [origin];
+        obj.source = { ...made, of: origin.source };
+        return obj;
+    }
+
+    private makeFrom(origin: LoadableObject, made: MadeSource): LoadableObject | null {
+        const obj = this.buildMade(origin, made);
+        return obj && savestatesEnabled() ? this.madeBy(obj, origin, made) : obj;
+    }
+
+    private rebuildMade(obj: LoadableObject, origin: DMusicObject | null, made: MadeSource): boolean {
+        if (!(origin instanceof LoadableObject) || !this.buildMade(origin, made, obj)) return false;
+        obj.references.push(origin);
+        this.holdReferences(obj);
+        obj.resolved = [origin];
+        obj.source = { ...made, of: origin.source };
+        return true;
     }
 
     private rebuildContents(obj: LoadableObject, source: ObjectSource, bytes: Uint8Array, resolved: Array<DMusicObject | null>): boolean {
@@ -724,16 +789,36 @@ export class DMusic implements IModule {
             wireLoader: (loader) => this.wireLoader(loader),
             readFile: (path) => this.readSystemFile([path]),
             rebuildContents: (obj, source, bytes, resolved) => this.rebuildContents(obj, source, bytes, resolved),
+            rebuildMade: (obj, origin, made) => this.rebuildMade(obj, origin, made),
+            adoptCollection: (obj) => { if (obj.collection) this.collectionObjects.set(obj.collection, obj); },
+            collectionObject: (collection) => {
+                const obj = this.collectionObjects.get(collection);
+                return obj && obj.collection === collection && obj.refCount > 0 ? obj : null;
+            },
+            wirePerformance: (perf) => this.wirePerformance(perf),
+            wirePort: (port) => this.wirePort(port),
+            wireState: (obj) => this.wireState(obj),
+            wirePath: (path) => this.wirePath(path),
+            newSink: (buffer, channels, sampleRate) => new DirectSoundSink(this.process, buffer, channels, sampleRate ?? DMusic.PATH_RATE),
+            newEngine: (perf, port) => this.newEngine(perf, port),
+            moduleState: () => ({
+                performances: [...this.performances], ports: [...this.ports], pathOutputs: [...this.pathOutputs],
+                messages: [...this.messages], pumpTimer: this.pumpTimer,
+            }),
+            restoreModuleState: (state) => {
+                for (const [set, list] of [[this.performances, state.performances], [this.ports, state.ports], [this.pathOutputs, state.pathOutputs]] as const) {
+                    (set as Set<DMusicObject>).clear();
+                    for (const obj of list) (set as Set<DMusicObject>).add(obj);
+                }
+                this.messages.clear();
+                for (const [ptr, obj] of state.messages) this.messages.set(ptr, obj);
+                this.pumpTimer = state.pumpTimer;
+            },
         });
     }
 
     savestateRefusal(): string | null {
-        if (this.performances.size > 0 || this.ports.size > 0) return 'dmusic: a DirectMusic performance or port is not part of a v1 savestate';
-        if (this.loading.size > 0) return 'dmusic: an object is still loading';
-        if (this.messages.size > 0) return 'dmusic: performance messages are still allocated';
-        if (this.pumpTimer !== null) return 'dmusic: the synth pump is running';
-        if (this.pathOutputs.size > 0) return 'dmusic: an audio path with its own buffer is not part of a savestate';
-        return null;
+        return this.loading.size > 0 ? 'dmusic: an object is still loading; try saving again' : null;
     }
 
     // ── system loader ───────────────────────────────────────────────────────────
@@ -748,6 +833,7 @@ export class DMusic implements IModule {
         obj.identity.objectId = GUID_DefaultGMCollection;
         obj.identity.name = "GM";
         obj.collection = this.defaultGmCollection();
+        this.collectionObjects.set(obj.collection, obj);
         obj.loaded = true;
         loader.defaultCollection = obj;
         return obj;
@@ -860,7 +946,7 @@ export class DMusic implements IModule {
         obj.fileName = fileName;
         obj.segment = buildSegment(file, () => null, (ref) => ref.objectId === GUID_DefaultGMCollection ? gm.collection : null);
         obj.tracks = file.tracks.map((t) => ({ classId: t.classId, group: t.group, object: null }));
-        obj.resolved = [gm];
+        if (into || savestatesEnabled()) obj.resolved = [gm];
         obj.loaded = true;
         return obj;
     }
@@ -990,15 +1076,31 @@ export class DMusic implements IModule {
         if (obj && obj.refCount > 0) return obj;
         obj = new SegmentStateObject();
         obj.state = state;
-        const made = obj;
-        obj.onDestroy = () => {
-            if (perf.stateObjects.get(state) === made) perf.stateObjects.delete(state);
-            obj.segment?.release();
-            obj.segment = null;
-        };
+        obj.performance = perf;
+        this.wireState(obj);
         perf.stateObjects.set(state, obj);
         // The performance owns the creation reference until the state ends or it closes.
         return obj;
+    }
+
+    private wireState(obj: SegmentStateObject): void {
+        obj.onDestroy = () => {
+            const state = obj.state;
+            if (state && obj.performance?.stateObjects.get(state) === obj) obj.performance.stateObjects.delete(state);
+            obj.segment?.release();
+            obj.segment = null;
+        };
+    }
+
+    private wirePerformance(perf: PerformanceObject): void {
+        perf.onDestroy = () => { this.closePerformance(perf); this.performances.delete(perf); };
+    }
+
+    private newEngine(perf: PerformanceObject, port: PortObject): Performance {
+        const engine = new Performance(port.synth);
+        if (savestatesEnabled()) engine.seedRandom(Math.random() * 0x100000000);
+        engine.onNotification = (type, state, time) => this.notify(perf, type, state, time);
+        return engine;
     }
 
     /** Hand a state object to the guest at `ppOut` (optional); the guest owns that reference. */
@@ -1078,10 +1180,9 @@ export class DMusic implements IModule {
         port.addRef();
         port.performance = perf;
         perf.port = port;
-        const engine = new Performance(port.synth);
+        const engine = this.newEngine(perf, port);
         engine.setMasterTempo(perf.masterTempo);
         port.synth.setMasterVolume(perf.masterVolume);
-        engine.onNotification = (type, state, time) => this.notify(perf, type, state, time);
         perf.engine = engine;
     }
 
@@ -1104,20 +1205,25 @@ export class DMusic implements IModule {
         port.voices = voices;
         port.synth = new DlsSynth(sampleRate, voices);
         this.setDirectSound(port, dm?.directSound ?? 0);
+        port.owner = dm;
         dm?.ports.add(port);
         this.ports.add(port);
+        this.wirePort(port);
+        return port;
+    }
+
+    private wirePort(port: PortObject): void {
         port.onDestroy = () => {
             this.activatePort(port, false);
             this.releasePortOutput(port);
             this.setDirectSound(port, 0);
             this.ports.delete(port);
-            dm?.ports.delete(port);
+            port.owner?.ports.delete(port);
             if (port.performance?.port === port) {
                 port.performance.port = null;
                 port.performance.engine = null;
             }
         };
-        return port;
     }
 
     private createDirectMusic(): DirectMusicObject {
@@ -1472,8 +1578,9 @@ export class DMusic implements IModule {
     // ── segments ────────────────────────────────────────────────────────────────
 
     /** A segment object around an engine segment the HLE made itself (a motif, a band, a transition). */
-    private wrapSegment(segment: PerfSegment, name: string): SegmentObject {
-        const obj = new SegmentObject();
+    private wrapSegment(segment: PerfSegment, name: string, into?: LoadableObject): SegmentObject | null {
+        if (into && !(into instanceof SegmentObject)) return null;
+        const obj = into ?? new SegmentObject();
         obj.segment = segment;
         obj.identity.name = name;
         obj.loaded = true;
@@ -1560,8 +1667,10 @@ export class DMusic implements IModule {
                 const time = a[4]! | 0;
                 const edit: [number, number, number] = [bytes[0]!, bytes[1]!, bytes[2]!];
                 if (!obj.segment.setCommand(time, ...edit)) return DMUS_E_TRACK_NOT_FOUND;
-                obj.commandEdits.delete(time);
-                obj.commandEdits.set(time, edit);
+                if (savestatesEnabled()) {
+                    obj.commandEdits.delete(time);
+                    obj.commandEdits.set(time, edit);
+                }
                 return S_OK;
             }
             // Bands hold their instruments already; downloading them to the port is nothing more.
@@ -1640,13 +1749,9 @@ export class DMusic implements IModule {
     private registerStyleExports(): void {
         const e = this.exports;
         const styleOf = (a: number[]): StyleObject | null => this.object<StyleObject>(a[0]!);
-        const bandObject = (owner: StyleObject, index: number): BandObject => {
-            const band = new BandObject();
-            band.band = owner.bands[index]!;
-            band.file = band.band.band;
-            band.identity = { ...band.file.identity };
-            band.loaded = true;
-            return band;
+        const made = (owner: StyleObject, source: MadeSource, ppOut: number): number => {
+            const obj = this.makeFrom(owner, source);
+            return obj ? this.publish(obj, ppOut) : E_FAIL;
         };
         // HRESULT GetMotif(WCHAR *pwszName, IDirectMusicSegment **ppSegment)
         e["IDirectMusicStyle8_GetMotif"] = (_c, _m, a) => {
@@ -1655,19 +1760,11 @@ export class DMusic implements IModule {
             if (!obj?.style || !ppSegment) return E_POINTER;
             const name = readWide(a[1]! >>> 0, DESC_NAME_CHARS).toLowerCase();
             const index = obj.style.motifs.findIndex((m) => m.name.toLowerCase() === name);
-            const motif = obj.style.motifs[index];
-            if (!motif) {
+            if (index < 0) {
                 Mem.writeUint32(ppSegment, 0);
                 return S_FALSE;
             }
-            const segment = PerfSegment.motif(obj.style, motif);
-            // A motif with a band of its own installs it as it starts.
-            if (motif.band) {
-                const pool = obj.bands.flatMap((b) => b.band.instruments.map((inst, i) => ({ inst, collection: b.collections[i] ?? null })));
-                segment.bands = [{ time: 0, band: loadBand(motif.band, (ref) =>
-                    pool.find((p) => p.inst.collection?.fileName === ref.fileName && p.collection)?.collection ?? null) }];
-            }
-            return this.publish(this.wrapSegment(segment, motif.name), ppSegment);
+            return made(obj, { made: "motif", index }, ppSegment);
         };
         e["IDirectMusicStyle8_EnumMotif"] = (_c, _m, a) => {
             const motif = styleOf(a)?.style?.motifs[a[1]! >>> 0];
@@ -1685,7 +1782,7 @@ export class DMusic implements IModule {
                 Mem.writeUint32(ppBand, 0);
                 return S_FALSE;
             }
-            return this.publish(bandObject(obj, index), ppBand);
+            return made(obj, { made: "style-band", index }, ppBand);
         };
         e["IDirectMusicStyle8_EnumBand"] = (_c, _m, a) => {
             const band = styleOf(a)?.style?.bands[a[1]! >>> 0];
@@ -1700,7 +1797,7 @@ export class DMusic implements IModule {
                 Mem.writeUint32(a[1] >>> 0, 0);
                 return S_FALSE;
             }
-            return this.publish(bandObject(obj, 0), a[1] >>> 0);
+            return made(obj, { made: "style-band", index: 0 }, a[1] >>> 0);
         };
         // HRESULT GetTimeSignature(DMUS_TIMESIGNATURE *pTimeSig): mtTime, then the three fields.
         e["IDirectMusicStyle8_GetTimeSignature"] = (_c, _m, a) => {
@@ -1748,7 +1845,8 @@ export class DMusic implements IModule {
         e["IDirectMusicBand_CreateSegment"] = (_c, _m, a) => {
             const obj = this.object<BandObject>(a[0]!);
             if (!obj?.band || !a[1]) return E_POINTER;
-            return this.publish(this.wrapSegment(PerfSegment.band(obj.band), obj.identity.name), a[1] >>> 0);
+            const segment = this.makeFrom(obj, { made: "band-segment" });
+            return segment ? this.publish(segment, a[1] >>> 0) : E_FAIL;
         };
         // A band's instruments are resolved when it loads; the port needs nothing sent to it.
         e["IDirectMusicBand_Download"] = (_c, _m, a) => this.object<BandObject>(a[0]!)?.band ? S_OK : DMUS_E_NOT_INIT;
@@ -1815,14 +1913,31 @@ export class DMusic implements IModule {
             if (!perf.engine) return DMUS_E_NOT_INIT;
             const to = a[2] ? this.object<SegmentObject>(a[2]) : null;
             if (a[2] && !to?.segment) return E_INVALIDARG;
+            const fromState = perf.engine.primaryState();
+            const from = fromState ? perf.stateObjects.get(fromState)?.segment ?? null : null;
             const result = perf.engine.autoTransition(to?.segment ?? null, a[3]! & 0xffff, a[4]! >>> 0);
-            if (result.transition) {
+            const saving = savestatesEnabled();
+            if (result.transition && result.transitionState) {
                 // The transition segment is a COM object only for a caller that takes it.
-                const transition = ppTransSeg ? this.wrapSegment(result.transition, "Transition") : null;
-                if (transition) this.publish(transition, ppTransSeg);
+                const transition = ppTransSeg || saving ? this.wrapSegment(result.transition, "Transition") : null;
+                const style = result.transition.styles[0]!.style;
+                const index = from?.segment?.fixedPattern?.style === style ? FIXED_STYLE
+                    : from?.segment?.styles.findIndex((item) => item.style === style) ?? -1;
+                if (saving && transition && from && from.segment === fromState?.segment && index !== -1) {
+                    const command = result.transition.commands![0]!;
+                    this.madeBy(transition, from, {
+                        made: "transition", style: index, tempo: result.transition.tempos[0]!.tempo, command: command.command,
+                        grooveLevel: command.grooveLevel,
+                    });
+                }
+                if (saving && transition) this.holdStateSegment(this.stateObject(perf, result.transitionState), transition);
+                if (transition && ppTransSeg) this.publish(transition, ppTransSeg);
+                else transition?.release();
                 this.publishState(perf, result.transitionState, transition, ppTransState);
             }
+            if (saving && result.toState && to) this.holdStateSegment(this.stateObject(perf, result.toState), to);
             this.publishState(perf, result.toState, to, ppToState);
+            if (saving) this.releaseEndedStates(perf);
             return S_OK;
         };
     }
@@ -2078,6 +2193,12 @@ export class DMusic implements IModule {
         path.sink = sink;
         path.channels = channels;
         this.pathOutputs.add(path);
+        this.wirePath(path);
+        this.startPump();
+        return true;
+    }
+
+    private wirePath(path: AudioPathObject): void {
         path.onDestroy = () => {
             const perf = path.performance;
             if (perf?.engine) {
@@ -2091,8 +2212,6 @@ export class DMusic implements IModule {
             if (path.buffer) soundReference(this.process, path.buffer, true, false);
             path.buffer = 0;
         };
-        this.startPump();
-        return true;
     }
 
     private renderPath(path: AudioPathObject, pcm: Int16Array, frames: number): void {

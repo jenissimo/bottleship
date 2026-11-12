@@ -73,7 +73,16 @@ export abstract class DMusicObject extends BaseComObject {
     }
 }
 
-export type ObjectSource = { bytes: Uint8Array } | { file: string; length: number; hash: string };
+export type MadeSource =
+    | { made: "motif"; index: number }
+    | { made: "band-segment" }
+    | { made: "style-band"; index: number }
+    | { made: "transition"; style: number; tempo: number; command: number; grooveLevel: number };
+
+export type ObjectSource =
+    | { bytes: Uint8Array }
+    | { file: string; length: number; hash: string }
+    | (MadeSource & { of: ObjectSource | null });
 
 const LOADABLE = { [IID_IDirectMusicObject]: "IDirectMusicObject", [IID_IPersistStream]: "IDirectMusicPersistStream", [IID_IPersist]: "IDirectMusicPersistStream" };
 
@@ -159,6 +168,7 @@ export class SegmentStateObject extends DMusicObject {
     };
     state: PerfSegmentState | null = null;
     segment: SegmentObject | null = null;
+    performance: PerformanceObject | null = null;
 }
 
 export class AudioPathObject extends DMusicObject {
@@ -201,6 +211,7 @@ export class PortObject extends DMusicObject {
     sink: DirectSoundSink | null = null;
     active = false;
     performance: PerformanceObject | null = null;
+    owner: DirectMusicObject | null = null;
 }
 
 export class StyleObject extends LoadableObject {
