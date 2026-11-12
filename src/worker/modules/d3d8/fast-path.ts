@@ -192,11 +192,15 @@ export function registerFastPathD3D8Functions(dispatcher: HleDispatcher): void {
             const pVP = view.getUint32(esp + 8, true) >>> 0;
             if (!pVP || pVP + 24 > mem.length) return null; // bad ptr → slow thunk
             const rt = device.activeRenderTarget;
+            const x = view.getUint32(pVP + 0, true);
+            const y = view.getUint32(pVP + 4, true);
+            const width = view.getUint32(pVP + 8, true);
+            const height = view.getUint32(pVP + 12, true);
+            // A viewport that does not fit the active render target is rejected and leaves
+            // the current one in place; the slow thunk owns that answer and its diagnostic.
+            if (x > rt.width || width > rt.width - x || y > rt.height || height > rt.height - y) return null;
             const vp = sanitizeViewport({
-                x: view.getUint32(pVP + 0, true),
-                y: view.getUint32(pVP + 4, true),
-                width: view.getUint32(pVP + 8, true),
-                height: view.getUint32(pVP + 12, true),
+                x, y, width, height,
                 minZ: view.getFloat32(pVP + 16, true),
                 maxZ: view.getFloat32(pVP + 20, true),
             }, rt.width, rt.height);
