@@ -1154,13 +1154,6 @@
     "texFloatBitsView",
     "texInfoView"
   ],
-  "src/worker/modules/glu32.ts": [
-    "_dv",
-    "_dvBuf",
-    "_tempMat",
-    "nextQuadricId",
-    "quadrics"
-  ],
   "src/worker/modules/iphlpapi.ts": [
     "ZERO_BLOCK"
   ],
@@ -1175,57 +1168,6 @@
   ],
   "src/worker/modules/openal/spatial.ts": [
     "listenerViews"
-  ],
-  "src/worker/modules/opengl32/client-arrays.ts": [
-    "_cvaIdx",
-    "_cvaStage",
-    "_gatherScratch",
-    "_idxMax",
-    "_idxMin",
-    "_indexScratch",
-    "_mvpScratch",
-    "_views",
-    "_viewsBuffer",
-    "_viewsOffset"
-  ],
-  "src/worker/modules/opengl32/frame-capture.ts": [
-    "armed",
-    "last"
-  ],
-  "src/worker/modules/opengl32/immediate.ts": [
-    "_f32ab",
-    "_f32dv",
-    "_mvpScratch",
-    "transformDiagCount"
-  ],
-  "src/worker/modules/opengl32/matrix.ts": [
-    "_f32ab",
-    "_f32dv",
-    "_mulResult",
-    "_tempMat"
-  ],
-  "src/worker/modules/opengl32/query.ts": [
-    "queryWarned"
-  ],
-  "src/worker/modules/opengl32/state.ts": [
-    "KNOWN_CAPS",
-    "_f32ab",
-    "_f32dv",
-    "_f64ab",
-    "_f64dv",
-    "warned"
-  ],
-  "src/worker/modules/opengl32/texture.ts": [
-    "_f32ab",
-    "_f32dv",
-    "createTextureExports.texUploadDiagCount"
-  ],
-  "src/worker/modules/opengl32/wgl.ts": [
-    "createWglExports.contexts",
-    "createWglExports.currentHdc",
-    "createWglExports.currentHglrc",
-    "createWglExports.nextHglrc",
-    "createWglExports.threadBindings"
   ],
   "src/worker/modules/quartz/com-objects.ts": [
     "static FilterGraphObject.nextAudioId"

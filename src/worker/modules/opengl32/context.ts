@@ -169,6 +169,13 @@ export class GLCommandStream {
         this.count = 0;
     }
 
+    restore(count: number, i32: Int32Array, f32: Float32Array): void {
+        while (this.capacity < count) this.grow();
+        this.i32.set(i32.subarray(0, count * CMD_I32));
+        this.f32.set(f32.subarray(0, count * CMD_F32));
+        this.count = count;
+    }
+
     private grow(): void {
         const capacity = this.capacity * 2;
         const i32 = new Int32Array(capacity * CMD_I32);
@@ -205,6 +212,16 @@ export class GLVertexArena {
 
     reset(): void {
         this.used = 0;
+    }
+
+    restore(data: Float32Array): void {
+        if (data.length > this.data.length) {
+            let capacity = this.data.length;
+            while (capacity < data.length) capacity *= 2;
+            this.data = new Float32Array(capacity);
+        }
+        this.data.set(data);
+        this.used = data.length;
     }
 }
 

@@ -61,6 +61,7 @@ const GL_ACCUM_GREEN_BITS = 0x0D59;
 const GL_ACCUM_BLUE_BITS = 0x0D5A;
 const GL_ACCUM_ALPHA_BITS = 0x0D5B;
 
+/** @transient(log-once memo, not guest state) */
 const queryWarned = new Set<string>();
 function warnOnceQuery(message: string): void {
     if (queryWarned.has(message)) return;

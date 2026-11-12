@@ -11,19 +11,47 @@ import { createMatrixExports } from "./matrix";
 import { createQueryExports } from "./query";
 import { createImmediateExports, registerWriteBufferGLFunctions } from "./immediate";
 import { createTextureExports } from "./texture";
-import { createWglExports } from "./wgl";
+import { createWglExports, createWglState, type WglState } from "./wgl";
 import { createListExports } from "./lists";
 import { createArrayExports } from "./arrays";
 import { createMultitextureExports } from "./multitexture";
 import { registerWriteBufferGLStateFunctions } from "./wbuf-state";
 import { GL_COMPILE } from "./constants";
+import { savestateParticipants, savestatesEnabled } from "../../savestate/participant";
+import type { SaveValue } from "../../savestate/value-codec";
+import {
+    OPENGL32_SCHEMA, captureOpenGL, createRestoreDebt, prepareOpenGL, restoreOpenGL, settleRestoreDebt,
+    type OpenGLSavedState,
+} from "./savestate";
 
 export class OpenGL32 implements IModule {
     name = "opengl32";
     exports: Record<string, ThunkImplementation> = {};
     private context: OpenGLContext | null = null;
+    private wgl: WglState = createWglState();
+    private restoreDebt = createRestoreDebt();
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'opengl32', version: 1, order: 59, covers: ['opengl32', 'glu32'], schema: OPENGL32_SCHEMA as unknown as SaveValue,
+            prepare: () => prepareOpenGL(this.context),
+            capture: (io) => {
+                if (!this.context) throw new Error("opengl32: the module is not initialized");
+                return captureOpenGL(this.context, this.wgl, io) as unknown as SaveValue;
+            },
+            restore: (saved, io) => {
+                if (!this.context) throw new Error("opengl32: the module is not initialized");
+                restoreOpenGL(this.context, this.wgl, saved as unknown as OpenGLSavedState, io.blob, this.restoreDebt);
+                const glu = this.context.process?.getModule?.("glu32") as { dropCachedStrings?: () => void } | undefined;
+                glu?.dropCachedStrings?.();
+            },
+        });
+    }
 
     initialize(process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
+        this.wgl = createWglState();
+        this.restoreDebt = createRestoreDebt();
         this.context = createOpenGLContext(process);
         this.context.presenter = new OpenGLPresenter(this.context);
 
@@ -32,7 +60,7 @@ export class OpenGL32 implements IModule {
         Object.assign(this.exports, createQueryExports(this.context));
         Object.assign(this.exports, createImmediateExports(this.context));
         Object.assign(this.exports, createTextureExports(this.context));
-        Object.assign(this.exports, createWglExports(this.context));
+        Object.assign(this.exports, createWglExports(this.context, undefined, this.wgl));
         Object.assign(this.exports, createListExports(this.context));
         Object.assign(this.exports, createArrayExports(this.context));
         Object.assign(this.exports, createMultitextureExports(this.context));
@@ -87,7 +115,7 @@ export class OpenGL32 implements IModule {
         this.context.backend = backend;
         this.context.executor?.destroy();
         this.context.executor = null;
-        // Executor re-created lazily on wglMakeCurrent or first frame
+        settleRestoreDebt(this.context, this.restoreDebt);
     }
 
     getFrameSnapshot(): GLFrameSnapshot {
@@ -108,5 +136,6 @@ export class OpenGL32 implements IModule {
 
     reset(): void {
         if (this.context) resetOpenGLContext(this.context);
+        this.restoreDebt = createRestoreDebt();
     }
 }

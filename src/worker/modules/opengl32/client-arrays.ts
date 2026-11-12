@@ -29,6 +29,7 @@ const SLOT_NORMAL = 8;
 const SLOT_TC0 = 11;
 const SLOT_TC1 = 13;
 
+/** @transient(matrix product scratch, written before every read) */
 const _mvpScratch = new Float32Array(16);
 
 // ---------------------------------------------------------------------------
@@ -48,8 +49,11 @@ export interface GuestViews {
     u32: Uint32Array | null;
 }
 
+/** @transient(cache key of the guest-memory views, rebuilt whenever the buffer differs) */
 let _viewsBuffer: ArrayBufferLike | null = null;
+/** @transient(cache key of the guest-memory views, rebuilt whenever the buffer differs) */
 let _viewsOffset = -1;
+/** @transient(typed views over the live guest window, rebuilt whenever the buffer differs) */
 let _views: GuestViews | null = null;
 
 /** Views over guest RAM for the current turn. Never hold the result across an await —
@@ -186,8 +190,11 @@ export function validateClientArrayRange(ctx: OpenGLContext, lo: number, hi: num
 // Index decoding
 // ---------------------------------------------------------------------------
 
+/** @transient(index gather scratch, filled before every draw) */
 let _indexScratch = new Uint32Array(8192);
+/** @transient(index range of the draw in flight) */
 let _idxMin = 0;
+/** @transient(index range of the draw in flight) */
 let _idxMax = 0;
 
 /** Lowest / highest index of the most recent decode — the range a lock must cover. */
@@ -462,7 +469,7 @@ const CVA_COMPS = [4, 4, 3, 2, 2];
 /** Interleaved-layout slot each attribute is gathered through / written back to. */
 const CVA_SLOT = [SLOT_POS, SLOT_COLOR, SLOT_NORMAL, SLOT_TC0, SLOT_TC1];
 
-interface GLCvaAttrib {
+export interface GLCvaAttrib {
     /** Array was enabled when the lock was taken — the only arrays the lock covers. */
     covered: boolean;
     /** Array spec the cached data was built from; any drift invalidates it. */
@@ -548,7 +555,9 @@ function cvaUsable(ctx: OpenGLContext, slot: number, lo: number, hi: number): bo
 // the shared draw-time scratches.
 // Sized on first use: context.ts imports this module, so nothing here may read a
 // context.ts binding (VERT_FLOATS) while the module graph is still initialising.
+/** @transient(index scratch of one cache fill) */
 let _cvaIdx = new Uint32Array(4096);
+/** @transient(staging scratch of one cache fill) */
 let _cvaStage = new Float32Array(0);
 
 /** Widen `slot`'s cached window to cover [lo,hi] and refill it. */
@@ -665,6 +674,7 @@ function refreshCvaMvp(ctx: OpenGLContext): void {
 // Draw-time entry point
 // ---------------------------------------------------------------------------
 
+/** @transient(vertex gather scratch, filled before every draw) */
 let _gatherScratch = new Float32Array(0);
 
 /** Reusable interleaved staging block for draws that still need primitive assembly. */

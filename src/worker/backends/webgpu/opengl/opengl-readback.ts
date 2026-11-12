@@ -89,3 +89,30 @@ export function resolveReadback(
     }
     return out;
 }
+
+/**
+ * The image to write into a render target of `targetW` x `targetH` from a colour read-back:
+ * `rgba` is `width` x `height` guest pixels, RGBA, bottom row first (what glReadPixels returns).
+ * The target is top row first, in the target's channel order, and may be larger or smaller than
+ * the read-back (internal scale); every target pixel takes the guest pixel it lies in.
+ */
+export function colorSeedPixels(
+    rgba: Uint8Array, width: number, height: number, targetW: number, targetH: number, bgra: boolean,
+): Uint8Array {
+    const out = new Uint8Array(targetW * targetH * 4);
+    const r = bgra ? 2 : 0, b = bgra ? 0 : 2;
+    for (let y = 0; y < targetH; y++) {
+        const guestRow = Math.min(height - 1, Math.floor(((y + 0.5) * height) / targetH));
+        const src = (height - 1 - guestRow) * width * 4;
+        const dst = y * targetW * 4;
+        for (let x = 0; x < targetW; x++) {
+            const from = src + Math.min(width - 1, Math.floor(((x + 0.5) * width) / targetW)) * 4;
+            const to = dst + x * 4;
+            out[to] = rgba[from + r]!;
+            out[to + 1] = rgba[from + 1]!;
+            out[to + 2] = rgba[from + b]!;
+            out[to + 3] = rgba[from + 3]!;
+        }
+    }
+    return out;
+}

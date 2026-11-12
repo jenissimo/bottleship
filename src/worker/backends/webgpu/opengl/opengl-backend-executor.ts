@@ -13,7 +13,7 @@ import { OpenGLPipelineConfig, pipelineConfigKey } from "./opengl-pipeline-facto
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
 import { registerBackendQualitySupport } from "../shared/quality-capabilities";
 import { resolveInternalScaleFactor } from "../shared/internal-resolution";
-import { readbackSourceRect, resolveReadback } from "./opengl-readback";
+import { colorSeedPixels, readbackSourceRect, resolveReadback } from "./opengl-readback";
 import { scissorRect, viewportRect } from "./opengl-render-space";
 import { registerGpuDeviceObserver } from "../../../core/gpu/gpu-device-lifecycle";
 import {
@@ -162,6 +162,7 @@ export class OpenGLBackendExecutor {
     private offscreenGuestW = 0;
     private offscreenGuestH = 0;
     private targetFormat: GPUTextureFormat | null = null;
+    private colorSeed: { rgba: Uint8Array; width: number; height: number } | null = null;
 
     private shaderModule: GPUShaderModule | null = null;
     private bindGroupLayout: GPUBindGroupLayout | null = null;
@@ -335,6 +336,8 @@ export class OpenGLBackendExecutor {
 
         this.uniformCursor = 0;
         this.vertexUploadCursor = 0;
+
+        this.applyColorSeed(queue, renderW, renderH);
 
         const encoder = device.createCommandEncoder();
         let renderPass: GPURenderPassEncoder | null = null;
@@ -802,6 +805,25 @@ export class OpenGLBackendExecutor {
         } finally {
             staging.destroy();
         }
+    }
+
+    seedColor(rgba: Uint8Array, width: number, height: number): void {
+        this.colorSeed = width > 0 && height > 0 && rgba.length === width * height * 4 ? { rgba, width, height } : null;
+    }
+
+    private applyColorSeed(queue: GPUQueue, renderW: number, renderH: number): void {
+        const seed = this.colorSeed;
+        if (!seed) return;
+        this.colorSeed = null;
+        const texture = this.offscreenTexture;
+        if (!texture) return;
+        queue.writeTexture(
+            { texture },
+            colorSeedPixels(seed.rgba, seed.width, seed.height, renderW, renderH, this.targetFormat === "bgra8unorm"),
+            { bytesPerRow: renderW * 4 },
+            { width: renderW, height: renderH, depthOrArrayLayers: 1 },
+        );
+        this.offscreenInitialized = true;
     }
 
     private pruneTextureCache(textures: Map<number, GLTextureObject>): void {

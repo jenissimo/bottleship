@@ -14,9 +14,40 @@ import {
     setWglPixelFormat,
 } from "../gdi32/painting";
 
-interface WGLContextBinding {
+export interface WGLContextBinding {
     hglrc: number;
     hdc: number;
+}
+
+export interface WglContextEntry {
+    hdc: number;
+    attached: boolean;
+}
+
+export interface WglState {
+    nextHglrc: number;
+    contexts: Map<number, WglContextEntry>;
+    threadBindings: Map<number, WGLContextBinding>;
+    currentHglrc: number;
+    currentHdc: number;
+}
+
+export function createWglState(): WglState {
+    return {
+        nextHglrc: 1,
+        contexts: new Map(),
+        threadBindings: new Map(),
+        currentHglrc: 0,
+        currentHdc: 0,
+    };
+}
+
+export function resetWglState(state: WglState): void {
+    state.nextHglrc = 1;
+    state.contexts = new Map();
+    state.threadBindings = new Map();
+    state.currentHglrc = 0;
+    state.currentHdc = 0;
 }
 
 /**
@@ -42,19 +73,14 @@ function resolveImplementedEntryPoint(dispatcher: any, name: string): number {
 export function createWglExports(
     ctx: OpenGLContext,
     drawableSize: (hdc: number) => { width: number; height: number } = guestDrawableSize,
+    state: WglState = createWglState(),
 ): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
-    let nextHglrc = 1;
-    const contexts = new Map<number, { hdc: number; attached: boolean }>();
-    const threadBindings = new Map<number, WGLContextBinding>(); // threadId -> binding
-    let currentHglrc = 0;
-    let currentHdc = 0;
-
     exports['wglCreateContext'] = (_c, _m, args): number => {
         const hdc = args[0] >>> 0;
-        const hglrc = nextHglrc++;
-        contexts.set(hglrc, { hdc, attached: false });
+        const hglrc = state.nextHglrc++;
+        state.contexts.set(hglrc, { hdc, attached: false });
         if (!ctx.drawableDC) ctx.drawableDC = hdc;
         Logger.log(LogCategory.GDI32, `wglCreateContext(hdc=0x${hdc.toString(16)}) -> 0x${hglrc.toString(16)}`);
         return hglrc;
@@ -62,16 +88,16 @@ export function createWglExports(
 
     exports['wglDeleteContext'] = (_c, _m, args): number => {
         const hglrc = args[0] >>> 0;
-        if (currentHglrc === hglrc) {
-            currentHglrc = 0;
-            currentHdc = 0;
+        if (state.currentHglrc === hglrc) {
+            state.currentHglrc = 0;
+            state.currentHdc = 0;
             const system = System.getInstance();
             if (system.services.render.getActive() === ctx.presenter) {
                 system.services.render.setActive(null);
             }
         }
-        contexts.delete(hglrc);
-        if (contexts.size === 0) {
+        state.contexts.delete(hglrc);
+        if (state.contexts.size === 0) {
             // The next context is a new GL state as far as its default rectangles go.
             ctx.viewportFromGuest = false;
             ctx.scissorFromGuest = false;
@@ -84,21 +110,21 @@ export function createWglExports(
         const hdc = args[0] >>> 0;
         const hglrc = args[1] >>> 0;
         if (hglrc === 0) {
-            currentHglrc = 0;
-            currentHdc = 0;
+            state.currentHglrc = 0;
+            state.currentHdc = 0;
             // wglMakeCurrent(NULL, NULL) unbinds but does not change what is on screen.
             // Keep the active presenter until wglDeleteContext — otherwise the GDI loop
             // would composite over the last GL frame between transient unbind/rebind pairs.
             Logger.verbose(LogCategory.GDI32, `wglMakeCurrent(0, 0) -> TRUE (unbind, keep active)`);
             return 1;
         }
-        const binding = contexts.get(hglrc);
+        const binding = state.contexts.get(hglrc);
         if (!binding) {
             Logger.warn(LogCategory.GDI32, `wglMakeCurrent: invalid hglrc 0x${hglrc.toString(16)}`);
             return 0;
         }
-        currentHglrc = hglrc;
-        currentHdc = hdc;
+        state.currentHglrc = hglrc;
+        state.currentHdc = hdc;
         if (hdc) ctx.drawableDC = hdc;
         if (hdc && !binding.attached) {
             binding.attached = true;
@@ -121,8 +147,8 @@ export function createWglExports(
         return 1;
     };
 
-    exports['wglGetCurrentContext'] = (): number => currentHglrc;
-    exports['wglGetCurrentDC'] = (): number => currentHdc;
+    exports['wglGetCurrentContext'] = (): number => state.currentHglrc;
+    exports['wglGetCurrentDC'] = (): number => state.currentHdc;
 
     exports['wglShareLists'] = (_c, _m, args): number => {
         Logger.verbose(LogCategory.GDI32, `wglShareLists(0x${(args[0] >>> 0).toString(16)}, 0x${(args[1] >>> 0).toString(16)}) -> TRUE (stub)`);
@@ -139,7 +165,7 @@ export function createWglExports(
 
         // No current context => NULL, per the WGL contract (an entry point is only
         // meaningful for the pixel format/context it was queried against).
-        if (!currentHglrc) {
+        if (!state.currentHglrc) {
             Logger.verbose(LogCategory.GDI32, `wglGetProcAddress("${name}") -> 0 (no current context)`);
             return 0;
         }

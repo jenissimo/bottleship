@@ -65,7 +65,9 @@ import { arenaReserve } from "./immediate";
 
 // ---- Helpers ----
 
+/** @transient(float bit-conversion scratch, written before every read) */
 const _f32ab = new ArrayBuffer(4);
+/** @transient(view over the float bit-conversion scratch) */
 const _f32dv = new DataView(_f32ab);
 
 function bitsToF32(bits: number): number {
@@ -73,7 +75,9 @@ function bitsToF32(bits: number): number {
     return _f32dv.getFloat32(0, true);
 }
 
+/** @transient(double bit-conversion scratch, written before every read) */
 const _f64ab = new ArrayBuffer(8);
+/** @transient(view over the double bit-conversion scratch) */
 const _f64dv = new DataView(_f64ab);
 
 function bitsToF64(lo: number, hi: number): number {
@@ -82,6 +86,7 @@ function bitsToF64(lo: number, hi: number): number {
     return _f64dv.getFloat64(0, true);
 }
 
+/** @transient(log-once memo, not guest state) */
 const warned = new Set<string>();
 function stubWarn(name: string): number {
     if (!warned.has(name)) {
@@ -159,6 +164,7 @@ function getTexGenState(ctx: OpenGLContext, coord: number): GLTexGenState | null
 
 // ---- Known enable caps ----
 
+/** @transient(constant table of supported capabilities, never written after load) */
 const KNOWN_CAPS = new Set<number>([
     GL_DEPTH_TEST, GL_BLEND, GL_ALPHA_TEST, GL_CULL_FACE, GL_TEXTURE_2D,
     GL_FOG, GL_SCISSOR_TEST, GL_LIGHTING, GL_NORMALIZE, GL_COLOR_MATERIAL,
