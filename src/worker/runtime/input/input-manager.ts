@@ -1537,6 +1537,21 @@ export class InputManager {
         };
     }
 
+    captureHeldKeys(): number[] {
+        const held: number[] = [];
+        for (let vk = 0; vk < 256; vk++) if (this.prevKeyBitfield[vk >> 5]! & (1 << (vk & 31))) held.push(vk);
+        return held;
+    }
+
+    restoreHeldKeys(held: readonly number[]): void {
+        this.prevKeyBitfield.fill(0);
+        for (const vk of held) {
+            this.prevKeyBitfield[vk >> 5]! |= 1 << (vk & 31);
+            this.keyStates[vk] = 0x80;
+        }
+        this.lastSeq = -1;
+    }
+
     captureDInputBuffers(): DInputBufferState {
         const lane = (size: number, seq: number, events: DInputBufferedEvent[], overflowed: boolean): DInputBufferLane =>
             ({ size, seq, events: events.map(e => ({ ...e })), overflowed });
