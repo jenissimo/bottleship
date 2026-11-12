@@ -9,7 +9,9 @@ import { GL_MODELVIEW, GL_PROJECTION, GL_TEXTURE, GL_STACK_OVERFLOW, GL_STACK_UN
 
 // ---- f32 bit reinterpretation ----
 
+/** @transient(float bit-conversion scratch, written before every read) */
 const _f32ab = new ArrayBuffer(4);
+/** @transient(view over the float bit-conversion scratch) */
 const _f32dv = new DataView(_f32ab);
 
 function bitsToF32(bits: number): number {
@@ -136,6 +138,7 @@ function transposeInPlace(m: Float32Array): void {
 
 // ---- Multiply current matrix by temp ----
 
+/** @transient(matrix product scratch, written before every read) */
 const _mulResult = new Float32Array(16);
 
 function multiplyCurrentByTemp(ctx: OpenGLContext, temp: Float32Array): void {
@@ -156,6 +159,7 @@ function getStackForMode(ctx: OpenGLContext, mode: number): GLMatrixStack | null
 }
 
 // Scratch matrices reused across calls
+/** @transient(matrix scratch, written before every read) */
 const _tempMat = new Float32Array(16);
 
 // ---- Export ----

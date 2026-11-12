@@ -21,7 +21,9 @@ export interface GLFrameCapture {
     verts: Float32Array;
 }
 
+/** @transient(one-shot harness request, not guest state) */
 let armed = false;
+/** @transient(harness copy of the last finished frame) */
 let last: GLFrameCapture | null = null;
 
 /** Request a copy of the next completed frame. */

@@ -18,7 +18,9 @@ import { mat4Multiply } from "./opengl32/context";
 
 // ---- f64 argument reader (each double = 2 DWORD slots in stdcall) ----
 
+/** @transient(scratch for one float64 conversion, written before every read) */
 const _dvBuf = new ArrayBuffer(8);
+/** @transient(view over the float64 scratch above) */
 const _dv = new DataView(_dvBuf);
 
 function readF64(args: number[], slot: number): number {
@@ -63,6 +65,7 @@ function mat4Ortho(
     out[15] = 1;
 }
 
+/** @transient(matrix scratch, fully written before each multiply) */
 const _tempMat = new Float32Array(16);
 
 function multiplyCurrentMatrix(process: Process, temp: Float32Array): void {
@@ -117,8 +120,37 @@ const GLU_ERRORS: Record<number, string> = {
 
 // ---- Quadric state ----
 
+export interface GluQuadric {
+    normals: number;
+    texture: boolean;
+    orientation: number;
+    drawStyle: number;
+}
+
+export interface GluState {
+    nextQuadricId: number;
+    quadrics: Array<[number, GluQuadric]>;
+}
+
+/** @participant(opengl32) */
 let nextQuadricId = 1;
-const quadrics = new Map<number, { normals: number; texture: boolean; orientation: number; drawStyle: number }>();
+/** @participant(opengl32) */
+const quadrics = new Map<number, GluQuadric>();
+
+export function captureGluState(): GluState {
+    return {
+        nextQuadricId,
+        quadrics: [...quadrics].map(([id, q]) => [id, { normals: q.normals, texture: q.texture, orientation: q.orientation, drawStyle: q.drawStyle }]),
+    };
+}
+
+export function restoreGluState(state: GluState): void {
+    quadrics.clear();
+    for (const [id, q] of state.quadrics) {
+        quadrics.set(id, { normals: q.normals, texture: q.texture, orientation: q.orientation, drawStyle: q.drawStyle });
+    }
+    nextQuadricId = state.nextQuadricId;
+}
 
 export class Glu32 implements IModule {
     name = "glu32";
@@ -531,6 +563,10 @@ export class Glu32 implements IModule {
     reset(): void {
         quadrics.clear();
         nextQuadricId = 1;
+        this.dropCachedStrings();
+    }
+
+    dropCachedStrings(): void {
         this.errorStringPtrs.clear();
         this.gluStringPtr = 0;
     }

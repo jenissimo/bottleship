@@ -23,7 +23,9 @@ import {
 import { Logger, LogCategory } from "../../core/logger";
 import { guestViews } from "./client-arrays";
 
+/** @transient(float bit-conversion scratch, written before every read) */
 const _f32ab = new ArrayBuffer(4);
+/** @transient(view over the float bit-conversion scratch) */
 const _f32dv = new DataView(_f32ab);
 export function bitsToF32(bits: number): number {
     _f32dv.setUint32(0, bits >>> 0, true);
@@ -31,6 +33,7 @@ export function bitsToF32(bits: number): number {
 }
 
 // Module-level scratch buffers — zero allocations on hot paths
+/** @transient(matrix product scratch, written before every read) */
 const _mvpScratch = new Float32Array(16);
 
 /** The guest DataView, from the SAME cache the gather path uses — a view keyed on the
@@ -162,6 +165,7 @@ export function assembleFlatVerts(
     return (d - dstOffset) / V;
 }
 
+/** @transient(diagnostic counter that limits log output) */
 let transformDiagCount = 0;
 
 export function transformFlatVerts(ctx: OpenGLContext, buf: Float32Array, offset: number, count: number): void {

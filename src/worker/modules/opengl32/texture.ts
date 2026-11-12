@@ -23,7 +23,9 @@ import {
     isOpenGLCompressedTextureFormat,
 } from "../../backends/webgpu/shared/texture-formats";
 
+/** @transient(float bit-conversion scratch, written before every read) */
 const _f32ab = new ArrayBuffer(4);
+/** @transient(view over the float bit-conversion scratch) */
 const _f32dv = new DataView(_f32ab);
 function bitsToF32(bits: number): number {
     _f32dv.setUint32(0, bits >>> 0, true);
@@ -140,6 +142,7 @@ export function applyInternalFormatComponents(data: Uint8Array, internalFormat: 
 
 export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
+    /** @transient(diagnostic counter that limits log output) */
     let texUploadDiagCount = 0;
 
     function ensureTexture(id: number): GLTextureObject {
