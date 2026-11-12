@@ -12,7 +12,6 @@ import { ensureBackBufferSurface } from './device-lifecycle';
 import type { D3D8DeviceAdapter } from '../../backends/webgpu/d3d8/d3d8-device-adapter';
 import { writeDeviceCaps8 } from './caps';
 import { deviceCooperativeLevel } from '../../core/gpu/gpu-device-loss-contract';
-import { System } from '../../core/system';
 import { createPresentRegion, type PresentRect } from '../../backends/webgpu/shared/present-region';
 import { deviceWindowClientExtent } from '../../runtime/windowing/fullscreen-window';
 
