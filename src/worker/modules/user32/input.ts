@@ -76,6 +76,7 @@ export interface User32InputState {
     ddeServices: Array<[string, number[]]>;
     ddeLastError: Array<[number, number]>;
     ddeClientOnly: number[];
+    heldKeys: number[];
 }
 
 export function createInputExports(): Record<string, ThunkImplementation> {
@@ -106,10 +107,10 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     // @participant(user32-input)
     const ddeClientOnly = new Set<number>();
     if (savestatesEnabled()) savestateParticipants.add({
-        id: 'user32-input', version: 1, order: 42,
+        id: 'user32-input', version: 2, order: 42,
         schema: stateKeys<User32InputState>({
             windowProperties: true, nextDdeInstance: true, nextDdeStringHandle: true, nextDdeConv: true,
-            ddeStrings: true, ddeServices: true, ddeLastError: true, ddeClientOnly: true,
+            ddeStrings: true, ddeServices: true, ddeLastError: true, ddeClientOnly: true, heldKeys: true,
         }),
         capture: () => {
             if (ddeInstances.size > 0 || ddeConversations.size > 0) throw new CaptureRefusal('user32: DDE conversations are not part of a v1 savestate');
@@ -120,11 +121,13 @@ export function createInputExports(): Record<string, ThunkImplementation> {
                 ddeServices: [...ddeServices].map(([name, insts]) => [name, [...insts]]),
                 ddeLastError: [...ddeLastError],
                 ddeClientOnly: [...ddeClientOnly],
+                heldKeys: System.getInstance().inputManager.captureHeldKeys(),
             };
             return state as unknown as SaveValue;
         },
         restore: (saved) => {
             const s = saved as unknown as User32InputState;
+            System.getInstance().inputManager.restoreHeldKeys(s.heldKeys);
             windowProperties.clear();
             for (const [h, props] of s.windowProperties) windowProperties.set(h, new Map(props));
             nextDdeInstance = s.nextDdeInstance;
