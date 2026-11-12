@@ -23,7 +23,10 @@ import {
     flipStorageCompatible,
     rotateFlipChain,
 } from "../../src/worker/modules/ddraw/flip-chain";
-import type { DirectDrawSurfaceState } from "../../src/worker/modules/ddraw/com-objects";
+import {
+    awaitsTextureAfterRestore, captureSurfaceState, restoreSurfaceState, textureCreatedAfterRestore,
+    type DirectDrawSurfaceState,
+} from "../../src/worker/modules/ddraw/com-objects";
 
 const DDSCAPS_FLIP = 0x00000010;
 const DDSCAPS_ZBUFFER = 0x00020000;
@@ -255,5 +258,61 @@ describe("ddraw flip chain", () => {
         // A lease id with nothing behind it in the registry must not wedge the frame loop.
         back.activeLeaseId = 12345;
         expect(findFlipBlockingLease([front, back])).toBeNull();
+    });
+
+    test("before any restore a Flip carries no texture debt", () => {
+        const front = surface(0xa000, 0);
+        const back = surface(0xb000, 0);
+        rotateFlipChain([front, back]);
+        expect([front, back].map(awaitsTextureAfterRestore)).toEqual([false, false]);
+    });
+
+    test("after a restore each image keeps its missing texture through a Flip until the presenter made it", () => {
+        const restored = (ptr: number) => restoreSurfaceState(captureSurfaceState({ ...surface(ptr, 0), mode: "CPU" } as DirectDrawSurfaceState));
+        const front = restored(0xa000);
+        const back = restored(0xb000);
+        const chain = [front, back];
+        expect(chain.map(awaitsTextureAfterRestore)).toEqual([true, true]);
+
+        const present = (): number => {
+            if (!awaitsTextureAfterRestore(front)) return front.gpuTexture ? 1 : 0;
+            front.gpuTexture = { label: `texture of ${image(front).toString(16)}` } as unknown as GPUTexture;
+            textureCreatedAfterRestore(front);
+            return 1;
+        };
+
+        expect(present()).toBe(1);
+        expect(chain.map(awaitsTextureAfterRestore)).toEqual([false, true]);
+
+        rotateFlipChain(chain);
+        expect(image(front)).toBe(0xb000);
+        expect(chain.map(awaitsTextureAfterRestore)).toEqual([true, false]);
+        expect(front.gpuTexture).toBeUndefined();
+        expect(present()).toBe(1);
+        expect(chain.map(awaitsTextureAfterRestore)).toEqual([false, false]);
+
+        let shown = 0;
+        for (let i = 0; i < 50; i++) {
+            rotateFlipChain(chain);
+            shown += present();
+        }
+        expect(shown).toBe(50);
+        expect(chain.map(awaitsTextureAfterRestore)).toEqual([false, false]);
+        expect(chain.map(s => (s.gpuTexture as unknown as { label: string }).label).sort()).toEqual(["texture of a000", "texture of b000"]);
+    });
+
+    test("a three-buffer chain restored without textures gets all three, one per Flip", () => {
+        const restored = (ptr: number) => restoreSurfaceState(captureSurfaceState({ ...surface(ptr, 0), mode: "CPU" } as DirectDrawSurfaceState));
+        const chain = [restored(0xa000), restored(0xb000), restored(0xc000)];
+        const made: number[] = [];
+        for (let i = 0; i < 6; i++) {
+            if (awaitsTextureAfterRestore(chain[0]!)) {
+                made.push(image(chain[0]!));
+                textureCreatedAfterRestore(chain[0]!);
+            }
+            rotateFlipChain(chain);
+        }
+        expect(made).toEqual([0xa000, 0xb000, 0xc000]);
+        expect(chain.map(awaitsTextureAfterRestore)).toEqual([false, false, false]);
     });
 });
