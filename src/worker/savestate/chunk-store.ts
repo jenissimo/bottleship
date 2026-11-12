@@ -33,6 +33,7 @@ export class MemoryChunkStore implements ChunkStore {
 
 export interface PackDir {
     names(): Promise<string[]>;
+    /** null only when the file does not exist; a file that exists and cannot be read throws. */
     read(name: string, from?: number, to?: number): Promise<Uint8Array | null>;
     write(name: string, bytes: Uint8Array): Promise<void>;
     remove(name: string): Promise<void>;
@@ -73,13 +74,27 @@ export class OpfsPackDir implements PackDir {
     }
 
     async read(name: string, from = 0, to?: number): Promise<Uint8Array | null> {
+        const cached = this.open.get(name);
+        if (cached) {
+            try {
+                return new Uint8Array(await cached.slice(from, to).arrayBuffer());
+            } catch {
+                this.open.delete(name);
+            }
+        }
+        let file: File;
         try {
-            let file = this.open.get(name);
-            if (!file) this.open.set(name, file = await (await this.dir.getFileHandle(name)).getFile());
-            return new Uint8Array(await file.slice(from, to).arrayBuffer());
-        } catch {
-            this.open.delete(name);
-            return null;
+            file = await (await this.dir.getFileHandle(name)).getFile();
+        } catch (e) {
+            if ((e as { name?: string } | null)?.name === 'NotFoundError') return null;
+            throw new Error(`savestate: ${name} cannot be opened (${describeError(e)})`);
+        }
+        try {
+            const bytes = new Uint8Array(await file.slice(from, to).arrayBuffer());
+            this.open.set(name, file);
+            return bytes;
+        } catch (e) {
+            throw new Error(`savestate: ${name} cannot be read (${describeError(e)})`);
         }
     }
 
@@ -96,6 +111,8 @@ export class OpfsPackDir implements PackDir {
         await this.dir.removeEntry(name).catch(() => undefined);
     }
 }
+
+const describeError = (e: unknown): string => (e instanceof Error ? `${e.name}: ${e.message}` : String(e));
 
 interface PackedEntry { pack: string; from: number; length: number }
 type PackIndex = { v: 1; pack: string; bytes: number; chunks: Array<[hash: string, from: number, length: number]> };
@@ -128,29 +145,38 @@ export class PackedChunkStore implements ChunkStore {
             if (HASH_NAME.test(name)) { store.loose.add(name); continue; }
             if (!name.endsWith(INDEX_SUFFIX)) continue;
             const pack = name.slice(0, -INDEX_SUFFIX.length);
-            const index = PACK_NAME.test(pack) && names.has(pack) ? parsePackIndex(await dir.read(name), pack) : null;
-            if (!index) { store.leftovers.add(name); continue; }
+            if (!PACK_NAME.test(pack) || !names.has(pack)) { store.leftovers.add(name); continue; }
+            const bytes = await dir.read(name);
+            if (!bytes) continue;
+            const index = parsePackIndex(bytes, pack);
+            if (!index) { store.leftovers.add(name); store.leftovers.add(pack); continue; }
             store.adopt(index);
         }
         for (const name of names) {
-            if (PACK_NAME.test(name) && !store.packs.has(name)) store.leftovers.add(name);
+            if (PACK_NAME.test(name) && !store.packs.has(name) && !names.has(name + INDEX_SUFFIX)) store.leftovers.add(name);
         }
         return store;
     }
 
-    /** Only under the game lock: nothing else may be between writing a pack and its index. */
-    async sweep(): Promise<{ removed: number; migrated: number }> {
+    /**
+     * Only under the game lock: nothing else may be between writing a pack and its index.
+     * A loose chunk is removed only once it is in a written pack; one that cannot be read
+     * stays where it is and is counted in `skipped`.
+     */
+    async sweep(): Promise<{ removed: number; migrated: number; skipped: number }> {
         const removed = this.leftovers.size;
         for (const name of this.leftovers) await this.dir.remove(name);
         this.leftovers.clear();
         const loose = [...this.loose];
         let migrated = 0;
+        let skipped = 0;
         for (let at = 0; at < loose.length; at += LOOSE_BATCH) {
             const batch: Array<[string, Uint8Array]> = [];
-            const names = loose.slice(at, at + LOOSE_BATCH);
-            for (const hash of names) {
-                const bytes = await this.dir.read(hash);
+            for (const hash of loose.slice(at, at + LOOSE_BATCH)) {
+                let bytes: Uint8Array | null;
+                try { bytes = await this.dir.read(hash); } catch { skipped++; continue; }
                 if (bytes) batch.push([hash, bytes]);
+                else this.loose.delete(hash);
             }
             for (const [hash] of batch) this.loose.delete(hash);
             try {
@@ -159,10 +185,10 @@ export class PackedChunkStore implements ChunkStore {
                 for (const [hash] of batch) this.loose.add(hash);
                 throw e;
             }
-            for (const hash of names) { this.loose.delete(hash); await this.dir.remove(hash); }
+            for (const [hash] of batch) await this.dir.remove(hash);
             migrated += batch.length;
         }
-        return { removed, migrated };
+        return { removed, migrated, skipped };
     }
 
     private adopt(index: PackIndex): void {
@@ -266,8 +292,7 @@ export class PackedChunkStore implements ChunkStore {
     }
 }
 
-function parsePackIndex(bytes: Uint8Array | null, pack: string): PackIndex | null {
-    if (!bytes) return null;
+function parsePackIndex(bytes: Uint8Array, pack: string): PackIndex | null {
     try {
         const index = JSON.parse(new TextDecoder().decode(bytes)) as PackIndex;
         if (index?.v !== 1 || index.pack !== pack || !Array.isArray(index.chunks)) return null;

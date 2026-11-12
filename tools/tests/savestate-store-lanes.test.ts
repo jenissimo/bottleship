@@ -221,9 +221,9 @@ describe("packed chunk store", () => {
         const reopened = await PackedChunkStore.open(dir);
         expect([...dir.files.keys()].sort()).toEqual(before);
         expect((await reopened.list()).sort()).toEqual(hashes.slice().sort());
-        expect(await reopened.sweep()).toEqual({ removed: 4, migrated: 0 });
+        expect(await reopened.sweep()).toEqual({ removed: 4, migrated: 0, skipped: 0 });
         expect([...dir.files.keys()].sort()).toEqual(["notes.txt", pack, pack + ".idx"].sort());
-        expect(await reopened.sweep()).toEqual({ removed: 0, migrated: 0 });
+        expect(await reopened.sweep()).toEqual({ removed: 0, migrated: 0, skipped: 0 });
     });
 
     test("a pack whose index is not written yet survives another open, and the save that owns it completes", async () => {
@@ -267,7 +267,7 @@ describe("packed chunk store", () => {
         dir.write = write;
         const next = await PackedChunkStore.open(dir);
         expect(await next.list()).toEqual([]);
-        expect(await next.sweep()).toEqual({ removed: 1, migrated: 0 });
+        expect(await next.sweep()).toEqual({ removed: 1, migrated: 0, skipped: 0 });
         expect(dir.files.size).toBe(0);
         await writeRamChunks(pending, next);
         expect((await next.list()).sort()).toEqual(hashes.slice().sort());
@@ -369,5 +369,93 @@ describe("packed chunk store", () => {
         await restoreRam(fresh, last!.manifest, store);
         expect(Buffer.from(fresh).equals(Buffer.from(mem))).toBe(true);
         expect(packsOf(dir).length).toBeLessThan(12);
+    });
+
+    class FlakyDir extends MemoryPackDir {
+        failing = new Map<string, number>();
+        override async read(name: string, from = 0, to?: number): Promise<Uint8Array | null> {
+            const left = this.failing.get(name) ?? 0;
+            if (left > 0) {
+                this.failing.set(name, left - 1);
+                throw new Error(`NotReadableError: ${name}`);
+            }
+            return super.read(name, from, to);
+        }
+    }
+
+    test("an index that cannot be read fails the open and costs nothing: the next open has the pack, and no sweep removes it", async () => {
+        const dir = new FlakyDir();
+        const first = await PackedChunkStore.open(dir);
+        const pending = await chunks(2);
+        const hashes = [...pending.keys()].sort();
+        await writeRamChunks(pending, first);
+        const pack = packsOf(dir)[0]!;
+        const before = [...dir.files.keys()].sort();
+
+        dir.failing.set(pack + ".idx", 1);
+        const failed = await PackedChunkStore.open(dir).catch(e => e as Error);
+        expect(failed).toBeInstanceOf(Error);
+        expect((failed as Error).message).toContain(pack + ".idx");
+        expect([...dir.files.keys()].sort()).toEqual(before);
+
+        const reopened = await PackedChunkStore.open(dir);
+        expect(await reopened.sweep()).toEqual({ removed: 0, migrated: 0, skipped: 0 });
+        expect(await reopened.sweep()).toEqual({ removed: 0, migrated: 0, skipped: 0 });
+        expect([...dir.files.keys()].sort()).toEqual(before);
+        expect((await reopened.list()).sort()).toEqual(hashes);
+        for (const hash of hashes) expect(await reopened.get(hash)).not.toBeNull();
+    });
+
+    test("an index that is listed but gone when it is read leaves its pack alone", async () => {
+        class Vanishing extends MemoryPackDir {
+            gone = "";
+            override async read(name: string, from = 0, to?: number): Promise<Uint8Array | null> {
+                return name === this.gone ? null : super.read(name, from, to);
+            }
+        }
+        const dir = new Vanishing();
+        await writeRamChunks(await chunks(2), await PackedChunkStore.open(dir));
+        const pack = packsOf(dir)[0]!;
+        const before = [...dir.files.keys()].sort();
+        dir.gone = pack + ".idx";
+        const store = await PackedChunkStore.open(dir);
+        expect(await store.list()).toEqual([]);
+        expect(await store.sweep()).toEqual({ removed: 0, migrated: 0, skipped: 0 });
+        expect(await store.sweep()).toEqual({ removed: 0, migrated: 0, skipped: 0 });
+        expect([...dir.files.keys()].sort()).toEqual(before);
+    });
+
+    test("a loose chunk that cannot be read during the sweep stays a loose file and is migrated by a later sweep", async () => {
+        const dir = new FlakyDir();
+        const loose: string[] = [];
+        for (let i = 0; i < 3; i++) {
+            const hash = await sha256Hex(new Uint8Array([7, i]));
+            dir.files.set(hash, new Uint8Array([0, 5, 6, i]));
+            loose.push(hash);
+        }
+        const store = await PackedChunkStore.open(dir);
+        dir.failing.set(loose[1]!, 1);
+        expect(await store.sweep()).toEqual({ removed: 0, migrated: 2, skipped: 1 });
+        expect(dir.files.has(loose[1]!)).toBe(true);
+        expect(dir.files.has(loose[0]!) || dir.files.has(loose[2]!)).toBe(false);
+        expect([...(await store.get(loose[1]!))!]).toEqual([0, 5, 6, 1]);
+
+        const reopened = await PackedChunkStore.open(dir);
+        expect((await reopened.list()).sort()).toEqual(loose.slice().sort());
+        for (const [i, hash] of loose.entries()) expect([...(await reopened.get(hash))!]).toEqual([0, 5, 6, i]);
+        expect(await reopened.sweep()).toEqual({ removed: 0, migrated: 1, skipped: 0 });
+        expect(dir.files.has(loose[1]!)).toBe(false);
+        for (const [i, hash] of loose.entries()) expect([...(await reopened.get(hash))!]).toEqual([0, 5, 6, i]);
+    });
+
+    test("a chunk whose pack cannot be read is an error, not a missing chunk", async () => {
+        const dir = new FlakyDir();
+        const store = await PackedChunkStore.open(dir);
+        const pending = await chunks(1);
+        const hash = [...pending.keys()][0]!;
+        await writeRamChunks(pending, store);
+        dir.failing.set(packsOf(dir)[0]!, 1);
+        expect((await store.get(hash).catch(e => e as Error)) instanceof Error).toBe(true);
+        expect(await store.get(hash)).not.toBeNull();
     });
 });

@@ -246,12 +246,25 @@ export async function listSlots(): Promise<{ gameId: string; game: string; slots
     return { gameId: t.gameId(), game, slots: list };
 }
 
+/**
+ * Housekeeping before a save or a delete. A failure here leaves the store as readable as it
+ * was (nothing is removed that was not packed first), so it is reported and the operation goes on.
+ */
+async function sweepChunks(chunks: ChunkStore): Promise<void> {
+    try {
+        const swept = await chunks.sweep?.() as { skipped?: number } | undefined;
+        if (swept?.skipped) Logger.warn(LogCategory.SYSTEM, `[SAVESTATE] ${swept.skipped} loose chunk file(s) could not be read and stay where they are`);
+    } catch (e) {
+        Logger.warn(LogCategory.SYSTEM, `[SAVESTATE] housekeeping of the chunk store failed and is retried at the next save: ${e instanceof Error ? e.message : String(e)}`);
+    }
+}
+
 export async function deleteSlot(slot: string): Promise<{ removedChunks: number }> {
     const game = gameDir();
     checkSlotName(slot);
     return withGameLock(game, async () => {
         const store = await gameStore(game);
-        await store.chunkStore.sweep?.();
+        await sweepChunks(store.chunkStore);
         return { removedChunks: await store.remove(slot) };
     });
 }
@@ -268,7 +281,7 @@ export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, p
     if (early) throw new CaptureRefusal(early);
     return withGameLock(game, async () => {
         const store = await gameStore(game);
-        await store.chunkStore.sweep?.();
+        await sweepChunks(store.chunkStore);
         const known = new Set(await store.chunkStore.list());
         const t = target(await overlayDigest());
         const t0 = performance.now();
