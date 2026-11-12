@@ -181,7 +181,10 @@ export function createComTripleStubs(): Record<string, ThunkImplementation> {
             const refCount = releaseComRef(ptr);
             // Final Release of a device: its cursor dies with it (wined3d_device_uninit_3d
             // drops cursor_texture), so the host must stop being told to draw it.
-            if (refCount === 0 && devices.has(ptr)) releaseDeviceCursor(ptr);
+            if (refCount === 0 && devices.has(ptr)) {
+                devices.get(ptr)!.clearBufferReferences();
+                releaseDeviceCursor(ptr);
+            }
             return refCount ?? 1;
         };
     }
@@ -336,6 +339,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         const src = device.getStreamSource(streamNumber);
         if (!writeOptionalUint32(args[2], src.vb)) return D3DERR_INVALIDCALL;
         if (!writeOptionalUint32(args[3], src.stride)) return D3DERR_INVALIDCALL;
+        if (src.vb) addComRef(src.vb);
         return D3D_OK;
     };
 
@@ -354,8 +358,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             device.recordStateBlock({ op: 'indices', ib: ibPtr, baseVertex: args[2] | 0 });
             return D3D_OK;
         }
-        device.indexIB = ibPtr;                // IB COM ptr
-        device.baseVertexIndex = args[2] | 0;  // D3D8 includes BaseVertexIndex here
+        device.setIndices(ibPtr, args[2] | 0);
         return D3D_OK;
     };
 
@@ -364,6 +367,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         if (!device) return D3DERR_INVALIDCALL;
         if (!writeOptionalUint32(args[1], device.indexIB)) return D3DERR_INVALIDCALL;
         if (!writeOptionalUint32(args[2], device.baseVertexIndex >>> 0)) return D3DERR_INVALIDCALL;
+        if (device.indexIB) addComRef(device.indexIB);
         return D3D_OK;
     };
 

@@ -164,8 +164,7 @@ export function registerFastPathD3D8Functions(dispatcher: HleDispatcher): void {
             const baseVertex = view.getInt32(esp + 12, true);
             if (ibPtr !== 0 && !device.ibData.has(ibPtr)) return null; // unknown IB → slow thunk (warns)
             if (device.recordingStateBlock) { device.recordStateBlock({ op: 'indices', ib: ibPtr, baseVertex }); return D3D_OK; }
-            device.indexIB = ibPtr;
-            device.baseVertexIndex = baseVertex;
+            device.setIndices(ibPtr, baseVertex);
             return D3D_OK;
         }, { trivial: true });
 

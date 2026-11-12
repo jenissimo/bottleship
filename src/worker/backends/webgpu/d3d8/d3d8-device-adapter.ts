@@ -131,6 +131,7 @@ import type { VertexBlendInput } from '../ddraw/compute/vertex-converter';
 import { MAX_FFP_SAMPLED_STAGES } from '../ddraw/ffp-stages';
 import { D3D8ShaderRegistry, D3D8VsObject } from './d3d8-shader-registry';
 import { D3D8ProgrammableRenderer } from './d3d8-programmable-draw';
+import { retainBuffer, releaseBuffer } from "../../../modules/d3d8/buffer-lifetime";
 import { KeyedStateBlockRecorder } from '../shared/state-block-recorder';
 import type { D3D8StateBlockEntry } from './d3d8-state-block';
 import {
@@ -402,8 +403,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     } = { frameId: 0, drawCalls: 0, presents: 0 };
 
     // Resource stores (COM ptr → data)
-    readonly vbData = new Map<number, { guestPtr: number; size: number; fvf: number; usage: number; pool: number }>();
-    readonly ibData = new Map<number, { guestPtr: number; size: number; format: number; usage: number; pool: number }>();
+    readonly vbData = new Map<number, { guestPtr: number; size: number; fvf: number; usage: number; pool: number; internalRefs?: number }>();
+    readonly ibData = new Map<number, { guestPtr: number; size: number; format: number; usage: number; pool: number; internalRefs?: number }>();
     readonly texSurfaces = new Map<number, DirectDrawSurfaceState>();
     
     // Lighting state
@@ -503,17 +504,31 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         // Recording lives in the device layer so the Tier-0 WBUF drain path (which bypasses
         // the thunk/FastPath) journals correctly during BeginStateBlock — same model as D3D9.
         // The thunk/FastPath recording branches short-circuit before this, so no double-record.
+        if (vbPtr !== 0 && !this.vbData.has(vbPtr >>> 0)) return;
         if (this.recordingStateBlock) { this.recordStateBlock({ op: 'streamSource', stream: streamNumber, vb: vbPtr >>> 0, stride: stride >>> 0 }); return; }
         const src = this.streamSources[streamNumber];
         if (!src) return;
-        src.vb = vbPtr >>> 0;
+        const next = vbPtr >>> 0, previous = src.vb;
+        if (previous !== next) {
+            this.flushProgrammablePending();
+            retainBuffer(this, "vb", next);
+            src.vb = next;
+            releaseBuffer(this, "vb", previous);
+        }
         src.stride = stride >>> 0;
     }
 
     /** SetIndices(pIB, BaseVertexIndex) — D3D8 folds BaseVertexIndex into the IB binding. */
     setIndices(ibPtr: number, baseVertex: number): void {
+        if (ibPtr !== 0 && !this.ibData.has(ibPtr >>> 0)) return;
         if (this.recordingStateBlock) { this.recordStateBlock({ op: 'indices', ib: ibPtr >>> 0, baseVertex: baseVertex | 0 }); return; }
-        this.indexIB = ibPtr >>> 0;
+        const next = ibPtr >>> 0, previous = this.indexIB;
+        if (previous !== next) {
+            this.flushProgrammablePending();
+            retainBuffer(this, "ib", next);
+            this.indexIB = next;
+            releaseBuffer(this, "ib", previous);
+        }
         this.baseVertexIndex = baseVertex | 0;
     }
 
@@ -1243,7 +1258,25 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     }
 
     recordStateBlock(entry: D3D8StateBlockEntry): void {
-        this.stateBlockRecorder.record(entry);
+        if (!this.recordingStateBlock) return;
+        this.referenceStateBlockBuffer(entry, true);
+        const previous = this.stateBlockRecorder.record(entry);
+        if (previous) this.referenceStateBlockBuffer(previous, false);
+    }
+
+    private referenceStateBlockBuffer(entry: D3D8StateBlockEntry, retain: boolean): void {
+        const update = retain ? retainBuffer : releaseBuffer;
+        if (entry.op === "streamSource") update(this, "vb", entry.vb);
+        else if (entry.op === "indices") update(this, "ib", entry.ib);
+    }
+
+    clearBufferReferences(): void {
+        if (this.recordingStateBlock) {
+            for (const entry of this.stateBlockRecorder.end()) this.referenceStateBlockBuffer(entry, false);
+        }
+        for (let stream = 0; stream < this.streamSources.length; stream++) this.setStreamSource(stream, 0, 0);
+        this.setIndices(0, 0);
+        for (const token of this.stateBlocks.keys()) this.deleteStateBlock(token);
     }
 
     beginStateBlock(): number {
@@ -1270,7 +1303,10 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     captureStateBlock(token: number): number {
         const entries = this.stateBlocks.get(token >>> 0);
         if (!entries) return 0x8876086c;
+        const previous = entries.slice();
         refreshD3D8CapturedEntries(this, entries);
+        for (const entry of entries) this.referenceStateBlockBuffer(entry, true);
+        for (const entry of previous) this.referenceStateBlockBuffer(entry, false);
         return 0;
     }
 
@@ -1279,12 +1315,18 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             return { hr: 0x8876086c, token: 0 };
         }
         const token = this.nextStateBlockToken++;
-        this.stateBlocks.set(token, captureD3D8StateToEntries(this, blockType));
+        const entries = captureD3D8StateToEntries(this, blockType);
+        for (const entry of entries) this.referenceStateBlockBuffer(entry, true);
+        this.stateBlocks.set(token, entries);
         return { hr: 0, token };
     }
 
     deleteStateBlock(token: number): number {
-        return this.stateBlocks.delete(token >>> 0) ? 0 : 0x8876086c;
+        const entries = this.stateBlocks.get(token >>> 0);
+        if (!entries) return 0x8876086c;
+        this.stateBlocks.delete(token >>> 0);
+        for (const entry of entries) this.referenceStateBlockBuffer(entry, false);
+        return 0;
     }
 
     setLight(index: number, light: D3DLight7Data): void {

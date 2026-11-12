@@ -6,7 +6,7 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
-import { freeComObject } from '../../core/com/com-memory';
+import { releaseBufferReference } from './buffer-lifetime';
 import {
     addComRef,
     clearRenderTargetOverrideForSurface,
@@ -1037,23 +1037,8 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         return 0;
     };
 
-    const releaseBuffer = (ptr: number, kind: "vb" | "ib"): number => {
-        const refs = releaseComRef(ptr);
-        if (refs === undefined) return 0;
-        if (refs > 0) return refs;
-        const device = resourceToDevice.get(ptr);
-        const data = kind === "vb" ? device?.vbData : device?.ibData;
-        const buffer = data?.get(ptr);
-        device?.releaseBuffer(kind, ptr);
-        if (buffer) System.getInstance().process?.memory.free(buffer.guestPtr);
-        data?.delete(ptr);
-        resourceToDevice.delete(ptr);
-        const process = System.getInstance().process;
-        if (process) freeComObject(process.memory, ptr);
-        return 0;
-    };
-    exports['IDirect3DVertexBuffer8_Release'] = (_ctx, _mem, args) => releaseBuffer(args[0], "vb");
-    exports['IDirect3DIndexBuffer8_Release'] = (_ctx, _mem, args) => releaseBuffer(args[0], "ib");
+    exports['IDirect3DVertexBuffer8_Release'] = (_ctx, _mem, args) => releaseBufferReference(args[0], "vb");
+    exports['IDirect3DIndexBuffer8_Release'] = (_ctx, _mem, args) => releaseBufferReference(args[0], "ib");
 
     exports['IDirect3DSurface8_AddRef'] = (_ctx, _mem, args) => {
         const pSurf = args[0];
