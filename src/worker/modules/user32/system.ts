@@ -945,15 +945,26 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return lpStr;
     };
 
-    // BOOL IsCharLowerA(CHAR ch)
-    // The ANSI entry point classifies the byte using the system ANSI code page. A
-    // character is lower case only when it has a distinct upper-case form and is
-    // already its lower-case form; digits, punctuation, and uncased letters are false.
-    exports['IsCharLowerA'] = (_ctx, _mem, args) => {
-        const cp = EmulatorConfig.getInstance().ansiCodePage;
-        const ch = getCodePageDecoder(cp).decode(new Uint8Array([args[0] & 0xFF]));
-        return ch === ch.toLowerCase() && ch !== ch.toUpperCase() ? 1 : 0;
-    };
+    // BOOL IsChar{Lower,Upper,Alpha,AlphaNumeric}{A,W}(TCHAR ch)
+    // The ANSI entry points classify the byte on the system ANSI code page, the wide
+    // ones the UTF-16 unit. A character is lower (upper) case only when it has a
+    // distinct other-case form and is already its lower (upper) form; a letter is any
+    // character of Unicode category L, which includes the uncased ones.
+    const ansiChar = (arg: number): string =>
+        getCodePageDecoder(EmulatorConfig.getInstance().ansiCodePage).decode(new Uint8Array([arg & 0xFF]));
+    const wideChar = (arg: number): string => String.fromCharCode(arg & 0xFFFF);
+    const isLower = (ch: string): boolean => ch === ch.toLowerCase() && ch !== ch.toUpperCase();
+    const isUpper = (ch: string): boolean => ch === ch.toUpperCase() && ch !== ch.toLowerCase();
+    const isAlpha = (ch: string): boolean => /^\p{L}$/u.test(ch);
+    const isAlphaNumeric = (ch: string): boolean => /^[\p{L}\p{Nd}]$/u.test(ch);
+    exports['IsCharLowerA'] = (_ctx, _mem, args) => isLower(ansiChar(args[0])) ? 1 : 0;
+    exports['IsCharLowerW'] = (_ctx, _mem, args) => isLower(wideChar(args[0])) ? 1 : 0;
+    exports['IsCharUpperA'] = (_ctx, _mem, args) => isUpper(ansiChar(args[0])) ? 1 : 0;
+    exports['IsCharUpperW'] = (_ctx, _mem, args) => isUpper(wideChar(args[0])) ? 1 : 0;
+    exports['IsCharAlphaA'] = (_ctx, _mem, args) => isAlpha(ansiChar(args[0])) ? 1 : 0;
+    exports['IsCharAlphaW'] = (_ctx, _mem, args) => isAlpha(wideChar(args[0])) ? 1 : 0;
+    exports['IsCharAlphaNumericA'] = (_ctx, _mem, args) => isAlphaNumeric(ansiChar(args[0])) ? 1 : 0;
+    exports['IsCharAlphaNumericW'] = (_ctx, _mem, args) => isAlphaNumeric(wideChar(args[0])) ? 1 : 0;
 
     // LPWSTR CharUpperW(LPWSTR lpsz)
     // If lpsz <= 0xFFFF it is a single wide character passed as atom; return uppercased code point.
