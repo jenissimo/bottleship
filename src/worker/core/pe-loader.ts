@@ -15,6 +15,8 @@ import { hypercallDataManager } from './cpu/hypercall-data';
 import { libHleManager } from './hle-lib/lib-hle-manager';
 import { hookRegistry } from './hooks';
 import { runNativeModulePatchers } from '../modules/native-patchers';
+import { savestatesEnabled } from '../savestate/participant';
+import { sha256HexSync } from '../savestate/sha256';
 import { findDllRule, normalizeDllPathToken } from './dll-rules';
 import { isUnderSystemDirectory } from './hle-system-catalog';
 import { EmulatorConfig } from './emulator-config-manager';
@@ -66,6 +68,16 @@ const DLL_PROCESS_ATTACH = 1;
 const DLL_PROCESS_DETACH = 0;
 const DLL_THREAD_ATTACH = 2;
 const DLL_THREAD_DETACH = 3;
+
+export interface InlineStubState {
+    heap: { heapAllocStub: number; heapFreeStub: number; regionBase: number; regionEnd: number } | null;
+    crt: { mallocStub: number; freeStub: number; regionBase: number; regionEnd: number } | null;
+    caseFold: { tolowerStub: number; toupperStub: number; regionBase: number; regionEnd: number } | null;
+    locale: LocaleInlineStubs | null;
+    mbwc: MbwcInlineStubs | null;
+    mbwcDeclined: boolean;
+    math: CrtMathStubs | null;
+}
 
 export class PELoader {
     /**
@@ -301,11 +313,42 @@ export class PELoader {
      * Collected during loadExecutable → loadDll, consumed by bootloader trampoline.
      */
     private pendingDllInits: DllInitEntry[] = [];
+    private bootImagesLoaded = false;
 
     constructor(getMemory: () => Uint8Array, thunkGenerator: ThunkGenerator, apiRegistry: APIRegistry) {
         this.getMemory = getMemory;
         this.thunkGenerator = thunkGenerator;
         this.apiRegistry = apiRegistry;
+    }
+
+    captureInlineStubs(): InlineStubState {
+        return structuredClone({
+            heap: this.heapInlineStubs, crt: this.crtInlineStubs, caseFold: this.caseFoldInlineStubs,
+            locale: this.localeInlineStubs, mbwc: this.mbwcInlineStubs, mbwcDeclined: this.mbwcStubsDeclined,
+            math: this.mathInlineStubs,
+        });
+    }
+
+    restoreInlineStubs(state: InlineStubState): void {
+        const saved = structuredClone(state);
+        this.heapInlineStubs = saved.heap;
+        this.crtInlineStubs = saved.crt;
+        this.caseFoldInlineStubs = saved.caseFold;
+        this.localeInlineStubs = saved.locale;
+        this.mbwcInlineStubs = saved.mbwc;
+        this.mbwcStubsDeclined = saved.mbwcDeclined;
+        this.mathInlineStubs = saved.math;
+        const scheduler = System.getInstance().scheduler;
+        for (const stubs of [saved.heap, saved.crt]) {
+            if (stubs) scheduler?.registerNonPreemptibleRange(stubs.regionBase, stubs.regionEnd);
+        }
+    }
+
+    async readImageFile(path: string): Promise<Uint8Array | null> {
+        if (!this.vfs) return null;
+        const handle = await this.vfs.open(path, 0x80000000, 3);
+        if (!handle) return null;
+        return this.vfs.read(handle, this.vfs.getFileSize(path));
     }
 
     /**
@@ -435,6 +478,7 @@ export class PELoader {
     }
 
     async loadExecutable(peData: Uint8Array): Promise<LoadedModule> {
+        this.bootImagesLoaded = false;
         const peView = new DataView(peData.buffer, peData.byteOffset, peData.byteLength);
 
         // Verify DOS Header
@@ -572,6 +616,7 @@ export class PELoader {
         // PE32 optional header offset 72 = SizeOfStackReserve
         const sizeOfStackReserve = peView.getUint32(optHeaderPtr + 72, true);
 
+        this.bootImagesLoaded = true;
         return {
             baseAddress,
             entryPoint: baseAddress + entryPointRVA,
@@ -743,6 +788,7 @@ export class PELoader {
         this.loadingDlls.add(dllNameLower);
 
         let registered = false;
+        const runTime = this.bootImagesLoaded;
         try {
             // Open and read DLL from VFS
             const handle = await this.vfs.open(dllPath, 0x80000000, 3); // GENERIC_READ, OPEN_EXISTING
@@ -847,18 +893,22 @@ export class PELoader {
                 initialized: false,
                 sections
             };
+            if (runTime) module.unsaved = 'has no content hash';
             this.moduleRegistry.register(module);
             registered = true;
+            let hostPatched = false;
 
             // Static Library HLE detection for this DLL's image (same reason as EXE path).
             try {
-                libHleManager.onModuleLoaded(module);
+                if (libHleManager.onModuleLoaded(module)) hostPatched = true;
             } catch (e) {
+                hostPatched = true;
                 Logger.warn(LogCategory.SYSTEM, `[HLE-lib] onModuleLoaded threw on DLL ${dllName}: ${e}`);
             }
             try {
-                hookRegistry.onModuleLoaded(module);
+                if (hookRegistry.onModuleLoaded(module)) hostPatched = true;
             } catch (e) {
+                hostPatched = true;
                 Logger.warn(LogCategory.SYSTEM, `[hooks] onModuleLoaded threw on DLL ${dllName}: ${e}`);
             }
 
@@ -878,7 +928,15 @@ export class PELoader {
             // is isolated by the registry, so one library's patcher cannot fail the DLL load.
             {
                 const system = System.getInstance();
-                if (system.process) runNativeModulePatchers(system.process, module);
+                if (system.process && runNativeModulePatchers(system.process, module)) hostPatched = true;
+            }
+            if (runTime) {
+                if (hostPatched) module.unsaved = 'is patched by host-side hooks';
+                else if (savestatesEnabled()) {
+                    delete module.unsaved;
+                    module.contentHash = sha256HexSync(peData);
+                    if (handle.source !== 'rom') module.imageBytes = peData.slice();
+                }
             }
 
             Logger.warn(LogCategory.SYSTEM,
@@ -1166,7 +1224,7 @@ export class PELoader {
     /**
      * Parse PE Export Directory to get exports
      */
-    private parseExportTable(peData: Uint8Array, baseAddress: number): {
+    parseExportTable(peData: Uint8Array, baseAddress: number): {
         exports: Map<string, number>;
         ordinals: Map<number, number>;
     } {

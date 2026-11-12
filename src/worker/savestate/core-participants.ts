@@ -15,6 +15,7 @@ import type { ThunkGeneratorState, ThunkStub } from '../core/thunking/thunk-gene
 import { captureKernel32Memory, restoreKernel32Memory, type Kernel32MemoryState } from '../modules/kernel32/memory';
 import { pickSaved, savestateParticipants, stateKeys, type CaptureContext, type FieldPolicy } from './participant';
 import { CPU_FIELDS, captureCpu, restoreCpu, type V86Cpu } from './participants/cpu';
+import { MODULE_IMAGES_SCHEMA, moduleImagesHooks } from './participants/module-images';
 import { CaptureRefusal, objectCodecs } from './object-codecs';
 import { registerKernel32Participant } from '../modules/kernel32/savestate';
 import { registerUser32Participants } from '../modules/user32/savestate';
@@ -207,6 +208,13 @@ export function registerCoreParticipants(): void {
         id: 'thunk-generator', version: 1, order: 5, schema: schema(SCHEMAS.thunkGenerator),
         capture: () => save(process().thunkGenerator.captureState()),
         restore: (s) => process().thunkGenerator.restoreState(as<ThunkGeneratorState>(s)),
+    });
+    const moduleImages = moduleImagesHooks(() => ({ registry: process().moduleRegistry, loader: process().loader }));
+    savestateParticipants.add({
+        id: 'module-images', version: 1, order: 7, schema: schema(MODULE_IMAGES_SCHEMA),
+        capture: (ctx) => refusing('module images', () => moduleImages.capture(ctx)),
+        verify: moduleImages.verify,
+        restore: moduleImages.restore,
     });
     savestateParticipants.add({
         id: 'resources', version: 1, order: 10, schema: schema(SCHEMAS.resources),

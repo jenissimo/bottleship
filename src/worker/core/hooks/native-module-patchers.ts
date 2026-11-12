@@ -26,7 +26,7 @@ export interface NativeModulePatcher {
      * for itself inside `patch` (some do their own multi-signal detection).
      */
     matches?: (module: LoadedPEModule) => boolean;
-    patch: (process: Process, module: LoadedPEModule) => unknown;
+    patch: (process: Process, module: LoadedPEModule) => boolean;
 }
 
 const patchers: NativeModulePatcher[] = [];
@@ -50,16 +50,19 @@ export function nativeModulePatcherDispatches(): string[] {
 }
 
 /** Offer one freshly loaded real module to every registered patcher, in registration order. */
-export function runNativeModulePatchers(process: Process, module: LoadedPEModule): void {
+export function runNativeModulePatchers(process: Process, module: LoadedPEModule): boolean {
     dispatched.push(module.name);
     if (dispatched.length > 64) dispatched.shift();
+    let patched = false;
     for (const entry of patchers) {
         try {
             if (entry.matches && !entry.matches(module)) continue;
-            entry.patch(process, module);
+            if (entry.patch(process, module)) patched = true;
         } catch (e) {
+            patched = true;
             Logger.warn(LogCategory.SYSTEM,
                 `[native-patch] "${entry.id}" threw on ${module.name}: ${e} — module left unpatched`);
         }
     }
+    return patched;
 }
