@@ -134,6 +134,40 @@ describe('CRT binary integers and wide stdio', () => {
         expect(await result(crt.readFileValue(fp, true))).toBe(65);
         expect(crt.ungetwc(0xffff, fp)).toBe(0xffff);
     });
+    test('fgetws reads a text line per call: CRLF becomes L"\\n", kept, and NUL-terminated', async () => {
+        const text = '[section]\r\nrocks, 2\r\nend';
+        const fp = await open([...text].map((c) => c.charCodeAt(0)), 'rt');
+        const line = (n = 64) => {
+            const r = crt.fgetws(0x8000, n, fp);
+            if (r === 0) return null;
+            let s = '';
+            for (let a = 0x8000, c = Mem.readUint16(a)!; c; c = Mem.readUint16(a += 2)!) s += String.fromCharCode(c);
+            return s;
+        };
+        expect(line()).toBe('[section]\n');
+        expect(line(4)).toBe('roc');   // count-1 characters, then the rest on the next call
+        expect(line()).toBe('ks, 2\n');
+        expect(line()).toBe('end');     // last line without a newline still comes back
+        expect(line()).toBeNull();      // WEOF before any character: NULL
+        expect(crt.fgetws(0x8000, 1, fp)).toBe(0x8000); // room for the terminator only: L""
+        expect(crt.fgetws(0x8000, 0, fp)).toBe(0);
+        expect(errno).toBe(22);
+    });
+    test('fgetws continues a line on the async path when the data is not resident', async () => {
+        const fp = await open([0x61, 0x62, 0x0a, 0x63], 'rt');
+        const originalRead = vfs.readSync.bind(vfs);
+        vfs.readSync = () => null;
+        vfs.read = async (h, n) => originalRead(h, n)!;
+        const pending = crt.fgetws(0x8000, 16, fp);
+        expect(pending).toBeInstanceOf(Promise);
+        expect(await pending).toEqual({ value: 0x8000, stackCleanup: 0 });
+        expect([0, 2, 4, 6].map((o) => Mem.readUint16(0x8000 + o))).toEqual([0x61, 0x62, 0x0a, 0]);
+    });
+    test('fgetws is declared cdecl with three arguments', () => {
+        const f = msvcrtModule.functions.find(f => f.name === 'fgetws')!;
+        expect(f.callingConvention).toBe('cdecl');
+        expect(f.params.length).toBe(3);
+    });
     test('cold wide reads await data with cdecl cleanup; I/O errors set error instead of EOF', async () => {
         const fp = await open([0x34, 0x12]);
         const originalRead = vfs.readSync.bind(vfs);
@@ -251,4 +285,42 @@ describe('tmpfile ownership and lifecycle', () => {
         expect(await result(crt.fclose(original))).toBe(0);
         expect(vfs.fileExists(path)).toBe(false);
     });
+});
+
+test('fgetws reports a read error after partial input instead of a successful line', async () => {
+    const fp = await open([0x61, 0x62], 'rt');
+    const read = vfs.readSync.bind(vfs);
+    vfs.readSync = (h, n) => {
+        if (vfs.tell(h) > 0) throw new Error('read refused');
+        return read(h, n);
+    };
+    expect(await result(crt.fgetws(0x8000, 8, fp))).toBe(0);
+    expect(crt.ferror_fn(fp)).toBe(1);
+    expect(crt.feof_fn(fp)).toBe(0);
+    expect(errno).toBe(5);
+});
+test('fgetws preserves async read errors and validates parameters', async () => {
+    const fp = await open([0x61], 'rt');
+    for (const args of [[0, 8, fp], [0x8000, 0, fp], [0x8000, -1, fp], [0x8000, 8, 0]]) {
+        expect(crt.fgetws(...args)).toBe(0);
+        expect(errno).toBe(22);
+    }
+    vfs.readSync = () => null;
+    vfs.read = async () => { throw new Error('read refused'); };
+    expect(await crt.fgetws(0x8000, 8, fp)).toEqual({ value: 0, stackCleanup: 0 });
+    expect(crt.ferror_fn(fp)).toBe(1);
+    expect(crt.feof_fn(fp)).toBe(0);
+});
+test('fgetws reuses wide binary and multibyte text decoding and pushback', async () => {
+    const fp = await open([0xac, 0x20, 0x0a, 0x00], 'rb');
+    expect(await result(crt.fgetws(0x8000, 8, fp))).toBe(0x8000);
+    expect([0, 2, 4].map(o => Mem.readUint16(0x8000 + o))).toEqual([0x20ac, 10, 0]);
+    expect(crt.ungetwc(0x41, fp)).toBe(0x41);
+    expect(await result(crt.fgetws(0x8000, 8, fp))).toBe(0x8000);
+    expect(Mem.readUint16(0x8000)).toBe(0x41);
+    const jp = await open([0x82, 0xa0, 0x0a], 'rt');
+    crt.currentLocale = 'Japanese_Japan.932';
+    EmulatorConfig.getInstance().ansiCodePage = 932;
+    expect(await result(crt.fgetws(0x8000, 8, jp))).toBe(0x8000);
+    expect([0, 2, 4].map(o => Mem.readUint16(0x8000 + o))).toEqual([0x3042, 10, 0]);
 });

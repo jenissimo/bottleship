@@ -139,6 +139,7 @@ const ucrtFunctions: FunctionDescriptor[] = [
     makeFunc("_getw", 1),
     makeFunc("_putw", 2),
     makeFunc("fgetwc", 1),
+    makeFunc("fgetws", 3),
     makeFunc("fputwc", 2),
     makeFunc("ungetwc", 2),
     makeFunc("tmpfile", 0),
