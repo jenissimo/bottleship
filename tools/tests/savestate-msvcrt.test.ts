@@ -170,7 +170,8 @@ describe("msvcrt participant", () => {
         const fd = crt.exports["_open_osfhandle"]!({}, mem, [0x44, 0]);
         expect(crt.exports["_get_osfhandle"]!({}, mem, [fd])).toBe(0x44);
         expect(() => crt.captureSavestate()).toThrow("Win32 handle");
-        expect(crt.exports["_close"]!({}, mem, [fd])).toBe(0);
+        // 0x44 has no kernel object behind it, so CloseHandle fails: -1, yet the fd is released.
+        expect(crt.exports["_close"]!({}, mem, [fd])).toBe(-1);
         expect((crt.fdHandles as Map<number, number>).size).toBe(0);
         expect((crt.handleFds as Map<number, number>).size).toBe(0);
         expect(() => crt.captureSavestate()).not.toThrow();
@@ -178,7 +179,20 @@ describe("msvcrt participant", () => {
         const again = crt.exports["_open_osfhandle"]!({}, mem, [0x44, 0]);
         expect(again).not.toBe(fd);
         expect(crt.exports["_get_osfhandle"]!({}, mem, [again])).toBe(0x44);
-        expect(crt.exports["_close"]!({}, mem, [again])).toBe(0);
+        expect(crt.exports["_close"]!({}, mem, [again])).toBe(-1);
+        expect((crt.fdHandles as Map<number, number>).size).toBe(0);
+    });
+
+    test("_close reports a failed CloseHandle like the CRT; std pseudo-handles close cleanly", () => {
+        const crt = played();
+        const errno = (): number => Mem.readUint32(crt.exports["_errno"]!({}, mem, []) as number) ?? 0;
+        const bad = crt.exports["_open_osfhandle"]!({}, mem, [0x4c, 0]);
+        expect(crt.exports["_close"]!({}, mem, [bad])).toBe(-1);
+        expect(errno()).toBe(9);
+        expect(crt.exports["_get_osfhandle"]!({}, mem, [bad])).toBe(-1);
+        const out = crt.exports["_open_osfhandle"]!({}, mem, [1, 0]);
+        expect(crt.exports["_close"]!({}, mem, [out])).toBe(0);
+        expect((crt.fdHandles as Map<number, number>).size).toBe(0);
     });
 
     test("fclose on an _fdopen stream drops the _open_osfhandle mappings", () => {
