@@ -205,7 +205,7 @@ describe("packed chunk store", () => {
         expect(dir.files.size).toBe(0);
     });
 
-    test("leftovers are cleaned at open: a pack without an index, an index without its pack, a broken index; loose chunk files of the old layout still read and delete", async () => {
+    test("leftovers are cleaned at open: a pack without an index, an index without its pack, a broken index, and the loose chunk files of the layout before packs", async () => {
         const dir = new MemoryPackDir();
         const store = await PackedChunkStore.open(dir);
         const pending = await chunks(3);
@@ -216,17 +216,15 @@ describe("packed chunk store", () => {
         dir.files.set("pabc-2.pack.idx", new TextEncoder().encode(JSON.stringify({ v: 1, pack: "pabc-2.pack", chunks: [] })));
         dir.files.set("pabc-3.pack", new Uint8Array(4));
         dir.files.set("pabc-3.pack.idx", new TextEncoder().encode("{not json"));
-        const loose = await sha256Hex(new Uint8Array([1, 2, 3]));
-        dir.files.set(loose, new Uint8Array([0, 1, 2, 3]));
+        const loose: string[] = [];
+        for (let i = 0; i < 40; i++) { loose.push(await sha256Hex(new Uint8Array([1, 2, i]))); dir.files.set(loose[i]!, new Uint8Array([0, 1, 2, 3])); }
+        dir.files.set("notes.txt", new Uint8Array(1));
         const reopened = await PackedChunkStore.open(dir);
-        expect([...dir.files.keys()].sort()).toEqual([loose, pack, pack + ".idx"].sort());
-        expect((await reopened.list()).sort()).toEqual([...hashes, loose].sort());
-        expect(await reopened.size(loose)).toBe(4);
-        expect([...(await reopened.get(loose))!]).toEqual([0, 1, 2, 3]);
-        await reopened.putMany!([[loose, new Uint8Array([9])]]);
-        expect(packsOf(dir)).toEqual([pack]);
-        await reopened.delete(loose);
-        expect(dir.files.has(loose)).toBe(false);
+        expect([...dir.files.keys()].sort()).toEqual(["notes.txt", pack, pack + ".idx"].sort());
+        expect((await reopened.list()).sort()).toEqual(hashes.slice().sort());
+        expect(await reopened.has(loose[0]!)).toBe(false);
+        expect(await reopened.get(loose[0]!)).toBeNull();
+        expect(await reopened.size(loose[0]!)).toBe(0);
     });
 
     test("fifty saves and collections leave only what the last manifest names", async () => {

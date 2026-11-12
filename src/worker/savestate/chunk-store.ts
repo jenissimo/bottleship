@@ -106,7 +106,6 @@ export const PACK_COMPACT_BELOW = 0.5;
 export class PackedChunkStore implements ChunkStore {
     private readonly entries = new Map<string, PackedEntry>();
     private readonly packs = new Map<string, { bytes: number; hashes: Set<string> }>();
-    private readonly loose = new Set<string>();
     private serial = 0;
 
     private constructor(private readonly dir: PackDir) {}
@@ -114,8 +113,12 @@ export class PackedChunkStore implements ChunkStore {
     static async open(dir: PackDir): Promise<PackedChunkStore> {
         const store = new PackedChunkStore(dir);
         const names = new Set(await dir.names());
+        const loose = [...names].filter(name => HASH_NAME.test(name));
+        let next = 0;
+        await Promise.all(Array.from({ length: Math.min(16, loose.length) }, async () => {
+            while (next < loose.length) await dir.remove(loose[next++]!);
+        }));
         for (const name of names) {
-            if (HASH_NAME.test(name)) { store.loose.add(name); continue; }
             if (!name.endsWith(INDEX_SUFFIX)) continue;
             const pack = name.slice(0, -INDEX_SUFFIX.length);
             const index = PACK_NAME.test(pack) && names.has(pack) ? parsePackIndex(await dir.read(name), pack) : null;
@@ -133,22 +136,20 @@ export class PackedChunkStore implements ChunkStore {
         let bytes = 0;
         for (const [hash, from, length] of index.chunks) {
             bytes = Math.max(bytes, from + length);
-            if (this.entries.has(hash) || this.loose.has(hash)) continue;
+            if (this.entries.has(hash)) continue;
             this.entries.set(hash, { pack: index.pack, from, length });
             hashes.add(hash);
         }
         this.packs.set(index.pack, { bytes, hashes });
     }
 
-    async has(hash: string): Promise<boolean> { checkHash(hash); return this.entries.has(hash) || this.loose.has(hash); }
+    async has(hash: string): Promise<boolean> { return this.entries.has(checkHash(hash)); }
 
     async get(hash: string): Promise<Uint8Array | null> {
         const e = this.entries.get(checkHash(hash));
-        if (e) {
-            const bytes = await this.dir.read(e.pack, e.from, e.from + e.length);
-            return bytes && bytes.byteLength === e.length ? bytes : null;
-        }
-        return this.loose.has(hash) ? this.dir.read(hash) : null;
+        if (!e) return null;
+        const bytes = await this.dir.read(e.pack, e.from, e.from + e.length);
+        return bytes && bytes.byteLength === e.length ? bytes : null;
     }
 
     async put(hash: string, bytes: Uint8Array): Promise<void> { await this.putMany([[hash, bytes]]); }
@@ -156,7 +157,7 @@ export class PackedChunkStore implements ChunkStore {
     async putMany(items: ReadonlyArray<readonly [string, Uint8Array]>): Promise<void> {
         const fresh = new Map<string, Uint8Array>();
         for (const [hash, bytes] of items) {
-            if (!this.entries.has(checkHash(hash)) && !this.loose.has(hash)) fresh.set(hash, bytes);
+            if (!this.entries.has(checkHash(hash))) fresh.set(hash, bytes);
         }
         if (fresh.size === 0) return;
         let total = 0;
@@ -175,12 +176,10 @@ export class PackedChunkStore implements ChunkStore {
         this.adopt(index);
     }
 
-    async list(): Promise<string[]> { return [...this.entries.keys(), ...this.loose]; }
+    async list(): Promise<string[]> { return [...this.entries.keys()]; }
 
     async size(hash: string): Promise<number> {
-        const e = this.entries.get(checkHash(hash));
-        if (e) return e.length;
-        return this.loose.has(hash) ? (await this.dir.read(hash))?.byteLength ?? 0 : 0;
+        return this.entries.get(checkHash(hash))?.length ?? 0;
     }
 
     async delete(hash: string): Promise<void> { await this.deleteMany([hash]); }
@@ -188,9 +187,7 @@ export class PackedChunkStore implements ChunkStore {
     async deleteMany(hashes: readonly string[]): Promise<void> {
         const touched = new Set<string>();
         for (const hash of hashes) {
-            checkHash(hash);
-            if (this.loose.delete(hash)) { await this.dir.remove(hash); continue; }
-            const e = this.entries.get(hash);
+            const e = this.entries.get(checkHash(hash));
             if (!e) continue;
             this.entries.delete(hash);
             this.packs.get(e.pack)?.hashes.delete(hash);
