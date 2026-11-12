@@ -65,7 +65,7 @@ cargo run --release --locked --manifest-path packages/lan-rust/Cargo.toml -- --c
 bun packages/lan/src/cli.ts --config server.json --invite friends --ttl 3600
 ```
 
-Paste the result into **Settings → Network → Invitation (private rooms)**, or pass `network.invite` when embedding. The client sends it in the Socket.IO auth object. **Copy invite link** carries it in the URL fragment `#lanInvite=...`, rather than the query string, to keep it out of ordinary HTTP request and Referer logs. Persisted network preferences omit the invitation.
+Paste the result into **Settings → Network → Invitation (private rooms)**, or pass `network.invite` when embedding. The client sends it in the Socket.IO auth object. **Copy invite link** carries it in the URL fragment `#lanInvite=...`, rather than the query string, to keep it out of ordinary HTTP request and Referer logs. The fragment does stay in the page address and browser history while connected, so a copied page URL or a screenshot of the address bar shares the invitation too. Persisted network preferences omit the invitation.
 
 An invitation is a reusable bearer capability until its expiry. Give it only to intended participants. The server verifies the signature, exact room, installation audience, canonical payload, scope limits and expiry on entry. Expiry also retires an active connection; application messages cannot continue after the deadline. Server cleanup can lag the deadline by its normal tick interval. Restarting with a rotated key invalidates existing invitations and retires existing connections. Individual invitation revocation and one-use invitations are not implemented.
 
@@ -79,7 +79,7 @@ Grant an invitation access to selected route/listener IDs:
 cargo run --release --locked --manifest-path packages/lan-rust/Cargo.toml -- --config server.json --invite friends --ttl 3600 --gateway-routes quake --udp-listeners native-host --tcp-listeners game-tcp
 ```
 
-The TS CLI accepts the same flags. Lists are comma-separated. Omit a flag to grant none of that permission. Use explicit route IDs in maintained configurations; routes without an ID have the compatibility ID `route-0`, `route-1`, etc., based on configuration order.
+The listener IDs here (`native-host`, `game-tcp`) stand for entries of `gateway.udpListeners` / `gateway.tcpListeners`, which the example configuration above does not define. The TS CLI accepts the same flags. Lists are comma-separated. Omit a flag to grant none of that permission. IDs are not checked against the configuration when signing, so a misspelled ID silently grants nothing. Use explicit route IDs in maintained configurations; routes without an ID have the compatibility ID `route-0`, `route-1`, etc., based on configuration order.
 
 An operator can also grant common permissions to every admitted participant of a room:
 
@@ -120,7 +120,7 @@ Every application event consumes one `maxFramesPerSecond` credit before decoding
 
 Both servers cap Engine.IO sessions before room authentication (`maxConnections: 256`), raw TCP connections (`maxTcpConnections: 1024`) and unauthenticated session lifetime (`authorizationTimeoutMs: 5000`). An incomplete handshake retains capacity until timeout or close.
 
-Reliable relay congestion retires the sending participant. The recipient remains connected; UDP still drops at capacity. Departure notices have a separate bounded control reserve and identical notices coalesce only within the same source connection. Queued departures retain the departing session's admission credit until output drain, preventing reconnect churn from growing control state without bound. A slow recipient can therefore temporarily retain admission capacity; its normal transport heartbeat timeout eventually retires it.
+Reliable relay congestion retires the sending participant. The recipient remains connected; UDP still drops at capacity. The converse follows: a participant that reads slowly, or stalls on purpose until its heartbeat times out, retires the peers that send it reliable traffic (for example a game host). There is no per-source share of a recipient's queue yet. Departure notices have a separate bounded control reserve and identical notices coalesce only within the same source connection. Queued departures retain the departing session's admission credit until output drain, preventing reconnect churn from growing control state without bound. A slow recipient can therefore temporarily retain admission capacity; its normal transport heartbeat timeout eventually retires it.
 
 ## Dependency audit and regression CI
 
