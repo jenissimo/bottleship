@@ -69,6 +69,16 @@ const DLL_PROCESS_DETACH = 0;
 const DLL_THREAD_ATTACH = 2;
 const DLL_THREAD_DETACH = 3;
 
+export interface InlineStubState {
+    heap: { heapAllocStub: number; heapFreeStub: number; regionBase: number; regionEnd: number } | null;
+    crt: { mallocStub: number; freeStub: number; regionBase: number; regionEnd: number } | null;
+    caseFold: { tolowerStub: number; toupperStub: number; regionBase: number; regionEnd: number } | null;
+    locale: LocaleInlineStubs | null;
+    mbwc: MbwcInlineStubs | null;
+    mbwcDeclined: boolean;
+    math: CrtMathStubs | null;
+}
+
 export class PELoader {
     /**
      * The name an import binds under: its declared name, else the canonical export name
@@ -311,9 +321,27 @@ export class PELoader {
         this.apiRegistry = apiRegistry;
     }
 
-    private inlineStubKey(): string {
-        return JSON.stringify([this.heapInlineStubs, this.crtInlineStubs, this.caseFoldInlineStubs,
-            this.localeInlineStubs, this.mbwcInlineStubs, this.mbwcStubsDeclined, this.mathInlineStubs]);
+    captureInlineStubs(): InlineStubState {
+        return structuredClone({
+            heap: this.heapInlineStubs, crt: this.crtInlineStubs, caseFold: this.caseFoldInlineStubs,
+            locale: this.localeInlineStubs, mbwc: this.mbwcInlineStubs, mbwcDeclined: this.mbwcStubsDeclined,
+            math: this.mathInlineStubs,
+        });
+    }
+
+    restoreInlineStubs(state: InlineStubState): void {
+        const saved = structuredClone(state);
+        this.heapInlineStubs = saved.heap;
+        this.crtInlineStubs = saved.crt;
+        this.caseFoldInlineStubs = saved.caseFold;
+        this.localeInlineStubs = saved.locale;
+        this.mbwcInlineStubs = saved.mbwc;
+        this.mbwcStubsDeclined = saved.mbwcDeclined;
+        this.mathInlineStubs = saved.math;
+        const scheduler = System.getInstance().scheduler;
+        for (const stubs of [saved.heap, saved.crt]) {
+            if (stubs) scheduler?.registerNonPreemptibleRange(stubs.regionBase, stubs.regionEnd);
+        }
     }
 
     async readImageFile(path: string): Promise<Uint8Array | null> {
@@ -887,13 +915,11 @@ export class PELoader {
             // get HLE thunk stubs patched into their IAT.
             const importDirRVA = peView.getUint32(optHeaderPtr + 104, true);
             hookStubs += stubCount();
-            const inlineStubs = this.inlineStubKey();
             if (importDirRVA !== 0) {
                 Logger.warn(LogCategory.SYSTEM,
                     `[PE] === Processing imports for NATIVE DLL "${dllNameLower}" (base=0x${baseAddress.toString(16)}) ===`);
                 await this.processImports(baseAddress, importDirRVA, dependencyDirectories);
             }
-            const emittedInlineStubs = this.inlineStubKey() !== inlineStubs;
             hookStubs -= stubCount();
 
             // Real-DLL export patchers (HLE replacements for a library the game ships), AFTER
@@ -907,9 +933,11 @@ export class PELoader {
             hookStubs += stubCount();
             if (runTime) {
                 if (hookStubs !== 0) module.unsaved = 'is patched by host-side hooks';
-                else if (emittedInlineStubs) module.unsaved = 'made the loader emit its inline stubs';
-                else if (savestatesEnabled()) module.contentHash = sha256HexSync(peData);
-                else module.unsaved = 'has no content hash';
+                else if (!savestatesEnabled()) module.unsaved = 'has no content hash';
+                else {
+                    module.contentHash = sha256HexSync(peData);
+                    if (handle.source !== 'rom') module.imageBytes = peData.slice();
+                }
             }
 
             Logger.warn(LogCategory.SYSTEM,

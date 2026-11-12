@@ -30,7 +30,7 @@ export interface Participant {
     readonly covers?: readonly string[];
     readonly schema?: SaveValue;
     prepare?(): Promise<void>;
-    verify?(state: SaveValue): void | Promise<void>;
+    verify?(state: SaveValue, blob: (hash: string) => Uint8Array): void | Promise<void>;
     capture(ctx: CaptureContext): SaveValue;
     restore(state: SaveValue, ctx: RestoreContext): void | Promise<void>;
 }

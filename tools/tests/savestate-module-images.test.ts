@@ -1,7 +1,8 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { PELoader } from "../../src/worker/core/pe-loader";
+import { PELoader, type InlineStubState } from "../../src/worker/core/pe-loader";
 import { APIRegistry } from "../../src/worker/core/api-registry";
 import { kernel32Module } from "../../src/worker/api/kernel32.api";
+import { msvcrtModule } from "../../src/worker/api/msvcrt.api";
 import { ModuleRegistry, type LoadedPEModule } from "../../src/worker/core/module-registry";
 import { System } from "../../src/worker/core/system";
 import { ThunkGenerator } from "../../src/worker/core/thunking/thunk-generator";
@@ -15,7 +16,8 @@ import {
 import { MemoryChunkStore } from "../../src/worker/savestate/chunk-store";
 import { RAM_CHUNK_SIZE, writeRamChunks } from "../../src/worker/savestate/ram";
 import { ParticipantRegistry, schemaHash } from "../../src/worker/savestate/participant";
-import { captureSession, restoreSession, RestoreFailed, type SavestateTarget } from "../../src/worker/savestate/session";
+import { captureSession, newCaptureRun, restoreSession, RestoreFailed, type SavestateTarget } from "../../src/worker/savestate/session";
+import { restoreObjectGraph } from "../../src/worker/savestate/object-codecs";
 import { decodeSavestate } from "../../src/worker/savestate/container";
 import { encodeValue, type SaveValue } from "../../src/worker/savestate/value-codec";
 import { sha256HexSync } from "../../src/worker/savestate/sha256";
@@ -27,6 +29,7 @@ let hookedName = "";
 
 beforeAll(() => {
     APIRegistry.getInstance().registerModule(kernel32Module);
+    APIRegistry.getInstance().registerModule(msvcrtModule);
     registerNativeModulePatcher({
         id: "savestate-module-images-test",
         matches: (m) => m.name === hookedName,
@@ -108,6 +111,7 @@ function image(opts: { imports?: string; importDll?: string; tag?: number } = {}
 interface Session {
     loader: PELoader; registry: ModuleRegistry; memory: Uint8Array; view: DataView; generator: ThunkGenerator;
     files: Map<string, Uint8Array>; process: unknown; beforeRead: { run?: (path: string) => void };
+    write(path: string, bytes: Uint8Array): void; remove(path: string): void;
 }
 
 function session(files: Record<string, Uint8Array>): Session {
@@ -121,19 +125,27 @@ function session(files: Record<string, Uint8Array>): Session {
     const loader = new PELoader(() => memory, generator, APIRegistry.getInstance());
     const registry = new ModuleRegistry();
     let nextBase = 0x10000;
-    registry.allocateBase = () => { const base = nextBase; nextBase += 0x10000; return base; };
+    registry.allocateBase = () => {
+        while (registry.getByBase(nextBase)) nextBase += 0x10000;
+        const base = nextBase;
+        nextBase += 0x10000;
+        return base;
+    };
     loader.setModuleRegistry(registry);
     const beforeRead: Session["beforeRead"] = {};
+    const written = new Set<string>();
+    const write = (path: string, data: Uint8Array) => { entries.set(path.toLowerCase(), data); written.add(path.toLowerCase()); };
+    const remove = (path: string) => { entries.delete(path.toLowerCase()); written.delete(path.toLowerCase()); };
     loader.setVfs({
         currentDir: "C:\\APP\\",
         resolvePath: (path: string) => path.replace(/\//g, "\\"),
         statEntry: (path: string) => (entries.has(path.toLowerCase()) ? { kind: "file", path } : null),
-        open: async (path: string) => (entries.has(path.toLowerCase()) ? { path: path.toLowerCase() } : null),
+        open: async (path: string) => (entries.has(path.toLowerCase()) ? { path: path.toLowerCase(), source: written.has(path.toLowerCase()) ? "overlay" : "rom" } : null),
         getFileSize: (path: string) => entries.get(path.toLowerCase())!.length,
         read: async (entry: { path: string }) => { beforeRead.run?.(entry.path); return entries.get(entry.path)!; },
     } as unknown as VirtualFileSystem);
     const process = { moduleRegistry: registry, loader, thunkGenerator: generator, resetGeneration: 0, lastError: 0 };
-    return { loader, registry, memory, view: new DataView(memory.buffer), generator, files: entries, process, beforeRead };
+    return { loader, registry, memory, view: new DataView(memory.buffer), generator, files: entries, process, beforeRead, write, remove };
 }
 
 const bootDone = (s: Session) => { (s.loader as unknown as { bootImagesLoaded: boolean }).bootImagesLoaded = true; };
@@ -154,9 +166,20 @@ const FILES = () => ({
 });
 
 const bytes = (v: unknown) => encodeValue(v as SaveValue).json;
+const STUBS = (n: number) => ({ regionBase: n * 0x100, regionEnd: n * 0x100 + 0x40 });
 
-async function restoreInto(fresh: Session, state: ModuleImagesState): Promise<void> {
-    restoreModuleImages(state, await verifyModuleImages(state, fresh.registry, fresh.loader), fresh.registry, fresh.loader);
+function capture(s: Session): { state: ModuleImagesState; blobs: Map<string, Uint8Array> } {
+    const run = newCaptureRun();
+    const state = structuredClone(captureModuleImages(s.registry, s.loader, run));
+    return { state, blobs: new Map([...run.blobs].map(([hash, data]) => [hash, data.slice()])) };
+}
+
+const snapshot = (s: Session) => bytes(capture(s).state);
+const noBlobs = restoreObjectGraph([]).blob;
+
+async function restoreInto(fresh: Session, state: ModuleImagesState, blobs: ReadonlyMap<string, Uint8Array> = new Map()): Promise<void> {
+    const files = await verifyModuleImages(state, fresh.registry, fresh.loader, restoreObjectGraph([], blobs).blob);
+    restoreModuleImages(state, files, fresh.registry, fresh.loader);
 }
 
 describe("a DLL loaded at run time is part of the savestate", () => {
@@ -168,7 +191,7 @@ describe("a DLL loaded at run time is part of the savestate", () => {
         expect(a.registry.getByName("boot.dll")!.contentHash).toBeUndefined();
         a.memory[plugin.baseAddress + DATA_RVA] = 0x55;
         system.implicitTlsEntries = [{ tlsIndex: 3, templateStart: plugin.baseAddress + DATA_RVA, templateSize: 4, zeroFillSize: 8, moduleName: "plugin" }];
-        const saved = structuredClone(captureModuleImages(a.registry));
+        const saved = capture(a).state;
         const thunks = structuredClone(a.generator.captureState());
         const iat = a.view.getUint32(plugin.baseAddress + IAT_RVA, true);
         expect(a.generator.getStubByAddress(iat)?.functionName).toBe("GetTickCount");
@@ -196,7 +219,7 @@ describe("a DLL loaded at run time is part of the savestate", () => {
         expect(system.implicitTlsEntries).toEqual(saved.implicitTls);
         const stub = b.generator.getStubByAddress(b.view.getUint32(plugin.baseAddress + IAT_RVA, true))!;
         expect([stub.dllName.toLowerCase().replace(/\.dll$/, ""), stub.functionName]).toEqual(["kernel32", "GetTickCount"]);
-        expect(bytes(captureModuleImages(b.registry))).toBe(bytes(saved));
+        expect(snapshot(b)).toBe(bytes(saved));
         expect(b.registry.getAllModules().map(m => m.name)).toEqual(a.registry.getAllModules().map(m => m.name));
     });
 
@@ -212,7 +235,7 @@ describe("a DLL loaded at run time is part of the savestate", () => {
         a.loader.getPendingDllInits();
         const proc = await call("GetProcAddress", [base, str(0x10200, "Answer")]);
         expect(proc).toBe(base + EXPORT_RVA);
-        const images = structuredClone(captureModuleImages(a.registry));
+        const images = capture(a).state;
         const refs = structuredClone(captureModuleRefs());
         expect(refs.dynamicRefs).toEqual([[base, 2]]);
 
@@ -259,12 +282,12 @@ describe("a session that cannot take the images refuses before anything is writt
     async function saved(): Promise<{ state: ModuleImagesState; base: number }> {
         const a = await booted(FILES());
         const plugin = (await a.loader.loadDll("plugin.dll"))!;
-        return { state: structuredClone(captureModuleImages(a.registry)), base: plugin.baseAddress };
+        return { state: capture(a).state, base: plugin.baseAddress };
     }
     const refusal = async (fresh: Session, state: ModuleImagesState) => {
         const ram = fresh.memory.slice();
         const names = fresh.registry.getAllModules().map(m => m.name);
-        const err = await verifyModuleImages(state, fresh.registry, fresh.loader).catch(e => e as Error);
+        const err = await verifyModuleImages(state, fresh.registry, fresh.loader, noBlobs).catch(e => e as Error);
         expect(fresh.memory).toEqual(ram);
         expect(fresh.registry.getAllModules().map(m => m.name)).toEqual(names);
         return err instanceof Error ? err.message : "";
@@ -322,7 +345,10 @@ describe("a session that cannot take the images refuses before anything is writt
         const reg = (verify: () => void) => {
             const r = new ParticipantRegistry();
             r.add({ id: "time", version: 1, order: 1, capture: () => 1, restore: () => { log.push("restore time"); } });
-            r.add({ id: "module-images", version: 1, order: 7, capture: () => 2, verify: () => { log.push("verify"); verify(); }, restore: () => { log.push("restore images"); } });
+            r.add({
+                id: "module-images", version: 1, order: 7, capture: (ctx) => ctx.blob(new Uint8Array([1, 2, 3])),
+                verify: (s, blob) => { log.push(`verify ${[...blob(s as string)]}`); verify(); }, restore: () => { log.push("restore images"); },
+            });
             return r;
         };
         const store = new MemoryChunkStore();
@@ -334,11 +360,11 @@ describe("a session that cannot take the images refuses before anything is writt
         expect(err).not.toBeInstanceOf(RestoreFailed);
         expect(err.message).toBe("module images: x is missing");
         expect(fresh.every(b => b === 1)).toBe(true);
-        expect(log).toEqual(["verify"]);
+        expect(log).toEqual(["verify 1,2,3"]);
         log.length = 0;
         await restoreSession(target(fresh), decodeSavestate(result.bytes), store, reg(() => undefined));
         expect(fresh).toEqual(mem);
-        expect(log).toEqual(["verify", "restore time", "restore images"]);
+        expect(log).toEqual(["verify 1,2,3", "restore time", "restore images"]);
     });
 
     test("the participant hooks restore from the verified files and verify on their own when nobody did", async () => {
@@ -348,13 +374,147 @@ describe("a session that cannot take the images refuses before anything is writt
         b.beforeRead.run = () => { reads++; };
         const hooks = moduleImagesHooks(() => ({ registry: b.registry, loader: b.loader }));
         const section = state as unknown as SaveValue;
-        await hooks.verify(section);
-        await hooks.restore(section, { object: () => undefined });
+        await hooks.verify(section, noBlobs);
+        await hooks.restore(section, restoreObjectGraph([]));
         expect(reads).toBe(1);
         expect(b.registry.getByBase(base)!.name).toBe("plugin");
         const c = await booted(FILES());
-        await moduleImagesHooks(() => ({ registry: c.registry, loader: c.loader })).restore(section, { object: () => undefined });
+        await moduleImagesHooks(() => ({ registry: c.registry, loader: c.loader })).restore(section, restoreObjectGraph([]));
         expect(c.registry.getByBase(base)!.name).toBe("plugin");
+    });
+});
+
+describe("a DLL from a file the program wrote is carried in the snapshot", () => {
+    const TEMP = "C:\\TEMP\\x1.tmp\\made.dll";
+    async function saved() {
+        const a = await booted(FILES());
+        a.write(TEMP, image({ imports: "GetTickCount", tag: 3 }));
+        const made = (await a.loader.loadDll(TEMP))!;
+        a.remove(TEMP);
+        return { a, made, ...capture(a) };
+    }
+
+    test("the file is deleted after the load, the snapshot is taken, and a session without the file registers the image", async () => {
+        const { a, made, state, blobs } = await saved();
+        expect(a.registry.getByName("plugin.dll")).toBeUndefined();
+        const image = state.images.find(i => i.path === made.path)!;
+        expect(image.blob).toBe(made.contentHash!);
+        expect([...blobs.keys()]).toEqual([made.contentHash!]);
+        expect(state.images.filter(i => i.blob !== undefined).length).toBe(1);
+
+        const b = await booted(FILES());
+        b.memory.set(a.memory);
+        const ram = b.memory.slice();
+        let reads = 0;
+        b.beforeRead.run = () => { reads++; };
+        await restoreInto(b, state, blobs);
+        expect(reads).toBe(0);
+        expect(b.memory).toEqual(ram);
+        const restored = b.registry.getByBase(made.baseAddress)!;
+        expect(restored.path).toBe(made.path);
+        expect([...restored.exports]).toEqual([...made.exports]);
+        expect([...restored.ordinalExports]).toEqual([...made.ordinalExports]);
+        expect(b.loader.getPendingDllInits()).toEqual([]);
+        const again = capture(b);
+        expect(bytes(again.state)).toBe(bytes(state));
+        expect([...again.blobs.keys()]).toEqual([...blobs.keys()]);
+    });
+
+    test("a package file is named by path and hash only", async () => {
+        const a = await booted(FILES());
+        const plugin = (await a.loader.loadDll("plugin.dll"))!;
+        const { state, blobs } = capture(a);
+        expect(plugin.imageBytes).toBeUndefined();
+        expect(blobs.size).toBe(0);
+        expect(state.images.every(i => i.blob === undefined)).toBe(true);
+    });
+
+    test("a missing or foreign blob refuses before anything is written", async () => {
+        const { state, blobs, made } = await saved();
+        const hash = [...blobs.keys()][0]!;
+        const b = await booted(FILES());
+        const ram = b.memory.slice();
+        const refuse = (with_: Map<string, Uint8Array>) => restoreInto(b, state, with_).then(() => "", e => (e as Error).message);
+        expect(await refuse(new Map())).toBe(`savestate: blob ${hash} is missing`);
+        expect(await refuse(new Map([[hash, image({ tag: 4 })]]))).toBe(`module images: the stored copy of ${made.path} is not the file that was loaded`);
+        expect(b.memory).toEqual(ram);
+        expect(b.registry.getAllModules().map(m => m.name)).toEqual(["boot"]);
+    });
+
+    test("through the session: the blob travels in the chunk store and its absence is found before the first write", async () => {
+        const { a, made, state } = await saved();
+        const target = (m: Uint8Array): SavestateTarget => ({
+            guestMemory: () => m, overlayState: () => "", gameId: () => "g", touchedModules: () => [],
+            compatibilityKey: () => ({ buildSha: "a", contentHash: "b", configHash: "c", bootLayout: "d", participants: {} }),
+        });
+        const reg = (s: Session) => {
+            const r = new ParticipantRegistry();
+            const hooks = moduleImagesHooks(() => ({ registry: s.registry, loader: s.loader }));
+            r.add({ id: "module-images", version: 1, ...hooks });
+            return r;
+        };
+        const ramA = new Uint8Array(RAM_CHUNK_SIZE).fill(6);
+        const store = new MemoryChunkStore();
+        const result = await captureSession(target(ramA), new Set(), () => undefined, reg(a));
+        await writeRamChunks(result.pending, store);
+        expect(result.blobs.map(([hash]) => hash)).toEqual([made.contentHash!]);
+
+        const b = await booted(FILES());
+        const fresh = new Uint8Array(ramA.length).fill(1);
+        await restoreSession(target(fresh), decodeSavestate(result.bytes), store, reg(b));
+        expect(fresh).toEqual(ramA);
+        expect(b.registry.getByBase(made.baseAddress)!.path).toBe(made.path);
+        expect(bytes(capture(b).state)).toBe(bytes(state));
+
+        await store.delete(made.contentHash!);
+        const c = await booted(FILES());
+        const untouched = new Uint8Array(ramA.length).fill(1);
+        const err = await restoreSession(target(untouched), decodeSavestate(result.bytes), store, reg(c)).catch(e => e);
+        expect(err).toBeInstanceOf(Error);
+        expect(err).not.toBeInstanceOf(RestoreFailed);
+        expect(String(err.message)).toContain("blob");
+        expect(untouched.every(v => v === 1)).toBe(true);
+        expect(c.registry.getByName("made.dll")).toBeUndefined();
+    });
+});
+
+describe("inline stubs a run-time image made the loader emit", () => {
+    const emitted = { mallocStub: 0x90010, freeStub: 0x90040, regionBase: 0x90000, regionEnd: 0x90100 };
+    const files = () => ({
+        ...FILES(),
+        "C:\\APP\\first.dll": image({ importDll: "other.dll" }),
+        "C:\\APP\\second.dll": image({ importDll: "MSVCRT.dll", imports: "malloc" }),
+    });
+    const ranges = () => (system.scheduler as unknown as { nonPreemptibleRanges: Array<{ base: number; end: number }> }).nonPreemptibleRanges;
+
+    test("are saved, and a DLL loaded after the restore binds to the same stubs", async () => {
+        const a = await booted(files());
+        a.beforeRead.run = (path) => {
+            if (path.endsWith("other.dll")) (a.loader as unknown as { crtInlineStubs: unknown }).crtInlineStubs = { ...emitted };
+        };
+        const first = (await a.loader.loadDll("first.dll"))!;
+        expect(first.unsaved).toBeUndefined();
+        const { state } = capture(a);
+        expect(state.inlineStubs.crt).toEqual(emitted);
+        const second = (await a.loader.loadDll("second.dll"))!;
+        const bound = a.view.getUint32(second.baseAddress + IAT_RVA, true);
+        expect(bound).toBe(emitted.mallocStub);
+
+        const plain = await booted(files());
+        await plain.loader.loadDll("first.dll");
+        const unbound = (await plain.loader.loadDll("second.dll"))!;
+        expect(plain.view.getUint32(unbound.baseAddress + IAT_RVA, true)).not.toBe(emitted.mallocStub);
+
+        const b = await booted(files());
+        const before = ranges().length;
+        await restoreInto(b, state);
+        expect(b.loader.captureInlineStubs()).toEqual(state.inlineStubs);
+        expect(ranges().slice(before)).toEqual([{ base: emitted.regionBase, end: emitted.regionEnd }]);
+        const later = (await b.loader.loadDll("second.dll"))!;
+        expect(later.baseAddress).toBe(second.baseAddress);
+        expect(b.view.getUint32(later.baseAddress + IAT_RVA, true)).toBe(bound);
+        expect(b.loader.captureInlineStubs()).toEqual(state.inlineStubs);
+        ranges().length = before;
     });
 });
 
@@ -365,9 +525,9 @@ describe("what a savestate still cannot carry is refused by name at capture", ()
         hookedName = "plugin";
         const plugin = (await a.loader.loadDll("plugin.dll"))!;
         expect(plugin.contentHash).toBeUndefined();
-        expect(() => captureModuleImages(a.registry)).toThrow(`module images: plugin (0x${plugin.baseAddress.toString(16)}) was loaded at run time and is patched by host-side hooks`);
+        expect(() => capture(a)).toThrow(`module images: plugin (0x${plugin.baseAddress.toString(16)}) was loaded at run time and is patched by host-side hooks`);
         a.registry.unregister("plugin.dll");
-        expect(() => captureModuleImages(a.registry)).not.toThrow();
+        expect(() => capture(a)).not.toThrow();
     });
 
     test("the same hook on a start image is not a refusal", async () => {
@@ -377,24 +537,14 @@ describe("what a savestate still cannot carry is refused by name at capture", ()
         hookedName = "plugin";
         const plugin = (await a.loader.loadDll("plugin.dll"))!;
         expect(plugin.unsaved).toBeUndefined();
-        expect(() => captureModuleImages(a.registry)).not.toThrow();
-    });
-
-    test("a run-time image whose imports made the loader emit inline stubs", async () => {
-        const a = await booted({ ...FILES(), "C:\\APP\\plugin.dll": image({ importDll: "other.dll" }) });
-        a.beforeRead.run = (path) => {
-            if (path.endsWith("other.dll")) (a.loader as unknown as { crtInlineStubs: unknown }).crtInlineStubs = { mallocStub: 1, freeStub: 2, regionBase: 1, regionEnd: 3 };
-        };
-        const plugin = (await a.loader.loadDll("plugin.dll"))!;
-        expect(a.registry.getByName("other.dll")!.unsaved).toBeUndefined();
-        expect(() => captureModuleImages(a.registry)).toThrow(`module images: plugin (0x${plugin.baseAddress.toString(16)}) was loaded at run time and made the loader emit its inline stubs`);
+        expect(() => capture(a)).not.toThrow();
     });
 
     test("a run-time image loaded while savestates were off", async () => {
         const a = await booted(FILES());
         flag.__savestates = undefined;
         const plugin = (await a.loader.loadDll("plugin.dll"))!;
-        expect(() => captureModuleImages(a.registry)).toThrow(`module images: plugin (0x${plugin.baseAddress.toString(16)}) was loaded at run time and has no content hash`);
+        expect(() => capture(a)).toThrow(`module images: plugin (0x${plugin.baseAddress.toString(16)}) was loaded at run time and has no content hash`);
     });
 });
 
@@ -402,7 +552,7 @@ describe("field policies", () => {
     test("every saved image field reaches the capture, every other one stays out", async () => {
         const a = await booted(FILES());
         const plugin = (await a.loader.loadDll("plugin.dll"))!;
-        const before = bytes(captureModuleImages(a.registry));
+        const before = snapshot(a);
         const mutate: Record<keyof LoadedPEModule, (m: LoadedPEModule) => void> = {
             name: m => { m.name = "renamed"; },
             path: m => { m.path = "C:\\APP\\renamed.dll"; },
@@ -413,6 +563,7 @@ describe("field policies", () => {
             initialized: m => { m.initialized = !m.initialized; },
             sections: m => { m.sections = [...m.sections!, { name: ".x", virtualAddress: 0, virtualSize: 0, rawSize: 0, characteristics: 0 }]; },
             contentHash: m => { m.contentHash = "00"; },
+            imageBytes: m => { m.imageBytes = new Uint8Array([1]); },
             exports: m => { m.exports = new Map([["other", 1]]); },
             ordinalExports: m => { m.ordinalExports = new Map([[9, 1]]); },
             isRealDll: m => { m.isRealDll = false; },
@@ -423,37 +574,46 @@ describe("field policies", () => {
         for (const [field, policy] of Object.entries(MODULE_IMAGE_FIELDS) as Array<[keyof LoadedPEModule, string]>) {
             const kept = { ...plugin };
             mutate[field](plugin);
-            const changed = bytes(captureModuleImages(a.registry)) !== before;
+            const changed = snapshot(a) !== before;
+            for (const key of Object.keys(plugin) as Array<keyof LoadedPEModule>) if (!(key in kept)) delete plugin[key];
             Object.assign(plugin, kept);
             expect([field, changed]).toEqual([field, policy === "save"]);
         }
-        expect(bytes(captureModuleImages(a.registry))).toBe(before);
+        expect(snapshot(a)).toBe(before);
     });
 
     test("every state key reaches the capture and the schema names them all", async () => {
         const a = await booted(FILES());
         await a.loader.loadDll("plugin.dll");
-        const state = captureModuleImages(a.registry);
+        const { state } = capture(a);
         expect(Object.keys(state).sort()).toEqual(MODULE_IMAGES_SCHEMA.state);
         const before = bytes(state);
         a.registry.restoreLayout(0x70000, []);
-        const layout = bytes(captureModuleImages(a.registry));
+        const layout = snapshot(a);
         expect(layout).not.toBe(before);
         a.registry.restoreLayout(0x70000, [[0x40000, 0x10000]]);
-        const free = bytes(captureModuleImages(a.registry));
+        const free = snapshot(a);
         expect(free).not.toBe(layout);
         for (const key of MODULE_IMAGES_SCHEMA.tls) {
             const entry = { tlsIndex: 1, templateStart: 2, templateSize: 3, zeroFillSize: 4, moduleName: "plugin" };
             system.implicitTlsEntries = [entry];
-            const one = bytes(captureModuleImages(a.registry));
+            const one = snapshot(a);
             (entry as Record<string, unknown>)[key] = key === "moduleName" ? "other" : 99;
-            expect([key, bytes(captureModuleImages(a.registry)) !== one]).toEqual([key, true]);
+            expect([key, snapshot(a) !== one]).toEqual([key, true]);
         }
         system.implicitTlsEntries = [];
-        expect(bytes(captureModuleImages(a.registry))).toBe(free);
+        expect(snapshot(a)).toBe(free);
+        const stubs = { heap: STUBS(1), crt: STUBS(2), caseFold: STUBS(3), locale: STUBS(4), mbwc: STUBS(5), mbwcDeclined: false, math: STUBS(6) } as unknown as InlineStubState;
+        a.loader.restoreInlineStubs(stubs);
+        expect(a.loader.captureInlineStubs()).toEqual(stubs);
+        const withStubs = snapshot(a);
+        for (const key of MODULE_IMAGES_SCHEMA.inlineStubs as Array<keyof InlineStubState>) {
+            a.loader.restoreInlineStubs({ ...stubs, [key]: key === "mbwcDeclined" ? true : null });
+            expect([key, snapshot(a) !== withStubs]).toEqual([key, true]);
+        }
     });
 
     test("the schema is pinned", () => {
-        expect(schemaHash(MODULE_IMAGES_SCHEMA as unknown as SaveValue)).toBe("eb8a15faafb2e682");
+        expect(schemaHash(MODULE_IMAGES_SCHEMA as unknown as SaveValue)).toBe("d20656b52f2472e7");
     });
 });

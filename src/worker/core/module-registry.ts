@@ -36,6 +36,7 @@ export interface LoadedPEModule {
     /** PE Sections (for debugging/diagnostics) */
     sections?: PESection[];
     contentHash?: string;
+    imageBytes?: Uint8Array;
     unsaved?: string;
 }
 

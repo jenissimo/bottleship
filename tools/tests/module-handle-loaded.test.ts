@@ -155,22 +155,24 @@ describe("GetModuleHandle observes loaded HLE images without loading them", () =
         expect(lookup("GetModuleHandleA", "dinput8.dll")).toBe(0);
         expect(lookup("GetModuleHandleA", "dinput.dll")).toBe(hleImageBase("dinput"));
     });
+    const imageLoader = { captureInlineStubs: () => null, restoreInlineStubs: () => undefined } as never;
+    const captureImages = () => captureModuleImages(process.moduleRegistry, imageLoader, { blob: () => "" });
     test("a savestate pins again the HLE modules that images bound, and leaves LoadLibrary references to kernel32", async () => {
         markHleModuleLoaded("ws2_32.dll");
         await call("LoadLibraryA", [writeName("dinput8.dll", false)]);
         const tls = System.getInstance().implicitTlsEntries;
-        const saved = structuredClone(captureModuleImages(process.moduleRegistry));
+        const saved = structuredClone(captureImages());
         expect(saved.hleBound).toEqual(["ws2_32"]);
         process.resetGeneration++;
         materializeHleModuleImages(process);
         expect(isHleModuleLoaded("ws2_32")).toBe(false);
-        restoreModuleImages(saved, new Map(), process.moduleRegistry, {} as never);
+        restoreModuleImages(saved, new Map(), process.moduleRegistry, imageLoader);
         System.getInstance().implicitTlsEntries = tls;
         expect(isHleModuleLoaded("ws2_32")).toBe(true);
         expect(isHleModuleLoaded("dinput8")).toBe(false);
-        expect(captureModuleImages(process.moduleRegistry).hleBound).toEqual(saved.hleBound);
+        expect(captureImages().hleBound).toEqual(saved.hleBound);
         markHleModuleLoaded("user32.dll");
-        expect(captureModuleImages(process.moduleRegistry).hleBound).toEqual(["user32", "ws2_32"]);
+        expect(captureImages().hleBound).toEqual(["user32", "ws2_32"]);
     });
     test("the fast path declines an unloaded image without changing loader membership", () => {
         expect(fast("ws2_32.dll")).toBeNull();

@@ -132,9 +132,10 @@ export async function restoreSession(
     const missingBlob = await missingBlobs(list, store);
     if (missingBlob.length > 0) throw new Error(`savestate: ${missingBlob.length} blob(s) are missing, e.g. ${missingBlob[0]}`);
     const blobs = await loadBlobs(list, store);
+    const blob = restoreObjectGraph([], blobs).blob;
     for (const p of participants.all()) {
         const value = state.sections.get(p.id);
-        if (value !== undefined) await p.verify?.(value);
+        if (value !== undefined) await p.verify?.(value, blob);
     }
     try {
         await restoreWritten(target, state, store, participants, blobs);
