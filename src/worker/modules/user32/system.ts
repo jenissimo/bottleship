@@ -12,6 +12,8 @@ import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
 import { System } from '../../core/system';
+import { KEY_TEXT_NONE, KEY_TEXT_UNKNOWN } from '../../../input/sab-layout';
+import { hostTextToChar } from './translate-message';
 import { EMU_NATIVE_VIDEO_DLLS } from '../../core/cpu/emulator-config';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { encodeAnsi, getAnsiCodePage, getCodePageDecoder, decodeAnsiString, readAnsiFromGuest, writeAnsiToGuest, encodeAnsiString } from '../codepage-utils';
@@ -1441,6 +1443,21 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     exports['MapVirtualKeyExA'] = (ctx, mem, args) => exports['MapVirtualKeyA']!(ctx, mem, args) as number;
     exports['MapVirtualKeyExW'] = (ctx, mem, args) => exports['MapVirtualKeyA']!(ctx, mem, args) as number;
 
+    // KEY_TEXT_* of a key that is held as this call translates its key-down. ToAscii is
+    // also called for keys nobody pressed (a game building its own key-name table), and
+    // those keep the US table: the host only knows what an actual press typed.
+    const heldKeyHostText = (vk: number, scanCode: number): number => {
+        if (scanCode & 0x8000) return KEY_TEXT_UNKNOWN;
+        const input = System.getInstance().inputManager;
+        if (!input || !(input.getKeyState(vk & 0xFF) & 0x8000)) return KEY_TEXT_UNKNOWN;
+        return input.getKeyDownText(vk & 0xFF);
+    };
+    const heldKeyHostChar = (vk: number, scanCode: number): number | null => {
+        const text = heldKeyHostText(vk, scanCode);
+        if (text === KEY_TEXT_UNKNOWN) return null;
+        return text === KEY_TEXT_NONE ? 0 : hostTextToChar(text);
+    };
+
     // int ToAscii(UINT uVirtKey, UINT uScanCode, const BYTE *lpKeyState, LPWORD lpChar, UINT uFlags)
     exports['ToAscii'] = (ctx, mem, args) => {
         const uVirtKey = args[0];
@@ -1451,6 +1468,15 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         Logger.verbose(LogCategory.USER32, `ToAscii(vk=0x${uVirtKey.toString(16)}, scan=0x${uScanCode.toString(16)})`);
 
         if (!lpChar) return 0;
+
+        // A key that is down right now types what its press typed on the host layout.
+        const hostChar = heldKeyHostChar(uVirtKey, uScanCode);
+        if (hostChar !== null) {
+            if (hostChar === 0) return 0;
+            mem[lpChar] = hostChar & 0xFF;
+            mem[lpChar + 1] = 0;
+            return 1;
+        }
 
         // Check shift state from keyboard state array
         const shiftDown = lpKeyState ? (mem[lpKeyState + 0x10] & 0x80) !== 0 : false;
@@ -1510,6 +1536,14 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const cchBuff = args[4] | 0;
         if (!pwszBuff || cchBuff <= 0) {
             return 0;
+        }
+
+        const hostUnit = heldKeyHostText(args[0], args[1]);
+        if (hostUnit !== KEY_TEXT_UNKNOWN) {
+            if (hostUnit === KEY_TEXT_NONE) return 0;
+            mem[pwszBuff] = hostUnit & 0xFF;
+            mem[pwszBuff + 1] = (hostUnit >> 8) & 0xFF;
+            return 1;
         }
 
         return exports['ToAscii']!(ctx, mem, [

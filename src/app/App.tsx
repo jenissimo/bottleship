@@ -2,7 +2,7 @@ import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useStat
 import { SessionWorker } from './session-worker';
 import { AudioPauseSync } from "../audio/pause-sync";
 import { ChildSessionSurface } from './child-session-surface';
-import { hardwareKeyVk } from "./hardware-key-vk";
+import { hardwareKeyText, hardwareKeyVk } from "./hardware-key-vk";
 import { cx } from "../ui/cx";
 import s from "./App.module.css";
 import OpfsTool from '../debug/OpfsTool';
@@ -2088,7 +2088,7 @@ export default function App() {
       }
 
       const vk = hardwareKeyVk(event.code, event.keyCode);
-      inputDevice.setKey(vk, state === 1, "hw-key");
+      inputDevice.setKey(vk, state === 1, "hw-key", state === 1 ? hardwareKeyText(event) : undefined);
       inputDevice.commit();
       recordSample(inputView, vk, state);
     };

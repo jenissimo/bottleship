@@ -20,8 +20,10 @@ import {
     INPUT_INDEX,
     KEY_BITFIELD_BASE,
     KEY_BITFIELD_COUNT,
+    KEY_TEXT_UNKNOWN,
     beginInputWrite,
     endInputWrite,
+    keyTextView,
 } from '../../../input/sab-layout';
 
 // Windows message constants
@@ -302,6 +304,7 @@ interface TmeHoverEntry {
 
 export class InputManager {
     private inputView: Int32Array | null = null;
+    private keyTextView: Uint16Array | null = null;
     private windowManager: WindowManager;
     public readonly keyStates = new Uint8Array(256);
     private readonly toggleStates = new Uint8Array(KEY_STATE_BYTES);
@@ -427,6 +430,7 @@ export class InputManager {
      */
     setInputBuffer(buffer: SharedArrayBuffer | null): void {
         this.inputView = buffer ? new Int32Array(buffer) : null;
+        this.keyTextView = this.inputView ? keyTextView(this.inputView) : null;
         // A new buffer carries an unknown initial pad level — seed, never announce.
         this.gamepadPresence.reset();
         if (this.inputView) {
@@ -1119,6 +1123,11 @@ export class InputManager {
             this.messageKeyStates.set(threadId, table);
         }
         table.set(packedKeyState.length === KEY_STATE_BYTES ? packedKeyState : packedKeyState.subarray(0, KEY_STATE_BYTES));
+    }
+
+    /** KEY_TEXT_* for the latest press of `vk`: the UTF-16 unit it typed on the host layout. */
+    getKeyDownText(vk: number): number {
+        return this.keyTextView ? this.keyTextView[vk & 0xFF]! : KEY_TEXT_UNKNOWN;
     }
 
     getKeyState(vk: number): number {
@@ -1877,6 +1886,7 @@ export class InputManager {
         const bit = v & 31;
         const idx = KEY_BITFIELD_BASE + word;
         beginInputWrite(view);
+        if (down && this.keyTextView) this.keyTextView[v] = KEY_TEXT_UNKNOWN;
         view[idx] = down ? (view[idx] | (1 << bit)) : (view[idx] & ~(1 << bit));
         endInputWrite(view);
         this.poll(true);
