@@ -9,6 +9,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { drawTextPrefixOptions, fillTextWithMnemonic, parseMnemonicText } from "../win32-text";
 import { writeBackDibSectionRect } from "./bitmap-resolve";
 import type { GDIContext } from './context';
+import { fontBaselineDrop } from './text-extent-cache';
 
 const NONANTIALIASED_QUALITY = 3;
 
@@ -144,7 +145,10 @@ export function textOut(gdi: GDIContext, hdc: number, x: number, y: number, text
         if (hAlign === TA_CENTER) x -= metrics.width / 2;
         else if (hAlign === TA_RIGHT) x -= metrics.width;
         const vAlign = align & TA_BASELINE;
-        if (vAlign === TA_BASELINE) y -= metrics.fontBoundingBoxAscent ?? state.fontSize * 0.8;
+        // The reference point is the alphabetic baseline. `metrics` was measured with
+        // textBaseline 'top', where fontBoundingBoxAscent is the sliver above the em box,
+        // not the ascent: using it left the text a whole ascent too low.
+        if (vAlign === TA_BASELINE) y -= fontBaselineDrop(ctx) ?? state.fontSize * 0.8;
         else if (vAlign === TA_BOTTOM) y -= state.fontSize;
         if (updateCp) gdi.setCurrentPosition(hdc, x + metrics.width, refY);
     }
