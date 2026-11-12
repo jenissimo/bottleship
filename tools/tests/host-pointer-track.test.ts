@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { HostPointerTrack, type HostPoint } from "../../src/input/host-pointer-track";
+import { HostPointerTrack, type HostPoint, wheelPointerTarget } from "../../src/input/host-pointer-track";
 
 const BOUNDS: HostPoint = { x: 1024, y: 768 };
 const CENTRE: HostPoint = { x: 512, y: 384 };
@@ -136,5 +136,30 @@ describe("HostPointerTrack", () => {
         // Guest warps to the centre without the host pointer moving, then the host
         // moves 5px: the guest must land 5px from ITS pointer, not 5px from the host's.
         expect(track.next({ x: 305, y: 300 }, CENTRE, BOUNDS)).toEqual({ x: 517, y: 384 });
+    });
+});
+
+// A WheelEvent's clientX/Y are frozen under Pointer Lock at the point where the lock was
+// taken; the guest's pointer has moved on by relative motion since. Publishing the frozen
+// point threw the pointer back there on every wheel notch.
+describe("wheelPointerTarget", () => {
+    const FROZEN = { x: 100, y: 80 };          // where the lock engaged
+    const GUEST = { x: 700, y: 500 };          // where relative motion has taken the pointer
+
+    it("under Pointer Lock a wheel notch leaves the pointer where it is", () => {
+        const track = new HostPointerTrack();
+        track.lose();                           // what every locked move does
+        expect(wheelPointerTarget(true, track, FROZEN, GUEST, BOUNDS)).toBeNull();
+        // ... and does not seat the track on the frozen point either: the first real
+        // sample after the lock is released is still a re-seat, not a delta from it.
+        expect(track.next({ x: 300, y: 300 }, GUEST, BOUNDS)).toEqual({ x: 300, y: 300 });
+    });
+
+    it("unlocked it is one more sample of the tracked host pointer", () => {
+        const track = new HostPointerTrack();
+        track.next({ x: 300, y: 300 }, { x: 300, y: 300 }, BOUNDS);
+        expect(wheelPointerTarget(false, track, { x: 300, y: 300 }, CENTRE, BOUNDS)).toEqual(CENTRE);
+        expect(wheelPointerTarget(false, track, { x: 310, y: 300 }, CENTRE, BOUNDS))
+            .toEqual({ x: CENTRE.x + 10, y: CENTRE.y });
     });
 });

@@ -81,3 +81,19 @@ export class HostPointerTrack {
         };
     }
 }
+
+/**
+ * Where a wheel notch leaves the guest's pointer, or null when it must not move it.
+ *
+ * A WheelEvent carries clientX/clientY like any mouse event, but under Pointer Lock they
+ * are frozen at the point where the lock was taken while the guest's pointer has since been
+ * moved by relative motion. Publishing that point as an absolute position threw the pointer
+ * back to where the lock engaged on every notch. Locked, the notch is a wheel delta only;
+ * unlocked, it is one more sample of the same host pointer the move handler tracks.
+ */
+export function wheelPointerTarget(
+    locked: boolean, track: HostPointerTrack, host: HostPoint, cursor: HostPoint, bounds: HostPoint,
+): HostPoint | null {
+    if (locked) return null;
+    return track.next(host, cursor, bounds);
+}
