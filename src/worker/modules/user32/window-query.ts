@@ -29,14 +29,16 @@ export function registerWindowQueryExports(exports: Record<string, ThunkImplemen
                     return false;
                 }
             } else {
-                const windowClass = getWindowClass(window.classId || 0);
-                const className = windowClass ? (typeof windowClass.className === "string" ? windowClass.className : "") : "";
-                if (className !== classFilter) {
+                const windowClass = window.classId !== undefined ? getWindowClass(window.classId) : undefined;
+                const className = (typeof windowClass?.className === "string" ? windowClass.className : "")
+                    || window.nativeClassName || window.systemControlClass || "";
+                if (className.toLowerCase() !== classFilter.toLowerCase()) {
                     return false;
                 }
             }
         }
-        if (titleFilter !== null && window.title !== titleFilter) {
+        // FindWindow compares both names without regard to case.
+        if (titleFilter !== null && (window.title ?? '').toLowerCase() !== titleFilter.toLowerCase()) {
             return false;
         }
         return true;

@@ -693,8 +693,8 @@ export function createClassExports(): Record<string, ThunkImplementation> {
         if (win.classId !== undefined) {
             return getWindowClass(win.classId) ?? null;
         }
-        // CreateWindowEx records classId only when the app passed an ATOM, so the name is
-        // the only key most windows have — and it is the class NAME, never the caption.
+        // A system control class has no atom here, so the name is its only key — and it
+        // is the class NAME, never the caption.
         return getWindowClassByName(resolveWindowClassName(hWnd) ?? '') ?? null;
     }
 
@@ -902,6 +902,12 @@ function getBuiltinClassInfo(nameLower: string): any | undefined {
         });
     }
     return info;
+}
+
+/** The atom of a class registered by name (app or builtin registration); undefined for the
+ *  lazily materialized system control classes, which have none here. */
+export function getWindowClassId(name: string): number | undefined {
+    return windowClassesByName.get(name.toLowerCase());
 }
 
 export function getWindowClassByName(name: string) {
