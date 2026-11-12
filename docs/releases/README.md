@@ -5,7 +5,7 @@ it into the library header and Settings → About. The About panel also shows th
 build's Git commit, so builds within a release can be distinguished.
 
 Versions use `major.minor.patch`; Git tags use `v<version>`. The current release is
-**0.7** (`0.7.0`, tag `v0.7.0`). While BottleShip is below 1.0, feature milestones
+**0.8** (`0.8.0`, tag `v0.8.0`). While BottleShip is below 1.0, feature milestones
 increment the minor version and maintenance releases increment the patch version.
 
 To prepare a release:
@@ -21,7 +21,9 @@ To prepare a release:
    that tag's release page.
 
 The first numbered release, 0.7, covers changes merged into `main` from October 5
-through October 8, 2026. GitHub provides source archives for its tagged snapshot;
+through October 8, 2026. Release 0.8 covers changes merged after 0.7 through
+November 12, 2026. GitHub provides source archives for each tagged snapshot;
 the live browser application remains at [bottleship.happydog.games](https://bottleship.happydog.games/).
 
+- [0.8 release notes](0.8.md)
 - [0.7 release notes](0.7.md)

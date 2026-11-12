@@ -307,6 +307,14 @@ full playability.
 
 Harry Potter 1 and Unreal Tournament demos also reach their rendered menus.
 
+### Freeware in the public catalog
+
+| Release | Observed stage | Public catalog |
+|---|---|:---:|
+| Command & Conquer: Tiberian Sun (EA freeware) | Playable; see the table above | ✓ |
+| Grand Theft Auto (1997, Rockstar Classics freeware) | Checked 2026-11-12 on `develop` (35bfdb24): the WGB starts `Grand Theft Auto.exe` with the GTA Settings defaults in the registry, reaches the main menu and enters Liberty City with the HUD. The published WGB contains only the files of Rockstar's `GTAINSTALLER.exe`; GTA Settings needs MFC42.DLL, which it does not ship | ✓ |
+| Grand Theft Auto 2 (Rockstar Classics freeware) | Checked 2026-11-12 on `develop` (35bfdb24): Bink intro, main menu, Play → Start Play in Area 1 enters Downtown with the HUD | ✓ |
+
 These four original installers use the project's own readers: Mafia's RAR4 LZ payload
 (27 files, CRC verified), Carmageddon II's ZIP → InstallShield 3 `data.z` payload
 (1,605 files, decoded sizes checked), Painkiller's VISE payload (55 files, CRC verified),
