@@ -772,6 +772,7 @@ export class Msvcrt implements IModule {
         exports["_getw"] = (ctx, mem, args) => this.readFileValue(args[0] ?? 0, false);
         exports["_putw"] = (ctx, mem, args) => this.writeFileValue(args[0] ?? 0, args[1] ?? 0, false);
         exports["fgetwc"] = (ctx, mem, args) => this.readFileValue(args[0] ?? 0, true);
+        exports["fgetws"] = (ctx, mem, args) => this.fgetws(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
         exports["fputwc"] = (ctx, mem, args) => this.writeFileValue(args[0] ?? 0, args[1] ?? 0, true);
         exports["ungetwc"] = (ctx, mem, args) => this.ungetwc(args[0] ?? 0, args[1] ?? 0);
         exports["tmpfile"] = () => this.tmpfile();
@@ -3494,6 +3495,39 @@ export class Msvcrt implements IModule {
             }
             return step.value;
         } catch { return fail(); }
+    }
+
+    /**
+     * fgetws: fgetwc until L'\n' (kept), count-1 characters, or WEOF. NULL on read error or EOF before any character; a successful line is NUL-terminated.
+     */
+    private fgetws(bufPtr: number, count: number, filePtr: number): number | Promise<ThunkResult> {
+        const n = count | 0;
+        if (!bufPtr || n <= 0 || !filePtr) { this.setErrno(22); return 0; }
+        let read = 0, eof = false;
+        const take = (ch: number): boolean => {
+            if (ch === 0xffff) { eof = true; return true; }
+            Mem.writeUint16(bufPtr + 2 * read++, ch);
+            return ch === 0x0a;
+        };
+        const finish = (): number => {
+            if (eof && (read === 0 || this.fileStreams.get(filePtr)?.err)) return 0;
+            Mem.writeUint16(bufPtr + 2 * read, 0);
+            return bufPtr >>> 0;
+        };
+        const resume = async (pending: Promise<ThunkResult>): Promise<ThunkResult> => {
+            let complete = take((await pending).value);
+            while (!complete && read < n - 1) {
+                const next = this.readFileValue(filePtr, true);
+                complete = take(next instanceof Promise ? (await next).value : next);
+            }
+            return { value: finish(), stackCleanup: 0 };
+        };
+        while (read < n - 1) {
+            const next = this.readFileValue(filePtr, true);
+            if (next instanceof Promise) return resume(next);
+            if (take(next)) break;
+        }
+        return finish();
     }
 
     private writeFileValue(value: number, filePtr: number, wide: boolean): number | Promise<ThunkResult> {
