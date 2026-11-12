@@ -100,15 +100,40 @@ export function snapshotRam(mem: Uint8Array, known: ReadonlySet<string>, patches
     return { manifest, pending, stats };
 }
 
-export async function writeRamChunks(pending: Map<string, Uint8Array>, store: ChunkStore, compress = true): Promise<void> {
-    for (const [hash, bytes] of pending) {
+export const STORE_LANES = 16;
+
+export async function inLanes<T>(items: readonly T[], lanes: number, run: (item: T) => Promise<void>): Promise<void> {
+    let next = 0;
+    let failed: unknown;
+    let stop = false;
+    const lane = async (): Promise<void> => {
+        while (!stop && next < items.length) {
+            const item = items[next++]!;
+            try { await run(item); } catch (e) { if (!stop) { stop = true; failed = e; } }
+        }
+    };
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(lanes, items.length)) }, lane));
+    if (stop) throw failed;
+}
+
+export async function writeRamChunks(pending: Map<string, Uint8Array>, store: ChunkStore, compress = true): Promise<Map<string, number>> {
+    const sizes = new Map<string, number>();
+    const batch: Array<[string, Uint8Array]> = [];
+    await inLanes([...pending], STORE_LANES, async ([hash, bytes]) => {
         const body = compress ? await deflate(bytes) : bytes;
         const file = new Uint8Array(body.byteLength + 1);
         file[0] = compress ? CODEC_DEFLATE_RAW : CODEC_RAW;
         file.set(body, 1);
+        if (store.putMany) { batch.push([hash, file]); return; }
         await store.put(hash, file);
+        sizes.set(hash, file.byteLength);
         pending.delete(hash);
+    });
+    if (store.putMany && batch.length > 0) {
+        await store.putMany(batch);
+        for (const [hash, file] of batch) { sizes.set(hash, file.byteLength); pending.delete(hash); }
     }
+    return sizes;
 }
 
 export async function captureRam(
@@ -132,26 +157,26 @@ export async function readChunk(store: ChunkStore, hash: string, size: number, w
 }
 
 /**
- * Writes each chunk as soon as it is verified, so at most one chunk is held at a time. A
+ * Writes each chunk as soon as it is verified, so at most one chunk per lane is held at a time. A
  * failed restore leaves the guest half-written: load happens only into a fresh worker, which
  * is discarded when a load fails.
  */
 export async function restoreRam(mem: Uint8Array, manifest: RamManifest, store: ChunkStore): Promise<void> {
     validateRamManifest(manifest, mem.length);
     let next = 0;
-    const zeroUpTo = (end: number) => {
-        if (end > next) zeroGuestRange(mem, next, end - next);
-    };
-    for (const [index, hash] of manifest.chunks) {
+    for (const [index] of manifest.chunks) {
+        const base = index * RAM_CHUNK_SIZE;
+        if (base > next) zeroGuestRange(mem, next, base - next);
+        next = base + Math.min(RAM_CHUNK_SIZE, mem.length - base);
+    }
+    if (mem.length > next) zeroGuestRange(mem, next, mem.length - next);
+    await inLanes(manifest.chunks, STORE_LANES, async ([index, hash]) => {
         const base = index * RAM_CHUNK_SIZE;
         const size = Math.min(RAM_CHUNK_SIZE, mem.length - base);
         const bytes = await readChunk(store, hash, size);
-        zeroUpTo(base);
         mem.set(bytes, base);
         markGuestPagesDirty(base, size);
-        next = base + size;
-    }
-    zeroUpTo(mem.length);
+    });
 }
 
 export function referencedChunks(manifests: Iterable<RamManifest>): Set<string> {
@@ -167,9 +192,8 @@ export function referencedChunks(manifests: Iterable<RamManifest>): Set<string> 
  */
 export async function collectGarbage(store: ChunkStore, live: Iterable<RamManifest>): Promise<number> {
     const keep = referencedChunks(live);
-    let removed = 0;
-    for (const hash of await store.list()) {
-        if (!keep.has(hash)) { await store.delete(hash); removed++; }
-    }
-    return removed;
+    const dead = (await store.list()).filter(hash => !keep.has(hash));
+    if (store.deleteMany) await store.deleteMany(dead);
+    else for (const hash of dead) await store.delete(hash);
+    return dead.length;
 }

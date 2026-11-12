@@ -1,7 +1,7 @@
 import { System } from '../core/system';
 import { Logger, LogCategory } from '../core/logger';
-import { OpfsChunkStore, sha256Hex } from './chunk-store';
-import { writeRamChunks } from './ram';
+import { OpfsPackDir, PackedChunkStore, sha256Hex } from './chunk-store';
+import { inLanes, STORE_LANES, writeRamChunks } from './ram';
 import { captureSession, checkSavestate, coverageRefusal, restoreSession, RestoreFailed, type SavestateTarget } from './session';
 import { CaptureRefusal } from './object-codecs';
 import type { ChunkStore } from './chunk-store';
@@ -146,7 +146,7 @@ const STORAGE_ROOT = ['bottleship', 'savestates'];
 
 const opfsStorage: SavestateStorage = {
     gameDir: (game) => OpfsDir.open([...STORAGE_ROOT, game]),
-    chunks: (game) => OpfsChunkStore.open([...STORAGE_ROOT, game, 'chunks']),
+    chunks: async (game) => PackedChunkStore.open(await OpfsPackDir.open([...STORAGE_ROOT, game, 'chunks'])),
 };
 
 export async function openGameStore(storage: SavestateStorage, game: string): Promise<SlotStore> {
@@ -167,8 +167,11 @@ export async function writePendingLoad(storage: SavestateStorage, game: string, 
 
 export async function requestLoadOnNextBoot(slot: string): Promise<void> {
     const game = gameDir();
-    if (!(await (await gameStore(game)).read(checkSlotName(slot)))) throw new Error(`savestate: slot ${slot} is empty`);
-    await writePendingLoad(opfsStorage, game, slot, Date.now());
+    checkSlotName(slot);
+    await withGameLock(game, async () => {
+        if (!(await (await gameStore(game)).read(slot))) throw new Error(`savestate: slot ${slot} is empty`);
+        await writePendingLoad(opfsStorage, game, slot, Date.now());
+    });
 }
 
 export type PendingLoadOutcome =
@@ -235,18 +238,35 @@ export function lastLoad(): LastLoad | null {
 export async function listSlots(): Promise<{ gameId: string; game: string; slots: SlotInfo[] }> {
     const game = gameDir();
     const t = target('');
-    const list = await (await gameStore(game)).list((state) => {
+    const list = await withGameLock(game, async () => (await gameStore(game)).list((state) => {
         const reasons = incompatibilities(state.header.key, t.compatibilityKey());
         if (state.header.gameId !== t.gameId()) reasons.unshift('other game');
         return reasons;
-    });
+    }));
     return { gameId: t.gameId(), game, slots: list };
+}
+
+/**
+ * Housekeeping before a save or a delete. A failure here leaves the store as readable as it
+ * was (nothing is removed that was not packed first), so it is reported and the operation goes on.
+ */
+async function sweepChunks(chunks: ChunkStore): Promise<void> {
+    try {
+        const swept = await chunks.sweep?.() as { skipped?: number } | undefined;
+        if (swept?.skipped) Logger.warn(LogCategory.SYSTEM, `[SAVESTATE] ${swept.skipped} loose chunk file(s) could not be read and stay where they are`);
+    } catch (e) {
+        Logger.warn(LogCategory.SYSTEM, `[SAVESTATE] housekeeping of the chunk store failed and is retried at the next save: ${e instanceof Error ? e.message : String(e)}`);
+    }
 }
 
 export async function deleteSlot(slot: string): Promise<{ removedChunks: number }> {
     const game = gameDir();
     checkSlotName(slot);
-    return withGameLock(game, async () => ({ removedChunks: await (await gameStore(game)).remove(slot) }));
+    return withGameLock(game, async () => {
+        const store = await gameStore(game);
+        await sweepChunks(store.chunkStore);
+        return { removedChunks: await store.remove(slot) };
+    });
 }
 
 export interface SaveReport {
@@ -261,6 +281,7 @@ export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, p
     if (early) throw new CaptureRefusal(early);
     return withGameLock(game, async () => {
         const store = await gameStore(game);
+        await sweepChunks(store.chunkStore);
         const known = new Set(await store.chunkStore.list());
         const t = target(await overlayDigest());
         const t0 = performance.now();
@@ -272,10 +293,12 @@ export async function saveToSlot(name: string, halt: () => Promise<SafePoint>, p
             safe.release();
         }
         const t1 = performance.now();
-        await writeRamChunks(result.pending, store.chunkStore);
+        const sizes = await writeRamChunks(result.pending, store.chunkStore);
+        const unsized = [...new Set([...result.manifest.chunks.map(([, hash]) => hash), ...result.blobs.map(([hash]) => hash)])].filter(hash => !sizes.has(hash));
+        await inLanes(unsized, 4 * STORE_LANES, async (hash) => { sizes.set(hash, await store.chunkStore.size(hash)); });
         let chunkBytes = 0;
-        for (const [, hash] of result.manifest.chunks) chunkBytes += await store.chunkStore.size(hash);
-        for (const [hash] of result.blobs) chunkBytes += await store.chunkStore.size(hash);
+        for (const [, hash] of result.manifest.chunks) chunkBytes += sizes.get(hash) ?? 0;
+        for (const [hash] of result.blobs) chunkBytes += sizes.get(hash) ?? 0;
         await store.save(name, result.bytes, chunkBytes);
         const t2 = performance.now();
         return {
