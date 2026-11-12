@@ -24,14 +24,16 @@ export interface HardwareKeyText {
 /**
  * The UTF-16 unit a key-down types on the host layout, for the guest's WM_CHAR.
  * `key` is already resolved by the host: AltGr+Q is "@" on a German keyboard, Shift+2
- * is '"', a dead key is "Dead". AltGr arrives as Ctrl+Alt on Windows, so only Ctrl
- * WITHOUT Alt (a shortcut, which types nothing of its own) is left to the guest's table.
+ * is '"', a dead key is "Dead". AltGr arrives as Ctrl+Alt on Windows and is the one
+ * modifier combination taken from `key`. Ctrl alone is a shortcut, and Alt alone never
+ * changes the character on Windows (macOS Option does: Option+F is "ƒ", Option+E is
+ * "Dead"), so both are left to the guest's table, as is Meta.
  */
 export function hardwareKeyText(event: HardwareKeyText): number {
+    const altGraph = event.getModifierState("AltGraph") || (event.ctrlKey && event.altKey);
+    if (event.metaKey || ((event.ctrlKey || event.altKey) && !altGraph)) return KEY_TEXT_UNKNOWN;
     if (event.key === "Dead") return KEY_TEXT_NONE;
     if (event.key.length !== 1) return KEY_TEXT_UNKNOWN;
-    if (event.metaKey) return KEY_TEXT_UNKNOWN;
-    if (event.ctrlKey && !event.altKey && !event.getModifierState("AltGraph")) return KEY_TEXT_UNKNOWN;
     const unit = event.key.charCodeAt(0);
     return unit === KEY_TEXT_NONE ? KEY_TEXT_UNKNOWN : unit;
 }

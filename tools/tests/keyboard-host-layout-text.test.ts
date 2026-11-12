@@ -9,7 +9,7 @@ import { hardwareKeyText, hardwareKeyVk } from "../../src/app/hardware-key-vk";
 import { INPUT_BUFFER_SIZE, KEY_TEXT_NONE, KEY_TEXT_UNKNOWN } from "../../src/input/sab-layout";
 import { VirtualInputDevice } from "../../src/input/virtual-device";
 import { InputManager } from "../../src/worker/runtime/input/input-manager";
-import { keyDownChar } from "../../src/worker/modules/user32/translate-message";
+import { keyDownChar, translateKeyMessage } from "../../src/worker/modules/user32/translate-message";
 import { createSystemExports } from "../../src/worker/modules/user32/system";
 import { System } from "../../src/worker/core/system";
 
@@ -70,9 +70,10 @@ describe("a key-down types what the host layout says", () => {
         expect(r.typed(r.press({ code: "KeyE", key: "€", keyCode: 0x45, ctrl: true, alt: true, altGraph: true }))).toBe(0x80);
     });
 
-    test("a character the ANSI code page lacks types nothing", () => {
+    test("a character the ANSI code page lacks falls back to the US table", () => {
         const r = rig();
-        expect(r.typed(r.press({ code: "KeyQ", key: "й", keyCode: VK_Q }))).toBe(0);
+        expect(r.typed(r.press({ code: "KeyQ", key: "й", keyCode: VK_Q }))).toBe(0x71);
+        expect(r.typed(VK_Q, true)).toBe(0x51);
     });
 
     test("a dead key types nothing", () => {
@@ -86,6 +87,64 @@ describe("a key-down types what the host layout says", () => {
         expect(hardwareKeyText(event({ code: "KeyC", key: "c", keyCode: 0x43, ctrl: true }))).toBe(KEY_TEXT_UNKNOWN);
         const r = rig();
         expect(r.typed(r.press({ code: "Enter", key: "Enter", keyCode: 13 }))).toBe(13);
+    });
+
+    test("Alt alone is not a layout modifier (macOS Option+F is 'ƒ', Option+E is a dead key)", () => {
+        expect(hardwareKeyText(event({ code: "KeyF", key: "ƒ", keyCode: 0x46, alt: true }))).toBe(KEY_TEXT_UNKNOWN);
+        expect(hardwareKeyText(event({ code: "KeyE", key: "Dead", keyCode: 0x45, alt: true }))).toBe(KEY_TEXT_UNKNOWN);
+        expect(hardwareKeyText(event({ code: "KeyF", key: "f", keyCode: 0x46, alt: true }))).toBe(KEY_TEXT_UNKNOWN);
+        const r = rig();
+        expect(r.typed(r.press({ code: "KeyF", key: "ƒ", keyCode: 0x46, alt: true }))).toBe(0x66);
+        expect(hardwareKeyText(event({ code: "KeyQ", key: "@", keyCode: VK_Q, alt: true, altGraph: true }))).toBe(0x40);
+    });
+});
+
+describe("TranslateMessage posts the host character", () => {
+    const WM_KEYDOWN = 0x100, WM_KEYUP = 0x101, WM_CHAR = 0x102, WM_SYSKEYDOWN = 0x104, WM_SYSCHAR = 0x106;
+    const HWND = 0x10001;
+    const system = System.getInstance() as unknown as { inputManager: InputManager; windowManager: unknown };
+
+    function translating(r: ReturnType<typeof rig>) {
+        const posted: Array<[number, number, number, number]> = [];
+        const saved = { inputManager: system.inputManager, windowManager: system.windowManager };
+        system.inputManager = r.im;
+        system.windowManager = { postMessage: (h: number, m: number, w: number, l: number) => { posted.push([h, m, w, l]); } };
+        return { posted, restore: () => { Object.assign(system, saved); } };
+    }
+
+    test("WM_KEYDOWN of AltGr+Q posts WM_CHAR '@' to the same window with the key's lParam", () => {
+        const r = rig();
+        const t = translating(r);
+        try {
+            const vk = r.press({ code: "KeyQ", key: "@", keyCode: VK_Q, ctrl: true, alt: true, altGraph: true });
+            expect(translateKeyMessage(HWND, WM_KEYDOWN, vk, 0x00100001)).toBe(true);
+            expect(t.posted).toEqual([[HWND, WM_CHAR, 0x40, 0x00100001]]);
+        } finally { t.restore(); }
+    });
+
+    test("WM_SYSKEYDOWN posts WM_SYSCHAR, a key-up and a dead key post nothing", () => {
+        const r = rig();
+        const t = translating(r);
+        try {
+            const vk = r.press({ code: "BracketLeft", key: "ü", keyCode: VK_OEM_1 });
+            expect(translateKeyMessage(HWND, WM_SYSKEYDOWN, vk, 1)).toBe(true);
+            expect(t.posted).toEqual([[HWND, WM_SYSCHAR, 0xfc, 1]]);
+            expect(translateKeyMessage(HWND, WM_KEYUP, vk, 1)).toBe(false);
+            r.release(vk);
+            const dead = r.press({ code: "Equal", key: "Dead", keyCode: 0xdd });
+            expect(translateKeyMessage(HWND, WM_KEYDOWN, dead, 1)).toBe(false);
+            expect(t.posted.length).toBe(1);
+        } finally { t.restore(); }
+    });
+
+    test("a host character outside the guest code page still posts the US character", () => {
+        const r = rig();
+        const t = translating(r);
+        try {
+            const vk = r.press({ code: "KeyQ", key: "й", keyCode: VK_Q });
+            expect(translateKeyMessage(HWND, WM_KEYDOWN, vk, 1)).toBe(true);
+            expect(t.posted).toEqual([[HWND, WM_CHAR, 0x71, 1]]);
+        } finally { t.restore(); }
     });
 });
 
@@ -143,6 +202,19 @@ describe("ToAscii and ToUnicode of a held key", () => {
             expect(word()).toBe(0x80);
             expect(call("ToUnicode", 0x45, 0x12)).toBe(1);
             expect(word()).toBe(0x20ac);
+        } finally { system.inputManager = saved; }
+    });
+
+    test("a held key whose host character the code page lacks answers the US character", () => {
+        const r = rig();
+        const saved = system.inputManager;
+        system.inputManager = r.im;
+        try {
+            const vk = r.press({ code: "KeyQ", key: "й", keyCode: VK_Q });
+            expect(call("ToAscii", vk, 0x10)).toBe(1);
+            expect(word()).toBe(0x71);
+            expect(call("ToUnicode", vk, 0x10)).toBe(1);
+            expect(word()).toBe(0x71);
         } finally { system.inputManager = saved; }
     });
 

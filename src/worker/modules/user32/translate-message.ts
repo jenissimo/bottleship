@@ -57,10 +57,18 @@ export function hostTextToChar(unit: number): number {
     return byte === 0xffff ? 0 : byte;
 }
 
-/** The WM_CHAR code of a key-down whose press typed `text` (KEY_TEXT_*) on the host; 0 for none. */
+/**
+ * The WM_CHAR code of a key-down whose press typed `text` (KEY_TEXT_*) on the host; 0 for
+ * none. A host character the guest's ANSI code page cannot represent (a Cyrillic layout
+ * over a cp1252 guest) is not typed as nothing: the key falls back to the US table, which
+ * is also the layout the guest is told it has.
+ */
 export function keyDownChar(text: number, vk: number, shiftDown: boolean, capsLock: boolean): number {
     if (text === KEY_TEXT_NONE) return 0;
-    if (text !== KEY_TEXT_UNKNOWN) return hostTextToChar(text);
+    if (text !== KEY_TEXT_UNKNOWN) {
+        const hostChar = hostTextToChar(text);
+        if (hostChar !== 0) return hostChar;
+    }
     return vkToChar(vk, shiftDown, capsLock);
 }
 

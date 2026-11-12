@@ -1452,10 +1452,12 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         if (!input || !(input.getKeyState(vk & 0xFF) & 0x8000)) return KEY_TEXT_UNKNOWN;
         return input.getKeyDownText(vk & 0xFF);
     };
+    /** ANSI byte the held key typed, 0 for a dead key, null when the US table decides. */
     const heldKeyHostChar = (vk: number, scanCode: number): number | null => {
         const text = heldKeyHostText(vk, scanCode);
         if (text === KEY_TEXT_UNKNOWN) return null;
-        return text === KEY_TEXT_NONE ? 0 : hostTextToChar(text);
+        if (text === KEY_TEXT_NONE) return 0;
+        return hostTextToChar(text) || null;
     };
 
     // int ToAscii(UINT uVirtKey, UINT uScanCode, const BYTE *lpKeyState, LPWORD lpChar, UINT uFlags)
@@ -1538,9 +1540,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             return 0;
         }
 
+        // The same rule as WM_CHAR: only a character the guest's ANSI code page has.
         const hostUnit = heldKeyHostText(args[0], args[1]);
-        if (hostUnit !== KEY_TEXT_UNKNOWN) {
-            if (hostUnit === KEY_TEXT_NONE) return 0;
+        if (hostUnit === KEY_TEXT_NONE) return 0;
+        if (hostUnit !== KEY_TEXT_UNKNOWN && hostTextToChar(hostUnit) !== 0) {
             mem[pwszBuff] = hostUnit & 0xFF;
             mem[pwszBuff + 1] = (hostUnit >> 8) & 0xFF;
             return 1;
