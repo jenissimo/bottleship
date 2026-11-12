@@ -5,7 +5,7 @@ import { SystemResourceProvider } from "../../core/resources/system-resource-pro
 import { System } from "../../core/system";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { gammaService } from "../../core/gamma-service";
-import { resolveBitmapRgba, bitmapPixelsPopulated, writeBackDibSectionRect } from './bitmap-resolve';
+import { resolveBitmapRgba, bitmapPixelsPopulated, writeBackDibSectionRect, writeDibSectionPixel } from './bitmap-resolve';
 import { asArrayBufferView } from '../../../dom-buffer';
 import { pickDefined, type FieldPolicy } from '../../savestate/participant';
 // Sibling GDI modules take this GDIContext as their `gdi` host and operate on
@@ -1822,6 +1822,55 @@ export class GDIContext {
         const offset = (y * width + x) * 4;
         const data = state.cachedImageData!.data;
         return (data[offset + 2] << 16) | (data[offset + 1] << 8) | data[offset];
+    }
+
+    /**
+     * SetPixel: one pixel, on its own path. A per-pixel loop that alternates with GetPixel
+     * (flood fill, a hand-drawn effect) must not pay for the surface on every step, so the
+     * GetPixel cache is updated in place instead of being dropped, and a DIB section gets
+     * the pixel written into its guest bits directly instead of through a canvas read-back.
+     * Returns the colour now at the pixel as a COLORREF, or CLR_INVALID outside the DC or
+     * its clip region.
+     */
+    setPixel(hdc: number, x: number, y: number, color: number): number {
+        const state = this.hdcStates.get(hdc);
+        const ctx = this.contexts.get(hdc);
+        if (!state || !ctx?.canvas) return 0xFFFFFFFF;
+        const { width, height } = ctx.canvas;
+        if ((x >>> 0) >= width || (y >>> 0) >= height) return 0xFFFFFFFF;
+        const clipRects = state.clip?.region?.rects;
+        if (clipRects) {
+            let visible = false;
+            for (let i = 0; i < clipRects.length && !visible; i += 4) {
+                visible = x >= clipRects[i]! && y >= clipRects[i + 1]! && x < clipRects[i + 2]! && y < clipRects[i + 3]!;
+            }
+            if (!visible) return 0xFFFFFFFF;
+        }
+
+        const requested = color & 0x00FFFFFF;
+        const stored = writeDibSectionPixel(state.hBitmap, x, y, requested & 0xFF, (requested >>> 8) & 0xFF, requested >>> 16);
+        const set = stored ?? requested;
+
+        if (ctx === this.overlayCtx) this.setOverlayDirty(true);
+        const css = this.colorToCss(set);
+        ctx.fillStyle = css;
+        state.appliedFillStyle = css;
+        ctx.fillRect(x, y, 1, 1);
+        const linkedBitmap = (ctx.canvas as any).__bitmapCanvas;
+        if (linkedBitmap) {
+            const bitmapCtx = linkedBitmap.getContext('2d');
+            if (bitmapCtx) {
+                bitmapCtx.fillStyle = css;
+                bitmapCtx.fillRect(x, y, 1, 1);
+            }
+        }
+
+        if (state.cachedPixels32 && !state.imageDataDirty) {
+            state.cachedPixels32[y * width + x] = (0xFF000000 | set) >>> 0;
+        }
+        this.expandDirtyRect(hdc, x, y, 1, 1);
+        this.markDirty(hdc);
+        return set;
     }
 
     /**

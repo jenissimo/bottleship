@@ -11,7 +11,7 @@ import { profiler } from '../../core/profiler';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { SystemResourceProvider } from '../../core/resources/system-resource-provider';
 import { toPlainGuestMemory } from '../../core/memory/guest-memory';
-import { LOGPEN_OFFSETS, LOGPEN_SIZE } from './gdi-objects';
+import { LOGPEN_OFFSETS, LOGPEN_SIZE, colorToCss } from './gdi-objects';
 import { writeBackDibSectionRect, readDibSectionRgbaGeneric } from './bitmap-resolve';
 import { patBlt } from './gdi-blit';
 import { extTextOut } from './ext-text-out';
@@ -1543,15 +1543,19 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         return actualCount;
     };
 
-    // SetPixel - set a single pixel color
+    // COLORREF SetPixel(HDC, int x, int y, COLORREF) — the colour actually set, or
+    // CLR_INVALID (-1) when the point lies outside the DC. ddutil's DDColorMatch, which
+    // DirectDraw titles use to turn an RGB colour key into the surface's pixel value,
+    // sets pixel (0,0) on the surface DC and reads it back through Lock.
+    const setPixel = (hdc: number, x: number, y: number, color: number): number =>
+        System.getInstance().gdiContext.setPixel(hdc, x, y, color);
     exports['SetPixel'] = (ctx, mem, args): number => {
-        const hdc = args[0];
-        const x = args[1] | 0; // signed
-        const y = args[2] | 0; // signed
-        const color = args[3];
-        Logger.verbose(LogCategory.GDI32, `SetPixel(hdc=0x${hdc.toString(16)}, x=${x}, y=${y}, color=0x${color.toString(16)})`);
-        // Stub: return the color (success)
-        return color;
+        Logger.verbose(LogCategory.GDI32, `SetPixel(hdc=0x${args[0].toString(16)}, x=${args[1] | 0}, y=${args[2] | 0}, color=0x${args[3].toString(16)})`);
+        return setPixel(args[0], args[1] | 0, args[2] | 0, args[3] >>> 0);
+    };
+    // BOOL SetPixelV(HDC, int x, int y, COLORREF)
+    exports['SetPixelV'] = (ctx, mem, args): number => {
+        return setPixel(args[0], args[1] | 0, args[2] | 0, args[3] >>> 0) === 0xFFFFFFFF ? 0 : 1;
     };
 
     // SetStretchBltMode - sets bitmap stretching mode

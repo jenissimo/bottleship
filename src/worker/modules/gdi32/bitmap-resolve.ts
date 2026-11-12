@@ -280,6 +280,60 @@ export function writeBackDibSectionRect(
     }
 }
 
+/**
+ * One pixel written straight into a DIB section's guest bits, without reading the
+ * canvas back. Returns the colour the section now holds at that pixel as a COLORREF
+ * (0x00BBGGRR): the requested one at 24/32 bpp, rounded to the channel widths at 16 bpp,
+ * the nearest colour-table entry at 1/4/8 bpp. Null when the bitmap has no guest bits,
+ * the pixel lies outside it, or an indexed section has no colour table.
+ */
+export function writeDibSectionPixel(hBitmap: number, x: number, y: number, r: number, g: number, b: number): number | null {
+    if (!hBitmap) return null;
+    const obj = unwrapBitmapObj(hBitmap);
+    if (!obj || !obj.bitsPtr || !obj.dibStride) return null;
+    const bpp = obj.dibBpp ?? 32;
+    const bw = obj.width ?? 0, bh = obj.height ?? 0;
+    if (x < 0 || y < 0 || x >= bw || y >= bh) return null;
+    const mem = toPlainGuestMemory(System.getInstance().process?.getCurrentMemory?.());
+    if (!mem || obj.bitsPtr + obj.dibStride * bh > mem.length) return null;
+    const row = obj.bitsPtr + (obj.dibTopDown ? y : bh - 1 - y) * obj.dibStride;
+    if (bpp === 32 || bpp === 24) {
+        const o = row + x * (bpp >> 3);
+        mem[o] = b; mem[o + 1] = g; mem[o + 2] = r;
+        return (b << 16) | (g << 8) | r;
+    }
+    if (bpp === 16) {
+        const [cr, cg, cb] = dibColorMasks(16, obj.dibMasks).map(maskChannel) as [MaskChannel, MaskChannel, MaskChannel];
+        const qr = Math.round(r * cr.max / 255), qg = Math.round(g * cg.max / 255), qb = Math.round(b * cb.max / 255);
+        const v = ((qr << cr.shift) | (qg << cg.shift) | (qb << cb.shift)) >>> 0;
+        const o = row + x * 2;
+        mem[o] = v & 0xff; mem[o + 1] = (v >>> 8) & 0xff;
+        const widen = (q: number, c: MaskChannel) => c.max ? Math.round(q * 255 / c.max) : 0;
+        return (widen(qb, cb) << 16) | (widen(qg, cg) << 8) | widen(qr, cr);
+    }
+    if (bpp !== 8 && bpp !== 4 && bpp !== 1) return null;
+    const palette = obj.dibPalette;
+    if (!palette || palette.length === 0) return null;
+    const count = Math.min(palette.length, 1 << bpp);
+    let best = 0, bestDistance = Infinity;
+    for (let i = 0; i < count; i++) {
+        const c = palette[i]!;
+        const d = (r - ((c >>> 16) & 0xff)) ** 2 + (g - ((c >>> 8) & 0xff)) ** 2 + (b - (c & 0xff)) ** 2;
+        if (d < bestDistance) { bestDistance = d; best = i; if (d === 0) break; }
+    }
+    if (bpp === 8) {
+        mem[row + x] = best;
+    } else if (bpp === 4) {
+        const o = row + (x >> 1);
+        mem[o] = (x & 1) ? ((mem[o]! & 0xf0) | best) : ((mem[o]! & 0x0f) | (best << 4));
+    } else {
+        const o = row + (x >> 3), bit = 0x80 >> (x & 7);
+        mem[o] = best ? (mem[o]! | bit) : (mem[o]! & ~bit);
+    }
+    const c = palette[best]!;
+    return ((c & 0xff) << 16) | (c & 0xff00) | ((c >>> 16) & 0xff);
+}
+
 /** 24bpp as B,G,R; 16bpp packed through the section's masks, each channel rounded to its width. */
 function writeBackRgbRect(
     obj: BitmapUserObj,
