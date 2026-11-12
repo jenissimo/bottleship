@@ -17,7 +17,7 @@ import {
     CTRL_SAMPLE_RATE, CTRL_BITS_PER_SAMPLE, CTRL_BLOCK_ALIGN, CTRL_STATE,
     CTRL_LOOP_MODE, CTRL_VOLUME, CTRL_PAN, CTRL_FREQUENCY, CTRL_DATA_LENGTH,
     CTRL_STOP_REQUESTED, CTRL_FLAGS, CTRL_RESERVED, CTRL_BLOCK_BYTES, CTRL_SLOTS,
-    STATE_PLAYING, FLAG_CIRCULAR, FLAG_STREAMING,
+    STATE_PLAYING, FLAG_CIRCULAR, FLAG_STREAMING, MIX_HISTORY_FRAMES,
     CTRL_3D_POS_X, CTRL_3D_POS_Y, CTRL_3D_POS_Z,
     CTRL_3D_VEL_X, CTRL_3D_VEL_Y, CTRL_3D_VEL_Z,
     CTRL_3D_MIN_DIST, CTRL_3D_MAX_DIST, CTRL_3D_MODE,
@@ -105,7 +105,9 @@ const CONCEAL_FADE_FRAMES = 64;
 // ~68 dB down. Sources at or above the output rate keep linear interpolation: there the
 // kernel would have to follow the output's Nyquist instead, and an equal rate (frac 0)
 // is already exact.
-const SINC_HALF = 8;                    // reads frames k-7 .. k+8 around frame k
+// Reads frames k-7 .. k+8 around frame k. A producer refilling what the head has passed
+// leaves MIX_HISTORY_FRAMES behind it alone (dsound trailRing).
+const SINC_HALF = MIX_HISTORY_FRAMES;
 const SINC_TAPS = SINC_HALF * 2;
 const SINC_PHASES = 256;                // rows; weights are interpolated between rows
 const SINC_CUTOFF = 0.85;               // fraction of the source Nyquist

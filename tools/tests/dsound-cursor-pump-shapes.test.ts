@@ -24,7 +24,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { DSound } from "../../src/worker/modules/dsound/dsound";
-import { CTRL_BLOCK_BYTES, CTRL_PLAY_CURSOR } from "../../src/audio/audio-ring-buffer";
+import { CTRL_BLOCK_BYTES, CTRL_PLAY_CURSOR, MIX_HISTORY_FRAMES } from "../../src/audio/audio-ring-buffer";
 
 const RENDER_BURST_MS = 10;
 const WARMUP_MS = 3000;
@@ -84,19 +84,19 @@ function rig(fmt: Format, size: number) {
             Atomics.store(ctrl, CTRL_PLAY_CURSOR, raw % RING);
         },
         cursors: () => call("getApiCursors") as { playCursor: number; writeCursor: number },
-        /** Lock + Unlock of `n` bytes at `offset` filled with `value`; `recorded` is the size Lock saw. */
-        unlock(offset: number, n: number, value: number, recorded = n) {
+        /** Lock + Unlock of `n` bytes at `offset` filled with `value` (`wrapValue` past the buffer
+         *  end); `recorded` is the size Lock saw. Placed the way Unlock places it. */
+        unlock(offset: number, n: number, value: number, recorded = n, wrapValue = value) {
             const first = Math.min(n, size - offset);
             mem.fill(value, PTR + offset, PTR + offset + first);
-            if (n > first) mem.fill(value, PTR, PTR + n - first);
+            if (n > first) mem.fill(wrapValue, PTR, PTR + n - first);
             const locks = (buffer.stepLockSizes as Float64Array | undefined)
                 ?? (buffer.stepLockSizes = new Float64Array(LOCK_WINDOW));
             const count = (buffer.stepLockCount as number | undefined) ?? 0;
             locks[count % LOCK_WINDOW] = recorded;
             buffer.stepLockCount = count + 1;
             call("trailRing");
-            call("writeToLaps", mem, offset, first);
-            if (n > first) call("writeToLaps", mem, 0, n - first);
+            call("writeSpanToLaps", mem, offset, first, n - first);
         },
     };
 }
@@ -216,8 +216,13 @@ describe("dsound: a delta pump with jittered wakes keeps its catch-up headroom",
  * ~45-55 ms refills what was played since its last refill, [lastEnd, play) rounded down to
  * 64 bytes: Locks of ~3.2 KB that vary with the wake, landing one lap ahead.
  * `recordLock` overrides the Lock size the bound sees (the negative control).
+ *
+ * `menu`: the shape its main menu runs (measured after skipping the intro videos). It
+ * queries once per ~50 ms wake and refills [lastEnd, play + ~580) rounded up to 64 bytes:
+ * every refill starts ~40 ms behind the cursor and runs ~10 ms past it. A refill that wraps
+ * is two Locks, the buffer's tail then its head.
  */
-function nfs5Pump(opts: { pauseMs: number; durationMs?: number; recordLock?: number }) {
+function nfs5Pump(opts: { pauseMs: number; durationMs?: number; recordLock?: number; menu?: boolean }) {
     const fmt = { rate: 16000, blockAlign: 4 };
     const size = 25600;
     const durationMs = opts.durationMs ?? 20_000;
@@ -247,23 +252,33 @@ function nfs5Pump(opts: { pauseMs: number; durationMs?: number; recordLock?: num
             clock += opts.pauseMs;
             nextPauseAt += 2000;
         } else {
-            clock += 0.3;
+            clock = opts.menu ? Math.max(clock + 0.3, nextWake) : clock + 0.3;
         }
         const played = r.raw;
         r.advance(clock);
         if (clock - r.start >= WARMUP_MS) {
-            for (let at = played; at < r.raw; at++) if (ring[at % r.ring] !== lapValue(at)) wrongBytes++;
+            // From the frames behind the head the mixer's interpolator still reads.
+            for (let at = played - MIX_HISTORY_FRAMES * fmt.blockAlign; at < r.raw; at++) {
+                if (ring[at % r.ring] !== lapValue(at)) wrongBytes++;
+            }
         }
         const { playCursor } = r.cursors();
         if (clock < nextWake) continue;
         nextWake = clock + [45, 50, 55, 48][wake++ % 4];
         const lastEnd = stream % size;
-        const n = Math.floor(((playCursor - lastEnd + size) % size) / 64) * 64;
+        const n = opts.menu
+            ? (Math.ceil((playCursor + 580) / 64) * 64 - lastEnd + size) % size
+            : Math.floor(((playCursor - lastEnd + size) % size) / 64) * 64;
         if (n <= 0) continue;
-        // One Lock; its two spans (before and after the buffer end) belong to two laps.
+        // Its two spans (before and after the buffer end) belong to two laps. The menu pump
+        // Locks them separately, back to back.
         const first = Math.min(n, size - lastEnd);
-        r.unlock(lastEnd, first, lapValue(stream), opts.recordLock ?? n);
-        if (n > first) r.unlock(0, n - first, lapValue(stream + first), opts.recordLock ?? n);
+        if (opts.menu && n > first) {
+            r.unlock(lastEnd, first, lapValue(stream), opts.recordLock ?? first);
+            r.unlock(0, n - first, lapValue(stream + first), opts.recordLock ?? n - first);
+        } else {
+            r.unlock(lastEnd, n, lapValue(stream), opts.recordLock ?? n, lapValue(stream + first));
+        }
         stream += n;
         if (clock - r.start >= WARMUP_MS) written += n;
     }
@@ -292,6 +307,34 @@ describe("dsound: NFS5's refill-what-was-played pump", () => {
 
     test("negative control: a stall longer than its lap of runway plays bytes from the wrong lap", () => {
         expect(nfs5Pump({ pauseMs: 600 }).wrongBytes).toBeGreaterThan(0);
+    });
+
+    for (const pauseMs of [0, 100, 250]) {
+        test(`its menu refill, run past the cursor, plays every lap in order${pauseMs ? ` across ${pauseMs} ms host pauses` : ""}`, () => {
+            const r = nfs5Pump({ pauseMs, menu: true });
+            expect(r.wrongBytes).toBe(0);
+            expect(r.rate).toBeGreaterThan(0.98);
+        });
+    }
+
+    test("negative control: refilled up to the head, the menu pump's next lap leaks into the interpolator", () => {
+        const g = globalThis as { __noTrailKeep?: boolean };
+        g.__noTrailKeep = true;
+        try {
+            expect(nfs5Pump({ pauseMs: 0, menu: true }).wrongBytes).toBeGreaterThan(0);
+        } finally {
+            delete g.__noTrailKeep;
+        }
+    });
+
+    test("negative control: split at the play cursor, the menu refill plays its tail a lap early", () => {
+        const g = globalThis as { __noCommittedSplit?: boolean };
+        g.__noCommittedSplit = true;
+        try {
+            expect(nfs5Pump({ pauseMs: 0, menu: true }).wrongBytes).toBeGreaterThan(0);
+        } finally {
+            delete g.__noCommittedSplit;
+        }
     });
 });
 
