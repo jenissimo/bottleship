@@ -12,7 +12,7 @@ import { convertToFloat, decodeStreamFile, parseWav, DIG_F_ADPCM_MASK } from "./
 import { decodeRawSampleImage } from "./raw-sample-cache";
 import { getBytesPerSecond, isEncodedFormat } from "./helpers";
 import {
-    armStreamingRing, hasStreamingRing, incrementalStreamPosition, pcmRingDataBytes, pcmRingPlayFrame,
+    armStreamingRing, hasStreamingRing, incrementalStreamPosition, pcmRingDataBytes, pcmRingEnded, pcmRingPlayFrame,
     resetMssRingBuffers, restorePcmRing, streamingRingBytes, streamingRingFreeBytes,
 } from "./playback-engine";
 import { restoreStreamingSource, refillChainRunning } from "./stream-engine";
@@ -106,6 +106,7 @@ export interface MssSampleState {
     decode: MssDecodeRule;
     decoded: Float32Array | null;
     playFrame: number;
+    ended: boolean;
 }
 
 export interface MssStreamState {
@@ -113,6 +114,7 @@ export interface MssStreamState {
     loaded: boolean;
     source: SourceFields | null;
     playFrame: number;
+    ended: boolean;
 }
 
 export interface MssState {
@@ -148,8 +150,8 @@ export const MSS_SCHEMA = {
         memAllocatedByMss: true, wavFormatByDataPtr: true, fileCallbacks: true, memCallbacks: true, streamUserData: true,
         streamCallbacks: true, sequenceUserData: true, sequenceCallbacks: true,
     }),
-    sampleState: stateKeys<MssSampleState>({ fields: true, image: true, decode: true, decoded: true, playFrame: true }),
-    streamState: stateKeys<MssStreamState>({ fields: true, loaded: true, source: true, playFrame: true }),
+    sampleState: stateKeys<MssSampleState>({ fields: true, image: true, decode: true, decoded: true, playFrame: true, ended: true }),
+    streamState: stateKeys<MssStreamState>({ fields: true, loaded: true, source: true, playFrame: true, ended: true }),
 };
 
 const STREAM_READ_ACCESS = 0x80000000;
@@ -224,7 +226,8 @@ function captureSample(s: MSSSample, mem: Uint8Array): MssSampleState {
         }
         if (decode === 'saved') decoded = s.decodedData;
     }
-    return { fields: pickDefined(s, MSS_SAMPLE_FIELDS), image, decode, decoded, playFrame: s.isPlaying ? pcmRingPlayFrame(s.id) ?? 0 : 0 };
+    const ended = s.isPlaying && pcmRingEnded(s.id);
+    return { fields: pickDefined(s, MSS_SAMPLE_FIELDS), image, decode, decoded, playFrame: s.isPlaying && !ended ? pcmRingPlayFrame(s.id) ?? 0 : 0, ended };
 }
 
 function restoreSample(ctx: MSSContext, st: MssSampleState, mem: Uint8Array): MSSSample {
@@ -238,7 +241,7 @@ function restoreSample(ctx: MSSContext, st: MssSampleState, mem: Uint8Array): MS
         s.decodedData = again.decoded;
     }
     if (s.isPlaying) s.startTime = elapsedStart(s);
-    if (s.isPlaying || s.isStopped) restorePcmRing(ctx, s, st.playFrame, s.isPlaying);
+    if (s.isPlaying || s.isStopped) restorePcmRing(ctx, s, st.playFrame, s.isPlaying && !st.ended);
     return s;
 }
 
@@ -256,7 +259,11 @@ function captureStream(ctx: MSSContext, s: MSSStream): MssStreamState {
         throw new Error(`mss32: stream ${streamName(s)} was read whole through the title's own file callbacks, which is not part of a v1 savestate`);
     }
     const fields = pickDefined(s, MSS_STREAM_FIELDS);
-    if (!src) return { fields, loaded: !!s.fileData, source: null, playFrame: s.isPlaying && !s.isPaused ? pcmRingPlayFrame(s.id) ?? 0 : 0 };
+    if (!src) {
+        const running = s.isPlaying && !s.isPaused;
+        const ended = running && pcmRingEnded(s.id);
+        return { fields, loaded: !!s.fileData, source: null, playFrame: running && !ended ? pcmRingPlayFrame(s.id) ?? 0 : 0, ended };
+    }
 
     const source = pickDefined(src, MSS_STREAM_SOURCE_FIELDS);
     if (hasStreamingRing(s) && s.isPlaying) {
@@ -270,7 +277,7 @@ function captureStream(ctx: MSSContext, s: MSSStream): MssStreamState {
             if (Math.floor(src.framesDecoded / src.totalFrames) > Math.floor(played / src.totalFrames)) source.endReported = true;
         }
     }
-    return { fields, loaded: false, source, playFrame: 0 };
+    return { fields, loaded: false, source, playFrame: 0, ended: false };
 }
 
 async function openStreamFile(s: MSSStream): Promise<VfsFileHandle> {
@@ -307,7 +314,7 @@ async function restoreStream(ctx: MSSContext, st: MssStreamState): Promise<MSSSt
         s.pendingStart = false;
         if (!decodeStreamFile(ctx, s)) throw new Error(`mss32: stream file "${s.filename}" no longer decodes`);
         Object.assign(s, st.fields);
-        if (s.isPlaying) restorePcmRing(ctx, s, st.playFrame, !s.isPaused);
+        if (s.isPlaying) restorePcmRing(ctx, s, st.playFrame, !s.isPaused && !st.ended);
     }
     if (s.isPlaying) s.startTime = elapsedStart(s);
     return s;

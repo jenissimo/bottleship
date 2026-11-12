@@ -596,6 +596,11 @@ export function pcmRingPlayFrame(id: number): number | null {
     return Math.floor(getCtrl(entry.sab, CTRL_PLAY_CURSOR) / Math.max(1, getCtrl(entry.sab, CTRL_BLOCK_ALIGN)));
 }
 
+export function pcmRingEnded(id: number): boolean {
+    const entry = ringBuffers.get(id);
+    return !!entry && !entry.streaming && getCtrl(entry.sab, CTRL_STATE) === STATE_STOPPED;
+}
+
 export function restorePcmRing(ctx: MSSContext, voice: MSSSample | MSSStream, frame: number, playing: boolean): boolean {
     const data = voice.decodedData;
     if (!data || data.length === 0) return false;

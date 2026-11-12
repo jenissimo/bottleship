@@ -314,6 +314,26 @@ describe("mss32 participant", () => {
         expect(rings.has(2)).toBe(false);
     });
 
+    test("a one-shot voice the worklet already finished is restored stopped and still playing, so the heartbeat ends it once", async () => {
+        const ctx = populated();
+        const voice = ctx.samplesById.get(1)!;
+        playSample(ctx, voice);
+        setCtrl(rings.get(1)!, CTRL_STATE, STATE_STOPPED);
+        setCtrl(rings.get(1)!, CTRL_PLAY_CURSOR, 0);
+        const state = captureMssSavestate(ctx);
+        const saved = state.samples.find(s => s.fields.id === 1)!;
+        expect(saved.ended).toBe(true);
+        expect(saved.playFrame).toBe(0);
+        expect(saved.fields.isPlaying).toBe(true);
+
+        const fresh = context(ctx.memory);
+        await restoreMssSavestate(fresh, throughCodec(state));
+        expect(getCtrl(rings.get(1)!, CTRL_STATE)).toBe(STATE_STOPPED);
+        expect(getCtrl(rings.get(1)!, CTRL_PLAY_CURSOR)).toBe(0);
+        expect(fresh.samplesById.get(1)!.isPlaying).toBe(true);
+        expect(captureMssSavestate(fresh).samples.find(s => s.fields.id === 1)!.ended).toBe(true);
+    });
+
     test("an incremental stream reopens its file and continues from the position that was audible", async () => {
         const ctx = context();
         const { s, src } = incremental(ctx, 0x10001, { loopCount: 0 });
@@ -455,7 +475,7 @@ describe("mss32 participant", () => {
             const p = savestateParticipants.all().find(x => x.id === "mss32")!;
             expect(p.covers).toEqual(["mss32"]);
             expect(savestateParticipants.coveredModules().has("mss32")).toBe(true);
-            expect(savestateParticipants.schemas().mss32).toEqual({ version: 1, schemaHash: "e643628eadcb8cf6" });
+            expect(savestateParticipants.schemas().mss32).toEqual({ version: 1, schemaHash: "567f198e080fc09e" });
             ctx.insideAilServe = true;
             expect(() => p.capture({} as never)).toThrow(CaptureRefusal);
         } finally {
