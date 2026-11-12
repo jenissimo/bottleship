@@ -37,6 +37,7 @@ export interface UserImageRecord {
     dibPalette?: unknown;
     dibBitsPtr?: number;
     shared?: boolean;
+    rectScratch?: Uint8ClampedArray;
 }
 
 export const USER_IMAGE_FIELDS = {
@@ -44,6 +45,7 @@ export const USER_IMAGE_FIELDS = {
     yHotspot: 'save', systemCursorId: 'save', isTopDown: 'save', bitCount: 'save', dibStride: 'save', dibTopDown: 'save',
     dibBits: 'save', palette: 'save', compatibleBitmap: 'save', compatibleEmpty: 'save', bitsPtr: 'save', bitsSize: 'save',
     bmBpp: 'save', dibBpp: 'save', dibMasks: 'save', dibPalette: 'save', dibBitsPtr: 'save', shared: 'save',
+    rectScratch: 'transient',
 } as const satisfies Record<keyof UserImageRecord, FieldPolicy>;
 
 // @transient(constant set)
@@ -61,7 +63,7 @@ export function captureUserImage(o: UserImageRecord): Record<string, SaveValue> 
     const out: Record<string, SaveValue> = {};
     for (const [key, value] of Object.entries(o)) {
         if (!(key in USER_IMAGE_FIELDS)) throw new CaptureRefusal(`gdi32: ${o.type.toLowerCase()} field ${key} has no savestate policy`);
-        if (value === undefined) continue;
+        if (value === undefined || USER_IMAGE_FIELDS[key as keyof UserImageRecord] !== 'save') continue;
         out[key] = value instanceof Uint8ClampedArray
             ? { $clamped: new Uint8Array(value) } as unknown as SaveValue
             : ArrayBuffer.isView(value) ? (value as Uint8Array).slice() : structuredClone(value) as SaveValue;
@@ -140,7 +142,7 @@ export function registerGdi32Participants(): void {
         restore: (d: Record<string, SaveValue>) => restoreUserImage(d),
     });
     savestateParticipants.add({
-        id: 'gdi32', version: 1, order: 45, covers: ['gdi32'], schema: GDI32_SCHEMA as unknown as SaveValue,
+        id: 'gdi32', version: 2, order: 45, covers: ['gdi32'], schema: GDI32_SCHEMA as unknown as SaveValue,
         capture: () => {
             try {
                 return captureGdi32State() as unknown as SaveValue;

@@ -12,6 +12,7 @@ import { Mem } from '../../src/worker/core/memory/mem-accessor';
 import { GDIContext } from '../../src/worker/modules/gdi32/context';
 import { bitBlt } from '../../src/worker/modules/gdi32/gdi-blit';
 import { SystemResourceProvider } from '../../src/worker/core/resources/system-resource-provider';
+import { captureUserImage, restoreUserImage, type UserImageRecord } from '../../src/worker/modules/gdi32/savestate';
 
 const system = System.getInstance();
 const saved = { gdi: system.gdiContext, process: system.process };
@@ -185,6 +186,28 @@ describe('the frame path: select, blit, deselect', () => {
         guestWrite(4, 32, 2, 1, [9, 8, 7]);
         bitBlt(gdi, window, 0, 0, 4, 2, mem, 0, 0, SRCCOPY);
         expect(rgbaAt(window, 2, 1)).toEqual([9, 8, 7]);
+    });
+
+    test('a DIB section that was blitted is saved without its conversion buffer, and blits again after a restore', () => {
+        const W = 4, H = 2;
+        const bmp = dibSection(W, H, 32);
+        const mem = memoryDc(W, H), window = memoryDc(W, H);
+        gdi.selectObject(mem, bmp);
+        guestWrite(W, 32, 1, 1, [5, 6, 7]);
+        bitBlt(gdi, window, 0, 0, W, H, mem, 0, 0, SRCCOPY);
+        const provider = SystemResourceProvider.getInstance();
+        const obj = provider.getUserObject(bmp) as UserImageRecord;
+        expect(obj.rectScratch).toBeInstanceOf(Uint8ClampedArray);
+        const saved = captureUserImage(obj);
+        expect(Object.keys(saved)).not.toContain('rectScratch');
+        const back = restoreUserImage(structuredClone(saved));
+        expect(back.rectScratch).toBeUndefined();
+        for (const key of Object.keys(obj) as Array<keyof UserImageRecord>) delete obj[key];
+        Object.assign(obj, back);
+        guestWrite(W, 32, 2, 0, [1, 2, 3]);
+        bitBlt(gdi, window, 0, 0, W, H, mem, 0, 0, SRCCOPY);
+        expect(rgbaAt(window, 2, 0)).toEqual([1, 2, 3]);
+        expect(rgbaAt(window, 1, 1)).toEqual([5, 6, 7]);
     });
 
     test('1000 frames: nothing accumulates and the conversion buffer is reused', () => {
