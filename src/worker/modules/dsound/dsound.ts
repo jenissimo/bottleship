@@ -2213,7 +2213,11 @@ export class DSound implements IModule {
             const buffer = this.getBuffer(args[0]);
             if (!buffer) return DSERR_INVALIDPARAM;
             if (!(buffer.flags & DSBCAPS_CTRLFREQUENCY)) return DSERR_CONTROLUNAVAIL;
-            const freq = Math.max(1, args[1] | 0);
+            // DSBFREQUENCY_ORIGINAL (0) is the rate of the buffer's own format; anything
+            // else outside DSBFREQUENCY_MIN..MAX is refused and leaves the rate alone.
+            const requested = args[1] >>> 0;
+            if (requested !== 0 && (requested < DSBFREQUENCY_MIN || requested > DSBFREQUENCY_MAX)) return DSERR_INVALIDPARAM;
+            const freq = requested === 0 ? buffer.format.sampleRate : requested;
             const freqChanged = buffer.frequency !== freq;
             buffer.frequency = freq;
             buffer.playbackRate = freq / buffer.format.sampleRate;
