@@ -99,4 +99,19 @@ An operator can also grant common permissions to every admitted participant of a
 
 A valid invitation's gateway lists add to that room's common permissions. Native destination/port/protocol allowlists, source-IP listener ACLs, binding generations, ownership and quotas still apply. A permission does not create a route or listener absent from the server configuration. Listener permission should go only to intended hosts.
 
+## Offline leases and port-state budgets
+
+Both implementations accept the same top-level limits:
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `maxOfflineRooms` | 32 | Completely offline rooms retained for reconnect |
+| `maxOfflinePeersPerRoom` | 16 | Offline identities retained in each room |
+| `maxBindingsPerPeer` | 1024 | Distinct protocol/local-port slots per connection |
+| `maxBindingEntries` | 16384 | Distinct slots across all live connections |
+
+Reconnect ownership is a bounded cache, retained for at most `reconnectGraceMs`. Offline entries yield first when a new room or peer needs capacity; active peers and rooms are never evicted to make space. Set either offline quota to zero to disable that cache. Ownership is retained while its cache entry exists; public-room identities are not authenticated accounts.
+
+A port slot includes active generations and release tombstones across relay, multicast and native operations. Reusing a slot with a newer generation does not consume another credit. Tombstones stay until connection retirement, preserving rejection of delayed traffic. Exceeding either budget retires the creating connection and refunds all its credits. Global and per-peer limits bound retained state even when clients send release messages without ever opening a port.
+
 TLS terminates at the deployment's HTTPS/WSS proxy; keep the cleartext backend inaccessible from the internet. Origin lists are additional browser restrictions, not authentication. The relay does not validate game coordinates, damage or resources: authoritative gameplay validation belongs to the game server.

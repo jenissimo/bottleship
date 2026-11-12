@@ -20,6 +20,10 @@ pub struct Limits {
     pub max_frames_per_second: u32,
     pub max_bytes_per_second: usize,
     pub reconnect_grace_ms: u64,
+    pub max_offline_rooms: usize,
+    pub max_offline_peers_per_room: usize,
+    pub max_bindings_per_peer: usize,
+    pub max_binding_entries: usize,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -31,6 +35,10 @@ impl Default for Limits {
             max_frames_per_second: 2000,
             max_bytes_per_second: 4194304,
             reconnect_grace_ms: 60000,
+            max_offline_rooms: 32,
+            max_offline_peers_per_room: 16,
+            max_bindings_per_peer: 1024,
+            max_binding_entries: 16384,
         }
     }
 }
@@ -47,6 +55,10 @@ impl Limits {
             || self.max_frames_per_second == 0
             || self.max_bytes_per_second == 0
             || self.reconnect_grace_ms > 86400000
+            || self.max_offline_rooms > 65536
+            || self.max_offline_peers_per_room > 4096
+            || !(1..=65536).contains(&self.max_bindings_per_peer)
+            || !(1..=1048576).contains(&self.max_binding_entries)
         {
             return Err(err("Invalid LAN limit"));
         }

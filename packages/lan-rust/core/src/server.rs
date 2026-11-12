@@ -15,7 +15,7 @@ mod tcp_host;
 use host::HostState;
 use tcp_host::TcpHostState;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreError(pub String);
 impl std::fmt::Display for CoreError {
@@ -233,6 +233,7 @@ struct Participant {
     join: JoinRequest,
     gateway: GatewayPermissions,
     access_expires_at: u64,
+    port_slots: HashSet<(u8,u16)>,
     bindings: BindingRegistry,
     multicast_bindings: BindingRegistry,
     window_start: u64,
@@ -254,6 +255,7 @@ pub struct Core {
     next_operation: u64,
     access: AccessPolicy,
     epoch_unix_ms: u64,
+    binding_entries: usize,
 }
 fn emit(to: ConnId, event: ServerEvent, reliable: bool, source: Option<ConnId>) -> Effect {
     let retained_bytes = event.retained_bytes();
@@ -293,6 +295,7 @@ impl Core {
             next_operation: 0,
             access,
             epoch_unix_ms,
+            binding_entries: 0,
         })
     }
     /// Authenticated identity for trusted gateway construction; unknown/retired
@@ -332,15 +335,15 @@ impl Core {
                 self.disconnect(old, now_ms, "Connection replaced", &mut effects);
             }
         } else {
-            if !self.rooms.contains_key(&join.room) && self.rooms.len() >= self.limits.max_rooms {
-                return Err(CoreError("LAN room limit reached".into()));
+            if !self.rooms.contains_key(&join.room) {
+                while self.rooms.len() >= self.limits.max_rooms {
+                    if !self.evict_offline_room() { return Err(CoreError("LAN room limit reached".into())); }
+                }
             }
-            if self
-                .rooms
-                .get(&join.room)
-                .is_some_and(|r| r.len() >= self.limits.max_peers_per_room)
-            {
-                return Err(CoreError("LAN room is full".into()));
+            if let Some(room) = self.rooms.get_mut(&join.room) {
+                while room.len() >= self.limits.max_peers_per_room {
+                    if !Self::evict_offline_peer(room) { return Err(CoreError("LAN room is full".into())); }
+                }
             }
         }
         self.rooms.entry(join.room.clone()).or_default().insert(
@@ -387,6 +390,7 @@ impl Core {
             Participant {
                 join,
                 gateway: admission.gateway,
+                port_slots: HashSet::new(),
                 access_expires_at: admission.expires_at.map(|s|s.saturating_mul(1000).saturating_sub(self.epoch_unix_ms)).unwrap_or(u64::MAX),
                 bindings: BindingRegistry::default(),
                 multicast_bindings: BindingRegistry::default(),
@@ -487,6 +491,27 @@ impl Core {
         }
         effects
     }
+    pub fn binding_entry_count(&self) -> usize { self.binding_entries }
+    fn reserve_port_state(&mut self, connection: ConnId, event: &InboundEvent, now_ms:u64, effects:&mut Vec<Effect>) -> bool {
+        let key=match event {
+            InboundEvent::Frame {datagram,generation:Some(_)} if wire::external_node(&datagram.node) || datagram.proto==1 => Some((datagram.proto,datagram.src_port)),
+            InboundEvent::Multicast4 {datagram,generation:Some(_)} => Some((1,datagram.datagram.src_port)),
+            InboundEvent::ReleasePort {proto,port,..} => Some((*proto,*port)),
+            InboundEvent::LeaseUdpPeer {request,..} => Some((request.proto,request.local_port)),
+            InboundEvent::OpenUdpHost {request,..} => Some((request.proto,request.local_port)),
+            InboundEvent::OpenTcpHost {request,..} => Some((request.proto,request.local_port)),
+            _ => None,
+        };
+        let Some((proto,port))=key.filter(|(proto,port)|*proto<=7 && *port!=0) else {return true;};
+        let p=&self.participants[&connection];
+        if p.port_slots.contains(&(proto,port)) {return true;}
+        if p.port_slots.len()>=self.limits.max_bindings_per_peer || self.binding_entries>=self.limits.max_binding_entries {
+            self.disconnect(connection,now_ms,"LAN binding state limit exceeded",effects);return false;
+        }
+        self.participants.get_mut(&connection).unwrap().port_slots.insert((proto,port));
+        self.binding_entries+=1;
+        true
+    }
     fn authorized_target(&self, connection: ConnId, datagram: &Datagram) -> Result<Target, ResolveError> {
         let target = self.routes.target(datagram)?;
         if !self.participants[&connection].gateway.routes.contains(&self.routes.route_id(target.route_id)) {
@@ -544,6 +569,7 @@ impl Core {
         now_ms: u64,
         effects: &mut Vec<Effect>,
     ) {
+        if !self.reserve_port_state(connection, &event, now_ms, effects) { return; }
         match event {
             InboundEvent::Multicast4 {
                 datagram,
@@ -1232,6 +1258,7 @@ impl Core {
         let Some(p) = self.participants.remove(&connection) else {
             return;
         };
+        self.binding_entries -= p.port_slots.len();
         for pending in p.resolving.values() {
             effects.push(Effect::CancelResolve {
                 connection,
@@ -1277,11 +1304,26 @@ impl Core {
                 ));
             }
         }
+        self.prune(now_ms);
+    }
+    fn evict_offline_peer(room: &mut HashMap<Node, Peer>) -> bool {
+        let oldest=room.iter().filter(|(_,p)|p.connection.is_none()).min_by_key(|(n,p)|(p.expires_at,**n)).map(|(n,_)|*n);
+        oldest.is_some_and(|node|room.remove(&node).is_some())
+    }
+    fn evict_offline_room(&mut self) -> bool {
+        let oldest=self.rooms.iter().filter(|(_,r)|r.values().all(|p|p.connection.is_none()))
+            .min_by_key(|(name,r)|(r.values().map(|p|p.expires_at).max().unwrap_or(0),(*name).clone())).map(|(name,_)|name.clone());
+        oldest.is_some_and(|name|self.rooms.remove(&name).is_some())
     }
     fn prune(&mut self, now_ms: u64) {
+        let offline_limit=self.limits.max_offline_peers_per_room.min(self.limits.max_peers_per_room);
         self.rooms.retain(|_, room| {
             room.retain(|_, peer| peer.connection.is_some() || peer.expires_at > now_ms);
+            while room.values().filter(|p|p.connection.is_none()).count()>offline_limit { Self::evict_offline_peer(room); }
             !room.is_empty()
         });
+        while self.rooms.values().filter(|r|r.values().all(|p|p.connection.is_none())).count()>self.limits.max_offline_rooms {
+            self.evict_offline_room();
+        }
     }
 }
