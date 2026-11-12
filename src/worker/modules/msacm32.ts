@@ -161,7 +161,7 @@ const MS_ADAPT_TABLE = [
 /** The seven standard predictor coefficient pairs; a stream may carry its own. */
 const MS_ADAPT_COEF1 = [256, 512, 0, 192, 240, 460, 392];
 const MS_ADAPT_COEF2 = [0, -256, 0, 64, 0, -208, -232];
-const MS_STANDARD_COEFS = (() => {
+export const MS_STANDARD_COEFS = (() => {
     const c = new Int16Array(MS_ADAPT_COEF1.length * 2);
     for (let i = 0; i < MS_ADAPT_COEF1.length; i++) {
         c[i * 2] = MS_ADAPT_COEF1[i]!;
@@ -223,7 +223,7 @@ function adpcmSamplesPerBlock(f: WaveFormat): number {
  * Returns the samples-per-channel written, or 0 if the block is malformed —
  * a short or corrupt block must not be reported as decoded silence.
  */
-function decodeMsAdpcmBlock(
+export function decodeMsAdpcmBlock(
     src: Uint8Array, at: number, blockSize: number, channels: number,
     coefs: Int16Array, samplesPerBlock: number, out: Int16Array, outAt: number,
 ): number {
