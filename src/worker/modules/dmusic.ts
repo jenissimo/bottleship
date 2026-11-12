@@ -50,7 +50,7 @@ import {
     CLSID_DirectMusicComposer, CLSID_DirectMusicLoader, CLSID_DirectMusicPerformance, CLSID_DirectMusicSegment,
     CLSID_DirectMusicStyle, CLSID_DirectMusicSynth, CollectionObject, ComposerObject, DirectMusicObject, DMusicObject,
     IID_IDirectMusicCollection, IID_IDirectMusicGetLoader, IID_IDirectMusicStyle, IID_IUnknown, LoadableObject,
-    LoaderObject, type ObjectSource, PerformanceObject, PortObject, SegmentObject, SegmentStateObject, StyleObject, TrackObject,
+    LoaderObject, type MadeSource, type ObjectSource, PerformanceObject, PortObject, SegmentObject, SegmentStateObject, StyleObject, TrackObject,
 } from "./dmusic-objects";
 import { createSinkBuffer, DirectSoundSink, sinkBufferBytes, soundReference, writeWaveFormat } from "./dmusic-sink";
 import { registerDMusicParticipant } from "./dmusic-savestate";
@@ -134,6 +134,8 @@ const SYNTH_PUMP_MS = 10;
 const DEFAULT_COLLECTION_PATHS = ["C:\\WINDOWS\\SYSTEM32\\DRIVERS\\GM.DLS", "C:\\WINDOWS\\SYSTEM\\GM.DLS"];
 /** The most a loadable object reads from its stream. */
 const MAX_OBJECT_BYTES = 64 * 1024 * 1024;
+
+const FIXED_STYLE = -2;
 
 type FoundReference = (ref: ObjectReference) => DMusicObject | null;
 
@@ -609,6 +611,62 @@ export class DMusic implements IModule {
         return E_NOTIMPL;
     }
 
+    private buildMade(origin: DMusicObject | null, made: MadeSource, into?: LoadableObject): LoadableObject | null {
+        if (made.made === "band-segment") {
+            if (!(origin instanceof BandObject) || !origin.band) return null;
+            return this.wrapSegment(PerfSegment.band(origin.band), origin.identity.name, into);
+        }
+        if (made.made === "transition") {
+            const from = origin instanceof SegmentObject ? origin.segment : null;
+            const style = made.style === FIXED_STYLE ? from?.fixedPattern?.style : from?.styles[made.style]?.style;
+            return style ? this.wrapSegment(PerfSegment.transition(style, made.tempo, made.command, made.grooveLevel), "Transition", into) : null;
+        }
+        if (!(origin instanceof StyleObject) || !origin.style) return null;
+        if (made.made === "style-band") {
+            const loaded = origin.bands[made.index];
+            if (!loaded || (into && !(into instanceof BandObject))) return null;
+            const band = into ?? new BandObject();
+            band.band = loaded;
+            band.file = loaded.band;
+            band.identity = { ...loaded.band.identity };
+            band.loaded = true;
+            return band;
+        }
+        const motif = origin.style.motifs[made.index];
+        if (!motif) return null;
+        const segment = PerfSegment.motif(origin.style, motif);
+        // A motif with a band of its own installs it as it starts.
+        if (motif.band) {
+            const pool = origin.bands.flatMap((b) => b.band.instruments.map((inst, i) => ({ inst, collection: b.collections[i] ?? null })));
+            segment.bands = [{ time: 0, band: loadBand(motif.band, (ref) =>
+                pool.find((p) => p.inst.collection?.fileName === ref.fileName && p.collection)?.collection ?? null) }];
+        }
+        return this.wrapSegment(segment, motif.name, into);
+    }
+
+    private madeBy<T extends LoadableObject>(obj: T, origin: LoadableObject, made: MadeSource): T {
+        origin.addRef();
+        obj.references.push(origin);
+        this.holdReferences(obj);
+        obj.resolved = [origin];
+        obj.source = { ...made, of: origin.source };
+        return obj;
+    }
+
+    private makeFrom(origin: LoadableObject, made: MadeSource): LoadableObject | null {
+        const obj = this.buildMade(origin, made);
+        return obj && this.madeBy(obj, origin, made);
+    }
+
+    private rebuildMade(obj: LoadableObject, origin: DMusicObject | null, made: MadeSource): boolean {
+        if (!(origin instanceof LoadableObject) || !this.buildMade(origin, made, obj)) return false;
+        obj.references.push(origin);
+        this.holdReferences(obj);
+        obj.resolved = [origin];
+        obj.source = { ...made, of: origin.source };
+        return true;
+    }
+
     private rebuildContents(obj: LoadableObject, source: ObjectSource, bytes: Uint8Array, resolved: Array<DMusicObject | null>): boolean {
         if (obj instanceof SegmentObject && isRiffWave(bytes)) {
             return !!this.waveSegment(bytes, "file" in source ? null : waveKey(bytes), obj.fileName, obj);
@@ -724,6 +782,7 @@ export class DMusic implements IModule {
             wireLoader: (loader) => this.wireLoader(loader),
             readFile: (path) => this.readSystemFile([path]),
             rebuildContents: (obj, source, bytes, resolved) => this.rebuildContents(obj, source, bytes, resolved),
+            rebuildMade: (obj, origin, made) => this.rebuildMade(obj, origin, made),
         });
     }
 
@@ -1472,8 +1531,9 @@ export class DMusic implements IModule {
     // ── segments ────────────────────────────────────────────────────────────────
 
     /** A segment object around an engine segment the HLE made itself (a motif, a band, a transition). */
-    private wrapSegment(segment: PerfSegment, name: string): SegmentObject {
-        const obj = new SegmentObject();
+    private wrapSegment(segment: PerfSegment, name: string, into?: LoadableObject): SegmentObject | null {
+        if (into && !(into instanceof SegmentObject)) return null;
+        const obj = into ?? new SegmentObject();
         obj.segment = segment;
         obj.identity.name = name;
         obj.loaded = true;
@@ -1640,13 +1700,9 @@ export class DMusic implements IModule {
     private registerStyleExports(): void {
         const e = this.exports;
         const styleOf = (a: number[]): StyleObject | null => this.object<StyleObject>(a[0]!);
-        const bandObject = (owner: StyleObject, index: number): BandObject => {
-            const band = new BandObject();
-            band.band = owner.bands[index]!;
-            band.file = band.band.band;
-            band.identity = { ...band.file.identity };
-            band.loaded = true;
-            return band;
+        const made = (owner: StyleObject, source: MadeSource, ppOut: number): number => {
+            const obj = this.makeFrom(owner, source);
+            return obj ? this.publish(obj, ppOut) : E_FAIL;
         };
         // HRESULT GetMotif(WCHAR *pwszName, IDirectMusicSegment **ppSegment)
         e["IDirectMusicStyle8_GetMotif"] = (_c, _m, a) => {
@@ -1655,19 +1711,11 @@ export class DMusic implements IModule {
             if (!obj?.style || !ppSegment) return E_POINTER;
             const name = readWide(a[1]! >>> 0, DESC_NAME_CHARS).toLowerCase();
             const index = obj.style.motifs.findIndex((m) => m.name.toLowerCase() === name);
-            const motif = obj.style.motifs[index];
-            if (!motif) {
+            if (index < 0) {
                 Mem.writeUint32(ppSegment, 0);
                 return S_FALSE;
             }
-            const segment = PerfSegment.motif(obj.style, motif);
-            // A motif with a band of its own installs it as it starts.
-            if (motif.band) {
-                const pool = obj.bands.flatMap((b) => b.band.instruments.map((inst, i) => ({ inst, collection: b.collections[i] ?? null })));
-                segment.bands = [{ time: 0, band: loadBand(motif.band, (ref) =>
-                    pool.find((p) => p.inst.collection?.fileName === ref.fileName && p.collection)?.collection ?? null) }];
-            }
-            return this.publish(this.wrapSegment(segment, motif.name), ppSegment);
+            return made(obj, { made: "motif", index }, ppSegment);
         };
         e["IDirectMusicStyle8_EnumMotif"] = (_c, _m, a) => {
             const motif = styleOf(a)?.style?.motifs[a[1]! >>> 0];
@@ -1685,7 +1733,7 @@ export class DMusic implements IModule {
                 Mem.writeUint32(ppBand, 0);
                 return S_FALSE;
             }
-            return this.publish(bandObject(obj, index), ppBand);
+            return made(obj, { made: "style-band", index }, ppBand);
         };
         e["IDirectMusicStyle8_EnumBand"] = (_c, _m, a) => {
             const band = styleOf(a)?.style?.bands[a[1]! >>> 0];
@@ -1700,7 +1748,7 @@ export class DMusic implements IModule {
                 Mem.writeUint32(a[1] >>> 0, 0);
                 return S_FALSE;
             }
-            return this.publish(bandObject(obj, 0), a[1] >>> 0);
+            return made(obj, { made: "style-band", index: 0 }, a[1] >>> 0);
         };
         // HRESULT GetTimeSignature(DMUS_TIMESIGNATURE *pTimeSig): mtTime, then the three fields.
         e["IDirectMusicStyle8_GetTimeSignature"] = (_c, _m, a) => {
@@ -1748,7 +1796,8 @@ export class DMusic implements IModule {
         e["IDirectMusicBand_CreateSegment"] = (_c, _m, a) => {
             const obj = this.object<BandObject>(a[0]!);
             if (!obj?.band || !a[1]) return E_POINTER;
-            return this.publish(this.wrapSegment(PerfSegment.band(obj.band), obj.identity.name), a[1] >>> 0);
+            const segment = this.makeFrom(obj, { made: "band-segment" });
+            return segment ? this.publish(segment, a[1] >>> 0) : E_FAIL;
         };
         // A band's instruments are resolved when it loads; the port needs nothing sent to it.
         e["IDirectMusicBand_Download"] = (_c, _m, a) => this.object<BandObject>(a[0]!)?.band ? S_OK : DMUS_E_NOT_INIT;
@@ -1815,13 +1864,27 @@ export class DMusic implements IModule {
             if (!perf.engine) return DMUS_E_NOT_INIT;
             const to = a[2] ? this.object<SegmentObject>(a[2]) : null;
             if (a[2] && !to?.segment) return E_INVALIDARG;
+            const fromState = perf.engine.primaryState();
+            const from = fromState ? perf.stateObjects.get(fromState)?.segment ?? null : null;
             const result = perf.engine.autoTransition(to?.segment ?? null, a[3]! & 0xffff, a[4]! >>> 0);
-            if (result.transition) {
-                // The transition segment is a COM object only for a caller that takes it.
-                const transition = ppTransSeg ? this.wrapSegment(result.transition, "Transition") : null;
-                if (transition) this.publish(transition, ppTransSeg);
+            if (result.transition && result.transitionState) {
+                const transition = this.wrapSegment(result.transition, "Transition")!;
+                const style = result.transition.styles[0]!.style;
+                const index = from?.segment?.fixedPattern?.style === style ? FIXED_STYLE
+                    : from?.segment?.styles.findIndex((item) => item.style === style) ?? -1;
+                if (from && from.segment === fromState?.segment && index !== -1) {
+                    const command = result.transition.commands![0]!;
+                    this.madeBy(transition, from, {
+                        made: "transition", style: index, tempo: result.transition.tempos[0]!.tempo, command: command.command,
+                        grooveLevel: command.grooveLevel,
+                    });
+                }
+                this.holdStateSegment(this.stateObject(perf, result.transitionState), transition);
+                if (ppTransSeg) this.publish(transition, ppTransSeg);
+                else transition.release();
                 this.publishState(perf, result.transitionState, transition, ppTransState);
             }
+            if (result.toState && to) this.holdStateSegment(this.stateObject(perf, result.toState), to);
             this.publishState(perf, result.toState, to, ppToState);
             return S_OK;
         };

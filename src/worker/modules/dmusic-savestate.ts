@@ -6,8 +6,8 @@ import { savestateParticipants, stateKeys, type FieldPolicy } from "../savestate
 import { sha256HexSync } from "../savestate/sha256";
 import type { SaveValue } from "../savestate/value-codec";
 import {
-    AudioPathObject, BandObject, CollectionObject, ComposerObject, DirectMusicObject, type DMusicObject, type LoadableObject, LoaderObject,
-    type ObjectSource, PerformanceObject, PortObject, SegmentObject, SegmentStateObject, StyleObject, TrackObject,
+    AudioPathObject, BandObject, CollectionObject, ComposerObject, DirectMusicObject, type DMusicObject, LoadableObject, LoaderObject,
+    type MadeSource, type ObjectSource, PerformanceObject, PortObject, SegmentObject, SegmentStateObject, StyleObject, TrackObject,
 } from "./dmusic-objects";
 
 export const GUID_DEFAULT_GM_COLLECTION = "f17e8673-c3b4-11d1-870b-00600893b1bd";
@@ -39,7 +39,7 @@ export const DEFAULT_COLLECTION_FIELDS = {
     fileName: 'derive', loaded: 'derive', references: 'transient', source: 'transient', resolved: 'transient', collection: 'derive',
 } as const satisfies Record<string, FieldPolicy>;
 
-export type SavedSource = { blob: string } | { file: string; length: number; hash: string };
+export type SavedSource = { blob: string } | { file: string; length: number; hash: string } | MadeSource;
 export interface SavedLoadable extends SavedDMusicBase {
     fileName: string;
     identity: ObjectIdentity;
@@ -102,6 +102,10 @@ export const DMUSIC_SCHEMA = {
     identity: stateKeys<ObjectIdentity>({ objectId: true, name: true, versionMS: true, versionLS: true, hasVersion: true }),
     sourceBlob: ['blob'],
     sourceFile: ['file', 'length', 'hash'],
+    sourceMade: {
+        'motif': ['made', 'index'], 'band-segment': ['made'], 'style-band': ['made', 'index'],
+        'transition': ['made', 'style', 'tempo', 'command', 'grooveLevel'],
+    },
     resolvedRow: 'object or -1, styles first, then collections, in file order',
     savedSegment: stateKeys<Omit<SavedSegment, keyof SavedLoadable>>({ settings: true, commandEdits: true, tracks: true }),
     segmentSettings: [...SEGMENT_SETTINGS],
@@ -117,6 +121,7 @@ export interface DMusicHost {
     wireLoader(loader: LoaderObject): LoaderObject;
     readFile(path: string): Uint8Array | null;
     rebuildContents(obj: LoadableObject, source: ObjectSource, bytes: Uint8Array, resolved: Array<DMusicObject | null>): boolean;
+    rebuildMade(obj: LoadableObject, origin: DMusicObject | null, made: MadeSource): boolean;
 }
 
 const base = (o: DMusicObject): SavedDMusicBase => ({ base: BaseComObject.captureComBase(o), addresses: [...o.addresses] });
@@ -144,7 +149,9 @@ const LOADABLE: Array<[string, new () => LoadableObject, string, (o: never) => u
     ['segment', SegmentObject, 'a DirectMusic segment', (o: SegmentObject) => o.segment ?? o.file],
 ];
 
-function sourceBytes(host: DMusicHost, source: ObjectSource, what: string): Uint8Array {
+type ReadSource = Exclude<ObjectSource, { made: string }>;
+
+function sourceBytes(host: DMusicHost, source: ReadSource, what: string): Uint8Array {
     if (!('file' in source)) return source.bytes;
     const bytes = host.readFile(source.file);
     if (!bytes) throw new Error(`dmusic: ${source.file} is missing; ${what} was loaded from it`);
@@ -229,9 +236,19 @@ export function registerDMusicCodecs(host: DMusicHost): void {
                 if (!o.source && (content as (o: LoadableObject) => unknown)(o)) {
                     throw new CaptureRefusal(`dmusic: ${what} whose load failed is not part of a savestate`);
                 }
+                let source: SavedSource | null = null;
+                if (o.source && 'made' in o.source) {
+                    const { of, ...made } = o.source;
+                    const origin = o.resolved[0];
+                    if (!(origin instanceof LoadableObject) || origin.source !== of) {
+                        throw new CaptureRefusal(`dmusic: ${what} made from an object that was loaded again since is not part of a savestate`);
+                    }
+                    source = made;
+                } else if (o.source) {
+                    source = 'file' in o.source ? { ...o.source } : { blob: blob(o.source.bytes) };
+                }
                 const saved: SavedLoadable = {
-                    ...base(o), fileName: o.fileName, identity: { ...o.identity },
-                    source: !o.source ? null : 'file' in o.source ? { ...o.source } : { blob: blob(o.source.bytes) },
+                    ...base(o), fileName: o.fileName, identity: { ...o.identity }, source,
                     resolved: o.resolved.map((target, i) => target ? ref(target, `reference ${i}`) : -1),
                 };
                 if (!(o instanceof SegmentObject)) return saved;
@@ -249,8 +266,11 @@ export function registerDMusicCodecs(host: DMusicHost): void {
                 return o;
             },
             link: (o, d: SavedLoadable | SavedSegment, ctx) => {
-                if (d.source) {
-                    const source: ObjectSource = 'file' in d.source ? { ...d.source } : { bytes: ctx.blob(d.source.blob) };
+                if (d.source && 'made' in d.source) {
+                    const origin = d.resolved[0] === undefined || d.resolved[0] < 0 ? null : ctx.object(d.resolved[0]) as DMusicObject;
+                    if (!host.rebuildMade(o, origin, d.source)) throw new Error(`dmusic: ${what} can no longer be made from its origin (${d.source.made})`);
+                } else if (d.source) {
+                    const source: ReadSource = 'file' in d.source ? { ...d.source } : { bytes: ctx.blob(d.source.blob) };
                     const from = 'file' in d.source ? d.source.file : `blob ${d.source.blob}`;
                     const resolved = d.resolved.map(r => r < 0 ? null : ctx.object(r) as DMusicObject);
                     if (!host.rebuildContents(o, source, sourceBytes(host, source, what), resolved)) {
@@ -297,7 +317,7 @@ export function registerDMusicCodecs(host: DMusicHost): void {
 export function registerDMusicParticipant(host: DMusicHost): () => void {
     registerDMusicCodecs(host);
     return savestateParticipants.add({
-        id: 'dmusic', version: 4, order: 64, covers: ['dmusic'], schema: DMUSIC_SCHEMA as unknown as SaveValue,
+        id: 'dmusic', version: 5, order: 64, covers: ['dmusic'], schema: DMUSIC_SCHEMA as unknown as SaveValue,
         capture: () => {
             const refusal = host.idleRefusal();
             if (refusal) throw new CaptureRefusal(refusal);

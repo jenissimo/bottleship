@@ -523,29 +523,76 @@ describe("dmusic saved fields", () => {
         expect(Object.keys(saved).sort()).toEqual([...DMUSIC_SCHEMA.loadable, ...DMUSIC_SCHEMA.savedSegment].sort());
         expect(Object.keys(saved.identity).sort()).toEqual(DMUSIC_SCHEMA.identity);
         expect(Object.keys(saved.settings!)).toEqual([...DMUSIC_SCHEMA.segmentSettings]);
-        expect(savestateParticipants.schemas().dmusic).toEqual({ version: 4, schemaHash: "b710f6ad125502cf" });
+        expect(savestateParticipants.schemas().dmusic).toEqual({ version: 5, schemaHash: "59ed722a2a5efa9e" });
+    });
+});
+
+describe("dmusic objects made by another object", () => {
+    function made() {
+        const { kit, brass, race } = world();
+        const call = <T extends DMusicObject>(name: string, args: number[]): T => {
+            expect(module.exports[name]!({} as never, mem, args)).toBe(0);
+            return rp.getComObjectByAddress(Mem.readUint32(OUT)!) as T;
+        };
+        const bandSegment = call<SegmentObject>("IDirectMusicBand_CreateSegment", [ptrOf(brass), OUT]);
+        writeWide(PARAM_AT, "Sting");
+        const motif = call<SegmentObject>("IDirectMusicStyle8_GetMotif", [ptrOf(race), PARAM_AT, OUT]);
+        const styleBand = call<BandObject>("IDirectMusicStyle8_GetDefaultBand", [ptrOf(race), OUT]);
+        return { kit, brass, race, bandSegment, motif, styleBand };
+    }
+
+    test("a motif, a band segment and a style's band keep their origin and are made again from it", () => {
+        const { brass, race, bandSegment, motif, styleBand } = made();
+        expect(motif.source).toEqual({ made: "motif", index: 0, of: race.source });
+        expect(bandSegment.source).toEqual({ made: "band-segment", of: brass.source });
+        expect(styleBand.source).toEqual({ made: "style-band", index: 0, of: race.source });
+        expect(motif.references).toEqual([race]);
+        motif.segment!.repeats = 7;
+        const { first, again, back } = roundTrip([motif, bandSegment, styleBand, race, brass]);
+        expect(again).toBe(first);
+        const [motif2, bandSegment2, styleBand2, race2, brass2] = back;
+        for (const [b, l] of [[motif2, motif], [bandSegment2, bandSegment], [styleBand2, styleBand]] as const) {
+            sameCom(b, l);
+            expect(b.identity).toEqual(l.identity);
+            expect(b.loaded).toBe(true);
+        }
+        expect(motif2.segment).toEqual(motif.segment!);
+        expect(motif2.segment!.repeats).toBe(7);
+        expect(motif2.segment!.fixedPattern!.style).toBe(race2.style!);
+        expect(motif2.segment!.fixedPattern!.pattern).toBe(race2.style!.motifs[0]!);
+        expect(motif2.references[0]).toBe(race2);
+        expect(motif2.source).toEqual({ made: "motif", index: 0, of: race2.source });
+        expect((motif2.source as { of: unknown }).of).toBe(race2.source);
+        expect(bandSegment2.segment).toEqual(bandSegment.segment!);
+        expect(bandSegment2.segment!.bands[0]!.band).toBe(brass2.band!);
+        expect(bandSegment2.references[0]).toBe(brass2);
+        expect(styleBand2.band).toBe(race2.bands[0]!);
+        expect(styleBand2.file).toBe(race2.style!.bands[0]!);
+        expect(styleBand2.references[0]).toBe(race2);
+    });
+
+    test("the origin stays alive while what it made does, and is released with it", () => {
+        const { race, motif } = made();
+        const held = race.refCount;
+        motif.release();
+        expect(race.refCount).toBe(held - 1);
+    });
+
+    test("an origin loaded again since, a made object without one, and an origin that no longer has the part are named", () => {
+        const { kit, race, motif, styleBand } = made();
+        const { objects, blobs, refs } = capture([styleBand]);
+        const saved = objects[0]![1] as unknown as SavedLoadable;
+        (saved.source as { index: number }).index = 5;
+        expect(() => restore(objects, blobs, refs)).toThrow("dmusic: a DirectMusic band can no longer be made from its origin (style-band)");
+        expect(load(race, style(120), { "kit.dls": kit })).toBe(0);
+        expect(() => capture([motif])).toThrow(CaptureRefusal);
+        expect(() => capture([motif])).toThrow("dmusic: a DirectMusic segment made from an object that was loaded again since is not part of a savestate");
+        const bare = internals.wrapSegment(motif.segment, "Bare") as SegmentObject;
+        expect(() => capture([bare])).toThrow("dmusic: a DirectMusic segment that was not loaded from a stream, memory or a file is not part of a savestate");
     });
 });
 
 describe("dmusic objects still refused", () => {
-    test("objects another object made instead of a load are refused by name", () => {
-        const { brass, race } = world();
-        const call = (name: string, args: number[]): DMusicObject => {
-            expect(module.exports[name]!({} as never, mem, args)).toBe(0);
-            return rp.getComObjectByAddress(Mem.readUint32(OUT)!) as DMusicObject;
-        };
-        const bandSegment = call("IDirectMusicBand_CreateSegment", [ptrOf(brass), OUT]);
-        writeWide(PARAM_AT, "Sting");
-        const motif = call("IDirectMusicStyle8_GetMotif", [ptrOf(race), PARAM_AT, OUT]);
-        const styleBand = call("IDirectMusicStyle8_GetDefaultBand", [ptrOf(race), OUT]);
-        const composed = internals.wrapSegment(motif instanceof SegmentObject ? motif.segment : null, "Transition") as SegmentObject;
-        const notLoaded = "that was not loaded from a stream, memory or a file is not part of a savestate";
-        for (const [obj, what] of [[bandSegment, "segment"], [motif, "segment"], [composed, "segment"], [styleBand, "band"]] as const) {
-            expect(() => capture([obj])).toThrow(CaptureRefusal);
-            expect(() => capture([obj])).toThrow(`dmusic: a DirectMusic ${what} ${notLoaded}`);
-        }
-    });
-
     test("a performance, a port and a segment state are refused by name, and so is a segment loaded while savestates were off", () => {
         for (const [obj, what] of [[new PerformanceObject(), "performance"], [new PortObject(), "port"], [new SegmentStateObject(), "segment state"]] as const) {
             expect(() => capture([obj])).toThrow(CaptureRefusal);
