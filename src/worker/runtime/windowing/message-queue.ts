@@ -609,6 +609,7 @@ export class MessageQueue {
             // and will be delivered when the next discrete event flushes them,
             // or when the waiter's 16ms timeout fires.  Waking on every coalesce
             // caused ~125fps spin in games using GetMessage/WaitMessage loops.
+            this.noteMoveQueued(hwnd);
             this.lastMouseMove.set(hwnd, {
                 wParam,
                 lParam,
@@ -711,13 +712,27 @@ export class MessageQueue {
         };
     }
 
-    // The pending move each thread was last told about by takeNewMouseMove (its guest
-    // time and point). Not saved: after a load the worst case is one move reported twice.
-    private reportedMoves: Map<number, { time: number; ptX: number; ptY: number }> = new Map();
+    // Every coalesced move gets the next number; a thread remembers the highest number
+    // it was told about (takeNewMouseMove) or looked at (peek/dequeue with a filter that
+    // admits WM_MOUSEMOVE). Numbers, not the move's contents: a thread with pending moves
+    // on two of its windows must not be told about them alternately forever.
+    // Not saved: after a load the worst case is one move reported twice.
+    private moveSeq: Map<number, number> = new Map();
+    private nextMoveSeq = 1;
+    private seenMoveSeq: Map<number, number> = new Map();
+
+    private noteMoveQueued(hwnd: number): void {
+        this.moveSeq.set(hwnd, this.nextMoveSeq++);
+    }
+
+    private noteMovesSeen(callerThreadId: number): void {
+        const newest = this.nextMoveSeq - 1;
+        if (this.seenMoveSeq.get(callerThreadId) !== newest) this.seenMoveSeq.set(callerThreadId, newest);
+    }
 
     /**
-     * Is there a coalesced mouse move for `callerThreadId` that this thread has not been
-     * told about yet? Answers true once per pending move and thread.
+     * Is there a coalesced mouse move for `callerThreadId` that is newer than anything
+     * this thread has been told about or has looked at? Answers true once per new move.
      *
      * This is the "new input" MsgWaitForMultipleObjects waits for. A coalesced move
      * deliberately wakes nobody when it is queued, so a thread that pumps only when that
@@ -726,18 +741,16 @@ export class MessageQueue {
      */
     takeNewMouseMove(callerThreadId: number): boolean {
         if (this.lastMouseMove.size === 0) return false;
-        for (const pending of this.lastMouseMove.values()) {
+        const seen = this.seenMoveSeq.get(callerThreadId) ?? 0;
+        let newest = seen;
+        for (const [hwnd, pending] of this.lastMouseMove) {
             if (callerThreadId !== 0 && pending.targetThreadId !== 0 && pending.targetThreadId !== callerThreadId) continue;
-            const seen = this.reportedMoves.get(callerThreadId);
-            if (seen && seen.time === pending.time && seen.ptX === pending.ptX && seen.ptY === pending.ptY) continue;
-            if (seen) {
-                seen.time = pending.time; seen.ptX = pending.ptX; seen.ptY = pending.ptY;
-            } else {
-                this.reportedMoves.set(callerThreadId, { time: pending.time, ptX: pending.ptX, ptY: pending.ptY });
-            }
-            return true;
+            const seq = this.moveSeq.get(hwnd) ?? 0;
+            if (seq > newest) newest = seq;
         }
-        return false;
+        if (newest === seen) return false;
+        this.seenMoveSeq.set(callerThreadId, newest);
+        return true;
     }
 
     hasPendingMoveSetCursor(msgMin = 0, msgMax = 0, callerThreadId = 0): boolean {
@@ -769,6 +782,7 @@ export class MessageQueue {
         // 2. Pending mouse moves (coalesced) — filter by owning thread to prevent
         // other threads (e.g. Galaxy audio) from stealing mouse messages.
         if (this.lastMouseMove.size > 0 && (noFilter || (WM_MOUSEMOVE >= msgMin && WM_MOUSEMOVE <= msgMax))) {
+            this.noteMovesSeen(callerThreadId);
             for (const [hwnd, pending] of this.lastMouseMove) {
                 if (callerThreadId > 0 && pending.targetThreadId > 0
                     && pending.targetThreadId !== callerThreadId) {
@@ -856,6 +870,7 @@ export class MessageQueue {
             return queued;
         }
         if (this.lastMouseMove.size > 0 && (noFilter || (WM_MOUSEMOVE >= msgMin && WM_MOUSEMOVE <= msgMax))) {
+            this.noteMovesSeen(callerThreadId);
             for (const [hwnd, pending] of this.lastMouseMove) {
                 if (callerThreadId > 0 && pending.targetThreadId > 0
                     && pending.targetThreadId !== callerThreadId) {
@@ -1047,6 +1062,7 @@ export class MessageQueue {
      */
     removeWindow(hwnd: number): void {
         this.lastMouseMove.delete(hwnd);
+        this.moveSeq.delete(hwnd);
         this.moveSetCursor.delete(hwnd);
         this.paintPending.delete(hwnd);
         for (const [key, entry] of this.timerPending) {
@@ -1109,7 +1125,8 @@ export class MessageQueue {
             // drain
         }
         this.lastMouseMove.clear();
-        this.reportedMoves.clear();
+        this.moveSeq.clear();
+        this.seenMoveSeq.clear();
         this.moveSetCursor.clear();
         this.timerPending.clear();
         this.paintPending.clear();
