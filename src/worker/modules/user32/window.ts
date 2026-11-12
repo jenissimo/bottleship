@@ -10,7 +10,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
-import { getWindowClass, getWindowClassByName } from './class';
+import { getWindowClass, getWindowClassByName, getWindowClassId } from './class';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { hasPendingStartupShowWindow, takeStartupShowWindow } from '../../core/process-startup-info';
@@ -1051,6 +1051,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             System.getInstance().scheduler.setLastError(ERROR_CANNOT_FIND_WND_CLASS);
             return null;
         }
+
+        if (classId === undefined && typeof className === 'string') classId = getWindowClassId(className);
 
         if (!classInfo && typeof className === 'string') {
             // A named class we do not implement is a missing implementation, not an app
