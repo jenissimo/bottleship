@@ -161,6 +161,7 @@ describe("winmm", () => {
                 }],
                 queued: [{ callback: 0x403000, timerId: 0x20000003, dwUser: 6, args: [0x20000003, 0x3bd, 6, 0x1100, 0], timer: null, expired: null }],
                 playSound: { id: 0x50000002, channels: 1, sampleRate: 8000, bitsPerSample: 8, loop: true, playCursor: 3, pcm: new Uint8Array([1, 2, 3, 4, 5, 6]) },
+                midiOut: null,
             };
             expect(Object.keys(values).sort()).toEqual(Object.keys(winmm().captureSavestate()).sort());
             for (const [field, value] of Object.entries(values) as Array<[keyof WinMMState, unknown]>) {
@@ -183,7 +184,7 @@ describe("winmm", () => {
     });
 
     test("WinMMState keys", () => {
-        const keys: Array<keyof WinMMState> = ["timers", "nextTimerId", "periodRefCounts", "nextWaveOutId", "nextMMIOHandle", "nextPlaySoundId", "timerThreadId", "timerThreadHandle", "timerWakeEvent", "joystick", "waveOut", "playSound", "queued"];
+        const keys: Array<keyof WinMMState> = ["timers", "nextTimerId", "periodRefCounts", "nextWaveOutId", "nextMMIOHandle", "nextPlaySoundId", "timerThreadId", "timerThreadHandle", "timerWakeEvent", "joystick", "waveOut", "playSound", "queued", "midiOut"];
         expect(Object.keys(winmm().captureSavestate()).sort()).toEqual([...keys].sort());
     });
 });
