@@ -70,7 +70,7 @@ import { INPUT_BUFFER_SIZE, INPUT_INDEX } from "../input/sab-layout";
 import { GuestCursorRenderer } from "./guest-cursor";
 import { inputDevice } from "../input/virtual-device";
 import { relativeIntent } from "../input/relative-intent";
-import { HostPointerTrack } from "../input/host-pointer-track";
+import { HostPointerTrack, wheelPointerTarget } from "../input/host-pointer-track";
 import { touchDriver } from "../input/touch/driver";
 import { TouchControlLayer, type TouchControlsHandle } from "./TouchControlLayer";
 import { TouchHud } from "./TouchHud";
@@ -2197,11 +2197,14 @@ export default function App() {
       const inputView = globalInputView;
       if (!inputView) return;
 
+      // Under Pointer Lock clientX/Y are frozen where the lock was taken: no hit test and
+      // no position from them (see wheelPointerTarget).
+      const locked = pointerLockedRef.current;
       const insideCanvas = event.clientX >= rect.left &&
         event.clientX <= rect.right &&
         event.clientY >= rect.top &&
         event.clientY <= rect.bottom;
-      if (!insideCanvas) return;
+      if (!locked && !insideCanvas) return;
 
       const pointerSpace =
         guestResolutionKnownRef.current
@@ -2215,11 +2218,12 @@ export default function App() {
       inputDevice.setPointerBounds(width, height);
       // Same host pointer as writePointer's, so the same track: a wheel notch must not
       // republish a stale absolute position over a pointer the guest has warped.
-      const wheelTarget = hostPointerTrackRef.current.next(
+      const wheelTarget = wheelPointerTarget(
+        locked, hostPointerTrackRef.current,
         { x: (event.clientX - rect.left) * scaleX, y: (event.clientY - rect.top) * scaleY },
         inputDevice.getCursor(), { x: width, y: height },
       );
-      inputDevice.setPointerAbsolute(wheelTarget.x, wheelTarget.y);
+      if (wheelTarget) inputDevice.setPointerAbsolute(wheelTarget.x, wheelTarget.y);
       // Normalize deltaY to CSS pixel equivalent regardless of deltaMode:
       //   DOM_DELTA_PIXEL (0): use as-is (~100px per notch → InputManager * 1.2 ≈ 120 WHEEL_DELTA)
       //   DOM_DELTA_LINE  (1): ~33px per line; 3 lines/notch → 99px → * 1.2 ≈ 120
