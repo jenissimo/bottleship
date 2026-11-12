@@ -11,7 +11,8 @@ import { isValidAddress, isValidUserAddress } from "../core/memory/address-guard
 import { getVirtualNetworkTopology, encodeInterfaceList, INTERFACE_INFO_SIZE } from "../net/virtual-topology";
 import { System } from "../core/system";
 import type { DeferredWrite, ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatcher";
-import { WsaSocketTable, WsaFailure, WsaUdpReceiveFailure, WSA, ipv4Address, ipv6Address, type WsaAddress, type WsaPacket } from "./wsa-network";
+import { WsaSocketTable, WsaFailure, WsaUdpReceiveFailure, WSA, ipv4Address, ipv6Address, type WsaAddress, type WsaPacket, type WsaEventTarget } from "./wsa-network";
+import { wsaEventNotifier } from "./wsa-event-notify";
 import { IPX_NETNUM, IPX_MAX_PAYLOAD, UDP_MAX_PAYLOAD, UDP6_MAX_PAYLOAD } from "../net/lan-network";
 import { hasIoCompletionAssociation } from "./kernel32/sync";
 import { reserveControlApc } from "./wsa-control-apc";
@@ -825,11 +826,8 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
     api.WSAAsyncSelect = adapt(counter, setError, a => {
         table.get(a[0]);
         if ((a[3] & ~0x3f) || (a[3] && (!a[1] || !a[2]))) fail(WSA.EINVAL);
-        table.configureEvents(a[0], a[3], (bit, error) => {
-            const system = System.getInstance();
-            system.windowManager.postMessage(a[1], a[2], a[0], ((error << 16) | bit) >>> 0);
-            system.scheduler.wakeMessageWaiters();
-        });
+        const target: WsaEventTarget | undefined = a[3] ? { kind: "window", hwnd: a[1] >>> 0, message: a[2] >>> 0 } : undefined;
+        table.configureEvents(a[0], a[3], target && wsaEventNotifier(a[0], target), target);
         return { value: 0 };
     });
     api.WSAEventSelect = adapt(counter, setError, a => {
@@ -838,7 +836,8 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
             const object = System.getInstance().resourceProvider.getKernelObject(a[1]);
             if (!object || object.kind !== "event") fail(WSA.EINVAL);
         }
-        table.configureEvents(a[0], a[2], () => { System.getInstance().scheduler.setEvent(a[1]); });
+        const target: WsaEventTarget | undefined = a[2] ? { kind: "event", handle: a[1] >>> 0 } : undefined;
+        table.configureEvents(a[0], a[2], target && wsaEventNotifier(a[0], target), target);
         return { value: 0 };
     });
     api.WSAEnumNetworkEvents = adapt(counter, setError, a => {

@@ -107,7 +107,7 @@ describe("winsock idle participant", () => {
         try {
             const covered = savestateParticipants.coveredModules();
             expect([covered.has("wsock32"), covered.has("ws2_32")]).toEqual([true, true]);
-            expect(savestateParticipants.schemas().winsock).toEqual({ version: 1, schemaHash: "15198a623a60eea0" });
+            expect(savestateParticipants.schemas().winsock).toEqual({ version: 2, schemaHash: "43ca4e1da044c1db" });
             const participant = savestateParticipants.all().find(p => p.id === "winsock")!;
             expect(participant.order).toBe(77);
             expect(participant.capture({} as never)).toEqual(s.capture() as unknown as SaveValue);
@@ -144,7 +144,7 @@ describe("winsock idle participant", () => {
         const env = environment(), s = env.open();
         expect(s.capture()).toEqual({
             startups: 0, version: 0x0202, nextSocket: 0x10000000, nextAsyncTask: wsaAsyncTaskCounter(),
-            hostent: [], protoent: 0, servent: 0, addrinfo: [],
+            hostent: [], protoent: 0, servent: 0, addrinfo: [], datagrams: [],
         });
     });
 
@@ -153,7 +153,7 @@ describe("winsock idle participant", () => {
         expect(saved).toEqual({
             startups: 2, version: 0x0101, nextSocket: first.socket + 1, nextAsyncTask: first.task + 1,
             hostent: [[1, first.hostent], [2, first.dotted - 4080]],
-            protoent: first.protoent, servent: first.servent, addrinfo: [[first.chain, [first.chain]]],
+            protoent: first.protoent, servent: first.servent, addrinfo: [[first.chain, [first.chain]]], datagrams: [],
         });
         wsaAsyncTaskCounter(1);
         const fresh = env.open();
@@ -167,6 +167,20 @@ describe("winsock idle participant", () => {
             startups: 5, version: 0x0002, nextSocket: 0x10000400, nextAsyncTask: 77,
             hostent: [[3, 0x50000], [9, 0x51000]], protoent: 0x52000, servent: 0x53000,
             addrinfo: [[0x54000, [0x54000, 0x54100]], [0x55000, [0x55000]]],
+            datagrams: [{
+                handle: 0x10000000, handleFlags: 0, config: {
+                    af: 2, type: 2, protocol: 17, nonBlocking: true, overlapped: false,
+                    binding: { kind: "loopback", port: 4711, address: [127, 0, 0, 1] },
+                    options: {
+                        broadcast: true, reuse: true, receiveLimit: 1000, sendLimit: 2000, receiveTimeout: 3, sendTimeout: 4,
+                        lingerEnabled: true, lingerSeconds: 5, keepAlive: true, noDelay: true, udpConnReset: false, v6Only: false,
+                        oobInline: true, extendedAddress: true, receiveHeader: true, headerInclude: true, ipTtl: 9, ipTos: 10,
+                        ipOptionsChanged: true, multicastInterface: 2, multicastTtl: 3, multicastLoop: false, packetType: 4,
+                        filterPacketType: 6, receiveBroadcast: false,
+                    },
+                    events: { mask: 33, disabled: 1, target: { kind: "window", hwnd: 0x77, message: 0x405 } },
+                },
+            }],
         };
         expect(Object.keys(values).sort()).toEqual(Object.keys(base).sort());
         for (const [field, value] of Object.entries(values) as Array<[keyof WinsockState, unknown]>) {
@@ -206,45 +220,56 @@ describe("winsock idle participant", () => {
         expect(s.call(s.wsock32, "socket", [2, 2, 17])).toBe(first.socket + 2);
     });
 
-    test("an open socket refuses the save by kind and handle until it is closed", () => {
+    test("an open stream socket refuses the save by kind and handle until it is closed", () => {
         const env = environment(), s = env.open(), hex = (n: number) => `0x${n.toString(16)}`;
         s.call(s.ws2_32, "WSAStartup", [0x0202, 0x1000]);
-        const udp = s.call(s.ws2_32, "socket", [2, 2, 17]);
-        expect(() => s.capture()).toThrow(`${NOT_IDLE}socket ${hex(udp)} (UDP)`);
-        expect(s.call(s.ws2_32, "bind", [udp, s.sockaddr(0x2000, 1234), 16])).toBe(0);
-        expect(() => s.capture()).toThrow(`${NOT_IDLE}socket ${hex(udp)} (UDP, bound to port 1234)`);
-        expect(s.call(s.wsock32, "closesocket", [udp])).toBe(0);
-        expect(s.capture().nextSocket).toBe(udp + 1);
         const tcp = s.call(s.wsock32, "socket", [2, 1, 6]);
+        expect(() => s.capture()).toThrow(`${NOT_IDLE}socket ${hex(tcp)} (TCP): is not a datagram socket`);
         expect(s.call(s.wsock32, "bind", [tcp, s.sockaddr(0x2000, 4321), 16])).toBe(0);
         expect(s.call(s.wsock32, "listen", [tcp, 5])).toBe(0);
-        expect(() => s.capture()).toThrow(`${NOT_IDLE}socket ${hex(tcp)} (TCP, listening on port 4321)`);
+        expect(() => s.capture()).toThrow(`${NOT_IDLE}socket ${hex(tcp)} (TCP, listening on port 4321): is not a datagram socket`);
         s.state.table.setHandleFlags(tcp, 2, 2);
         expect(s.call(s.ws2_32, "closesocket", [tcp])).toBe(0);
         expect(() => s.capture()).toThrow(`socket ${hex(tcp)} (TCP, listening on port 4321)`);
         s.state.table.setHandleFlags(tcp, 2, 0);
         expect(s.call(s.ws2_32, "closesocket", [tcp])).toBe(0);
         expect(s.capture().startups).toBe(1);
-        const ipx = s.call(s.wsock32, "socket", [6, 2, 1000]);
-        expect(() => s.capture()).toThrow(`${NOT_IDLE}socket ${hex(ipx)} (IPX)`);
         expect(s.call(s.ws2_32, "WSACleanup", [])).toBe(0);
         expect(s.capture().startups).toBe(0);
     });
 
-    test("WSAAsyncSelect and WSAEventSelect registrations live on a socket and go with it", () => {
+    test("an idle datagram socket is saved as configuration, a used one still names itself", () => {
+        const env = environment(), s = env.open(), hex = (n: number) => `0x${n.toString(16)}`;
+        s.call(s.ws2_32, "WSAStartup", [0x0202, 0x1000]);
+        const udp = s.call(s.ws2_32, "socket", [2, 2, 17]);
+        expect(s.capture().datagrams.map(d => [d.handle, d.config.binding])).toEqual([[udp, null]]);
+        expect(s.call(s.ws2_32, "bind", [udp, s.sockaddr(0x2000, 1234), 16])).toBe(0);
+        expect(s.capture().datagrams.map(d => [d.handle, d.config.binding])).toEqual([[udp, { kind: "wildcard", port: 1234, address: null }]]);
+        const ipx = s.call(s.wsock32, "socket", [6, 2, 1000]);
+        expect(s.capture().datagrams.map(d => d.config.af)).toEqual([2, 6]);
+        s.state.table.get(udp).available = 1;
+        expect(() => s.capture()).toThrow(`${NOT_IDLE}socket ${hex(udp)} (UDP, bound to port 1234): holds received data`);
+        s.state.table.get(udp).available = 0;
+        expect(s.call(s.wsock32, "closesocket", [udp])).toBe(0);
+        expect(s.call(s.wsock32, "closesocket", [ipx])).toBe(0);
+        expect(s.capture().datagrams).toEqual([]);
+    });
+
+    test("WSAAsyncSelect and WSAEventSelect registrations are saved with their target", () => {
         const env = environment(), s = env.open();
         s.call(s.ws2_32, "WSAStartup", [0x0202, 0x1000]);
         const selected = s.call(s.wsock32, "socket", [2, 2, 17]);
         expect(s.call(s.wsock32, "WSAAsyncSelect", [selected, 5, 0x400, 1])).toBe(0);
-        expect(() => s.capture()).toThrow(`${NOT_IDLE}socket 0x${selected.toString(16)} (UDP)`);
+        expect(s.capture().datagrams.map(d => d.config.events)).toEqual([{ mask: 1, disabled: 0, target: { kind: "window", hwnd: 5, message: 0x400 } }]);
         expect(s.call(s.wsock32, "closesocket", [selected])).toBe(0);
         expect(s.capture().startups).toBe(1);
         const event = s.call(s.ws2_32, "WSACreateEvent", []);
         disposers.push(() => System.getInstance().resourceProvider.unregisterKernelObject(event));
-        expect(s.capture().startups).toBe(1);
         const watched = s.call(s.ws2_32, "socket", [2, 2, 17]);
         expect(s.call(s.ws2_32, "WSAEventSelect", [watched, event, 1])).toBe(0);
-        expect(() => s.capture()).toThrow(`${NOT_IDLE}socket 0x${watched.toString(16)} (UDP)`);
+        expect(s.capture().datagrams.map(d => d.config.events)).toEqual([{ mask: 1, disabled: 0, target: { kind: "event", handle: event } }]);
+        expect(s.call(s.ws2_32, "WSAEventSelect", [watched, event, 2])).toBe(0);
+        expect(() => s.capture()).toThrow(`${NOT_IDLE}socket 0x${watched.toString(16)} (UDP): has a pending error or event`);
         expect(s.call(s.ws2_32, "closesocket", [watched])).toBe(0);
         expect(s.capture().startups).toBe(1);
     });
@@ -289,7 +314,7 @@ describe("winsock idle participant", () => {
         const socket = s.call(s.ws2_32, "socket", [2, 2, 17]), provider = getWsaOverlapped(s.state.table, s.process);
         const answer = provider.issue(socket, 0x7000, 0, "read", () => { throw new WsaFailure(WSA.EWOULDBLOCK); }, () => []);
         expect(answer.error).toBe(997);
-        expect(() => s.capture()).toThrow(`winsock: not idle, 2 thing(s) open: socket 0x${socket.toString(16)} (UDP), overlapped request 0x7000 on socket 0x${socket.toString(16)}`);
+        expect(() => s.capture()).toThrow(`${NOT_IDLE}overlapped request 0x7000 on socket 0x${socket.toString(16)}`);
         expect(s.call(s.ws2_32, "closesocket", [socket])).toBe(0);
         expect(() => s.capture()).toThrow(`${NOT_IDLE}overlapped request 0x7000 on socket 0x${socket.toString(16)}`);
         await tick();
@@ -350,16 +375,16 @@ describe("winsock idle participant", () => {
     test("more than four open things are counted and the list is cut", () => {
         const env = environment(), s = env.open();
         s.call(s.ws2_32, "WSAStartup", [0x0202, 0x1000]);
-        const first = s.call(s.ws2_32, "socket", [2, 2, 17]), hex = (n: number) => `socket 0x${n.toString(16)} (UDP)`;
-        for (let i = 1; i < 12; i++) s.call(s.ws2_32, "socket", [2, 2, 17]);
+        const first = s.call(s.ws2_32, "socket", [2, 1, 6]), hex = (n: number) => `socket 0x${n.toString(16)} (TCP): is not a datagram socket`;
+        for (let i = 1; i < 12; i++) s.call(s.ws2_32, "socket", [2, 1, 6]);
         expect(() => s.capture()).toThrow(`winsock: not idle, 12 thing(s) open: ${[0, 1, 2, 3].map(i => hex(first + i)).join(", ")}, …`);
     });
 
     test("a restore into a session that is not idle fails", async () => {
         const env = environment(), saved = (await used(env)).capture(), s = env.open();
         s.call(s.ws2_32, "WSAStartup", [0x0202, 0x1000]);
-        const socket = s.call(s.ws2_32, "socket", [2, 2, 17]);
-        expect(() => s.restore(saved)).toThrow(`winsock: the fresh session is not idle: socket 0x${socket.toString(16)} (UDP)`);
+        const socket = s.call(s.ws2_32, "socket", [2, 2, 17]), stream = s.call(s.ws2_32, "socket", [2, 1, 6]);
+        expect(() => s.restore(saved)).toThrow(`winsock: the fresh session is not idle: socket 0x${stream.toString(16)} (TCP): is not a datagram socket, socket 0x${socket.toString(16)} (UDP)`);
         expect(s.state.counter.captureState()).toEqual({ startups: 1, version: 0x0202 });
     });
 });
@@ -369,18 +394,20 @@ describe("winsock idle check in the socket actor", () => {
         const table = new WsaSocketTable(new LanNetwork(Uint8Array.of(2, 0, 0, 4, 5, 6))), kernel = new WsaActorKernel(table);
         const one = { pid: 11, slot: 0, epoch: 1 }, two = { pid: 12, slot: 1, epoch: 1 };
         kernel.register(one); kernel.register(two);
-        const idle = { count: 0, open: [], nextHandle: 0x10000000 };
+        const idle = { count: 0, open: [], nextHandle: 0x10000000, idle: [] };
         expect(kernel.execute(one, "openForSavestate", [])).toEqual(idle);
         const socket = kernel.execute(one, "socket", [2, 2, 17]) as number, name = `socket 0x${socket.toString(16)} (UDP)`;
-        expect(kernel.execute(one, "openForSavestate", [])).toEqual({ count: 1, open: [name], nextHandle: socket + 1 });
+        const listed = kernel.execute(one, "openForSavestate", []) as { count: number; open: string[]; nextHandle: number; idle: Array<{ handle: number }> };
+        expect([listed.count, listed.open, listed.nextHandle, listed.idle.map(item => item.handle)]).toEqual([0, [], socket + 1, [socket]]);
         expect(kernel.execute(two, "openForSavestate", [])).toEqual({ ...idle, nextHandle: socket + 1 });
         const copy = kernel.execute(one, "duplicate", [socket, 12]) as number;
-        expect(kernel.execute(two, "openForSavestate", [])).toEqual({ count: 1, open: [`socket 0x${copy.toString(16)} (UDP)`], nextHandle: copy + 1 });
+        expect(kernel.execute(one, "openForSavestate", [])).toEqual({ count: 1, open: [`${name}: is shared by more than one descriptor`], nextHandle: copy + 1, idle: [] });
+        expect(kernel.execute(two, "openForSavestate", [])).toEqual({ count: 1, open: [`socket 0x${copy.toString(16)} (UDP): is shared by more than one descriptor`], nextHandle: copy + 1, idle: [] });
         kernel.execute(two, "reset", []);
         expect((kernel.execute(two, "openForSavestate", []) as { count: number }).count).toBe(1);
         const lease = kernel.execute(one, "acquireNativeIo", [socket, "data"], true) as number;
         expect(kernel.execute(one, "closesocket", [socket])).toBe(0);
-        expect(kernel.execute(one, "openForSavestate", [])).toEqual({ count: 1, open: [`data operation on socket 0x${socket.toString(16)}`], nextHandle: copy + 1 });
+        expect(kernel.execute(one, "openForSavestate", [])).toEqual({ count: 1, open: [`data operation on socket 0x${socket.toString(16)}`], nextHandle: copy + 1, idle: [] });
         kernel.execute(one, "releaseNativeIo", [lease], true);
         expect((kernel.execute(one, "openForSavestate", []) as { count: number }).count).toBe(0);
         expect(kernel.execute(two, "closesocket", [copy], true)).toBe(0);
@@ -404,10 +431,14 @@ describe("winsock idle check in the socket actor", () => {
             const process = { resetGeneration: 0 } as Process, capture = () => captureWinsockSavestate(process, state as never);
             expect(capture().nextSocket).toBe(0x10000000);
             const socket = table.socket(2, 2, 17);
-            expect(table.openForSavestate()).toEqual({ count: 1, open: [`socket 0x${socket.toString(16)} (UDP)`], nextHandle: socket + 1 });
-            expect(capture).toThrow(`${NOT_IDLE}socket 0x${socket.toString(16)} (UDP)`);
+            expect(table.openForSavestate().idle.map(item => item.handle)).toEqual([socket]);
+            expect(capture().datagrams.map(item => item.handle)).toEqual([socket]);
+            const stream = table.socket(1, 2, 6);
+            expect(table.openForSavestate()).toMatchObject({ count: 1, open: [`socket 0x${stream.toString(16)} (TCP): is not a datagram socket`], nextHandle: stream + 1 });
+            expect(capture).toThrow(`${NOT_IDLE}socket 0x${stream.toString(16)} (TCP): is not a datagram socket`);
+            table.closesocket(stream);
             table.closesocket(socket);
-            expect(capture().nextSocket).toBe(socket + 1);
+            expect(capture().nextSocket).toBe(stream + 1);
             table.advanceHandles(0x10000800);
             expect(table.socket(1, 2, 6)).toBe(0x10000800);
             table.closesocket(0x10000800);

@@ -1,5 +1,5 @@
 /** Host socket objects outlive individual guest descriptors and issuing processes. */
-import { WsaSocketTable, WsaFailure, WSA, describeWsaSocket, type WsaIoPurpose } from "./wsa-network";
+import { WsaSocketTable, WsaFailure, WSA, describeWsaSocket, validWsaEventTarget, type WsaIoPurpose, type WsaIdleDatagram } from "./wsa-network";
 import type { WsaActorIdentity, WsaActorNotification } from "./wsa-actor-protocol";
 import type { UdpHostLease } from "../net/udp-host-lease-rpc";
 type State = ReturnType<WsaSocketTable["get"]>;
@@ -58,9 +58,11 @@ export class WsaActorKernel {
         if (!alias || !this.table.isValid(alias.physical)) fail(WSA.ENOTSOCK);
         return alias;
     }
-    private reserve(context: Context, physical: number, cache?: Cache, imported = true): number {
-        if (context.aliases.size >= 4096 || this.nextHandle > 0x7fffffff) fail(WSA.ENOBUFS);
-        const id = this.nextHandle++, state = this.table.get(physical), values: Cache = {};
+    private reserve(context: Context, physical: number, cache?: Cache, imported = true, requested?: number): number {
+        if (context.aliases.size >= 4096 || (requested === undefined && this.nextHandle > 0x7fffffff)) fail(WSA.ENOBUFS);
+        if (requested !== undefined && (!Number.isInteger(requested) || requested < 0x10000000 || requested > 0x7fffffff ||
+            [...this.processes.values()].some(other => other.aliases.has(requested)))) fail(WSA.EINVAL);
+        const id = requested ?? this.nextHandle++, state = this.table.get(physical), values: Cache = {};
         for (const key of cached) (values as any)[key] = cache && Object.hasOwn(cache, key) ? cache[key] : state[key];
         const alias: Alias = { id, physical, owner: context, cache: values, imported, handleFlags: 1, listenOperations: new Map() };
         context.aliases.set(id, alias);
@@ -85,6 +87,18 @@ export class WsaActorKernel {
             Object.assign(this.table.get(alias.physical), { lingerEnabled: abortive || alias.cache.lingerEnabled, lingerSeconds: abortive ? 0 : alias.cache.lingerSeconds });
             this.table.closesocket(alias.physical);
         }
+    }
+    private forwardEvents(alias: Alias): (bit: number, error: number) => void {
+        return (bit, error) => {
+            const owner = this.selected.get(alias.physical); if (owner) owner.owner.notify?.({ type: "event", socket: owner.id, bit, error });
+        };
+    }
+    private aliasRefusal(alias: Alias): string | undefined {
+        if ((this.references.get(alias.physical)?.size ?? 0) !== 1) return "is shared by more than one descriptor";
+        for (const context of this.processes.values()) for (const op of context.udpHosts.values()) if (op.alias === alias) return "has a native UDP host";
+        if (alias.listenOperations.size) return "is listening";
+        if (this.table.get(alias.physical).eventMask && this.selected.get(alias.physical) !== alias) return "has an event selection";
+        return undefined;
     }
     private snapshot(alias: Alias): State {
         const output: any = {};
@@ -213,10 +227,40 @@ export class WsaActorKernel {
         if (command === "reset") { for (const alias of [...context.aliases.values()]) if(alias.imported)this.release(alias); return null; }
         if (command === "openForSavestate") {
             const hex = (value: number) => "0x" + (value >>> 0).toString(16);
-            const open = [...context.aliases.values()].map(alias => this.table.isValid(alias.physical)
-                ? describeWsaSocket(alias.id, this.table.get(alias.physical)) : `socket ${hex(alias.id)} (stale)`);
+            const open: string[] = [], idle: WsaIdleDatagram[] = [];
+            for (const alias of context.aliases.values()) {
+                if (!this.table.isValid(alias.physical)) { open.push(`socket ${hex(alias.id)} (stale)`); continue; }
+                const state = this.table.get(alias.physical), refusal = this.aliasRefusal(alias);
+                const found = refusal ? { refusal } : this.table.inspectDatagram(alias.physical);
+                if ("refusal" in found) { open.push(`${describeWsaSocket(alias.id, state)}: ${found.refusal}`); continue; }
+                const options = found.config.options as unknown as Record<string, unknown>;
+                for (const key of cached) {
+                    const value = alias.cache[key];
+                    if (value === undefined) continue;
+                    if (key in options) options[key] = value;
+                    else if (key === "overlapped") found.config.overlapped = value as boolean;
+                }
+                idle.push({ handle: alias.id, handleFlags: alias.handleFlags, config: found.config });
+            }
             for (const lease of context.nativeIo.values()) open.push(`${lease.purpose} operation on socket ${hex(lease.id)}`);
-            return { count: open.length, open: open.slice(0, 8), nextHandle: this.nextHandle };
+            return { count: open.length, open: open.slice(0, 8), nextHandle: this.nextHandle, idle };
+        }
+        if (command === "restoreDatagram") {
+            const item = args[0] as WsaIdleDatagram;
+            if (!item || typeof item !== "object" || !Number.isInteger(item.handle) || !Number.isInteger(item.handleFlags) || (item.handleFlags & ~3)) fail(WSA.EINVAL);
+            const physical = this.table.restoreDatagram(item.config);
+            try {
+                const alias = context.aliases.get(this.reserve(context, physical, undefined, true, item.handle))!;
+                alias.handleFlags = item.handleFlags;
+                const state = this.table.get(physical);
+                if (state.eventMask) { this.selected.set(physical, alias); state.notify = this.forwardEvents(alias); }
+                return alias.id;
+            } catch (error) { this.table.closesocket(physical); throw error; }
+        }
+        if (command === "discardDatagram") {
+            const alias = this.alias(context, args[0] as number);
+            alias.handleFlags = 1; this.release(alias); context.notify?.({ type: "changed" });
+            return null;
         }
         if (command === "advanceHandles") {
             const next = args[0] as number;
@@ -266,10 +310,9 @@ export class WsaActorKernel {
             this.release(alias); context.notify?.({ type: "changed" }); return 0;
         }
         if (command === "configureEvents") {
+            if (args[2] !== undefined && args[2] !== null && !validWsaEventTarget(args[2])) fail(WSA.EINVAL);
             this.selected.set(alias.physical, alias);
-            this.table.configureEvents(alias.physical, args[1] as number, (bit, error) => {
-                const owner = this.selected.get(alias.physical); if (owner) owner.owner.notify?.({ type: "event", socket: owner.id, bit, error });
-            }); return null;
+            this.table.configureEvents(alias.physical, args[1] as number, this.forwardEvents(alias), args[2] ?? undefined); return null;
         }
         if (!operations.has(command)) fail(WSA.EINVAL);
         const listenOperation = command === "listen" ? (args[3] === undefined ? -alias.id : args[3]) : undefined;
