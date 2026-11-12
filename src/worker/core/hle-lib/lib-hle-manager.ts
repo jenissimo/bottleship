@@ -165,7 +165,8 @@ class LibHleManager {
         const cfg = EmulatorConfig.getInstance().hleLibs;
         if (!cfg.enable) return false;
 
-        let patched = this.replaceNativeLeaves(module, cfg.logOnly);
+        this.replaceNativeLeaves(module, cfg.logOnly);
+        let patched = false;
 
         const descriptors = libRegistry.getAll();
         if (descriptors.length === 0) {
@@ -217,20 +218,18 @@ class LibHleManager {
     }
 
     /** Kill switch for A/B: `setWorkerFlag('__noNativeLeaves', true)` before the image loads. */
-    private replaceNativeLeaves(module: LoadedPEModule, logOnly: boolean): boolean {
-        if ((globalThis as { __noNativeLeaves?: boolean }).__noNativeLeaves === true) return false;
+    private replaceNativeLeaves(module: LoadedPEModule, logOnly: boolean): void {
+        if ((globalThis as { __noNativeLeaves?: boolean }).__noNativeLeaves === true) return;
         const image = this.init?.getMemory();
-        if (!image) return false;
+        if (!image) return;
         if (logOnly) {
             for (const s of findNativeLeaves(image, module)) {
                 Logger.log(LogCategory.SYSTEM, `[HLE-lib] logOnly=true — native leaf ${s.crt} ${s.name} @ 0x${s.address.toString(16)} NOT replaced`);
             }
-            return false;
+            return;
         }
-        const before = this.nativeLeafSites.length;
         this.nativeLeafSites.push(...applyNativeLeaves(image, module));
         this.nativeLeafSites.push(...applyNativeSplices(image, module));
-        return this.nativeLeafSites.length > before;
     }
 
     getNativeLeafSites(): NativeLeafSite[] {
