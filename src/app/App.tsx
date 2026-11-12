@@ -780,6 +780,18 @@ export default function App() {
     }
   };
 
+  // The dialog is answered with the real pointer, so the guest's relative-mouse claim
+  // (and with it Pointer Lock) waits while one is up. updatePointerLockIntent reads only
+  // refs and the store, so whichever render's copy runs here does the same thing.
+  useEffect(() => {
+    relativeIntent.setHostHold(messageBox !== null);
+    updatePointerLockIntent();
+    return () => {
+      relativeIntent.setHostHold(false);
+      updatePointerLockIntent();
+    };
+  }, [messageBox]);
+
   const sabAvailable = typeof SharedArrayBuffer !== "undefined";
   const isolated = typeof crossOriginIsolated !== "undefined" && crossOriginIsolated === true;
   const secureContext = typeof window !== "undefined" ? window.isSecureContext : true;
@@ -2241,7 +2253,13 @@ export default function App() {
     const handlePointerLockChange = () => {
       pointerLockedRef.current = document.pointerLockElement === canvas;
       syncCursorPresence();
-      if (pointerLockedRef.current) {
+      if (pointerLockedRef.current && !relativeIntent.get()) {
+        // The request was still pending when the guest dropped its claim (it hid the
+        // pointer for a moment around the click that asked), so nothing has released a
+        // lock that only now arrives. Without this it stays for good: the guest shows an
+        // absolute pointer and the player is steering it by motion.
+        updatePointerLockIntent();
+      } else if (pointerLockedRef.current) {
         disarmPointerLockGesture();
         // The device already holds the last absolute position, which is exactly the
         // seed we want; nothing to publish because the position has not changed.
