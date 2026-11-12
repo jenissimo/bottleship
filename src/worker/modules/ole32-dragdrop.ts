@@ -74,4 +74,13 @@ export class DragDropRegistry {
         this.registrations.clear();
         for (const dropTarget of targets) this.options.release(dropTarget);
     }
+
+    captureState(): Array<[number, number]> {
+        return [...this.registrations];
+    }
+
+    restoreState(rows: ReadonlyArray<readonly [number, number]>): void {
+        this.registrations.clear();
+        for (const [hwnd, dropTarget] of rows) this.registrations.set(hwnd, dropTarget);
+    }
 }

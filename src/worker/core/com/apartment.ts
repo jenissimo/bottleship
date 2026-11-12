@@ -23,6 +23,8 @@ interface ThreadApartment {
     oleInits: number;
 }
 
+export type ApartmentRow = [threadId: number, model: ApartmentModel, inits: number, oleInits: number];
+
 export class ComApartments {
     private threads = new Map<number, ThreadApartment>();
 
@@ -84,7 +86,16 @@ export class ComApartments {
     reset(): void {
         this.threads.clear();
     }
+
+    captureState(): ApartmentRow[] {
+        return [...this.threads].map(([threadId, a]) => [threadId, a.model, a.inits, a.oleInits]);
+    }
+
+    restoreState(rows: readonly ApartmentRow[]): void {
+        this.threads = new Map(rows.map(([threadId, model, inits, oleInits]) => [threadId, { model, inits, oleInits }]));
+    }
 }
 
 /** The process's apartments. One instance because ole32 and combase must agree. */
+// @participant(ole32)
 export const comApartments = new ComApartments();
