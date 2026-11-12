@@ -1,12 +1,12 @@
 import { savestateParticipants, uncoveredModules, type CaptureContext, type CpuOverride, type ParticipantRegistry } from './participant';
-import { copyRam, hashRamCopy, restoreRam, validateRamManifest, type RamCaptureStats, type RamManifest, type RamPatch } from './ram';
+import { copyRam, hashRamCopy, restoreRam, STORE_LANES, validateRamManifest, type RamCaptureStats, type RamManifest, type RamPatch } from './ram';
 import type { ChunkStore } from './chunk-store';
 import {
     decodeSavestate, encodeSavestateSections, incompatibilities, type CompatibilityKey, type Savestate,
 } from './container';
 import { encodeValue, type EncodedValue, type SaveValue } from './value-codec';
 import { CaptureRefusal, newObjectGraph, restoreObjectGraph } from './object-codecs';
-import { BLOBS, loadBlobs, missingBlobs, savedBlobs, type BlobList } from './blobs';
+import { BLOBS, PendingBlobs, loadBlobs, missingBlobs, savedBlobs, type BlobList } from './blobs';
 
 const OBJECTS = '$objects';
 
@@ -24,8 +24,12 @@ export interface CaptureRun extends CaptureContext {
     readonly ramPatches: readonly RamPatch[];
 }
 
-export function newCaptureRun(): CaptureRun {
-    const graph = newObjectGraph();
+/**
+ * With `pending`, an array that was never hashed gets a stand-in name and is hashed later (see
+ * PendingBlobs); without it every blob is named on the spot.
+ */
+export function newCaptureRun(pending?: PendingBlobs): CaptureRun {
+    const graph = newObjectGraph(pending);
     const ramPatches: RamPatch[] = [];
     let cpu: CpuOverride | null = null;
     return {
@@ -53,6 +57,8 @@ export interface CaptureResult {
     captureMs: Record<string, number>;
     ramCopyMs: number;
     ramHashMs: number;
+    blobHashMs: number;
+    prepareMs: number;
 }
 
 export function coverageRefusal(target: Pick<SavestateTarget, 'touchedModules'>, participants: ParticipantRegistry = savestateParticipants): string | null {
@@ -67,12 +73,15 @@ export async function captureSession(
 ): Promise<CaptureResult> {
     const refusal = coverageRefusal(target, participants);
     if (refusal) throw new CaptureRefusal(refusal);
+    const p0 = performance.now();
     for (const p of participants.all()) await p.prepare?.();
+    const prepareMs = performance.now() - p0;
     stillReady();
     const sections = new Map<string, EncodedValue>();
     const sizes: Record<string, number> = {};
     const captureMs: Record<string, number> = {};
-    const run = newCaptureRun();
+    const later = new PendingBlobs();
+    const run = newCaptureRun(later);
     for (const p of participants.all()) {
         const started = performance.now();
         const value = p.capture(run);
@@ -82,8 +91,6 @@ export async function captureSession(
         sizes[p.id] = enc.json.length + enc.blobs.reduce((n, b) => n + b.length, 0);
     }
     sections.set(OBJECTS, encodeValue(run.objects as unknown as SaveValue));
-    const blobs: BlobList = [...run.blobs].map(([hash, bytes]) => [hash, bytes.byteLength] as [string, number]).sort((a, b) => (a[0] < b[0] ? -1 : 1));
-    if (blobs.length > 0) sections.set(BLOBS, encodeValue(blobs));
     const t0 = performance.now();
     const copy = copyRam(target.guestMemory(), known, run.ramPatches);
     const t1 = performance.now();
@@ -92,8 +99,20 @@ export async function captureSession(
     captured();
     const snap = await hashRamCopy(copy, known);
     const ramHashMs = performance.now() - t1;
-    for (const [hash, bytes] of run.blobs) if (!known.has(hash)) snap.pending.set(hash, bytes);
-    return { bytes: encodeSavestateSections({ ...header, ram: snap.manifest }, sections), manifest: snap.manifest, pending: snap.pending, blobs, ram: snap.stats, sections: sizes, captureMs, ramCopyMs: t1 - t0, ramHashMs };
+    const t2 = performance.now();
+    const held = new Map(run.blobs);
+    if (later.size > 0) {
+        for (const [hash, bytes] of await later.hash(STORE_LANES)) if (!held.has(hash)) held.set(hash, bytes);
+        for (const [name, enc] of sections) {
+            enc.json = later.resolve(enc.json, name);
+            if (name in sizes) sizes[name] = enc.json.length + enc.blobs.reduce((n, b) => n + b.length, 0);
+        }
+    }
+    const blobHashMs = performance.now() - t2;
+    const blobs: BlobList = [...held].map(([hash, bytes]) => [hash, bytes.byteLength] as [string, number]).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+    if (blobs.length > 0) sections.set(BLOBS, encodeValue(blobs));
+    for (const [hash, bytes] of held) if (!known.has(hash)) snap.pending.set(hash, bytes);
+    return { bytes: encodeSavestateSections({ ...header, ram: snap.manifest }, sections), manifest: snap.manifest, pending: snap.pending, blobs, ram: snap.stats, sections: sizes, captureMs, ramCopyMs: t1 - t0, ramHashMs, blobHashMs, prepareMs };
 }
 
 export interface LoadCheck { ok: boolean; reasons: string[]; overlayChanged: boolean; state: Savestate }
