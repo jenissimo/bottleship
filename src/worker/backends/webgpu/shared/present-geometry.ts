@@ -155,13 +155,17 @@ export function contentRectFromPresentRect(
     return { left, top, width, height, right: left + width, bottom: top + height };
 }
 
-/** A client/CSS point mapped into a `spaceW x spaceH` guest space through the content rect. */
+/**
+ * A client/CSS point mapped through the content rect onto the part of the guest screen it
+ * shows; the result is a guest SCREEN coordinate.
+ */
 export function clientToGuestPoint(
-    content: HostRect, clientX: number, clientY: number, spaceW: number, spaceH: number,
+    content: HostRect, clientX: number, clientY: number,
+    space: { x: number; y: number; width: number; height: number },
 ): { x: number; y: number } {
     return {
-        x: (clientX - content.left) * (spaceW / Math.max(1, content.width)),
-        y: (clientY - content.top) * (spaceH / Math.max(1, content.height)),
+        x: space.x + (clientX - content.left) * (space.width / Math.max(1, content.width)),
+        y: space.y + (clientY - content.top) * (space.height / Math.max(1, content.height)),
     };
 }
 

@@ -14,6 +14,7 @@
 
 import { inputDevice } from "../virtual-device";
 import { relativeIntent } from "../relative-intent";
+import type { PointerSpace } from "../host-pointer-track";
 import { FINGER_OFFSET_Y_PX } from "./gestures";
 import {
     createRecognizer,
@@ -39,7 +40,7 @@ export interface TouchDriverOptions {
     /** The presented picture's CSS rect (not necessarily the whole canvas element). */
     getCanvasRect: () => { left: number; top: number; width: number; height: number; right: number; bottom: number } | null;
     /** Guest-space size the cursor is published in. */
-    getPointerSpace: () => { width: number; height: number };
+    getPointerSpace: () => PointerSpace;
     getSettings: () => TouchSettings;
     /**
      * On-screen controls claim a contact before the translator sees it. Returns true
@@ -215,15 +216,15 @@ export class TouchDriver {
         cfg.sensitivity = settings.touchSensitivity;
         cfg.longPressRight = settings.touchLongPressRight;
         cfg.cursorAid = settings.touchCursorAid;
-        const space = this.opts?.getPointerSpace() ?? { width: 1, height: 1 };
-        cfg.minX = 0;
-        cfg.minY = 0;
-        cfg.maxX = Math.max(1, space.width) - 1;
-        cfg.maxY = Math.max(1, space.height) - 1;
+        const space = this.opts?.getPointerSpace() ?? { x: 0, y: 0, width: 1, height: 1 };
+        cfg.minX = space.x;
+        cfg.minY = space.y;
+        cfg.maxX = space.x + Math.max(1, space.width) - 1;
+        cfg.maxY = space.y + Math.max(1, space.height) - 1;
         // The device clamps relative motion against its own bounds, and the mouse path
         // is the only other writer — with no mouse event yet they are still 1x1, which
         // pins a finger-driven cursor at the origin.
-        inputDevice.setPointerBounds(space.width, space.height);
+        inputDevice.setPointerBounds(space);
         cfg.offsetY = settings.touchCursorAid ? FINGER_OFFSET_Y_PX * this.guestPerCss().y : 0;
     }
 
@@ -241,11 +242,12 @@ export class TouchDriver {
         const rect = opts.getCanvasRect();
         if (!rect) return;
         const scale = this.guestPerCss();
+        const space = opts.getPointerSpace();
         const ev: TouchEvent2 = {
             id: event.pointerId,
             phase,
-            x: (event.clientX - rect.left) * scale.x,
-            y: (event.clientY - rect.top) * scale.y,
+            x: space.x + (event.clientX - rect.left) * scale.x,
+            y: space.y + (event.clientY - rect.top) * scale.y,
         };
         this.emit(step(this.recognizer, ev, event.timeStamp || performance.now()), scale);
     }

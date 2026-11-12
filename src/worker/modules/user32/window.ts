@@ -350,7 +350,10 @@ function applyWindowPosGeometry(
         repaintParentDialogIfSystemControlGeometryChanged(window, moving, resizing);
     }
 
-    if (moving || resizing) syncWindowDCsToGeometry(hWnd);
+    if (moving || resizing) {
+        syncWindowDCsToGeometry(hWnd);
+        System.getInstance().followHostViewWindow(hWnd, window.x, window.y, window.width, window.height);
+    }
 
     if (!options?.skipDialogOverlayRepaint && !(uFlags & 0x0008 /* SWP_NOREDRAW */)
         && window.visible && window.nativeClassName === '#32770'
@@ -1601,6 +1604,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             }
         }
         windows.delete(hWnd);
+        System.getInstance().forgetHostViewWindow(hWnd);
         removeWindowPlacement(hWnd);
         removeWindowUpdate(hWnd);
         System.getInstance().windowManager.destroyWindow(hWnd);
@@ -1945,7 +1949,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             }
 
             if (show && !isChild && !(live.style & WS_POPUP)) {
-                System.getInstance().requestHostResize(live.width, live.height);
+                System.getInstance().requestHostViewOfWindow(hWnd, live.x, live.y, live.width, live.height);
             }
             if (isAnimateControlWindow(live)) onAnimateShowWindow(hWnd, nCmdShow);
             return resultValue;

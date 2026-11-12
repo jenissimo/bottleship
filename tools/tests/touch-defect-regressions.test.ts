@@ -101,12 +101,12 @@ describe("the driver decides what belongs to the guest", () => {
         (globalThis as any).cancelAnimationFrame = cancel;
     });
 
-    function rig() {
+    function rig(space = { x: 0, y: 0, width: 640, height: 480 }) {
         const view = new Int32Array(INPUT_BUFFER_SIZE / 4);
         inputDevice.attach(view, () => { /* the worker poke is not what this asserts */ });
         inputDevice.releaseAllSources();
-        inputDevice.setPointerBounds(640, 480);
-        inputDevice.setPointerAbsolute(7, 9);
+        inputDevice.setPointerBounds(space);
+        inputDevice.setPointerAbsolute(space.x + 7, space.y + 9);
         inputDevice.commit({ immediate: true });
 
         const panel = new FakePanel();
@@ -114,7 +114,7 @@ describe("the driver decides what belongs to the guest", () => {
         const claims: string[] = [];
         driver.attach(panel as unknown as HTMLElement, {
             getCanvasRect: () => RECT as DOMRect,
-            getPointerSpace: () => ({ width: 640, height: 480 }),
+            getPointerSpace: () => space,
             getSettings: () => ({
                 touchMode: "direct", touchSensitivity: 1,
                 touchLongPressRight: true, touchCursorAid: false,
@@ -131,6 +131,22 @@ describe("the driver decides what belongs to the guest", () => {
         const s = r.snap();
         expect(s.cursor).toEqual({ x: 320, y: 240 });
         expect(s.buttons).toBe(1);
+    });
+
+    test("a tap lands on the screen point the picture shows there when the view is part of the screen", () => {
+        // The 640x480 CSS picture shows the 560x400 rectangle at (40,40) of the guest screen.
+        const r = rig({ x: 40, y: 40, width: 560, height: 400 });
+        r.panel.fire("pointerdown", pev(1, 100, 50));
+        r.panel.fire("pointerup", pev(1, 100, 50, PLAIN, 30));
+        expect(r.snap().cursor).toEqual({ x: 40, y: 40 });
+        r.panel.fire("pointerdown", pev(2, 420, 290, PLAIN, 400));
+        r.panel.fire("pointerup", pev(2, 420, 290, PLAIN, 430));
+        expect(r.snap().cursor).toEqual({ x: 320, y: 240 });
+        r.panel.fire("pointerdown", pev(3, 739, 529, PLAIN, 800));
+        r.panel.fire("pointerup", pev(3, 739, 529, PLAIN, 830));
+        const far = r.snap().cursor;
+        expect(far.x).toBeGreaterThan(598); expect(far.x).toBeLessThanOrEqual(599);
+        expect(far.y).toBeGreaterThan(438); expect(far.y).toBeLessThanOrEqual(439);
     });
 
     test("a tap on a data-touch-reserved overlay reaches neither the guest nor the widgets", () => {
@@ -188,7 +204,7 @@ describe("BindingPresser.releaseAll defers its publish when asked", () => {
     // unplug — DIERR_INPUTLOST on every acquired DirectInput joystick, on every tab hide.
     // Asserted against the REAL presser and the real device: a hand-rolled stand-in would
     // pass whatever the production path did.
-    function rig() {
+    function rig(space = { x: 0, y: 0, width: 640, height: 480 }) {
         const view = new Int32Array(INPUT_BUFFER_SIZE / 4);
         let publishes = 0;
         inputDevice.attach(view, () => { publishes++; });

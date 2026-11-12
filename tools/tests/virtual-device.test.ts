@@ -14,7 +14,7 @@ function makeDevice(): { device: VirtualInputDevice; view: Int32Array; ticks: ()
     let ticks = 0;
     const device = new VirtualInputDevice();
     device.attach(view, () => { ticks++; });
-    device.setPointerBounds(640, 480);
+    device.setPointerBounds({ x: 0, y: 0, width: 640, height: 480 });
     return { device, view, ticks: () => ticks };
 }
 
@@ -184,5 +184,40 @@ describe("publication", () => {
         device.setKey(VK_W, true, "hw-key");
         device.commit();
         expect(ticks()).toBe(1);
+    });
+});
+
+// The pointer is published in guest SCREEN coordinates and confined to the part of the
+// screen the host surface shows, wherever on the screen that part is.
+describe("pointer bounds are a rectangle of the guest screen", () => {
+    const VIEW = { x: 40, y: 40, width: 560, height: 400 };
+
+    test("an absolute position is confined to the rectangle", () => {
+        const { device } = makeDevice();
+        device.setPointerBounds(VIEW);
+        device.setPointerAbsolute(10, 20);
+        expect(device.getCursor()).toEqual({ x: 40, y: 40 });
+        device.setPointerAbsolute(630, 470);
+        expect(device.getCursor()).toEqual({ x: 600, y: 440 });
+        device.setPointerAbsolute(320, 240);
+        expect(device.getCursor()).toEqual({ x: 320, y: 240 });
+    });
+
+    test("relative motion stops at the rectangle's edges", () => {
+        const { device } = makeDevice();
+        device.setPointerBounds(VIEW);
+        device.setPointerAbsolute(320, 240);
+        device.addPointerRelative(-1000, -1000);
+        expect(device.getCursor()).toEqual({ x: 40, y: 40 });
+        device.addPointerRelative(5000, 5000);
+        expect(device.getCursor()).toEqual({ x: 599, y: 439 });
+    });
+
+    test("a rectangle at the origin confines as a plain size did", () => {
+        const { device } = makeDevice();
+        device.setPointerAbsolute(-5, 700);
+        expect(device.getCursor()).toEqual({ x: 0, y: 480 });
+        device.addPointerRelative(900, 10);
+        expect(device.getCursor()).toEqual({ x: 639, y: 479 });
     });
 });

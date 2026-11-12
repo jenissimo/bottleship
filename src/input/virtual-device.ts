@@ -22,6 +22,7 @@ import {
     keyTextView,
 } from "./sab-layout";
 import type { Binding } from "./bindings";
+import type { PointerSpace } from "./host-pointer-track";
 
 export type SourceId =
     | "hw-mouse"
@@ -78,6 +79,8 @@ export class VirtualInputDevice {
     /** Virtual cursor in guest space; the single owner of the published position. */
     private cursorX = 0;
     private cursorY = 0;
+    private boundsX = 0;
+    private boundsY = 0;
     private boundsW = 1;
     private boundsH = 1;
 
@@ -97,10 +100,12 @@ export class VirtualInputDevice {
         this.notify = notify;
     }
 
-    /** Clamp box for relative motion, in the same space the cursor is published in. */
-    setPointerBounds(width: number, height: number): void {
-        this.boundsW = Math.max(1, width);
-        this.boundsH = Math.max(1, height);
+    /** Clamp box for the cursor, in the guest screen coordinates it is published in. */
+    setPointerBounds(space: PointerSpace): void {
+        this.boundsX = space.x;
+        this.boundsY = space.y;
+        this.boundsW = Math.max(1, space.width);
+        this.boundsH = Math.max(1, space.height);
     }
 
     getCursor(): { x: number; y: number } {
@@ -209,8 +214,8 @@ export class VirtualInputDevice {
     }
 
     setPointerAbsolute(x: number, y: number): void {
-        const nx = Math.max(0, Math.min(this.boundsW, x));
-        const ny = Math.max(0, Math.min(this.boundsH, y));
+        const nx = Math.max(this.boundsX, Math.min(this.boundsX + this.boundsW, x));
+        const ny = Math.max(this.boundsY, Math.min(this.boundsY + this.boundsH, y));
         if (nx === this.cursorX && ny === this.cursorY) return;
         this.cursorX = nx;
         this.cursorY = ny;
@@ -226,8 +231,8 @@ export class VirtualInputDevice {
      * must never swallow motion the guest has not read yet.
      */
     addPointerRelative(dx: number, dy: number, rawDx = dx, rawDy = dy): void {
-        this.cursorX = Math.max(0, Math.min(this.boundsW - 1, this.cursorX + dx));
-        this.cursorY = Math.max(0, Math.min(this.boundsH - 1, this.cursorY + dy));
+        this.cursorX = Math.max(this.boundsX, Math.min(this.boundsX + this.boundsW - 1, this.cursorX + dx));
+        this.cursorY = Math.max(this.boundsY, Math.min(this.boundsY + this.boundsH - 1, this.cursorY + dy));
         const view = this.view;
         if (view) {
             Atomics.add(view, INPUT_INDEX.dinputDX, Math.round(rawDx));

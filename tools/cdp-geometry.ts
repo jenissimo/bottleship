@@ -24,7 +24,7 @@ const CANVAS_GEOMETRY_EXPR = `(() => {
     const gr = (window.__BS__ && window.__BS__.guestResolution) || (styW && styH ? { width: styW, height: styH } : { width: cv.width || 1024, height: cv.height || 768 });
     return {
         rect: { x: r.left, y: r.top, w: r.width, h: r.height },
-        guest: { w: Math.max(1, gr.width), h: Math.max(1, gr.height) },
+        guest: { x: gr.x || 0, y: gr.y || 0, w: Math.max(1, gr.width), h: Math.max(1, gr.height) },
         dpr: window.devicePixelRatio || 1,
     };
 })()`;
@@ -32,8 +32,8 @@ const CANVAS_GEOMETRY_EXPR = `(() => {
 export interface CanvasGeometry {
     /** Canvas bounding box in viewport CSS px — the space CDP Input events use. */
     rect: { x: number; y: number; w: number; h: number };
-    /** Guest surface dimensions in guest px. */
-    guest: { w: number; h: number };
+    /** The part of the guest screen the canvas shows, in guest screen px. */
+    guest: { x: number; y: number; w: number; h: number };
     /** CSS px per guest px, per axis (letterboxing makes them differ). */
     scale: { x: number; y: number };
     dpr: number;
@@ -49,7 +49,10 @@ export async function readCanvasGeometry(session: CdpSession): Promise<CanvasGeo
     return { ...g, scale: { x: g.rect.w / g.guest.w, y: g.rect.h / g.guest.h } };
 }
 
-/** Guest pixel → viewport CSS px (what Input.dispatch* consumes). */
+/** Guest screen pixel → viewport CSS px (what Input.dispatch* consumes). */
 export function guestToClient(geo: CanvasGeometry, gx: number, gy: number): { x: number; y: number } {
-    return { x: geo.rect.x + gx * geo.scale.x, y: geo.rect.y + gy * geo.scale.y };
+    return {
+        x: geo.rect.x + (gx - geo.guest.x) * geo.scale.x,
+        y: geo.rect.y + (gy - geo.guest.y) * geo.scale.y,
+    };
 }
