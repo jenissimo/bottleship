@@ -118,15 +118,21 @@ export async function inLanes<T>(items: readonly T[], lanes: number, run: (item:
 
 export async function writeRamChunks(pending: Map<string, Uint8Array>, store: ChunkStore, compress = true): Promise<Map<string, number>> {
     const sizes = new Map<string, number>();
+    const batch: Array<[string, Uint8Array]> = [];
     await inLanes([...pending], STORE_LANES, async ([hash, bytes]) => {
         const body = compress ? await deflate(bytes) : bytes;
         const file = new Uint8Array(body.byteLength + 1);
         file[0] = compress ? CODEC_DEFLATE_RAW : CODEC_RAW;
         file.set(body, 1);
+        if (store.putMany) { batch.push([hash, file]); return; }
         await store.put(hash, file);
         sizes.set(hash, file.byteLength);
         pending.delete(hash);
     });
+    if (store.putMany && batch.length > 0) {
+        await store.putMany(batch);
+        for (const [hash, file] of batch) { sizes.set(hash, file.byteLength); pending.delete(hash); }
+    }
     return sizes;
 }
 
@@ -186,9 +192,8 @@ export function referencedChunks(manifests: Iterable<RamManifest>): Set<string> 
  */
 export async function collectGarbage(store: ChunkStore, live: Iterable<RamManifest>): Promise<number> {
     const keep = referencedChunks(live);
-    let removed = 0;
-    for (const hash of await store.list()) {
-        if (!keep.has(hash)) { await store.delete(hash); removed++; }
-    }
-    return removed;
+    const dead = (await store.list()).filter(hash => !keep.has(hash));
+    if (store.deleteMany) await store.deleteMany(dead);
+    else for (const hash of dead) await store.delete(hash);
+    return dead.length;
 }

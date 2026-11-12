@@ -1,6 +1,6 @@
 import { System } from '../core/system';
 import { Logger, LogCategory } from '../core/logger';
-import { OpfsChunkStore, sha256Hex } from './chunk-store';
+import { OpfsPackDir, PackedChunkStore, sha256Hex } from './chunk-store';
 import { inLanes, STORE_LANES, writeRamChunks } from './ram';
 import { captureSession, checkSavestate, coverageRefusal, restoreSession, RestoreFailed, type SavestateTarget } from './session';
 import { CaptureRefusal } from './object-codecs';
@@ -146,7 +146,7 @@ const STORAGE_ROOT = ['bottleship', 'savestates'];
 
 const opfsStorage: SavestateStorage = {
     gameDir: (game) => OpfsDir.open([...STORAGE_ROOT, game]),
-    chunks: (game) => OpfsChunkStore.open([...STORAGE_ROOT, game, 'chunks']),
+    chunks: async (game) => PackedChunkStore.open(await OpfsPackDir.open([...STORAGE_ROOT, game, 'chunks'])),
 };
 
 export async function openGameStore(storage: SavestateStorage, game: string): Promise<SlotStore> {

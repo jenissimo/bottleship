@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { MemoryChunkStore, sha256Hex } from "../../src/worker/savestate/chunk-store";
+import { MemoryChunkStore, MemoryPackDir, PackedChunkStore, sha256Hex } from "../../src/worker/savestate/chunk-store";
 import { RAM_CHUNK_SIZE, STORE_LANES, inLanes, readChunk, restoreRam, snapshotRam, writeRamChunks } from "../../src/worker/savestate/ram";
 
 const tick = () => new Promise<void>(r => setTimeout(r, 1));
@@ -130,5 +130,122 @@ describe("savestate store lanes", () => {
         await store.delete(snap.manifest.chunks[10]![1]);
         const err = await restoreRam(new Uint8Array(mem.length), snap.manifest, store).catch(e => e as Error);
         expect((err as Error).message).toContain("is missing");
+    });
+});
+
+describe("packed chunk store", () => {
+    const packsOf = (dir: MemoryPackDir) => [...dir.files.keys()].filter(n => n.endsWith(".pack"));
+
+    test("one save is one pack and one index; has, size and list need no file access; a reopened store reads the same chunks", async () => {
+        const dir = new MemoryPackDir();
+        const store = await PackedChunkStore.open(dir);
+        const pending = await chunks(40);
+        const originals = new Map([...pending].map(([h, b]) => [h, b.slice()]));
+        const sizes = await writeRamChunks(pending, store);
+        expect(pending.size).toBe(0);
+        expect(dir.writes).toBe(2);
+        expect(packsOf(dir).length).toBe(1);
+        dir.reads = 0;
+        for (const [hash, size] of sizes) {
+            expect(await store.has(hash)).toBe(true);
+            expect(await store.size(hash)).toBe(size);
+        }
+        expect((await store.list()).sort()).toEqual([...originals.keys()].sort());
+        expect(dir.reads).toBe(0);
+
+        const again = await PackedChunkStore.open(dir);
+        expect((await again.list()).sort()).toEqual([...originals.keys()].sort());
+        for (const [hash, bytes] of originals) expect(Buffer.from(await readChunk(again, hash, RAM_CHUNK_SIZE)).equals(Buffer.from(bytes))).toBe(true);
+
+        await writeRamChunks(new Map(originals), again);
+        expect(packsOf(dir).length).toBe(1);
+        const more = await chunks(45);
+        for (const hash of originals.keys()) more.delete(hash);
+        expect(more.size).toBe(5);
+        await writeRamChunks(more, again);
+        expect(packsOf(dir).length).toBe(2);
+    });
+
+    test("a snapshot written to a packed store restores to the same memory", async () => {
+        const mem = new Uint8Array(24 * RAM_CHUNK_SIZE);
+        for (let c = 0; c < 24; c++) if (c % 4) for (let k = 0; k < RAM_CHUNK_SIZE; k += 53) mem[c * RAM_CHUNK_SIZE + k] = (c * 11 + k) & 0xff || 1;
+        const store = await PackedChunkStore.open(new MemoryPackDir());
+        const snap = snapshotRam(mem, new Set(await store.list()));
+        await writeRamChunks(snap.pending, store);
+        const fresh = new Uint8Array(mem.length).fill(0x77);
+        await restoreRam(fresh, snap.manifest, store);
+        expect(Buffer.from(fresh).equals(Buffer.from(mem))).toBe(true);
+        const second = snapshotRam(mem, new Set(await store.list()));
+        expect(second.pending.size).toBe(0);
+    });
+
+    test("deleting: a pack that keeps most of its chunks only gets a new index, one that keeps few is rewritten, an empty one goes away", async () => {
+        const dir = new MemoryPackDir();
+        const store = await PackedChunkStore.open(dir);
+        const pending = await chunks(20);
+        const hashes = [...pending.keys()];
+        const originals = new Map([...pending].map(([h, b]) => [h, b.slice()]));
+        await writeRamChunks(pending, store);
+        const first = packsOf(dir)[0]!;
+        await store.deleteMany!(hashes.slice(0, 4));
+        expect(packsOf(dir)).toEqual([first]);
+        expect((await store.list()).length).toBe(16);
+        expect(await store.get(hashes[0]!)).toBeNull();
+        expect((await (await PackedChunkStore.open(dir)).list()).length).toBe(16);
+
+        await store.deleteMany!(hashes.slice(4, 17));
+        expect(packsOf(dir).length).toBe(1);
+        expect(packsOf(dir)[0]).not.toBe(first);
+        const kept = hashes.slice(17);
+        for (const reopened of [store, await PackedChunkStore.open(dir)]) {
+            expect((await reopened.list()).sort()).toEqual(kept.slice().sort());
+            for (const hash of kept) expect(Buffer.from(await readChunk(reopened, hash, RAM_CHUNK_SIZE)).equals(Buffer.from(originals.get(hash)!))).toBe(true);
+        }
+        await store.deleteMany!(kept);
+        expect(dir.files.size).toBe(0);
+    });
+
+    test("leftovers are cleaned at open: a pack without an index, an index without its pack, a broken index; loose chunk files of the old layout still read and delete", async () => {
+        const dir = new MemoryPackDir();
+        const store = await PackedChunkStore.open(dir);
+        const pending = await chunks(3);
+        const hashes = [...pending.keys()];
+        await writeRamChunks(pending, store);
+        const pack = packsOf(dir)[0]!;
+        dir.files.set("pabc-1.pack", new Uint8Array(10));
+        dir.files.set("pabc-2.pack.idx", new TextEncoder().encode(JSON.stringify({ v: 1, pack: "pabc-2.pack", chunks: [] })));
+        dir.files.set("pabc-3.pack", new Uint8Array(4));
+        dir.files.set("pabc-3.pack.idx", new TextEncoder().encode("{not json"));
+        const loose = await sha256Hex(new Uint8Array([1, 2, 3]));
+        dir.files.set(loose, new Uint8Array([0, 1, 2, 3]));
+        const reopened = await PackedChunkStore.open(dir);
+        expect([...dir.files.keys()].sort()).toEqual([loose, pack, pack + ".idx"].sort());
+        expect((await reopened.list()).sort()).toEqual([...hashes, loose].sort());
+        expect(await reopened.size(loose)).toBe(4);
+        expect([...(await reopened.get(loose))!]).toEqual([0, 1, 2, 3]);
+        await reopened.putMany!([[loose, new Uint8Array([9])]]);
+        expect(packsOf(dir)).toEqual([pack]);
+        await reopened.delete(loose);
+        expect(dir.files.has(loose)).toBe(false);
+    });
+
+    test("fifty saves and collections leave only what the last manifest names", async () => {
+        const dir = new MemoryPackDir();
+        const mem = new Uint8Array(8 * RAM_CHUNK_SIZE);
+        let last: ReturnType<typeof snapshotRam> | null = null;
+        for (let round = 0; round < 50; round++) {
+            for (let c = 0; c < 8; c++) mem[c * RAM_CHUNK_SIZE + 5] = (round % 3 === 0 || c < 2) ? round + 1 : mem[c * RAM_CHUNK_SIZE + 5]! || 1;
+            const store = await PackedChunkStore.open(dir);
+            last = snapshotRam(mem, new Set(await store.list()));
+            await writeRamChunks(last.pending, store);
+            const dead = (await store.list()).filter(h => !last!.manifest.chunks.some(([, x]) => x === h));
+            await store.deleteMany!(dead);
+        }
+        const store = await PackedChunkStore.open(dir);
+        expect((await store.list()).sort()).toEqual([...new Set(last!.manifest.chunks.map(([, h]) => h))].sort());
+        const fresh = new Uint8Array(mem.length);
+        await restoreRam(fresh, last!.manifest, store);
+        expect(Buffer.from(fresh).equals(Buffer.from(mem))).toBe(true);
+        expect(packsOf(dir).length).toBeLessThan(12);
     });
 });
