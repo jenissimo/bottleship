@@ -299,6 +299,19 @@ describe('everything else still sees the bits', () => {
     });
 });
 
+describe('a section whose bits cannot be read', () => {
+    test('the deferred mirror shows the bitmap\'s last image instead of leaving the DC as it was', () => {
+        const bmp = dibSection(4, 2, 32);
+        guestWrite(4, 32, 1, 0, [40, 50, 60]);
+        const mem = memoryDc(4, 2);
+        ctxOf(mem).fillStyle = 'rgb(9, 9, 9)'; ctxOf(mem).fillRect(0, 0, 4, 2);
+        gdi.selectObject(mem, bmp);
+        (system.process as any).v86 = {};
+        expect(gdi.getPixel(mem, 1, 0)).toBe(0x003C3228);
+        expect(gdi.getPixel(mem, 3, 1)).toBe(0);
+    });
+});
+
 describe('the window side of the frame', () => {
     test('the retained client image is a read-back canvas like the DC it is copied from', () => {
         const W = 8, H = 4, HWND = 0x10001;

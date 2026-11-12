@@ -1556,13 +1556,20 @@ export class GDIContext {
         for (const [dc, bmp] of stale) if (bmp === hbitmap) pending.push(dc);
         for (const dc of pending) stale.delete(dc);
         const pixels = this.refreshDibSectionCanvas(hbitmap);
-        if (!pixels) return;
         const bitmapDC = this.bitmapDCCache.get(hbitmap);
+        const bitmapCtx = bitmapDC !== undefined ? this.contexts.peek(bitmapDC) : undefined;
         for (const dc of pending) {
             if (dc === bitmapDC || this.hdcStates.get(dc)?.hBitmap !== hbitmap) continue;
             const ctx = this.contexts.peek(dc);
             if (!ctx) continue;
-            ctx.putImageData(new (ImageData as any)(pixels.data, pixels.width, pixels.height), 0, 0);
+            if (pixels) {
+                ctx.putImageData(new (ImageData as any)(pixels.data, pixels.width, pixels.height), 0, 0);
+            } else if (bitmapCtx) {
+                // The bits could not be read: show the bitmap's last known image, as the
+                // select itself did when its refresh came back empty.
+                ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+                ctx.drawImage(bitmapCtx.canvas, 0, 0);
+            }
             this.invalidateImageDataCache(dc);
         }
     }
