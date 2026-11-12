@@ -73,6 +73,13 @@ export interface DInputBufferState {
     gamepad: DInputBufferLane;
 }
 
+export interface CursorState {
+    x: number;
+    y: number;
+    movedX: number;
+    movedY: number;
+}
+
 /** @deprecated use DInputBufferedEvent */
 export type DInputMouseEvent = DInputBufferedEvent;
 
@@ -1572,6 +1579,18 @@ export class InputManager {
         this.keyStates[0x02] = (buttons & 2) ? 0x80 : 0x00;
         this.keyStates[0x04] = (buttons & 4) ? 0x80 : 0x00;
         this.lastSeq = -1;
+    }
+
+    captureCursor(): CursorState {
+        return { x: this.currentMouseX, y: this.currentMouseY, movedX: this.lastMouseX, movedY: this.lastMouseY };
+    }
+
+    restoreCursor(s: CursorState): void {
+        this.commitCursorPosition(s.x | 0, s.y | 0);
+        this.lastMouseX = s.movedX | 0;
+        this.lastMouseY = s.movedY | 0;
+        this.lastSabMouseX = this.inputView?.[INPUT_INDEX.mouseX] ?? 0;
+        this.lastSabMouseY = this.inputView?.[INPUT_INDEX.mouseY] ?? 0;
     }
 
     captureDInputBuffers(): DInputBufferState {

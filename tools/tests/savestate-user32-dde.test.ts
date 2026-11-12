@@ -136,12 +136,12 @@ describe("user32 DDE in the user32-input participant", () => {
     test("every saved DDE field reaches the capture and survives a restore", () => {
         used();
         const base = structuredClone(capture());
-        const values: Omit<User32InputState, "windowProperties" | "heldKeys" | "heldButtons"> = {
+        const values: Omit<User32InputState, "windowProperties" | "heldKeys" | "heldButtons" | "cursor"> = {
             nextDdeInstance: 9, nextDdeStringHandle: 12, nextDdeConv: 5,
             ddeStrings: [[7, "Other"]], ddeServices: [["other", [4, 6]]], ddeLastError: [[4, DMLERR_DLL_USAGE]], ddeClientOnly: [6],
             ddeInstances: [4, 6], ddeConversations: [0xd0000003, 0xd0000004],
         };
-        expect(Object.keys({ ...values, windowProperties: [], heldKeys: [], heldButtons: 0 }).sort()).toEqual(Object.keys(base).sort());
+        expect(Object.keys({ ...values, windowProperties: [], heldKeys: [], heldButtons: 0, cursor: 0 }).sort()).toEqual(Object.keys(base).sort());
         for (const [field, value] of Object.entries(values) as Array<[keyof User32InputState, unknown]>) {
             expect({ field, same: bytes(value) === bytes(base[field]) }).toEqual({ field, same: false });
             session();
