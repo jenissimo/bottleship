@@ -2956,7 +2956,10 @@ class OpfsOverlay {
                     clearTimeout(staleWriter.flushTimer);
                     staleWriter.flushTimer = null;
                 }
-                try { await staleWriter.writer?.close(); } catch {}
+                // Bytes below the new EOF may still exist only in the write buffer.
+                await this.flushWriteBuffer(staleWriter);
+                await staleWriter.queue;
+                await staleWriter.writer?.close();
             }
             this.closeSyncHandle(path);
             const handle = await this.getFileHandle(path, true);

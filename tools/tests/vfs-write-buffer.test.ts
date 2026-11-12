@@ -145,6 +145,23 @@ describe("F6 — writeFileSync does not drop a buffered run behind an in-flight 
         expect(Array.from(fake!.data.subarray(16))).toEqual(new Array(16).fill(0x11));
     });
 
+    test("SetEndOfFile right after WriteFile keeps the still-buffered bytes", async () => {
+        // A freshly created file, written and then cut at its own length before any flush:
+        // the bytes exist only in the writer's memory buffer when the truncate runs.
+        // (Rise of Nations saves LoadTiming.xml this way; it came back as 101 zero bytes.)
+        const { vfs, root } = await freshVfs();
+        const path = "C:\\Saved.xml";
+        const h = vfs.openSync(path, GENERIC_WRITE, CREATE_ALWAYS)!;
+        const text = new TextEncoder().encode("<?xml version=\"1.0\"?>\r\n<ROOT/>\r\n");
+        vfs.writeSync(h, text);
+        await vfs.truncateAt(path, text.length);
+        await vfs.flushAll();
+
+        const fake = findFakeByName(root, "Saved.xml");
+        expect(fake!.data.length).toBe(text.length);
+        expect(new TextDecoder().decode(fake!.data)).toBe("<?xml version=\"1.0\"?>\r\n<ROOT/>\r\n");
+    });
+
     test("a scattered write while a flush is in flight keeps the earlier run", async () => {
         const { vfs, root } = await freshVfs();
         const h = vfs.openSync("C:\\out.bin", GENERIC_WRITE, CREATE_ALWAYS)!;
@@ -218,4 +235,46 @@ describe("F7 — writeFile does not clear bytes appended during its awaits", () 
         expect(fake!.data.length).toBe(big.length + tail.length);
         expect(Array.from(fake!.data.subarray(big.length))).toEqual([0xde, 0xad, 0xbe, 0xef]);
     });
+});
+
+for (const size of [2, 4, 8]) {
+    test(`buffered data below EOF survives setting size ${size} and reopening`, async () => {
+        const { vfs, root, gameId } = await freshVfs();
+        const path = "C:\\Keep.bin";
+        const h = vfs.openSync(path, GENERIC_WRITE, CREATE_ALWAYS)!;
+        vfs.writeSync(h, new Uint8Array([1, 2, 3, 4]));
+        await vfs.truncateAt(path, size);
+        const file = findFakeByName(root, "Keep.bin")!;
+        expect(file.data.length).toBe(size);
+        expect([...file.data.subarray(0, Math.min(size, 4))]).toEqual([1, 2, 3, 4].slice(0, size));
+        const reopened = new VirtualFileSystem();
+        reopened.mountRom(null as unknown as ZipArchive, "rom", new Map());
+        await reopened.initOverlay(gameId);
+        await reopened.ensureOverlayIndex();
+        const input = await reopened.open(path, GENERIC_READ, OPEN_EXISTING);
+        expect(input).not.toBeNull();
+        expect([...(await reopened.read(input!, size)).subarray(0, Math.min(size, 4))]).toEqual([1, 2, 3, 4].slice(0, size));
+    });
+}
+
+test("a failed buffer flush rejects SetEndOfFile before committing a truncate", async () => {
+    const { vfs, root } = await freshVfs();
+    const path = "C:\\Failure.bin";
+    const h = vfs.openSync(path, GENERIC_WRITE, CREATE_ALWAYS)!;
+    vfs.writeSync(h, new Uint8Array([1, 2, 3, 4]));
+    await vfs.flushAll();
+    const next = vfs.openSync(path, GENERIC_WRITE, OPEN_EXISTING)!;
+    vfs.writeSync(next, new Uint8Array([9, 9]));
+    const entry = writerEntry(vfs, path)! as unknown as { writer: unknown; memoryBuffer: Uint8Array };
+    let closed = false;
+    entry.writer = {
+        seek: async () => { throw new Error("write refused"); },
+        close: async () => { closed = true; },
+    };
+    await expect(vfs.truncateAt(path, 2)).rejects.toThrow("write refused");
+    expect([...findFakeByName(root, "Failure.bin")!.data]).toEqual([1, 2, 3, 4]);
+    expect(closed).toBe(false);
+    // Retire the injected writer before its cleanup timer can run.
+    const overlay = (vfs as any).overlay;
+    overlay.writerCache.delete(path.toLowerCase());
 });
