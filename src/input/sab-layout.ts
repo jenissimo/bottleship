@@ -5,7 +5,7 @@
 //
 // Plain leaf module: no DOM, no worker imports, so it is unit-testable directly.
 
-/** Bytes. 1024 B = 256 Int32 slots; slots 0..34 are defined, the rest are spare. */
+/** Bytes. 1024 B = 256 Int32 slots; slots 0..34 and 64..191 (KEY_TEXT) are defined, the rest are spare. */
 export const INPUT_BUFFER_SIZE = 1024;
 
 export const INPUT_INDEX = {
@@ -56,6 +56,23 @@ export const KEY_BITFIELD_COUNT = 8;
  */
 export const GUEST_POLLED_KEYS_BASE = 25;
 export const GUEST_POLLED_KEYS_COUNT = 8;
+
+/**
+ * The character each key's latest press typed on the HOST layout, one UTF-16 unit per
+ * VK (host → worker). The keyboard bitfield says which key is down; only the host knows
+ * what that press types — AltGr+Q is '@' on a German keyboard, Shift+2 is '"'. Written
+ * before the press is published, read when the guest translates the key-down.
+ */
+export const KEY_TEXT_BYTE_OFFSET = 256;
+export const KEY_TEXT_COUNT = 256;
+/** The producer does not know what the press types: the guest falls back to its own table. */
+export const KEY_TEXT_UNKNOWN = 0;
+/** The press types nothing (a dead key). */
+export const KEY_TEXT_NONE = 0xffff;
+
+export function keyTextView(inputView: Int32Array): Uint16Array {
+    return new Uint16Array(inputView.buffer, inputView.byteOffset + KEY_TEXT_BYTE_OFFSET, KEY_TEXT_COUNT);
+}
 
 /** Guest input reads that identify a device rather than a key. */
 export const GUEST_INPUT_FLAG = {
