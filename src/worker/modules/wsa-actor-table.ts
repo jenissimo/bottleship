@@ -1,4 +1,4 @@
-import { WsaSocketTable, WsaFailure, WsaOwnedSocketOutcomeUnknown, WsaUdpReceiveFailure, WSA, type WsaAddress, type WsaNativeIoLease, type WsaIoPurpose } from "./wsa-network";
+import { WsaSocketTable, WsaFailure, WsaOwnedSocketOutcomeUnknown, WsaUdpReceiveFailure, WSA, type WsaAddress, type WsaNativeIoLease, type WsaIoPurpose, type WsaEventTarget, type WsaEventNotifier, type WsaIdleDatagram, type WsaDatagramRestore } from "./wsa-network";
 import type { LanNetwork } from "../net/lan-network";
 import { TCP_SEGMENT } from "../net/netplay-wire";
 import { WSA_ACTOR_MAILBOX_BYTES, WSA_ACTOR_HEADER_BYTES, WSA_ACTOR_PENDING, WSA_ACTOR_DONE, WSA_ACTOR_ERROR, WSA_ACTOR_CANCELLED, WSA_ACTOR_EXECUTING,
@@ -168,9 +168,27 @@ export function createWsaActorTable(network: LanNetwork, initialBoot: WsaActorCl
         hasFileObject(objectId: number) { try { return !!call("hasFileObject", [objectId], [], true); } catch { return false; } },
         get, subscribe(callback:()=>void) { listeners.add(callback); return () => listeners.delete(callback); },
         reset() { try { if (!closed) call("reset", []); } catch { closed = true; /* A retired guest has already released its references. */ } finally { generation++; notifications.clear(); properties.clear(); nativeProperties.clear(); changed(); } },
-        configureEvents(socket:number, mask:number, notify?:(bit:number,error:number)=>void) {
+        configureEvents(socket:number, mask:number, notify?:(bit:number,error:number)=>void, target?:WsaEventTarget) {
             if (notify) notifications.set(socket, notify); else notifications.delete(socket);
-            call("configureEvents", [socket, mask]);
+            call("configureEvents", [socket, mask, notify ? target : undefined]);
+        },
+        restoreIdleDatagrams(items:WsaIdleDatagram[], notifierFor:(socket:number,target:WsaEventTarget)=>WsaEventNotifier):WsaDatagramRestore {
+            const created:number[]=[];
+            for (const item of items) {
+                try {
+                    const handle=call("restoreDatagram",[item]) as number;
+                    created.push(handle);
+                    if (item.config.events.target) notifications.set(handle, notifierFor(handle, item.config.events.target));
+                } catch (error) {
+                    for (const handle of created) {
+                        notifications.delete(handle); properties.delete(handle); nativeProperties.delete(handle);
+                        try { call("discardDatagram",[handle]); } catch { continue; }
+                    }
+                    return { failed: { handle: item?.handle, error: error instanceof WsaFailure ? error.code : WSA.ENOBUFS } };
+                }
+            }
+            changed();
+            return { failed: null };
         },
         duplicate(socket:number,targetPid:number) { return call("duplicate",[socket,targetPid]); },
         importDuplicate(reservedHandle:number) { return call("import",[reservedHandle]); },

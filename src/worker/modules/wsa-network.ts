@@ -71,7 +71,7 @@ export class WsaUdpReceiveFailure extends WsaFailure {
 type UdpReceiveRecord = WsaPacket | { kind: "error"; from?: WsaAddress };
 interface UdpReceiveQueue { records: UdpReceiveRecord[]; dataCount: number; errorCount: number; }
 export interface WsaPacket { data: Uint8Array; from: WsaAddress; truncated?: boolean; ipxHeader?: Uint8Array; }
-interface SocketState {
+export interface SocketState {
     id: number; wireId: number; af: number; type: number; protocol: number;
     acceptListener?: number; acceptListenerObjectId?: number; originalLocal?: WsaAddress | null; connectContextPending: boolean; connectExCompleted?: boolean; disconnected: boolean; connectedAt: number;
     nonBlocking: boolean; overlapped: boolean; handleFlags: number; local: WsaAddress | null; peer: WsaAddress | null;
@@ -88,12 +88,37 @@ interface SocketState {
     broadcast: boolean; reuse: boolean; packetType: number; filterPacketType: number | null; receiveBroadcast: boolean; receiveLimit: number; sendLimit: number;
     receiveTimeout: number; sendTimeout: number; lingerEnabled: boolean; lingerSeconds: number;
     eventMask: number; eventPending: number; eventErrors: number[];
-    eventDisabled: number; notify?: (bit: number, error: number) => void;
+    eventDisabled: number; notify?: (bit: number, error: number) => void; eventTarget?: WsaEventTarget;
 }
+export type WsaEventTarget = { kind: "window"; hwnd: number; message: number } | { kind: "event"; handle: number };
+const u32 = (value: unknown): value is number => typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
+export function validWsaEventTarget(target: unknown): target is WsaEventTarget {
+    if (!target || typeof target !== "object") return false;
+    const item = target as Record<string, unknown>;
+    if (item.kind === "window") return Object.keys(item).length === 3 && u32(item.hwnd) && u32(item.message) && item.hwnd !== 0 && item.message !== 0;
+    return item.kind === "event" && Object.keys(item).length === 2 && u32(item.handle) && item.handle !== 0;
+}
+export const WSA_DATAGRAM_OPTION_KEYS = [
+    "broadcast", "reuse", "receiveLimit", "sendLimit", "receiveTimeout", "sendTimeout", "lingerEnabled", "lingerSeconds",
+    "keepAlive", "noDelay", "udpConnReset", "v6Only", "oobInline", "extendedAddress", "receiveHeader", "headerInclude",
+    "ipTtl", "ipTos", "ipOptionsChanged", "multicastInterface", "multicastTtl", "multicastLoop", "packetType",
+    "filterPacketType", "receiveBroadcast",
+] as const satisfies readonly (keyof SocketState)[];
+export type WsaDatagramOptions = Pick<SocketState, typeof WSA_DATAGRAM_OPTION_KEYS[number]>;
+export interface WsaDatagramBinding { kind: "wildcard" | "loopback" | "own"; port: number; address: number[] | null; }
+export interface WsaDatagramConfig {
+    af: number; type: number; protocol: number; nonBlocking: boolean; overlapped: boolean;
+    binding: WsaDatagramBinding | null; options: WsaDatagramOptions;
+    events: { mask: number; disabled: number; target: WsaEventTarget | null };
+}
+export interface WsaIdleDatagram { handle: number; handleFlags: number; config: WsaDatagramConfig; }
+export type WsaDatagramInspection = { refusal: string } | { config: WsaDatagramConfig };
+export interface WsaDatagramRestore { failed: { handle: number; error: number } | null; }
+export type WsaEventNotifier = (bit: number, error: number) => void;
 interface Binding { port: number; proto: number; endpoint: LanEndpoint; sockets: Set<number>; }
 export const FD_READ = 1, FD_WRITE = 2, FD_OOB = 4, FD_ACCEPT = 8, FD_CONNECT = 16, FD_CLOSE = 32;
 
-export interface WsaOpenForSavestate { count: number; open: string[]; nextHandle: number; }
+export interface WsaOpenForSavestate { count: number; open: string[]; nextHandle: number; idle: WsaIdleDatagram[]; }
 export function describeWsaSocket(handle: number, s: { af: number; type: number; state: string; local: WsaAddress | null }): string {
     const kind = s.af === 6 ? "IPX" : s.type === 1 ? "TCP" : s.type === 2 ? "UDP" : "RAW";
     const port = s.local ? ` port ${s.local.port}` : "";
@@ -247,8 +272,102 @@ export class WsaSocketTable {
     }
     get generation(): number { return this.epoch; }
     openForSavestate(): WsaOpenForSavestate {
-        const open = [...this.sockets.values()].map(s => describeWsaSocket(s.id, s));
-        return { count: open.length, open: open.slice(0, 8), nextHandle: this.nextId };
+        const open: string[] = [], idle: WsaIdleDatagram[] = [];
+        for (const s of this.sockets.values()) {
+            const found = this.inspectDatagram(s.id);
+            if ("refusal" in found) open.push(`${describeWsaSocket(s.id, s)}: ${found.refusal}`);
+            else idle.push({ handle: s.id, handleFlags: s.handleFlags, config: found.config });
+        }
+        return { count: open.length, open: open.slice(0, 8), nextHandle: this.nextId, idle };
+    }
+    inspectDatagram(sid: number): WsaDatagramInspection {
+        const s = this.get(sid);
+        if (s.type !== 2) return { refusal: "is not a datagram socket" };
+        if (s.state !== "new" || s.peer || s.disconnected || s.connectTimer || s.connectContextPending || s.connectExCompleted ||
+            s.originalLocal !== undefined || s.acceptListener !== undefined || s.acceptListenerObjectId !== undefined || s.pending.length) return { refusal: "has been connected" };
+        if (s.packets.length || s.chunks.length || s.available || this.udpReceiveQueues.has(s.id) || s.oob !== null || s.oobPending.length ||
+            s.urgentMark !== null || s.offset || s.readPosition) return { refusal: "holds received data" };
+        if (s.error || s.pendingError || s.eventPending || s.eventErrors.some(Boolean) || s.writeBlocked) return { refusal: "has a pending error or event" };
+        if (s.readShutdown || s.writeShutdown || s.eof) return { refusal: "was shut down" };
+        if (this.multicastMemberships.has(s.id)) return { refusal: "has a multicast membership" };
+        if (this.nativeListeners.has(s)) return { refusal: "has a native listener" };
+        if (s.eventMask && !validWsaEventTarget(s.eventTarget)) return { refusal: "has an event selection" };
+        let binding: WsaDatagramBinding | null = null;
+        if (s.local) {
+            const ip = s.af === 2 ? s.local.ip : s.af === 23 ? s.local.ip6 : undefined;
+            if (s.af === 6) binding = { kind: "wildcard", port: s.local.port, address: null };
+            else if (!ip) return { refusal: "is bound to an address that cannot be recreated" };
+            else if (zeros(ip)) binding = { kind: "wildcard", port: s.local.port, address: null };
+            else if (s.af === 2 ? ip[0] === 127 : ip.subarray(0, 15).every(v => !v) && ip[15] === 1) binding = { kind: "loopback", port: s.local.port, address: [...ip] };
+            else if (same(ip, s.af === 2 ? this.network.ipv4 : this.network.ipv6)) binding = { kind: "own", port: s.local.port, address: null };
+            else return { refusal: "is bound to an address that cannot be recreated" };
+        }
+        const options = {} as Record<string, unknown>;
+        for (const key of WSA_DATAGRAM_OPTION_KEYS) options[key] = s[key];
+        return { config: {
+            af: s.af, type: s.type, protocol: s.protocol, nonBlocking: s.nonBlocking, overlapped: s.overlapped, binding,
+            options: options as WsaDatagramOptions,
+            events: { mask: s.eventMask, disabled: s.eventDisabled, target: s.eventMask && s.eventTarget ? { ...s.eventTarget } : null },
+        } };
+    }
+    restoreDatagram(config: WsaDatagramConfig, id?: number): number {
+        const bad = () => fail(WSA.EINVAL);
+        if (!config || config.type !== 2 || typeof config.nonBlocking !== "boolean" || typeof config.overlapped !== "boolean" ||
+            !config.options || !config.events || !u32(config.events.mask) || (config.events.mask & ~0x3f) ||
+            !u32(config.events.disabled) || (config.events.disabled & ~0x3f)) bad();
+        if (config.events.mask ? !validWsaEventTarget(config.events.target) : config.events.target !== null) bad();
+        const binding = config.binding;
+        if (binding) {
+            if (!["wildcard", "loopback", "own"].includes(binding.kind) || !Number.isInteger(binding.port) || binding.port < 1 || binding.port > 65535) bad();
+            if (binding.kind === "loopback" ? !Array.isArray(binding.address) || binding.address.length !== (config.af === 2 ? 4 : 16) ||
+                binding.address.some(v => !Number.isInteger(v) || v < 0 || v > 255) || (config.af === 6) : binding.address !== null) bad();
+        }
+        if (id !== undefined && (!u32(id) || id < 0x10000000 || this.sockets.has(id))) fail(WSA.EINVAL);
+        const resume = this.nextId;
+        if (id !== undefined) this.nextId = id;
+        let sid: number;
+        try { sid = this.socket(2, config.af, config.protocol); }
+        finally { if (id !== undefined) this.nextId = Math.max(resume, id + 1); }
+        try {
+            const s = this.get(sid);
+            for (const key of WSA_DATAGRAM_OPTION_KEYS) {
+                const value = (config.options as Record<string, unknown>)[key], current = s[key];
+                if (typeof value !== typeof current && !(key === "filterPacketType" && (value === null || typeof value === "number"))) bad();
+                (s as unknown as Record<string, unknown>)[key] = value;
+            }
+            s.nonBlocking = config.nonBlocking; s.overlapped = config.overlapped;
+            if (binding) {
+                const wildcard = binding.kind === "wildcard";
+                const address: WsaAddress = { family: s.af, port: binding.port, node: wildcard || binding.kind === "loopback" ? new Uint8Array(6) : this.network.node.slice() };
+                if (s.af === 2) address.ip = wildcard ? new Uint8Array(4) : binding.kind === "own" ? this.network.ipv4.slice() : Uint8Array.from(binding.address!);
+                if (s.af === 23) address.ip6 = wildcard ? new Uint8Array(16) : binding.kind === "own" ? this.network.ipv6.slice() : Uint8Array.from(binding.address!);
+                this.bind(sid, address);
+            }
+            s.eventMask = config.events.mask; s.eventDisabled = config.events.disabled;
+            s.eventTarget = config.events.target ? { ...config.events.target } : undefined;
+        } catch (error) {
+            this.closesocket(sid);
+            throw error;
+        }
+        this.changed();
+        return sid;
+    }
+    restoreIdleDatagrams(items: WsaIdleDatagram[], notifierFor: (socket: number, target: WsaEventTarget) => WsaEventNotifier): WsaDatagramRestore {
+        const created: number[] = [];
+        for (const item of items) {
+            try {
+                if (!item || !u32(item.handle) || !u32(item.handleFlags) || (item.handleFlags & ~3)) fail(WSA.EINVAL);
+                const sid = this.restoreDatagram(item.config, item.handle);
+                created.push(sid);
+                const s = this.get(sid);
+                s.handleFlags = item.handleFlags;
+                if (s.eventTarget) s.notify = notifierFor(sid, s.eventTarget);
+            } catch (error) {
+                for (const sid of created) { this.get(sid).handleFlags = 1; this.closesocket(sid); }
+                return { failed: { handle: item?.handle, error: error instanceof WsaFailure ? error.code : WSA.ENOBUFS } };
+            }
+        }
+        return { failed: null };
     }
     advanceHandles(next: number): void {
         if (Number.isInteger(next) && next > this.nextId && next <= 0x80000000) this.nextId = next;
@@ -619,7 +738,7 @@ export class WsaSocketTable {
         const child = this.get(id);
         child.nonBlocking = s.nonBlocking;
         child.eventMask = s.eventMask;
-        child.notify = s.notify;
+        child.notify = s.notify; child.eventTarget = s.eventTarget;
         this.refreshEvents(s);
         return id;
     }
@@ -638,7 +757,7 @@ export class WsaSocketTable {
         }
         this.sockets.delete(accepted); this.wireSockets.delete(old.wireId);
         socket.id = target; socket.originalLocal = old.local; socket.nonBlocking = old.nonBlocking; socket.overlapped = old.overlapped;
-        socket.eventMask = old.eventMask; socket.notify = old.notify;
+        socket.eventMask = old.eventMask; socket.notify = old.notify; socket.eventTarget = old.eventTarget;
         socket.eventPending = 0; socket.eventDisabled = 0; socket.eventErrors.fill(0);
         this.sockets.set(target, socket); this.changed();
     }
@@ -665,7 +784,7 @@ export class WsaSocketTable {
             const refs = this.bindingRefs.get(socket);
             if (refs) { this.bindingRefs.set(replacement, refs); this.bindingRefs.delete(socket); }
         }
-        replacement.eventMask = socket.eventMask; replacement.notify = socket.notify;
+        replacement.eventMask = socket.eventMask; replacement.notify = socket.notify; replacement.eventTarget = socket.eventTarget;
         this.sockets.set(sid, replacement); this.changed();
     }
     deferAccepted(listener: number, child: number): void {
@@ -1123,9 +1242,10 @@ export class WsaSocketTable {
             return s.available || (this.udpReceiveQueues.get(s.id)?.records.length ? 1 : 0);
         return s.type !== 1 ? (s.packets[0]?.data.length ?? 0) + (s.receiveHeader && s.packets[0]?.ipxHeader ? 30 : 0) : s.available;
     }
-    configureEvents(sid: number, mask: number, notify?: (bit: number, error: number) => void): void {
+    configureEvents(sid: number, mask: number, notify?: (bit: number, error: number) => void, target?: WsaEventTarget): void {
         const s = this.get(sid);
         s.eventMask = mask; s.eventPending = 0; s.eventDisabled = 0; s.eventErrors.fill(0); s.notify = notify;
+        s.eventTarget = mask && notify && validWsaEventTarget(target) ? { ...target } : undefined;
         if (mask) s.nonBlocking = true;
         this.refreshEvents(s);
     }
