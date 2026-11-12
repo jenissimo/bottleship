@@ -8,7 +8,9 @@ import { applyEncodedPcmLength, inspectEncodedAudio, isMp3, isOgg, refreshSample
 import { playSample, playStream } from "./playback-engine";
 
 // Decoded audio cache - avoids re-decoding same WAV files (significant perf win)
+// @transient(decode cache keyed by the image bytes; a miss decodes again)
 let decodedCache = new Map<string, { data: Float32Array; sampleRate: number; channels: number }>();
+// @transient(size of the decode cache)
 let cacheBytes = 0;
 const MAX_CACHE_BYTES = 32 * 1024 * 1024; // 32MB max
 

@@ -1167,28 +1167,6 @@
   "src/worker/modules/iphlpapi.ts": [
     "ZERO_BLOCK"
   ],
-  "src/worker/modules/mss32/audio-decode.ts": [
-    "cacheBytes",
-    "decodedCache"
-  ],
-  "src/worker/modules/mss32/index.ts": [
-    "EXPORT_CLEANUP"
-  ],
-  "src/worker/modules/mss32/playback-engine.ts": [
-    "ringBuffers"
-  ],
-  "src/worker/modules/mss32/raw-sample-cache.ts": [
-    "cachedBytes",
-    "hits",
-    "images",
-    "misses"
-  ],
-  "src/worker/modules/mss32/sample.ts": [
-    "adpcmRawWarned"
-  ],
-  "src/worker/modules/mss32/stream-engine.ts": [
-    "refillChainInFlight"
-  ],
   "src/worker/modules/msvfw32-mciwnd.ts": [
     "states"
   ],

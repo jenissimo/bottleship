@@ -26,6 +26,8 @@ import { createWavInfoExports } from "./wav-info";
 import { createSequenceExports } from "./sequence";
 import { createMidiDriverExports } from "./midi-driver";
 import { mssCensus, type MssCensus } from "./census";
+import { registerMssSavestate } from "./savestate";
+import { savestatesEnabled } from "../../savestate/participant";
 
 /**
  * Bytes each export pops on return, read from the SAME descriptor the guest stub's
@@ -39,6 +41,7 @@ import { mssCensus, type MssCensus } from "./census";
  * it, so a wrong number here desynchronises the guest stack only on the calls where a
  * refill happened to come due.
  */
+// @transient(a constant table built from the API descriptor)
 const EXPORT_CLEANUP: ReadonlyMap<string, number> = new Map(
     mss32Module.functions.map((fn) => [
         fn.name,
@@ -54,6 +57,7 @@ export class MSS32 implements IModule {
 
     initialize(process: Process): void {
         this.ctx = createMSSContext(process);
+        if (savestatesEnabled()) registerMssSavestate(this.ctx);
 
         // The heartbeat syncs emulator memory with playback state (50Hz / 20ms): EOS
         // detection (samples reaching SMP_DONE), position writeback, and the service
