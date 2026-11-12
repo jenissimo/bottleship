@@ -2105,17 +2105,25 @@ export class Msvcrt implements IModule {
             this.setErrno(9);
             return -1;
         }
-        this.dropFd(fd);
-        return 0;
+        if (this.dropFd(fd)) return 0;
+        this.setErrno(9);
+        return -1;
     }
 
-    private dropFd(fd: number): void {
+    /**
+     * Forget a descriptor and close the Win32 handle behind an `_open_osfhandle` one.
+     * Returns false only when that CloseHandle failed: the CRT then still releases the
+     * descriptor but `_close` reports -1/EBADF and `fclose` EOF. Our std pseudo-handles
+     * (GetStdHandle's 0/1/2) have no resource behind them, so they count as closed.
+     */
+    private dropFd(fd: number): boolean {
         this.fds.delete(fd);
         const h = this.fdHandles.get(fd);
-        if (h === undefined) return;
+        if (h === undefined) return true;
         this.fdHandles.delete(fd);
         if (this.handleFds.get(h) === fd) this.handleFds.delete(h);
-        fileIo.CloseHandle!(null as never, null as never, [h]);
+        const closed = fileIo.CloseHandle!(null as never, null as never, [h]) !== 0;
+        return closed || (h >>> 0) <= 2;
     }
 
     private read(ctx: any, mem: Uint8Array, fd: number, buffer: number, count: number): number | Promise<ThunkResult> {
@@ -3349,7 +3357,7 @@ export class Msvcrt implements IModule {
     private fclose(filePtr: number): number | Promise<ThunkResult> {
         const stream = this.fileStreams.get(filePtr);
         if (!stream) return -1;
-        this.dropFd(stream.fd);
+        const handleClosed = this.dropFd(stream.fd);
         this.fileStreams.delete(filePtr);
         if (stream.bufPtr) { try { this.free(stream.bufPtr); } catch { /* best-effort */ } }
         if (stream.structPtr) { try { this.free(stream.structPtr); } catch { /* best-effort */ } }
@@ -3363,6 +3371,7 @@ export class Msvcrt implements IModule {
                 },
             );
         }
+        if (!handleClosed) { this.setErrno(9); return -1; }
         return 0;
     }
 
