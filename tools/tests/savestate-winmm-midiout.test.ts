@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { decodeValue, encodeValue, type SaveValue } from "../../src/worker/savestate/value-codec";
 import { savestateParticipants, schemaHash } from "../../src/worker/savestate/participant";
+import { newObjectGraph, restoreObjectGraph } from "../../src/worker/savestate/object-codecs";
 import { currentGmBank, loadGmBank, resetGmBankForTests } from "../../src/worker/core/audio/gm-bank";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { System } from "../../src/worker/core/system";
@@ -498,6 +499,36 @@ describe("winmm participant with MIDI output", () => {
         const w = module();
         w.mci = { openDeviceCount: () => 1 };
         expect(() => w.captureSavestate()).toThrow("winmm: open MCI devices are not part of a v1 savestate");
+    });
+
+    test("an open MIDI handle and a queued waveOut completion are saved together and both come back through the participant", async () => {
+        const WOM_DONE = 0x3bd;
+        const w = module();
+        const before = savestateParticipants.all().find(x => x.id === "winmm");
+        expect(call(w, "midiOutOpen", [PHMO, 0xffffffff, 0, 0, 0])).toBe(0);
+        const h = view.getUint32(PHMO, true);
+        call(w, "midiOutShortMsg", [h, msg(0xc1, 40)]);
+        pump();
+        (w.pendingTimerCallbacks as unknown[]).push({ callbackAddr: CALLBACK, timerId: 0x20000001, dwUser: INSTANCE, args: [0x20000001, WOM_DONE, INSTANCE, HDR, 0] });
+        const graph = newObjectGraph();
+        const offSource = w.registerSavestate();
+        const stored = savestateParticipants.all().find(x => x.id === "winmm")!.capture(graph as never);
+        offSource();
+        const inner = w.captureSavestate();
+        expect(inner.waveDone).toEqual([{ callback: CALLBACK, args: [0x20000001, WOM_DONE, INSTANCE, HDR, 0] }]);
+        expect(inner.midiOut!.handles.map(x => x.handle)).toEqual([h]);
+
+        const fresh = module();
+        const offFresh = fresh.registerSavestate();
+        try {
+            await savestateParticipants.all().find(x => x.id === "winmm")!.restore(throughCodec(stored), restoreObjectGraph([], graph.blobs));
+            expect(queued(fresh)).toEqual([[0x20000001, WOM_DONE, INSTANCE, HDR, 0]]);
+            expect(bytes(fresh.captureSavestate())).toBe(bytes(inner));
+            expect(call(fresh, "midiOutShortMsg", [h, msg(0x91, 60, 100)])).toBe(0);
+        } finally {
+            offFresh();
+            if (before) savestateParticipants.add(before);
+        }
     });
 
     test("version 4 with a pinned schema", () => {
