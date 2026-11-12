@@ -13,6 +13,9 @@
  *   late (see dsound-cursor-jittered-pump.test.ts).
  * - A delta pump on a 10 ms cadence (NFSU2) must stream at real time instead of ratcheting
  *   its Locks down (see dsound-cursor-step-cap.test.ts).
+ * - A refill pump (Need for Speed: Porsche Unleashed) polls back to back and every ~50 ms
+ *   rewrites what was played since its last refill, one lap ahead. The bound must stay out
+ *   of its way and every lap must play in order.
  *
  * Simulated end to end against the real methods: getApiCursors for each query,
  * trailRing + writeToLaps for each Unlock, and a worklet consuming the host ring in render
@@ -66,7 +69,7 @@ function rig(fmt: Format, size: number) {
     let raw = 0;
     let playedZeros = 0;
     return {
-        buffer, start, bytesPerMs, ring: RING,
+        ds, buffer, start, bytesPerMs, ring: RING,
         get raw() { return raw; },
         get playedZeros() { return playedZeros; },
         /** The worklet consumes the ring in render bursts up to `to`; zeros played after warm-up are dropouts. */
@@ -204,6 +207,91 @@ describe("dsound: a delta pump with jittered wakes keeps its catch-up headroom",
         // Recorded as one constant Lock size (the typical delta), the bound gets no
         // catch-up headroom: the cursor drifts behind and the writes land a lap late.
         expect(galaxyPump([20, 20, 20, 42], 30_000, 1764).playedZeros).toBeGreaterThan(0);
+    });
+});
+
+/**
+ * Need for Speed: Porsche Unleashed (menu music): 16 kHz stereo s16 in a 25600-byte (400 ms)
+ * looping buffer. It polls GetCurrentPosition back to back (~0.3 ms apart, ~90k/s) and every
+ * ~45-55 ms refills what was played since its last refill, [lastEnd, play) rounded down to
+ * 64 bytes: Locks of ~3.2 KB that vary with the wake, landing one lap ahead.
+ * `recordLock` overrides the Lock size the bound sees (the negative control).
+ */
+function nfs5Pump(opts: { pauseMs: number; durationMs?: number; recordLock?: number }) {
+    const fmt = { rate: 16000, blockAlign: 4 };
+    const size = 25600;
+    const durationMs = opts.durationMs ?? 20_000;
+    const r = rig(fmt, size);
+    let queries = 0, capped = 0;
+    const cap = r.ds.capCursorStep;
+    r.ds.capCursorStep = function (this: unknown, b: unknown, c: unknown, ...rest: unknown[]) {
+        const out = cap.call(this, b, c, ...rest);
+        queries++;
+        if (out !== c) capped++;
+        return out;
+    };
+    // Every lap of the stream carries its own byte value, so a byte the worklet plays from
+    // the wrong lap (a refill that landed late, or one that overwrote the lap being played)
+    // is seen, not just silence.
+    const lapValue = (streamByte: number) => (Math.floor(streamByte / size) % 200) + 1;
+    const ring = new Uint8Array(r.buffer.sab, CTRL_BLOCK_BYTES);
+    r.unlock(0, size, lapValue(0));
+    let stream = size;
+    let written = 0;
+    let wrongBytes = 0;
+    let nextWake = r.start + 50;
+    let wake = 0;
+    let nextPauseAt = r.start + WARMUP_MS;
+    while (clock - r.start < durationMs) {
+        if (opts.pauseMs > 0 && clock >= nextPauseAt) {
+            clock += opts.pauseMs;
+            nextPauseAt += 2000;
+        } else {
+            clock += 0.3;
+        }
+        const played = r.raw;
+        r.advance(clock);
+        if (clock - r.start >= WARMUP_MS) {
+            for (let at = played; at < r.raw; at++) if (ring[at % r.ring] !== lapValue(at)) wrongBytes++;
+        }
+        const { playCursor } = r.cursors();
+        if (clock < nextWake) continue;
+        nextWake = clock + [45, 50, 55, 48][wake++ % 4];
+        const lastEnd = stream % size;
+        const n = Math.floor(((playCursor - lastEnd + size) % size) / 64) * 64;
+        if (n <= 0) continue;
+        // One Lock; its two spans (before and after the buffer end) belong to two laps.
+        const first = Math.min(n, size - lastEnd);
+        r.unlock(lastEnd, first, lapValue(stream), opts.recordLock ?? n);
+        if (n > first) r.unlock(0, n - first, lapValue(stream + first), opts.recordLock ?? n);
+        stream += n;
+        if (clock - r.start >= WARMUP_MS) written += n;
+    }
+    const seconds = (durationMs - WARMUP_MS) / 1000;
+    return { wrongBytes, rate: written / seconds / r.bytesPerMs / 1000, cappedFrac: capped / queries };
+}
+
+describe("dsound: NFS5's refill-what-was-played pump", () => {
+    for (const pauseMs of [0, 100, 250]) {
+        test(`plays every lap in order at real time${pauseMs ? ` across ${pauseMs} ms host pauses` : ""}`, () => {
+            const r = nfs5Pump({ pauseMs });
+            expect(r.wrongBytes).toBe(0);
+            expect(r.rate).toBeGreaterThan(0.98);
+        });
+    }
+
+    test("the step bound never holds its cursor back, even across a 250 ms pause", () => {
+        // Its ~3.2 KB Locks dwarf the advance between its queries, so the Lock-size floor
+        // keeps the bound out of its way.
+        expect(nfs5Pump({ pauseMs: 250 }).cappedFrac).toBe(0);
+    });
+
+    test("negative control: bounded at its query cadence instead, every pause is clipped", () => {
+        expect(nfs5Pump({ pauseMs: 250, recordLock: 64 }).cappedFrac).toBeGreaterThan(0);
+    });
+
+    test("negative control: a stall longer than its lap of runway plays bytes from the wrong lap", () => {
+        expect(nfs5Pump({ pauseMs: 600 }).wrongBytes).toBeGreaterThan(0);
     });
 });
 
