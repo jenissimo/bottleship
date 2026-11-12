@@ -6,42 +6,28 @@ import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { exportContainer, importContainer } from "../../src/worker/runtime/filesystem/save-export";
 import { getContainerDir } from "../../src/worker/runtime/filesystem/container-store";
 
-function notFound(): Error { const e = new Error("nf"); (e as any).name = "NotFoundError"; return e; }
-class FakeFileHandle {
-    kind = "file" as const; data = new Uint8Array(0);
-    constructor(public name: string) {}
-    async getFile() { const d = this.data; return { size: d.length, arrayBuffer: async () => d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength) }; }
-    async createWritable() { const self = this; return { async write(x: any) { self.data = x instanceof Uint8Array ? new Uint8Array(x) : new Uint8Array(x); }, async close() {}, async abort() {} }; }
-}
-class FakeDirHandle {
-    kind = "directory" as const; children = new Map<string, FakeDirHandle | FakeFileHandle>();
-    constructor(public name: string) {}
-    async getDirectoryHandle(name: string, opts?: { create?: boolean }) {
-        let c = this.children.get(name);
-        if (!c) { if (!opts?.create) throw notFound(); c = new FakeDirHandle(name); this.children.set(name, c); }
-        return c as FakeDirHandle;
-    }
-    async getFileHandle(name: string, opts?: { create?: boolean }) {
-        let c = this.children.get(name);
-        if (!c) { if (!opts?.create) throw notFound(); c = new FakeFileHandle(name); this.children.set(name, c); }
-        return c as FakeFileHandle;
-    }
-    async *entries() { yield* this.children.entries(); }
-}
+import { installFakeOpfs, FakeDirHandle } from "./fixtures/fake-opfs";
+import { VirtualFileSystem } from "../../src/worker/runtime/filesystem/vfs";
+import { ZipArchive, BufferSource } from "@bottleship/formats/zip";
+import { buildZip } from "@bottleship/formats/wgb/zip-build";
 
 let root: FakeDirHandle;
 const orig = (globalThis as any).navigator;
-beforeEach(() => { root = new FakeDirHandle(""); (globalThis as any).navigator = { storage: { getDirectory: async () => root } }; });
+beforeEach(() => { root = installFakeOpfs(); });
 afterAll(() => { (globalThis as any).navigator = orig; });
 
 async function seed(gameId: string) {
     const c = await getContainerDir(gameId, true);
     const reg = await c!.getFileHandle("registry.json", { create: true });
-    await (await reg.createWritable()).write(new TextEncoder().encode('{"v":2}'));
+    const regWriter = await reg.createWritable();
+    await regWriter.write(new TextEncoder().encode('{"v":2}'));
+    await regWriter.close();
     const overlay = await c!.getDirectoryHandle("overlay", { create: true });
     const saves = await overlay.getDirectoryHandle("saves", { create: true });
     const slot = await saves.getFileHandle("slot1.sav", { create: true });
-    await (await slot.createWritable()).write(new Uint8Array([1, 2, 3, 4, 5]));
+    const slotWriter = await slot.createWritable();
+    await slotWriter.write(new Uint8Array([1, 2, 3, 4, 5]));
+    await slotWriter.close();
 }
 
 describe("container save export/import", () => {
@@ -67,4 +53,30 @@ describe("container save export/import", () => {
         const bytes = new Uint8Array(await (await slot.getFile()).arrayBuffer());
         expect(Array.from(bytes)).toEqual([1, 2, 3, 4, 5]);
     });
+});
+
+test("export/import preserves the authoritative EOF of a replaced ROM file", async () => {
+    const archive = new ZipArchive(new BufferSource(buildZip(new Map([
+        ["rom/state.dat", new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8])],
+    ]))));
+    await archive.init();
+    const mount = async (id: string) => {
+        const vfs = new VirtualFileSystem();
+        vfs.mountRom(archive, "rom", new Map(archive.listEntries().map(e => [e.name.replace(/^rom\//, ""), e])));
+        await vfs.initOverlay(id);
+        await vfs.ensureOverlayIndex();
+        return vfs;
+    };
+    const source = await mount("test:shadow-export-source");
+    const out = source.openSync("C:\\state.dat", 0x40000000, 2)!;
+    source.writeSync(out, new Uint8Array([9, 10]));
+    await source.flushAll();
+    const zip = await exportContainer("test:shadow-export-source");
+    expect(zip).not.toBeNull();
+    await importContainer("test:shadow-export-target", zip!);
+    const restored = await mount("test:shadow-export-target");
+    expect(restored.getFileSize("C:\\state.dat")).toBe(2);
+    const input = await restored.open("C:\\state.dat", 0x80000000, 3);
+    expect(input).not.toBeNull();
+    expect(Array.from(await restored.read(input!, 8))).toEqual([9, 10]);
 });
