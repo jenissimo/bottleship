@@ -247,7 +247,7 @@ describe("user32 export factories", () => {
         }
     });
 
-    test("window properties and SPI settings round-trip; DDE is refused", () => {
+    test("window properties and SPI settings round-trip; a DDE instance does not refuse", () => {
         flag.__savestates = true;
         const input = createInputExports();
         createSystemExports();
@@ -262,7 +262,7 @@ describe("user32 export factories", () => {
             expect(bytes(p.capture(newCaptureRun()))).toEqual(bytes(first));
         }
         windows.clear();
-        input.DdeInitializeA!({} as never, new Uint8Array(0x1000), [0x200, 0, 0, 0]);
-        expect(() => participant('user32-input').capture(newCaptureRun())).toThrow(CaptureRefusal);
+        expect(input.DdeInitializeA!({} as never, new Uint8Array(0x1000), [0x200, 0, 0, 0])).toBe(0);
+        expect((participant('user32-input').capture(newCaptureRun()) as { ddeInstances: number[] }).ddeInstances).toEqual([1]);
     });
 });
