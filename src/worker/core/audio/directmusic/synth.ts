@@ -201,6 +201,8 @@ export function findInstrument(collection: DlsCollection, patch: number): DlsIns
 
 class Channel {
     instrument: PreparedInstrument | null = null;
+    collection: DlsCollection | null = null;
+    patch = 0;
     pendingDecode: object | null = null;
     volume = 100;
     expression = 127;
@@ -234,6 +236,8 @@ class Voice {
     channel!: Channel;
     key = 0;
     region!: PreparedRegion;
+    collection: DlsCollection | null = null;
+    patch = 0;
     position = 0;
     /** Playback rate before pitch modulation, in source frames per output frame. */
     baseStep = 0;
@@ -264,6 +268,27 @@ class Voice {
     started = false;
 }
 
+const CHANNEL_VALUES = ["volume", "expression", "pan", "modWheel", "pitchBend", "bendRangeCents", "rpn"] as const;
+const VOICE_VALUES = [
+    "channelId", "key", "patch", "position", "baseStep", "velocityGain", "age", "stage", "attackLevel", "attenuationDb", "attackRate",
+    "decayRate", "sustainDb", "releaseRate", "eg2Stage", "eg2Level", "eg2AttackRate", "eg2DecayRate", "eg2ReleaseRate", "lfoPhase",
+    "lfoDelayFrames", "gainLeft", "gainRight",
+] as const;
+const VOICE_FLAGS = ["held", "releasePending", "started"] as const;
+
+export const SYNTH_STATE_KEYS = {
+    channel: ["id", "collection", "patch", "sustain", ...CHANNEL_VALUES],
+    voice: ["slot", "collection", "region", ...VOICE_FLAGS, ...VOICE_VALUES],
+} as const;
+
+export interface SynthData {
+    masterGain: number;
+    noteCounter: number;
+    stats: [notes: number, noInstrument: number, noRegion: number];
+    channels: Array<{ id: number; collection: number; patch: number; sustain: boolean; values: number[] }>;
+    voices: Array<{ slot: number; collection: number; region: number; flags: boolean[]; values: number[] }>;
+}
+
 export class DlsSynth {
     readonly sampleRate: number;
     private readonly voices: Voice[] = [];
@@ -276,6 +301,57 @@ export class DlsSynth {
     constructor(sampleRate: number, maxVoices: number) {
         this.sampleRate = sampleRate;
         for (let i = 0; i < Math.max(1, maxVoices); i++) this.voices.push(new Voice());
+    }
+
+    captureState(collectionRef: (collection: DlsCollection | null) => number): SynthData {
+        const voices: SynthData["voices"] = [];
+        this.voices.forEach((v, slot) => {
+            const inst = v.active && v.collection ? findInstrument(v.collection, v.patch) : null;
+            const region = inst ? inst.regions.indexOf(v.region.region) : -1;
+            if (region < 0) return;
+            voices.push({
+                slot, collection: collectionRef(v.collection), region,
+                flags: VOICE_FLAGS.map((key) => v[key]), values: VOICE_VALUES.map((key) => v[key]),
+            });
+        });
+        return {
+            masterGain: this.masterGain, noteCounter: this.noteCounter,
+            stats: [this.stats.notes, this.stats.noInstrument, this.stats.noRegion],
+            channels: [...this.channels].map(([id, ch]) => ({
+                id, collection: collectionRef(ch.collection), patch: ch.patch, sustain: ch.sustain, values: CHANNEL_VALUES.map((key) => ch[key]),
+            })),
+            voices,
+        };
+    }
+
+    restoreState(d: SynthData, collectionOf: (ref: number) => DlsCollection | null): void {
+        this.masterGain = d.masterGain;
+        this.noteCounter = d.noteCounter;
+        [this.stats.notes, this.stats.noInstrument, this.stats.noRegion] = d.stats;
+        this.channels.clear();
+        for (const saved of d.channels) {
+            const ch = this.channel(saved.id);
+            this.setInstrument(saved.id, collectionOf(saved.collection), saved.patch);
+            ch.sustain = saved.sustain;
+            CHANNEL_VALUES.forEach((key, i) => { ch[key] = saved.values[i]!; });
+            ch.update();
+        }
+        for (const v of this.voices) v.active = false;
+        for (const saved of d.voices) {
+            const v = this.voices[saved.slot];
+            const collection = collectionOf(saved.collection);
+            const patch = saved.values[VOICE_VALUES.indexOf("patch")]!;
+            const inst = collection ? findInstrument(collection, patch) : null;
+            const wanted = inst?.regions[saved.region];
+            const region = collection && inst && wanted ? prepareInstrument(collection, inst).regions.find((r) => r.region === wanted) : undefined;
+            if (!v || !region) continue;
+            VOICE_VALUES.forEach((key, i) => { v[key] = saved.values[i]!; });
+            VOICE_FLAGS.forEach((key, i) => { v[key] = saved.flags[i]!; });
+            v.channel = this.channel(v.channelId);
+            v.collection = collection;
+            v.region = region;
+            v.active = true;
+        }
     }
 
     /** Master volume in hundredths of a decibel, as GUID_PerfMasterVolume gives it. */
@@ -302,6 +378,8 @@ export class DlsSynth {
     setInstrument(channelId: number, collection: DlsCollection | null, patch: number): boolean {
         const ch = this.channel(channelId);
         const inst = collection ? findInstrument(collection, patch) : null;
+        ch.collection = collection;
+        ch.patch = patch;
         ch.pendingDecode = null;
         if (inst && collection && waveDecoder && hasUndecodedWaves(collection, inst)) {
             const token = {};
@@ -384,6 +462,8 @@ export class DlsSynth {
         voice.channel = ch;
         voice.key = key;
         voice.region = region;
+        voice.collection = ch.collection;
+        voice.patch = ch.patch;
         voice.position = 0;
         voice.baseStep = (region.sampleRate / rate)
             * Math.pow(2, ((key - region.unityNote) * 100 + region.fineTune) / 1200);

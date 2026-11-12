@@ -45,6 +45,8 @@ export function soundReference(process: Process, ptr: number, buffer: boolean, r
     }
 }
 
+export interface SinkData { bufferBytes: number; scratch: number; writeOffset: number; playing: boolean; silentBytes: number }
+
 export class DirectSoundSink {
     private readonly process: Process;
     private readonly buffer: number;
@@ -63,6 +65,21 @@ export class DirectSoundSink {
         this.buffer = buffer >>> 0;
         this.blockAlign = channels * 2;
         this.bytesPerSecond = sampleRate * this.blockAlign;
+    }
+
+    captureState(): SinkData {
+        return {
+            bufferBytes: this.bufferBytes, scratch: this.scratch, writeOffset: this.writeOffset, playing: this.playing,
+            silentBytes: this.silentBytes,
+        };
+    }
+
+    restoreState(d: SinkData): void {
+        this.bufferBytes = d.bufferBytes;
+        this.scratch = d.scratch;
+        this.writeOffset = d.writeOffset;
+        this.playing = d.playing;
+        this.silentBytes = d.silentBytes;
     }
 
     private call(method: string, args: number[]): number {
