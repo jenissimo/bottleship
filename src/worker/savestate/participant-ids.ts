@@ -33,6 +33,7 @@ export const PARTICIPANT_IDS = [
     'comdlg32',
     'smackw32',
     'winsock',
+    'msacm32',
     'dispatcher',
     'loaded-modules',
     'cpu',
