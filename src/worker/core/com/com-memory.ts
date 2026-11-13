@@ -31,6 +31,15 @@ export function registerComVtableOwner(vtableAddr: number, moduleName: string, i
     if (ifaceName) vtableLabel.set(vtableAddr >>> 0, ifaceName);
 }
 
+/** Test hook: the returned function puts the owner tables back as they are now. */
+export function snapshotComVtableOwners(): () => void {
+    const owners = new Map(vtableOwner), labels = new Map(vtableLabel);
+    return () => {
+        vtableOwner.clear(); for (const [k, v] of owners) vtableOwner.set(k, v);
+        vtableLabel.clear(); for (const [k, v] of labels) vtableLabel.set(k, v);
+    };
+}
+
 export function comVtableOwner(vtableAddr: number): string {
     return vtableOwner.get(vtableAddr >>> 0) ?? "unknown";
 }

@@ -8,6 +8,9 @@ import {
     CTRL_BLOCK_BYTES, CTRL_DATA_LENGTH, CTRL_LOOP_MODE, CTRL_PAN, CTRL_PLAY_CURSOR, CTRL_RESERVED, CTRL_STATE, CTRL_VOLUME,
     CTRL_WRITE_CURSOR, STATE_PLAYING, STATE_STOPPED, getCtrl, setCtrl,
 } from "../../src/audio/audio-ring-buffer";
+import { preserveGlobals } from "./helpers/scoped-globals";
+
+preserveGlobals("__audioStatsSab", "__audioMasterStatsSab");
 
 const WOM_DONE = 0x3bd;
 const CALLBACK_FUNCTION = 0x30000;

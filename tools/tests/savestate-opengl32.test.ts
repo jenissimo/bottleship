@@ -15,6 +15,9 @@ import {
     GL_MATRIX_STACK_FIELDS, GL_TEXGEN_FIELDS, GL_TEXTURE_FIELDS, GL_TEXTURE_UNIT_FIELDS, OPENGL_CONTEXT_FIELDS,
     WGL_BINDING_FIELDS, WGL_CONTEXT_FIELDS, WGL_STATE_FIELDS,
 } from "../../src/worker/modules/opengl32/savestate";
+import { preserveMemBinding } from "./helpers/scoped-process-state";
+
+preserveMemBinding();
 
 const GL_TRIANGLES = 4;
 const GL_QUADS = 7;

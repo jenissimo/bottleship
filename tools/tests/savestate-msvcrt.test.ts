@@ -11,6 +11,9 @@ import { CaptureRefusal } from "../../src/worker/savestate/object-codecs";
 import { ParticipantRegistry, savestateParticipants, uncoveredModules } from "../../src/worker/savestate/participant";
 import { coverageModules, touchedModules } from "../../src/worker/savestate/core-participants";
 import type { ZipArchive, ZipEntry } from "@bottleship/formats/zip";
+import { preserveMemBinding } from "./helpers/scoped-process-state";
+
+preserveMemBinding();
 
 const bytes = (v: unknown) => {
     const e = encodeValue(v as SaveValue);
