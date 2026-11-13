@@ -12,7 +12,7 @@
  * introducing a second opinion about which code page the guest is running under.
  */
 
-import { EmulatorConfig } from "../../core/emulator-config-manager";
+import { EmulatorConfig, getCodePageDecoder, isSingleByteCodePage } from "../../core/emulator-config-manager";
 
 export const ANSI_CHARSET = 0;
 export const DEFAULT_CHARSET = 1;
@@ -124,6 +124,54 @@ export function resolveCharset(lfCharSet: number): number {
 
 export function charsetCodePage(charset: number): number | undefined {
     return CHARSET_TO_CODEPAGE.get(charset);
+}
+
+/** The multi-byte ANSI pages a host decoder exists for. */
+const DBCS_DECODER_LABELS: Readonly<Record<number, string>> = { 932: 'shift_jis', 936: 'gbk', 949: 'euc-kr', 950: 'big5' };
+// @transient(pure host decoders, one per multi-byte code page)
+const dbcsDecoders = new Map<number, TextDecoder>();
+
+/**
+ * The character an ANSI entry point's character CODE names on `codePage`: one byte on a
+ * single-byte page, or a packed two-byte character on a multi-byte one (lead byte in the
+ * high byte: CP932 0x82A0 is the bytes 0x82,0xA0, 'あ'). Null when the code cannot be a
+ * character of that page, or the page is a multi-byte one no decoder exists for — never
+ * a guess through another page.
+ */
+export function decodeAnsiCharCode(code: number, codePage: number): string | null {
+    if (isSingleByteCodePage(codePage)) {
+        return code > 0xFF ? null : getCodePageDecoder(codePage).decode(new Uint8Array([code]));
+    }
+    const label = DBCS_DECODER_LABELS[codePage];
+    if (!label || code > 0xFFFF) return null;
+    let decoder = dbcsDecoders.get(codePage);
+    if (!decoder) { decoder = new TextDecoder(label); dbcsDecoders.set(codePage, decoder); }
+    return decoder.decode(code > 0xFF ? new Uint8Array([code >> 8, code & 0xFF]) : new Uint8Array([code]));
+}
+
+/**
+ * The characters of an ANSI character-code range on `codePage`, or null for a range GDI
+ * refuses: a code that is not a character of the page, or a multi-byte range whose ends
+ * differ in the lead byte.
+ */
+export function decodeAnsiCharRange(first: number, last: number, codePage: number): string[] | null {
+    if (last < first) return null;
+    if (!isSingleByteCodePage(codePage) && ((first ^ last) >>> 0) > 0xFF) return null;
+    const out: string[] = [];
+    for (let code = first; code <= last; code++) {
+        const ch = decodeAnsiCharCode(code, codePage);
+        if (ch === null) return null;
+        out.push(ch);
+    }
+    return out;
+}
+
+/**
+ * The code page 8-bit text is in for a font of this REALISED charset. A charset with no
+ * page of its own (SYMBOL, OEM, MAC) is drawn through the system ANSI page, as GDI does.
+ */
+export function fontCodePage(charset: number): number {
+    return charsetCodePage(charset) ?? EmulatorConfig.getInstance().ansiCodePage;
 }
 
 /** FONTSIGNATURE for a realised charset: [fsUsb0..3, fsCsb0, fsCsb1]. */

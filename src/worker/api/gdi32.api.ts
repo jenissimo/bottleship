@@ -233,6 +233,8 @@ export const gdi32Module: ModuleDescriptor = {
         makeFunc("GetCharABCWidthsW", 4),
         makeFunc("GetCharABCWidthsFloatA", 4),
         makeFunc("GetCharABCWidthsFloatW", 4),
+        // Declared for its stack shape; there is no handler. Outline metrics would send the
+        // caller on to native glyph outlines (GGO_NATIVE), which GetGlyphOutline refuses.
         makeFunc("GetOutlineTextMetricsA", 3),
 
         makeFunc("GetGlyphOutlineA", 7),
