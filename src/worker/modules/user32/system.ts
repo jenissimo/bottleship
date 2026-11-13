@@ -1843,7 +1843,9 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             const err = (e as Error).message;
             if (spruLog) spruLog.error = err;
             Logger.warn(LogCategory.USER32, `${apiName} BMP: Error loading "${normalizedFilename}": ${e}`);
-            return failedFileLoad();
+            // Once the pixels are on the object the bitmap is loaded, and ddraw may already
+            // hold the handle; a later failure keeps it rather than freeing it under ddraw.
+            return resourceData.pixels ? handle : failedFileLoad();
         } finally {
             resourceData.loading = false;
         }
