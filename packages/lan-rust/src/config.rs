@@ -1,5 +1,12 @@
 use bottleship_lan_core::config::{GatewayConfig, Limits};
 use serde::{Deserialize, Serialize};
+fn valid_env_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= 128
+        && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Origins {
@@ -31,6 +38,9 @@ pub struct ServerConfig {
     pub dns_timeout_ms: u64,
     /// Structured connection diagnostics; disabled on the normal packet path.
     pub log_connections: bool,
+    /// Environment variable holding the GET /stats bearer token. Unset or empty
+    /// leaves the endpoint absent (404).
+    pub stats_token_env: String,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -49,6 +59,7 @@ impl Default for ServerConfig {
             max_dns_operations: 64,
             dns_timeout_ms: 10000,
             log_connections: false,
+            stats_token_env: bottleship_lan_core::stats::DEFAULT_STATS_TOKEN_ENV.into(),
         }
     }
 }
@@ -68,6 +79,7 @@ impl ServerConfig {
             || self.max_dns_operations == 0
             || self.max_dns_operations > 1024
             || !(1..=120000).contains(&self.dns_timeout_ms)
+            || !valid_env_name(&self.stats_token_env)
             || self.transports.is_empty()
             || self
                 .transports

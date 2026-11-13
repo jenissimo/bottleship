@@ -3,11 +3,14 @@ pub mod config;
 mod dispatch;
 #[cfg(test)]
 mod startup_dns_tests;
+#[cfg(test)]
+mod stats_tests;
 use bottleship_lan_core::{
-    Command, ConnId, Core, Effect,
+    Command, ConnId, Core, Effect, ServerEvent,
     config::GatewayConfig,
     gateway::DestinationPolicy,
     routes::{NativeAddress, ResolveCode, ResolveError, Routes},
+    stats::{DEFAULT_UNIQUE_CAPACITY, ServerStats, StatsToken},
 };
 use bottleship_lan_gateway::{
     Gateway, GatewayEvents, GatewayHandle, GatewayOptions, GatewayOutput,
@@ -43,6 +46,19 @@ impl LanServer {
         Self::bind_with_startup_resolver(config, resolve_sync).await
     }
     async fn bind_with_startup_resolver<F>(config: ServerConfig, resolver: F) -> Result<Self, Error>
+    where
+        F: Fn(&str) -> Result<Vec<NativeAddress>, ResolveError> + Send + Sync + 'static,
+    {
+        config.validate().map_err(std::io::Error::other)?;
+        // The token is reduced to a digest here; neither it nor its digest is logged.
+        let token = StatsToken::from_environment(&config.stats_token_env)?;
+        Self::bind_configured(config, resolver, token).await
+    }
+    async fn bind_configured<F>(
+        config: ServerConfig,
+        resolver: F,
+        stats_token: Option<StatsToken>,
+    ) -> Result<Self, Error>
     where
         F: Fn(&str) -> Result<Vec<NativeAddress>, ResolveError> + Send + Sync + 'static,
     {
@@ -112,7 +128,15 @@ impl LanServer {
         // stay within their own budget can never exhaust it for anyone else.
         let mut limits = config.limits.clone();
         limits.max_binding_entries = Some(limits.binding_entry_budget(config.max_connections));
-        let core = Core::new(limits, routes, access, epoch)?;
+        let mut core = Core::new(limits, routes, access, epoch)?;
+        let stats = match stats_token {
+            Some(token) => {
+                let stats = Arc::new(ServerStats::new(epoch, DEFAULT_UNIQUE_CAPACITY, Box::new(os_salt))?);
+                core = core.with_stats(stats.clone());
+                Some((token, stats))
+            }
+            None => None,
+        };
         let mut wire = transport::Config::default();
         wire.max_connections = config.max_connections;
         wire.max_tcp_connections = config.max_tcp_connections;
@@ -130,10 +154,22 @@ impl LanServer {
         wire.health_response = Some(bytes::Bytes::from_static(
             b"{\"service\":\"bottleship-lan\",\"version\":1}",
         ));
+        let relay_stats = stats.as_ref().map(|(_, stats)| stats.clone());
+        if let Some((token, stats)) = stats {
+            let (max_connections, max_rooms) = (config.max_connections, config.limits.max_rooms);
+            wire.stats = Some(transport::StatsEndpoint {
+                authorize: Arc::new(move |header: Option<&[u8]>| token.verify(header)),
+                // Same clock as Core: startup wall time plus monotonic elapsed time.
+                render: Arc::new(move || {
+                    let now = epoch.saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                    bytes::Bytes::from(stats.render(now, max_connections, max_rooms, env!("CARGO_PKG_VERSION")))
+                }),
+            });
+        }
         let transport = transport::bind(address, wire).await?;
         let address = transport.address;
         let (stop, stopping) = watch::channel(false);
-        let task = tokio::spawn(run(transport, core, gateway, dns, config, stopping, started));
+        let task = tokio::spawn(run(transport, core, gateway, dns, config, stopping, started, relay_stats));
         Ok(Self {
             address,
             stop,
@@ -178,6 +214,7 @@ struct Dispatcher {
     started: Instant,
     dns_timeout: Duration,
     log_connections: bool,
+    stats: Option<Arc<ServerStats>>,
 }
 impl Dispatcher {
     fn now(&self) -> u64 {
@@ -287,6 +324,11 @@ impl Dispatcher {
                     reliable,
                     source,
                 } => {
+                    // Room relay: a frame forwarded from another participant.
+                    let relayed = match (&event, source) {
+                        (ServerEvent::Frame { bytes, .. }, Some(_)) => Some(bytes.len()),
+                        _ => None,
+                    };
                     match self.transport.try_emit(Egress {
                         recipient: to,
                         event,
@@ -294,7 +336,13 @@ impl Dispatcher {
                         reliable,
                         sender: source,
                     }) {
-                        Ok(ticket) => { tickets.push(ticket); vec![] },
+                        Ok(ticket) => {
+                            if let (Some(stats), Some(bytes)) = (&self.stats, relayed) {
+                                stats.relayed(bytes);
+                            }
+                            tickets.push(ticket);
+                            vec![]
+                        },
                         Err(rejected) => {
                             if self.log_connections {
                                 eprintln!("{}", serde_json::json!({"event":"deliveryRejected","connection":rejected.recipient,"reason":rejected.reason,"reliable":rejected.reliable}));
@@ -496,6 +544,7 @@ async fn run(
     config: ServerConfig,
     mut stopping: watch::Receiver<bool>,
     started: Instant,
+    stats: Option<Arc<ServerStats>>,
 ) -> Result<(), String> {
     let (events, mut incoming) = mpsc::channel(256);
     let mut dispatcher = Dispatcher {
@@ -515,6 +564,7 @@ async fn run(
         started,
         dns_timeout: Duration::from_millis(config.dns_timeout_ms),
         log_connections: config.log_connections,
+        stats,
     };
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -696,6 +746,11 @@ async fn run(
         return Err("Native or transport retirement timed out".into());
     }
     failure.map_or(Ok(()), Err)
+}
+fn os_salt() -> Option<[u8; 32]> {
+    let mut salt = [0u8; 32];
+    getrandom::fill(&mut salt).ok()?;
+    Some(salt)
 }
 async fn resolve_owned<F>(
     host: String,

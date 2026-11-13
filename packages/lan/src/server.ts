@@ -6,6 +6,7 @@ import { NetResolveError } from "./resolve";
 import { RoomAccess, type RoomAccessConfig, type Admission } from "./access";
 import {TcpHostOwner} from "./tcp-host-owner";
 import {TcpAcceptHostOwner} from "./tcp-accept-host-owner";
+import { DEFAULT_STATS_TOKEN_ENV, LanStats, StatsToken } from "./stats";
 import {
     asBytes, decodeDatagram, isDatagramProtocol, isBroadcastNode, isLanNode, nodeKey, nodeToIpv4,
     PROTOCOL_VERSION, MAX_FRAME_SIZE, SOCKET_PATH, validBindingGeneration, validPort, isProtocol,
@@ -34,6 +35,8 @@ export interface LanServerOptions {
     maxBindingEntries?: number;
     gateway?: GatewayOptions;
     roomAccess?: RoomAccessConfig;
+    /** Environment variable holding the GET /stats bearer token; unset or empty: no endpoint. */
+    statsTokenEnv?: string;
 }
 type PeerSocket = Socket<ClientEvents, ServerEvents>;
 interface Lease { clientId: string; node: Uint8Array; socket: PeerSocket | null; expiresAt: number }
@@ -64,12 +67,30 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
     }
     let bindingEntries=0;
     const access = new RoomAccess(options.roomAccess);
+    const statsTokenEnv = options.statsTokenEnv ?? DEFAULT_STATS_TOKEN_ENV;
+    if (typeof statsTokenEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(statsTokenEnv)) throw new Error("Invalid statsTokenEnv");
+    // The token is reduced to a digest here; neither it nor its digest is logged.
+    const statsToken = StatsToken.fromValue(process.env[statsTokenEnv]);
+    const stats = statsToken ? new LanStats() : undefined;
+    let participants = 0;
+    const liveIn = (room: Room): number => { let live = 0; for (const peer of room.peers.values()) if (peer.socket) live++; return live; };
     const rooms = new Map<string, Room>();
     const gatewayRoutes = new GatewayRoutes(options.gateway);
     const http = createServer((request, response) => {
         if (request.method === "GET" && request.url === "/health") {
             response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
             response.end(JSON.stringify({ service: "bottleship-lan", version: PROTOCOL_VERSION }));
+        } else if (stats && statsToken && request.method === "GET" && request.url?.split("?", 1)[0] === "/stats") {
+            // Exactly one Authorization header; a bare 401 otherwise. No CORS, never cached.
+            const values: string[] = [];
+            for (let i = 0; i + 1 < request.rawHeaders.length; i += 2) if (request.rawHeaders[i].toLowerCase() === "authorization") values.push(request.rawHeaders[i + 1]);
+            if (values.length === 1 && statsToken.verify(values[0])) {
+                response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+                response.end(JSON.stringify(stats.snapshot(limits)));
+            } else {
+                response.writeHead(401, { "Cache-Control": "no-store", "WWW-Authenticate": "Bearer" });
+                response.end();
+            }
         } else { response.writeHead(404); response.end(); }
     });
     const allowedOrigins = options.allowedOrigins ?? "*";
@@ -193,15 +214,18 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
         if (!existing) while(room.peers.size >= limits.maxPeersPerRoom) { if(!evictOfflinePeer(room)){next(new Error("LAN room is full"));return;} }
         const lease: Lease = existing ?? { clientId: request.clientId, node, socket: null, expiresAt: Infinity };
         lease.socket?.disconnect(true);
+        const liveBefore = stats ? liveIn(room) : 0;
         lease.socket = socket;
         lease.expiresAt = Infinity;
         room.peers.set(key, lease);
         rooms.set(request.room,room);
+        if (stats) { stats.roomLiveness(liveBefore, liveIn(room)); stats.joined(request.clientId); }
         socket.data = { room, lease, admission };
         next();
     });
     io.on("connection", socket => {
         const session=sessions.get(socket.conn);if(session){session.authorized=true;if(session.timer)clearTimeout(session.timer);}
+        participants++;stats?.setConnections(participants);
         const { room, lease, admission } = socket.data as { room: Room; lease: Lease; admission: Admission };
         const allowedRoutes = new Set(admission.gateway.routes);
         // Port slot -> released. When a budget is full, this connection's oldest released
@@ -521,11 +545,13 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
                 queued.frames++;
                 queued.bytes += forwarded.byteLength;
                 recipient.emit("frame", forwarded);
+                stats?.relayed(forwarded.byteLength);
             };
             if (broadcast || multicast) { for (const peer of room.peers.values()) deliver(peer); }
             else if (destination) deliver(destination);
         });
         socket.on("disconnect", () => {
+            participants--;stats?.setConnections(participants);
             releaseNotices();
             if (expiration !== undefined) clearTimeout(expiration);
             bindingEntries-=portSlots.size;portSlots.clear();
@@ -538,7 +564,9 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             gateway.close();
             for (const entry of resolving.values()) entry.cancelled = true;
             if (lease.socket === socket) {
+                const liveBefore = stats ? liveIn(room) : 0;
                 lease.socket = null;
+                if (stats) stats.roomLiveness(liveBefore, liveIn(room));
                 lease.expiresAt = Date.now() + limits.reconnectGraceMs;
                 for (const peer of room.peers.values()) if (peer.socket) notifyPeerLeft(peer.socket, lease.node, socket);
                 prune();

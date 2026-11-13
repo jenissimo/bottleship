@@ -37,6 +37,10 @@ Public API: src/lib.rs and src/runtime.rs.
 - Optional Config.health_response supplies a caller-owned JSON /health response.
   The adapter does not invent application version/service fields. Maximum 4096
   bytes, served with Cache-Control: no-store. CORS credentials are not enabled.
+- Optional Config.stats (StatsEndpoint) serves GET /stats: absent is 404; the caller's
+  authorize callback receives the single Authorization header value (none when absent
+  or repeated) and must compare in constant time; refusal is an empty 401 with
+  WWW-Authenticate: Bearer. Both answers are no-store and carry no CORS headers.
 
 Ingress callbacks are synchronous EngineIoHandler calls. There is no task spawned
 per application event and no semaphore awaited after an unbounded spawn. A parser

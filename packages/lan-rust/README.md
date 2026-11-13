@@ -11,6 +11,20 @@ cargo run --release --locked -- --config server.json
 
 Set the emulator network configuration to the server URL and the same room for each participant. GET /health returns {"service":"bottleship-lan","version":1}. Stop the production CLI with Ctrl-C; shutdown waits for transport and native socket retirement. No publication or deployment is performed by this package.
 
+## Operator statistics (GET /stats)
+
+GET /stats exists only when the environment variable named by `statsTokenEnv` (default `BOTTLESHIP_LAN_STATS_TOKEN`) holds a token of 16..512 visible ASCII characters; unset or empty leaves the path 404, and a shorter token fails startup. Requests need exactly one `Authorization: Bearer <token>` header. The check hashes both values and compares the digests in constant time; a missing, duplicated or wrong header is a bare 401. Responses carry `Cache-Control: no-store` and no CORS headers. The token is never logged; keep it in the service's secret store, not in JSON or arguments.
+
+```sh
+curl -H "Authorization: Bearer $BOTTLESHIP_LAN_STATS_TOKEN" http://127.0.0.1:9001/stats
+```
+
+```json
+{"uptimeSeconds":3600,"connections":{"current":3,"peak":5},"rooms":{"active":2,"withTwoOrMore":1,"peakActive":3},"joins":{"total":12},"uniqueSessions":{"today":7,"yesterday":19,"approximate":false},"traffic":{"framesRelayed":48211,"bytesRelayed":9120344},"limits":{"maxConnections":256,"maxRooms":128},"version":"0.1.0"}
+```
+
+`connections` counts authenticated room participants. `rooms.active`/`withTwoOrMore` are rooms with at least one/two live participants; offline reconnect leases do not count. Peaks never decrease during the process lifetime. `joins.total` counts accepted joins, including reconnects. `uniqueSessions` counts distinct handshake `clientId`s per UTC day (see the [privacy notes](../../docs/multiplayer-security.md#operator-statistics-and-privacy)); it is not a count of people or IP addresses. `traffic` counts room relay frames accepted for delivery to each recipient, including multicast fan-out, and excludes native gateway traffic. All counters reset on restart. The TS reference serves the same schema.
+
 Rooms default to private and require a signing key supplied through the environment. The quick start above explicitly enables public rooms. Room membership grants no native access by itself. See [room policies, signed invitations and gateway permissions](../../docs/multiplayer-security.md).
 
 ## Configuration
