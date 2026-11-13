@@ -1048,6 +1048,8 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             const srcFmt = srcState.gpuTextureFormat;
             const dstFmt = dstState.gpuTextureFormat;
             const formatMismatch = !!(srcFmt && dstFmt && srcFmt !== dstFmt);
+            // Not reached today: canUseGpuFastPath refuses a colour key, so keyed blits reach the
+            // GPU only through the mixed path below and BltFast's composite.
             if (useColorKey && colorKey) {
                 profiler.start("Blt:gpuPath:colorKeyBlit");
                 context.executor!.blitWithColorKey(srcState, dstState, effSrcRect, effDstRect, colorKey);

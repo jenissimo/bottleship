@@ -35,7 +35,7 @@ function surface(texture: GPUTexture): RenderSurface {
         surfaceType: "render_surface", width: 4, height: 2, pitch: 16, caps: 0, surfacePtr: 0,
         surfacePtrAllocated: false, attachedSurfaceAddr: 0,
         format: { flags: 0x41, bpp: 32, rMask: 0xff0000, gMask: 0xff00, bMask: 0xff, aMask: 0xff000000 },
-        gpuTexture: texture, gpuTextureView: {} as GPUTextureView, gpuTextureFormat: "rgba8unorm",
+        gpuTexture: texture, gpuTextureView: { tex: names.get(texture) } as unknown as GPUTextureView, gpuTextureFormat: "rgba8unorm",
         mode: "GPU_ONLY", version: 0, gpuDirty: false, everLocked: false, lastUploadVersion: 0, writeGeneration: 0,
     } as unknown as RenderSurface;
     setAuthorityGpu(s);
@@ -54,9 +54,9 @@ function executor(): DDrawWebGPUExecutor {
         flushBatch: () => {}, resetBindFastPath: () => {}, ensureSurfaceGPUResources: () => {},
         vertexConverter: { flushParams: () => {}, destroyPendingAfterSubmit: () => {}, startFrame: () => {} },
         ringBufferManager: { flushGeometry: () => {}, flushUniforms: () => {}, flushLights: () => {}, flushStorageBuffer: () => {} },
-        clearPipeline: { destroyPendingAfterSubmit: () => {} },
-        depthManager: { flushGarbage: () => {} },
-        msaaColorManager: { flushGarbage: () => {} },
+        clearPipeline: { destroyPendingAfterSubmit: () => {}, clear: (_e: unknown, v: { tex: string }) => { ops.push(`clear:${v.tex}`); } },
+        depthManager: { flushGarbage: () => {}, getDepthViewForTarget: () => undefined },
+        msaaColorManager: { flushGarbage: () => {}, getColorViewForTarget: () => null },
         textureConverter: { destroyPendingAfterSubmit: () => {} },
         colorKeyBlitPipeline: {
             blit: () => { ops.push("blit"); pending++; },
@@ -188,7 +188,51 @@ describe("a blit keeps its place after draws prepared before it", () => {
     });
 });
 
+describe("a deferred clear of either surface is encoded before the blit", () => {
+    const pendingClear = (state: RenderSurface): RenderSurface => {
+        const s = state as unknown as { needsColorClear: boolean; clearColor: unknown };
+        s.needsColorClear = true;
+        s.clearColor = { r: 0, g: 0, b: 0, a: 1 };
+        (ex as unknown as { surfacesNeedingClear: Set<unknown> }).surfacesNeedingClear.add(state);
+        return state;
+    };
+    const blits = [
+        ["colour-key", (s: RenderSurface, d: RenderSurface) => ex.blitWithColorKey(s, d, RECT, RECT, KEY)],
+        ["shader copy", (s: RenderSurface, d: RenderSurface) => ex.blitWithShaderCopy(s, d, RECT, RECT)],
+    ] as const;
+
+    for (const [kind, blit] of blits) {
+        test(`${kind}: a pending clear of the destination runs first, not dropped`, () => {
+            const dst = pendingClear(surface(tex("back")));
+            blit(surface(tex("glyphs")), dst);
+            expect(ops).toEqual(["clear:back", "blit"]);
+            expect((dst as unknown as { needsColorClear: boolean }).needsColorClear).toBe(false);
+            expect((ex as unknown as { surfacesNeedingClear: Set<unknown> }).surfacesNeedingClear.has(dst)).toBe(false);
+        });
+
+        test(`${kind}: a pending clear of the source runs before the blit reads it`, () => {
+            const src = pendingClear(surface(tex("fade")));
+            blit(src, surface(tex("back")));
+            expect(ops).toEqual(["clear:fade", "blit"]);
+        });
+    }
+
+    test("the encoded clear marks its texture: an upload to it (a source sync) submits the clear first", () => {
+        const fade = tex("fade");
+        (ex as unknown as { encodePendingClear(s: RenderSurface): void }).encodePendingClear(pendingClear(surface(fade)));
+        uploadToGPUTexture(queue, fade, PIXELS, 4, 2);
+        expect(ops).toEqual(["clear:fade", "submit", "write:fade"]);
+    });
+});
+
 describe("unsubmitted blits are bounded by the colour-key uniform ring", () => {
+    test("shader copies share the ring: the 257th submits the first 256 first", () => {
+        const a = tex("a"), b = tex("b");
+        for (let i = 0; i < 257; i++) ex.blitWithShaderCopy(surface(a), surface(b), RECT, RECT);
+        expect(ops.filter((o) => o === "submit")).toHaveLength(1);
+        expect(ops.indexOf("submit")).toBe(256);
+    });
+
     test("the 257th blit in one encoder submits the first 256 first; a submit frees the ring", () => {
         const a = tex("a"), b = tex("b");
         for (let i = 0; i < 257; i++) ex.blitWithColorKey(surface(a), surface(b), RECT, RECT, KEY);
