@@ -11,6 +11,7 @@
  */
 
 import { Logger, LogCategory } from "../../../core/logger";
+import { beforeQueueWrite } from "../shared/queue-write-guard";
 // Re-exported from the shared mip math so existing importers (ddraw-backend-executor) are unaffected.
 export { mipLevelCountFor } from "../shared/mip-utils";
 
@@ -87,6 +88,8 @@ fn fs(in: VSOut) -> @location(0) vec4f {
             pass.draw(3, 1, 0, 0);
             pass.end();
         }
+        // The levels are written by this submit, ahead of any recorded work that samples them.
+        beforeQueueWrite(texture);
         this.device.queue.submit([encoder.finish()]);
         Logger.verbose(LogCategory.DDRAW, `MipGenerator: generated ${levelCount - 1} mip level(s)`);
     }

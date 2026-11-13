@@ -31,6 +31,7 @@ import {
     getSurfaceFormatLayout,
 } from "../shared/texture-formats";
 import { fixupBoth } from "../shared/d3d-blend-factor";
+import { registerQueueWriteGuard, unregisterQueueWriteGuard, type QueueWriteGuard } from "../shared/queue-write-guard";
 import {
     markGpuSyncedFromCpu,
     setAuthorityCpu,
@@ -328,7 +329,7 @@ function surfacePixelsAreBlank(state: DirectDrawSurfaceState): boolean {
 /**
  * Main executor class for DirectDraw WebGPU rendering
  */
-export class DDrawWebGPUExecutor {
+export class DDrawWebGPUExecutor implements QueueWriteGuard {
     private device!: GPUDevice;
     private queue!: GPUQueue;
     private swapChainFormat!: GPUTextureFormat;
@@ -541,6 +542,7 @@ export class DDrawWebGPUExecutor {
             onDeviceLost: () => this.onDeviceLost(),
             onDeviceRecreated: (device) => this.onDeviceRecreated(device),
         });
+        registerQueueWriteGuard(this);
     }
 
     /** Everything this executor owns that is derived from the device, in one place. */
@@ -680,6 +682,7 @@ export class DDrawWebGPUExecutor {
         const pixel = this.debugFlags.forceMissingTextureMagenta
             ? new Uint8Array([255, 0, 255, 255])
             : new Uint8Array([255, 255, 255, 255]);
+        this.beforeQueueWrite(this.dummyTexture);
         this.queue.writeTexture(
             { texture: this.dummyTexture },
             pixel,
@@ -798,6 +801,7 @@ export class DDrawWebGPUExecutor {
 
     destroy(): void {
         this.flush();
+        unregisterQueueWriteGuard(this);
         this.currentRenderTarget = null;
 
         this.vertexConverter.destroy();
@@ -841,6 +845,7 @@ export class DDrawWebGPUExecutor {
         texHashDirty: 0,       // scans whose hash CHANGED → forced a re-upload
         texSyncs: 0,           // syncSurfaceFromMemory calls from the stage-texture path
         earlyTexSubmits: 0,    // mid-frame submits forced by a sampled texture being overwritten
+        queueWriteSubmits: 0,  // submits forced by a queue-level write to a texture recorded work uses
     };
 
     /** Count non-finite positions in CPU-converted vertex data (diagnoses guest-side
@@ -1369,6 +1374,7 @@ export class DDrawWebGPUExecutor {
             msaaColorView = this.msaaColorManager.getColorViewForTarget(target) ?? undefined;
         }
 
+        this.noteRecordedTexture(target.gpuTexture);
         this.clearPipeline.clear(
             this.currentEncoder,
             target.gpuTextureView!,
@@ -1653,6 +1659,7 @@ export class DDrawWebGPUExecutor {
                         targetFormat, // Pass format (handles bgra8unorm swizzle in Compute Shader)
                         paletteEntries
                     );
+                    this.noteRecordedTexture(state.gpuTexture);
                     markGpuSyncedFromCpu(state);
                     if (isRenderSurface(state)) {
                         state.dirtyRegion = undefined;
@@ -2164,6 +2171,8 @@ export class DDrawWebGPUExecutor {
         const colorKeyLow = decodeColorKeyToRGBA(colorKey.low, srcFormat);
         const colorKeyHigh = decodeColorKeyToRGBA(colorKey.high, srcFormat);
 
+        this.noteRecordedTexture(srcState.gpuTexture);
+        this.noteRecordedTexture(dstState.gpuTexture);
         // Perform the blit
         this.colorKeyBlitPipeline.blit(this.currentEncoder, {
             srcView: srcState.gpuTextureView,
@@ -2265,6 +2274,8 @@ export class DDrawWebGPUExecutor {
             this.currentEncoder = this.device.createCommandEncoder();
         }
 
+        this.noteRecordedTexture(srcState.gpuTexture);
+        this.noteRecordedTexture(dstState.gpuTexture);
         // Dummy colorkey values; discard disabled by enableColorKey=false
         const zero = { r: 0, g: 0, b: 0, a: 0 };
         this.colorKeyBlitPipeline.blit(this.currentEncoder, {
@@ -3542,102 +3553,108 @@ export class DDrawWebGPUExecutor {
         // No device: submitting is a silent no-op anyway, and the recorded commands would be
         // built from handles that are already dead. Skip the whole frame instead.
         if (this.deviceLost) return;
-        this.renderStats.flushes++;
-        this.flushBatch();
-        // These publish this frame's staged uploads. A throw here — an oversize or
-        // misaligned writeBuffer — would otherwise skip the submit AND its teardown
-        // below, leaving currentEncoder alive with an open pass for every later frame
-        // to append to: one bad frame becomes every frame after it. Losing this frame's
-        // uploads is recoverable; losing the encoder is not.
+        if (this.flushing) return;
+        this.flushing = true;
         try {
-            this.vertexConverter.flushParams();
-            this.ringBufferManager.flushGeometry();
-            this.ringBufferManager.flushUniforms();
-            this.ringBufferManager.flushLights();
-            this.ringBufferManager.flushStorageBuffer();
-        } catch (e) {
-            recordGpuError("throw", "ddrawExecutor.flushUploads", String(e));
-            Logger.error(LogCategory.DDRAW, `[WEBGPU] flush() upload publish failed — frame's uploads dropped: ${e}`);
-        }
+            this.renderStats.flushes++;
+            this.flushBatch();
+            // These publish this frame's staged uploads. A throw here — an oversize or
+            // misaligned writeBuffer — would otherwise skip the submit AND its teardown
+            // below, leaving currentEncoder alive with an open pass for every later frame
+            // to append to: one bad frame becomes every frame after it. Losing this frame's
+            // uploads is recoverable; losing the encoder is not.
+            try {
+                this.vertexConverter.flushParams();
+                this.ringBufferManager.flushGeometry();
+                this.ringBufferManager.flushUniforms();
+                this.ringBufferManager.flushLights();
+                this.ringBufferManager.flushStorageBuffer();
+            } catch (e) {
+                recordGpuError("throw", "ddrawExecutor.flushUploads", String(e));
+                Logger.error(LogCategory.DDRAW, `[WEBGPU] flush() upload publish failed — frame's uploads dropped: ${e}`);
+            }
 
-        if (drainDeferredClears && this.surfacesNeedingClear.size > 0) {
-            Logger.log(LogCategory.DDRAW,
-                `flush: processing ${this.surfacesNeedingClear.size} deferred clears (no draws consumed them)`);
-            // flushBatch() may leave a render pass open via ensureRenderPass().
-            // clearPipeline.clear() calls encoder.beginRenderPass() internally — encoder must be unlocked first.
+            if (drainDeferredClears && this.surfacesNeedingClear.size > 0) {
+                Logger.log(LogCategory.DDRAW,
+                    `flush: processing ${this.surfacesNeedingClear.size} deferred clears (no draws consumed them)`);
+                // flushBatch() may leave a render pass open via ensureRenderPass().
+                // clearPipeline.clear() calls encoder.beginRenderPass() internally — encoder must be unlocked first.
+                if (this.currentRenderPass) {
+                    this.currentRenderPass.end();
+                    this.currentRenderPass = null;
+                    this.currentRenderTarget = null;
+                }
+                if (!this.currentEncoder) {
+                    this.currentEncoder = this.device.createCommandEncoder();
+                }
+
+                for (const target of this.surfacesNeedingClear) {
+                    if (target.needsColorClear && target.clearColor !== undefined && target.gpuTextureView) {
+                        const colorFormat = this.resolveSurfaceTextureFormat(target);
+                    
+                        this.clearPipeline.clear(
+                            this.currentEncoder,
+                            target.gpuTextureView,
+                            target.width,
+                            target.height,
+                            this.depthManager.getDepthViewForTarget(target),
+                            {
+                                flags: D3DCLEAR_TARGET,
+                                color: target.clearColor,
+                                depth: 0,
+                                stencil: undefined,
+                                viewport: undefined,
+                                rects: undefined,
+                            },
+                            colorFormat,
+                            this.msaaColorManager.getColorViewForTarget(target) ?? undefined
+                        );
+
+                        target.needsColorClear = false;
+                        target.clearColor = undefined;
+                    }
+                }
+
+                this.surfacesNeedingClear.clear();
+            }
+        
             if (this.currentRenderPass) {
                 this.currentRenderPass.end();
                 this.currentRenderPass = null;
-                this.currentRenderTarget = null;
             }
-            if (!this.currentEncoder) {
-                this.currentEncoder = this.device.createCommandEncoder();
-            }
-
-            for (const target of this.surfacesNeedingClear) {
-                if (target.needsColorClear && target.clearColor !== undefined && target.gpuTextureView) {
-                    const colorFormat = this.resolveSurfaceTextureFormat(target);
-                    
-                    this.clearPipeline.clear(
-                        this.currentEncoder,
-                        target.gpuTextureView,
-                        target.width,
-                        target.height,
-                        this.depthManager.getDepthViewForTarget(target),
-                        {
-                            flags: D3DCLEAR_TARGET,
-                            color: target.clearColor,
-                            depth: 0,
-                            stencil: undefined,
-                            viewport: undefined,
-                            rects: undefined,
-                        },
-                        colorFormat,
-                        this.msaaColorManager.getColorViewForTarget(target) ?? undefined
-                    );
-
-                    target.needsColorClear = false;
-                    target.clearColor = undefined;
+            if (this.currentEncoder) {
+                const submittedEncoder = this.currentEncoder;
+                const submitStart = frameProfiler.startTimer();
+                try {
+                    this.queue.submit([this.currentEncoder.finish()]);
+                } catch (e) {
+                    // The teardown below must run even on a throw. A finish()/submit() that throws
+                    // leaves the encoder already finished, so keeping it would hand every later
+                    // frame an unusable encoder — one bad frame becomes every frame after it.
+                    recordGpuError("throw", "ddrawExecutor.flush", String(e));
+                    Logger.error(LogCategory.DDRAW, `[WEBGPU] flush() submit failed — frame discarded: ${e}`);
+                } finally {
+                    // Queue submission or permanent abandonment releases this encoder only.
+                    this.clearPipeline.destroyPendingAfterSubmit(submittedEncoder);
                 }
+                frameProfiler.endTimer("gpu", submitStart);
+                this.currentEncoder = null;
+                this.encoderEpoch++;
+                // Flush garbage list after submit to safely destroy unused depth textures
+                this.depthManager.flushGarbage();
+                this.msaaColorManager.flushGarbage();
+                // Destroy deferred TextureConverter buffers (resized mid-frame) so no "used while destroyed"
+                this.textureConverter.destroyPendingAfterSubmit();
+                // Destroy deferred VertexConverter buffers after submit to avoid "used while destroyed"
+                this.vertexConverter.destroyPendingAfterSubmit();
+                // Reuse global conversion buffer from offset 0 after each submit.
+                this.vertexConverter.startFrame();
             }
-
-            this.surfacesNeedingClear.clear();
+            this.currentRenderTarget = null;
+            this.resetBindFastPath();
+        } finally {
+            this.flushing = false;
         }
-        
-        if (this.currentRenderPass) {
-            this.currentRenderPass.end();
-            this.currentRenderPass = null;
-        }
-        if (this.currentEncoder) {
-            const submittedEncoder = this.currentEncoder;
-            const submitStart = frameProfiler.startTimer();
-            try {
-                this.queue.submit([this.currentEncoder.finish()]);
-            } catch (e) {
-                // The teardown below must run even on a throw. A finish()/submit() that throws
-                // leaves the encoder already finished, so keeping it would hand every later
-                // frame an unusable encoder — one bad frame becomes every frame after it.
-                recordGpuError("throw", "ddrawExecutor.flush", String(e));
-                Logger.error(LogCategory.DDRAW, `[WEBGPU] flush() submit failed — frame discarded: ${e}`);
-            } finally {
-                // Queue submission or permanent abandonment releases this encoder only.
-                this.clearPipeline.destroyPendingAfterSubmit(submittedEncoder);
-            }
-            frameProfiler.endTimer("gpu", submitStart);
-            this.currentEncoder = null;
-            this.encoderEpoch++;
-            // Flush garbage list after submit to safely destroy unused depth textures
-            this.depthManager.flushGarbage();
-            this.msaaColorManager.flushGarbage();
-            // Destroy deferred TextureConverter buffers (resized mid-frame) so no "used while destroyed"
-            this.textureConverter.destroyPendingAfterSubmit();
-            // Destroy deferred VertexConverter buffers after submit to avoid "used while destroyed"
-            this.vertexConverter.destroyPendingAfterSubmit();
-            // Reuse global conversion buffer from offset 0 after each submit.
-            this.vertexConverter.startFrame();
-        }
-        this.currentRenderTarget = null;
-        this.resetBindFastPath();
     }
 
     /** Retire clear uniforms when an external caller abandons a detached encoder. */
@@ -3955,6 +3972,7 @@ export class DDrawWebGPUExecutor {
         const mem = toPlainGuestMemory(System.getInstance()?.process?.getCurrentMemory());
         if (!mem) return false;
 
+        this.beforeQueueWrite(state.gpuTexture);
         for (let i = 0; i < subs.length && i + 1 < levels; i++) {
             const sub = subs[i];
             if (!sub.surfacePtr) continue;
@@ -3987,6 +4005,39 @@ export class DDrawWebGPUExecutor {
      *  is the whole copy→draw→copy→draw hazard, and comparing this to a surface's
      *  sampledEncoderEpoch is how we detect it. */
     private encoderEpoch = 1;
+
+    /** The encoder epoch in which recorded (unsubmitted) work last read or wrote a texture.
+     *  Keyed by GPUTexture, not by surface, so a flip chain that rotates textures between
+     *  surfaces keeps the right answer. A submit advances the epoch, which clears every
+     *  entry at once. */
+    private readonly textureEpochs = new WeakMap<GPUTexture, number>();
+    /** Set while flush() runs: a write it causes itself (a texture synced while the batch is
+     *  encoded) keeps today's order and must not re-enter it. */
+    private flushing = false;
+
+    /** Record that the current encoder (or the pending batch) reads or writes `texture`. */
+    private noteRecordedTexture(texture: GPUTexture | undefined | null): void {
+        if (texture) this.textureEpochs.set(texture, this.encoderEpoch);
+    }
+
+    /** True when draws, blits or clears are recorded or batched but not yet submitted. */
+    hasRecordedWork(): boolean {
+        return this.currentEncoder !== null || this.currentBatch !== null;
+    }
+
+    /** Submit recorded work, if any; for code that submits an encoder of its own. */
+    flushPending(): void {
+        if (!this.flushing && this.hasRecordedWork()) this.flush(false);
+    }
+
+    /** QueueWriteGuard: a queue-level write to `texture` must not run ahead of recorded work that uses it. */
+    beforeQueueWrite(texture: GPUTexture): void {
+        if (!this.hasRecordedWork()) return;
+        if (this.textureEpochs.get(texture) !== this.encoderEpoch) return;
+        this.renderStats.queueWriteSubmits++;
+        if (this.opLogArmed > 0) this.opLog(`SUBMIT-BEFORE-WRITE epoch=${this.encoderEpoch}`);
+        this.flush(false);
+    }
 
     /** Samples per surface for the content hash. The scan runs once per surface per frame, so
      *  its cost is charged to every textured frame — a full sweep of every bound texture cost
@@ -4106,6 +4157,7 @@ export class DDrawWebGPUExecutor {
         // conservative can cost an extra submit; it can never miss one.
         tex.sampledEncoderEpoch = this.encoderEpoch;
         tex.sampledContentVersion = surfaceContentVersion(tex);
+        this.noteRecordedTexture(tex.gpuTexture);
     }
 
     /** Bit-cast a DWORD render state to its float value (POINTSIZE/SCALE are stored as floats). */
@@ -5094,6 +5146,7 @@ export class DDrawWebGPUExecutor {
             if (!this.currentEncoder) {
                 this.currentEncoder = this.device.createCommandEncoder();
             }
+            this.noteRecordedTexture(target.gpuTexture);
             
             const useClear = target.needsColorClear && target.clearColor !== undefined;
             const clearColor = useClear && target.clearColor !== undefined

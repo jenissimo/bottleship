@@ -31,6 +31,7 @@ import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { onFrameEnd as frameCaptureOnFrameEnd } from "./frame-capture";
 import { statsOverlay } from "../../core/stats-overlay";
 import { registerGpuDeviceObserver } from "../../core/gpu/gpu-device-lifecycle";
+import { beforeQueueWrite } from "../../backends/webgpu/shared/queue-write-guard";
 
 const FLIP_HOLD_MAX_MS = 100;
 const FLIP_HOLD_FLIP_INTERVALS = 1.5;
@@ -1163,6 +1164,8 @@ export class DDrawPresenter implements RenderActive {
                 );
             }
 
+            // This submit writes the surface texture ahead of the executor's recorded work.
+            beforeQueueWrite(surface.gpuTexture);
             queue.submit([encoder.finish()]);
         }
         profiler.end("present:rgb565Upload:gpuConvert");

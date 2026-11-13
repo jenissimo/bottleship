@@ -14,6 +14,7 @@ import { tryConvertPixelKernel } from "../../backends/webgpu/shared/dxt-kernel";
 import { DDPF_FOURCC } from "./constants";
 import { lockCostProfiler, LP } from "./lock-cost-profiler";
 import type { DirectDrawSurfaceState } from "./com-objects";
+import { beforeQueueWrite } from "../../backends/webgpu/shared/queue-write-guard";
 
 // ============================================================================
 // PRE-COMPUTED LOOKUP TABLES (initialized once at module load)
@@ -1883,6 +1884,7 @@ function uploadPartialRegion(
     }
 
     const bytesPerRow = needsPadding ? alignedDirtyBPR : dirtyBPR;
+    beforeQueueWrite(texture);
     queue.writeTexture(
         { texture, origin: { x, y, z: 0 } },
         dirtyData as GPUAllowSharedBufferSource,
@@ -1942,6 +1944,7 @@ export function uploadRGB565ToGPU(
     const alignedBPR = (bytesPerRow + 255) & ~255;
     const needsPadding = alignedBPR !== bytesPerRow && height > 1;
 
+    beforeQueueWrite(texture);
     if (needsPadding) {
         // Add row padding for WebGPU alignment
         const padded = new Uint16Array(alignedBPR / 2 * height);
@@ -2082,6 +2085,7 @@ export function uploadToGPUTexture(
     }
 
     const bytesPerRow = needsPadding ? alignedBPR : unpaddedBPR;
+    beforeQueueWrite(texture);
     queue.writeTexture(
         { texture },
         dataToUpload as GPUAllowSharedBufferSource,

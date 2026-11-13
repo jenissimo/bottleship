@@ -26,6 +26,7 @@ import {
     RGB555_TO_RGBA,
     ARGB1555_TO_RGBA,
 } from "../../../modules/ddraw/gpu-texture-utils";
+import { beforeQueueWrite } from "./queue-write-guard";
 
 // Threshold for using GPU compute vs CPU fallback (in pixels)
 const GPU_PIXEL_THRESHOLD = 64 * 64; // 4096 pixels
@@ -1034,6 +1035,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
             const rgba = this.convertCPU(memory, srcAddr, width, height, pitch, format, colorkey, undefined, textureFormat, palette);
             const unpaddedBPR = width * 4;
             const alignedBPR = (unpaddedBPR + 255) & ~255;
+            beforeQueueWrite(texture);
             if (alignedBPR === unpaddedBPR || height === 1) {
                 this.queue.writeTexture(
                     { texture },
