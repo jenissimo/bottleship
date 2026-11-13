@@ -350,13 +350,6 @@ export class EmulatorConfig {
     // capability (any bundle may declare it); mirrors real per-process x87 precision policy.
     public fpuStrict = false;
 
-    /**
-     * Opt-in: implicit primary presents of a guest that Flips wait for its next Flip
-     * (bounded) instead of being drawn at the next refresh. For titles whose front-buffer
-     * passes after a Flip are only incomplete because emulation stretches them.
-     */
-    public ddrawHoldPresentsUntilFlip = false;
-
     // ANSI code page (GetACP) — default 1252 (Western European)
     public ansiCodePage = 1252;
 
@@ -631,9 +624,8 @@ export class EmulatorConfig {
             Logger.log(LogCategory.SYSTEM, "EmulatorConfig: strict x87 FPU (relaxed-FPU disabled at boot, fpuStrict=true)");
         }
 
-        if (config.ddrawHoldPresentsUntilFlip) {
-            this.ddrawHoldPresentsUntilFlip = true;
-            Logger.log(LogCategory.SYSTEM, "EmulatorConfig: ddraw implicit presents wait for the next Flip (ddrawHoldPresentsUntilFlip=true)");
+        if (config.ddrawHoldPresentsUntilFlip !== undefined) {
+            Logger.log(LogCategory.SYSTEM, "EmulatorConfig: ddrawHoldPresentsUntilFlip is ignored and can be removed from the manifest: implicit primary presents draw the pixels committed at Unlock/Blt/BltFast");
         }
 
         // Apply per-game graphics quality override (layers on top of the global user pref)
@@ -768,7 +760,6 @@ export class EmulatorConfig {
         this.screenBackgroundColor = { ...DEFAULT_SCREEN_BACKGROUND };
         this.skipVideo = false;
         this.fpuStrict = false;
-        this.ddrawHoldPresentsUntilFlip = false;
         this.disabledDlls = [];
         this.appDirDlls = [];
         this.crtBinding = "auto";

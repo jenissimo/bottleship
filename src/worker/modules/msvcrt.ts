@@ -10,6 +10,7 @@ import { Process } from "../core/process";
 import { ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../core/logger";
 import { Mem } from "../core/memory/mem-accessor";
+import { scanCString, scanWString, findString } from './crt-string-scan';
 import type { Vc6LocaleSnapshot } from "./crt-cpp-locale-vc6";
 import { System } from "../core/system";
 import { shutdownProcess } from "./kernel32/process/process";
@@ -1862,17 +1863,16 @@ export class Msvcrt implements IModule {
 
     private strlen(ptr: number): number {
         if (!ptr) return 0;
-        let len = 0;
-        while (len < 0x100000) {
-            const b = Mem.readUint8(ptr + len);
-            if (b === 0 || b === null) break;
-            len++;
-        }
-        return len;
+        return scanCString(ptr).length;
     }
 
     private strcpy(dest: number, src: number): number {
-        const value = this.readCString(src, 0x100000);
+        const scan = src ? scanCString(src) : null;
+        if (dest && scan?.terminated) {
+            Mem.memmove(dest, src, scan.length + 1);
+            return dest >>> 0;
+        }
+        const value = this.readCString(src, scan ? scan.length : 0);
         this.writeCString(dest, value);
         return dest >>> 0;
     }
@@ -2413,20 +2413,16 @@ export class Msvcrt implements IModule {
 
     private wcslen(ptr: number): number {
         if (!ptr) return 0;
-        const region = this.process.addressSpace.getRegion(ptr);
-        const maxByRegion = region ? ((region.base + region.size - ptr) >>> 1) : Msvcrt.MAX_WIDE_SCAN_CHARS;
-        const maxChars = Math.max(1, Math.min(Msvcrt.MAX_WIDE_SCAN_CHARS, maxByRegion));
-        let chars = 0;
-        for (let i = 0; i < maxChars * 2; i += 2) {
-            const codeUnit = Mem.readUint16(ptr + i);
-            if (codeUnit === null || codeUnit === 0) break;
-            chars++;
-        }
-        return chars;
+        return scanWString(ptr).length;
     }
 
     private wcscpy(dest: number, src: number): number {
         if (!dest || !src) return dest >>> 0;
+        const scan = scanWString(src);
+        if (scan.terminated) {
+            Mem.memmove(dest, src, (scan.length + 1) * 2);
+            return dest >>> 0;
+        }
         const maxCharsToCopy = this.computeSafeWideCopyChars(dest);
         if (maxCharsToCopy <= 0) {
             this.setErrno(34);
@@ -2465,9 +2461,9 @@ export class Msvcrt implements IModule {
     private wcschr(ptr: number, ch: number): number {
         if (!ptr) return 0;
         const target = ch & 0xffff;
-        for (let i = 0; i < 0x100000; i += 2) {
+        for (let i = 0; ; i += 2) {
             const codeUnit = Mem.readUint16(ptr + i);
-            if (codeUnit === null) break;
+            if (codeUnit == null || ptr + i > 0xfffffffe) break;
             if (codeUnit === target) return (ptr + i) >>> 0;
             if (codeUnit === 0) break;
         }
@@ -2525,12 +2521,7 @@ export class Msvcrt implements IModule {
     private wcsstr(hayPtr: number, needlePtr: number): number {
         if (this.dbgStrCap) this._dbgCapPair('wcsstr', hayPtr, needlePtr);
         if (!hayPtr || !needlePtr) return 0;
-        const needle = this.readWString(needlePtr, Msvcrt.MAX_WIDE_SCAN_CHARS);
-        if (needle.length === 0) return hayPtr >>> 0;
-        const haystack = this.readWString(hayPtr, Msvcrt.MAX_WIDE_SCAN_CHARS);
-        const idx = haystack.indexOf(needle);
-        if (idx < 0) return 0;
-        return (hayPtr + idx * 2) >>> 0;
+        return findString(hayPtr, needlePtr, true);
     }
 
     private wcsnicmp(aPtr: number, bPtr: number, count: number): number {
@@ -2560,7 +2551,7 @@ export class Msvcrt implements IModule {
         const mem = getMemory(this.process.v86);
         if (!mem) return 0;
         let i = 0;
-        const limit = max > 0 ? max : Msvcrt.MAX_WIDE_SCAN_CHARS;
+        const limit = max > 0 ? max : Infinity;
         const memLen = mem.length - 1;
         while (i < limit) {
             const aOff = aPtr + i * 2;

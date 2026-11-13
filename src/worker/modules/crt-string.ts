@@ -5,6 +5,7 @@
  */
 import { ThunkImplementation } from '../core/thunking/thunk-dispatcher';
 import { Mem } from '../core/memory/mem-accessor';
+import { findString } from './crt-string-scan';
 
 export interface CrtStringHost {
     readCString(ptr: number, maxLen: number): string;
@@ -22,12 +23,7 @@ export function registerCrtStringExports(exports: Record<string, ThunkImplementa
     exports["strstr"] = (_c, _m, a) => {
         const haystack = a[0] ?? 0, needle = a[1] ?? 0;
         if (!haystack || !needle) return 0;
-        const str = host.readCString(haystack, 0x100000);
-        const sub = host.readCString(needle, 0x100000);
-        if (sub.length === 0) return haystack >>> 0;
-        const idx = str.indexOf(sub);
-        if (idx < 0) return 0;
-        return (haystack + idx) >>> 0;
+        return findString(haystack, needle, false);
     };
 
     exports["strpbrk"] = (_c, _m, a) => {
