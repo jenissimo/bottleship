@@ -164,7 +164,9 @@ export class DeferredUploadManager {
      * Upload all dirty surfaces in one batch (called from Present/Flip).
      * This is the main optimization - batches all texture uploads together.
      */
-    async flushAll(queue: GPUQueue, mem: Uint8Array): Promise<void> {
+    /** `committed`: pixels of `surface` copied at its last commit point; they are uploaded
+     *  instead of what guest memory holds now. */
+    async flushAll(queue: GPUQueue, mem: Uint8Array, committed?: { surface: DirectDrawSurfaceState; bytes: Uint8Array }): Promise<void> {
         if (this.dirtySurfaces.size === 0) return;
 
         profiler.start("DeferredUpload:batch");
@@ -192,9 +194,10 @@ export class DeferredUploadManager {
 
             profiler.start("DeferredUpload:batch:convert");
             const palette = resolvePalette(surface);
+            const fromCommit = committed !== undefined && committed.surface === surface;
             const rgbaData = decodeSurfaceFormatToRgba8(
-                mem,
-                surface.surfacePtr,
+                fromCommit ? committed.bytes : mem,
+                fromCommit ? 0 : surface.surfacePtr,
                 surface.width,
                 surface.height,
                 surface.pitch,
