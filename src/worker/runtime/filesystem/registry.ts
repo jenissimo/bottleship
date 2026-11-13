@@ -1,6 +1,7 @@
 import { RegistryPersistence, RegistryAccessLogEntry, PersistedRegistryState } from "./registry-persistence";
 import { Logger, LogCategory } from "../../core/logger";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
+import { SHELL_FOLDERS_VALUES, specialFolderPath } from "./special-folders";
 import { redirectsForImage, validateRedirects, type ExeRegistryRedirect, type RegistryRedirect } from "@bottleship/formats/sdb";
 
 export type RegistryValueType = "REG_SZ" | "REG_DWORD" | "REG_BINARY" | "REG_MULTI_SZ";
@@ -160,6 +161,13 @@ function buildSystemDefaults(osVersion: {
         {
             root: "HKLM", path: "Software\\Microsoft\\DirectX",
             values: [sz("Version", "4.09.00.0904")],
+        },
+        // Where the per-user folders are. A program that reads this key instead of calling
+        // SHGetFolderPath (a Flash Player projector finds its SharedObject store here) gets
+        // the same folders shell32 answers.
+        {
+            root: "HKCU", path: "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders",
+            values: SHELL_FOLDERS_VALUES.map(([name, csidl]) => sz(name, specialFolderPath(csidl)!)),
         },
     ];
     if (!isWin9x) {
