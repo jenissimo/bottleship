@@ -16,10 +16,23 @@ import { wgbEtag } from "./wgb-etag";
  *   BS_AUTH_REALM  realm shown in the browser prompt (default "BottleShip")
  */
 import path from "path";
+import { realpathSync } from "node:fs";
+import { realpath, stat } from "node:fs/promises";
 import { createHash, timingSafeEqual } from "node:crypto";
 
 const DIST = path.resolve(process.env.BS_DIST_DIR ?? path.join(import.meta.dir, "..", "dist"));
 const APPS = process.env.BS_APPS_DIR ? path.resolve(process.env.BS_APPS_DIR) : null;
+// Symlinks resolved once: the mount itself may be one, but nothing inside it may point out.
+const APPS_REAL = APPS ? resolveDir(APPS) : null;
+
+function resolveDir(dir: string): string {
+    try {
+        return realpathSync(dir);
+    } catch {
+        console.error(`BS_APPS_DIR "${dir}" does not exist or cannot be read`);
+        process.exit(1);
+    }
+}
 const PORT = parseInt(process.env.PORT ?? "5173");
 
 const AUTH_USER = process.env.BS_AUTH_USER ?? "";
@@ -129,6 +142,18 @@ async function serveFile(filePath: string, req: Request, extraHeaders: Record<st
     return new Response(isHead ? null : file, { headers });
 }
 
+/**
+ * A regular .wgb file whose real path is inside the apps mount, else null. The extension is
+ * checked on the resolved file too, so a link named x.wgb cannot serve something else.
+ */
+async function resolveBundle(requested: string): Promise<string | null> {
+    if (!APPS_REAL || path.extname(requested).toLowerCase() !== ".wgb") return null;
+    const real = await realpath(requested).catch(() => null);
+    if (!real || !real.startsWith(APPS_REAL + path.sep) || path.extname(real).toLowerCase() !== ".wgb") return null;
+    const info = await stat(real).catch(() => null);
+    return info?.isFile() ? real : null;
+}
+
 Bun.serve({
     port: PORT,
     hostname: "0.0.0.0",
@@ -152,7 +177,13 @@ Bun.serve({
             if (!bundlePath.startsWith(APPS + path.sep)) {
                 return new Response("Forbidden", { status: 403 });
             }
-            const resp = await serveFile(bundlePath, req, { "Cross-Origin-Resource-Policy": "same-origin" });
+            const real = await resolveBundle(bundlePath);
+            const resp = real ? await serveFile(real, req, {
+                "Cross-Origin-Resource-Policy": "same-origin",
+                "Content-Disposition": "attachment",
+                "Content-Security-Policy": "sandbox",
+                "X-Content-Type-Options": "nosniff",
+            }) : null;
             return resp ?? new Response("Not Found", { status: 404, headers: COOP_COEP });
         }
 
