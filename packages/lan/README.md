@@ -58,6 +58,10 @@ Multiple origins can be comma-separated. An HTTPS emulator page requires an HTTP
 relay URL: terminate TLS at a reverse proxy and forward both normal HTTP requests
 and WebSocket upgrades under `/socket.io/`. The root path `/health` returns the
 service name and protocol version. The relay does not host game files.
+Authenticated aggregate statistics at `/stats` are opt-in through the environment
+variable named by `statsTokenEnv` (default `BOTTLESHIP_LAN_STATS_TOKEN`); the
+schema and privacy rules match the Rust server, see
+[operator statistics](../../docs/multiplayer-security.md#operator-statistics-and-privacy).
 
 Rooms default to private and require a signing key supplied through the environment.
 The quick starts explicitly enable public name-only rooms. Public/private policies,
