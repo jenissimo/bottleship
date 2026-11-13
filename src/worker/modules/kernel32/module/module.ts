@@ -1294,20 +1294,31 @@ function initModuleFunctions(): void {
             unload();
             return { value: 1, stackCleanup: 4 };
         }
-        mod.initialized = false;
         const frameId = callbackManager.saveSuspendedThunkContext(ctx as never, 4, 'FreeLibrary DllMain');
         if (!frameId) {
-            unload();
-            return { value: 1, stackCleanup: 4 };
+            dynamicLoadRefs.set(hModule, 1);
+            return { value: 0, stackCleanup: 4 };
         }
-        const { callbackId } = callbackManager.invokeCallback(
-            (hModule + mod.entryPoint) >>> 0, [hModule, DLL_PROCESS_DETACH, 0], 0, () => { unload(); return 1; },
-            false, 'FreeLibrary DllMain', frameId,
-        );
+        mod.initialized = false;
+        let callbackId: number;
+        try {
+            ({ callbackId } = callbackManager.invokeCallback(
+                (hModule + mod.entryPoint) >>> 0, [hModule, DLL_PROCESS_DETACH, 0], 0, () => { unload(); return 1; },
+                false, 'FreeLibrary DllMain', frameId,
+            ));
+        } catch (error) {
+            mod.initialized = true;
+            dynamicLoadRefs.set(hModule, 1);
+            callbackManager.abandonSuspendedFrame(frameId);
+            // Setup can throw after changing guest ESP/EIP. Preserve the fatal error;
+            // abandoning a frame releases ownership but does not restore the CPU.
+            throw error;
+        }
         if (!callbackId) {
             callbackManager.abandonSuspendedFrame(frameId);
-            unload();
-            return { value: 1, stackCleanup: 4 };
+            mod.initialized = true;
+            dynamicLoadRefs.set(hModule, 1);
+            return { value: 0, stackCleanup: 4 };
         }
         return { value: 1, suspendedForCallback: true, callbackId, stackCleanup: 4 };
     };
