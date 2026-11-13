@@ -40,7 +40,11 @@ const TEB_TLS_POINTER       = 0x2C;
 const TEB_PEB               = 0x30;
 const TEB_LAST_ERROR        = 0x34;
 
-const TEB_SIZE = 4096;          // One page per TEB
+/** NT keeps TLS_MINIMUM_AVAILABLE slots inline at TEB+0xE10 (TlsSlots), and code that inlines
+ *  TlsGetValue reads them there: Mono's JIT emits `mov eax, fs:[0x18]; mov eax, [eax+0xE10+4*i]`
+ *  for its thread/domain slots. The TLS array therefore starts at that offset of the TEB block,
+ *  so slots 0..63 are the TlsSlots; the expansion slots follow it inside the same block. */
+const TEB_TLS_SLOTS = 0xE10;
 // A 32-bit NT 5.x PEB is 0x210 bytes. Anything we place at PEB+offset below that lands inside a
 // real field (0x100 is in the middle of GdiHandleBuffer), so the header proper is reserved whole.
 const PEB_SIZE = 0x230;
@@ -52,6 +56,8 @@ const PEB_SIZE = 0x230;
  *  index that exists can land past its end. */
 export const TLS_INDEX_LIMIT = 64 + 1024;
 const TLS_ARRAY_SIZE = TLS_INDEX_LIMIT * 4;
+/** The allocation behind one TEB: the TEB page plus the TLS array that starts inside it. */
+export const TEB_BLOCK_SIZE = TEB_TLS_SLOTS + TLS_ARRAY_SIZE;
 
 import { currentProcessId } from './process-identity';
 
@@ -285,14 +291,11 @@ export class TebManager {
             return 0;
         }
 
-        // Allocate TEB
-        const tebAddress = memoryManager.alloc(TEB_SIZE);
+        // One block: the TEB page with the TLS array starting at its TlsSlots offset.
+        const tebAddress = memoryManager.alloc(TEB_BLOCK_SIZE);
         const mem = this.getMemory();
-        mem.fill(0, tebAddress, tebAddress + TEB_SIZE);
-
-        // Allocate TLS array
-        const tlsArrayAddress = memoryManager.alloc(TLS_ARRAY_SIZE);
-        mem.fill(0, tlsArrayAddress, tlsArrayAddress + TLS_ARRAY_SIZE);
+        mem.fill(0, tebAddress, tebAddress + TEB_BLOCK_SIZE);
+        const tlsArrayAddress = tebAddress + TEB_TLS_SLOTS;
 
         const view = this.getView()!;
 
@@ -419,7 +422,9 @@ export class TebManager {
         const tls = this.tlsArrayMap.get(threadId);
         this.tebMap.delete(threadId);
         this.tlsArrayMap.delete(threadId);
-        if (tls !== undefined) memory.free(tls);
+        // A TLS array inside the TEB block goes with it; only one restored from an older
+        // savestate, where it was a block of its own, is freed separately.
+        if (tls !== undefined && (teb === undefined || tls !== teb + TEB_TLS_SLOTS)) memory.free(tls);
         if (teb !== undefined) memory.free(teb);
         return teb !== undefined || tls !== undefined;
     }

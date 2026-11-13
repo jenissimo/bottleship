@@ -14,7 +14,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Scheduler } from "../../src/worker/core/scheduler/scheduler";
 import { STACK_SIZE_PARAM_IS_A_RESERVATION, type Thread, type KernelThreadObject } from "../../src/worker/core/scheduler/types";
-import { TLS_INDEX_LIMIT } from "../../src/worker/core/teb-manager";
+import { TEB_BLOCK_SIZE, TLS_INDEX_LIMIT } from "../../src/worker/core/teb-manager";
 import { hypercallDataManager } from "../../src/worker/core/cpu/hypercall-data";
 import { System } from "../../src/worker/core/system";
 import { newObjectGraph, restoreObjectGraph } from "../../src/worker/savestate/object-codecs";
@@ -23,8 +23,6 @@ import { registerCoreParticipants } from "../../src/worker/savestate/core-partic
 
 const MB = 1024 * 1024;
 const MEM_BYTES = 64 * MB;
-const TEB_SIZE = 0x1000;
-const TLS_ARRAY_BYTES = TLS_INDEX_LIMIT * 4;
 
 /** Bump allocator with an exact-fit free list, so a released block really comes back. */
 class FakeMemory {
@@ -98,6 +96,15 @@ const reap = (s: Scheduler) => (s as any).reapTerminatedThreads();
 const thread = (s: Scheduler, id: number): Thread | undefined => (s as any).threads.get(id);
 
 describe("scheduler: a reaped thread's TEB and TLS array go back to the allocator", () => {
+    test("TLS slots 0..63 are the TEB's TlsSlots at +0xE10, where inlined TlsGetValue reads them", () => {
+        const { s, mem, view } = setup();
+        const id = spawn(s, mem);
+        const teb = s.tebManager.getTebAddress(id)!;
+        for (const i of [0, 12, 63]) s.tebManager.syncTlsSlot(id, i, 0xabc000 + i);
+        for (const i of [0, 12, 63]) expect(view.getUint32(teb + 0xe10 + i * 4, true)).toBe(0xabc000 + i);
+        expect(view.getUint32(teb + 0x2c, true)).toBe(teb + 0xe10);
+    });
+
     test("create/exit churn reuses one TEB and one TLS array instead of growing", () => {
         const { s, mem, memory } = setup();
         const tebs = new Set<number>(), arrays = new Set<number>();
@@ -107,7 +114,7 @@ describe("scheduler: a reaped thread's TEB and TLS array go back to the allocato
             const id = spawn(s, mem);
             tebs.add(s.tebManager.getTebAddress(id)!);
             arrays.add(s.tebManager.getTlsArrayAddress(id)!);
-            expect(memory.live.size).toBe(baseline + 3);          // stack + TEB + TLS array
+            expect(memory.live.size).toBe(baseline + 2);          // stack + TEB block (TLS array inside it)
             kill(s, id);
             reap(s);
             expect(thread(s, id)).toBeUndefined();
@@ -115,8 +122,7 @@ describe("scheduler: a reaped thread's TEB and TLS array go back to the allocato
             expect(s.tebManager.getTlsArrayAddress(id)).toBeUndefined();
         }
         expect([tebs.size, arrays.size]).toEqual([1, 1]);
-        expect(memory.liveOfSize(TEB_SIZE)).toBe(0);
-        expect(memory.liveOfSize(TLS_ARRAY_BYTES)).toBe(0);
+        expect(memory.liveOfSize(TEB_BLOCK_SIZE)).toBe(0);
         expect(s.tebManager.getAllTebs().size).toBe(0);
     });
 
@@ -124,8 +130,7 @@ describe("scheduler: a reaped thread's TEB and TLS array go back to the allocato
         const { s, mem, memory } = setup();
         (s as any).releaseTeb = () => true;                          // the old behaviour: drop the record only
         for (let i = 0; i < 10; i++) { const id = spawn(s, mem); kill(s, id); reap(s); }
-        expect(memory.liveOfSize(TEB_SIZE)).toBe(10);
-        expect(memory.liveOfSize(TLS_ARRAY_BYTES)).toBe(10);
+        expect(memory.liveOfSize(TEB_BLOCK_SIZE)).toBe(10);
     });
 
     test("live threads keep their TEB and TLS while dead ones are freed and their blocks reused", () => {
@@ -157,11 +162,9 @@ describe("scheduler: a reaped thread's TEB and TLS array go back to the allocato
         const array = s.tebManager.getTlsArrayAddress(id)!, teb = s.tebManager.getTebAddress(id)!;
         kill(s, id);
         reap(s);
-        // Another owner takes both blocks and fills them.
-        expect(memory.alloc(TLS_ARRAY_BYTES)).toBe(array);
-        expect(memory.alloc(TEB_SIZE)).toBe(teb);
-        mem.fill(0x5a, array, array + TLS_ARRAY_BYTES);
-        mem.fill(0x5a, teb, teb + TEB_SIZE);
+        // Another owner takes the block (TEB with the TLS array inside) and fills it.
+        expect(memory.alloc(TEB_BLOCK_SIZE)).toBe(teb);
+        mem.fill(0x5a, teb, teb + TEB_BLOCK_SIZE);
         expect(s.tlsFree(index)).toBe(true);                       // clearTlsSlotAllThreads walks the maps
         s.setLastErrorForThread(id, 0x77);                          // a late completion for the dead thread
         expect(view.getUint32(array + index * 4, true)).toBe(0x5a5a5a5a);
