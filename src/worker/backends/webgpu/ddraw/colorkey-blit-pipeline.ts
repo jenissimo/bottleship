@@ -222,12 +222,23 @@ export class ColorKeyBlitPipeline {
     }
 
     /**
-     * Perform a colorkey blit operation.
-     *
-     * @param encoder Command encoder to record commands into
-     * @param config Blit configuration
+     * Open a render pass on a blit destination, loading it (destination pixels stay under
+     * transparent areas). Consecutive blits to the same destination are encoded into this one pass.
      */
-    blit(encoder: GPUCommandEncoder, config: ColorKeyBlitConfig): void {
+    beginPass(encoder: GPUCommandEncoder, dstView: GPUTextureView): GPURenderPassEncoder {
+        return encoder.beginRenderPass({
+            colorAttachments: [
+                {
+                    view: dstView,
+                    loadOp: "load",
+                    storeOp: "store",
+                },
+            ],
+        });
+    }
+
+    /** Encode one blit into an open pass on `config.dstView`. */
+    encode(pass: GPURenderPassEncoder, config: ColorKeyBlitConfig): void {
         if (!this.uniformBuffer || !this.vertexBuffer || !this.pointSampler ||
             !this.linearSampler || !this.bindGroupLayout) {
             Logger.warn(LogCategory.DDRAW, `ColorKeyBlitPipeline: Not initialized`);
@@ -257,46 +268,33 @@ export class ColorKeyBlitPipeline {
 
         const bindGroup = this.bindGroupFor(config.srcView, config.filter === "linear");
 
-        // Begin render pass with loadOp: "load" to preserve existing destination pixels
-        const renderPass = encoder.beginRenderPass({
-            colorAttachments: [
-                {
-                    view: config.dstView,
-                    loadOp: "load", // preserve destination pixels under transparent areas
-                    storeOp: "store",
-                },
-            ],
-        });
-
-        renderPass.setPipeline(pipeline);
-        renderPass.setBindGroup(0, bindGroup, this.dynamicOffset);
-        renderPass.setVertexBuffer(0, this.vertexBuffer);
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup, this.dynamicOffset);
+        pass.setVertexBuffer(0, this.vertexBuffer);
 
         // Set viewport and scissor to destination rect for correct clipping
         const rectWidth = config.dstRect.right - config.dstRect.left;
         const rectHeight = config.dstRect.bottom - config.dstRect.top;
-        renderPass.setViewport(
-            config.dstRect.left,
-            config.dstRect.top,
-            rectWidth,
-            rectHeight,
-            0,
-            1
-        );
-        renderPass.setScissorRect(
-            config.dstRect.left,
-            config.dstRect.top,
-            rectWidth,
-            rectHeight
-        );
+        pass.setViewport(config.dstRect.left, config.dstRect.top, rectWidth, rectHeight, 0, 1);
+        pass.setScissorRect(config.dstRect.left, config.dstRect.top, rectWidth, rectHeight);
 
-        renderPass.draw(4, 1, 0, 0);
-        renderPass.end();
+        pass.draw(4, 1, 0, 0);
 
         Logger.verbose(LogCategory.DDRAW,
             `ColorKeyBlitPipeline: ${config.srcWidth}x${config.srcHeight} -> ${config.dstWidth}x${config.dstHeight} ` +
             `colorkey=RGB[${config.colorKeyLow.r.toFixed(3)},${config.colorKeyLow.g.toFixed(3)},${config.colorKeyLow.b.toFixed(3)}]`
         );
+    }
+
+    /** One blit in a pass of its own. */
+    blit(encoder: GPUCommandEncoder, config: ColorKeyBlitConfig): void {
+        if (!this.uniformBuffer) {
+            Logger.warn(LogCategory.DDRAW, `ColorKeyBlitPipeline: Not initialized`);
+            return;
+        }
+        const pass = this.beginPass(encoder, config.dstView);
+        this.encode(pass, config);
+        pass.end();
     }
 
     /** False when the next blit would overwrite a slot an unsubmitted blit still reads. */
