@@ -1478,6 +1478,9 @@ export function registerPerfCommands(svc: HarnessService): void {
      *     `module+rva`. This is the only sound wasm-function[N] -> guest-address route:
      *     v86's table indices do NOT match Chrome's numbering, so the mapping is established
      *     by sampling, never computed. No rows => attribution unavailable, said plainly.
+     *     It reads instruction_pointer between slices, i.e. the block entered NEXT (see
+     *     eipProfile): good for the wasm-function join, biased toward short callees as a
+     *     ranking.
      *   - `counted` (COUNT-weighted): the trace2 recorder's per-block `exec * static
      *     instructions`, resolved to `module+rva` — the ranking that survives a noisy machine
      *     because it never looks at time.
@@ -1612,13 +1615,29 @@ export function registerPerfCommands(svc: HarnessService): void {
     });
 
     /**
-     * eipProfile({ms?=3000, intervalMs?=5, top?=15}) — where the GUEST burns CPU, as data.
+     * eipProfile({ms?=3000, intervalMs?=5, top?=15, attribution?, warmupMs?=1500}) — where the
+     * GUEST burns CPU, as data.
      *
      * The frame/thunk profilers only see OUR side; when a stall is guest code (a level
      * load, a decode loop) they report a few hundred ms out of several seconds and the
-     * Chrome trace attributes JIT blocks to opaque `wasm-function[N]`. This samples
-     * cpu.instruction_pointer and symbolizes it against the loaded PE modules, so the
+     * Chrome trace attributes JIT blocks to opaque `wasm-function[N]`. This samples the
+     * guest between v86 slices and symbolizes against the loaded PE modules, so the
      * answer is "module+rva", which `re decompile` takes directly.
+     *
+     * WHAT A SAMPLE IS: the timer runs on the CPU's own thread, so it only fires between
+     * slices, and a slice ends at the first budget check after its instruction budget ran
+     * out. Samples are therefore INSTRUCTION-weighted at activation granularity, not
+     * wall-time-weighted. `attribution` picks what a sample names:
+     *   - 'exitSite' (default when the engine has it): the exit instruction of the last module
+     *     activation, i.e. the code that spent the budget. Turning it on recompiles (JIT cache
+     *     clear, then `warmupMs` before sampling, and again on the way out), so the window
+     *     around the call is not a clean timing window.
+     *   - 'nextEip': instruction_pointer, which at a budget exit already holds the TARGET.
+     *     A short leaf entered from long code is charged for that code (a ~2% leaf read as
+     *     19-31%). Kept for engines without the switch and for comparison — `nextEipTop` is
+     *     always reported alongside.
+     * Exact per-block counts are `guestBlocks` (counted channel); this verb is the cheap,
+     * unarmed one that covers every page.
      *
      * `stoppedPct` is the instrument's own blind spot, reported rather than hidden: while
      * v86 is stopped (async park / intentional yield) the register holds the LAST executed
@@ -1627,9 +1646,13 @@ export function registerPerfCommands(svc: HarnessService): void {
      * CPU — read that before reading the histogram.
      */
     svc.register("eipProfile", async (args) => {
-        const opts = (args[0] ?? {}) as { ms?: number; intervalMs?: number; top?: number };
+        const opts = (args[0] ?? {}) as {
+            ms?: number; intervalMs?: number; top?: number;
+            attribution?: EipAttribution; warmupMs?: number;
+        };
         const durationMs = Math.max(50, Math.min(60_000, opts.ms ?? 3000));
         const intervalMs = Math.max(1, opts.intervalMs ?? 5);
+        const warmupMs = Math.max(0, Math.min(30_000, opts.warmupMs ?? 1500));
         const top = opts.top ?? 15;
 
         const c = cpu();
@@ -1638,41 +1661,96 @@ export function registerPerfCommands(svc: HarnessService): void {
         const scheduler: any = sys().scheduler;
         const v86: any = (sys().process as any)?.v86;
 
-        const exact = new Map<number, number>();
-        const pages = new Map<number, number>();
-        let running = 0, stopped = 0;
+        const ex = traceExports();
+        const supported = exitSiteSupported(ex);
+        const attribution: EipAttribution = opts.attribution ?? (supported ? "exitSite" : "nextEip");
+        if (attribution === "exitSite" && !supported) {
+            throw new HarnessError("attribution:'exitSite' needs set_jit_exit_site_sampling/jit_exit_site_eip — rebuild vendor/v86", HarnessErrorCode.INTERNAL);
+        }
 
-        await new Promise<void>((resolve) => {
-            const id = setInterval(() => {
-                if (scheduler?.intentionalYield || v86?.running === false) { stopped++; return; }
-                running++;
-                const eip = ip[0] >>> 0;
-                exact.set(eip, (exact.get(eip) ?? 0) + 1);
-                const page = eip & ~0xfff;
-                pages.set(page, (pages.get(page) ?? 0) + 1);
-            }, intervalMs) as unknown as number;
-            setTimeout(() => { clearInterval(id); resolve(); }, durationMs);
-        });
+        const site = new EipHistogram(), next = new EipHistogram();
+        let stopped = 0;
+        const sample = async () => {
+            await new Promise<void>((resolve) => {
+                const id = setInterval(() => {
+                    if (scheduler?.intentionalYield || v86?.running === false) { stopped++; return; }
+                    next.add(ip[0] >>> 0);
+                    if (attribution === "exitSite") site.add(ex!.jit_exit_site_eip() >>> 0);
+                }, intervalMs) as unknown as number;
+                setTimeout(() => { clearInterval(id); resolve(); }, durationMs);
+            });
+        };
+        if (attribution === "exitSite") await withExitSiteSampling(ex!, warmupMs, sample);
+        else await sample();
 
-        const rank = (m: Map<number, number>, denom: number) =>
-            Array.from(m.entries())
-                .sort((a, b) => b[1] - a[1])
-                .slice(0, top)
-                .map(([addr, n]) => ({
-                    addr: "0x" + addr.toString(16),
-                    sym: symbolize(addr),
-                    count: n,
-                    pct: denom > 0 ? Math.round((n / denom) * 1000) / 10 : 0,
-                }));
-
+        const primary = attribution === "exitSite" ? site : next;
+        const running = next.total;
         const total = running + stopped;
         return {
-            durationMs, intervalMs,
+            durationMs, intervalMs, attribution,
+            ...(attribution === "exitSite" ? { warmupMs } : {}),
+            weighting: "instruction-weighted per v86 slice (a slice ends after a fixed instruction budget), not wall time",
+            note: attribution === "exitSite"
+                ? "each sample is the exit instruction of the last JIT activation before the slice ended (the dispatch entry for interpreted code); the JIT cache was cleared on entry and exit"
+                : "each sample is instruction_pointer between slices: the block entered NEXT after the activation that spent the budget, so a short callee of long code is over-charged. Use attribution:'exitSite' or guestBlocks for exact counts.",
             samples: total,
             runningSamples: running,
             stoppedPct: total > 0 ? Math.round((stopped / total) * 1000) / 10 : 0,
-            topPages: rank(pages, running),
-            topEips: rank(exact, running),
+            topPages: primary.rankPages(top),
+            topEips: primary.rank(top),
+            nextEipTop: next.rank(Math.min(top, 5)),
         };
     });
+}
+
+export type EipAttribution = "exitSite" | "nextEip";
+
+class EipHistogram {
+    readonly exact = new Map<number, number>();
+    total = 0;
+    add(eip: number): void { this.total++; this.exact.set(eip, (this.exact.get(eip) ?? 0) + 1); }
+    rank(top: number, m: Map<number, number> = this.exact) {
+        return Array.from(m.entries())
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, top)
+            .map(([addr, n]) => ({
+                addr: "0x" + addr.toString(16),
+                sym: symbolize(addr),
+                count: n,
+                pct: this.total > 0 ? Math.round((n / this.total) * 1000) / 10 : 0,
+            }));
+    }
+    rankPages(top: number) {
+        const pages = new Map<number, number>();
+        for (const [eip, n] of this.exact) { const p = (eip & ~0xfff) >>> 0; pages.set(p, (pages.get(p) ?? 0) + n); }
+        return this.rank(top, pages);
+    }
+}
+
+export function exitSiteSupported(ex: TraceExports | undefined): boolean {
+    return typeof ex?.set_jit_exit_site_sampling === "function"
+        && typeof ex?.get_jit_exit_site_sampling === "function"
+        && typeof ex?.jit_exit_site_eip === "function"
+        && typeof ex?.jit_clear_cache_js === "function";
+}
+
+let exitSiteWindowOpen = false;
+
+/** Run `body` with exit-site sampling compiled in. The switch shapes generated code, so it
+ *  only reaches modules compiled after it flips: clear, let the hot set recompile for
+ *  `warmupMs`, and on the way out restore the previous state and clear again so the session
+ *  goes back to the code it was running. One window at a time — a second caller would
+ *  restore the switch under the first. */
+export async function withExitSiteSampling<T>(ex: TraceExports, warmupMs: number, body: () => Promise<T>): Promise<T> {
+    if (exitSiteWindowOpen) throw new HarnessError("an exit-site eipProfile window is already open", HarnessErrorCode.INTERNAL);
+    exitSiteWindowOpen = true;
+    const prev = ex.get_jit_exit_site_sampling() >>> 0;
+    try {
+        if (prev !== 1) { ex.set_jit_exit_site_sampling(1); ex.jit_clear_cache_js(); }
+        if (warmupMs > 0) await new Promise((r) => setTimeout(r, warmupMs));
+        return await body();
+    } finally {
+        if (prev !== 1) { ex.set_jit_exit_site_sampling(prev); ex.jit_clear_cache_js(); }
+        exitSiteWindowOpen = false;
+    }
 }
