@@ -1,7 +1,7 @@
 /** Glyph metrics and bitmap packing, including explicit failures for unsupported formats. */
 import { afterEach, expect, test } from "bun:test";
 import { System } from "../../src/worker/core/system";
-import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
+import { EmulatorConfig, getCodePageDecoder, encodeAnsiString } from "../../src/worker/core/emulator-config-manager";
 import { getGlyphOutline } from "../../src/worker/modules/gdi32/gdi-text";
 import { GDIContext } from "../../src/worker/modules/gdi32/context";
 import { createPaintingExports } from "../../src/worker/modules/gdi32/painting";
@@ -277,7 +277,7 @@ test("GetGlyphOutlineW takes uChar as a UTF-16 code unit, not an ANSI byte", () 
         // 0x20AC (€) has no single-byte Windows-1252 representation; the W entry must not
         // try to decode it as one.
         const r = exports['GetGlyphOutlineW']!({}, mem, [0, 0x20AC, GGO_METRICS, 0x100, 0, 0, 0]);
-        expect(r).toBe(0);
+        expect(r).toBe(1);
     } finally { restore(); }
 });
 
@@ -344,9 +344,18 @@ test("GetKerningPairsA/W report zero kerning pairs instead of failing", () => {
     expect(exports['GetKerningPairsW']!({}, mem, [0, 0, 0])).toBe(0);
 });
 
-test("unhinted and unknown format flags fail instead of returning an untransformed approximation", () => {
-    const { mem, exports } = setupThunks();
-    for (const flag of [0x100, 0x200]) {
-        expect(exports['GetGlyphOutlineW']!({}, mem, [0, 65, GGO_BITMAP | flag, 0x100, 0, 0, 0])).toBe(GDI_ERROR);
-    }
+test("GGO_UNHINTED is advisory while unknown flags fail", () => {
+    const restore = installFakeOffscreenCanvas();
+    try {
+        scenario = { ...freshScenario(), width: 4, abLeft: 0, abRight: 2, abAscent: 2, abDescent: 0, alpha: [[255, 0], [0, 255]] };
+        const { mem, exports } = setupThunks();
+        expect(exports['GetGlyphOutlineW']!({}, mem, [0, 65, GGO_METRICS | 0x100, 0x100, 0, 0, 0])).toBe(1);
+        expect(exports['GetGlyphOutlineW']!({}, mem, [0, 65, GGO_BITMAP | 0x200, 0x100, 0, 0, 0])).toBe(GDI_ERROR);
+    } finally { restore(); }
+});
+
+test.each([932, 936, 949, 950])("glyph DBCS support leaves global ANSI round trips unchanged for CP%s", (codePage) => {
+    const bytes = new Uint8Array([0x82, 0xa0, 0x2e, 0x73, 0x61, 0x76]);
+    const decoded = getCodePageDecoder(codePage).decode(bytes);
+    expect(encodeAnsiString(decoded, codePage)).toEqual(bytes);
 });

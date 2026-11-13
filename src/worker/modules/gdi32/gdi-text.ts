@@ -100,8 +100,7 @@ function fillTextGdi(
 }
 
 // GetGlyphOutline's uFormat (wingdi.h GGO_*). The low nibble is one mode value (not a mask);
-// GGO_GLYPH_INDEX/GGO_UNHINTED are flag bits a caller ORs on top of it (rejected by the
-// painting.ts thunk before this is reached — see there for why).
+// GGO_GLYPH_INDEX is rejected at the thunk boundary; GGO_UNHINTED is advisory.
 const GGO_METRICS = 0x0000;
 const GGO_BITMAP = 0x0001;
 const GGO_GRAY2_BITMAP = 0x0004;

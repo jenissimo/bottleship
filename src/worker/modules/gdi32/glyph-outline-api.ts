@@ -5,6 +5,10 @@ import { MemoryGuard } from '../../core/memory/mem-guard';
 import { isValidAddress } from '../../core/memory/address-guard';
 import { Logger, LogCategory } from '../../core/logger';
 
+const GLYPH_DBCS_LABELS: Readonly<Record<number, string>> = { 932: 'shift_jis', 936: 'gbk', 949: 'euc-kr', 950: 'big5' };
+// @transient(pure host decoders for glyph character codes)
+const glyphDecoders = new Map<number, TextDecoder>();
+
 export function registerGlyphOutlineExports(exports: Record<string, ThunkImplementation>): void {
     // GLYPHMETRICS layout (offsets in bytes): +0 gmBlackBoxX (UINT) +4 gmBlackBoxY (UINT)
     // +8 gmptGlyphOrigin.x (LONG) +12 gmptGlyphOrigin.y (LONG) +16 gmCellIncX (short)
@@ -43,7 +47,11 @@ export function registerGlyphOutlineExports(exports: Record<string, ThunkImpleme
         const bytes = !isSingleByteCodePage(codePage) && uChar > 0xFF
             ? new Uint8Array([(uChar >> 8) & 0xFF, uChar & 0xFF])
             : new Uint8Array([uChar & 0xFF]);
-        return getCodePageDecoder(codePage).decode(bytes);
+        const label = GLYPH_DBCS_LABELS[codePage];
+        if (!label) return getCodePageDecoder(codePage).decode(bytes);
+        let decoder = glyphDecoders.get(codePage);
+        if (!decoder) { decoder = new TextDecoder(label); glyphDecoders.set(codePage, decoder); }
+        return decoder.decode(bytes);
     }
 
     // GetGlyphOutlineA/W(hdc, uChar, uFormat, lpgm, cbBuffer, lpvBuffer, lpmat2). uChar is a
@@ -62,7 +70,8 @@ export function registerGlyphOutlineExports(exports: Record<string, ThunkImpleme
         const lpmat2 = args[6]!;
         const GDI_ERROR = 0xFFFFFFFF;
 
-        if ((uFormat & ~0x0f) !== 0) return GDI_ERROR;
+        const rasterFormat = uFormat & ~0x100; // GGO_UNHINTED is advisory for the host rasterizer.
+        if ((rasterFormat & ~0x0f) !== 0) return GDI_ERROR;
         if (lpmat2) {
             if (!isValidAddress(mem, lpmat2, 16, 'r')) return GDI_ERROR;
             if (!isIdentityMat2(mem, lpmat2)) return GDI_ERROR;
@@ -73,7 +82,7 @@ export function registerGlyphOutlineExports(exports: Record<string, ThunkImpleme
             : decodeAnsiChar(uChar, EmulatorConfig.getInstance().ansiCodePage);
 
         const gdi = System.getInstance().gdiContext;
-        const result = gdi.getGlyphOutline(hdc, char, uFormat);
+        const result = gdi.getGlyphOutline(hdc, char, rasterFormat);
         Logger.verbose(LogCategory.GDI32, `GetGlyphOutline${isWide ? 'W' : 'A'}(hdc=0x${hdc.toString(16)}, char='${char}', uFormat=${uFormat})`);
         if (!result) return GDI_ERROR; // unsupported format or rasterization failure
 
@@ -81,7 +90,7 @@ export function registerGlyphOutlineExports(exports: Record<string, ThunkImpleme
             if (!isValidAddress(mem, lpgm, GLYPHMETRICS_SIZE, 'rw')) return GDI_ERROR;
             writeGlyphMetrics(lpgm, result, mem);
         }
-        if (!result.bitmap) return 0; // GGO_METRICS: no raster, metrics-only success
+        if (!result.bitmap) return 1; // GGO_METRICS: no raster, metrics-only success
 
         const required = result.bitmap.length;
         if (!lpvBuffer || cbBuffer === 0) return required; // size query: lpgm is filled, nothing else to do
