@@ -93,7 +93,11 @@ const ERROR_FILENAME_EXCED_RANGE = 206;
 const SEE_MASK_NOCLOSEPROCESS = 0x00000040;
 
 function getSpecialFolderPath(csidl: number): string {
-    return specialFolderPath(csidl) ?? "C:\\";
+    const path = specialFolderPath(csidl);
+    if (path !== undefined) return path;
+    // The next folder to add to special-folders.ts shows up here.
+    Logger.verbose(LogCategory.SYSTEM, `shell32: no folder for CSIDL 0x${(csidl & 0xff).toString(16)}, answering C:\\`);
+    return "C:\\";
 }
 
 /**
