@@ -23,6 +23,10 @@ import { restoreModuleImages, type ModuleImagesState } from "../../src/worker/sa
 import type { ModuleDescriptor } from "../../src/worker/api/types";
 import type { VTableInfo } from "../../src/worker/api/adapters/module-adapter";
 import type { Process } from "../../src/worker/core/process";
+import { preserveComReleaseTracking, preserveComVtableOwners } from "./helpers/scoped-process-state";
+
+preserveComReleaseTracking();
+preserveComVtableOwners();
 
 const system = System.getInstance(), resources = system.resourceProvider, config = EmulatorConfig.getInstance();
 const savedProcess = system.process, savedThread = system.scheduler.getCurrentThreadId, savedMem = Object.getOwnPropertyDescriptors(Mem);

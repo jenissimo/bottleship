@@ -19,6 +19,8 @@ import { DMUS_OBJ_FILENAME, DMUS_OBJ_MEMORY } from "../../packages/formats/src/d
 import { MemoryChunkStore } from "../../src/worker/savestate/chunk-store";
 import { CaptureRefusal, newObjectGraph, restoreObjectGraph } from "../../src/worker/savestate/object-codecs";
 import { ParticipantRegistry, savestateParticipants } from "../../src/worker/savestate/participant";
+import { preserveGlobals } from "./helpers/scoped-globals";
+import { preserveComReleaseTracking, preserveMemBinding } from "./helpers/scoped-process-state";
 import { writeRamChunks, RAM_CHUNK_SIZE } from "../../src/worker/savestate/ram";
 import { captureSession } from "../../src/worker/savestate/session";
 import { sha256HexSync } from "../../src/worker/savestate/sha256";
@@ -109,6 +111,9 @@ const SMF = Uint8Array.from([...ascii("MThd"), ...be(6, 4), ...be(0, 2), ...be(1
 const system = System.getInstance(), savedProcess = system.process, savedFs = (system as unknown as { fileSystem: unknown }).fileSystem;
 const rp = SystemResourceProvider.getInstance();
 const flags = globalThis as { __savestates?: unknown };
+preserveGlobals("__savestates");
+preserveMemBinding();
+preserveComReleaseTracking();
 let mem: Uint8Array, module: DMusic, internals: Record<string, any>, guestProcess: unknown;
 let files: Map<string, Uint8Array>, dispose: Array<() => void>, comBefore: Set<number>, nextHeap: number, nextCom: number, savedFlag: unknown;
 

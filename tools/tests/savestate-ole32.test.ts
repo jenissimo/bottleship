@@ -8,6 +8,10 @@ import { savestateParticipants } from "../../src/worker/savestate/participant";
 import { System } from "../../src/worker/core/system";
 import { comVtableOwner, registerComVtableOwner } from "../../src/worker/core/com/com-memory";
 import { registerHleComServer } from "../../src/worker/core/com/hle-com-registry";
+import { preserveComVtableOwners, preserveMemBinding } from "./helpers/scoped-process-state";
+
+preserveMemBinding();
+preserveComVtableOwners();
 
 const bytes = (v: unknown) => {
     const e = encodeValue(v as SaveValue);

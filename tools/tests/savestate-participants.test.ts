@@ -53,6 +53,9 @@ import { DMusic } from "../../src/worker/modules/dmusic";
 import { clearTimerHandler } from "../../src/worker/core/scheduler/timer-wheel";
 import { exports as vistaRuntimeExports } from "../../src/worker/modules/kernel32/vista-runtime";
 import { exports as processExports } from "../../src/worker/modules/kernel32/process/process";
+import { preserveSavestateParticipants } from "./helpers/scoped-process-state";
+
+preserveSavestateParticipants();
 
 const bytes = (v: unknown) => {
     const e = encodeValue(v as SaveValue);

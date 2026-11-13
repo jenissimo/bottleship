@@ -10,7 +10,7 @@ import { registerNativeModulePatcher, unregisterNativeModulePatcher } from "../.
 import { libHleManager } from "../../src/worker/core/hle-lib/lib-hle-manager";
 import { NATIVE_LEAVES } from "../../src/worker/core/hle-lib/native-leaves";
 import type { VirtualFileSystem } from "../../src/worker/runtime/filesystem/vfs";
-import { exports as kernel32, captureModuleRefs, restoreModuleRefs } from "../../src/worker/modules/kernel32/module/module";
+import { exports as kernel32, captureModuleRefs, resetModuleRefs, restoreModuleRefs } from "../../src/worker/modules/kernel32/module/module";
 import {
     captureModuleImages, moduleImagesHooks, restoreModuleImages, verifyModuleImages,
     MODULE_IMAGE_FIELDS, MODULE_IMAGES_SCHEMA, type ModuleImagesState,
@@ -23,10 +23,15 @@ import { restoreObjectGraph } from "../../src/worker/savestate/object-codecs";
 import { decodeSavestate } from "../../src/worker/savestate/container";
 import { encodeValue, type SaveValue } from "../../src/worker/savestate/value-codec";
 import { sha256HexSync } from "../../src/worker/savestate/sha256";
+import { preserveGlobals } from "./helpers/scoped-globals";
+
+preserveGlobals("__savestates");
 
 const system = System.getInstance();
 const flag = globalThis as { __savestates?: unknown };
 const original = { process: system.process, exe: system.executablePath, tls: system.implicitTlsEntries, flag: flag.__savestates };
+const preemptRanges = (system.scheduler as unknown as { nonPreemptibleRanges: Array<{ base: number; end: number }> }).nonPreemptibleRanges;
+const originalPreemptRanges = [...preemptRanges];
 let hookedName = "";
 let hookMode: "patches" | "declines-after-a-stub" | "throws" = "patches";
 
@@ -53,6 +58,8 @@ afterEach(() => {
 });
 afterAll(() => {
     unregisterNativeModulePatcher("savestate-module-images-test");
+    preemptRanges.splice(0, preemptRanges.length, ...originalPreemptRanges);
+    resetModuleRefs();
 });
 
 const EXPORT_RVA = 0x1800, IAT_RVA = 0x1340, DATA_RVA = 0x1900;

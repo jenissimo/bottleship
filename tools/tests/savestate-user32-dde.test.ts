@@ -1,9 +1,14 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { encodeValue, type SaveValue } from "../../src/worker/savestate/value-codec";
 import { savestateParticipants, type Participant } from "../../src/worker/savestate/participant";
 import { newCaptureRun } from "../../src/worker/savestate/session";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
+import { System } from "../../src/worker/core/system";
 import { createInputExports, type User32InputState } from "../../src/worker/modules/user32/input";
+import { preserveSavestateParticipants } from "./helpers/scoped-process-state";
+
+preserveSavestateParticipants();
+afterAll(() => System.getInstance().inputManager.reset());
 
 const DNS_REGISTER = 0x0001;
 const APPCMD_CLIENTONLY = 0x10;

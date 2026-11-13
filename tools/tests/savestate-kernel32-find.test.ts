@@ -5,6 +5,9 @@ import { exports as fileIo } from "../../src/worker/modules/kernel32/file-io";
 import { newObjectGraph, restoreObjectGraph } from "../../src/worker/savestate/object-codecs";
 import { decodeValue, encodeValue, type SaveValue } from "../../src/worker/savestate/value-codec";
 import type { VfsEntry } from "../../src/worker/runtime/filesystem/vfs";
+import { preserveMemBinding } from "./helpers/scoped-process-state";
+
+preserveMemBinding();
 
 const PATH = 0x100, FIND_DATA = 0x400;
 const listing: VfsEntry[] = [

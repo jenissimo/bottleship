@@ -18,6 +18,11 @@ import {
 import { CaptureRefusal } from "../../src/worker/savestate/object-codecs";
 import { savestateParticipants } from "../../src/worker/savestate/participant";
 import { decodeValue, encodeValue, type SaveValue } from "../../src/worker/savestate/value-codec";
+import { preserveGlobals } from "./helpers/scoped-globals";
+import { preserveMemBinding } from "./helpers/scoped-process-state";
+
+preserveGlobals("__savestates");
+preserveMemBinding();
 
 const disposers: Array<() => void> = [];
 afterEach(() => { for (const fn of disposers.splice(0).reverse()) fn(); });
