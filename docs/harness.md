@@ -165,6 +165,12 @@ far too much log output to grep. So the harness gives you structured views inste
   guest pages and diffs two captures — per-section sizes, declared locals, first differing
   offset. It is the decisive test for any codegen flag: if the bytes don't change, the flag is
   dead on that workload, and no timing measurement can say otherwise.
+- **Executed op density.** `jitPublications arm {blockMap:true}` records, for every module
+  compiled after arming, each basic block's physical guest address, instruction count and the
+  byte range of its code. `tools/bench-v86/jit-exec-density.mjs <publications.json>
+  <guestBlocks.json>` joins that with `guestBlocks` exec counts: Wasm ops per guest instruction
+  weighted by what actually ran, per guest module, JIT module and named range. The bringup
+  skill has the command sequence.
 - **GPU device loss.** A lost WebGPU device never throws — every later call is a validated
   no-op — so the picture stops changing while every counter keeps incrementing.
   **`gpuDeviceState()`** reports the device's status and generation alongside the answers the
