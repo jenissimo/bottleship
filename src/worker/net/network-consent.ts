@@ -90,7 +90,7 @@ export class NetworkConsent {
     /** Tests and worker reset. */
     reset(): void {
         this.release();
-        this.mode = "off"; this.decision = "undecided"; this.pending = null;
+        this.mode = "off"; this.decision = "undecided"; this.pending = null; this.nextId = 1;
     }
 }
 

@@ -913,9 +913,10 @@ test("network permission: finding or opening a session asks first; enumerating p
         u32(0x3000, 80);
         const parked = call("EnumSessions", [0x3000, 60, 0x7000, 0, 0]) as Promise<ThunkResult>;
         expect(parked).toBeInstanceOf(Promise);
-        expect(posted).toEqual([{ id: 1, api: "directplay", operation: "EnumSessions" }]);
+        expect(posted).toEqual([{ id: expect.any(Number), api: "directplay", operation: "EnumSessions" }]);
+        const requestId = (posted[0] as { id: number }).id;   // ids are process-wide; other files may have asked first
         expect(call("EnumSessions", [0, 0, 0, 0, 0x20])).toBe(DP.OK);   // stopping an async enumeration is not network use
-        networkConsent.answer(1, false);
+        networkConsent.answer(requestId, false);
         expect((await parked).reissue).toBe(true);
         // Refused: the re-issued call runs as on a machine with loopback only: no session answers.
         const enumerated = await call("EnumSessions", [0x3000, 60, 0x7000, 0, 0]) as ThunkResult;
