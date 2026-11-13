@@ -8,6 +8,7 @@ import { Process } from "../core/process";
 import { ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../core/logger";
 import { Mem } from "../core/memory/mem-accessor";
+import { scanCString, scanWString, findString } from './crt-string-scan';
 import { System } from "../core/system";
 import { VfsFileHandle } from "../runtime/filesystem/vfs";
 import { fpuGetST, fpuPop, fpuSetST0 } from "../core/fpu-helper";
@@ -350,11 +351,17 @@ export class Crtdll implements IModule {
     // ==================== String ====================
 
     private strlen(ptr: number): number {
-        return this.readCString(ptr, 0x100000).length;
+        if (!ptr) return 0;
+        return scanCString(ptr).length;
     }
 
     private strcpy(dest: number, src: number): number {
-        const value = this.readCString(src, 0x100000);
+        const scan = src ? scanCString(src) : null;
+        if (dest && scan?.terminated) {
+            Mem.memmove(dest, src, scan.length + 1);
+            return dest >>> 0;
+        }
+        const value = this.readCString(src, scan ? scan.length : 0);
         this.writeCString(dest, value);
         return dest >>> 0;
     }
@@ -413,12 +420,7 @@ export class Crtdll implements IModule {
 
     private strstr(haystack: number, needle: number): number {
         if (!haystack || !needle) return 0;
-        const str = this.readCString(haystack, 0x100000);
-        const sub = this.readCString(needle, 0x100000);
-        if (sub.length === 0) return haystack >>> 0;
-        const idx = str.indexOf(sub);
-        if (idx < 0) return 0;
-        return (haystack + idx) >>> 0;
+        return findString(haystack, needle, false);
     }
 
     private strpbrk(str: number, charset: number): number {
@@ -474,14 +476,7 @@ export class Crtdll implements IModule {
 
     private wcslen(ptr: number): number {
         if (!ptr) return 0;
-        let len = 0;
-        for (let i = 0; i < 0x100000; i += 2) {
-            const lo = Mem.readUint8(ptr + i);
-            const hi = Mem.readUint8(ptr + i + 1);
-            if (lo === null || hi === null || (lo === 0 && hi === 0)) break;
-            len++;
-        }
-        return len;
+        return scanWString(ptr).length;
     }
 
     private wcstombs(dest: number, src: number, count: number): number {
