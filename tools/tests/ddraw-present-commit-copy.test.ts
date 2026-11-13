@@ -68,8 +68,8 @@ function presenterWithDrawLog() {
         presentCallCount: 0, pendingSurface: null, pendingOptions: null, pendingResolvers: [],
         pendingCommit: null, commitBuffers: [null, null], commitInFlight: null,
         pumpRunning: false, pumpQueued: false, presentClock: clock, latchedSince: -1,
-        refreshUnregister: null, backstopCancel: null, lastFlipAt: -Infinity, flipIntervalMs: 0,
-        lockedSince: -1, holdUntilFlip: () => false,
+        refreshUnregister: null, backstopCancel: null,
+        lockedSince: -1,
     });
     const drawn: Array<{ options: any; at: number; surface: any; shown: number[] }> = [];
     presenter.drawFrame = async (surface: DirectDrawSurfaceState, options: unknown, commit: Uint8Array | null) => {

@@ -34,8 +34,6 @@ import { statsOverlay } from "../../core/stats-overlay";
 import { registerGpuDeviceObserver } from "../../core/gpu/gpu-device-lifecycle";
 import { beforeQueueWrite } from "../../backends/webgpu/shared/queue-write-guard";
 
-const FLIP_HOLD_MAX_MS = 100;
-const FLIP_HOLD_FLIP_INTERVALS = 1.5;
 const LOCK_HOLD_MAX_MS = 50;
 const REFRESH_BACKSTOP_MS = 50;
 
@@ -86,11 +84,8 @@ export class DDrawPresenter implements RenderActive {
     presentClock: PresentClock = defaultPresentClock;
     private latchedSince = -1;
     private lockedSince = -1;
-    holdUntilFlip: () => boolean = () => EmulatorConfig.getInstance().ddrawHoldPresentsUntilFlip;
     private refreshUnregister: (() => void) | null = null;
     private backstopCancel: (() => void) | null = null;
-    private lastFlipAt = -Infinity;
-    private flipIntervalMs = 0;
 
     // Phase-blend present mode (C). When enabled, guest Flips only SNAPSHOT into the interpolator;
     // a per-rAF callback (blendFrameUnreg) re-presents mix(prev,new,phase) at full refresh so a
@@ -284,14 +279,6 @@ export class DDrawPresenter implements RenderActive {
 
     async present(surface: DirectDrawSurfaceState, _mem: Uint8Array, options: { throttle?: boolean; frameAlreadyMarked?: boolean; flip?: boolean; snapshotTextureView?: GPUTextureView; commit?: boolean; palette?: boolean } = {}): Promise<void> {
         this.presentCallCount++;
-        const now = this.presentClock.now();
-        if (options.flip) {
-            if (this.lastFlipAt > -Infinity) {
-                const interval = now - this.lastFlipAt;
-                this.flipIntervalMs = this.flipIntervalMs > 0 ? this.flipIntervalMs * 0.75 + interval * 0.25 : interval;
-            }
-            this.lastFlipAt = now;
-        }
         return new Promise<void>((resolve, reject) => {
             if (this.pendingSurface || this.pendingResolvers.length > 0) {
                 const supersededResolvers = this.pendingResolvers.splice(0);
@@ -326,10 +313,8 @@ export class DDrawPresenter implements RenderActive {
      *   is drawn at the next refresh, once per refresh. A primary that is locked is held for
      *   at most LOCK_HOLD_MAX_MS from when it was first seen locked; one that stays locked
      *   is a continuous scanout writer and is drawn once per refresh after that.
-     * - Opt-in (manifest emulator.ddrawHoldPresentsUntilFlip): for a guest that Flips, the
-     *   latch waits for its next Flip, at most FLIP_HOLD_FLIP_INTERVALS of its Flip interval
-     *   (capped at FLIP_HOLD_MAX_MS), then draws the held state. Worst-case added latency of
-     *   an implicit present after a Flip: FLIP_HOLD_MAX_MS plus one refresh.
+     * - An implicit present from Unlock, Blt or BltFast draws the pixels copied at that call,
+     *   so a guest that keeps writing the front outside any lock is not sampled mid-pass.
      */
     private schedulePump(implicit: boolean): void {
         if (!implicit) {
@@ -348,14 +333,7 @@ export class DDrawPresenter implements RenderActive {
         this.armBackstop();
     }
 
-    private flipHoldMs(): number {
-        if (this.lastFlipAt === -Infinity || !this.holdUntilFlip()) return 0;
-        if (this.flipIntervalMs <= 0) return FLIP_HOLD_MAX_MS;
-        return Math.min(FLIP_HOLD_MAX_MS, this.flipIntervalMs * FLIP_HOLD_FLIP_INTERVALS);
-    }
-
     private implicitReady(now: number): boolean {
-        if (now - this.lastFlipAt < this.flipHoldMs()) return false;
         const locked = (this.pendingSurface as { activeLeaseId?: number } | null)?.activeLeaseId !== undefined;
         if (!locked) { this.lockedSince = -1; return true; }
         if (this.lockedSince < 0) this.lockedSince = this.latchedSince;
