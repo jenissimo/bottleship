@@ -4,6 +4,7 @@ import { type HleDispatcher, ThunkImplementation } from '../../core/thunking/thu
 import { registerPaintingDcStateExports } from './painting-dc-state';
 import { registerPaintingMiscExports } from './painting-misc';
 import { registerOutlineMetricsExports } from './outline-metrics';
+import { installedFontExternalLeadingEm } from './font-resource';
 import { System } from '../../core/system';
 import { savestateParticipants, savestatesEnabled, stateKeys } from '../../savestate/participant';
 import type { SaveValue } from '../../savestate/value-codec';
@@ -655,7 +656,12 @@ function writeTextMetrics(hdc: number, lptm: number, mem: Uint8Array): void {
     view.setInt32(lptm +  4, ascent,  true); // tmAscent
     view.setInt32(lptm +  8, descent, true); // tmDescent
     view.setInt32(lptm + 12, 0,       true); // tmInternalLeading
-    view.setInt32(lptm + 16, Math.round(ascent * 0.15), true); // tmExternalLeading
+    // An installed font states its own line gap; the estimate stands in for the faces whose tables we do not hold.
+    const leadingEm = installedFontExternalLeadingEm(gdi.getSelectedFontFace(hdc));
+    const externalLeading = leadingEm !== null
+        ? Math.round(leadingEm * (gdi.hdcStates.get(hdc)?.fontSize ?? height))
+        : Math.round(ascent * 0.15);
+    view.setInt32(lptm + 16, externalLeading, true); // tmExternalLeading
     view.setInt32(lptm + 20, aveWidth, true); // tmAveCharWidth
     view.setInt32(lptm + 24, maxWidth, true); // tmMaxCharWidth
     view.setInt32(lptm + 28, 400,      true); // tmWeight (FW_NORMAL)

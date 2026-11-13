@@ -32,7 +32,7 @@ afterEach(() => {
 });
 
 test('parseSfntFace reads the family, full name and style', () => {
-    expect(parseSfntFace(BOLD)).toEqual({ family: 'Liberation Sans', fullName: 'Liberation Sans Bold', weight: 700, italic: false });
+    expect(parseSfntFace(BOLD)).toEqual({ family: 'Liberation Sans', fullName: 'Liberation Sans Bold', weight: 700, italic: false, externalLeadingEm: 67 / 2048 });
     expect(parseSfntFace(ITALIC)?.italic).toBe(true);
     expect(parseSfntFace(new Uint8Array(16))).toBeNull();
 });

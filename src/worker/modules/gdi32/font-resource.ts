@@ -14,6 +14,8 @@ const SFNT_OTTO = 0x4f54544f; // 'OTTO'
 const SFNT_TRUE = 0x74727565; // 'true'
 const TAG_NAME = 0x6e616d65;  // 'name'
 const TAG_OS2 = 0x4f532f32;   // 'OS/2'
+const TAG_HEAD = 0x68656164;  // 'head'
+const TAG_HHEA = 0x68686561;  // 'hhea'
 const TAG_CMAP = 0x636d6170;  // 'cmap'
 const NAME_ID_FAMILY = 1;
 const NAME_ID_FULL = 4;
@@ -75,7 +77,9 @@ function parseSfntName(data: Uint8Array, nameId: number): string | null {
         } else {
             continue;
         }
-        s = s.trim();
+        // A name record may carry its terminator inside the stored length; GDI reads a C string.
+        const nul = s.indexOf('\0');
+        s = (nul < 0 ? s : s.slice(0, nul)).trim();
         if (!s) continue;
         const score = (platform === 3 ? 2 : 1) + (platform === 3 && language === 0x409 ? 1 : 0);
         if (score > bestScore) {
@@ -94,6 +98,23 @@ export interface SfntFace {
     /** OS/2 usWeightClass, 400 when the table is absent. */
     weight: number;
     italic: boolean;
+    /** tmExternalLeading as a fraction of the em, or null when the tables cannot say. */
+    externalLeadingEm: number | null;
+}
+
+/**
+ * The line gap GDI reports as tmExternalLeading: what the font's hhea line spacing adds
+ * beyond the usWinAscent + usWinDescent cell, never negative.
+ */
+function sfntExternalLeadingEm(data: Uint8Array): number | null {
+    const head = sfntTable(data, TAG_HEAD), hhea = sfntTable(data, TAG_HHEA), os2 = sfntTable(data, TAG_OS2);
+    if (!head || !hhea || !os2 || head + 20 > data.byteLength || hhea + 10 > data.byteLength || os2 + 78 > data.byteLength) return null;
+    const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const unitsPerEm = dv.getUint16(head + 18);
+    if (!unitsPerEm) return null;
+    const lineSpacing = dv.getInt16(hhea + 4) - dv.getInt16(hhea + 6) + dv.getInt16(hhea + 8);
+    const cell = dv.getUint16(os2 + 74) + dv.getUint16(os2 + 76);
+    return Math.max(0, lineSpacing - cell) / unitsPerEm;
 }
 
 /** The names and style GDI selects a font file by. */
@@ -109,11 +130,12 @@ export function parseSfntFace(data: Uint8Array): SfntFace | null {
         weight: hasOs2 ? dv.getUint16(os2 + 4) || 400 : 400,
         // fsSelection bit 0: ITALIC.
         italic: hasOs2 ? (dv.getUint16(os2 + 62) & 1) !== 0 : false,
+        externalLeadingEm: sfntExternalLeadingEm(data),
     };
 }
 
 // The worker owns one guest process, so its FontFaceSet also scopes FR_PRIVATE fonts.
-interface InstalledFont { faces: FontFace[]; family: string; fullName: string | null; references: Map<number, number> }
+interface InstalledFont { faces: FontFace[]; family: string; fullName: string | null; externalLeadingEm: number | null; references: Map<number, number> }
 // @refuse(fonts added at run time are not part of a v1 savestate)
 const installedFonts = new Map<string, InstalledFont>();
 // @refuse(fonts added at run time are not part of a v1 savestate)
@@ -193,7 +215,7 @@ async function loadFontResource(resolvedPath: string, data: Uint8Array, generati
         if (generation !== fontGeneration) return null;
         Logger.log(LogCategory.GDI32,
             `AddFontResource: installed '${names.join("' / '")}' from "${resolvedPath}"`);
-        return { faces, family: face.family, fullName: face.fullName, references: new Map() };
+        return { faces, family: face.family, fullName: face.fullName, externalLeadingEm: face.externalLeadingEm, references: new Map() };
     } catch (e) {
         Logger.warn(LogCategory.GDI32, `AddFontResource: FontFace load failed for "${resolvedPath}": ${e}`);
         return null;
@@ -229,6 +251,15 @@ export function isInstalledFontName(faceName: string): boolean {
         if (entry.family.toLowerCase() === name || entry.fullName?.toLowerCase() === name) return true;
     }
     return false;
+}
+
+/** tmExternalLeading of an installed font as a fraction of the em; null for any other face. */
+export function installedFontExternalLeadingEm(faceName: string): number | null {
+    const name = faceName.toLowerCase();
+    for (const entry of installedFonts.values()) {
+        if (entry.family.toLowerCase() === name || entry.fullName?.toLowerCase() === name) return entry.externalLeadingEm;
+    }
+    return null;
 }
 
 /** Uninstall a font previously added by addFontResource. Returns false when the

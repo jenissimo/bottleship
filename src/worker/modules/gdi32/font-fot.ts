@@ -7,7 +7,6 @@
 const NE_RT_FONTDIR = 0x8007;
 const NE_RT_PATH = 0x80cc;
 const NE_SHIFT = 4;
-const FONT_FILE = /\.(ttf|otf|ttc)$/i;
 const MZ_STUB = "This is a TrueType font, not a program.";
 
 const ascii = (bytes: Uint8Array): string => {
@@ -55,7 +54,7 @@ export function parseFot(data: Uint8Array): FotReference | null {
             const raw = ascii(data.subarray(off, off + len));
             const nul = raw.indexOf("\0");
             const candidate = nul < 0 ? raw : raw.slice(0, nul);
-            if (FONT_FILE.test(candidate)) fontPath = candidate;
+            if (candidate) fontPath = candidate;
         }
     }
     if (!fontPath) return null;
