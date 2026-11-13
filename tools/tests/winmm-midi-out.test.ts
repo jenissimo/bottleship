@@ -153,6 +153,37 @@ describe("midiOut handles", () => {
         expect(midi.shortMessage(h, 0x90)).toBe(5);
     });
 
+    test("CALLBACK_THREAD posts MM_MOM_OPEN, MM_MOM_DONE and MM_MOM_CLOSE to that thread's queue", () => {
+        const posted: number[][] = [];
+        let state = 2;
+        const system = System.getInstance() as unknown as { windowManager: unknown; scheduler: unknown };
+        const wm = system.windowManager, sched = system.scheduler;
+        system.windowManager = { postMessage: (hwnd: number, m: number, w: number, l: number, _x: number, _y: number, tid: number) => posted.push([hwnd, m, w, l, tid]) };
+        system.scheduler = { getThreadStateById: (id: number) => (id === 0x2c ? { state, stateName: "" } : null) };
+        restore.push(() => { system.windowManager = wm; system.scheduler = sched; });
+
+        const midi = new WinmmMidiOut({ callFunction: (cb, args) => calls.push([cb, ...args]) });
+        expect(midi.open(0x11100, 0, 0x2c, 0x77, 0x20000)).toBe(0);
+        const h = view().getUint32(0x11100, true);
+        const hdr = 0x12000;
+        mem.set([0xf0, 0x7e, 0x7f, 0x09, 0x01, 0xf7], 0x13000);
+        view().setUint32(hdr, 0x13000, true);
+        view().setUint32(hdr + 4, 6, true);
+        expect(midi.prepare(h, hdr, 48, true)).toBe(0);
+        expect(midi.longMessage(h, hdr, 48)).toBe(0);
+        expect(midi.longMessage(h, hdr, 48)).toBe(0);
+        expect(midi.close(h)).toBe(0);
+        expect(posted).toEqual([[0, 0x3c7, h, 0, 0x2c], [0, 0x3c9, h, hdr, 0x2c], [0, 0x3c9, h, hdr, 0x2c], [0, 0x3c8, h, 0, 0x2c]]);
+        expect(calls).toEqual([]);
+
+        posted.length = 0;
+        expect(midi.open(0x11100, 0, 0x2c, 0x77, 0x20000)).toBe(0);
+        state = 5;
+        expect(midi.close(view().getUint32(0x11100, true))).toBe(0);
+        expect(midi.open(0x11100, 0, 0x99, 0x77, 0x20000)).toBe(0);
+        expect(posted).toEqual([[0, 0x3c7, view().getUint32(0x11100, true) - 4, 0, 0x2c]]);
+    });
+
     test("gmBankAvailable follows the bundle's gm.dls, and an empty bundle loads no bank", async () => {
         expect(gmBankAvailable()).toBe(true);
         (System.getInstance() as unknown as { fileSystem: unknown }).fileSystem = { getFileSize: () => -1, openSync: () => null };
