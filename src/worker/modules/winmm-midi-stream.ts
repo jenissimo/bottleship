@@ -87,6 +87,7 @@ export class MidiStream {
         if (!this.playing) return;
         this.pausedMs = now - this.anchor;
         this.playing = false;
+        this.sink.allNotesOff();
     }
 
     /** Silences the stream, returns every queued buffer and rewinds to position 0, paused. */

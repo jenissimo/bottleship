@@ -113,6 +113,7 @@ describe("the stream player", () => {
         stream.restart(0);
         stream.tick(0);
         stream.pause(200);
+        expect(s.off).toBe(1);
         expect(stream.positionMs(5000)).toBe(200);
         stream.tick(5000);
         expect(s.played.length).toBe(1);
@@ -242,6 +243,33 @@ describe("midiStream handles", () => {
         expect(calls.slice(-2).map(c => [c[2], c[4]])).toEqual([[0x3c9, HDR], [0x3c8, 0]]);
         expect(output.tickers.size).toBe(0);
         expect(midi.streamClose(h)).toBe(5);
+    });
+
+    test("midiOutReset on a stream returns every queued buffer; unprepare then succeeds", () => {
+        const midi = new WinmmMidiOut({ callFunction: (cb, args) => calls.push([cb, ...args]) });
+        const h = open(midi);
+        buffer(HDR, DATA, [[100000, msg(0x90, 60, 100)]], 0);
+        buffer(HDR2, DATA2, [[0, msg(0x90, 62, 100)]], 0);
+        for (const hdr of [HDR, HDR2]) {
+            expect(midi.prepare(h, hdr, 64, true)).toBe(0);
+            expect(midi.streamOut(h, hdr, 64)).toBe(0);
+        }
+        expect(midi.prepare(h, HDR, 64, false)).toBe(65);
+        expect(midi.reset(h)).toBe(0);
+        expect(calls.slice(-2).map(c => [c[2], c[4]])).toEqual([[0x3c9, HDR], [0x3c9, HDR2]]);
+        for (const hdr of [HDR, HDR2]) {
+            expect(view().getUint32(hdr + 16, true) & (MHDR_DONE | MHDR_INQUEUE)).toBe(MHDR_DONE);
+            expect(midi.prepare(h, hdr, 64, false)).toBe(0);
+        }
+    });
+
+    test("a buffer queued while playing starts at once, not on the next pump", () => {
+        const midi = new WinmmMidiOut({ callFunction: () => undefined });
+        const h = open(midi);
+        expect(midi.streamRestart(h)).toBe(0);
+        buffer(HDR, DATA, [[0, msg(0x90, 60, 100)]]);
+        expect(midi.streamOut(h, HDR, 64)).toBe(0);
+        expect(output.router.pending).toBe(1);
     });
 
     test("stream calls refuse a plain midiOut handle, and bad arguments", () => {

@@ -232,6 +232,7 @@ export class WinmmMidiOut {
     reset(hmo: number): number {
         const h = this.handles.get(hmo >>> 0);
         if (!h) return MMSYSERR_INVALHANDLE;
+        h.stream?.stop();
         h.output.router.allNotesOff();
         return MMSYSERR_NOERROR;
     }
