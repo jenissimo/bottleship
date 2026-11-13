@@ -14,6 +14,7 @@ import { sys } from "../serialize";
 import { bytesToBase64 } from "./screen";
 import { harnessBus } from "../event-bus";
 import { vfsIoCensus } from "../../runtime/filesystem/vfs";
+import { readChildVfsTrace } from "../../core/child-vfs";
 
 const GENERIC_READ = 0x80000000;
 const GENERIC_WRITE = 0x40000000;
@@ -130,6 +131,19 @@ export function registerFsCommands(svc: HarnessService): void {
         }
         await fsx.flushFile?.(h.path ?? path);
         return { path, size, byte, source: h.source ?? "overlay" };
+    });
+
+    /** childVfsTrace({match?, limit?}) — what a CHILD process asked of the filesystem (creates,
+     *  writes, directory and delete calls, failed opens) and what it was answered. Kept on the
+     *  parent, so it is still readable after the child has exited — which is exactly when a
+     *  game that saves on quit has finished saving. Run it against the parent (`--parent`). */
+    svc.register("childVfsTrace", (args) => {
+        const opts = (args[0] ?? {}) as { match?: string; limit?: number };
+        const trace = readChildVfsTrace();
+        const re = opts.match ? new RegExp(opts.match, "i") : null;
+        const entries = re ? trace.entries.filter(e => re.test(e.target) || re.test(e.method)) : trace.entries;
+        const limit = opts.limit ?? 200;
+        return { total: trace.total, retained: trace.entries.length, matched: entries.length, entries: entries.slice(-limit) };
     });
 
     /** fsList(path) — directory listing. */

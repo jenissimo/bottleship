@@ -72,6 +72,54 @@ export function settleWithin(work: Promise<unknown>, budgetMs: number): Promise<
     ]).finally(() => clearTimeout(timer));
 }
 
+/**
+ * What a child asked of the parent's filesystem, kept on the PARENT: a child that saves at
+ * exit takes its own diagnostics down with it. Reads and pure queries are left out —
+ * the question this answers is "which file did it try to create or write, and what did we say".
+ */
+export interface ChildVfsTraceEntry { seq: number; method: string; target: string; detail: string; result: string; count: number }
+const CHILD_VFS_TRACE_CAPACITY = 512;
+// @transient(constant set)
+const TRACE_SKIPPED = new Set(['read', 'readSync', 'tell', 'setPosition', 'duplicateHandle', 'resolveRomMediaPath',
+    'statEntry', 'hasRomFile', 'fileExists', 'directoryExists', 'parentDirectoryExists', 'listDirectory',
+    'getFileSize', 'resolveStoredFile', 'classifyOpenFailure']);
+// @transient(diagnostic ring; a restored session starts a fresh one)
+const childVfsTrace: ChildVfsTraceEntry[] = [];
+// @transient(diagnostic counter for the ring above)
+let childVfsTraceSeq = 0;
+function traceChildVfs(method: string, args: unknown[], value: unknown, error: string | null): void {
+    if (TRACE_SKIPPED.has(method)) return;
+    const first = args[0];
+    const isHandle = !!first && typeof first === 'object';
+    const target = isHandle ? String((first as VfsFileHandle).path ?? '?') : String(first ?? '');
+    // A plain read-only open of an existing file that succeeded is the firehose; its failures are not.
+    if ((method === 'open' || method === 'openSync') && args[2] === 3 && value && !error
+        && ((Number(args[1]) >>> 0) & 0x40000000) === 0) return;
+    let detail = '';
+    if (method === 'open' || method === 'openSync') detail = `access=0x${(Number(args[1]) >>> 0).toString(16)} disposition=${args[2]}`;
+    else if (method === 'write' || method === 'writeSync') {
+        const data = args[1] as { length?: number; childBytes?: unknown[] } | undefined;
+        detail = `bytes=${data?.length ?? data?.childBytes?.length ?? '?'}`;
+    }
+    const result = error ? `ERROR ${error}`
+        : value && typeof value === 'object' ? ('childHandle' in value ? 'handle' : 'object')
+        : String(value);
+    const shown = result.slice(0, 160);
+    childVfsTraceSeq++;
+    // A polled open or a chunked write repeats; one entry with a count keeps the ring for the rest.
+    const last = childVfsTrace[childVfsTrace.length - 1];
+    if (last && last.method === method && last.target === target && last.detail === detail && last.result === shown) {
+        last.count++;
+        return;
+    }
+    if (childVfsTrace.length >= CHILD_VFS_TRACE_CAPACITY) childVfsTrace.shift();
+    childVfsTrace.push({ seq: childVfsTraceSeq, method, target, detail, result: shown, count: 1 });
+}
+/** The retained tail of child filesystem requests, oldest first, and how many were ever recorded. */
+export function readChildVfsTrace(): { total: number; entries: ChildVfsTraceEntry[] } {
+    return { total: childVfsTraceSeq, entries: childVfsTrace.slice() };
+}
+
 export function createChildVfsServer(vfs: VirtualFileSystem, buffer: SharedArrayBuffer,
     onMutation?: (path: string) => void,
 ) {
@@ -204,8 +252,10 @@ export function createChildVfsServer(vfs: VirtualFileSystem, buffer: SharedArray
         let response: { value?: unknown; error?: string };
         try {
             response = { value: await serve(method, args) };
+            traceChildVfs(method, args, response.value, null);
         } catch (error) {
             response = { error: String(error) };
+            traceChildVfs(method, args, undefined, response.error!);
         }
         let bytes = encoder.encode(JSON.stringify(response));
         if (bytes.length > payload.length) {
