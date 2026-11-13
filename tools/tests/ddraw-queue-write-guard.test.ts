@@ -46,7 +46,7 @@ function executor(): DDrawWebGPUExecutor {
     const fields: Record<string, unknown> = {
         deviceLost: false, flushing: false, encoderEpoch: 1, textureEpochs: new WeakMap(),
         currentEncoder: null, currentRenderPass: null, currentRenderTarget: null, currentBatch: null,
-        opLogArmed: 0, queue,
+        opLogArmed: 0, queue, debugFlags: { disableTextureOverwriteSubmit: false },
         device: { createCommandEncoder: () => ({ finish: () => ({}) }) },
         renderStats: { flushes: 0, queueWriteSubmits: 0, clears: 0 },
         surfacesNeedingClear: new Set(),
@@ -129,6 +129,24 @@ describe("a queue write to a texture that recorded work uses submits that work f
         expect(ops).toEqual(["blit", "submit", "write:glyphs"]);
     });
 
+    test("after a submit, unrelated recorded work does not make the old texture a hazard again", () => {
+        const glyphs = tex("glyphs"), back = tex("back"), a = tex("a"), b = tex("b");
+        ex.blitWithColorKey(surface(glyphs), surface(back), RECT, RECT, KEY);
+        ex.flush(false);
+        ex.blitWithShaderCopy(surface(a), surface(b), RECT, RECT);
+        uploadToGPUTexture(queue, glyphs, PIXELS, 4, 2);
+        expect(ops).toEqual(["blit", "submit", "blit", "write:glyphs"]);
+        expect(ex.hasRecordedWork()).toBe(true);
+    });
+
+    test("the debug switch that disables the early submit disables the write guard too", () => {
+        const glyphs = tex("glyphs"), back = tex("back");
+        (ex as unknown as { debugFlags: { disableTextureOverwriteSubmit: boolean } }).debugFlags = { disableTextureOverwriteSubmit: true };
+        ex.blitWithColorKey(surface(glyphs), surface(back), RECT, RECT, KEY);
+        uploadToGPUTexture(queue, glyphs, PIXELS, 4, 2);
+        expect(ops).toEqual(["blit", "write:glyphs"]);
+    });
+
     test("a write made from inside flush() does not re-enter it, and a lost device submits nothing", () => {
         const glyphs = tex("glyphs"), back = tex("back");
         ex.blitWithColorKey(surface(glyphs), surface(back), RECT, RECT, KEY);
@@ -189,6 +207,25 @@ describe("validate-queue-writes", () => {
             expect(run(dir)).toBe(1);
         } finally {
             rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("fails when the guard before a pinned submit is removed, or replaced by an unrelated flush()", () => {
+        for (const [file, guard, replacement] of [
+            ["src/worker/modules/ddraw/presenter.ts", "beforeQueueWrite(surface.gpuTexture);", ""],
+            ["src/worker/backends/webgpu/ddraw/mip-generator.ts", "beforeQueueWrite(texture);", "stream.flush();"],
+        ] as const) {
+            const dir = mkdtempSync(join(tmpdir(), "queue-writes-"));
+            try {
+                copyScope(dir);
+                const victim = join(dir, file);
+                const text = readFileSync(victim, "utf8");
+                expect(text.includes(guard)).toBe(true);
+                writeFileSync(victim, text.replace(guard, replacement));
+                expect(run(dir)).toBe(1);
+            } finally {
+                rmSync(dir, { recursive: true, force: true });
+            }
         }
     });
 });

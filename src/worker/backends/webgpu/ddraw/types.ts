@@ -69,7 +69,8 @@ export interface DebugFlags {
      *  through a cached lpSurface (see prepareStageTexture). Off = hashing on. */
     disableCpuTextureHash: boolean;
     /** DIAG: stop submitting mid-frame when a texture already sampled by recorded draws is
-     *  overwritten. On = the copy→draw→copy→draw pattern renders every draw with the LAST
+     *  overwritten, and the queue-write guard's submit before a write to a texture recorded
+     *  work uses. On = the copy→draw→copy→draw pattern renders every draw with the LAST
      *  upload. */
     disableTextureOverwriteSubmit: boolean;
     /** DIAG: accumulate batches normally but DROP them at flush (render nothing) */
