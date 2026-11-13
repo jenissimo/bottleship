@@ -5,6 +5,7 @@ import { registerPaintingDcStateExports } from './painting-dc-state';
 import { registerPaintingMiscExports } from './painting-misc';
 import { registerOutlineMetricsExports } from './outline-metrics';
 import { installedFontExternalLeadingEm } from './font-resource';
+import { decodeAnsiCharRange, fontCodePage, systemDefaultCharset } from './font-charset';
 import { System } from '../../core/system';
 import { savestateParticipants, savestatesEnabled, stateKeys } from '../../savestate/participant';
 import type { SaveValue } from '../../savestate/value-codec';
@@ -2143,9 +2144,12 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             const gdi = System.getInstance().gdiContext;
             const dcCtx = gdi.getMeasureContext(hdc);
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const count = iLast - iFirst + 1;
-            for (let i = 0; i < count; i++) {
-                const ch = String.fromCharCode(iFirst + i);
+            // The codes are characters of the selected font's code page, not Unicode scalars.
+            const characters = decodeAnsiCharRange(iFirst >>> 0, iLast >>> 0,
+                fontCodePage(gdi.getSelectedFontCharset(hdc) ?? systemDefaultCharset()));
+            if (!characters) return 0;
+            for (let i = 0; i < characters.length; i++) {
+                const ch = characters[i]!;
                 let width = 8;
                 if (dcCtx) {
                     try {
@@ -2615,13 +2619,15 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
     registerPaintingMiscExports(exports);
     registerOutlineMetricsExports(exports);
 
-    exports['GetCharABCWidthsA'] = (ctx, mem, args): number => {
+    // GetCharABCWidths(hdc, uFirst, uLast, lpabc): W takes UTF-16 code units, A takes
+    // character codes in the selected font's code page (a packed pair on a multi-byte one).
+    const charAbcWidths = (wide: boolean): ThunkImplementation => (ctx, mem, args): number => {
         const hdc = args[0];
-        const wFirst = args[1];
-        const wLast = args[2];
+        const wFirst = args[1] >>> 0;
+        const wLast = args[2] >>> 0;
         const lpABC = args[3];
 
-        Logger.verbose(LogCategory.GDI32, `GetCharABCWidthsA(hdc=0x${hdc.toString(16)}, first=${wFirst}, last=${wLast})`);
+        Logger.verbose(LogCategory.GDI32, `GetCharABCWidths${wide ? 'W' : 'A'}(hdc=0x${hdc.toString(16)}, first=${wFirst}, last=${wLast})`);
 
         if (!lpABC || wLast < wFirst || wLast > 0xffff) return 0;
 
@@ -2629,9 +2635,12 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const dcCtx = gdi.getMeasureContext(hdc);
         const count = wLast - wFirst + 1;
         if (!isValidAddress(mem, lpABC, count * 12, 'rw')) return 0;
+        const characters = wide
+            ? Array.from({ length: count }, (_, i) => String.fromCharCode(wFirst + i))
+            : decodeAnsiCharRange(wFirst, wLast, fontCodePage(gdi.getSelectedFontCharset(hdc) ?? systemDefaultCharset()));
+        if (!characters) return 0;
         for (let i = 0; i < count; i++) {
-            const charCode = wFirst + i;
-            const ch = String.fromCharCode(charCode);
+            const ch = characters[i]!;
             let width = 8; // fallback
             let left = 0, black = width;
             if (dcCtx) {
@@ -2650,8 +2659,8 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
 
         return 1; // TRUE
     };
-
-    exports['GetCharABCWidthsW'] = exports['GetCharABCWidthsA'];
+    exports['GetCharABCWidthsA'] = charAbcWidths(false);
+    exports['GetCharABCWidthsW'] = charAbcWidths(true);
 
     return exports;
 }
