@@ -51,17 +51,32 @@ export function vkToChar(vk: number, shiftDown: boolean, capsLock: boolean): num
     return 0;
 }
 
+/** controlChar's answer for a key that has a control column but types nothing with Shift added. */
+export const CONTROL_NONE = -2;
+
 /**
- * The control character a key types with Ctrl down and Alt up, or -1 when the key has none.
- * Keyed by virtual key, like the layout's own control column: Ctrl+A..Z are 0x01..0x1A,
- * and 0x00 (Ctrl+Shift+2) is a character, which is why "none" is not 0 here.
+ * The control character a key types with Ctrl down and Alt up; CONTROL_NONE when the key
+ * types nothing; -1 when the key has no control column and types as without Ctrl.
+ * Keyed by virtual key, like the US layout's own table (kbdus): Ctrl+A..Z are 0x01..0x1A
+ * with or without Shift; [ \ ] (and the ISO key left of Z), Backspace, Esc, Enter, Space
+ * and Break have a Ctrl column but no Ctrl+Shift column; 2, 6 and - have only a
+ * Ctrl+Shift column. 0x00 (Ctrl+Shift+2) is a character, which is why "none" is not 0.
  */
 export function controlChar(vk: number, shiftDown: boolean): number {
     if (vk >= 0x41 && vk <= 0x5A) return vk - 0x40;
-    if (vk === 0xDB) return 0x1B;   // [
-    if (vk === 0xDC) return 0x1C;   // \
-    if (vk === 0xDD) return 0x1D;   // ]
-    if (vk === 0x08) return 0x7F;   // Backspace
+    let column = -1;
+    switch (vk) {
+        case 0xDB: column = 0x1B; break;   // [
+        case 0xDC: column = 0x1C; break;   // \
+        case 0xDD: column = 0x1D; break;   // ]
+        case 0xE2: column = 0x1C; break;   // VK_OEM_102, the ISO \ key
+        case 0x08: column = 0x7F; break;   // Backspace
+        case 0x1B: column = 0x1B; break;   // Esc
+        case 0x0D: column = 0x0A; break;   // Enter
+        case 0x20: column = 0x20; break;   // Space
+        case 0x03: column = 0x03; break;   // VK_CANCEL (Ctrl+Break)
+    }
+    if (column >= 0) return shiftDown ? CONTROL_NONE : column;
     if (shiftDown) {
         if (vk === 0x32) return 0x00;   // 2
         if (vk === 0x36) return 0x1E;   // 6
@@ -102,6 +117,7 @@ export function translateKeyMessage(hwnd: number, message: number, wParam: numbe
     // Ctrl alone selects the control column; Ctrl+Alt is AltGr and types the layout's character.
     const ctrlOnly = (input.getKeyState(VK_CONTROL) & 0x8000) !== 0 && (input.getKeyState(VK_MENU) & 0x8000) === 0;
     let charCode = ctrlOnly ? controlChar(vk, shiftDown) : -1;
+    if (charCode === CONTROL_NONE) return false;
     if (charCode < 0) {
         charCode = keyDownChar(input.getKeyDownText(vk), vk, shiftDown, (input.getKeyState(VK_CAPITAL) & 1) !== 0);
         if (charCode === 0) return false;

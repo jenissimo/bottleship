@@ -301,6 +301,29 @@ describe("Ctrl types control characters", () => {
         });
     });
 
+    test("Ctrl+Enter, Ctrl+Space, Ctrl+Esc, Ctrl+Break and Ctrl+ISO-backslash post kbdus's control column", () => {
+        withCtrl((_r, char) => {
+            expect(char({ code: "Enter", key: "Enter", keyCode: 13 })).toBe(0x0a);
+            expect(char({ code: "Space", key: " ", keyCode: 0x20 })).toBe(0x20);
+            expect(char({ code: "Escape", key: "Escape", keyCode: 0x1b })).toBe(0x1b);
+            expect(char({ code: "Pause", key: "Cancel", keyCode: 0x03 })).toBe(0x03);
+            expect(char({ code: "IntlBackslash", key: "\\", keyCode: 0xe2 })).toBe(0x1c);
+        });
+    });
+
+    test("Ctrl+Shift on a key with only a Ctrl column posts nothing", () => {
+        withCtrl((_r, char) => {
+            expect(char({ code: "BracketLeft", key: "{", keyCode: 0xdb })).toBeNull();
+            expect(char({ code: "Backslash", key: "|", keyCode: 0xdc })).toBeNull();
+            expect(char({ code: "BracketRight", key: "}", keyCode: 0xdd })).toBeNull();
+            expect(char({ code: "Backspace", key: "Backspace", keyCode: 8 })).toBeNull();
+            expect(char({ code: "Enter", key: "Enter", keyCode: 13 })).toBeNull();
+            expect(char({ code: "Space", key: " ", keyCode: 0x20 })).toBeNull();
+            expect(char({ code: "Escape", key: "Escape", keyCode: 0x1b })).toBeNull();
+            expect(char({ code: "KeyA", key: "A", keyCode: 0x41 })).toBe(0x01);
+        }, true);
+    });
+
     test("AltGr+Q on a German layout is still '@', and Q alone after Ctrl is released is 'q'", () => {
         withCtrl((r, char, releaseCtrl) => {
             const altGr = r.press({ code: "AltRight", key: "AltGraph", keyCode: VK_MENU, ctrl: true, alt: true, altGraph: true });
@@ -348,6 +371,41 @@ describe("ToAscii and ToUnicode honour Ctrl in the caller's key state", () => {
             expect(word()).toBe(0x00);
             expect(call(name, 0x36)).toBe(1);
             expect(word()).toBe(0x1e);
+        });
+
+        test(`${name}: Ctrl+Shift+[ and Ctrl+Shift+Enter give no character; Ctrl+Enter is 0x0A`, () => {
+            state(true, false, true);
+            mem[OUT] = 0xee; mem[OUT + 1] = 0xee;
+            expect(call(name, 0xdb)).toBe(0);
+            expect(call(name, 0x0d)).toBe(0);
+            expect(word()).toBe(0xeeee);
+            state(true, false, false);
+            expect(call(name, 0x0d)).toBe(1);
+            expect(word()).toBe(0x0a);
+        });
+
+        test(`${name}: Ctrl without Shift reads the Shift bit of the caller's state (Ctrl+2 is not 0x00)`, () => {
+            state(true, false, false);
+            mem[OUT] = 0xee; mem[OUT + 1] = 0xee;
+            expect(call(name, 0x32)).toBe(1);
+            expect(word()).toBe(0x32);
+        });
+
+        test(`${name}: Ctrl in the caller's state wins over a held key's host character`, () => {
+            const r = rig();
+            const system = System.getInstance() as unknown as { inputManager: InputManager };
+            const saved = system.inputManager;
+            system.inputManager = r.im;
+            try {
+                r.press({ code: "KeyC", key: "c", keyCode: 0x43 });
+                state(true, false, false);
+                mem[OUT] = 0xee; mem[OUT + 1] = 0xee;
+                expect(exports[name]!({} as never, mem, name === "ToUnicode" ? [0x43, 0x2e, STATE, OUT, 4, 0] : [0x43, 0x2e, STATE, OUT, 0])).toBe(1);
+                expect(word()).toBe(0x03);
+                r.press({ code: "BracketLeft", key: "{", keyCode: 0xdb });
+                state(true, false, true);
+                expect(exports[name]!({} as never, mem, name === "ToUnicode" ? [0xdb, 0x1a, STATE, OUT, 4, 0] : [0xdb, 0x1a, STATE, OUT, 0])).toBe(0);
+            } finally { system.inputManager = saved; }
         });
 
         test(`${name}: Ctrl+Alt, and no Ctrl, translate the key as before`, () => {
