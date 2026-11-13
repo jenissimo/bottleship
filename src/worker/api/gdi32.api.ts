@@ -231,6 +231,9 @@ export const gdi32Module: ModuleDescriptor = {
         makeFunc("PtInRegion", 3),
         makeFunc("GetCharABCWidthsA", 4),
         makeFunc("GetCharABCWidthsW", 4),
+        makeFunc("GetCharABCWidthsFloatA", 4),
+        makeFunc("GetCharABCWidthsFloatW", 4),
+        makeFunc("GetOutlineTextMetricsA", 3),
 
         makeFunc("GetGlyphOutlineA", 7),
         makeFunc("GetGlyphOutlineW", 7),

@@ -3,6 +3,7 @@ import { registerGlyphOutlineExports } from './glyph-outline-api';
 import { type HleDispatcher, ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { registerPaintingDcStateExports } from './painting-dc-state';
 import { registerPaintingMiscExports } from './painting-misc';
+import { registerOutlineMetricsExports } from './outline-metrics';
 import { System } from '../../core/system';
 import { savestateParticipants, savestatesEnabled, stateKeys } from '../../savestate/participant';
 import type { SaveValue } from '../../savestate/value-codec';
@@ -2606,6 +2607,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
 
     registerPaintingDcStateExports(exports);
     registerPaintingMiscExports(exports);
+    registerOutlineMetricsExports(exports);
 
     exports['GetCharABCWidthsA'] = (ctx, mem, args): number => {
         const hdc = args[0];
