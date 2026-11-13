@@ -37,6 +37,7 @@ import {
 } from './pe-import-binding';
 import { planProcessCrt, processCrtBinding, type CrtScanImport } from './crt-binding';
 import { parsePeImports } from '@bottleship/formats/pe';
+import { applyBaseRelocations } from './pe-relocations';
 import { nameOrdinalImports, readExportNameDirectory, shippedExportNames } from './pe-export-names';
 import { normalizeDllBaseName, resolveThunkedDllAlias } from './dll-aliases';
 import { dllSearchDirectories } from './dll-search-order';
@@ -1100,48 +1101,13 @@ export class PELoader {
             return;
         }
 
-        // Work on guest memory (sections already copied there)
-        const mem = this.memory;
-        const memView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-
-        let fixupCount = 0;
-        let blockOffset = relocDirRVA;
-        const relocEnd = relocDirRVA + relocDirSize;
-
-        while (blockOffset < relocEnd) {
-            const blockAddr = baseAddress + blockOffset;
-            if (blockAddr + 8 > mem.length) break;
-
-            const pageRVA = memView.getUint32(blockAddr, true);
-            const blockSize = memView.getUint32(blockAddr + 4, true);
-
-            if (blockSize < 8) break; // Invalid block
-
-            const entryCount = (blockSize - 8) / 2;
-            for (let i = 0; i < entryCount; i++) {
-                const entryOffset = blockAddr + 8 + i * 2;
-                if (entryOffset + 2 > mem.length) break;
-
-                const entry = memView.getUint16(entryOffset, true);
-                const type = (entry >> 12) & 0xF;
-                const offset = entry & 0xFFF;
-
-                if (type === 3) { // IMAGE_REL_BASED_HIGHLOW
-                    const targetAddr = baseAddress + pageRVA + offset;
-                    if (targetAddr + 4 <= mem.length) {
-                        const oldValue = memView.getUint32(targetAddr, true);
-                        memView.setUint32(targetAddr, (oldValue + delta) >>> 0, true);
-                        fixupCount++;
-                    }
-                }
-                // type 0 = IMAGE_REL_BASED_ABSOLUTE (padding, skip)
-            }
-
-            blockOffset += blockSize;
+        const { applied, duplicates } = applyBaseRelocations(this.memory, baseAddress, relocDirRVA, relocDirSize, delta);
+        if (duplicates > 0) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[PE] Relocation table names ${duplicates} location(s) more than once; each is fixed up once`);
         }
-
         Logger.log(LogCategory.SYSTEM,
-            `[PE] Applied ${fixupCount} relocations (delta=0x${(delta >>> 0).toString(16)}, ` +
+            `[PE] Applied ${applied} relocations (delta=0x${(delta >>> 0).toString(16)}, ` +
             `preferred=0x${preferredBase.toString(16)} -> actual=0x${baseAddress.toString(16)})`);
     }
 
