@@ -223,7 +223,7 @@ async function runArm(opts: ArmOptions): Promise<ArmResult & { idx: number; appl
         }
         s.tebManager.initProcess(mem, memory);
         const threads = { 1: makeThread(1), 2: makeThread(2) } as Record<1 | 2, Thread>;
-        // A guard block is the very next allocation after each thread's TLS array.
+        // A guard block is the very next allocation after each thread's TEB block (TLS array at its end).
         const guards: Record<number, number> = {};
         for (const t of Object.values(threads)) {
             t.tebAddress = s.tebManager.allocateTeb(t.id, t.stackBase, t.stackTop, memory);
@@ -256,8 +256,10 @@ async function runArm(opts: ArmOptions): Promise<ArmResult & { idx: number; appl
             if (opts.legacyStorage && idx >= 64) threads[tid].tlsValues.set(idx, INITIAL_SLOT[tid]);
         }
         const afterInitial = after();
-        const arraySpan = [1, 2].map(tid => allocs[allocs.indexOf(tlsArray(tid)) + 1]! - tlsArray(tid));
-        expect([1, 2].map(tid => allocs[allocs.indexOf(tlsArray(tid)) + 1])).toEqual([guards[1], guards[2]]);
+        // The TLS array ends its thread's TEB block, so the guard is the next allocation after the block.
+        const tebBlock = (tid: number) => s.tebManager.getTebAddress(tid)!;
+        const arraySpan = [1, 2].map(tid => allocs[allocs.indexOf(tebBlock(tid)) + 1]! - tlsArray(tid));
+        expect([1, 2].map(tid => allocs[allocs.indexOf(tebBlock(tid)) + 1])).toEqual([guards[1], guards[2]]);
         const switchTo = (tid: 1 | 2) => {
             const from = threads[(s as any).currentThreadId as 1 | 2];
             from.lastError = manager.readLastError(); from.state = ThreadState.READY;
