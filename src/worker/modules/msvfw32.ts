@@ -40,6 +40,8 @@ export class Msvfw32 implements IModule {
         this.exports["ICClose"] = () => ICERR_BADHANDLE;
         this.exports["ICSendMessage"] = () => ICERR_BADHANDLE;
         this.exports["ICDecompress"] = () => ICERR_BADHANDLE;
+        this.exports["ICCompress"] = () => ICERR_BADHANDLE;
+        this.exports["ICGetInfo"] = () => 0;
 
         // VideoForWindowsVersion() — VFW 1.1, the version every 32-bit Windows reports.
         const videoForWindowsVersion = () => 0x040003B6;
