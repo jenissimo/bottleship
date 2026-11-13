@@ -4391,7 +4391,7 @@ export class ThunkDispatcher {
         }
         this.cachedDataView!.setUint32(esp, returnAddr >>> 0, true);
         const scheduler = this.ensureScheduler();
-        scheduler.applyAsyncRestoreCpuState(cpu, stub.address >>> 0, esp >>> 0, cpu.reg32?.[0] ?? 0, `async_reissue:${name}`, {
+        scheduler.applyAsyncRestoreCpuState(cpu, stub.address >>> 0, esp >>> 0, 0 /* the stub loads EAX itself */, `async_reissue:${name}`, {
             threadId: info.threadId ?? scheduler.getCurrentThreadId?.() ?? 0,
             asyncParkGeneration: info.asyncParkGeneration ?? 0,
             completionName: name,

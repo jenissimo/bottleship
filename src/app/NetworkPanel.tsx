@@ -142,6 +142,7 @@ export default function NetworkPanel(props: NetworkPanelProps): React.ReactEleme
           )}
           {(() => {
             const error = !connecting && (inputError || (!connected && failed));
+            if (!connecting && !error && !notice) return null;
             return (
               <div className={s.status} data-tone={error ? "error" : "info"} role="status" aria-live="polite">
                 {connecting ? "Connecting…" : error ? <>{error}{/own server/i.test(String(error)) && <> <a href={RUN_YOUR_OWN_SERVER_URL} target="_blank" rel="noopener noreferrer">How to run one</a></>}</> : notice}

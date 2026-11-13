@@ -442,6 +442,7 @@ networkConsent.beforeRelease = async () => {
   if (networkConsent.state.decision !== "granted") return;
   try { await awaitSessionNetwork(); } catch { /* The guest then sees the network as down. */ }
 };
+// @transient(host-UI pause owned by the open permission dialog; never part of a guest snapshot)
 let consentPaused = false;
 networkConsent.onWaitingChange(waiting => {
   if (waiting) {
