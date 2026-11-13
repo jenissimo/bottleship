@@ -744,6 +744,39 @@ fn error(status: u16) -> Response<HttpBody> {
         .body(engineioxide::ResponseBody::empty_response())
         .unwrap()
 }
+/// GET /stats: 404 when disabled, 401 without detail unless exactly one valid
+/// Authorization header is present. Never carries CORS headers; never cached.
+fn stats_response(stats: Option<&StatsEndpoint>, headers: &http::HeaderMap) -> Response<HttpBody> {
+    let Some(stats) = stats else { return error(404) };
+    let mut values = headers.get_all(http::header::AUTHORIZATION).iter();
+    let presented = match (values.next(), values.next()) {
+        (Some(value), None) => Some(value.as_bytes()),
+        _ => None,
+    };
+    let mut response = if (stats.authorize)(presented) {
+        let mut ok = Response::new(engineioxide::ResponseBody::custom_response(
+            http_body_util::Full::new((stats.render)()),
+        ));
+        ok.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        ok
+    } else {
+        let mut denied = Response::new(engineioxide::ResponseBody::empty_response());
+        *denied.status_mut() = http::StatusCode::UNAUTHORIZED;
+        denied.headers_mut().insert(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static("Bearer"),
+        );
+        denied
+    };
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
 fn query_sid(req: &Request<HttpIncoming>) -> Result<Option<&str>, ()> {
     let mut sid = None;
     for entry in req.uri().query().unwrap_or("").split('&') {
@@ -856,6 +889,9 @@ pub async fn bind(address: SocketAddr, config: Config) -> io::Result<BoundTransp
                 async move{
                  if req.uri().path()=="/health"&&req.method()==http::Method::GET{
                   return Ok::<_,Infallible>(match &context.config.health_response{Some(body)=>Response::builder().status(200).header(http::header::CONTENT_TYPE,"application/json").header(http::header::CACHE_CONTROL,"no-store").body(engineioxide::ResponseBody::custom_response(http_body_util::Full::new(body.clone()))).unwrap(),None=>error(404)});
+                 }
+                 if req.uri().path()=="/stats"&&req.method()==http::Method::GET{
+                  return Ok::<_,Infallible>(stats_response(context.config.stats.as_ref(),req.headers()));
                  }
                  if req.uri().path()!="/socket.io/"&&req.uri().path()!="/socket.io"{return Ok::<_,Infallible>(error(404))}
                  if req.headers().len()>64||req.headers().iter().map(|(n,v)|n.as_str().len()+v.as_bytes().len()).sum::<usize>()>16384{return Ok(error(431))}

@@ -551,6 +551,63 @@ async fn caller_health_response_does_not_create_engine_session() {
     assert_eq!(server.handle.metrics().sessions, 0);
     server.shutdown().await;
 }
+async fn raw_get(address: std::net::SocketAddr, path: &str, headers: &str) -> (u16, String, String) {
+    let mut socket = TcpStream::connect(address).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n{headers}\r\n");
+    socket.write_all(request.as_bytes()).await.unwrap();
+    let mut bytes = vec![];
+    timeout(Duration::from_secs(2), socket.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    let all = String::from_utf8(bytes).unwrap();
+    let (head, body) = all.split_once("\r\n\r\n").unwrap();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, head.to_ascii_lowercase(), body.into())
+}
+#[tokio::test]
+async fn stats_endpoint_is_absent_by_default_and_requires_exactly_one_valid_bearer() {
+    let server = bind("127.0.0.1:0".parse().unwrap(), Config::default()).await.unwrap();
+    let (status, _, _) = raw_get(server.address, "/stats", "Authorization: Bearer x\r\n").await;
+    assert_eq!(status, 404);
+    server.shutdown().await;
+
+    let mut config = Config::default();
+    config.origins = vec!["*".into()];
+    config.stats = Some(StatsEndpoint {
+        authorize: std::sync::Arc::new(|header: Option<&[u8]>| header == Some(b"Bearer good-token".as_slice())),
+        render: std::sync::Arc::new(|| Bytes::from_static(br#"{"ok":true}"#)),
+    });
+    let server = bind("127.0.0.1:0".parse().unwrap(), config).await.unwrap();
+    let origin = "Origin: https://foreign.example\r\n";
+    for headers in [
+        String::new(),
+        "Authorization: Bearer bad-token\r\n".into(),
+        // A second header cannot be used to smuggle a valid value past a check of the first.
+        "Authorization: Bearer bad-token\r\nAuthorization: Bearer good-token\r\n".into(),
+        "Authorization: Bearer good-token\r\nAuthorization: Bearer good-token\r\n".into(),
+    ] {
+        let (status, head, body) = raw_get(server.address, "/stats", &format!("{origin}{headers}")).await;
+        assert_eq!(status, 401, "{headers}");
+        assert!(body.is_empty());
+        assert!(head.contains("cache-control: no-store"));
+        assert!(head.contains("www-authenticate: bearer"));
+        assert!(!head.contains("access-control-"));
+    }
+    let (status, head, body) = raw_get(
+        server.address,
+        "/stats?cache=1",
+        &format!("{origin}Authorization: Bearer good-token\r\n"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, r#"{"ok":true}"#);
+    assert!(head.contains("content-type: application/json"));
+    assert!(head.contains("cache-control: no-store"));
+    assert!(!head.contains("access-control-"));
+    assert_eq!(server.handle.metrics().sessions, 0);
+    server.shutdown().await;
+}
 #[tokio::test]
 async fn completed_binary_reservation_tracks_retained_bytes_across_a_tcp_window() {
     let mut server = bind("127.0.0.1:0".parse().unwrap(), Config::default())

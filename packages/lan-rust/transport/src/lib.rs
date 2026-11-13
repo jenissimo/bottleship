@@ -8,10 +8,25 @@ pub use budget::Usage;
 pub use runtime::{BoundTransport, CloseReceipt, DeliveryTicket, TransportHandle, bind};
 use std::{net::SocketAddr, time::Duration};
 use tokio::sync::{mpsc, oneshot};
+/// Caller-owned GET /stats endpoint. Absent: /stats is 404.
+#[derive(Clone)]
+pub struct StatsEndpoint {
+    /// Checks the raw Authorization header value; must be constant-time.
+    pub authorize: std::sync::Arc<dyn Fn(Option<&[u8]>) -> bool + Send + Sync>,
+    /// Renders the JSON body; called only after authorization succeeds.
+    pub render: std::sync::Arc<dyn Fn() -> bytes::Bytes + Send + Sync>,
+}
+impl std::fmt::Debug for StatsEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StatsEndpoint(..)")
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Optional caller-owned /health JSON body (at most 4096 bytes).
     pub health_response: Option<bytes::Bytes>,
+    /// Optional authenticated operator statistics (GET /stats).
+    pub stats: Option<StatsEndpoint>,
     pub max_connections: usize,
     pub max_tcp_connections: usize,
     pub max_sessions_per_tcp: usize,
@@ -39,6 +54,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             health_response: None,
+            stats: None,
             max_connections: 256,
             max_tcp_connections: 1024,
             max_sessions_per_tcp: 1,

@@ -265,6 +265,11 @@ pub struct Core {
     epoch_unix_ms: u64,
     binding_entries: usize,
     binding_budget: usize,
+    /// Rooms with at least one / two live participants, maintained at the only
+    /// two points that change liveness (join and retire).
+    active_rooms: usize,
+    rooms_with_two_or_more: usize,
+    stats: Option<std::sync::Arc<crate::stats::ServerStats>>,
 }
 fn emit(to: ConnId, event: ServerEvent, reliable: bool, source: Option<ConnId>) -> Effect {
     let retained_bytes = event.retained_bytes();
@@ -307,7 +312,37 @@ impl Core {
             epoch_unix_ms,
             binding_entries: 0,
             binding_budget,
+            active_rooms: 0,
+            rooms_with_two_or_more: 0,
+            stats: None,
         })
+    }
+    /// Publish aggregate counters to an operator statistics sink.
+    pub fn with_stats(mut self, stats: std::sync::Arc<crate::stats::ServerStats>) -> Self {
+        stats.set_connections(self.participants.len());
+        stats.set_rooms(self.active_rooms, self.rooms_with_two_or_more);
+        self.stats = Some(stats);
+        self
+    }
+    /// (rooms with >= 1 live participant, rooms with >= 2 live participants).
+    pub fn room_activity(&self) -> (usize, usize) {
+        (self.active_rooms, self.rooms_with_two_or_more)
+    }
+    fn live_in_room(&self, room: &str) -> usize {
+        self.rooms.get(room).map_or(0, |r| r.values().filter(|p| p.connection.is_some()).count())
+    }
+    fn room_liveness_changed(&mut self, before: usize, after: usize) {
+        for (threshold, counter) in [(1, &mut self.active_rooms), (2, &mut self.rooms_with_two_or_more)] {
+            if before < threshold && after >= threshold {
+                *counter = counter.saturating_add(1);
+            } else if before >= threshold && after < threshold {
+                *counter = counter.saturating_sub(1);
+            }
+        }
+        if let Some(stats) = &self.stats {
+            stats.set_rooms(self.active_rooms, self.rooms_with_two_or_more);
+            stats.set_connections(self.participants.len());
+        }
     }
     /// Authenticated identity for trusted gateway construction; unknown/retired
     /// connection IDs never acquire a participant identity.
@@ -357,6 +392,7 @@ impl Core {
                 }
             }
         }
+        let live_before = self.live_in_room(&join.room);
         self.rooms.entry(join.room.clone()).or_default().insert(
             join.node,
             Peer {
@@ -418,6 +454,13 @@ impl Core {
                 tcp_host: TcpHostState::default(),
             },
         );
+        if let Some(joined) = self.participants.get(&connection).map(|p| &p.join) {
+            let live_after = self.live_in_room(&joined.room);
+            if let Some(stats) = &self.stats {
+                stats.joined(&joined.client_id, self.epoch_unix_ms.saturating_add(now_ms));
+            }
+            self.room_liveness_changed(live_before, live_after);
+        }
         effects.push(emit(
             connection,
             json_event("ready", vec![ready]),
@@ -1309,6 +1352,10 @@ impl Core {
             connection,
             input: GatewayInput::Close,
         });
+        let live_before = self.live_in_room(&p.join.room);
+        if let Some(stats) = &self.stats {
+            stats.set_connections(self.participants.len());
+        }
         if let Some(room) = self.rooms.get_mut(&p.join.room) {
             if let Some(peer) = room.get_mut(&p.join.node) {
                 if peer.connection != Some(connection) {
@@ -1317,6 +1364,10 @@ impl Core {
                 peer.connection = None;
                 peer.expires_at = now_ms.saturating_add(self.limits.reconnect_grace_ms);
             }
+        }
+        let live_after = self.live_in_room(&p.join.room);
+        self.room_liveness_changed(live_before, live_after);
+        if let Some(room) = self.rooms.get(&p.join.room) {
             for recipient in room.values().filter_map(|p| p.connection) {
                 effects.push(emit(
                     recipient,

@@ -32,6 +32,7 @@ dependencies = [
  "bottleship-lan-native",
  "bottleship-lan-transport",
  "bytes",
+ "getrandom",
  "serde",
  "serde_json",
  "tokio",
