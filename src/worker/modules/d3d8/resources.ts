@@ -6,6 +6,7 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
+import { releaseBufferReference } from './buffer-lifetime';
 import {
     addComRef,
     clearRenderTargetOverrideForSurface,
@@ -1035,6 +1036,9 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         releaseTextureStorage(pTex);
         return 0;
     };
+
+    exports['IDirect3DVertexBuffer8_Release'] = (_ctx, _mem, args) => releaseBufferReference(args[0], "vb");
+    exports['IDirect3DIndexBuffer8_Release'] = (_ctx, _mem, args) => releaseBufferReference(args[0], "ib");
 
     exports['IDirect3DSurface8_AddRef'] = (_ctx, _mem, args) => {
         const pSurf = args[0];

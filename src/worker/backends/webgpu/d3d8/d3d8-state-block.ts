@@ -109,8 +109,7 @@ export function applyD3D8StateBlockEntries(device: D3D8DeviceAdapter, entries: D
                 device.setStreamSource(entry.stream, entry.vb, entry.stride);
                 break;
             case "indices":
-                device.indexIB = entry.ib;
-                device.baseVertexIndex = entry.baseVertex;
+                device.setIndices(entry.ib, entry.baseVertex);
                 break;
         }
     }

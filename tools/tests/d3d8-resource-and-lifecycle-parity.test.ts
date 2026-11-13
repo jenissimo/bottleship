@@ -76,6 +76,7 @@ class FakeD3D8Device {
     setTexture(stage: number, _surface: unknown, texPtr: number): void { this.textureComPtrs[stage] = texPtr; }
     getStreamSource(stream: number): { vb: number; stride: number } { return this.streams[stream] ?? { vb: 0, stride: 0 }; }
     setStreamSource(stream: number, vb: number, stride: number): void { this.streams[stream] = { vb, stride }; }
+    setIndices(ib: number, baseVertex: number): void { this.indexIB = ib; this.baseVertexIndex = baseVertex; }
     getAllTransforms(): { state: number; matrix: Float32Array }[] { return [...this.transforms.entries()].map(([state, matrix]) => ({ state, matrix })); }
     setTransform(state: number, matrix: Float32Array): void { this.transforms.set(state, matrix); }
     getMaterial(): unknown { return this.material; }
