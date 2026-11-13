@@ -99,6 +99,152 @@ function fillTextGdi(
     else ctx.fillText(text, x, y);
 }
 
+// GetGlyphOutline's uFormat (wingdi.h GGO_*). The low nibble is one mode value (not a mask);
+// GGO_GLYPH_INDEX/GGO_UNHINTED are flag bits a caller ORs on top of it (rejected by the
+// painting.ts thunk before this is reached — see there for why).
+const GGO_METRICS = 0x0000;
+const GGO_BITMAP = 0x0001;
+const GGO_GRAY2_BITMAP = 0x0004;
+const GGO_GRAY4_BITMAP = 0x0005;
+const GGO_GRAY8_BITMAP = 0x0006;
+const GGO_MODE_MASK = 0x0f;
+
+// GGO_NATIVE (0x0002) and GGO_BEZIER (0x0003) both ask for a true vector outline (a
+// POLYGONHEADER/POLYCURVE record); this emulator doesn't parse font outline tables, so it
+// can only produce the metrics/bitmap formats below. Anything else (including a future mode
+// value) is equally unsupported — whitelist rather than exclude the two known vector modes.
+// @transient(immutable supported glyph formats)
+const SUPPORTED_GGO_FORMATS = new Set([GGO_METRICS, GGO_BITMAP, GGO_GRAY2_BITMAP, GGO_GRAY4_BITMAP, GGO_GRAY8_BITMAP]);
+
+export interface GlyphOutlineResult {
+    blackBoxX: number;
+    blackBoxY: number;
+    originX: number;
+    originY: number;
+    cellIncX: number;
+    cellIncY: number;
+    /** Row-padded raster in the caller's requested GGO_* format; null for GGO_METRICS. */
+    bitmap: Uint8Array | null;
+}
+
+// @transient(host glyph scratch canvas)
+let glyphScratch: OffscreenCanvas | null = null;
+// @transient(host glyph scratch context)
+let glyphScratchCtx: OffscreenCanvasRenderingContext2D | null = null;
+
+function ensureGlyphScratch(w: number, h: number): OffscreenCanvasRenderingContext2D | null {
+    if (!glyphScratch || glyphScratch.width < w || glyphScratch.height < h) {
+        glyphScratch = new OffscreenCanvas(Math.max(w, glyphScratch?.width ?? 0), Math.max(h, glyphScratch?.height ?? 0));
+        glyphScratchCtx = glyphScratch.getContext('2d', { willReadFrequently: true }) as OffscreenCanvasRenderingContext2D | null;
+    }
+    return glyphScratchCtx;
+}
+
+/** One scanline's byte count for `width` pixels at `bitsPerPixel`, padded to a DWORD —
+ *  the row layout every GGO_* raster (and DIB scanlines) share. */
+function ggoRowStride(bitsPerPixel: number, width: number): number {
+    return ((width * bitsPerPixel + 31) >> 5) << 2;
+}
+
+/** Rasterize the selected font into DWORD-aligned GGO bitmap rows; unsupported modes fail. */
+export function getGlyphOutline(
+    gdi: GDIContext,
+    hdc: number,
+    char: string,
+    uFormat: number,
+): GlyphOutlineResult | null {
+    const baseFormat = uFormat & GGO_MODE_MASK;
+    if (!SUPPORTED_GGO_FORMATS.has(baseFormat)) return null;
+
+    const fontSize = gdi.hdcStates.get(hdc)?.fontSize ?? 16;
+    const fontString = gdi.getMeasureContext(hdc)?.font || '16px sans-serif';
+
+    const pad = 2;
+    const measureScratch = ensureGlyphScratch(Math.ceil(fontSize * 2) + pad * 2, Math.ceil(fontSize * 2) + pad * 2);
+    if (!measureScratch) return null;
+    measureScratch.font = fontString;
+    measureScratch.textBaseline = 'alphabetic';
+    measureScratch.textAlign = 'left';
+
+    const metrics = measureScratch.measureText(char);
+    const abLeft = metrics.actualBoundingBoxLeft ?? 0;
+    const abRight = metrics.actualBoundingBoxRight ?? 0;
+    const abAscent = metrics.actualBoundingBoxAscent ?? fontSize * 0.8;
+    const abDescent = metrics.actualBoundingBoxDescent ?? 0;
+
+    // Round each ink edge outward (away from the pen origin) to the integer grid, and derive
+    // both GLYPHMETRICS and the pen placement below from these SAME edges — rounding the box
+    // and the origin separately let them disagree by a pixel on fractional Canvas bounds
+    // (e.g. abLeft=0.4/abRight=5.4 independently rounds to origin 0/width 6, which doesn't
+    // enclose the ink; floor/ceil of the same edges gives origin -1/width 7, which does).
+    // A glyph with no ink (e.g. space) has every actualBoundingBox* at 0, so all four edges
+    // land on 0 too — a genuine zero-sized black box, not an invented 1x1 one.
+    const leftEdge = Math.floor(-abLeft) || 0; // normalize -0 (abLeft===0) to 0
+    const rightEdge = Math.ceil(abRight);
+    const topEdge = Math.ceil(abAscent);
+    const bottomEdge = Math.ceil(abDescent);
+
+    const result: GlyphOutlineResult = {
+        blackBoxX: rightEdge - leftEdge,
+        blackBoxY: topEdge + bottomEdge,
+        originX: leftEdge,
+        originY: topEdge,
+        cellIncX: Math.round(metrics.width),
+        cellIncY: 0,
+        bitmap: null,
+    };
+    if (baseFormat === GGO_METRICS) return result;
+
+    // No ink: an empty raster is the correct answer (and matches native GDI's zero required
+    // buffer size for a space), not a call to getImageData on a zero-area crop.
+    if (result.blackBoxX === 0 || result.blackBoxY === 0) {
+        result.bitmap = new Uint8Array(0);
+        return result;
+    }
+
+    // The font-size estimate above just seeds the scratch canvas; re-request it at the
+    // box this glyph actually measured (a wide 'W' or a deep descender can exceed it).
+    const w = result.blackBoxX + pad * 2;
+    const h = result.blackBoxY + pad * 2;
+    const s = ensureGlyphScratch(w, h);
+    if (!s) return null; // a bitmap was requested and couldn't be built: fail, don't claim success
+    s.clearRect(0, 0, s.canvas.width, s.canvas.height);
+    s.font = fontString;
+    s.textBaseline = 'alphabetic';
+    s.textAlign = 'left';
+    s.fillStyle = '#fff';
+    // Placing the pen so (leftEdge, topEdge) lands exactly at pixel (pad, pad) makes the crop
+    // below a fixed rect — no re-measuring the rendered pixels to find where the glyph landed.
+    s.fillText(char, pad - leftEdge, pad + topEdge);
+
+    let coverage: Uint8ClampedArray;
+    try {
+        coverage = s.getImageData(pad, pad, result.blackBoxX, result.blackBoxY).data;
+    } catch {
+        return null; // couldn't read back the rasterized glyph: fail, don't claim success
+    }
+
+    const bpp = baseFormat === GGO_BITMAP ? 1 : 8;
+    const levels = baseFormat === GGO_GRAY2_BITMAP ? 4 : baseFormat === GGO_GRAY4_BITMAP ? 16 : 64; // GGO_GRAY8_BITMAP
+    const stride = ggoRowStride(bpp, result.blackBoxX);
+    const bitmap = new Uint8Array(stride * result.blackBoxY);
+
+    for (let y = 0; y < result.blackBoxY; y++) {
+        const rowBase = y * stride;
+        for (let x = 0; x < result.blackBoxX; x++) {
+            const alpha = coverage[(y * result.blackBoxX + x) * 4 + 3]!;
+            if (baseFormat === GGO_BITMAP) {
+                if (alpha >= 128) bitmap[rowBase + (x >> 3)] |= 0x80 >> (x & 7);
+            } else {
+                bitmap[rowBase + x] = Math.round((alpha / 255) * levels);
+            }
+        }
+    }
+
+    result.bitmap = bitmap;
+    return result;
+}
+
 export function textOut(gdi: GDIContext, hdc: number, x: number, y: number, text: string): boolean {
     if (!text) return false;
     const ctx = gdi.contexts.get(hdc);

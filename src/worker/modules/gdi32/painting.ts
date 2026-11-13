@@ -1,3 +1,4 @@
+import { registerGlyphOutlineExports } from './glyph-outline-api';
 
 import { type HleDispatcher, ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { registerPaintingDcStateExports } from './painting-dc-state';
@@ -694,6 +695,7 @@ export interface PaletteState {
 
 export function createPaintingExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
+    registerGlyphOutlineExports(exports);
 
     exports['GetStockObject'] = (ctx, mem, args): number => {
         const objectId = args[0];
