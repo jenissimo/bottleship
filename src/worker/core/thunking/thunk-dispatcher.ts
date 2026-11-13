@@ -1208,8 +1208,8 @@ export class ThunkDispatcher {
     /**
      * Handle thread exit stub.
      */
-    private handleSchedulerThreadExitStub(cpu: any, mem: Uint8Array): void {
-        this.ensureScheduler().handleThreadExitStub(cpu, mem);
+    private handleSchedulerThreadExitStub(cpu: any, mem: Uint8Array): boolean {
+        return this.ensureScheduler().handleThreadExitStub(cpu, mem);
     }
 
     // =========================================================================
@@ -2649,7 +2649,12 @@ export class ThunkDispatcher {
         }
 
         if (this.isSchedulerThreadExitId(functionId)) {
-            this.handleSchedulerThreadExitStub(cpu, this.cachedMem8!);
+            if (this.handleSchedulerThreadExitStub(cpu, this.cachedMem8!)) {
+                // DllMain(DLL_THREAD_DETACH) runs first; EIP and ESP are already on the chain.
+                this.lastExpectedEspAfterReturn = 0;
+                this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.CALLBACK_STUB, 0);
+                return;
+            }
             // Note: Set EIP to spin loop BEFORE calling onThunkComplete.
             // Without this, v86 resumes the thunk stub's RET N on the terminated
             // thread's stack > jumps to garbage > #UD crash. Also redirect [ESP] so a

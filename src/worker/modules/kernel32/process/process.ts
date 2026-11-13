@@ -1347,7 +1347,7 @@ export const exports: Record<string, ThunkImplementation> = {
             dwStackSize,
             dwCreationFlags,
             lpThreadId,
-            mem
+            mem, true
         );
 
         if (handle === 0) {
@@ -1447,6 +1447,8 @@ export const exports: Record<string, ThunkImplementation> = {
     'ExitThread': (ctx, mem, args) => {
         const exitCode = args[0] >>> 0;
         Logger.log(LogCategory.KERNEL32, `ExitThread(code=0x${exitCode.toString(16)})`);
+        const detach = System.getInstance().scheduler.exitThreadWithDetach(ctx.esp >>> 0, exitCode, mem);
+        if (detach) return detach;
         System.getInstance().scheduler.exitThread(exitCode);
         return { value: 0, terminated: true };
     },
@@ -2712,7 +2714,7 @@ export const exports: Record<string, ThunkImplementation> = {
             dwStackSize,
             dwCreationFlags,
             lpThreadId,
-            mem
+            mem, true
         );
 
         if (handle === 0) {

@@ -1,6 +1,7 @@
 // Module management functions for kernel32
 // GetModuleHandle*, LoadLibrary*, GetProcAddress, FreeLibrary, GetModuleFileName*
 
+import { noteDllUnloaded } from '../../../core/dll-thread-notify';
 import { type HleDispatcher, ThunkImplementation, ThunkResult, type X86Context } from '../../../core/thunking/thunk-dispatcher';
 import type { FastPathImplementation } from '../../../core/thunking/thunk-dispatcher';
 import { System } from '../../../core/system';
@@ -1273,6 +1274,7 @@ function initModuleFunctions(): void {
         // pointer into the old code keeps working instead of faulting.
         const unload = (): void => {
             registry!.unregister(mod.name);
+            noteDllUnloaded(hModule);
             for (const [k, v] of loadLibraryHandleCache) {
                 if (v === hModule) loadLibraryHandleCache.delete(k);
             }

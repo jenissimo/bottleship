@@ -38,6 +38,7 @@ import {
 import { planProcessCrt, processCrtBinding, type CrtScanImport } from './crt-binding';
 import { parsePeImports } from '@bottleship/formats/pe';
 import { applyBaseRelocations } from './pe-relocations';
+import { noteDllInitialized, resetDllThreadNotify } from './dll-thread-notify';
 import { nameOrdinalImports, readExportNameDirectory, shippedExportNames } from './pe-export-names';
 import { normalizeDllBaseName, resolveThunkedDllAlias } from './dll-aliases';
 import { dllSearchDirectories } from './dll-search-order';
@@ -365,6 +366,7 @@ export class PELoader {
     /** Clear per-process caches (heap inline stubs, etc.) tied to specific guest
      *  memory addresses. Called from Process.reset() before thunk memory is regenerated. */
     resetCaches(): void {
+        resetDllThreadNotify();
         this.heapInlineStubs = null;
         this.crtInlineStubs = null;
         this.caseFoldInlineStubs = null;
@@ -948,6 +950,7 @@ export class PELoader {
             // Runtime LoadLibrary* path can defer this to thunk-dispatcher callback flow.
             if (invokeDllMain && entryPointRVA !== 0) {
                 module.initialized = true;
+                noteDllInitialized(baseAddress);
                 this.pendingDllInits.push({
                     baseAddress,
                     entryPoint: baseAddress + entryPointRVA,

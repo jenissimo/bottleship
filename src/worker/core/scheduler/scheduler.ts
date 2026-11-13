@@ -11,6 +11,7 @@
  * 7. No circular dependencies — one-way data flow
  */
 
+import { DLL_THREAD_ATTACH, DLL_THREAD_DETACH, layNotifyChain, layNotifyChainForRet, markThreadAttached, takeThreadDetach, threadNotifyTargets, type ThreadNotifyTarget } from '../dll-thread-notify';
 import { Logger, LogCategory } from '../logger';
 import { invalidateGuestCode } from '../memory/guest-code';
 import { Process } from '../process';
@@ -122,6 +123,9 @@ interface SwitchTraceRecord {
     kind: ThunkBoundaryKind;
     cleanup: number;
 }
+
+/** Offset of `pop esp; ret` in the thread-exit stub (after its 12 bytes). */
+const THREAD_EXIT_PIVOT = 16;
 
 export interface SavedThread {
     id: number; handle: number; state: ThreadState; kernelObject: number;
@@ -2230,7 +2234,8 @@ export class Scheduler {
 
     createThread(
         startAddress: number, parameter: number, stackSize: number,
-        creationFlags: number, outThreadId: number, memory: Uint8Array
+        creationFlags: number, outThreadId: number, memory: Uint8Array,
+        notifyDlls = false,
     ): number {
         if (!this.process) return 0;
         this.writeThreadExitStub();
@@ -2263,8 +2268,20 @@ export class Scheduler {
             kind: 'thread', threadId,
         } as KernelThreadObject);
 
+        // A guest-created thread first runs DllMain(DLL_THREAD_ATTACH) of every loaded DLL;
+        // the last one returns into the start routine with the frame it would have had.
+        let entryEip = startAddress;
+        const targets = notifyDlls && this.process.moduleRegistry
+            ? threadNotifyTargets(this.process.moduleRegistry) : [];
+        if (targets.length > 0) {
+            esp = layNotifyChain(view, stackTop, targets, DLL_THREAD_ATTACH,
+                startAddress, [this.threadExitStubAddr, parameter]);
+            entryEip = targets[0]!.entry;
+            markThreadAttached(threadId);
+        }
+
         const isSuspended = (creationFlags & CREATE_SUSPENDED) !== 0;
-        const context = createInitialContext(startAddress, esp);
+        const context = createInitialContext(entryEip, esp);
 
         let tebAddress = 0;
         if (this.process.memory) {
@@ -2387,6 +2404,7 @@ export class Scheduler {
         // A terminated thread leaves the shared table: its handle can be handed to a new
         // thread, and the WASM handler must not answer for the dead one.
         hypercallDataManager.forgetThreadSuspendCount(thread.handle >>> 0);
+        takeThreadDetach(threadId);
         this.setThreadState(thread, ThreadState.TERMINATED);
         thread.exitCode = safeExitCode;
         thread.waitInfo = null;
@@ -4455,22 +4473,69 @@ export class Scheduler {
     // Thread Exit Stub
     // ═══════════════════════════════════════════════════════════════════════
 
+    /**
+     * The start routine returned into the exit stub of a thread that received DLL_THREAD_ATTACH:
+     * DllMain(DLL_THREAD_DETACH) runs first, in reverse order, and the chain comes back past the
+     * stub's PUSH EAX with the exit code on top. Execution continues at the stub's pivot
+     * (`pop esp; ret`), which is also where the instructions after the OUT fall through to.
+     */
+    private beginThreadDetach(threadId: number, view: DataView, top: number, exitCode: number, cpu: V86Cpu): boolean {
+        const targets = this.threadDetachTargets(threadId);
+        if (targets.length === 0) return false;
+        const chain = layNotifyChainForRet(view, top, targets, DLL_THREAD_DETACH, (this.threadExitStubAddr + 1) >>> 0, [exitCode]);
+        const slot = (chain - 4) >>> 0;
+        view.setUint32(slot, chain, true);
+        const v = cpuViews(cpu);
+        v.reg32[4] = slot;
+        if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
+        v.instructionPointer[0] = (this.threadExitStubAddr + THREAD_EXIT_PIVOT) >>> 0;
+        return true;
+    }
+
+    /** DLLs to notify of this thread's exit (reverse initialization order), once per thread. */
+    private threadDetachTargets(threadId: number): ThreadNotifyTarget[] {
+        if (!this.process?.moduleRegistry || !takeThreadDetach(threadId)) return [];
+        return threadNotifyTargets(this.process.moduleRegistry).reverse();
+    }
+
+    /**
+     * ExitThread from a thread that received DLL_THREAD_ATTACH: lay the DLL_THREAD_DETACH chain
+     * below the caller's stack and make ExitThread return into it through the exit stub's
+     * stack pivot (`pop esp; ret`). Returns the thunk result to use, or null to exit directly.
+     */
+    exitThreadWithDetach(esp: number, exitCode: number, mem: Uint8Array): { value: number; stackCleanup: number } | null {
+        const thread = this.getCurrentThread();
+        if (!thread) return null;
+        const targets = this.threadDetachTargets(thread.id);
+        if (targets.length === 0) return null;
+        this.writeThreadExitStub();
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const chain = layNotifyChainForRet(view, (esp - 0x100) >>> 0, targets, DLL_THREAD_DETACH,
+            (this.threadExitStubAddr + 1) >>> 0, [exitCode]);
+        view.setUint32(esp, (this.threadExitStubAddr + THREAD_EXIT_PIVOT) >>> 0, true);
+        view.setUint32(esp + 4, chain, true);
+        return { value: 0, stackCleanup: 0 };
+    }
+
     isThreadExitId(functionId: number): boolean {
         return functionId === this.threadExitFunctionId;
     }
 
-    handleThreadExitStub(cpu: V86Cpu, mem: Uint8Array): void {
+    /** Returns true when the thread keeps running guest code to deliver DLL_THREAD_DETACH first. */
+    handleThreadExitStub(cpu: V86Cpu, mem: Uint8Array): boolean {
         const thread = this.getCurrentThread();
-        if (!thread || thread.state === ThreadState.TERMINATED) return;
+        if (!thread || thread.state === ThreadState.TERMINATED) return false;
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const esp = readEsp(cpu);
-        if (esp + 4 > mem.length) return;
+        if (esp + 4 > mem.length) return false;
 
         const exitCode = view.getUint32(esp, true);
+        if (this.beginThreadDetach(thread.id, view, esp, exitCode, cpu)) return true;
         Logger.log(LogCategory.THREAD, `Thread ${thread.id} returned via exitStub, exitCode=0x${exitCode.toString(16)}`);
         this.terminateThread(thread.id, exitCode);
         this.requestSwitch();
+        return false;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -5633,6 +5698,9 @@ export class Scheduler {
         mem[this.threadExitStubAddr + off++] = 0x00;
         mem[this.threadExitStubAddr + off++] = 0x00;
         mem[this.threadExitStubAddr + off++] = 0xEF; // OUT DX, EAX
+        while (off < THREAD_EXIT_PIVOT) mem[this.threadExitStubAddr + off++] = 0x90; // NOP
+        mem[this.threadExitStubAddr + off++] = 0x5C; // POP ESP  (ExitThread's DLL_THREAD_DETACH pivot)
+        mem[this.threadExitStubAddr + off++] = 0xC3; // RET
         while (off < this.threadExitStubSize) mem[this.threadExitStubAddr + off++] = 0x90; // NOP
         invalidateGuestCode(this.threadExitStubAddr, this.threadExitStubSize);
     }

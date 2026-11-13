@@ -678,7 +678,7 @@ export class Msvcrt implements IModule {
                 stackSize,
                 0,
                 0,
-                mem,
+                mem, true,
             );
             if (handle === 0) {
                 sched.setLastError(8);
@@ -705,7 +705,7 @@ export class Msvcrt implements IModule {
                 stackSize,
                 creationFlags,
                 thrdAddr,
-                mem,
+                mem, true,
             );
             if (handle === 0) {
                 sched.setLastError(8);
