@@ -4,7 +4,7 @@
 
 import { System } from '../../core/system';
 import { Logger, LogCategory } from '../../core/logger';
-import { resizeFullscreenWindowToMode } from '../../runtime/windowing/fullscreen-window';
+import { requestWindowedDeviceHostView, resizeFullscreenWindowToMode } from '../../runtime/windowing/fullscreen-window';
 import {
     createComObject,
     deviceBackBufferSurfaces,
@@ -90,6 +90,21 @@ function destroyImplicitDepthStencil(devicePtr: number): void {
  */
 export function resizeFullscreenDeviceWindow(hwnd: number, width: number, height: number): void {
     resizeFullscreenWindowToMode(hwnd, width, height, "D3D8");
+}
+
+/**
+ * CreateDevice's host view from its D3DPRESENT_PARAMETERS (Windowed @ +28, hDeviceWindow
+ * @ +24 with the focus window as the fallback): a fullscreen device is a mode set, a
+ * windowed one shows its back buffer at the device window's screen origin.
+ */
+export function publishCreateDeviceHostView(
+    view: DataView, pPresParams: number, hFocusWindow: number, width: number, height: number,
+): void {
+    if (view.getUint32(pPresParams + 28, true) === 0) {
+        System.getInstance().requestHostResize(width, height, { modeSet: true });
+        return;
+    }
+    requestWindowedDeviceHostView((view.getUint32(pPresParams + 24, true) || hFocusWindow) >>> 0, width, height);
 }
 
 // BeginScene/EndScene pairing (wined3d dlls/wined3d/device.c:3718-3743): real D3D8
