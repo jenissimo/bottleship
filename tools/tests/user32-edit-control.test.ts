@@ -357,3 +357,37 @@ describe("savestate", () => {
         expect(editControlCount()).toBe(0);
     });
 });
+
+describe("EDIT WM_CHAR line feed (Ctrl+Enter)", () => {
+    const EM_GETSEL_ = EM_GETSEL;
+    const sel = (win: WindowInfo): number => send(win, EM_GETSEL_) as number;
+
+    test("a multiline edit inserts CR LF, with or without ES_WANTRETURN", () => {
+        resetEditStatesForTests();
+        const win = edit("ab", ES_MULTILINE);
+        send(win, EM_SETSEL, 1, 1);
+        send(win, WM_CHAR, 0x0a);
+        expect(win.title).toBe("a\r\nb");
+        expect(sel(win) & 0xffff).toBe(3);
+    });
+
+    test("a read-only multiline edit moves the caret to the start of the next line", () => {
+        resetEditStatesForTests();
+        const win = edit("one\r\ntwo\r\nthree", ES_MULTILINE | ES_READONLY);
+        send(win, EM_SETSEL, 2, 2);
+        send(win, WM_CHAR, 0x0a);
+        expect(win.title).toBe("one\r\ntwo\r\nthree");
+        expect(sel(win)).toBe((5 << 16) | 5);
+        send(win, EM_SETSEL, 12, 12);
+        send(win, WM_CHAR, 0x0a);
+        expect(sel(win)).toBe((10 << 16) | 10);
+    });
+
+    test("a single-line edit ignores it", () => {
+        resetEditStatesForTests();
+        const win = edit("ab");
+        send(win, EM_SETSEL, 1, 1);
+        send(win, WM_CHAR, 0x0a);
+        expect(win.title).toBe("ab");
+    });
+});
