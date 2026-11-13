@@ -223,6 +223,7 @@ for (const failure of ['none', 'finish', 'submit'] as const)
             msaaColorManager: { flushGarbage() {} },
             textureConverter: { destroyPendingAfterSubmit() {} },
             clearPipeline: x.pipeline,
+            colorKeyBlitPipeline: { slotsSubmitted() {} },
             encoderEpoch: 0,
             resetBindFastPath() {},
             queue: {

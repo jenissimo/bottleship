@@ -82,7 +82,7 @@ describe("BltFast onto a surface whose pixels are on the GPU", () => {
         const before = dst.version;
 
         expect(blt(10, 6, DDBLTFAST_SRCCOLORKEY)).toBe(DD_OK);
-        expect(calls).toEqual([`gpu keyed 0,0,${SPRITE},${SPRITE} -> 10,6,${10 + SPRITE},${6 + SPRITE}`, "flush"]);
+        expect(calls).toEqual([`gpu keyed 0,0,${SPRITE},${SPRITE} -> 10,6,${10 + SPRITE},${6 + SPRITE}`]);
         expect(dstPixel(11, 6)).toBe(0);
         // The blit is a new version of the surface, written by the GPU: a copy of the old
         // version that was read back earlier must not pass for the current pixels.
@@ -97,7 +97,7 @@ describe("BltFast onto a surface whose pixels are on the GPU", () => {
         const { dst, calls, blt } = setup();
         setAuthorityGpu(dst);
         expect(blt(0, 8, 0)).toBe(DD_OK);
-        expect(calls).toEqual([`gpu copy 0,0,${SPRITE},${SPRITE} -> 0,8,${SPRITE},${8 + SPRITE}`, "flush"]);
+        expect(calls).toEqual([`gpu copy 0,0,${SPRITE},${SPRITE} -> 0,8,${SPRITE},${8 + SPRITE}`]);
     });
 
     test("a frame built on the CPU stays a memory copy", () => {
@@ -117,5 +117,43 @@ describe("BltFast onto a surface whose pixels are on the GPU", () => {
         expect(await blt(10, 6, DDBLTFAST_SRCCOLORKEY)).toBe(DD_OK);
         expect(calls).toEqual(["download"]);
         expect(dstPixel(11, 6)).toBe(0xffff);
+    });
+});
+
+describe("Blt between two GPU render targets of one format", () => {
+    test("the plain copy records into an encoder of its own, so the executor's work is submitted first", () => {
+        const mem = new Uint8Array(0x10000);
+        Mem.bind(() => mem);
+        const calls: string[] = [];
+        const state = (ptr: number): any => ({
+            surfaceType: "render_surface", mode: "GPU_ONLY", width: WIDTH, height: HEIGHT, pitch: WIDTH * 2,
+            caps: 0, surfacePtr: ptr, format: RGB565, gpuTexture: { label: String(ptr) }, gpuTextureFormat: "bgra8unorm",
+            version: 1, lastUploadVersion: 1, gpuDirty: false, everLocked: false,
+        });
+        const dst = state(DST_PIXELS), src = state(SRC_PIXELS);
+        setAuthorityGpu(dst);
+        setAuthorityGpu(src);
+        const device = {
+            createCommandEncoder: () => ({
+                copyTextureToTexture: () => { calls.push("copy"); },
+                finish: () => ({}),
+            }),
+        };
+        const context: any = {
+            backend: { getDevice: () => device, getQueue: () => ({ submit: () => { calls.push("submit"); } }) },
+            surfaces: {},
+            resourceProvider: {
+                getComObjectByAddress: (addr: number) => (addr === DST ? surfaceObject(dst) : addr === SRC ? surfaceObject(src) : null),
+            },
+            executor: {
+                syncSurfaceToMemoryFromScratch: () => false,
+                blitWithColorKey() { calls.push("keyed"); },
+                blitWithShaderCopy() { calls.push("shader copy"); },
+                flush() { calls.push("flush"); },
+            },
+        };
+        const blt = createSurfaceBltFlipExports(context).IDirectDrawSurface7_Blt!;
+        expect(blt({ esp: 0 } as never, mem, [DST, 0, SRC, 0, 0, 0])).toBe(DD_OK);
+        expect(calls).toEqual(["flush", "copy", "submit"]);
     });
 });

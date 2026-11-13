@@ -1048,10 +1048,11 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             const srcFmt = srcState.gpuTextureFormat;
             const dstFmt = dstState.gpuTextureFormat;
             const formatMismatch = !!(srcFmt && dstFmt && srcFmt !== dstFmt);
+            // Not reached today: canUseGpuFastPath refuses a colour key, so keyed blits reach the
+            // GPU only through the mixed path below and BltFast's composite.
             if (useColorKey && colorKey) {
                 profiler.start("Blt:gpuPath:colorKeyBlit");
                 context.executor!.blitWithColorKey(srcState, dstState, effSrcRect, effDstRect, colorKey);
-                context.executor!.flush();
                 profiler.end("Blt:gpuPath:colorKeyBlit");
                 setAuthorityGpu(dstState);
             } else if (formatMismatch) {
@@ -1059,11 +1060,13 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                     `IDirectDrawSurface7_Blt: GPU format mismatch src=${srcFmt} dst=${dstFmt} - using shader copy`);
                 profiler.start("Blt:gpuPath:shaderCopy");
                 context.executor!.blitWithShaderCopy(srcState, dstState, effSrcRect, effDstRect);
-                context.executor!.flush();
                 profiler.end("Blt:gpuPath:shaderCopy");
                 setAuthorityGpu(dstState);
             } else {
                 profiler.start("Blt:gpuPath:copy");
+                // A copy in an encoder of its own: the executor's recorded work (and a deferred
+                // clear) has to land first.
+                context.executor!.flush();
                 const device = context.backend!.getDevice()!;
                 const encoder = device.createCommandEncoder();
                 encoder.copyTextureToTexture(
@@ -1083,11 +1086,6 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         if (willUseGpu) {
             profiler.start("Blt:gpuPath");
             Logger.verbose(LogCategory.DDRAW, `IDirectDrawSurface7_Blt: Using GPU FAST PATH`);
-            if (context.executor) {
-                profiler.start("Blt:gpuPath:flush");
-                context.executor.flush();
-                profiler.end("Blt:gpuPath:flush");
-            }
             const backend = context.backend!;
             const device = backend.getDevice();
             if (device && context.executor) {
@@ -1143,7 +1141,6 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
 
             if (srcState.gpuTexture) {
                 context.executor.blitWithShaderCopy(srcState, dstState, effSrcRect, effDstRect);
-                context.executor.flush();
                 setAuthorityGpu(dstState);
                 recordSurfaceOp("blt", "gpu:stretch", dstState, srcState, effDstRect, effSrcRect, colorKey);
             } else if (surfaceHasActiveWriteLease(dstState)) {
@@ -1183,7 +1180,6 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                         } else {
                             context.executor!.blitWithShaderCopy(srcState, dstState, effSrcRect, effDstRect);
                         }
-                        context.executor!.flush();
                         setAuthorityGpu(dstState);
                         recordSurfaceOp("blt", useColorKey ? "gpu:mixed:colorkey" : "gpu:mixed", dstState, srcState, effDstRect, effSrcRect, colorKey);
                         profiler.end("Blt:mixedGpuPath");
@@ -1198,7 +1194,6 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             } else {
                 context.executor.blitWithShaderCopy(srcState, dstState, effSrcRect, effDstRect);
             }
-            context.executor.flush();
             setAuthorityGpu(dstState);
             recordSurfaceOp("blt", useColorKey ? "gpu:mixed:colorkey" : "gpu:mixed", dstState, srcState, effDstRect, effSrcRect, colorKey);
             profiler.end("Blt:mixedGpuPath");
@@ -1341,7 +1336,6 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             } else {
                 context.executor.blitWithShaderCopy(srcState, dstState, srcRect, dstRect);
             }
-            context.executor.flush();
             setAuthorityGpu(dstState);
             (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
             recordSurfaceOp("bltfast", colorKey ? "gpu:mixed:colorkey" : "gpu:mixed", dstState, srcState, dstRect, srcRect, colorKey);

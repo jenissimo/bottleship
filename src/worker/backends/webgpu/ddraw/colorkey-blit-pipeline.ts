@@ -52,7 +52,8 @@ const UNIFORM_FLOATS = UNIFORM_SIZE / 4;
 /**
  * Blits between two submits each read their own slot of the uniform ring, addressed by a
  * dynamic offset. A slot is written again RING_SLOTS blits later, so no more than that many
- * blits may sit in unsubmitted encoders at once. Both callers submit after every blit today.
+ * blits may sit in unsubmitted encoders at once: the caller asks hasFreeSlot() before a
+ * blit, submits when it is false, and reports every submit through slotsSubmitted().
  */
 const RING_SLOTS = 256;
 
@@ -88,6 +89,8 @@ export class ColorKeyBlitPipeline {
      *  uniform offset alignment. */
     private slotStride = 256;
     private nextSlot = 0;
+    /** Slots written since the caller's last submit. */
+    private unsubmittedSlots = 0;
     /** One blit's uniforms; written to the ring slot and reused by the next blit. */
     private readonly uniformScratch = new Float32Array(UNIFORM_FLOATS);
     private readonly dynamicOffset = [0];
@@ -248,6 +251,7 @@ export class ColorKeyBlitPipeline {
         u[11] = config.enableColorKey !== false ? 1 : 0;
         const offset = this.nextSlot * this.slotStride;
         this.nextSlot = (this.nextSlot + 1) % RING_SLOTS;
+        this.unsubmittedSlots++;
         this.queue.writeBuffer(this.uniformBuffer, offset, u);
         this.dynamicOffset[0] = offset;
 
@@ -293,6 +297,16 @@ export class ColorKeyBlitPipeline {
             `ColorKeyBlitPipeline: ${config.srcWidth}x${config.srcHeight} -> ${config.dstWidth}x${config.dstHeight} ` +
             `colorkey=RGB[${config.colorKeyLow.r.toFixed(3)},${config.colorKeyLow.g.toFixed(3)},${config.colorKeyLow.b.toFixed(3)}]`
         );
+    }
+
+    /** False when the next blit would overwrite a slot an unsubmitted blit still reads. */
+    hasFreeSlot(): boolean {
+        return this.unsubmittedSlots < RING_SLOTS;
+    }
+
+    /** Every blit recorded so far has been submitted. */
+    slotsSubmitted(): void {
+        this.unsubmittedSlots = 0;
     }
 
     private bindGroupFor(srcView: GPUTextureView, linear: boolean): GPUBindGroup {
