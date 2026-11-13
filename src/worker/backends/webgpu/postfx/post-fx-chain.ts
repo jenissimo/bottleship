@@ -327,7 +327,11 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
             effects.some((e) => (e.needsOutputRes ? e.needsOutputRes(q) : false));
         const workW = wantOutputRes ? contentW : (srcW || contentW || 1);
         const workH = wantOutputRes ? contentH : (srcH || contentH || 1);
-        const needUpscale = wantOutputRes && (workW !== srcW || workH !== srcH);
+        // A cropped source is resampled once, by the passthrough, into a [0,1] intermediate of
+        // the work size: an effect that sampled the plane through the crop UVs would centre its
+        // vignette/curvature on the plane, let pixels outside the crop in and step its texels
+        // in plane units while its resolution says the crop's.
+        const needUpscale = !!opts.sourceUv || (wantOutputRes && (workW !== srcW || workH !== srcH));
 
         const ctx: PostFrameContext = {
             resolution: { width: workW, height: workH },

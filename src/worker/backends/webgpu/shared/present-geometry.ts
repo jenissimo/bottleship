@@ -133,6 +133,7 @@ export interface PlaneView { x: number; y: number; w: number; h: number; whole: 
 // @transient(a copy of System's host view, republished with every host resize - the boot and restore mode sets included)
 let viewX = 0, viewY = 0, viewW = 0, viewH = 0;
 const planeView: PlaneView = { x: 0, y: 0, w: 0, h: 0, whole: true };
+const wholeView: PlaneView = { x: 0, y: 0, w: 0, h: 0, whole: true };
 
 /** The rectangle of the guest screen the host surface shows; a non-positive size means all of it. */
 export function setGuestView(x: number, y: number, width: number, height: number): void {
@@ -159,6 +160,13 @@ export function guestViewOnPlane(planeW: number, planeH: number): PlaneView {
     }
     v.x = x0; v.y = y0; v.w = x1 - x0; v.h = y1 - y0; v.whole = false;
     return v;
+}
+
+/** The whole plane: for a frame that is drawn uncropped (phase-blend), whose overlays must not be cropped either. */
+export function wholePlaneView(planeW: number, planeH: number): PlaneView {
+    wholeView.w = planeW;
+    wholeView.h = planeH;
+    return wholeView;
 }
 
 /**

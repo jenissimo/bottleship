@@ -9,6 +9,7 @@ import {
     guestViewOnPlane,
     publishPresentRect,
     setGuestView,
+    wholePlaneView,
     type HostRect,
     type PresentRect,
 } from "../../src/worker/backends/webgpu/shared/present-geometry";
@@ -199,6 +200,13 @@ describe("the host view's part of a screen plane", () => {
         expect({ ...guestViewOnPlane(640, 480) }).toEqual(whole);
         setGuestView(700, 500, 100, 100);
         expect({ ...guestViewOnPlane(640, 480) }).toEqual(whole);
+        setGuestView(0, 0, 0, 0);
+    });
+
+    test("wholePlaneView is the plane whatever the view is (an uncropped, phase-blended frame)", () => {
+        setGuestView(75, 49, 490, 400);
+        expect({ ...wholePlaneView(640, 480) }).toEqual(whole);
+        expect({ ...guestViewOnPlane(640, 480) }).toEqual({ x: 75, y: 49, w: 490, h: 400, whole: false });
         setGuestView(0, 0, 0, 0);
     });
 

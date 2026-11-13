@@ -10,7 +10,7 @@ import { setD3D9FloatCapabilityContract } from "./shared/float-format-policy";
 import { setD3D9VolumeCapabilityContract } from "./shared/volume-policy";
 import { setD3D9MsaaCapabilityContract } from "./d3d9/multisample";
 import { setD3D9WebGpuCapabilityLimits } from "./shared/webgpu-capability-limits";
-import { appendOverlayRectQuads, coversTarget, guestViewOnPlane, overlayDestRect, publishComputedPresentRect } from "./shared/present-geometry";
+import { appendOverlayRectQuads, coversTarget, guestViewOnPlane, overlayDestRect, publishComputedPresentRect, wholePlaneView } from "./shared/present-geometry";
 import { instrumentGpuDeviceCensus } from "./shared/gpu-memory-census";
 
 /** Backoff between requestDevice attempts while recovering, in ms. The list also fixes how
@@ -536,6 +536,7 @@ export class WebGPUBackend implements RenderBackend {
         target: GPUTextureView,
         encoder: GPUCommandEncoder,
         rects: Array<{ x: number; y: number; w: number; h: number }>,
+        wholePlane = false,
     ): void {
         if (!this.device || !this.queue || rects.length === 0) return;
 
@@ -556,7 +557,8 @@ export class WebGPUBackend implements RenderBackend {
         }
 
         const verts: number[] = [];
-        appendOverlayRectQuads(verts, rects, screenW, screenH, guestViewOnPlane(screenW, screenH), dest, outW, outH);
+        appendOverlayRectQuads(verts, rects, screenW, screenH,
+            wholePlane ? wholePlaneView(screenW, screenH) : guestViewOnPlane(screenW, screenH), dest, outW, outH);
         if (verts.length === 0) return;
 
         const vertices = new Float32Array(verts);
@@ -671,7 +673,7 @@ export class WebGPUBackend implements RenderBackend {
      * are placed in the same content rect the presented frame went to — not stretched over the
      * whole host canvas, which is sized from the host container and is a different space.
      */
-    renderOverlay(target: GPUTextureView, encoder: GPUCommandEncoder): void {
+    renderOverlay(target: GPUTextureView, encoder: GPUCommandEncoder, wholePlane = false): void {
         if (!this.device || !this.overlayTextureView) {
             return;
         }
@@ -679,7 +681,7 @@ export class WebGPUBackend implements RenderBackend {
         const { width: outW, height: outH } = this.getCanvasSize();
         const dest = overlayDestRect(outW, outH);
         const planeW = this.overlayTexture?.width ?? 0, planeH = this.overlayTexture?.height ?? 0;
-        const view = guestViewOnPlane(planeW, planeH);
+        const view = wholePlane ? wholePlaneView(planeW, planeH) : guestViewOnPlane(planeW, planeH);
         const full = coversTarget(dest, outW, outH) && view.whole;
         const u0 = view.whole ? 0 : view.x / planeW, u1 = view.whole ? 1 : (view.x + view.w) / planeW;
         const v0 = view.whole ? 0 : view.y / planeH, v1 = view.whole ? 1 : (view.y + view.h) / planeH;
@@ -757,9 +759,9 @@ export class WebGPUBackend implements RenderBackend {
     /**
      * Blit an external canvas onto a target texture view (Combined operation)
      */
-    blit(source: OffscreenCanvas, target: GPUTextureView, encoder: GPUCommandEncoder): void {
+    blit(source: OffscreenCanvas, target: GPUTextureView, encoder: GPUCommandEncoder, wholePlane = false): void {
         this.updateOverlayTexture(source);
-        this.renderOverlay(target, encoder);
+        this.renderOverlay(target, encoder, wholePlane);
     }
 
     /**
