@@ -151,6 +151,8 @@ export function addComRef(ptr: number): number | undefined {
     return next;
 }
 
+// retainAtZero keeps internally owned buffers registered at public count 0. isComObjectLive
+// then describes live storage, not a positive public count: Get* may AddRef that storage again.
 export function releaseComRef(ptr: number, retainAtZero = false): number | undefined {
     const current = comRefCounts.get(ptr);
     if (current === undefined) return undefined;

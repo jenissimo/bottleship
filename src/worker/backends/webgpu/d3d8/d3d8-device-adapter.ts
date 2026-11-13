@@ -510,7 +510,6 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         if (!src) return;
         const next = vbPtr >>> 0, previous = src.vb;
         if (previous !== next) {
-            this.flushProgrammablePending();
             retainBuffer(this, "vb", next);
             src.vb = next;
             releaseBuffer(this, "vb", previous);
@@ -524,7 +523,6 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         if (this.recordingStateBlock) { this.recordStateBlock({ op: 'indices', ib: ibPtr >>> 0, baseVertex: baseVertex | 0 }); return; }
         const next = ibPtr >>> 0, previous = this.indexIB;
         if (previous !== next) {
-            this.flushProgrammablePending();
             retainBuffer(this, "ib", next);
             this.indexIB = next;
             releaseBuffer(this, "ib", previous);

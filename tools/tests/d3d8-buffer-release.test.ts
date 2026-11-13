@@ -7,7 +7,7 @@ import { registerFastPathD3D8Functions } from "../../src/worker/modules/d3d8/fas
 import { KeyedStateBlockRecorder } from "../../src/worker/backends/webgpu/shared/state-block-recorder";
 import { d3d8EntryKey, type D3D8StateBlockEntry } from "../../src/worker/backends/webgpu/d3d8/d3d8-state-block";
 import { createComTripleStubs, createStateExports } from "../../src/worker/modules/d3d8/state";
-import { createComObject, addComRef, getComRefCount, devices, resourceToDevice, forgetComObject } from "../../src/worker/modules/d3d8/shared-state";
+import { createComObject, addComRef, getComRefCount, devices, resourceToDevice, forgetComObject, isComObjectLive } from "../../src/worker/modules/d3d8/shared-state";
 
 const api = { ...createComTripleStubs(), ...createResourcesExports(), ...createStateExports() };
 let oldProcess: unknown, oldMem: any, mem: Uint8Array, adapter: any;
@@ -33,7 +33,7 @@ beforeEach(() => {
 });
 afterEach(() => {
     devices.delete(0xabc);
-    for (const p of created) { resourceToDevice.delete(p); forgetComObject(p); }
+    for (const p of created) { devices.delete(p); resourceToDevice.delete(p); forgetComObject(p); }
     System.getInstance().process = oldProcess as never; Mem.bind(oldMem);
 });
 function buffer(kind: "vb" | "ib"): number {
@@ -85,6 +85,7 @@ for (const kind of ["vb", "ib"] as const) {
         bind(kind, p); bind(kind, p);
         expect(getComRefCount(p)).toBe(1);
         expect(release(p, kind)).toBe(0);
+        expect(isComObjectLive(p)).toBe(true);
         expect(adapter[kind + "Data"].has(p)).toBe(true);
         expect(kind === "vb" ? adapter.streamSources[0].vb : adapter.indexIB).toBe(p);
         expect(events).not.toContain("COM free");
@@ -203,4 +204,58 @@ test("multiple state blocks keep a shared buffer alive until the last block is d
     expect(adapter.vbData.has(p)).toBe(true);
     adapter.deleteStateBlock(second);
     expect(adapter.vbData.has(p)).toBe(false);
+});
+
+for (const kind of ["vb", "ib"] as const) {
+    test(`${kind}: rebinding does not submit until the old buffer is actually retired`, () => {
+        const p = buffer(kind), q = buffer(kind);
+        bind(kind, p); bind(kind, q);
+        expect(events).toEqual([]);
+        expect(adapter[kind + "Data"].has(p)).toBe(true);
+        expect(release(p, kind)).toBe(0);
+        expect(events).toEqual(["submit", "GPU destroy", "guest free", "COM free"]);
+        events.length = 0;
+        release(q, kind);
+        expect(events).toEqual([]);
+        bind(kind, 0);
+        expect(events).toEqual(["submit", "GPU destroy", "guest free", "COM free"]);
+    });
+
+    test(`${kind}: Capture retains the replacement buffer until DeleteStateBlock`, () => {
+        const original = buffer(kind), replacement = buffer(kind);
+        devices.set(0xabc, adapter);
+        adapter.beginStateBlock(); bind(kind, original);
+        const token = adapter.endStateBlock().token;
+        bind(kind, replacement);
+        expect(api.IDirect3DDevice8_CaptureStateBlock!({} as never, mem, [0xabc, token])).toBe(0);
+        bind(kind, 0);
+        release(original, kind); release(replacement, kind);
+        expect(adapter[kind + "Data"].has(original)).toBe(false);
+        expect(adapter[kind + "Data"].has(replacement)).toBe(true);
+        expect(api.IDirect3DDevice8_DeleteStateBlock!({} as never, mem, [0xabc, token])).toBe(0);
+        expect(adapter[kind + "Data"].has(replacement)).toBe(false);
+    });
+
+    test(`${kind}: an unknown buffer cannot replace a live binding`, () => {
+        const p = buffer(kind);
+        bind(kind, p); events.length = 0;
+        bind(kind, 0xdead);
+        expect(kind === "vb" ? adapter.streamSources[0].vb : adapter.indexIB).toBe(p);
+        expect(events).toEqual([]);
+        release(p, kind); bind(kind, 0);
+        expect(adapter[kind + "Data"].has(p)).toBe(false);
+    });
+}
+
+test("final device Release through the thunk retires app-released bound buffers", () => {
+    const device = createComObject(0x10000); created.push(device);
+    devices.set(device, adapter);
+    const vb = buffer("vb"), ib = buffer("ib");
+    bind("vb", vb); bind("ib", ib);
+    release(vb, "vb"); release(ib, "ib");
+    expect(adapter.vbData.has(vb)).toBe(true); expect(adapter.ibData.has(ib)).toBe(true);
+    expect(api.IDirect3DDevice8_Release!({} as never, mem, [device])).toBe(0);
+    expect(adapter.vbData.size).toBe(0); expect(adapter.ibData.size).toBe(0);
+    expect(isComObjectLive(vb)).toBe(false); expect(isComObjectLive(ib)).toBe(false);
+    expect(events.filter(e => e === "COM free")).toHaveLength(2);
 });
