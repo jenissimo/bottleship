@@ -10,13 +10,14 @@ import { memoryWatch } from "../../core/memory/memory-watch";
 import {
     EMU_DDRAW_DEFAULT_CAPS,
     DDCAPS2_CANRENDERWINDOWED,
+    DDCAPS_OVERLAY,
     MEM_SURFACE_BASE,
     MEM_SURFACE_SIZE,
 } from "../../core/cpu/emulator-config";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { framePacer } from "../../core/frame-pacer";
 import { initReturnPtr } from "../../backends/webgpu/shared/dx-com-helpers";
-import { getSurfaceFormatLayout } from "../../backends/webgpu/shared/texture-formats";
+import { getSurfaceFormatLayout, isBlockCompressedFormat } from "../../backends/webgpu/shared/texture-formats";
 import {
     writeAdapterIdentifier8,
 } from "../../backends/webgpu/shared/dx-adapter-identifier";
@@ -49,6 +50,10 @@ import {
     DDSCAPS_MIPMAP,
     DDSCAPS_3DDEVICE,
     DDSCAPS_VIDEOMEMORY,
+    DDSCAPS_OVERLAY,
+    DDPF_FOURCC,
+    DDERR_NOOVERLAYHW,
+    DDERR_INVALIDPIXELFORMAT,
     DDSURFACEDESC_SIZE,
     DDSURFACEDESC2_SIZE,
     E_FAIL,
@@ -346,6 +351,29 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                 `(DDERR_NOCOLORKEYHW); no DirectDraw hardware supports one`);
             view.setUint32(lplpSurf, 0, true);
             return DDERR_NOCOLORKEYHW;
+        }
+
+        // An overlay is a hardware plane: without DDCAPS_OVERLAY the create fails and the
+        // caller (a movie player, typically) falls back to blitting RGB itself. Handing it
+        // a surface whose UpdateOverlay shows nothing plays the movie into the dark.
+        if ((rawDesc.caps & DDSCAPS_OVERLAY) !== 0
+            && (EmulatorConfig.getInstance().ddrawCaps.dwCaps & DDCAPS_OVERLAY) === 0) {
+            Logger.log(LogCategory.DDRAW,
+                `CreateSurface: refused — DDSCAPS_OVERLAY without overlay hardware (DDERR_NOOVERLAYHW)`);
+            view.setUint32(lplpSurf, 0, true);
+            return DDERR_NOOVERLAYHW;
+        }
+
+        // A FourCC outside GetFourCCCodes has no layout here: no pitch, no decoder.
+        const requestedFourCC = (rawDesc.flags & DDSD_PIXELFORMAT) !== 0
+            && ((rawDesc.pixelFormat?.flags ?? 0) & DDPF_FOURCC) !== 0
+            ? (rawDesc.pixelFormat?.fourCC ?? 0) : 0;
+        if (requestedFourCC !== 0 && !isBlockCompressedFormat(requestedFourCC)) {
+            Logger.log(LogCategory.DDRAW,
+                `CreateSurface: refused — unsupported FourCC 0x${requestedFourCC.toString(16)} ` +
+                `(DDERR_INVALIDPIXELFORMAT)`);
+            view.setUint32(lplpSurf, 0, true);
+            return DDERR_INVALIDPIXELFORMAT;
         }
 
         if (lpDesc && (rawDesc.flags & DDSD_PIXELFORMAT) !== 0) {
