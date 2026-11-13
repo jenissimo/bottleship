@@ -1060,10 +1060,43 @@ export class DMusic implements IModule {
         // HRESULT LoadObjectFromFile(REFGUID rguidClassID, REFIID iidInterfaceID,
         //                            WCHAR *pwzFilePath, void **ppObject)
         e["IDirectMusicLoader8_LoadObjectFromFile"] = (_c, _m, a) => {
-            const ppObject = a[4] >>> 0;
-            if (ppObject) Mem.writeUint32(ppObject, 0);
-            Logger.log(LogCategory.COM,
-                `[DMusic] LoadObjectFromFile("${readWide(a[3] >>> 0, DESC_FILENAME_CHARS)}") -> DMUS_E_LOADER_FAILEDOPEN`);
+            const ppObject = a[4]! >>> 0;
+            if (!validPointer(ppObject, 4, "w")) return E_POINTER;
+            Mem.writeUint32(ppObject, 0);
+            const loader = this.object<LoaderObject>(a[0]);
+            if (!(loader instanceof LoaderObject) || !validPointer(a[1]! >>> 0, 16, "r")
+                || !validPointer(a[2]! >>> 0, 16, "r") || !validPointer(a[3]! >>> 0, 2, "r")) return E_POINTER;
+            const classId = guidAt(a[1]! >>> 0), iid = guidAt(a[2]! >>> 0);
+            if (classId !== CLSID_DirectMusicSegment) return 0x80040154 | 0; // REGDB_E_CLASSNOTREG
+            const file = readWide(a[3]! >>> 0, DESC_FILENAME_CHARS);
+            if (!validPointer(a[3]! >>> 0, (file.length + 1) * 2, "r")) return E_POINTER;
+            if (!file || Mem.readUint16((a[3]! >>> 0) + file.length * 2) !== 0) return E_INVALIDARG;
+            const vfs = System.getInstance().fileSystem;
+            const candidates = [file];
+            if (!/^(?:[a-z]:|[\\/])/i.test(file)) {
+                // LoadObjectFromFile searches cwd, PATH, then the loader's directory.
+                const envPath = [...(this.process.environment ?? [])].find(([key]) => key.toUpperCase() === "PATH")?.[1] ?? "";
+                for (const dir of [...envPath.split(";"), loader.searchDirectory]) {
+                    if (dir) candidates.push(dir.replace(/[\\/]+$/, "") + "\\" + file);
+                }
+            }
+            const seen = new Set<string>();
+            for (const candidate of candidates) {
+                const path = vfs.resolvePath(candidate), key = path.toLowerCase();
+                if (seen.has(key)) continue;
+                seen.add(key);
+                const cached = loader.cache.get(key);
+                if (cached?.classId === classId) return this.queryInterface(cached, iid, ppObject);
+                const bytes = this.readSystemFile([path]);
+                if (!bytes) continue;
+                if (!isRiffWave(bytes)) return DMUS_E_LOADER_FORMATNOTSUPPORTED;
+                const obj = this.objectFromFile(loader, bytes, file, path);
+                if (!obj) return DMUS_E_LOADER_FORMATNOTSUPPORTED;
+                const hr = this.queryInterface(obj, iid, ppObject);
+                if (hr === S_OK && this.loaderCaches(loader, classId)) loader.cache.set(key, obj);
+                else obj.release();
+                return hr;
+            }
             return DMUS_E_LOADER_FAILEDOPEN;
         };
     }
