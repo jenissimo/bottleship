@@ -1943,3 +1943,22 @@ test("public Server GetPlayerContext waits for the Client CREATE return", async 
         expect(s.state.callbacks.queue.size).toBe(0);
     }finally{client.dispose();api.reset();network.attach(null);remote.attach(null);}
 },15000);
+
+test("network permission: DP8 EnumHosts/Host ask first, a loopback host and Initialize do not", async () => {
+    const { networkConsent } = await import("../../src/worker/net/network-consent");
+    const posted: { operation: string }[] = [];
+    networkConsent.reset(); networkConsent.post = r => { posted.push(r); }; networkConsent.configure("ask");
+    try {
+        initialize();
+        write(0x4000, 72); ram.set(guidBytes(DP8_PEER), 0x4018);
+        const local = new DirectPlayAddress(); local.buildHost("localhost", 2302); const localPtr = addresses.create(local);
+        expect(call("EnumHosts", [0x4000, localPtr, 0, 0, 0, 1, 1, 1, 0, 0x4200, 0])).not.toBeInstanceOf(Promise);
+        expect(posted).toHaveLength(0);
+        const parked = call("EnumHosts", [0x4000, 0, 0, 0, 0, 1, 1, 1, 0, 0x4200, 0]) as Promise<ThunkResult>;
+        expect(parked).toBeInstanceOf(Promise);
+        expect(posted).toMatchObject([{ api: "directplay8", operation: "EnumHosts" }]);
+        networkConsent.answer((posted[0] as { id: number }).id, false);
+        expect((await parked).reissue).toBe(true);
+        expect(networkConsent.check({ api: "directplay8", operation: "Host" })).toBe("deny");
+    } finally { networkConsent.reset(); networkConsent.post = () => {}; }
+});

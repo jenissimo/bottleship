@@ -8,6 +8,7 @@ import { ComObjectFactory } from "../../core/com/base-com-object";
 import { allocateComObject } from "../../core/com/com-memory";
 import { dpnetModule } from "../../api/dpnet.api";
 import { lanNetwork, type LanNetwork, nodeToIpv4 } from "../../net/lan-network";
+import { networkConsent } from "../../net/network-consent";
 import { DirectPlaySendQueue } from "../dplayx/send-queue";
 import type { SessionDesc, Discovery, Address } from "../dplayx/session";
 import { DirectPlay8Session, dp8Result, type DirectPlay8Role } from "./peer";
@@ -214,6 +215,14 @@ export class DirectPlay8NetworkApi {
     private endpoint(address: Address): DirectPlayAddress {
         const result = new DirectPlayAddress();
         result.buildHost(Array.from(nodeToIpv4(new Uint8Array(address.node))).join("."), address.port); return result;
+    }
+    /** A host address naming this machine: traffic that never leaves the session. */
+    private loopbackHost(pointer: number): boolean {
+        if (!pointer) return false;
+        const name = this.addresses.address(pointer)?.text("hostname")?.toLowerCase();
+        if (!name) return false;
+        return name === "localhost" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(name)
+            || name === Array.from(this.network.ipv4).join(".");
     }
     private async resolveHost(host: DirectPlayAddress): Promise<Uint8Array | null> {
         const name = host.text("hostname"); if (!name) return null;
@@ -925,6 +934,14 @@ export class DirectPlay8NetworkApi {
             if (method === "Send") target = "SendTo";
             if (method === "DestroyClient") target = "DestroyPeer";
             if (!s.session.initialized && !["QueryInterface", "AddRef", "Release", "Initialize", "EnumServiceProviders", "RegisterLobby", "Connect", "SetGroupInfo", "DestroyPeer", "DestroyClient", "TerminateSession", "GetPlayerContext"].includes(method)) return DPN.UNINITIALIZED;
+            // Enumerating, hosting or connecting is the first use of the network. A refusal leaves
+            // the provider on loopback only: no hosts answer, a host session is local-only, a
+            // Connect to another machine gets no response.
+            if ((target === "EnumHosts" || target === "Host" || target === "Connect") && s.session.initialized
+                && !(target !== "Host" && this.loopbackHost(a[2]))) {
+                const verdict = networkConsent.check({ api: "directplay8", operation: target });
+                if (verdict instanceof Promise) return verdict;
+            }
             return methods[target](s, a, iface, ctx);
         };
         exports["IDirectPlay8Peer_QueryInterface"] = bind("IDirectPlay8Peer", "QueryInterface");

@@ -902,3 +902,26 @@ test("RunApplication publishes settings before worker boot, defers the PID outpu
         }
     }
 });
+
+test("network permission: finding or opening a session asks first; enumerating providers does not", async () => {
+    const { networkConsent } = await import("../../src/worker/net/network-consent");
+    const posted: unknown[] = [];
+    networkConsent.reset(); networkConsent.post = r => { posted.push(r); }; networkConsent.configure("ask");
+    try {
+        initialize();
+        expect(call("EnumConnections", [0, 0x7000, 0, 0])).not.toBeInstanceOf(Promise);
+        u32(0x3000, 80);
+        const parked = call("EnumSessions", [0x3000, 60, 0x7000, 0, 0]) as Promise<ThunkResult>;
+        expect(parked).toBeInstanceOf(Promise);
+        expect(posted).toEqual([{ id: 1, api: "directplay", operation: "EnumSessions" }]);
+        expect(call("EnumSessions", [0, 0, 0, 0, 0x20])).toBe(DP.OK);   // stopping an async enumeration is not network use
+        networkConsent.answer(1, false);
+        expect((await parked).reissue).toBe(true);
+        // Refused: the re-issued call runs as on a machine with loopback only: no session answers.
+        const enumerated = await call("EnumSessions", [0x3000, 60, 0x7000, 0, 0]) as ThunkResult;
+        expect(enumerated.value).toBe(DP.OK);
+        u32(0x3028, 8); bytes(0x3018, "1".repeat(32));
+        expect(call("Open", [0x3000, 2])).toBe(DP.OK);                     // hosting stays a local session
+        expect(posted).toHaveLength(1);
+    } finally { networkConsent.reset(); networkConsent.post = () => {}; }
+});
