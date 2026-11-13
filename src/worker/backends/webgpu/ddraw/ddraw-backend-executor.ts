@@ -854,6 +854,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         passes: 0,             // render passes created
         batches: 0,            // megabatches flushed
         batchedDraws: 0,       // draws inside flushed megabatches
+        megaDrawsEncoded: 0,   // non-indexed megabatch draws encoded into a pass
+        vertexRangeBinds: 0,   // non-indexed megabatches that bound one vertex range for all draws
         clears: 0,             // executor.clear() calls
         flushes: 0,            // full flush() calls
         nanVerts: 0,           // CPU-converted vertices with non-finite x/y/z/w (guest data bad?)
@@ -5552,24 +5554,53 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                     totalVertexBytes += draw.vertexCount * batch.vertexSize;
                 }
             } else {
-                // MegaBatch non-indexed: each draw has unique drawIndex
+                // MegaBatch non-indexed: each draw has unique drawIndex. All draws of a batch
+                // share one vertex buffer, so one binding over the range that holds every draw's
+                // vertices serves them all, each starting at its firstVertex inside that range.
+                // That needs every offset to lie a whole number of vertices from the others and
+                // every draw to read only its own allocation; otherwise each draw binds its own
+                // range as before.
+                const stride = batch.vertexSize;
+                let rangeStart = -1, rangeEnd = 0, oneRange = !skipMinIdx && stride > 0;
+                let anchor = 0;
+                if (oneRange) {
+                    for (const draw of batch.draws) {
+                        if (draw.vertexCount <= 0) continue;
+                        const off = draw.vertexBufferOffset ?? ((draw.firstVertex ?? 0) * stride);
+                        const size = draw.vertexBufferSize ?? (draw.vertexCount * stride);
+                        if (rangeStart < 0) { rangeStart = off; anchor = off; }
+                        if ((off - anchor) % stride !== 0 || draw.vertexCount * stride > size) { oneRange = false; break; }
+                        if (off < rangeStart) rangeStart = off;
+                        if (off + size > rangeEnd) rangeEnd = off + size;
+                    }
+                    if (rangeStart < 0) oneRange = false;
+                }
+                if (oneRange) {
+                    this.currentRenderPass!.setVertexBuffer(0, batch.vertexBuffer, rangeStart, rangeEnd - rangeStart);
+                    this.renderStats.vertexRangeBinds++;
+                }
                 for (const draw of batch.draws) {
                     if (draw.vertexCount <= 0) continue;
                     if (skipMinIdx && draw.vertexCount >= skipMinIdx) { this.opLog(`SKIP-DRAW v=${draw.vertexCount}`); continue; }
 
-                    const vertexOffset = draw.vertexBufferOffset ?? ((draw.firstVertex ?? 0) * batch.vertexSize);
-                    const vertexSize = draw.vertexBufferSize ?? (draw.vertexCount * batch.vertexSize);
-
-                    this.currentRenderPass!.setVertexBuffer(0, batch.vertexBuffer, vertexOffset, vertexSize);
+                    const vertexOffset = draw.vertexBufferOffset ?? ((draw.firstVertex ?? 0) * stride);
+                    let firstVertex = 0;
+                    if (oneRange) {
+                        firstVertex = (vertexOffset - rangeStart) / stride;
+                    } else {
+                        const vertexSize = draw.vertexBufferSize ?? (draw.vertexCount * stride);
+                        this.currentRenderPass!.setVertexBuffer(0, batch.vertexBuffer, vertexOffset, vertexSize);
+                    }
                     // firstInstance = drawIndex: shader indexes draws[] via @builtin(instance_index)
                     this.currentRenderPass!.draw(
                         draw.vertexCount,
                         1,
-                        0,
+                        firstVertex,
                         draw.drawIndex ?? 0
                     );
+                    this.renderStats.megaDrawsEncoded++;
                     actualDrawCalls++;
-                    totalVertexBytes += draw.vertexCount * batch.vertexSize;
+                    totalVertexBytes += draw.vertexCount * stride;
                 }
             }
         } else {
