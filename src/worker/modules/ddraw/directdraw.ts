@@ -1682,6 +1682,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             context.cooperative.exclusive = false;
             context.gdiSurfaceVisible = true;
         }
+        // Exclusive DirectDraw owns the whole screen; leaving it frames the window again.
+        System.getInstance().refreshHostView();
 
         return DD_OK;
     };

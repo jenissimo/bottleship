@@ -382,7 +382,6 @@ export class System {
      */
     public implicitTlsEntries: ImplicitTlsEntry[] = [];
     private hostResize: ((view: HostView) => void) | null = null;
-    private hostViewWindow = 0;
     private hostCursorVisibility: ((visible: boolean) => void) | null = null;
     private hostCursorVisibleState: boolean | null = null;
     private hostCursorImage: ((image: HostCursorImage | null) => void) | null = null;
@@ -857,7 +856,8 @@ export class System {
                     `[DISPLAY-MODE] ${width}x${height}${opts?.bpp ? `x${opts.bpp}` : ""} published as the emulated display mode`);
             }
         }
-        this.publishHostView(0, 0, width, height, 0);
+        if (this.hostViewSelector) this.refreshHostView();
+        else this.publishHostView(0, 0, width, height);
     }
 
     /**
@@ -866,39 +866,31 @@ export class System {
      * view that does not start at the screen origin needs nothing from the cursor path.
      */
     private hostViewRect: HostView | null = null;
+    private hostViewSelector: ((out: HostView) => void) | null = null;
+    private readonly hostViewScratch: HostView = { x: 0, y: 0, width: 0, height: 0 };
 
     get hostView(): HostView | null {
         return this.hostViewRect;
     }
 
-    /** The window whose client rectangle is the host view, or 0 when a size was published. */
-    get hostViewOwner(): number {
-        return this.hostViewWindow;
+    /** The one rule that derives the view from the windows and the mode (host-view-policy). */
+    setHostViewSelector(selector: ((out: HostView) => void) | null): void {
+        this.hostViewSelector = selector;
     }
 
-    /** Show a top-level window's client rectangle; a later move or resize of it follows. */
-    requestHostViewOfWindow(hwnd: number, x: number, y: number, width: number, height: number): void {
-        this.publishHostView(x, y, width, height, hwnd);
+    /** Re-derive the view; publishes only when it changed. */
+    refreshHostView(): void {
+        const selector = this.hostViewSelector;
+        if (!selector) return;
+        const v = this.hostViewScratch;
+        selector(v);
+        const cur = this.hostViewRect;
+        if (cur && cur.x === v.x && cur.y === v.y && cur.width === v.width && cur.height === v.height) return;
+        if (v.width <= 0 || v.height <= 0) return;
+        this.publishHostView(v.x, v.y, v.width, v.height);
     }
 
-    /**
-     * The shown window moved or resized. The caller reports real changes only; the
-     * comparison is a guard so that a caller which does not cannot republish per frame.
-     */
-    followHostViewWindow(hwnd: number, x: number, y: number, width: number, height: number): void {
-        if (hwnd === 0 || hwnd !== this.hostViewWindow) return;
-        const v = this.hostViewRect;
-        if (v && v.x === x && v.y === y && v.width === width && v.height === height) return;
-        this.publishHostView(x, y, width, height, hwnd);
-    }
-
-    /** A destroyed window stops driving the view; the rectangle stays until the next publisher. */
-    forgetHostViewWindow(hwnd: number): void {
-        if (hwnd === this.hostViewWindow) this.hostViewWindow = 0;
-    }
-
-    private publishHostView(x: number, y: number, width: number, height: number, hwnd: number): void {
-        this.hostViewWindow = hwnd;
+    private publishHostView(x: number, y: number, width: number, height: number): void {
         this.hostViewRect = { x, y, width, height };
         if (this.hostResize) this.hostResize(this.hostViewRect);
     }

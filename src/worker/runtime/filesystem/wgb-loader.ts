@@ -139,6 +139,8 @@ export interface WgbManifest {
             refreshRate?: number;
             refresh?: number;
         }>;
+        /** Show the whole desktop instead of framing the foreground window. */
+        showWholeDesktop?: boolean;
         screenBackgroundColor?: {
             r: number;
             g: number;

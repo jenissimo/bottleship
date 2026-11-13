@@ -760,10 +760,9 @@ function runModalDialog(
         dlgY = 0;
     }
 
-    // Ensure host canvas matches configured screen resolution for dialog-only flows
-    // (no DDraw SetDisplayMode → canvas may still be at default/window size)
-    const system2 = System.getInstance();
-    system2.requestHostResize(screen.width, screen.height);
+    // The dialog becomes the foreground window: the host view is derived again (its owner
+    // stays framed while the dialog fits inside it, otherwise the screen is shown).
+    System.getInstance().refreshHostView();
 
     const previousActiveHwnd = system.windowManager.getActiveHwnd() || hWndParent;
 

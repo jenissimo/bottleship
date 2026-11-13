@@ -301,6 +301,9 @@ export class EmulatorConfig {
     // Screen background color (for letterboxing/clearing)
     public screenBackgroundColor = { ...DEFAULT_SCREEN_BACKGROUND };
 
+    /** The host surface shows the whole desktop instead of framing the foreground window. */
+    public showWholeDesktop = false;
+
     // Memory configuration
     public memory = {
         ram: EMU_MEMORY_SIZE,
@@ -515,6 +518,8 @@ export class EmulatorConfig {
                 `EmulatorConfig: Supported resolutions: ${this.supportedResolutions.map(r => `${r.width}x${r.height}x${r.bpp}@${r.refreshRate}Hz`).join(", ")}`
             );
         }
+
+        if (typeof config.showWholeDesktop === "boolean") this.showWholeDesktop = config.showWholeDesktop;
 
         // Apply screen background color override
         if (config.screenBackgroundColor) {
