@@ -1972,6 +1972,9 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             const state = obj.getState();
             const address = context.resourceProvider.getAddressForHandle(obj.handle);
             if (!address) continue;
+            // Only root surfaces are enumerated; the implicit members of a flip or mip
+            // chain are reached through GetAttachedSurface.
+            if (state.implicitChainMember) continue;
 
             // DOESEXIST flag: only enumerate existing surfaces
             if (!(dwFlags & DDENUMSURFACES_DOESEXIST)) continue;
@@ -2039,9 +2042,10 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                 if (useV1Desc) writeSurfaceDescV1(mem, descAddr, surfDesc);
                 else writeSurfaceDesc(mem, descAddr, surfDesc);
 
-                // NOTE: Not calling AddRef here — many games don't
-                // Release the surface in their EnumSurfaces callback, so AddRef would leak refs.
-                // The surface stays alive as long as the DirectDraw object owns it.
+                // The callback owns a reference to every surface it is handed and is the one
+                // to Release it; a guest that keeps the pointer and releases it later would
+                // otherwise free a surface it never held.
+                context.resourceProvider.getComObjectByAddress(surfAddr)?.addRef(surfAddr);
 
                 Logger.log(LogCategory.SYSTEM,
                     `IDirectDraw7_EnumSurfaces: callback #${index} surface=0x${surfAddr.toString(16)} ` +
