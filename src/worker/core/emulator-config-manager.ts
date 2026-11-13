@@ -116,6 +116,7 @@ const CP_TO_ENCODING: Record<number, string> = {
     1256: 'windows-1256', 1257: 'windows-1257', 1258: 'windows-1258',
     28591: 'iso-8859-1', 28592: 'iso-8859-2', 28595: 'iso-8859-5',
     65001: 'utf-8',
+
 };
 
 // CP437 (US OEM / IBM PC) — upper 128 code points (0x80–0xFF).

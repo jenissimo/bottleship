@@ -1,3 +1,4 @@
+import { getGlyphOutline as getGlyphOutlineImpl, type GlyphOutlineResult } from './gdi-text';
 
 import { LruCache } from "../../core/collections/lru-cache";
 import { Logger, LogCategory } from "../../core/logger";
@@ -2388,6 +2389,10 @@ export class GDIContext {
 
     drawText(hdc: number, text: string, rect?: { left: number; top: number; right: number; bottom: number }, format?: number): DrawTextLayout | null {
         return drawTextImpl(this, hdc, text, rect, format);
+    }
+
+    getGlyphOutline(hdc: number, char: string, uFormat: number): GlyphOutlineResult | null {
+        return getGlyphOutlineImpl(this, hdc, char, uFormat);
     }
 
     private ensureState(hdc: number): {
