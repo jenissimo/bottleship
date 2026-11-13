@@ -16,23 +16,15 @@
  */
 import { readFileSync } from 'node:fs';
 import { createMachine, LEFT, RIGHT, RAM } from './bulk-machine.mjs';
+import { NARROW_LENGTHS, WIDE_LENGTH, TOP_BYTES, GARBAGE, TIME_BOUND_MS, fillNarrow, fillWide } from './string-long-cases.mjs';
 
 const binaryPath = process.env.V86_TEST_BINARY;
 if (!binaryPath) throw new Error('V86_TEST_BINARY is required');
 const binary = readFileSync(binaryPath);
 
-const TIME_BOUND_MS = 2000;
 let failures = 0;
 const check = (ok, text) => { if (!ok) failures++; console.log(`${ok ? 'OK  ' : 'FAIL'} ${text}`); };
 
-function fillNarrow(g, at, length, seed) {
-    for (let i = 0; i < length; i++) g[at + i] = 0x41 + ((i * 7 + seed) % 26);
-    g[at + length] = 0;
-}
-function fillWide(g, at, length, seed) {
-    for (let i = 0; i < length; i++) { g[at + i * 2] = 0x41 + ((i * 7 + seed) % 26); g[at + i * 2 + 1] = i % 3 === 0 ? 0x04 : 0; }
-    g[at + length * 2] = 0; g[at + length * 2 + 1] = 0;
-}
 
 function timed(m, name, a, b) {
     const calls = m.hostCalls;
@@ -50,7 +42,7 @@ for (const kernels of [1, 0]) {
     m.setFallback(() => {});
     const g = m.guest();
 
-    for (const length of [0x100001, 0x100002, 1739453]) {
+    for (const length of NARROW_LENGTHS) {
         fillNarrow(g, LEFT, length, 1);
         let r = timed(m, 'strlen', LEFT, 0);
         check(!r.declined && r.eax === length && r.ms < TIME_BOUND_MS, `${tag}: strlen(${length}) = ${r.eax} in ${r.ms.toFixed(1)} ms`);
@@ -60,7 +52,7 @@ for (const kernels of [1, 0]) {
         for (let i = 0; i <= length && same; i++) same = g[RIGHT + i] === g[LEFT + i];
         check(!r.declined && r.eax === RIGHT && same && g[RIGHT + length + 1] === 0xcd, `${tag}: strcpy of ${length} bytes copies all of it and the terminator`);
     }
-    const wlen = 0x100001;
+    const wlen = WIDE_LENGTH;
     fillWide(g, LEFT, wlen, 2);
     let r = timed(m, 'wcslen', LEFT, 0);
     check(!r.declined && r.eax === wlen && r.ms < TIME_BOUND_MS, `${tag}: wcslen(${wlen}) = ${r.eax}`);
@@ -68,13 +60,13 @@ for (const kernels of [1, 0]) {
     r = timed(m, 'wcscpy', RIGHT, LEFT);
     check(!r.declined && g[RIGHT + wlen * 2] === 0 && g[RIGHT + wlen * 2 + 1] === 0 && g[RIGHT + wlen * 2 - 2] === g[LEFT + wlen * 2 - 2], `${tag}: wcscpy of ${wlen} units`);
 
-    const top = RAM - 16;
+    const top = RAM - TOP_BYTES;
     for (let i = top; i < RAM; i++) g[i] = 0x41;
     r = timed(m, 'strlen', top, 0);
     check(r.declined && r.ms < TIME_BOUND_MS, `${tag}: strlen of an unterminated string at RAM-16 declines (${r.ms.toFixed(1)} ms)`);
     r = timed(m, 'wcslen', top, 0);
     check(r.declined && r.ms < TIME_BOUND_MS, `${tag}: wcslen of an unterminated string at RAM-16 declines`);
-    for (const bad of [0xCDCDCDCD, 0xBAADF00D, 0xFEEEFEEE]) {
+    for (const bad of GARBAGE) {
         r = timed(m, 'strlen', bad, 0);
         check(r.declined && r.ms < TIME_BOUND_MS, `${tag}: strlen(0x${bad.toString(16)}) declines (${r.ms.toFixed(1)} ms)`);
         r = timed(m, 'strcmp', bad, LEFT);
@@ -109,13 +101,13 @@ for (const kernels of [1, 0]) {
     const m = await createMachine(binary, {});
     m.setFallback(() => {});
     const g = m.guest();
-    const top = RAM - 16;
+    const top = RAM - TOP_BYTES;
     for (let i = top; i < RAM; i++) g[i] = 0x41;
     let r = timed(m, 'strlen', top, 0);
     check(r.declined && r.ms < TIME_BOUND_MS, `paging off: strlen of an unterminated string at RAM-16 declines at the end of RAM (${r.ms.toFixed(1)} ms)`);
     r = timed(m, 'wcslen', top, 0);
     check(r.declined && r.ms < TIME_BOUND_MS, 'paging off: wcslen of an unterminated string at RAM-16 declines');
-    for (const bad of [0xCDCDCDCD, 0xBAADF00D, 0xFEEEFEEE, 0xA0000]) {
+    for (const bad of [...GARBAGE, 0xA0000]) {
         r = timed(m, 'strlen', bad, 0);
         check(r.declined && r.ms < TIME_BOUND_MS, `paging off: strlen(0x${bad.toString(16)}) declines (${r.ms.toFixed(1)} ms)`);
     }

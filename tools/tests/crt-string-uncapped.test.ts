@@ -3,32 +3,23 @@ import { Msvcrt } from '../../src/worker/modules/msvcrt';
 import { Crtdll } from '../../src/worker/modules/crtdll';
 import { Mem } from '../../src/worker/core/memory/mem-accessor';
 import { System } from '../../src/worker/core/system';
+import {
+    NARROW_LENGTHS, WIDE_LENGTH, TOP_BYTES, GARBAGE, TIME_BOUND_MS, fallback, fillNarrow, fillWide,
+} from '../runtime-test/string-long-cases.mjs';
 
 // The JS fallbacks of the CRT string leaves answer like the string hypercalls: no length
 // cap inside guest memory, and every scan bounded by readable memory. The hypercall arm of
-// the same cases is tools/runtime-test/string-long.mjs.
+// the same cases (tools/runtime-test/string-long-cases.mjs) is tools/runtime-test/string-long.mjs.
 
 const RAM = 8 * 1024 * 1024;
 const A = 0x100000, B = 0x400000;
-const LENGTHS = [0x100001, 0x100002, 1739453];
-const TIME_BOUND_MS = 2000;
 
 let mem: Uint8Array, crt: any, crtdll: any, oldScheduler: any;
 const callIn = (m: any, name: string, ...args: number[]) => m.exports[name]({}, mem, args) >>> 0;
 const call = (name: string, ...args: number[]) => callIn(crt, name, ...args);
 
-function narrow(at: number, length: number, seed: number) {
-    for (let i = 0; i < length; i++) mem[at + i] = 0x41 + ((i * 7 + seed) % 26);
-    mem[at + length] = 0;
-}
-function wide(at: number, length: number, seed: number) {
-    for (let i = 0; i < length; i++) {
-        mem[at + i * 2] = 0x41 + ((i * 7 + seed) % 26);
-        mem[at + i * 2 + 1] = i % 3 === 0 ? 0x04 : 0;
-    }
-    mem[at + length * 2] = 0;
-    mem[at + length * 2 + 1] = 0;
-}
+const narrow = (at: number, length: number, seed: number) => fillNarrow(mem, at, length, seed);
+const wide = (at: number, length: number, seed: number) => fillWide(mem, at, length, seed);
 function timed<T>(fn: () => T): { value: T; ms: number } {
     const t0 = performance.now();
     const value = fn();
@@ -61,7 +52,7 @@ afterEach(() => {
 });
 
 test('strlen/strcpy/strcmp/_stricmp/strstr answer whole strings over 1 MiB (msvcrt and crtdll)', () => {
-    for (const length of LENGTHS) {
+    for (const length of NARROW_LENGTHS) {
         narrow(A, length, 1);
         for (const m of [crt, crtdll]) expect(callIn(m, 'strlen', A)).toBe(length);
         mem.fill(0xcd, B, B + length + 16);
@@ -85,7 +76,7 @@ test('strlen/strcpy/strcmp/_stricmp/strstr answer whole strings over 1 MiB (msvc
 });
 
 test('wcslen/wcscpy/wcscat/_wcsicmp/wcschr/wcsstr answer whole strings over 1 MiB units', () => {
-    const length = 0x100001;
+    const length = WIDE_LENGTH;
     wide(A, length, 2);
     expect(call('wcslen', A)).toBe(length);
     expect(callIn(crtdll, 'wcslen', A)).toBe(length);
@@ -106,19 +97,29 @@ test('wcslen/wcscpy/wcscat/_wcsicmp/wcschr/wcsstr answer whole strings over 1 Mi
 });
 
 test('scans that run to the end of guest memory or start outside it end within the time bound', () => {
-    mem.fill(0x41, RAM - 16, RAM);
+    mem.fill(0x41, RAM - TOP_BYTES, RAM);
     narrow(A, 8, 5);
-    for (const name of ['strlen', 'wcslen']) {
-        const r = timed(() => call(name, RAM - 16));
+    for (const [name, value] of [['strlen', fallback.strlenTop], ['wcslen', fallback.wcslenTop]] as const) {
+        const r = timed(() => call(name, RAM - TOP_BYTES));
         expect(r.ms).toBeLessThan(TIME_BOUND_MS);
+        expect(r.value).toBe(value);
     }
-    for (const bad of [0xcdcdcdcd, 0xbaadf00d, 0xfeeefeee]) {
+    expect(callIn(crtdll, 'strlen', RAM - TOP_BYTES)).toBe(fallback.strlenTop);
+    for (const bad of GARBAGE) {
         for (const [name, args] of [['strlen', [bad]], ['wcslen', [bad]], ['strcmp', [bad, A]], ['_stricmp', [bad, A]],
             ['_wcsicmp', [bad, A]], ['wcschr', [bad, 0x41]], ['strstr', [bad, A]], ['wcsstr', [bad, A]]] as const) {
             const r = timed(() => call(name, ...(args as number[])));
             expect(r.ms).toBeLessThan(TIME_BOUND_MS);
         }
     }
-    expect(call('strlen', 0xcdcdcdcd)).toBe(0);
-    expect(call('strstr', 0xcdcdcdcd, A)).toBe(0);
+    for (const bad of GARBAGE) {
+        expect(call('strlen', bad)).toBe(fallback.strlenGarbage);
+        expect(callIn(crtdll, 'strlen', bad)).toBe(fallback.strlenGarbage);
+        expect(call('wcslen', bad)).toBe(fallback.wcslenGarbage);
+        expect(call('wcschr', bad, 0x41)).toBe(fallback.wcschrGarbage);
+        expect(call('strstr', bad, A)).toBe(fallback.strstrGarbageHaystack);
+        expect(call('strstr', A, bad)).toBe(fallback.strstrGarbageNeedle);
+        expect(call('wcsstr', bad, A)).toBe(fallback.wcsstrGarbageHaystack);
+        expect(call('wcsstr', A, bad)).toBe(fallback.wcsstrGarbageNeedle);
+    }
 });
