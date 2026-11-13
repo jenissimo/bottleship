@@ -1167,6 +1167,29 @@ export class DMusic implements IModule {
         port.ownsBuffer = false;
     }
 
+    /** A new IDirectSound8 from the dsound module, at 2 for `hWnd`; 0 when there is none. */
+    private createDirectSound(hWnd: number): number {
+        const exports = this.process.getModule("dsound")?.exports;
+        const create = exports?.["directsoundcreate8"];
+        const mem = Mem.getView();
+        if (!create || !mem) return 0;
+        const scratch = this.process.memory.alloc(4, "HEAP", "rw");
+        if (!scratch) return 0;
+        try {
+            Mem.writeUint32(scratch, 0);
+            const ctx = NO_CONTEXT;
+            if ((create(ctx, mem, [0, scratch, 0]) as number) !== S_OK) return 0;
+            const ds = Mem.readUint32(scratch) ?? 0;
+            if (ds && exports["idirectsound8_setcooperativelevel"]?.(ctx, mem, [ds, hWnd, 2]) !== S_OK) {
+                soundReference(this.process, ds, false, false);
+                return 0;
+            }
+            return ds;
+        } finally {
+            this.process.memory.free(scratch);
+        }
+    }
+
     private setDirectSound(obj: DirectMusicObject | PortObject, ptr: number): void {
         if (obj.directSound === ptr) return;
         soundReference(this.process, ptr, false, true);
@@ -1277,7 +1300,14 @@ export class DMusic implements IModule {
         // InitAudio(ppDirectMusic, ppDirectSound, hWnd, dwDefaultPathType, dwPChannelCount, dwFlags, pParams)
         e["IDirectMusicPerformance8_InitAudio"] = (_c, _m, a) => {
             const ppDirectSound = a[2]! >>> 0;
-            const hr = init(a[0]!, a[1]! >>> 0, ppDirectSound ? (Mem.readUint32(ppDirectSound) ?? 0) : 0);
+            if (!perfOf(a) || (ppDirectSound && !validPointer(ppDirectSound, 4, "rw"))) return E_POINTER;
+            let directSound = ppDirectSound ? (Mem.readUint32(ppDirectSound) ?? 0) : 0;
+            if (ppDirectSound && !directSound) {
+                directSound = this.createDirectSound(a[3]! >>> 0);
+                if (!directSound) return E_FAIL;
+                Mem.writeUint32(ppDirectSound, directSound);
+            }
+            const hr = init(a[0]!, a[1]! >>> 0, directSound);
             const perf = perfOf(a);
             // InitAudio brings its own synthesizer: there is no AddPort to wait for.
             if (hr === S_OK && perf && !perf.engine) {
