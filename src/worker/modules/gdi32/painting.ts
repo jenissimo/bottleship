@@ -936,6 +936,9 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         return System.getInstance().gdiContext.setTextColor(hdc, color);
     };
 
+    exports['GetTextColor'] = (ctx, mem, args): number => System.getInstance().gdiContext.getTextColor(args[0]);
+    exports['GetBkMode'] = (ctx, mem, args): number => System.getInstance().gdiContext.getBkMode(args[0]);
+
     exports['SetTextAlign'] = (ctx, mem, args): number => {
         return System.getInstance().gdiContext.setTextAlign(args[0], args[1]);
     };

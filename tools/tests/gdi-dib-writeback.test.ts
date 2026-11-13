@@ -10,6 +10,9 @@
  *    no bit outside the rect — neighbouring pixels share its bytes.
  *  - 16bpp write-back packs through the section's masks (5-5-5 for BI_RGB), 24bpp as B,G,R.
  *    Text an app draws into a 16-bit section to build its own glyph textures lives there.
+ *  - 8/4bpp write-back stores the nearest colour-table index. A text engine that renders
+ *    into an 8-bit gray-ramp section and blends from its bits (Director's TextXtra) shows
+ *    no text at all when the drawn pixels never reach them.
  */
 import { afterEach, expect, test } from "bun:test";
 import { writeBackDibSectionRect } from "../../src/worker/modules/gdi32/bitmap-resolve";
@@ -114,4 +117,52 @@ test("16bpp BI_BITFIELDS write-back packs through the masks", () => {
 
 test("24bpp write-back stores B,G,R", () => {
     expect([...writeOne(24, [0x10, 0x20, 0x30]).subarray(0, 3)]).toEqual([0x30, 0x20, 0x10]);
+});
+
+function palettizedSection(bpp: 8 | 4, w: number, palette: number[], fill = 0) {
+    const stride = 4;
+    const mem = new Uint8Array(BITS_PTR + stride + 16);
+    mem.fill(fill, BITS_PTR, BITS_PTR + stride);
+    installGuestMemory(mem);
+    const hBitmap = SystemResourceProvider.getInstance().registerUserObject({
+        type: "BITMAP", width: w, height: 1,
+        bitsPtr: BITS_PTR, dibBpp: bpp, dibStride: stride, dibTopDown: true,
+        dibPalette: Uint32Array.from(palette),
+    } as never);
+    return { mem, hBitmap };
+}
+
+const gray = (v: number) => 0xff000000 | (v << 16) | (v << 8) | v;
+
+test("8bpp write-back stores the nearest colour-table index", () => {
+    // 0 = black, 1 = gray 0x80, 2 = white, 3 = pure red
+    const { mem, hBitmap } = palettizedSection(8, 4, [gray(0), gray(0x80), gray(0xff), 0xffff0000]);
+    const pixels = new Uint8ClampedArray([
+        0xf0, 0xf0, 0xf0, 0xff,   // near white -> 2
+        0x70, 0x70, 0x70, 0xff,   // near gray  -> 1
+        0xe0, 0x10, 0x10, 0xff,   // near red   -> 3
+        0x00, 0x00, 0x00, 0xff,   // exact black -> 0
+    ]);
+    writeBackDibSectionRect(hBitmap, fakeContext(pixels, 4, 1), 0, 0, 4, 1);
+    expect([...mem.subarray(BITS_PTR, BITS_PTR + 4)]).toEqual([2, 1, 3, 0]);
+});
+
+test("8bpp write-back breaks a tie toward the lower index", () => {
+    // 0x40 is equidistant from 0x00 (index 0) and 0x80 (index 1).
+    const { mem, hBitmap } = palettizedSection(8, 1, [gray(0), gray(0x80)], 0xff);
+    writeBackDibSectionRect(hBitmap, fakeContext(new Uint8ClampedArray([0x40, 0x40, 0x40, 0xff]), 1, 1), 0, 0, 1, 1);
+    expect(mem[BITS_PTR]).toBe(0);
+});
+
+test("4bpp write-back packs high nibble first and leaves the neighbour nibble alone", () => {
+    const palette = Array.from({ length: 16 }, (_, i) => gray(i * 0x11));
+    const { mem, hBitmap } = palettizedSection(4, 4, palette, 0xff);
+    // Rect covers pixels 1..2 only: gray 0x33 (index 3) and gray 0xaa (index 10).
+    const pixels = new Uint8ClampedArray(4 * 4);
+    pixels.set([0x33, 0x33, 0x33, 0xff], 1 * 4);
+    pixels.set([0xaa, 0xaa, 0xaa, 0xff], 2 * 4);
+    writeBackDibSectionRect(hBitmap, fakeContext(pixels, 4, 1), 1, 0, 2, 1);
+    // byte 0 = pixel 0 (untouched 0xf) | pixel 1 (3); byte 1 = pixel 2 (0xa) | pixel 3 (untouched 0xf)
+    expect(mem[BITS_PTR]).toBe(0xf3);
+    expect(mem[BITS_PTR + 1]).toBe(0xaf);
 });

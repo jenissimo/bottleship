@@ -2394,6 +2394,16 @@ export class GDIContext {
         return this.ensureState(hdc).textAlign;
     }
 
+    getTextColor(hdc: number): number {
+        if (!this.contexts.has(hdc)) return 0xFFFFFFFF; // CLR_INVALID
+        return this.ensureState(hdc).textColorValue >>> 0;
+    }
+
+    getBkMode(hdc: number): number {
+        if (!this.contexts.has(hdc)) return 0;
+        return this.ensureState(hdc).bkMode;
+    }
+
     textOut(hdc: number, x: number, y: number, text: string): boolean {
         return textOutImpl(this, hdc, x, y, text);
     }
