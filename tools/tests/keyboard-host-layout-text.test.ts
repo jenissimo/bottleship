@@ -234,3 +234,129 @@ describe("ToAscii and ToUnicode of a held key", () => {
         } finally { system.inputManager = saved; }
     });
 });
+
+// Ctrl without Alt selects the layout's control column: WM_CHAR carries 0x01..0x1A for the
+// letters and a handful of others, which is what edit controls and in-game consoles read
+// Ctrl+C / Ctrl+V / Ctrl+Z from. Ctrl+Alt is AltGr and keeps typing the layout's character.
+describe("Ctrl types control characters", () => {
+    const WM_KEYDOWN = 0x100, WM_CHAR = 0x102;
+    const HWND = 0x10001;
+    const system = System.getInstance() as unknown as { inputManager: InputManager; windowManager: unknown };
+
+    function withCtrl(
+        run: (r: ReturnType<typeof rig>, char: (p: Press) => number | null, releaseCtrl: () => void) => void,
+        shift = false,
+    ) {
+        const r = rig();
+        const posted: number[][] = [];
+        const saved = { inputManager: system.inputManager, windowManager: system.windowManager };
+        system.inputManager = r.im;
+        system.windowManager = { postMessage: (...m: number[]) => { posted.push(m); } };
+        try {
+            const ctrlVk = r.press({ code: "ControlLeft", key: "Control", keyCode: VK_CONTROL, ctrl: true });
+            if (shift) r.press({ code: "ShiftLeft", key: "Shift", keyCode: 0x10, ctrl: true });
+            run(r, (p) => {
+                posted.length = 0;
+                const vk = r.press({ ...p, ctrl: true });
+                const sent = translateKeyMessage(HWND, WM_KEYDOWN, vk, 0x001e0001);
+                r.release(vk);
+                if (!sent) { expect(posted).toEqual([]); return null; }
+                expect(posted).toEqual([[HWND, WM_CHAR, posted[0]![2]!, 0x001e0001]]);
+                return posted[0]![2]!;
+            }, () => r.release(ctrlVk));
+        } finally { Object.assign(system, saved); }
+    }
+
+    test("Ctrl+A..Ctrl+Z post WM_CHAR 0x01..0x1A", () => {
+        withCtrl((_r, char) => {
+            for (let i = 0; i < 26; i++) {
+                const letter = String.fromCharCode(0x61 + i);
+                expect(char({ code: `Key${letter.toUpperCase()}`, key: letter, keyCode: 0x41 + i })).toBe(i + 1);
+            }
+        });
+    });
+
+    test("Ctrl+[ \\ ] and Ctrl+Backspace post 0x1B, 0x1C, 0x1D and 0x7F", () => {
+        withCtrl((_r, char) => {
+            expect(char({ code: "BracketLeft", key: "[", keyCode: 0xdb })).toBe(0x1b);
+            expect(char({ code: "Backslash", key: "\\", keyCode: 0xdc })).toBe(0x1c);
+            expect(char({ code: "BracketRight", key: "]", keyCode: 0xdd })).toBe(0x1d);
+            expect(char({ code: "Backspace", key: "Backspace", keyCode: 8 })).toBe(0x7f);
+        });
+    });
+
+    test("Ctrl+Shift+2 posts a WM_CHAR of 0x00; Ctrl+Shift+6 and Ctrl+Shift+- post 0x1E and 0x1F", () => {
+        withCtrl((_r, char) => {
+            expect(char({ code: "Digit2", key: "@", keyCode: 0x32 })).toBe(0x00);
+            expect(char({ code: "Digit6", key: "^", keyCode: 0x36 })).toBe(0x1e);
+            expect(char({ code: "Minus", key: "_", keyCode: 0xbd })).toBe(0x1f);
+        }, true);
+    });
+
+    test("without Shift those three keys have no control character and type as before", () => {
+        withCtrl((_r, char) => {
+            expect(char({ code: "Digit2", key: "2", keyCode: 0x32 })).toBe(0x32);
+            expect(char({ code: "Digit6", key: "6", keyCode: 0x36 })).toBe(0x36);
+            expect(char({ code: "Minus", key: "-", keyCode: 0xbd })).toBe(0x2d);
+        });
+    });
+
+    test("AltGr+Q on a German layout is still '@', and Q alone after Ctrl is released is 'q'", () => {
+        withCtrl((r, char, releaseCtrl) => {
+            const altGr = r.press({ code: "AltRight", key: "AltGraph", keyCode: VK_MENU, ctrl: true, alt: true, altGraph: true });
+            expect(char({ code: "KeyQ", key: "@", keyCode: VK_Q, alt: true, altGraph: true })).toBe(0x40);
+            r.release(altGr);
+            expect(char({ code: "KeyQ", key: "q", keyCode: VK_Q })).toBe(0x11);
+            releaseCtrl();
+            expect(char({ code: "KeyQ", key: "q", keyCode: VK_Q })).toBe(0x71);
+        });
+    });
+});
+
+describe("ToAscii and ToUnicode honour Ctrl in the caller's key state", () => {
+    const mem = new Uint8Array(0x1000);
+    const STATE = 0x100, OUT = 0x300;
+    const exports = createSystemExports();
+    const call = (name: string, vk: number): number =>
+        exports[name]!({} as never, mem, name === "ToUnicode" ? [vk, 0, STATE, OUT, 4, 0] : [vk, 0, STATE, OUT, 0]) as number;
+    const word = (): number => mem[OUT]! | (mem[OUT + 1]! << 8);
+    const state = (ctrl: boolean, alt: boolean, shift: boolean): void => {
+        mem.fill(0, STATE, STATE + 256);
+        if (shift) mem[STATE + 0x10] = 0x80;
+        if (ctrl) mem[STATE + 0x11] = 0x80;
+        if (alt) mem[STATE + 0x12] = 0x80;
+    };
+
+    for (const name of ["ToAscii", "ToUnicode"]) {
+        test(`${name}: Ctrl down gives the control character, whatever the keyboard itself holds`, () => {
+            state(true, false, false);
+            mem[OUT] = 0xee; mem[OUT + 1] = 0xee;
+            expect(call(name, 0x43)).toBe(1);
+            expect(word()).toBe(0x03);
+            expect(call(name, 0x5a)).toBe(1);
+            expect(word()).toBe(0x1a);
+            expect(call(name, 0xdb)).toBe(1);
+            expect(word()).toBe(0x1b);
+            expect(call(name, 0x08)).toBe(1);
+            expect(word()).toBe(0x7f);
+        });
+
+        test(`${name}: Ctrl+Shift+2 is one character, 0x00; Ctrl+Shift+6 is 0x1E`, () => {
+            state(true, false, true);
+            mem[OUT] = 0xee; mem[OUT + 1] = 0xee;
+            expect(call(name, 0x32)).toBe(1);
+            expect(word()).toBe(0x00);
+            expect(call(name, 0x36)).toBe(1);
+            expect(word()).toBe(0x1e);
+        });
+
+        test(`${name}: Ctrl+Alt, and no Ctrl, translate the key as before`, () => {
+            state(true, true, false);
+            expect(call(name, 0x43)).toBe(1);
+            expect(word()).toBe(0x63);
+            state(false, false, true);
+            expect(call(name, 0x43)).toBe(1);
+            expect(word()).toBe(0x43);
+        });
+    }
+});

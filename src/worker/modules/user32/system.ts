@@ -13,7 +13,7 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
 import { System } from '../../core/system';
 import { KEY_TEXT_NONE, KEY_TEXT_UNKNOWN } from '../../../input/sab-layout';
-import { hostTextToChar } from './translate-message';
+import { controlChar, hostTextToChar } from './translate-message';
 import { EMU_NATIVE_VIDEO_DLLS } from '../../core/cpu/emulator-config';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { encodeAnsi, getAnsiCodePage, getCodePageDecoder, decodeAnsiString, readAnsiFromGuest, writeAnsiToGuest, encodeAnsiString } from '../codepage-utils';
@@ -1460,6 +1460,13 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return hostTextToChar(text) || null;
     };
 
+    /** The control character for `vk` under the CALLER's key state (Ctrl down, Alt up), or -1. */
+    const keyStateControlChar = (mem: Uint8Array, lpKeyState: number, vk: number): number => {
+        if (!lpKeyState) return -1;
+        if ((mem[lpKeyState + 0x11]! & 0x80) === 0 || (mem[lpKeyState + 0x12]! & 0x80) !== 0) return -1;
+        return controlChar(vk & 0xFF, (mem[lpKeyState + 0x10]! & 0x80) !== 0);
+    };
+
     // int ToAscii(UINT uVirtKey, UINT uScanCode, const BYTE *lpKeyState, LPWORD lpChar, UINT uFlags)
     exports['ToAscii'] = (ctx, mem, args) => {
         const uVirtKey = args[0];
@@ -1470,6 +1477,13 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         Logger.verbose(LogCategory.USER32, `ToAscii(vk=0x${uVirtKey.toString(16)}, scan=0x${uScanCode.toString(16)})`);
 
         if (!lpChar) return 0;
+
+        const control = keyStateControlChar(mem, lpKeyState, uVirtKey);
+        if (control >= 0) {
+            mem[lpChar] = control;
+            mem[lpChar + 1] = 0;
+            return 1;
+        }
 
         // A key that is down right now types what its press typed on the host layout.
         const hostChar = heldKeyHostChar(uVirtKey, uScanCode);
@@ -1538,6 +1552,13 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const cchBuff = args[4] | 0;
         if (!pwszBuff || cchBuff <= 0) {
             return 0;
+        }
+
+        const control = keyStateControlChar(mem, args[2] >>> 0, args[0]);
+        if (control >= 0) {
+            mem[pwszBuff] = control;
+            mem[pwszBuff + 1] = 0;
+            return 1;
         }
 
         // The same rule as WM_CHAR: only a character the guest's ANSI code page has.

@@ -17,6 +17,8 @@ const WM_SYSKEYDOWN = 0x0104;
 const WM_CHAR = 0x0102;
 const WM_SYSCHAR = 0x0106;
 const VK_SHIFT = 0x10;
+const VK_CONTROL = 0x11;
+const VK_MENU = 0x12;
 const VK_CAPITAL = 0x14;
 
 const OEM_US: Record<number, [number, number]> = {
@@ -49,6 +51,25 @@ export function vkToChar(vk: number, shiftDown: boolean, capsLock: boolean): num
     return 0;
 }
 
+/**
+ * The control character a key types with Ctrl down and Alt up, or -1 when the key has none.
+ * Keyed by virtual key, like the layout's own control column: Ctrl+A..Z are 0x01..0x1A,
+ * and 0x00 (Ctrl+Shift+2) is a character, which is why "none" is not 0 here.
+ */
+export function controlChar(vk: number, shiftDown: boolean): number {
+    if (vk >= 0x41 && vk <= 0x5A) return vk - 0x40;
+    if (vk === 0xDB) return 0x1B;   // [
+    if (vk === 0xDC) return 0x1C;   // \
+    if (vk === 0xDD) return 0x1D;   // ]
+    if (vk === 0x08) return 0x7F;   // Backspace
+    if (shiftDown) {
+        if (vk === 0x32) return 0x00;   // 2
+        if (vk === 0x36) return 0x1E;   // 6
+        if (vk === 0xBD) return 0x1F;   // -
+    }
+    return -1;
+}
+
 /** A host-typed UTF-16 unit as the WM_CHAR byte of the ANSI code page; 0 when the page has no such character. */
 export function hostTextToChar(unit: number): number {
     if (unit < 0x80) return unit;
@@ -76,9 +97,15 @@ export function keyDownChar(text: number, vk: number, shiftDown: boolean, capsLo
 export function translateKeyMessage(hwnd: number, message: number, wParam: number, lParam: number): boolean {
     if (message !== WM_KEYDOWN && message !== WM_SYSKEYDOWN) return false;
     const input = System.getInstance().inputManager;
-    const charCode = keyDownChar(input.getKeyDownText(wParam & 0xFF), wParam & 0xFF,
-        (input.getKeyState(VK_SHIFT) & 0x8000) !== 0, (input.getKeyState(VK_CAPITAL) & 1) !== 0);
-    if (charCode === 0) return false;
+    const vk = wParam & 0xFF;
+    const shiftDown = (input.getKeyState(VK_SHIFT) & 0x8000) !== 0;
+    // Ctrl alone selects the control column; Ctrl+Alt is AltGr and types the layout's character.
+    const ctrlOnly = (input.getKeyState(VK_CONTROL) & 0x8000) !== 0 && (input.getKeyState(VK_MENU) & 0x8000) === 0;
+    let charCode = ctrlOnly ? controlChar(vk, shiftDown) : -1;
+    if (charCode < 0) {
+        charCode = keyDownChar(input.getKeyDownText(vk), vk, shiftDown, (input.getKeyState(VK_CAPITAL) & 1) !== 0);
+        if (charCode === 0) return false;
+    }
     System.getInstance().windowManager.postMessage(hwnd, message === WM_SYSKEYDOWN ? WM_SYSCHAR : WM_CHAR, charCode, lParam);
     return true;
 }
