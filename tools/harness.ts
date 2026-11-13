@@ -643,7 +643,7 @@ async function cmdGridShot(out: string, stepArg?: string): Promise<void> {
     const geo = await readCanvasGeometry(session);
     const inject = `(() => {
         const r = ${JSON.stringify(geo.rect)}, sx = ${geo.scale.x}, sy = ${geo.scale.y};
-        const gw = ${geo.guest.w}, gh = ${geo.guest.h}, dpr = ${geo.dpr};
+        const gw = ${geo.guest.w}, gh = ${geo.guest.h}, ox = ${geo.guest.x}, oy = ${geo.guest.y}, dpr = ${geo.dpr};
         const old = document.getElementById('__bs_grid_overlay'); if (old) old.remove();
         const niceStep = (n) => { const t = n / 12; for (const s of [10,20,25,50,100,200,250,500]) if (s >= t) return s; return 1000; };
         const stp = ${step} > 0 ? ${step} : niceStep(Math.max(gw, gh));
@@ -652,21 +652,21 @@ async function cmdGridShot(out: string, stepArg?: string): Promise<void> {
         ov.width = Math.round(r.w*dpr); ov.height = Math.round(r.h*dpr);
         const c = ov.getContext('2d'); c.scale(dpr, dpr);
         c.font = '11px monospace'; c.textBaseline = 'top'; c.lineWidth = 1;
-        for (let gx=0; gx<=gw; gx+=stp) { const px=gx*sx; c.strokeStyle='rgba(0,234,255,0.30)'; c.beginPath(); c.moveTo(px,0); c.lineTo(px,r.h); c.stroke();
+        for (let gx=Math.ceil(ox/stp)*stp; gx<=ox+gw; gx+=stp) { const px=(gx-ox)*sx; c.strokeStyle='rgba(0,234,255,0.30)'; c.beginPath(); c.moveTo(px,0); c.lineTo(px,r.h); c.stroke();
             c.fillStyle='rgba(0,0,0,0.6)'; c.fillRect(px+1,0,String(gx).length*7+2,12); c.fillStyle='#0ef'; c.fillText(String(gx), px+2, 1); }
-        for (let gy=0; gy<=gh; gy+=stp) { const py=gy*sy; c.strokeStyle='rgba(0,234,255,0.30)'; c.beginPath(); c.moveTo(0,py); c.lineTo(r.w,py); c.stroke();
+        for (let gy=Math.ceil(oy/stp)*stp; gy<=oy+gh; gy+=stp) { const py=(gy-oy)*sy; c.strokeStyle='rgba(0,234,255,0.30)'; c.beginPath(); c.moveTo(0,py); c.lineTo(r.w,py); c.stroke();
             c.fillStyle='rgba(0,0,0,0.6)'; c.fillRect(0,py+1,String(gy).length*7+2,12); c.fillStyle='#0ef'; c.fillText(String(gy), 1, py+2); }
         let controls = [];
         // dialogs() may be async (RPC) → only use a synchronously-available array.
         try { const d = window.__BS__.harness.dialogs && window.__BS__.harness.dialogs(); if (Array.isArray(d)) controls = d; } catch (e) {}
         for (const ctl of controls) {
             if (!ctl || typeof ctl.x !== 'number') continue;
-            const x=ctl.x*sx, y=ctl.y*sy, w=(ctl.w||0)*sx, h=(ctl.h||0)*sy;
+            const x=(ctl.x-ox)*sx, y=(ctl.y-oy)*sy, w=(ctl.w||0)*sx, h=(ctl.h||0)*sy;
             c.strokeStyle='rgba(255,210,0,0.9)'; c.strokeRect(x,y,w,h);
             const cx=(ctl.cx!=null?ctl.cx:ctl.x+(ctl.w||0)/2), cy=(ctl.cy!=null?ctl.cy:ctl.y+(ctl.h||0)/2);
             const lbl=(ctl.text||ctl.cls||'')+' ('+Math.round(cx)+','+Math.round(cy)+')';
             c.fillStyle='rgba(0,0,0,0.7)'; c.fillRect(x, y-12, c.measureText(lbl).width+4, 12); c.fillStyle='#fd0'; c.fillText(lbl, x+2, y-12);
-            c.fillStyle='#fd0'; c.beginPath(); c.arc(cx*sx, cy*sy, 3, 0, 7); c.fill();
+            c.fillStyle='#fd0'; c.beginPath(); c.arc((cx-ox)*sx, (cy-oy)*sy, 3, 0, 7); c.fill();
         }
         document.body.appendChild(ov);
         return { ok:true, step:stp, controls:controls.length };
@@ -683,7 +683,7 @@ async function cmdGridShot(out: string, stepArg?: string): Promise<void> {
     const file = out || artifact("logs/harness-gridshot.png");
     await Bun.write(file, Buffer.from(shot.result?.data ?? "", "base64"));
     await pageEval(session, "(()=>{const o=document.getElementById('__bs_grid_overlay');if(o)o.remove();return 1})()", { timeoutMs: 5000 }).catch(() => {});
-    console.log(`gridShot -> ${file}  guest=${geo.guest.w}x${geo.guest.h} step=${meta.step}px controls=${meta.controls}`);
+    console.log(`gridShot -> ${file}  guest=${geo.guest.w}x${geo.guest.h}@${geo.guest.x},${geo.guest.y} step=${meta.step}px controls=${meta.controls}`);
     console.log(`  read a feature's (x,y) off the grid (GUEST pixels), then: bun tools/harness.ts clickAt <x> <y>`);
 }
 

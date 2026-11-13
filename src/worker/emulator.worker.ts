@@ -2631,7 +2631,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           x: r.x, y: r.y, w: r.w, h: r.h, outW: r.outW, outH: r.outH,
         });
       });
-      system.setHostResizeCallback((width, height) => {
+      system.setHostResizeCallback(({ x, y, width, height }) => {
         // The canvas BACKING BUFFER is the host's to size — it follows the display area, not
         // the guest mode (the picture is stretched into it at present time). The host echoes a
         // "resize" with the display-fit size, and that is its single writer.
@@ -2639,8 +2639,8 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         state.height = height;
         syncOverlayToGuestScreen();
         Logger.log(LogCategory.SYSTEM,
-          `hostResize: guest mode ${width}x${height} (canvas=${state.canvas?.width ?? 0}x${state.canvas?.height ?? 0})`);
-        self.postMessage({ type: "app_resize", width, height });
+          `hostResize: guest view ${width}x${height} at (${x},${y}) (canvas=${state.canvas?.width ?? 0}x${state.canvas?.height ?? 0})`);
+        self.postMessage({ type: "app_resize", x, y, width, height });
       });
       system.setHostCursorVisibilityCallback((visible) => {
         self.postMessage({ type: "cursor_visibility", visible });

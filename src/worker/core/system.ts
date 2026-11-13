@@ -135,6 +135,9 @@ export interface ImplicitTlsEntry {
     moduleName: string;
 }
 
+/** A rectangle of the virtual screen, in screen coordinates. */
+export interface HostView { x: number; y: number; width: number; height: number }
+
 export class System {
     private static instance: System;
     public process: Process | null = null;
@@ -378,7 +381,8 @@ export class System {
      * new threads (CreateThread) can initialize their own TLS data copies.
      */
     public implicitTlsEntries: ImplicitTlsEntry[] = [];
-    private hostResize: ((width: number, height: number) => void) | null = null;
+    private hostResize: ((view: HostView) => void) | null = null;
+    private hostViewWindow = 0;
     private hostCursorVisibility: ((visible: boolean) => void) | null = null;
     private hostCursorVisibleState: boolean | null = null;
     private hostCursorImage: ((image: HostCursorImage | null) => void) | null = null;
@@ -806,7 +810,7 @@ export class System {
         }
     }
 
-    setHostResizeCallback(callback: (width: number, height: number) => void): void {
+    setHostResizeCallback(callback: (view: HostView) => void): void {
         this.hostResize = callback;
     }
 
@@ -853,9 +857,55 @@ export class System {
                     `[DISPLAY-MODE] ${width}x${height}${opts?.bpp ? `x${opts.bpp}` : ""} published as the emulated display mode`);
             }
         }
-        if (this.hostResize) {
-            this.hostResize(width, height);
-        }
+        this.publishHostView(0, 0, width, height, 0);
+    }
+
+    /**
+     * The part of the virtual screen the host surface shows, in screen coordinates. The
+     * host maps its pointer onto this rectangle and publishes SCREEN coordinates, so a
+     * view that does not start at the screen origin needs nothing from the cursor path.
+     */
+    private hostViewRect: HostView | null = null;
+
+    get hostView(): HostView | null {
+        return this.hostViewRect;
+    }
+
+    /** The window whose client rectangle is the host view, or 0 when a size was published. */
+    get hostViewOwner(): number {
+        return this.hostViewWindow;
+    }
+
+    /** Show a rectangle that belongs to no single window's client area (a windowed device's back buffer). */
+    requestHostViewAt(x: number, y: number, width: number, height: number): void {
+        this.publishHostView(x, y, width, height, 0);
+    }
+
+    /** Show a top-level window's client rectangle; a later move or resize of it follows. */
+    requestHostViewOfWindow(hwnd: number, x: number, y: number, width: number, height: number): void {
+        this.publishHostView(x, y, width, height, hwnd);
+    }
+
+    /**
+     * The shown window moved or resized. The caller reports real changes only; the
+     * comparison is a guard so that a caller which does not cannot republish per frame.
+     */
+    followHostViewWindow(hwnd: number, x: number, y: number, width: number, height: number): void {
+        if (hwnd === 0 || hwnd !== this.hostViewWindow) return;
+        const v = this.hostViewRect;
+        if (v && v.x === x && v.y === y && v.width === width && v.height === height) return;
+        this.publishHostView(x, y, width, height, hwnd);
+    }
+
+    /** A destroyed window stops driving the view; the rectangle stays until the next publisher. */
+    forgetHostViewWindow(hwnd: number): void {
+        if (hwnd === this.hostViewWindow) this.hostViewWindow = 0;
+    }
+
+    private publishHostView(x: number, y: number, width: number, height: number, hwnd: number): void {
+        this.hostViewWindow = hwnd;
+        this.hostViewRect = { x, y, width, height };
+        if (this.hostResize) this.hostResize(this.hostViewRect);
     }
 
     /**

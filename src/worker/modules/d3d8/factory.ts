@@ -9,7 +9,7 @@ import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
 import { FFPRenderer } from '../../backends/webgpu/shared';
 import { D3D8DeviceAdapter } from '../../backends/webgpu/d3d8/d3d8-device-adapter';
 import { getVTables, createComObject, devices, deviceCreationParams, deviceWindowed, resourceToDevice } from './shared-state';
-import { bindAutoDepthStencil, resizeFullscreenDeviceWindow } from './device-lifecycle';
+import { bindAutoDepthStencil, publishCreateDeviceHostView, resizeFullscreenDeviceWindow } from './device-lifecycle';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import {
     checkD3D8DeviceFormat,
@@ -312,9 +312,7 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             // Resize canvas to match backbuffer (like DDraw SetDisplayMode does). Only a
             // FULLSCREEN device is a mode-set — a windowed backbuffer lives inside the
             // desktop and must not become SM_CXSCREEN. (Windowed @ +28 in d3d8.)
-            system.requestHostResize(bbWidth, bbHeight, {
-                modeSet: view.getUint32(pPresParams + 28, true) === 0,
-            });
+            publishCreateDeviceHostView(view, pPresParams, hFocusWindow, bbWidth, bbHeight);
 
             // FULLSCREEN device: also resize the focus/device window's tracked client rect to
             // the back-buffer size, like real D3D8 does. Apps GetClientRect() the now-fullscreen

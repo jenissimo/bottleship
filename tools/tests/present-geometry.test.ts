@@ -36,7 +36,7 @@ function hostInverse(
         left: 0, top: 0, width: outW, height: outH, right: outW, bottom: outH,
     };
     const content = contentRectFromPresentRect(box, getPresentRect(), outW, outH)!;
-    return clientToGuestPoint(content, cx, cy, srcW, srcH);
+    return clientToGuestPoint(content, cx, cy, { x: 0, y: 0, width: srcW, height: srcH });
 }
 
 interface Case {
@@ -157,5 +157,26 @@ describe("present geometry", () => {
         expect(coversTarget({ x: 0, y: 0, w: 1200, h: 900 }, 1200, 900)).toBe(true);
         expect(coversTarget({ x: 0, y: 0, w: 1199, h: 900 }, 1200, 900)).toBe(true);
         expect(coversTarget({ x: 200, y: 0, w: 800, h: 900 }, 1200, 900)).toBe(false);
+    });
+});
+
+// The host surface can show a part of the guest screen. The picture of that part fills the
+// content rect, and a pointer event comes back as a SCREEN coordinate inside it.
+describe("a view that is a sub-rectangle of the guest screen", () => {
+    const view = { x: 40, y: 40, width: 560, height: 400 };
+    const content: HostRect = { left: 100, top: 50, width: 1120, height: 800, right: 1220, bottom: 850 };
+
+    test("the content rect's corners are the view's corners in screen coordinates", () => {
+        expect(clientToGuestPoint(content, 100, 50, view)).toEqual({ x: 40, y: 40 });
+        expect(clientToGuestPoint(content, 1220, 850, view)).toEqual({ x: 600, y: 440 });
+    });
+
+    test("a point inside maps linearly, offset by the view's origin", () => {
+        expect(clientToGuestPoint(content, 100 + 280, 50 + 200, view)).toEqual({ x: 180, y: 140 });
+    });
+
+    test("a view at the screen origin is the plain size mapping", () => {
+        const whole = { x: 0, y: 0, width: 640, height: 480 };
+        expect(clientToGuestPoint(content, 100 + 560, 50 + 400, whole)).toEqual({ x: 320, y: 240 });
     });
 });

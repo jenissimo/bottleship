@@ -20,7 +20,7 @@ function rig(mode: "direct" | "trackpad" = "direct") {
     const view = new Int32Array(INPUT_BUFFER_SIZE / 4);
     const device = new VirtualInputDevice();
     device.attach(view, () => { /* the worker poke is not what this asserts */ });
-    device.setPointerBounds(GUEST_W, GUEST_H);
+    device.setPointerBounds({ x: 0, y: 0, width: GUEST_W, height: GUEST_H });
     const rec = createRecognizer({
         mode, maxX: GUEST_W - 1, maxY: GUEST_H - 1, cursorAid: false,
     });

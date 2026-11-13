@@ -1,12 +1,15 @@
 import { describe, expect, it } from "bun:test";
-import { HostPointerTrack, type HostPoint, wheelPointerTarget } from "../../src/input/host-pointer-track";
+import { HostPointerTrack, type HostPoint, type PointerSpace, wheelPointerTarget } from "../../src/input/host-pointer-track";
 
-const BOUNDS: HostPoint = { x: 1024, y: 768 };
+const BOUNDS: PointerSpace = { x: 0, y: 0, width: 1024, height: 768 };
 const CENTRE: HostPoint = { x: 512, y: 384 };
 
 /** What virtual-device's setPointerAbsolute does to a published position. */
-function clamp(p: HostPoint, bounds: HostPoint): HostPoint {
-    return { x: Math.max(0, Math.min(bounds.x, p.x)), y: Math.max(0, Math.min(bounds.y, p.y)) };
+function clamp(p: HostPoint, bounds: PointerSpace): HostPoint {
+    return {
+        x: Math.max(bounds.x, Math.min(bounds.x + bounds.width, p.x)),
+        y: Math.max(bounds.y, Math.min(bounds.y + bounds.height, p.y)),
+    };
 }
 
 /**
@@ -136,6 +139,35 @@ describe("HostPointerTrack", () => {
         // Guest warps to the centre without the host pointer moving, then the host
         // moves 5px: the guest must land 5px from ITS pointer, not 5px from the host's.
         expect(track.next({ x: 305, y: 300 }, CENTRE, BOUNDS)).toEqual({ x: 517, y: 384 });
+    });
+});
+
+// The host surface may show a part of the guest screen that does not start at its origin;
+// every position here is a guest SCREEN coordinate, and "outside" is outside that part.
+describe("a view that does not start at the screen origin", () => {
+    const VIEW: PointerSpace = { x: 40, y: 40, width: 560, height: 400 };
+
+    it("tracks motion inside the view exactly as it does on the whole screen", () => {
+        const track = new HostPointerTrack();
+        expect(track.next({ x: 50, y: 60 }, { x: 0, y: 0 }, VIEW)).toEqual({ x: 50, y: 60 });
+        // The guest warped its pointer; the next sample applies what the host pointer moved.
+        expect(track.next({ x: 57, y: 60 }, { x: 320, y: 240 }, VIEW)).toEqual({ x: 327, y: 240 });
+    });
+
+    it("a sample left of or above the view is a lost track, not a delta", () => {
+        const track = new HostPointerTrack();
+        track.next({ x: 100, y: 100 }, { x: 100, y: 100 }, VIEW);
+        // (30, 100) is on the screen but outside the view: re-seat, and re-seat again after it.
+        expect(track.next({ x: 30, y: 100 }, { x: 300, y: 300 }, VIEW)).toEqual({ x: 30, y: 100 });
+        expect(track.next({ x: 45, y: 100 }, { x: 300, y: 300 }, VIEW)).toEqual({ x: 45, y: 100 });
+    });
+
+    it("the far edge is the view's, not the screen's", () => {
+        const track = new HostPointerTrack();
+        track.next({ x: 590, y: 430 }, { x: 590, y: 430 }, VIEW);
+        // 601 > 40 + 560: outside, although well inside a 640x480 screen.
+        expect(track.next({ x: 601, y: 430 }, { x: 100, y: 100 }, VIEW)).toEqual({ x: 601, y: 430 });
+        expect(track.next({ x: 600, y: 440 }, { x: 100, y: 100 }, VIEW)).toEqual({ x: 600, y: 440 });
     });
 });
 

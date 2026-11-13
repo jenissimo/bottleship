@@ -19,6 +19,8 @@
  */
 
 export interface HostPoint { x: number; y: number }
+/** The part of the guest screen the host surface shows, in guest screen coordinates. */
+export interface PointerSpace { x: number; y: number; width: number; height: number }
 /** right/bottom EXCLUSIVE, as in Win32 RECT. */
 export interface ConfineRect { left: number; top: number; right: number; bottom: number }
 
@@ -54,15 +56,17 @@ export class HostPointerTrack {
     /**
      * Where the guest's pointer belongs after this host sample.
      *
-     * @param host    host pointer in guest space
+     * @param host    host pointer in guest screen coordinates
      * @param cursor  where the guest's pointer is NOW — the guest's own SetCursorPos
      *                moves this, and the host pointer does not follow
-     * @param bounds  the guest space; a sample outside it is a lost track, because the
-     *                published position is clamped there and a delta taken against a
-     *                clamped value would drift by exactly what the clamp removed
+     * @param bounds  the shown part of the guest screen; a sample outside it is a lost
+     *                track, because the published position is clamped there and a delta
+     *                taken against a clamped value would drift by exactly what the clamp
+     *                removed
      */
-    next(host: HostPoint, cursor: HostPoint, bounds: HostPoint): HostPoint {
-        const outside = host.x < 0 || host.y < 0 || host.x > bounds.x || host.y > bounds.y;
+    next(host: HostPoint, cursor: HostPoint, bounds: PointerSpace): HostPoint {
+        const outside = host.x < bounds.x || host.y < bounds.y
+            || host.x > bounds.x + bounds.width || host.y > bounds.y + bounds.height;
         const prev = outside ? null : this.last;
         this.last = outside ? null : host;
         const target = prev
@@ -92,7 +96,7 @@ export class HostPointerTrack {
  * unlocked, it is one more sample of the same host pointer the move handler tracks.
  */
 export function wheelPointerTarget(
-    locked: boolean, track: HostPointerTrack, host: HostPoint, cursor: HostPoint, bounds: HostPoint,
+    locked: boolean, track: HostPointerTrack, host: HostPoint, cursor: HostPoint, bounds: PointerSpace,
 ): HostPoint | null {
     if (locked) return null;
     return track.next(host, cursor, bounds);

@@ -71,8 +71,8 @@ export async function hostClick(
     const holdMs = Math.max(1, opts.holdMs ?? 80);
     await session.send("Page.bringToFront", {}, undefined, { timeoutMs: DISPATCH_TIMEOUT_MS }).catch(() => { });
     const geo = await readCanvasGeometry(session);
-    const gx = opts.x ?? geo.guest.w / 2;
-    const gy = opts.y ?? geo.guest.h / 2;
+    const gx = opts.x ?? geo.guest.x + geo.guest.w / 2;
+    const gy = opts.y ?? geo.guest.y + geo.guest.h / 2;
     const p = guestToClient(geo, gx, gy);
     const at = { x: Math.round(p.x), y: Math.round(p.y) };
     lastClient = { x: at.x, y: at.y };
@@ -113,7 +113,7 @@ export async function hostMove(
 ): Promise<{ dx: number; dy: number; steps: number; from: { x: number; y: number }; to: { x: number; y: number }; locked: boolean }> {
     await session.send("Page.bringToFront", {}, undefined, { timeoutMs: DISPATCH_TIMEOUT_MS }).catch(() => { });
     const geo = await readCanvasGeometry(session);
-    const from = lastClient ?? guestToClient(geo, geo.guest.w / 2, geo.guest.h / 2);
+    const from = lastClient ?? guestToClient(geo, geo.guest.x + geo.guest.w / 2, geo.guest.y + geo.guest.h / 2);
     const to = { x: from.x + dx * geo.scale.x, y: from.y + dy * geo.scale.y };
     const n = Math.max(1, steps | 0);
     for (let i = 1; i <= n; i++) {

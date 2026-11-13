@@ -70,7 +70,7 @@ import { INPUT_BUFFER_SIZE, INPUT_INDEX } from "../input/sab-layout";
 import { GuestCursorRenderer } from "./guest-cursor";
 import { inputDevice } from "../input/virtual-device";
 import { relativeIntent } from "../input/relative-intent";
-import { HostPointerTrack, wheelPointerTarget } from "../input/host-pointer-track";
+import { HostPointerTrack, wheelPointerTarget, type PointerSpace } from "../input/host-pointer-track";
 import { touchDriver } from "../input/touch/driver";
 import { TouchControlLayer, type TouchControlsHandle } from "./TouchControlLayer";
 import { TouchHud } from "./TouchHud";
@@ -459,13 +459,23 @@ export default function App() {
   }, []);
 
   const presentModeRef = useRef<PresentMode>(uiSettings.presentMode);
-  const guestResolutionRef = useRef({ width: 1024, height: 768 });
+  const guestResolutionRef = useRef({ x: 0, y: 0, width: 1024, height: 768 });
   // True once the guest has published its own resolution (the "app_resize" handler below).
   // Pointer mapping is ALWAYS in guest-resolution space (SetCursorPos, GetCursorPos, DirectInput
   // absolute axes are all guest-relative) — but guestResolutionRef starts at a 1024x768
   // PLACEHOLDER indistinguishable from a real 1024x768 guest mode, so a boot-time pointer
   // event before the first publish must fall back to the render size instead of trusting it.
   const guestResolutionKnownRef = useRef(false);
+  /** The part of the guest screen the canvas shows, in guest screen coordinates — the
+   *  space every pointer position is mapped into and clamped against. */
+  const pointerSpace = useCallback((): PointerSpace => {
+    if (!guestResolutionKnownRef.current) {
+      const backing = resolutionRef.current;
+      return { x: 0, y: 0, width: Math.max(1, backing.width), height: Math.max(1, backing.height) };
+    }
+    const view = guestResolutionRef.current;
+    return { x: view.x, y: view.y, width: Math.max(1, view.width), height: Math.max(1, view.height) };
+  }, []);
   // Current UI settings, readable from non-React callbacks (e.g. the audio-engine
   // creation path, which may run after the settings-apply effect has fired).
   const uiSettingsRef = useRef<UiSettings>(uiSettings);
@@ -966,10 +976,7 @@ export default function App() {
         const rect = liveContentRect();
         if (!rect || rect.width <= 0 || rect.height <= 0) return null;
         const origin = panelRectRef.current;
-        const space =
-          guestResolutionKnownRef.current
-            ? guestResolutionRef.current
-            : resolutionRef.current;
+        const space = pointerSpace();
         return {
           left: rect.left,
           top: rect.top,
@@ -977,6 +984,8 @@ export default function App() {
           height: rect.height,
           originLeft: origin?.left ?? 0,
           originTop: origin?.top ?? 0,
+          spaceLeft: space.x,
+          spaceTop: space.y,
           spaceWidth: space.width,
           spaceHeight: space.height,
         };
@@ -1042,11 +1051,7 @@ export default function App() {
     // against it. Established here, not on the first pointer event: a guest SetCursorPos
     // can arrive before the user has touched anything, and 1x1 bounds warp it to (0,0).
     const syncPointerBounds = () => {
-      const space =
-        guestResolutionKnownRef.current
-          ? guestResolutionRef.current
-          : resolutionRef.current;
-      inputDevice.setPointerBounds(Math.max(1, space.width), Math.max(1, space.height));
+      inputDevice.setPointerBounds(pointerSpace());
     };
     const captureRects = () => {
       measureRects();
@@ -1740,7 +1745,7 @@ export default function App() {
         // SetCursorPos moves the GUEST's cursor, so it applies whatever transport the host
         // happens to be using: Pointer Lock must not be observable by the guest, and gating
         // the warp on it would make a WinAPI contract depend on a host decision.
-        inputDevice.setPointerAbsolute(Number(event.data.x) | 0, Number(event.data.y) | 0);
+        inputDevice.warpPointer(Number(event.data.x) | 0, Number(event.data.y) | 0);
         inputDevice.commit({ immediate: true });
       }
       if (event.data?.type === "device_cursor_pos") {
@@ -1784,12 +1789,15 @@ export default function App() {
       if (event.data?.type === "app_resize") {
         const width = Math.max(1, Number(event.data.width) || 1);
         const height = Math.max(1, Number(event.data.height) || 1);
-        guestResolutionRef.current = { width, height };
+        // Where that width x height sits on the guest screen; absent means its origin.
+        const x = Number(event.data.x) || 0;
+        const y = Number(event.data.y) || 0;
+        guestResolutionRef.current = { x, y, width, height };
         guestResolutionKnownRef.current = true;
         setGuestResolution({ width, height });
-        // Expose for the harness UI-overlay tool (gridShot): maps guest pixels —
+        // Expose for the harness UI-overlay tool (gridShot): maps guest screen pixels —
         // the space clickAt() injects into — onto the on-screen canvas rect.
-        ((window as any).__BS__ ??= {}).guestResolution = { width, height };
+        ((window as any).__BS__ ??= {}).guestResolution = { x, y, width, height };
         if (canvas) {
           // No inline size: the canvas ATTRIBUTES already carry the guest resolution, so
           // width/height:auto resolve to it and max-*:100% fits it into the panel with
@@ -1913,10 +1921,7 @@ export default function App() {
     const detachTouch = panelRef.current
       ? touchDriver.attach(panelRef.current, {
           getCanvasRect: () => contentRectRef.current ?? canvas.getBoundingClientRect(),
-          getPointerSpace: () =>
-            guestResolutionKnownRef.current
-              ? guestResolutionRef.current
-              : resolutionRef.current,
+          getPointerSpace: pointerSpace,
           getSettings: () => uiSettingsRef.current,
           hitTest: (x, y, id, phase) => touchControlsRef.current?.hitTest(x, y, id, phase) ?? false,
         })
@@ -1948,13 +1953,10 @@ export default function App() {
         try { requestPointerLockSafe(canvas); } catch { /* not a valid gesture in this browser */ }
       }
 
-      const pointerSpace =
-        guestResolutionKnownRef.current
-          ? guestResolutionRef.current
-          : resolutionRef.current;
-      const width  = Math.max(1, pointerSpace.width);
-      const height = Math.max(1, pointerSpace.height);
-      inputDevice.setPointerBounds(width, height);
+      const space = pointerSpace();
+      const width  = space.width;
+      const height = space.height;
+      inputDevice.setPointerBounds(space);
       const rect = contentRectRef.current ?? canvas.getBoundingClientRect();
 
       // --- Pointer Lock mode: use relative movementX/Y, skip canvas bounds check ---
@@ -1995,13 +1997,11 @@ export default function App() {
       // We map them to the virtual resolution [0..width/height]
       const scaleX = width / rect.width;
       const scaleY = height / rect.height;
-      const guest = clientToGuestPoint(rect, event.clientX, event.clientY, width, height);
+      const guest = clientToGuestPoint(rect, event.clientX, event.clientY, space);
       // SetCursorPos moved the guest's pointer and the physical one did not follow, so
       // the host position is stale by that warp — apply what it MOVED (see
       // HostPointerTrack). Identical to publishing `guest` while nothing has warped.
-      const target = hostPointerTrackRef.current.next(
-        guest, inputDevice.getCursor(), { x: width, y: height },
-      );
+      const target = hostPointerTrackRef.current.next(guest, inputDevice.getCursor(), space);
       inputDevice.setPointerAbsolute(target.x, target.y);
       inputDevice.setButtonsMask(event.buttons, "hw-mouse");
       const dinputDX = Math.round(event.movementX * scaleX);
@@ -2206,22 +2206,14 @@ export default function App() {
         event.clientY <= rect.bottom;
       if (!locked && !insideCanvas) return;
 
-      const pointerSpace =
-        guestResolutionKnownRef.current
-          ? guestResolutionRef.current
-          : resolutionRef.current;
-      const width = Math.max(1, pointerSpace.width);
-      const height = Math.max(1, pointerSpace.height);
-
-      const scaleX = width / rect.width;
-      const scaleY = height / rect.height;
-      inputDevice.setPointerBounds(width, height);
+      const space = pointerSpace();
+      inputDevice.setPointerBounds(space);
       // Same host pointer as writePointer's, so the same track: a wheel notch must not
       // republish a stale absolute position over a pointer the guest has warped.
       const wheelTarget = wheelPointerTarget(
         locked, hostPointerTrackRef.current,
-        { x: (event.clientX - rect.left) * scaleX, y: (event.clientY - rect.top) * scaleY },
-        inputDevice.getCursor(), { x: width, y: height },
+        clientToGuestPoint(rect, event.clientX, event.clientY, space),
+        inputDevice.getCursor(), space,
       );
       if (wheelTarget) inputDevice.setPointerAbsolute(wheelTarget.x, wheelTarget.y);
       // Normalize deltaY to CSS pixel equivalent regardless of deltaMode:
