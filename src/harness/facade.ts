@@ -39,7 +39,7 @@ import { sharedBufferCensus } from "../utils/shared-buffer-census";
 const BROWSER_ONLY = new Set([
     "openWgb", "loadPe", "audioGesture", "waitForEvent", "onModal", "dismissModal", "inputSab",
     "report", "hostModals", "setHostModal", "storageReport",
-    "hostRecord", "hostRecordStop", "hostReplay",
+    "hostRecord", "hostRecordStop", "hostReplay", "networkConsent",
 ]);
 
 export interface HarnessFacade {
@@ -243,6 +243,13 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         liveModal.dismiss(id);
         liveModal = null;
         return { dismissed: true, text };
+    }
+
+    /** The network permission prompt App.tsx shows (it publishes `__bsNetworkConsent`). */
+    function networkConsent(choice = "state", room?: string, serverUrl?: string): unknown {
+        const api = (window as any).__bsNetworkConsent;
+        if (!api) throw new HarnessError("the network permission UI is not mounted", HarnessErrorCode.NOT_FOUND);
+        return choice === "state" ? api.state() : api.answer(choice, room, serverUrl);
     }
 
     /** Clear every armed auto-answer, including the ones persisted across reloads. */
@@ -632,6 +639,7 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         if (step.cmd === "onModal") { onMessageBox((step.args[0] as string) ?? ".*", (step.args[1] as string | number) ?? "ok"); return { armed: true, pattern: step.args[0] ?? ".*" }; }
         if (step.cmd === "clearModals") { clearModalAnswers(); return { cleared: true }; }
         if (step.cmd === "dismissModal") return dismissModal((step.args[0] as number | string) ?? "ok", (step.args[1] as boolean) ?? true);
+        if (step.cmd === "networkConsent") return networkConsent((step.args[0] as string) ?? "state", step.args[1] as string | undefined, step.args[2] as string | undefined);
         if (step.cmd === "report") return reportWithHost(step.args, step.opts);
         if (step.cmd === "hostModals") return { modals: hostModalCensus() };
         // Predicate args (waitUntil) are pre-serialized as {__fn} — pass through;
@@ -685,6 +693,7 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         autoModalReply,
         setLiveModal,
         dismissModal,
+        networkConsent,
         setHostModal,
         hostModals: () => ({ modals: hostModalCensus() }),
         report: (...args: unknown[]) => reportWithHost(args),

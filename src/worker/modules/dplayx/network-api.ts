@@ -8,6 +8,7 @@ import { allocateComObject } from "../../core/com/com-memory";
 import { ComObjectFactory } from "../../core/com/base-com-object";
 import { dplayxModule } from "../../api/dplayx.api";
 import { lanNetwork, type LanNetwork } from "../../net/lan-network";
+import { networkConsent } from "../../net/network-consent";
 import { decodeAnsiString, encodeAnsi, getAnsiCodePage } from "../codepage-utils";
 import { DirectPlaySendQueue } from "./send-queue";
 import { getWsaProcessState } from "../wsa-stub-shared";
@@ -921,6 +922,14 @@ export class DirectPlayNetworkApi {
                 if (!state) return DPERR_INVALIDOBJECT;
                 if (!["Initialize", "InitializeConnection", "EnumConnections", "SaveSession"].includes(methodName) && state.session.readyError
                     && !(methodName === "Receive" && state.session.queue.length)) return state.session.readyError;
+                // Finding, hosting or joining a session is the first use of the network; a refusal
+                // leaves the provider on loopback only (an empty enumeration, a local session).
+                const consentOperation = methodName === "EnumSessions" ? (a[5] & 0x20 ? null : "EnumSessions")
+                    : methodName === "Open" || methodName === "SecureOpen" ? "Open" : null;
+                if (consentOperation) {
+                    const verdict = networkConsent.check({ api: "directplay", operation: consentOperation });
+                    if (verdict instanceof Promise) return verdict;
+                }
                 return handler ? handler(state, a, legacy, ctx, wide) : DP.UNSUPPORTED;
             };
         };

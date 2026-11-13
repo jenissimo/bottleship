@@ -35,7 +35,13 @@ import { installHarnessFacade } from "../harness/facade";
 import { getCachedGamepadMeta, initGamepadCache, readLiveGamepad, rescanGamepads } from "../gamepad-cache";
 import GameSelectScreen, { type GameEntry } from "../library/GameSelectScreen";
 import SettingsDrawer from "../settings/SettingsDrawer";
-import { loadNetworkConfig, networkInviteUrl, networkConfigForStorage, NETWORK_SETTINGS_KEY, type NetworkConfig, type NetworkStatus } from "../network-config";
+import {
+  loadNetworkConfig, networkInviteUrl, networkConfigForStorage, NETWORK_SETTINGS_KEY, DEFAULT_LAN_SERVER, networkSuggestion, networkFromLink,
+  networkConsentAutoFromLocation, loadRememberedConsent, saveRememberedConsent, normalizeNetworkConfig, generateRoomName, publicLoadUrl,
+  type NetworkConfig, type NetworkStatus, type RememberedConsent,
+} from "../network-config";
+import NetworkPanel, { NetworkIndicator } from "./NetworkPanel";
+import { useHostModal } from "../harness/use-host-modal";
 import DevPanel from "./DevPanel";
 import ExitOverlay from "./ExitOverlay";
 import MessageBoxModal, { type MessageBoxRequest } from "../debug/MessageBoxModal";
@@ -420,6 +426,87 @@ export default function App() {
     try { localStorage.setItem(NETWORK_SETTINGS_KEY, JSON.stringify(networkConfigForStorage(config))); } catch { /* Storage may be unavailable. */ }
     globalWorker?.postMessage({ type: "set_network", network: config });
   }, []);
+  // Network permission (worker/net/network-consent.ts). Nothing connects until the game
+  // first needs the relay and the user picked a room; the answer holds for this session.
+  const networkStatusRef = useRef(networkStatus);
+  const [consentRequest, setConsentRequest] = useState<{ id: number; worker: Worker | MessagePort } | null>(null);
+  const [networkPanelOpen, setNetworkPanelOpen] = useState(false);
+  const [networkTouched, setNetworkTouched] = useState(() => networkFromLink(window.location.search, window.location.hash));
+  const consentDecisionRef = useRef<"granted" | "denied" | null>(null);
+  /** A granted request is answered once the relay is actually up. */
+  const consentAnswerRef = useRef<{ id: number; worker: Worker | MessagePort; remember: RememberedConsent | null; auto: boolean } | null>(null);
+  const consentGameKeyRef = useRef<string | null>(null);
+  const answerConsent = useCallback((target: { id: number; worker: Worker | MessagePort }, granted: boolean) => {
+    target.worker.postMessage({ type: "network_consent_result", id: target.id, granted });
+  }, []);
+  /** Leave the relay without forgetting the saved server and room. */
+  const dropNetwork = useCallback(() => {
+    globalWorker?.postMessage({ type: "set_network", network: null });
+    setNetworkStatus({ state: "offline" });
+  }, []);
+  const handleConsentConnect = useCallback((config: NetworkConfig, remember: boolean) => {
+    const request = consentRequest;
+    const memory: RememberedConsent | null = remember ? { choice: "connect", serverUrl: config.serverUrl, room: config.room } : null;
+    if (request) consentAnswerRef.current = { ...request, remember: memory, auto: false };
+    else consentDecisionRef.current = "granted";
+    handleNetworkChange(config);
+  }, [consentRequest, handleNetworkChange]);
+  const handleConsentNotNow = useCallback((remember: boolean) => {
+    const request = consentRequest;
+    consentAnswerRef.current = null;
+    consentDecisionRef.current = "denied";
+    if (remember && consentGameKeyRef.current) saveRememberedConsent(consentGameKeyRef.current, { choice: "offline" });
+    if (networkStatusRef.current.state !== "offline") dropNetwork();
+    if (request) answerConsent(request, false);
+    setConsentRequest(null);
+  }, [consentRequest, answerConsent, dropNetwork]);
+  const handleConsentRequest = useCallback((id: number, target: Worker | MessagePort) => {
+    setNetworkTouched(true);
+    const request = { id, worker: target };
+    if (consentDecisionRef.current === "denied") { answerConsent(request, false); return; }
+    if (consentDecisionRef.current === "granted" && networkStatusRef.current.state === "connected") { answerConsent(request, true); return; }
+    const auto = networkConsentAutoFromLocation(window.location.search);
+    const remembered = !auto && consentGameKeyRef.current ? loadRememberedConsent(consentGameKeyRef.current) : null;
+    if (remembered?.choice === "offline") { consentDecisionRef.current = "denied"; answerConsent(request, false); return; }
+    let config: NetworkConfig | null = null;
+    try {
+      if (remembered?.choice === "connect") config = normalizeNetworkConfig({ serverUrl: remembered.serverUrl, room: remembered.room });
+      else if (auto) {
+        const hint = networkSuggestion(window.location.search, window.location.hash, networkRef.current);
+        config = networkRef.current ?? normalizeNetworkConfig({ serverUrl: hint.serverUrl, room: hint.room || generateRoomName(), ...(hint.invite ? { invite: hint.invite } : {}) });
+      }
+    } catch { config = null; }
+    if (config) {
+      consentAnswerRef.current = { ...request, remember: null, auto: true };
+      handleNetworkChange(config);
+      return;
+    }
+    if (auto) { consentDecisionRef.current = "denied"; answerConsent(request, false); return; }
+    setConsentRequest(request);
+  }, [answerConsent, handleNetworkChange]);
+  const handleNetworkState = useCallback((status: NetworkStatus) => {
+    networkStatusRef.current = status;
+    setNetworkStatus(status);
+    if (status.state !== "offline") setNetworkTouched(true);
+    const pending = consentAnswerRef.current;
+    // Connected from Settings counts as the answer, as it does in the worker.
+    if (!pending) { if (status.state === "connected") consentDecisionRef.current = "granted"; return; }
+    if (status.state === "connected") {
+      consentAnswerRef.current = null;
+      consentDecisionRef.current = "granted";
+      if (pending.remember && consentGameKeyRef.current) saveRememberedConsent(consentGameKeyRef.current, pending.remember);
+      answerConsent(pending, true);
+      setConsentRequest(null);
+    } else if (status.state === "error" && pending.auto) {
+      // Unattended: no one can fix the server, so the guest sees no network instead of a hang.
+      consentAnswerRef.current = null;
+      consentDecisionRef.current = "denied";
+      dropNetwork();
+      answerConsent(pending, false);
+    }
+  }, [answerConsent, dropNetwork]);
+  const consentHandlersRef = useRef({ handleConsentRequest, handleNetworkState });
+  consentHandlersRef.current = { handleConsentRequest, handleNetworkState };
   const [quality, setQuality] = useState<QualityConfig>(() => loadQuality());
   const qualityRef = useRef<QualityConfig>(quality);
   // Quality keys the ACTIVE graphics backend told us (via the set_quality ack) it does
@@ -578,6 +665,35 @@ export default function App() {
     };
   }, [gameIdFromUrl, selectedGame]);
   const gameDisplayName = bundleDisplayName ?? displayGame?.name ?? "Game";
+  // "Remember for this game" key and what a friend's link can carry (network-config.ts).
+  const consentGameKey = gameId ?? (displayGame && displayGame.id !== "dev" ? displayGame.id : null) ?? bundleDisplayName ?? null;
+  useEffect(() => { consentGameKeyRef.current = consentGameKey; }, [consentGameKey]);
+  const shareableGame = useMemo(() => ({
+    catalogId: selectedGame && selectedGame.id !== "dev" && !hasImportedBundle ? selectedGame.id : undefined,
+    publicLoadUrl: selectedGame?.id === "dev" && !hasImportedBundle
+      ? publicLoadUrl(new URLSearchParams(window.location.search).get("load"), window.location.origin) : undefined,
+  }), [selectedGame, hasImportedBundle]);
+  const networkDialogOpen = !!consentRequest || networkPanelOpen;
+  useHostModal("networkConsent", networkDialogOpen, { caption: consentRequest ? "Play over the network?" : "Network" });
+  // Harness: answer the permission prompt without clicking (`networkConsent` verb).
+  const networkConsentApiRef = useRef({ handleConsentConnect, handleConsentNotNow, consentRequest });
+  networkConsentApiRef.current = { handleConsentConnect, handleConsentNotNow, consentRequest };
+  useEffect(() => {
+    (window as any).__bsNetworkConsent = {
+      state: () => ({ waiting: !!networkConsentApiRef.current.consentRequest, decision: consentDecisionRef.current, status: networkStatusRef.current }),
+      answer: (choice: string, room?: string, serverUrl?: string) => {
+        const api = networkConsentApiRef.current;
+        if (!api.consentRequest) throw new Error("no network permission prompt is open");
+        if (choice === "offline") { api.handleConsentNotNow(false); return { answered: "offline" }; }
+        const hint = networkSuggestion(window.location.search, window.location.hash, networkRef.current);
+        const config = normalizeNetworkConfig({ serverUrl: serverUrl ?? hint.serverUrl, room: room ?? (choice === "join" ? hint.room : generateRoomName()) });
+        if (!config) throw new Error("no room");
+        api.handleConsentConnect(config, false);
+        return { answered: choice, room: config.room, serverUrl: config.serverUrl };
+      },
+    };
+    return () => { delete (window as any).__bsNetworkConsent; };
+  }, []);
   const browserSupport = useMemo(() => detectBrowserSupport(), []);
   // A deployment may admit only the browser it was rehearsed on (see deployment-config).
   // undefined = policy not loaded yet; null = allowed.
@@ -1076,7 +1192,9 @@ export default function App() {
       // dumps it emits, and those must name the session's own directory — an agent sent
       // to logs/debug/ while its PNG went to logs/alpha/debug/ reads a sibling's evidence.
       globalWorker.postMessage({ type: "set_session", session: sessionFromLocation(window.location.search) });
-      globalWorker.postMessage({ type: "set_network", network: networkRef.current });
+      // The network stays down until the game needs it and the user agrees: no relay
+      // sees this page's address before that (see network-consent.ts).
+      globalWorker.postMessage({ type: "set_network_consent", mode: "ask" });
       const jitPolicy = resolveHostJitPolicy({
         userAgent: navigator.userAgent,
         maxTouchPoints: navigator.maxTouchPoints,
@@ -1345,7 +1463,12 @@ export default function App() {
     // 3. Setup Worker Message Handling
     worker.onmessage = (event: MessageEvent) => {
       if (event.data?.type === "network_state") {
-        setNetworkStatus(event.data.status as NetworkStatus);
+        consentHandlersRef.current.handleNetworkState(event.data.status as NetworkStatus);
+        return;
+      }
+      if (event.data?.type === "network_consent_request") {
+        const target = worker instanceof SessionWorker ? worker.replyTarget(event) : event.target as Worker;
+        consentHandlersRef.current.handleConsentRequest(Number(event.data.id) || 0, target);
         return;
       }
       if (event.data?.type === 'child_session') {
@@ -3311,6 +3434,9 @@ export default function App() {
           )}
         </div>
         <div className={s["emu-topbar-actions"]}>
+          {networkTouched && (
+            <NetworkIndicator className={s["emu-topbar-btn"]} status={networkStatus} network={network} onClick={() => setNetworkPanelOpen(true)} />
+          )}
           <button
             className={cx(s, "emu-topbar-btn", isPaused && "emu-btn-active")}
             onClick={togglePause}
@@ -3532,6 +3658,22 @@ export default function App() {
 
       {messageBox && (
         <MessageBoxModal messageBox={messageBox} onClose={() => setMessageBox(null)} />
+      )}
+
+      {networkDialogOpen && (
+        <NetworkPanel
+          key={consentRequest ? `request-${consentRequest.id}` : "panel"}
+          mode={consentRequest ? "request" : "panel"}
+          suggestion={networkSuggestion(window.location.search, window.location.hash, network, DEFAULT_LAN_SERVER)}
+          network={network}
+          status={networkStatus}
+          game={shareableGame}
+          canRemember={!!consentRequest && !!consentGameKey}
+          onConnect={handleConsentConnect}
+          onNotNow={handleConsentNotNow}
+          onDisconnect={() => { consentDecisionRef.current = "denied"; dropNetwork(); }}
+          onClose={() => setNetworkPanelOpen(false)}
+        />
       )}
 
       {settingsDrawer}

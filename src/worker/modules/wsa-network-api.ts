@@ -16,6 +16,8 @@ import { wsaEventNotifier } from "./wsa-event-notify";
 import { IPX_NETNUM, IPX_MAX_PAYLOAD, UDP_MAX_PAYLOAD, UDP6_MAX_PAYLOAD } from "../net/lan-network";
 import { hasIoCompletionAssociation } from "./kernel32/sync";
 import { reserveControlApc } from "./wsa-control-apc";
+import { gateNetworkThunk, type NetworkConsentReason } from "../net/network-consent";
+import { describeWsaAddress, wsaDestinationLeavesSession, wsaListenerLeavesSession, type LocalIdentity } from "./wsa-network-consent";
 
 export type WsaErrorSetter = ((code: number) => void) & { capture?: () => (code: number) => void };
 interface Counter { started: boolean; }
@@ -1188,7 +1190,38 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         if (a[4]) guard(a[4], 4, true);
         return overlap().result(a[0], a[1], !!a[3], a[2], a[4]);
     }, 0);
+    gateWinsockConsent(api, table, setError, counter);
     return api;
+}
+
+/**
+ * The network permission gate (net/network-consent.ts) in front of every Winsock call that
+ * needs the relay. Refused, the call fails as on a PC whose only interface is loopback:
+ * no route to the destination, WSAENETUNREACH (connect/sendto docs). A refused listen is
+ * not an error there — it listens, and only this session can reach it.
+ */
+function gateWinsockConsent(api: Record<string, ThunkImplementation>, table: WsaSocketTable, setError: WsaErrorSetter, counter: Counter): void {
+    const self = (): LocalIdentity => ({ node: table.network.node, ipv4: table.network.ipv4, ipv6: table.network.ipv6 });
+    const destination = (operation: string, socket: number, ptr: number, length: number): NetworkConsentReason | null => {
+        if (!counter.started || !ptr || !table.isValid(socket)) return null;
+        const peer = address(ptr, length | 0);
+        return wsaDestinationLeavesSession(peer, self()) ? { api: "winsock", operation, target: describeWsaAddress(peer) } : null;
+    };
+    const unreachable = (failure: number) => (): number => { (setError.capture?.() ?? setError)(WSA.ENETUNREACH); return failure; };
+    const gate = (name: string, classify: (a: number[]) => NetworkConsentReason | null, deny?: (a: number[]) => number) => {
+        if (api[name]) api[name] = gateNetworkThunk(api[name], classify, deny);
+    };
+    gate("connect", a => destination("connect", a[0], a[1], a[2]), unreachable(-1));
+    gate("WSAConnect", a => destination("connect", a[0], a[1], a[2]), unreachable(-1));
+    gate("ConnectEx", a => destination("connect", a[0], a[1], a[2]), unreachable(0));
+    gate("sendto", a => destination("sendto", a[0], a[4], a[5]), unreachable(-1));
+    gate("WSASendTo", a => destination("sendto", a[0], a[5], a[6]), unreachable(-1));
+    gate("listen", a => {
+        if (!counter.started || !table.isValid(a[0])) return null;
+        const socket = table.get(a[0]);
+        return socket.type === 1 && wsaListenerLeavesSession(socket.local, socket.af)
+            ? { api: "winsock", operation: "listen", target: socket.local ? `port ${socket.local.port}` : undefined } : null;
+    });
 }
 
 export function makeNetworkSelect(table: WsaSocketTable, setError: WsaErrorSetter, counter: Counter = { started: true }): ThunkImplementation {

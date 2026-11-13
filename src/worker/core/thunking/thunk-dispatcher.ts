@@ -244,6 +244,14 @@ export interface ThunkResult {
      * On throw/invalid result the outer value is the failure return and all pending writes are dropped.
      */
     resumeOnOwner?: (frame: OwnerThunkFrame) => number | OwnerThunkResult;
+    /**
+     * Async-only: instead of returning to the caller, re-enter this thunk's stub with the
+     * parked frame — [ESP] holds the original return address and the arguments are the
+     * guest's own, so the call runs again synchronously on its issuing thread (its own
+     * TEB, its own frame). For a host decision that must precede the real call, e.g. the
+     * network permission prompt. All other result fields are ignored.
+     */
+    reissue?: boolean;
 }
 
 interface ActiveAsyncThunk {
@@ -289,6 +297,7 @@ interface PendingAsyncRestore {
     /** Deferred guest-callback chain (see ThunkResult.startCallbackChain). Applied at the safe point. */
     startCallbackChain?: (frame: { esp: number; returnAddr: number; mem: Uint8Array }) => boolean;
     resumeOnOwner?: ThunkResult['resumeOnOwner'];
+    reissue?: boolean;
     /** Consecutive TRANSIENT validation failures (target stack page momentarily non-writable
      *  during CoW/decommit churn). Retried up to ASYNC_RESTORE_MAX_VALIDATION_RETRIES before
      *  escalating, so a transient miss doesn't discard the thread's only completion → park forever. */
@@ -3666,6 +3675,7 @@ export class ThunkDispatcher {
             dllInits,
             startCallbackChain,
             resumeOnOwner: (typeof res === 'object' && res !== null) ? (res as ThunkResult).resumeOnOwner : undefined,
+            reissue: typeof res === 'object' && res !== null && (res as ThunkResult).reissue === true,
             errorFlag: false,
             completionName: name,
         });
@@ -4103,6 +4113,10 @@ export class ThunkDispatcher {
     }
 
     private applyPendingAsyncRestoreAtSafePoint(pending: PendingAsyncRestore, cpu: any): void {
+        if (pending.reissue) {
+            this._reissueAsyncThunk(pending.info, cpu, pending.completionName);
+            return;
+        }
         if (pending.resumeOnOwner) {
             const scheduler = this.ensureScheduler();
             const epoch = this.asyncEpoch;
@@ -4358,6 +4372,32 @@ export class ThunkDispatcher {
             return { esp: le, mismatch: true };
         }
         return { esp: newEsp, mismatch: false };
+    }
+
+    /** ThunkResult.reissue: put the parked frame back exactly as the stub saw it on entry and
+     *  resume AT the stub, so the call is dispatched again from scratch. */
+    private _reissueAsyncThunk(info: ActiveAsyncThunk, cpu: any, name: string): void {
+        this.updateMemoryCache();
+        const mem8 = this.cachedMem8, stub = this.thunkGenerator.getStubById(info.functionId);
+        const esp = info.esp, returnAddr = info.returnAddr;
+        if (!mem8 || !this.isDataViewValid() || !stub || esp === undefined || returnAddr === undefined) {
+            Logger.error(LogCategory.THUNK, `Cannot reissue ${name}: ${!stub ? 'no stub' : 'frame unavailable'} — failing the call`);
+            this._restoreAsyncContext(info, cpu, 0xffffffff, this.resolveThunkCleanup(info.functionId, 0), name);
+            return;
+        }
+        if (info.spinAddr !== undefined && info.originalSpinBytes) {
+            mem8[info.spinAddr] = info.originalSpinBytes[0];
+            mem8[info.spinAddr + 1] = info.originalSpinBytes[1];
+        }
+        this.cachedDataView!.setUint32(esp, returnAddr >>> 0, true);
+        const scheduler = this.ensureScheduler();
+        scheduler.applyAsyncRestoreCpuState(cpu, stub.address >>> 0, esp >>> 0, 0 /* the stub loads EAX itself */, `async_reissue:${name}`, {
+            threadId: info.threadId ?? scheduler.getCurrentThreadId?.() ?? 0,
+            asyncParkGeneration: info.asyncParkGeneration ?? 0,
+            completionName: name,
+            functionId: info.functionId,
+            cleanupBytes: 0,
+        });
     }
 
     private _restoreAsyncContext(info: ActiveAsyncThunk, cpu: any, returnValue: number, cleanupBytes: number, name: string, deferredWrites?: DeferredWrite[]): void {

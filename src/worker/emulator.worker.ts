@@ -181,6 +181,7 @@ import { framePacer } from "./core/frame-pacer";
 import { EmulatorConfig } from "./core/emulator-config-manager";
 import { configureNetplay } from "./net/configure-netplay";
 import { lanNetwork } from "./net/lan-network";
+import { networkConsent } from "./net/network-consent";
 import type { NetworkStatus } from "../network-config";
 import { logQualityGapsOnce, activeQualityBackend, onQualityBackendChanged, internalScaleSupport } from "./backends/webgpu/shared/quality-capabilities";
 import type { QualityConfig } from "./core/quality-config";
@@ -433,6 +434,27 @@ const applySessionNetwork = (value: unknown): void => {
   // A load awaits this promise; the settings screen can also connect before any load.
   void sessionNetworkReady.catch(() => {});
 };
+// Network permission (net/network-consent.ts). The guest waits on a parked thread while the
+// host shows its dialog; the whole guest is paused meanwhile, as a modal OS prompt would
+// hold a fullscreen game, and resumes once the answer (and, if granted, the relay) is in.
+networkConsent.post = request => self.postMessage({ type: "network_consent_request", ...request });
+networkConsent.beforeRelease = async () => {
+  if (networkConsent.state.decision !== "granted") return;
+  try { await awaitSessionNetwork(); } catch { /* The guest then sees the network as down. */ }
+};
+// @transient(host-UI pause owned by the open permission dialog; never part of a guest snapshot)
+let consentPaused = false;
+networkConsent.onWaitingChange(waiting => {
+  if (waiting) {
+    if (isPaused || consentPaused) return;
+    consentPaused = true;
+    // Out of the thunk that asked: pausing stops v86, which must not happen inside its tick.
+    setTimeout(() => { if (consentPaused && !isPaused) pauseEmulator(); }, 0);
+  } else if (consentPaused) {
+    consentPaused = false;
+    if (isPaused) resumeEmulator();
+  }
+});
 /** True once a PE has been booted in this worker session (loadApp / load_bundle without page reload). */
 let gameSessionActive = false;
 /** The payload that booted the current game — replayed verbatim by a self re-exec. */
@@ -3677,6 +3699,20 @@ const handleWorkerMessage = (event: MessageEvent): void => {
 
   if (message?.type === "set_network") {
     applySessionNetwork(message.network);
+    // Connecting is the user's decision; disconnecting withdraws it for this session. While
+    // a prompt is open the host answers it itself, once the relay is actually up.
+    if (message.network) { if (!networkConsent.state.waiting) networkConsent.decide("granted"); }
+    else if (networkConsent.state.decision === "granted") networkConsent.decide("denied");
+    return;
+  }
+
+  if (message?.type === "set_network_consent") {
+    networkConsent.configure(message.mode === "ask" ? "ask" : "off");
+    return;
+  }
+
+  if (message?.type === "network_consent_result") {
+    networkConsent.answer(Number(message.id) || 0, message.granted === true);
     return;
   }
 
