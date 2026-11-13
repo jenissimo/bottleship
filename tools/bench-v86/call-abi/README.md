@@ -26,6 +26,9 @@ independent checksums. Every timed run is checked against it, and a mismatch abo
 `expected.json` holds the sha256 of every generated module and the expected state at
 `n = 0, 1, 1000, 1000003`. `wasm/` holds the generated modules; `--check` verifies that the
 generator, `wasm/` and `expected.json` agree and that every arm reaches the expected state.
+The Node front end's `--check` and timed runs fail if `expected.json` or any module in `wasm/` is missing,
+or if a recorded hash, state or call count disagrees. `--emit` and `--write-expected`
+regenerate their respective artifacts without requiring the previous copies.
 
 ## Commands
 
