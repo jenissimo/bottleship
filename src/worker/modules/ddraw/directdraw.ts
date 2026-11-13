@@ -17,7 +17,7 @@ import {
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { framePacer } from "../../core/frame-pacer";
 import { initReturnPtr } from "../../backends/webgpu/shared/dx-com-helpers";
-import { getSurfaceFormatLayout, isBlockCompressedFormat } from "../../backends/webgpu/shared/texture-formats";
+import { getSurfaceFormatLayout } from "../../backends/webgpu/shared/texture-formats";
 import {
     writeAdapterIdentifier8,
 } from "../../backends/webgpu/shared/dx-adapter-identifier";
@@ -54,6 +54,7 @@ import {
     DDPF_FOURCC,
     DDERR_NOOVERLAYHW,
     DDERR_INVALIDPIXELFORMAT,
+    isSupportedFourCC,
     DDSURFACEDESC_SIZE,
     DDSURFACEDESC2_SIZE,
     E_FAIL,
@@ -364,11 +365,12 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             return DDERR_NOOVERLAYHW;
         }
 
-        // A FourCC outside GetFourCCCodes has no layout here: no pitch, no decoder.
-        const requestedFourCC = (rawDesc.flags & DDSD_PIXELFORMAT) !== 0
-            && ((rawDesc.pixelFormat?.flags ?? 0) & DDPF_FOURCC) !== 0
-            ? (rawDesc.pixelFormat?.fourCC ?? 0) : 0;
-        if (requestedFourCC !== 0 && !isBlockCompressedFormat(requestedFourCC)) {
+        // A FourCC surface is creatable only in a format GetFourCCCodes reports. The flag
+        // decides that this IS a FourCC request; a zero code is then as unlisted as any other.
+        const declaresFourCC = (rawDesc.flags & DDSD_PIXELFORMAT) !== 0
+            && ((rawDesc.pixelFormat?.flags ?? 0) & DDPF_FOURCC) !== 0;
+        const requestedFourCC = (rawDesc.pixelFormat?.fourCC ?? 0) >>> 0;
+        if (declaresFourCC && !isSupportedFourCC(requestedFourCC)) {
             Logger.log(LogCategory.DDRAW,
                 `CreateSurface: refused — unsupported FourCC 0x${requestedFourCC.toString(16)} ` +
                 `(DDERR_INVALIDPIXELFORMAT)`);

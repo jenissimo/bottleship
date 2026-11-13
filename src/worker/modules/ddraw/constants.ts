@@ -66,6 +66,8 @@ const fourCC = (s: string): number =>
 export const SUPPORTED_FOURCC_CODES: ReadonlyArray<number> = [
     fourCC("DXT1"), fourCC("DXT2"), fourCC("DXT3"), fourCC("DXT4"), fourCC("DXT5"),
 ];
+/** Whether a FourCC surface can be created: the one support set GetFourCCCodes also reports. */
+export const isSupportedFourCC = (code: number): boolean => SUPPORTED_FOURCC_CODES.includes(code >>> 0);
 
 export const DDBD_8  = 0x00000800;
 export const DDBD_16 = 0x00000400;
