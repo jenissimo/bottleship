@@ -30,7 +30,7 @@ interface LoadedObject {
     width: number; height: number; pixels: Uint8Array | null; bitCount?: number; loading: boolean;
 }
 
-async function load(path: string, flags: number, files: Record<string, Uint8Array>) {
+async function load(path: string, flags: number, files: Record<string, Uint8Array>, ddraw: unknown = null) {
     const NAME = 0x20000;
     const big = new Uint8Array(NAME + 0x200);
     for (let i = 0; i < path.length; i++) big[NAME + i] = path.charCodeAt(i);
@@ -50,7 +50,7 @@ async function load(path: string, flags: number, files: Record<string, Uint8Arra
             getFileSize: (p: string) => files[p]?.length ?? 0,
             read: async (h: { path: string }) => files[h.path],
         },
-        process: { getModule: () => null },
+        process: { getModule: (name: string) => (name === 'ddraw' ? ddraw : null) },
     };
     const system = spyOn(System, 'getInstance').mockReturnValue(fake as unknown as System);
     try {
@@ -108,5 +108,24 @@ describe('LoadImage from a file', () => {
         expect(r.handle).not.toBe(0);
         expect(r.released).toEqual([]);
         expect(r.object.pixels).toBeNull();
+    });
+
+    test('LR_LOADFROMFILE on an empty file returns NULL and keeps no handle', async () => {
+        const r = await load('data\\Empty.pbm', LR_LOADFROMFILE, { 'data/Empty.pbm': new Uint8Array(0) });
+        expect(r.opened).toEqual(['data/Empty.pbm']);
+        expect(r.handle).toBe(0);
+        expect(r.released).toEqual([0x5001]);
+        expect(r.object.loading).toBe(false);
+    });
+
+    test('a failure after the bitmap is parsed keeps the handle ddraw was given', async () => {
+        const given: number[] = [];
+        const ddraw = { updateTextureFromBitmap: (h: number) => { given.push(h); throw new Error('texture upload failed'); } };
+        const r = await load('data\\Title.pbm', LR_LOADFROMFILE, { 'data/Title.pbm': bmp2x2() }, ddraw);
+        expect(given).toEqual([0x5001]);
+        expect(r.handle).toBe(0x5001);
+        expect(r.released).toEqual([]);
+        expect(r.object.pixels).toBeTruthy();
+        expect(r.object.loading).toBe(false);
     });
 });
