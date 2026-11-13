@@ -6,7 +6,7 @@
 import type { DataEntry } from "./entries/data";
 import type { FileEntry } from "./entries/file";
 import { DirectoryCasingRegistry } from "./directory-casing";
-import { normalizeInnoDestination } from "./paths";
+import { isGogSupportSave, normalizeInnoDestination } from "./paths";
 
 const INVALID_LOCATION = 0xffffffff;
 
@@ -122,6 +122,7 @@ export function filterExtractableFiles(
     wantEntry?: (file: FileEntry) => boolean,
 ): SelectedFile[] {
     const winners = new Map<string, SelectedFile>();
+    const saveFallbacks = new Map<string, SelectedFile>();
     const dirCasing = new DirectoryCasingRegistry();
 
     for (const file of files) {
@@ -139,9 +140,10 @@ export function filterExtractableFiles(
         rel = dirCasing.fixPath(rel);
 
         const internal = rel.toLowerCase();
-        const existing = winners.get(internal);
+        const target = isGogSupportSave(file.destination) ? saveFallbacks : winners;
+        const existing = target.get(internal);
         if (!existing) {
-            winners.set(internal, { file, relPath: rel });
+            target.set(internal, { file, relPath: rel });
             continue;
         }
 
@@ -151,9 +153,12 @@ export function filterExtractableFiles(
 
         const skip = handleCollision(existing.file, oldData, file, newData);
         if (skip === null) {
-            winners.set(internal, { file, relPath: rel });
+            target.set(internal, { file, relPath: rel });
         }
     }
 
+    for (const [internal, fallback] of saveFallbacks) {
+        if (!winners.has(internal)) winners.set(internal, fallback);
+    }
     return [...winners.values()];
 }

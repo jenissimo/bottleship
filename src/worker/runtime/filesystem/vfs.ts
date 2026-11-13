@@ -420,7 +420,7 @@ export class VirtualFileSystem {
         let firstCompressedName: string | null = null;
         let firstCompressedMethod: number | null = null;
         for (const [key, entry] of index) {
-            const lowerKey = key.toLowerCase();
+            const lowerKey = canonicalRomRel(key).toLowerCase();
             this.romIndex.set(lowerKey, entry);
             // Record every parent directory (and explicit dir entries) for O(1) lookup.
             const normKey = lowerKey.replace(/\/+$/, "");
@@ -2005,6 +2005,7 @@ export class VirtualFileSystem {
         if (this.romPrefix && p.toLowerCase().startsWith(`${this.romPrefix.toLowerCase()}/`)) {
             p = p.slice(this.romPrefix.length + 1);
         }
+        p = canonicalRomRel(p);
         return p.toLowerCase() === lowerRel ? p : lowerRel;
     }
 
@@ -3818,9 +3819,22 @@ function normalizePathUncached(path: string): string {
             stack.pop();
             continue;
         }
-        stack.push(part);
+        stack.push(trimComponent(part));
     }
     return `${drive}:\\${stack.join("\\")}`;
+}
+
+/** Win32 drops trailing dots and spaces from each component: "Saves." is "Saves". */
+function trimComponent(part: string): string {
+    return part.replace(/[. ]+$/, "") || part;
+}
+
+/**
+ * A ROM entry's relative path with each component trimmed as Win32 trims it, so the
+ * ROM index holds the same names that path lookups normalize to.
+ */
+function canonicalRomRel(rel: string): string {
+    return rel.split("/").map((seg) => (seg ? trimComponent(seg) : seg)).join("/");
 }
 
 function toKey(path: string): string {

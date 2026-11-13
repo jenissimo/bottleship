@@ -139,6 +139,20 @@ CLI invocation reconnects without it.
   overwrites init-time evidence in ~20s and it is gone before a late crash fires. Quiet the
   firehose category first — `logLevel("DDRAW","WARN")` (`logLevel()` resets) — rather than
   just enlarging the ring, which only postpones losing the same lines.
+- "WHICH GUEST CODE burns the CPU?" — two instruments, and they answer different questions:
+  - `eipProfile()` — cheap, covers every page, nothing armed. A sample is taken BETWEEN v86
+    slices, and a slice ends after a fixed instruction budget, so samples are
+    INSTRUCTION-weighted per activation, not wall time. Default `attribution:'exitSite'`
+    names the exit instruction of the JIT activation that spent the budget; it recompiles
+    (JIT cache clear, `warmupMs` warm-up, clear again on exit), so never take timings from
+    that window. `attribution:'nextEip'` (and the `nextEipTop` column) is the raw
+    `instruction_pointer`, which at a budget exit already holds the block entered NEXT — a
+    short leaf called from long code gets that code's share (a measured ~2% leaf read as
+    19-31%). Never rank functions from `nextEip`.
+  - `guestBlocks()` — EXACT `exec x instructions` per block from the trace2 census, the
+    number to quote. It arms at most 64 tier-2 pages (name others with `pages`/`ranges`) and
+    slows the guest while armed. When `eipProfile` and `guestBlocks` disagree on a hot block,
+    trust the counts.
 - A guest blocked on a **MessageBox** looks exactly like a freeze: the host draws it as DOM,
   so no canvas capture shows it and the one string naming the problem is invisible.
   `report().pendingModals` lists them (text, caption, how long it has waited);

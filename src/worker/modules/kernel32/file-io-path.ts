@@ -123,6 +123,12 @@ export function ensureTempDirectories(environment: Map<string, string>, vfs: Pic
     }
 }
 
+/** GetCurrentDirectory carries a trailing backslash only for a drive root ("C:\\"). */
+function windowsCurrentDirectory(): string {
+    const dir = System.getInstance().fileSystem.currentDir || 'C:\\';
+    return dir.length > 3 && dir.endsWith('\\') ? dir.slice(0, -1) : dir;
+}
+
 export function registerFileIoPathExports(exports: Record<string, ThunkImplementation>): void {
     registerFileIoTempExports(exports);
     exports['GetCurrentDirectoryA'] = (ctx, mem, args) => {
@@ -131,12 +137,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
 
         Logger.verbose(LogCategory.KERNEL32, `GetCurrentDirectoryA(${nBufferLength})`);
 
-        let currentDir = System.getInstance().fileSystem.currentDir || 'C:\\';
-        // Many old games expect trailing backslash and concatenate filenames directly
-        // Add trailing backslash for compatibility (technically wrong per Windows spec, but works)
-        if (!currentDir.endsWith('\\')) {
-            currentDir += '\\';
-        }
+        const currentDir = windowsCurrentDirectory();
 
         const dirBytes = encodeFileApiString(currentDir + '\0');
 
@@ -155,11 +156,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
 
         Logger.verbose(LogCategory.KERNEL32, `GetCurrentDirectoryW(${nBufferLength})`);
 
-        let currentDir = System.getInstance().fileSystem.currentDir || 'C:\\';
-        // Many old games expect trailing backslash - add for compatibility
-        if (!currentDir.endsWith('\\')) {
-            currentDir += '\\';
-        }
+        const currentDir = windowsCurrentDirectory();
 
         const dirBytes = encodeUTF16LE(currentDir);
         const dirLengthChars = dirBytes.length / 2 - 1; // Length without null terminator (in characters)

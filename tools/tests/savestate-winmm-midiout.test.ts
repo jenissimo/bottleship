@@ -548,12 +548,12 @@ describe("winmm participant with MIDI output", () => {
         }
     });
 
-    test("version 5 with a pinned schema", () => {
+    test("version 6 with a pinned schema", () => {
         const w = new WinMM();
         const off = w.registerSavestate();
         try {
-            expect(savestateParticipants.all().find(x => x.id === "winmm")!.version).toBe(5);
-            expect(schemaHash(WINMM_SCHEMA as unknown as SaveValue)).toBe("2bb8fff2cd33ccfe");
+            expect(savestateParticipants.all().find(x => x.id === "winmm")!.version).toBe(6);
+            expect(schemaHash(WINMM_SCHEMA as unknown as SaveValue)).toBe("a0ad9024170c4f7c");
         } finally {
             off();
         }

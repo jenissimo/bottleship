@@ -253,12 +253,29 @@ export async function findOrCreateTab(url = DEFAULT_DEV_URL, opts: { port?: numb
     throw new Error(`failed to open tab ${target} (PUT and GET both rejected)`);
 }
 
+/** What a caller is told when the tab's renderer process dies under it. */
+export const RENDERER_CRASH_HINT =
+    "the tab's RENDERER PROCESS died (Inspector.targetCrashed) — the guest is gone, not slow. "
+    + "A renderer hosting a bundle needs the manifest's emulator.memory.ram (v86 WASM memory) PLUS the "
+    + "bundle bytes PLUS the WebGPU backend's allocations in ONE process, so the usual cause is host "
+    + "memory: check `free -m` against the manifest's ram, and re-run `harness up` to get a live tab.";
+
+/** Commands the BROWSER process answers, so they still work — and are the only way back —
+ *  after the renderer has died. These must never be short-circuited by the crash latch:
+ *  Page.reload/navigate is exactly how `harness up` revives a crashed tab. */
+function survivesRendererCrash(method: string): boolean {
+    return method === "Page.reload" || method === "Page.navigate" || method === "Page.close"
+        || method.startsWith("Target.") || method.startsWith("Browser.") || method.startsWith("Inspector.");
+}
+
 /** A live CDP WebSocket session with id-correlated requests + event fan-out. */
 export class CdpSession {
     private ws: WebSocket;
     private nextId = 1;
     private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
     private listeners = new Map<string, Array<(params: any, sessionId?: string) => void>>();
+    private crashed: string | null = null;
+    private recoveryIds = new Set<number>();
 
     private constructor(ws: WebSocket) {
         this.ws = ws;
@@ -267,10 +284,12 @@ export class CdpSession {
             if (m.id && this.pending.has(m.id)) {
                 const p = this.pending.get(m.id)!;
                 this.pending.delete(m.id);
+                this.recoveryIds.delete(m.id);
                 if (m.error) p.reject(new Error(`${m.error.message ?? "CDP error"} (${m.error.code ?? "?"})`));
                 else p.resolve(m);
                 return;
             }
+            if (m.method === "Inspector.targetCrashed") this.latchCrash(RENDERER_CRASH_HINT);
             if (m.method) {
                 const ls = this.listeners.get(m.method);
                 if (ls) for (const l of ls) l(m.params, m.sessionId);
@@ -278,17 +297,34 @@ export class CdpSession {
         };
     }
 
+    /** A dead renderer answers NOTHING, forever: the browser keeps the target listed, so
+     *  every in-flight and future command just spends its deadline. Fail them all at the
+     *  moment of the crash instead, with the reason, or a chain sits out its whole budget
+     *  (a 9-minute sleep) and then reports a bare timeout. */
+    private latchCrash(reason: string): void {
+        if (this.crashed) return;
+        this.crashed = reason;
+        for (const [id, p] of this.pending) {
+            if (this.recoveryIds.has(id)) continue;
+            this.pending.delete(id);
+            p.reject(new Error(reason));
+        }
+    }
+
+    /** Non-null once the renderer has crashed. */
+    crashReason(): string | null { return this.crashed; }
+
     /** Acquisition-only ownership. Defaults remain unbounded for legacy callers.
      * A timeout/abort retires the raw socket even before its WebSocket handshake
      * completes. After success, the caller owns the session and these options no
      * longer govern it. */
-    static connect(wsUrl: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<CdpSession> {
+    static async connect(wsUrl: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<CdpSession> {
         const signal = opts.signal, timeoutMs = opts.timeoutMs;
-        if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("CDP ws acquisition aborted", "AbortError"));
+        if (signal?.aborted) throw signal.reason ?? new DOMException("CDP ws acquisition aborted", "AbortError");
         if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 0x7fffffff)) {
-            return Promise.reject(new RangeError("CDP acquisition timeout must be finite, positive and at most 2147483647ms"));
+            throw new RangeError("CDP acquisition timeout must be finite, positive and at most 2147483647ms");
         }
-        return new Promise((resolve, reject) => {
+        const session = await new Promise<CdpSession>((resolve, reject) => {
             const ws = new WebSocket(wsUrl);
             let settled = false;
             let timer: ReturnType<typeof setTimeout> | undefined;
@@ -329,22 +365,35 @@ export class CdpSession {
                 failed(new DOMException("CDP ws acquisition timed out after " + timeoutMs + "ms", "TimeoutError"));
             }, timeoutMs);
         });
+        // Inspector.targetCrashed only fires on an ENABLED domain, and arming it here is what
+        // makes crash detection unconditional for every caller. Meaningless on the browser
+        // endpoint (captureTrace), hence the catch.
+        void session.send("Inspector.enable", {}, undefined, { timeoutMs: 5_000 }).catch(() => { /* not a page session */ });
+        return session;
     }
 
     /** `timeoutMs` is opt-in: CDP has no deadline of its own, and several commands here
      *  (Tracing, navigation) are legitimately unbounded. Give it to any command that can
      *  wait on the RENDERER — a request that never settles spends wall-clock silently. */
     send(method: string, params: any = {}, sessionId?: string, opts?: { timeoutMs?: number }): Promise<any> {
+        const recoverable = survivesRendererCrash(method);
+        if (this.crashed && !recoverable) return Promise.reject(new Error(this.crashed));
         const id = this.nextId++;
         const payload: any = { id, method, params };
         if (sessionId) payload.sessionId = sessionId;
         this.ws.send(JSON.stringify(payload));
+        // A completed reload/navigate IS a fresh renderer, so the latch has to lift with it —
+        // otherwise one crash poisons the session that recovered from it.
+        const revives = method === "Page.reload" || method === "Page.navigate";
         return new Promise((resolve, reject) => {
-            this.pending.set(id, { resolve, reject });
+            if (recoverable) this.recoveryIds.add(id);
+            const onResolve = revives ? (v: any) => { this.crashed = null; resolve(v); } : resolve;
+            this.pending.set(id, { resolve: onResolve, reject });
             const ms = opts?.timeoutMs;
             if (!ms) return;
             const timer = setTimeout(() => {
                 if (!this.pending.delete(id)) return;
+                this.recoveryIds.delete(id);
                 reject(new Error(`CDP ${method} did not answer within ${ms}ms`));
             }, ms);
             const entry = this.pending.get(id)!;
@@ -367,6 +416,9 @@ export class CdpSession {
     }
 
     close(): void {
+        for (const p of this.pending.values()) p.reject(new Error("CDP session closed"));
+        this.pending.clear();
+        this.recoveryIds.clear();
         try { this.ws.close(); } catch { /* */ }
     }
 }

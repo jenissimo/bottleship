@@ -581,14 +581,14 @@ describe("winmm PlaySound savestate", () => {
 });
 
 describe("winmm participant", () => {
-    test("version 5 with a pinned schema, and a refusal reaches the caller as a CaptureRefusal", () => {
+    test("version 6 with a pinned schema, and a refusal reaches the caller as a CaptureRefusal", () => {
         const w = new WinMM() as Module;
         const before = savestateParticipants.all().find(x => x.id === "winmm");
         const off = w.registerSavestate();
         try {
             const p = savestateParticipants.all().find(x => x.id === "winmm")!;
-            expect(p.version).toBe(5);
-            expect(schemaHash(WINMM_SCHEMA as unknown as SaveValue)).toBe("2bb8fff2cd33ccfe");
+            expect(p.version).toBe(6);
+            expect(schemaHash(WINMM_SCHEMA as unknown as SaveValue)).toBe("a0ad9024170c4f7c");
             (w.mmioHandles as Map<number, unknown>).set(1, {});
             expect(() => p.capture({} as never)).toThrow(CaptureRefusal);
         } finally {
