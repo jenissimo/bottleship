@@ -1137,6 +1137,38 @@ export function registerWriteBufferGLFunctions(dispatcher: any, ctx: OpenGLConte
                 ctx.currentNormal[2] = bitsToF32(mem32[(ptr + 8) >> 2]);
             });
 
+        // glColor4ubv(const GLubyte *v) — ring contains the 4 bytes as one dword (r in the low
+        // byte), record as glColor4ub with one byte per argument word.
+        regPd('glColor4ubv', 'glColor4ub', 1,
+            (m32, p) => { const c = m32[p >> 2]; return [c & 0xFF, (c >>> 8) & 0xFF, (c >>> 16) & 0xFF, c >>> 24]; },
+            (_mem8, mem32, ptr) => {
+                const c = mem32[ptr >> 2];
+                ctx.currentColor[0] = (c & 0xFF) / 255;
+                ctx.currentColor[1] = ((c >>> 8) & 0xFF) / 255;
+                ctx.currentColor[2] = ((c >>> 16) & 0xFF) / 255;
+                ctx.currentColor[3] = (c >>> 24) / 255;
+            });
+
+        // glColor4fv(const GLfloat *v) — ring contains 4 float bits, record as glColor4f
+        regPd('glColor4fv', 'glColor4f', 4,
+            (m32, p) => [m32[p >> 2], m32[(p + 4) >> 2], m32[(p + 8) >> 2], m32[(p + 12) >> 2]],
+            (_mem8, mem32, ptr) => {
+                ctx.currentColor[0] = bitsToF32(mem32[ptr >> 2]);
+                ctx.currentColor[1] = bitsToF32(mem32[(ptr + 4) >> 2]);
+                ctx.currentColor[2] = bitsToF32(mem32[(ptr + 8) >> 2]);
+                ctx.currentColor[3] = bitsToF32(mem32[(ptr + 12) >> 2]);
+            });
+
+        // glColor3fv(const GLfloat *v) — ring contains 3 float bits, record as glColor3f
+        regPd('glColor3fv', 'glColor3f', 3,
+            (m32, p) => [m32[p >> 2], m32[(p + 4) >> 2], m32[(p + 8) >> 2]],
+            (_mem8, mem32, ptr) => {
+                ctx.currentColor[0] = bitsToF32(mem32[ptr >> 2]);
+                ctx.currentColor[1] = bitsToF32(mem32[(ptr + 4) >> 2]);
+                ctx.currentColor[2] = bitsToF32(mem32[(ptr + 8) >> 2]);
+                ctx.currentColor[3] = 1.0;
+            });
+
         // glTexCoord2fv(const GLfloat *v) — ring contains 2 float bits, record as glTexCoord2f
         regPd('glTexCoord2fv', 'glTexCoord2f', 2,
             (m32, p) => [m32[p >> 2], m32[(p + 4) >> 2]],

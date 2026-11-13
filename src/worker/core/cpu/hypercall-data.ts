@@ -231,6 +231,13 @@ const WASM_WRITE_HANDLERS = new Set<number>([
     HANDLER_MEMCPY, HANDLER_MEMSET, HANDLER_STRCPY,
 ]);
 
+/** Handlers that answer from a page CACHE of TEB state (LastError, the current thread's FLS
+ *  values). The trap-free guest stubs (kernel32/teb-stubs.ts) update the TEB without telling
+ *  the page, so while they are bound a call that still reaches the trap is answered by JS,
+ *  which reads the TEB. The writers (SetLastError, Tls*) write the TEB and stay routed. */
+// @transient(constant handler-id set, never mutated)
+const TEB_STUB_CACHE_HANDLERS = new Set<number>([HANDLER_GET_LAST_ERROR, HANDLER_FLS_GET_VALUE]);
+
 const HANDLER_MAP: Record<string, number> = {
     'kernel32.gettickcount': HANDLER_GET_TICK_COUNT,
     'kernel32.gettickcount64': HANDLER_GET_TICK_COUNT64,
@@ -487,6 +494,7 @@ export interface HypercallState {
     suspendSlots: number[][];
     suspendTable: Uint8Array;
     wasmStringWritersOff: boolean;
+    tebStubsBound?: boolean;
 }
 
 export class HypercallDataManager {
@@ -572,6 +580,8 @@ export class HypercallDataManager {
     // or a WASM-buffer change would silently re-enable them mid-run and the write trap
     // would report a clean range it never actually covered.
     private wasmStringWritersOff = false;
+    /** The kernel32 TEB guest stubs are bound: TEB_STUB_CACHE_HANDLERS answer from JS. */
+    private tebStubsBound = false;
     /** thread handle -> slot index in the shared suspend table (packed from the front). */
     private readonly threadSuspendSlots = new Map<number, number>();
 
@@ -679,6 +689,7 @@ export class HypercallDataManager {
             suspendSlots: [...this.threadSuspendSlots],
             suspendTable: page(OFF_HC_THREAD_SUSPEND, HC_THREAD_SUSPEND_SLOTS * 8),
             wasmStringWritersOff: this.wasmStringWritersOff,
+            tebStubsBound: this.tebStubsBound,
         };
     }
 
@@ -697,6 +708,7 @@ export class HypercallDataManager {
         this.flsCurrentTid = state.flsCurrentTid;
         this.captureHwndShadow = state.captureHwnd;
         this.wasmStringWritersOff = state.wasmStringWritersOff;
+        this.tebStubsBound = state.tebStubsBound ?? false;
         this.threadSuspendSlots.clear();
         for (const [h, slot] of state.suspendSlots) this.threadSuspendSlots.set(h, slot);
         new Uint8Array(view.buffer, this.hpBase + OFF_HC_THREAD_SUSPEND, HC_THREAD_SUSPEND_SLOTS * 8).set(state.suspendTable);
@@ -720,8 +732,8 @@ export class HypercallDataManager {
 
         // Dispatch table entries
         for (const [functionId, handlerId] of this.registeredEntries) {
-            const suppressed = this.wasmStringWritersOff && WASM_WRITE_HANDLERS.has(handlerId);
-            this.view.setUint8(this.hpBase + this.dispatchEntryOffset(functionId), suppressed ? 0 : handlerId);
+            this.view.setUint8(this.hpBase + this.dispatchEntryOffset(functionId),
+                this.isSuppressed(handlerId) ? 0 : handlerId);
         }
 
         // Slab control-block pointer (the slab control fields themselves live in guest RAM,
@@ -1177,8 +1189,7 @@ export class HypercallDataManager {
         // Write handler_id into dispatch_table[functionId]
         const offset = this.hpBase + this.dispatchEntryOffset(functionId);
         // Use setUint8 since dispatch table entries are single bytes
-        const suppressed = this.wasmStringWritersOff && WASM_WRITE_HANDLERS.has(handlerId);
-        this.view.setUint8(offset, suppressed ? 0 : handlerId);
+        this.view.setUint8(offset, this.isSuppressed(handlerId) ? 0 : handlerId);
         this.registeredEntries.set(functionId, handlerId);
 
         Logger.verbose(LogCategory.SYSTEM,
@@ -1241,6 +1252,27 @@ export class HypercallDataManager {
             `[HYPERCALL] WASM string/mem WRITERS ${on ? "enabled" : "DISABLED (JS fallback)"} ` +
             `for ${affected.length} functionIds`);
         return { enabled: on, affected };
+    }
+
+    private isSuppressed(handlerId: number): boolean {
+        return (this.wasmStringWritersOff && WASM_WRITE_HANDLERS.has(handlerId))
+            || (this.tebStubsBound && TEB_STUB_CACHE_HANDLERS.has(handlerId));
+    }
+
+    /** The TEB guest stubs were bound (pe-loader): route the page-cache readers to JS. */
+    setTebStubsBound(bound: boolean): void {
+        this.tebStubsBound = bound;
+        this.refreshViews();
+        if (!this.view || this.hpBase === 0) return;
+        for (const [functionId, handlerId] of this.registeredEntries) {
+            if (!TEB_STUB_CACHE_HANDLERS.has(handlerId)) continue;
+            this.view.setUint8(this.hpBase + this.dispatchEntryOffset(functionId),
+                this.isSuppressed(handlerId) ? 0 : handlerId);
+        }
+    }
+
+    areTebStubsBound(): boolean {
+        return this.tebStubsBound;
     }
 
     /** True while the write-capable string/mem handlers are forced to JS. */
@@ -1348,6 +1380,7 @@ export class HypercallDataManager {
         this.registeredEntries.clear();
         this.enabled = false;
         this.enablePending = false;
+        this.tebStubsBound = false;
         this.clearFlsSlots();
     }
 

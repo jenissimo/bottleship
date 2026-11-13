@@ -80,7 +80,7 @@ describe("pre-populated GetProcAddress cache", () => {
             // The shared handler remains available for direct debug-CRT imports.
             expect(hleExportBindingAddress(gen, "msvcrt", name)).toBeDefined();
             expect(getProcAddress(msvcrt, name)).toBe(0);
-            expect(System.getInstance().process!.lastError).toBe(127);
+            expect(System.getInstance().scheduler.getLastError()).toBe(127);
             expect(getProcAddress(msvcrt, name)).toBe(0);
         }
         expect(getProcAddress(msvcrt, "_msize")).not.toBe(0);

@@ -2081,7 +2081,7 @@ export const exports: Record<string, ThunkImplementation> = {
         const required = 24; // sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) on x86
 
         if (!returnLengthPtr) {
-            System.getInstance().process!.lastError = 87; // ERROR_INVALID_PARAMETER
+            System.getInstance().scheduler.setLastError(87); // ERROR_INVALID_PARAMETER
             return 0;
         }
 
@@ -2092,7 +2092,7 @@ export const exports: Record<string, ThunkImplementation> = {
         Mem.writeUint32(returnLengthPtr, required);
 
         if (!bufferPtr || length < required) {
-            System.getInstance().process!.lastError = 122; // ERROR_INSUFFICIENT_BUFFER
+            System.getInstance().scheduler.setLastError(122); // ERROR_INSUFFICIENT_BUFFER
             return 0;
         }
 

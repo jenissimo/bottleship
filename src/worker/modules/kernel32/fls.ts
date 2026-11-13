@@ -3,21 +3,21 @@
  *
  * Slot indices are process-global, but VALUES are per-fiber — per-THREAD here
  * (no fiber support): the UCRT stores each thread's _ptd in one shared slot
- * index, so a process-global value table would hand thread A's _ptd to
- * thread B. FlsFree callbacks are not invoked (callback ignored).
+ * index. The values live in the thread's RTL_FLS_DATA block (TEB+0xFB4), the same
+ * storage the trap-free guest stubs (teb-stubs.ts) read and write; Get/Set follow NT
+ * and never consult the allocation bitmap. FlsFree callbacks are not invoked.
  */
 
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { System } from '../../core/system';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
+import { FLS_INDEX_LIMIT } from '../../core/teb-manager';
 
 const FLS_OUT_OF_INDEXES = 0xffffffff;
-const MAX_SLOTS = 128;
+const ERROR_INVALID_PARAMETER = 87;
 
 // @participant(kernel32)
 const allocated = new Set<number>();
-// @participant(kernel32)
-const valuesByThread = new Map<number, Map<number, number>>();
 // @participant(kernel32)
 let nextSlot = 1;
 // @transient(identity of the owning process object)
@@ -34,7 +34,6 @@ function ensureProcessLocalFls(): void {
     flsOwnerProcess = process;
     flsOwnerResetGeneration = gen;
     allocated.clear();
-    valuesByThread.clear();
     nextSlot = 1;
     hypercallDataManager.clearFlsSlots();
 }
@@ -44,13 +43,14 @@ export function resetFlsState(): void {
     flsOwnerProcess = null;
     flsOwnerResetGeneration = -1;
     allocated.clear();
-    valuesByThread.clear();
     nextSlot = 1;
     hypercallDataManager.clearFlsSlots();
 }
 
+/** Values are guest memory (the per-thread FLS blocks) and travel with it; `values` is kept
+ *  only so the kernel32 schema stays put, and is always empty. */
 export function captureFls(): { allocated: number[]; values: Array<[number, Array<[number, number]>]>; nextSlot: number } {
-    return { allocated: [...allocated], values: [...valuesByThread].map(([tid, v]) => [tid, [...v]]), nextSlot };
+    return { allocated: [...allocated], values: [], nextSlot };
 }
 
 export function restoreFls(state: { allocated: number[]; values: Array<[number, Array<[number, number]>]>; nextSlot: number }): void {
@@ -59,8 +59,6 @@ export function restoreFls(state: { allocated: number[]; values: Array<[number, 
     flsOwnerResetGeneration = process?.resetGeneration ?? 0;
     allocated.clear();
     for (const slot of state.allocated) allocated.add(slot);
-    valuesByThread.clear();
-    for (const [tid, v] of state.values) valuesByThread.set(tid, new Map(v));
     nextSlot = state.nextSlot;
 }
 
@@ -71,7 +69,7 @@ function currentTid(): number {
 export const exports: Record<string, ThunkImplementation> = {
     FlsAlloc(ctx, mem, args) {
         ensureProcessLocalFls();
-        if (nextSlot > MAX_SLOTS) return FLS_OUT_OF_INDEXES;
+        if (nextSlot >= FLS_INDEX_LIMIT) return FLS_OUT_OF_INDEXES;
         const index = nextSlot++;
         allocated.add(index);
         hypercallDataManager.ensureFlsCurrentThread(currentTid());
@@ -81,30 +79,36 @@ export const exports: Record<string, ThunkImplementation> = {
 
     FlsGetValue(ctx, mem, args) {
         ensureProcessLocalFls();
-        const dwFlsIndex = args[0];
-        if (!allocated.has(dwFlsIndex)) return 0;
-        return valuesByThread.get(currentTid())?.get(dwFlsIndex) ?? 0;
+        const scheduler = System.getInstance().scheduler;
+        const value = scheduler.flsGetValue(args[0] >>> 0);
+        // As NT: success clears LastError so a NULL value is distinguishable from failure.
+        scheduler.setLastError(value === undefined ? ERROR_INVALID_PARAMETER : 0);
+        return value ?? 0;
     },
 
     FlsSetValue(ctx, mem, args) {
         ensureProcessLocalFls();
-        const dwFlsIndex = args[0];
-        const lpFlsData = args[1];
-        if (!allocated.has(dwFlsIndex)) return 0;
-        const tid = currentTid();
-        let values = valuesByThread.get(tid);
-        if (!values) { values = new Map(); valuesByThread.set(tid, values); }
-        values.set(dwFlsIndex, lpFlsData >>> 0);
-        hypercallDataManager.ensureFlsCurrentThread(tid);
-        hypercallDataManager.setFlsSlot(dwFlsIndex, true, lpFlsData >>> 0, tid);
+        const dwFlsIndex = args[0] >>> 0;
+        const lpFlsData = args[1] >>> 0;
+        const scheduler = System.getInstance().scheduler;
+        if (!scheduler.flsSetValue(dwFlsIndex, lpFlsData)) {
+            scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        // The WASM FlsGetValue serves allocated indices from the page cache.
+        if (allocated.has(dwFlsIndex)) {
+            const tid = currentTid();
+            hypercallDataManager.ensureFlsCurrentThread(tid);
+            hypercallDataManager.setFlsSlot(dwFlsIndex, true, lpFlsData, tid);
+        }
         return 1;
     },
 
     FlsFree(ctx, mem, args) {
         ensureProcessLocalFls();
-        const dwFlsIndex = args[0];
+        const dwFlsIndex = args[0] >>> 0;
         if (!allocated.delete(dwFlsIndex)) return 0;
-        for (const values of valuesByThread.values()) values.delete(dwFlsIndex);
+        System.getInstance().scheduler.flsClearSlotAllThreads(dwFlsIndex);
         hypercallDataManager.setFlsSlot(dwFlsIndex, false, 0);
         return 1;
     },

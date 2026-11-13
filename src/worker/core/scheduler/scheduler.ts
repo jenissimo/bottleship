@@ -3854,11 +3854,34 @@ export class Scheduler {
         return this.tlsSlots.has(index);
     }
 
+    /** As NT: any index below TLS_INDEX_LIMIT is stored, allocated or not; only an index past
+     *  the expansion range fails (ERROR_INVALID_PARAMETER, set by the caller). */
     tlsSetValue(index: number, value: number): boolean {
         const t = this.getCurrentThread();
-        if (!t || !this.tlsSlots.has(index)) return false;
-        this.storeTlsValue(t.id, t, index, value >>> 0);
+        if (!t || (index >>> 0) >= TLS_INDEX_LIMIT) return false;
+        this.storeTlsValue(t.id, t, index >>> 0, value >>> 0);
         return true;
+    }
+
+    // ═══ FLS — values live in the thread's RTL_FLS_DATA (TEB+0xFB4), the block the guest
+    // stubs read; the hypercall page's FLS table is a cache of it for the WASM FlsGetValue.
+
+    /** undefined = ERROR_INVALID_PARAMETER: index 0 / past FLS_MAXIMUM_AVAILABLE, or no block
+     *  yet (NT allocates it on the thread's first FlsSetValue). */
+    flsGetValue(index: number): number | undefined {
+        const t = this.getCurrentThread();
+        return t ? this.tebManager.readFlsSlot(t.id, index >>> 0) : undefined;
+    }
+
+    flsSetValue(index: number, value: number): boolean {
+        const t = this.getCurrentThread();
+        const memory = this.process?.memory;
+        if (!t || !memory) return false;
+        return this.tebManager.writeFlsSlot(t.id, index >>> 0, value >>> 0, memory);
+    }
+
+    flsClearSlotAllThreads(index: number): void {
+        this.tebManager.clearFlsSlotAllThreads(index >>> 0);
     }
 
     /**
@@ -3970,6 +3993,7 @@ export class Scheduler {
             if (t.tebAddress > 0) this.tebManager.syncLastError(t.id, code >>> 0);
         }
         if (this.process) this.process.lastError = code >>> 0;
+        else this.detachedLastError = code >>> 0;
         // Keep the WASM hypercall page in sync: GetLastError is served from that
         // page (hpBase+OFF_HC_LAST_ERROR), which is otherwise only refreshed on a
         // context switch. A JS thunk that fails and then the guest immediately
@@ -4012,14 +4036,29 @@ export class Scheduler {
         if (t.tebAddress > 0) this.tebManager.syncLastError(t.id, code >>> 0);
     }
 
+    /**
+     * TEB+0x34 is the one LastError store: the trap-free guest stubs (kernel32/teb-stubs.ts),
+     * the WASM SetLastError/TlsGetValue and every JS setter write it. thread.lastError and the
+     * hypercall page are caches of it, authoritative only for a thread that has no TEB.
+     */
+    /** LastError before a process is attached (no thread, no Process): host-side callers only. */
+    private detachedLastError = 0;
+
+    private tebLastError(t: Thread): number | undefined {
+        return this.tebManager.getTebAddress(t.id) !== undefined
+            ? this.tebManager.readLastError(t.id) >>> 0 : undefined;
+    }
+
     getLastError(): number {
         const t = this.getCurrentThread();
+        const fromTeb = t ? this.tebLastError(t) : undefined;
+        if (fromTeb !== undefined) return fromTeb;
         // The WASM fast SetLastError does not enter JS; the live owner reads its
         // hypercall slot until parking snapshots it into the Thread record.
         if (t?.state === ThreadState.RUNNING && hypercallDataManager.isInitialized()) {
             return hypercallDataManager.readLastError();
         }
-        return t ? t.lastError >>> 0 : (this.process?.lastError ?? 0);
+        return t ? t.lastError >>> 0 : (this.process ? this.process.lastError >>> 0 : this.detachedLastError);
     }
 
     pinCurrentThread(): void {
@@ -5187,7 +5226,8 @@ export class Scheduler {
             this.currentThreadId = thread.id;
             // Async wake and ordinary switches publish the same owner metadata.
             if (hypercallDataManager.isInitialized()) {
-                hypercallDataManager.syncThreadData(thread.id, thread.lastError, thread.tebAddress);
+                hypercallDataManager.syncThreadData(
+                    thread.id, this.tebLastError(thread) ?? thread.lastError, thread.tebAddress);
             }
         } else if (context) {
             thread.context = context;
@@ -5219,7 +5259,7 @@ export class Scheduler {
         // any park/suspend relinquishes CPU ownership, including blocking waits.
         if (thread.state === ThreadState.RUNNING && newState !== ThreadState.RUNNING &&
             thread.id === this.currentThreadId && hypercallDataManager.isInitialized()) {
-            thread.lastError = hypercallDataManager.readLastError();
+            thread.lastError = this.tebLastError(thread) ?? hypercallDataManager.readLastError();
         }
         if (!isValidTransition(thread.state, newState)) {
             Logger.error(LogCategory.THREAD,
