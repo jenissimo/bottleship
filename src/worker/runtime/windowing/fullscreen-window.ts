@@ -17,7 +17,7 @@ import { System } from "../../core/system";
 import { Logger, LogCategory } from "../../core/logger";
 import { Mem } from "../../core/memory/mem-accessor";
 import { isValidAddress } from "../../core/memory/address-guard";
-import { windows as sharedWindows } from "../../modules/user32/shared-state";
+import { getVirtualScreenRect, windows as sharedWindows } from "../../modules/user32/shared-state";
 import { clearPresentedClientRect, setPresentedClientRect } from "../../backends/webgpu/shared/present-geometry";
 import { activateTopLevelWindow } from "../../modules/user32/activation-messages";
 
@@ -118,11 +118,14 @@ export const EMPTY_CLIENT_BACK_BUFFER_EXTENT = 8;
  * dimension resolved from the device window's client area and written BACK into the
  * caller's struct (BackBufferWidth @ +0, BackBufferHeight @ +4 in both D3D8 and D3D9).
  *
- * wined3d does this for both generations (wined3d_swapchain_state_init at creation,
- * wined3d_swapchain_resize_buffers on Reset) and uses 8 for a dimension whose client size
- * is zero as well: a window that exists but has not been sized yet. A window nobody
- * tracks is a different case and is left alone, so the caller's own fallback stays
- * visible instead of an invented extent.
+ * wined3d resolves a zero dimension from the client area for both generations
+ * (wined3d_swapchain_state_init at creation, wined3d_swapchain_resize_buffers on Reset),
+ * and at creation it uses 8 for a dimension whose client size is zero as well: a window
+ * that exists but has not been sized yet. On Reset wined3d takes the client size as it
+ * is, so an empty client area gives a zero extent there; using 8 on Reset too is our
+ * choice, so a device reset while its window is still empty keeps a usable back buffer.
+ * A window nobody tracks is a different case and is left alone, so the caller's own
+ * fallback stays visible instead of an invented extent.
  *
  * A fullscreen device with a zero extent is malformed; it is left for the parameter
  * validator to refuse.
@@ -163,11 +166,19 @@ export function resolveWindowedBackBufferExtent(
 
 const MAX_PARENT_DEPTH = 32;
 
+// @transient(log-once marks for device windows whose client area reaches past the screen; diagnostics only)
+const loggedOffScreenClients = new Set<number>();
+
 /**
  * A device presents into `hwnd`'s client area (0 = it owns the screen): the presenters show
  * its frame where that client area lies inside the host view. Called on every Present, so
  * it walks the parent chain without allocating; an unknown window is treated like a
- * fullscreen device, which is what every present was before.
+ * fullscreen device, which is what every present was before. The child walk repeats
+ * getAbsoluteWindowPosition's on purpose: that helper allocates a cycle-guard Set per
+ * call, and this runs on every Present.
+ *
+ * A client area that reaches past the screen is shown as far as the screen goes, as on
+ * Windows; that is logged once per window, since such a package needs a larger desktop.
  */
 export function publishPresentedClient(hwnd: number): void {
     const win = hwnd ? sharedWindows.get(hwnd >>> 0) : undefined;
@@ -184,6 +195,15 @@ export function publishPresentedClient(hwnd: number): void {
         cur = parent;
     }
     setPresentedClientRect(x, y, win.width, win.height);
+    if (!loggedOffScreenClients.has(hwnd >>> 0)) {
+        const screen = getVirtualScreenRect();
+        if (x < screen.left || y < screen.top || x + win.width > screen.right || y + win.height > screen.bottom) {
+            loggedOffScreenClients.add(hwnd >>> 0);
+            Logger.log(LogCategory.SYSTEM,
+                `Present: the client area of hwnd=0x${(hwnd >>> 0).toString(16)} (${x},${y} ${win.width}x${win.height}) `
+                + `reaches past the screen (${screen.left},${screen.top}-${screen.right},${screen.bottom}); only its on-screen part is shown`);
+        }
+    }
 }
 
 /**

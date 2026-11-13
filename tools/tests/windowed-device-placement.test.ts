@@ -3,9 +3,11 @@
  * where that client area lies inside the host view V, and a windowed device no longer
  * publishes a view of its own.
  */
-import { afterEach, beforeEach, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { Logger } from '../../src/worker/core/logger';
+import { WebGPUBackend } from '../../src/worker/backends/webgpu/webgpu-backend';
 import { System, type HostView } from '../../src/worker/core/system';
-import { windows, type WindowInfo } from '../../src/worker/modules/user32/shared-state';
+import { getVirtualScreenRect, windows, type WindowInfo } from '../../src/worker/modules/user32/shared-state';
 import {
     clearPresentedClientRect, presentedClientPlacement, setGuestView, setPresentedClientRect,
 } from '../../src/worker/backends/webgpu/shared/present-geometry';
@@ -199,4 +201,61 @@ test('a windowed D3D8 Reset publishes no view; a fullscreen one sets the mode', 
     view.setUint32(16 + 28, 0, true);
     expect((adapter as D3D8DeviceAdapter).reset(16, mem)).toBe(0);
     expect(published).toEqual([{ x: 0, y: 0, width: 640, height: 480 }]);
+});
+
+describe('the canvas present passes the placement to the post-fx chain', () => {
+    function backendRecording() {
+        const opts: Array<Record<string, unknown>> = [];
+        const be = Object.create(WebGPUBackend.prototype) as Record<string, unknown>;
+        Object.assign(be, {
+            device: {}, format: 'bgra8unorm',
+            postFx: { present: (_s: unknown, _t: unknown, _e: unknown, o: Record<string, unknown>) => { opts.push({ ...o }); } },
+            getCanvasSize: () => ({ width: 1280, height: 960 }),
+            screenPlaneUv: [0, 0, 1, 1],
+        });
+        const draw = () => (be as unknown as WebGPUBackend).drawTexture(
+            {} as GPUTextureView, {} as GPUTextureView, {} as GPUCommandEncoder, true, undefined, undefined, undefined, true,
+            { srcW: 800, srcH: 600, outW: 1280, outH: 960, toCanvas: true, clientPlane: true });
+        return { opts, draw };
+    }
+
+    test('a client area that is the view: no placement, the back buffer size', () => {
+        const { opts, draw } = backendRecording();
+        setPresentedClientRect(0, 0, 640, 480);
+        draw();
+        expect(opts[0]).toMatchObject({ sourceWidth: 800, sourceHeight: 600, sourceUv: undefined, destPlace: undefined });
+    });
+
+    test('a client area inside the view: its placement and uv, and the view size as the source size', () => {
+        const { opts, draw } = backendRecording();
+        setPresentedClientRect(40, 40, 560, 400);
+        draw();
+        expect(opts[0]).toMatchObject({
+            sourceWidth: 640, sourceHeight: 480, sourceUv: [0, 0, 1, 1],
+            destPlace: [40 / 640, 40 / 480, 600 / 640, 440 / 480],
+        });
+    });
+
+    test('an empty client area places nothing instead of the previous placement', () => {
+        const { opts, draw } = backendRecording();
+        setPresentedClientRect(40, 40, 560, 400);
+        draw();
+        setPresentedClientRect(40, 40, 0, 0);
+        draw();
+        expect(opts[1]!.destPlace).toEqual([0, 0, 0, 0]);
+    });
+});
+
+test('a client area reaching past the screen is logged once per window, one inside it never', () => {
+    const logs: string[] = [];
+    const spy = spyOn(Logger, 'log').mockImplementation(((_c: unknown, m: string) => { logs.push(m); }) as never);
+    try {
+        const screen = getVirtualScreenRect();
+        makeWindow(TOP, 0, screen.left, screen.top, (screen.right - screen.left) + 160, (screen.bottom - screen.top) + 120);
+        publishPresentedClient(TOP);
+        publishPresentedClient(TOP);
+        makeWindow(CHILD, 0, screen.left + 10, screen.top + 10, 100, 100);
+        publishPresentedClient(CHILD);
+    } finally { spy.mockRestore(); }
+    expect(logs.filter(m => m.includes('reaches past the screen'))).toHaveLength(1);
 });

@@ -14,6 +14,7 @@ import {
     resolveWindowedBackBufferExtent,
 } from '../../src/worker/runtime/windowing/fullscreen-window';
 import { createStateExports } from '../../src/worker/modules/d3d8/state';
+import { createFactoryExports } from '../../src/worker/modules/d3d8/factory';
 import { deviceCreationParams, devices } from '../../src/worker/modules/d3d8/shared-state';
 import type { D3D8DeviceAdapter } from '../../src/worker/backends/webgpu/d3d8/d3d8-device-adapter';
 
@@ -120,5 +121,31 @@ describe('IDirect3DDevice8_Reset with a zero back buffer', () => {
     test('a fullscreen Reset is passed through unchanged', () => {
         withWindows({ width: 560, height: 400 }, null);
         expect(reset(false, HWND)).toEqual([[0, 0]]);
+    });
+});
+
+describe('IDirect3D8_CreateDevice with a zero back buffer', () => {
+    const create = async (windowed: boolean, hDeviceWindow: number, hFocusWindow: number) => {
+        params(0, 0);
+        view.setUint32(PP + 24, hDeviceWindow, true);
+        view.setUint32(PP + 28, windowed ? 1 : 0, true);
+        const base = System.getInstance() as unknown as Record<string, unknown>;
+        systemSpy?.mockRestore();
+        systemSpy = spyOn(System, 'getInstance').mockReturnValue({
+            ...base,
+            windowManager: { getWindow: () => undefined },
+            process: { canvas: {}, v86: undefined },
+            services: { render: { getBackend: () => { throw new Error('stop after the parameters were read'); } } },
+        } as unknown as System);
+        await createFactoryExports().IDirect3D8_CreateDevice({} as never, memory, [0, 0, 1, hFocusWindow, 0x20, PP, 0x200]);
+        return declared();
+    };
+
+    test('the declared size becomes the device window\'s client size before the backend is touched', async () => {
+        sharedWindows.set(HWND, { handle: HWND, x: 0, y: 0, width: 560, height: 400 } as never);
+        Mem.bind(() => memory);
+        expect(await create(true, HWND, 0)).toEqual([560, 400]);
+        expect(await create(true, 0, HWND)).toEqual([560, 400]);
+        expect(await create(false, HWND, 0)).toEqual([0, 0]);
     });
 });
