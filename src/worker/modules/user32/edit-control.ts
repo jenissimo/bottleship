@@ -871,6 +871,19 @@ export function handleEditMessage(
                 }
                 return 0;
             }
+            if (ch === 0x0A) { // Ctrl+Enter: a new line in any multiline edit (Wine EDIT_WM_Char '\n')
+                if ((child.style & ES_MULTILINE) === 0) return 0;
+                if (!isReadOnly(child)) {
+                    replaceSelection(child, '\r\n', true);
+                    return 0;
+                }
+                // Read-only: the caret goes to the start of the next line (MoveHome, MoveDown).
+                const lines = editLines(child);
+                const from = lineFromCharIndex(child, clamp(state.selEnd, 0, len()));
+                state.selStart = state.selEnd = lines[Math.min(from + 1, lines.length - 1)].start;
+                ensureCaretVisible(child, state);
+                return 0;
+            }
             // TranslateMessage folds Ctrl+key into a control character; the class turns
             // those back into the clipboard messages (Wine EDIT_WM_Char). A password
             // edit refuses to hand its content out, so ^C/^X do nothing there.

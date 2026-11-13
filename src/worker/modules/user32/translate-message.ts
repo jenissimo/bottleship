@@ -57,10 +57,23 @@ export const CONTROL_NONE = -2;
 /**
  * The control character a key types with Ctrl down and Alt up; CONTROL_NONE when the key
  * types nothing; -1 when the key has no control column and types as without Ctrl.
- * Keyed by virtual key, like the US layout's own table (kbdus): Ctrl+A..Z are 0x01..0x1A
- * with or without Shift; [ \ ] (and the ISO key left of Z), Backspace, Esc, Enter, Space
- * and Break have a Ctrl column but no Ctrl+Shift column; 2, 6 and - have only a
- * Ctrl+Shift column. 0x00 (Ctrl+Shift+2) is a character, which is why "none" is not 0.
+ * Keyed by virtual key, as the US layout's table (kbdus) has it. 0x00 (Ctrl+Shift+2) is a
+ * character, which is why "none" is not 0.
+ *
+ *   key                 | plain   | Shift   | Ctrl        | Ctrl+Shift
+ *   A..Z                | a..z    | A..Z    | 01..1A      | 01..1A
+ *   [ \ ] VK_OEM_102    | [ \ ] \ | { | } | | 1B 1C 1D 1C | none
+ *   Backspace           | 08      | 08      | 7F          | none
+ *   Esc                 | 1B      | 1B      | 1B          | none
+ *   Enter               | 0D      | 0D      | 0A          | none
+ *   Space               | 20      | 20      | 20          | none
+ *   Cancel (Ctrl+Break) | 03      | 03      | 03          | none
+ *   2 6 -               | 2 6 -   | @ ^ _   | none        | 00 1E 1F
+ *
+ * The Cancel row only matches when the host reports Ctrl+Pause as VK_CANCEL (keyCode 3,
+ * as Chrome on Windows does); a host that reports VK_PAUSE (19) never reaches it.
+ * Keys with no Ctrl column at all, and 2/6/- without Shift, still type as without Ctrl
+ * here (see the follow-up issue on keys without a Ctrl column).
  */
 export function controlChar(vk: number, shiftDown: boolean): number {
     if (vk >= 0x41 && vk <= 0x5A) return vk - 0x40;
