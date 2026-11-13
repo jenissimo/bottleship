@@ -11,12 +11,27 @@ How the networking stack works inside is described in
 ## Play together
 
 1. Open BottleShip (for example https://bottleship.happydog.games) and load the game.
-2. Open **Settings → Network**, enter the LAN server address and a room name, and
-   connect. The status shows when the connection is ready.
-3. Send the others an invite: **Copy invite link** puts the server and room into the
-   page URL. Opening the link fills in the same settings.
-4. In the game, use its LAN or TCP/IP multiplayer menu. One player hosts, the others
-   look for games on the local network and join.
+2. In the game, open its LAN or TCP/IP multiplayer menu. The first time the game
+   reaches for the network (it searches for games, hosts one or connects to an
+   address), BottleShip pauses it and asks: **Create room**, **Join room** or
+   **Not now**. Nothing is sent to the relay server before you choose.
+3. Whoever creates the room sends the others **Copy link for a friend**. For a game
+   from the library the link opens the same game and the same room; for a game you
+   loaded yourself it carries only the room, and your friend needs their own copy.
+   Opening the link preselects the room, so joining is one click. A room name typed
+   or pasted into **Join room** works too.
+4. One player hosts, the others look for games on the local network and join.
+
+Rooms are public: anyone who knows the room name can join it. **Not now** leaves the
+game as on a computer without a network (it finds no games, and connecting to
+another address fails); BottleShip does not ask again until the page is reloaded.
+**Remember for this game** keeps the answer for that game in this browser. Traffic
+that stays inside the game itself (a launcher talking to its game, a single-player
+game talking to its own local server) never asks. The network indicator in the top
+bar shows the room and opens the same panel (copy the link, disconnect).
+**Settings → Network** can also connect ahead of time; that counts as the answer.
+
+The server is the deployment's default; **Advanced** in the dialog changes it.
 
 Everyone needs the same game and the same game version. Each player gets a stable
 virtual IPv4 (and IPX) address; games that ask you to type the host's address accept
@@ -39,6 +54,13 @@ These quick-start commands explicitly enable public, name-only rooms. The defaul
 
 Then use `http://127.0.0.1:9001` as the server address. `GET /health` answers
 `{"service":"bottleship-lan","version":1}`.
+
+A BottleShip build offers a default server only when one is configured: set
+`VITE_LAN_SERVER` (an HTTP(S) origin, for example `https://lan.example.org`) in the
+build environment — for Cloudflare Pages, in the project's environment variables.
+Without it the dialog asks for an address. The server must list the site's origin in
+`allowedOrigins` (or `--origin`); a server that refuses the origin is reported as
+"This server doesn't accept connections from this site" rather than as unreachable.
 
 To let other machines on your network connect, listen on all interfaces and give the
 others your machine's address:
@@ -109,3 +131,13 @@ disconnects. The server URL is an HTTP(S) origin without a path; a room name is 
 letters, digits, `_` or `-`. The worker reports progress with `network_state` messages
 (offline, connecting, connected, disconnected or error). Invite links use
 `?lanServer=<url-encoded server>&room=<room>`.
+
+An embedder that wants the same ask-first behaviour sends
+`{ type: "set_network_consent", mode: "ask" }`. The worker then answers the game's first
+network operation with `{ type: "network_consent_request", id, api, operation, target? }`
+and keeps the calling thread waiting until the page replies
+`{ type: "network_consent_result", id, granted }` — after `set_network`, once
+`network_state` is `connected`. Without `set_network_consent` (mode `off`) the network
+follows `set_network` alone, as before. The BottleShip page answers the prompt
+unattended with `?lanConsent=auto` (the URL's or saved room, else a new one); the
+harness verb `networkConsent("create" | "join" | "offline")` answers an open one.

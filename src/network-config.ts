@@ -17,6 +17,112 @@ export interface NetworkStatus {
 }
 
 export const NETWORK_SETTINGS_KEY = "bottleship_network_v1";
+/** Per-game "Remember for this game" answers of the network permission dialog. */
+export const NETWORK_CONSENT_KEY = "bottleship_network_consent_v1";
+
+/** The relay this deployment offers; empty means the dialog asks for one. */
+export const DEFAULT_LAN_SERVER: string = import.meta.env.VITE_LAN_SERVER ?? "";
+
+const ROOM_ADJECTIVES = ["quiet", "brave", "lucky", "sunny", "swift", "clever", "gentle", "bold", "merry", "calm",
+    "bright", "jolly", "keen", "proud", "silver", "amber", "misty", "rusty", "salty", "windy"];
+const ROOM_ANIMALS = ["otter", "falcon", "badger", "heron", "walrus", "lynx", "marten", "puffin", "beaver", "gecko",
+    "narwhal", "osprey", "panda", "raven", "seal", "tapir", "wombat", "yak", "koala", "dolphin"];
+/** A room name a person can read aloud: quiet-otter-4821. */
+export function generateRoomName(random: (n: number) => number = n => {
+    const value = new Uint32Array(1); crypto.getRandomValues(value); return value[0] % n;
+}): string {
+    return `${ROOM_ADJECTIVES[random(ROOM_ADJECTIVES.length)]}-${ROOM_ANIMALS[random(ROOM_ANIMALS.length)]}-${String(1000 + random(9000))}`;
+}
+
+/** What a pasted "Join room" text names: a whole invite link, or just a room name. */
+export interface RoomInput { room: string; serverUrl?: string; invite?: string }
+export function parseRoomInput(text: string): RoomInput {
+    const value = text.trim();
+    if (/^[A-Za-z0-9_-]{1,64}$/.test(value)) return { room: value };
+    let url: URL;
+    try { url = new URL(value); } catch { throw new Error("Paste the link your friend sent, or a room name such as quiet-otter-4821."); }
+    const room = url.searchParams.get("room");
+    if (!room || !/^[A-Za-z0-9_-]{1,64}$/.test(room)) throw new Error("That link has no room in it.");
+    const serverUrl = url.searchParams.get("lanServer") ?? undefined;
+    const invite = new URLSearchParams(url.hash.replace(/^#/, "")).get("lanInvite") ?? undefined;
+    return { room, ...(serverUrl ? { serverUrl } : {}), ...(invite ? { invite } : {}) };
+}
+
+/** True when the page was opened with network settings in its URL (an invite link). */
+export function networkFromLink(search: string, hash = ""): boolean {
+    const params = new URLSearchParams(search);
+    return params.has("room") || params.has("lanServer") || new URLSearchParams(hash.replace(/^#/, "")).has("lanInvite");
+}
+
+/**
+ * What the permission dialog offers before the user touched anything: the link's room and
+ * server, else the saved choice, else the deployment's server and no room. A link with a
+ * room but no server (a friend's room-only link) uses the default server.
+ */
+export interface NetworkSuggestion { serverUrl: string; room: string; invite?: string; fromLink: boolean }
+export function networkSuggestion(search: string, hash: string, saved: NetworkConfig | null, defaultServer = DEFAULT_LAN_SERVER): NetworkSuggestion {
+    const params = new URLSearchParams(search);
+    const fromLink = networkFromLink(search, hash);
+    const room = params.get("room") ?? (fromLink ? "" : saved?.room ?? "");
+    const serverUrl = params.get("lanServer") ?? saved?.serverUrl ?? defaultServer;
+    const invite = new URLSearchParams(hash.replace(/^#/, "")).get("lanInvite") ?? undefined;
+    return { serverUrl, room: /^[A-Za-z0-9_-]{1,64}$/.test(room) ? room : "", ...(invite ? { invite } : {}), fromLink };
+}
+
+/** `?lanConsent=auto` answers the permission prompt with the configured room, for tests. */
+export function networkConsentAutoFromLocation(search: string): boolean {
+    return new URLSearchParams(search).get("lanConsent") === "auto";
+}
+
+/** How a friend opens the same game: the catalog id, or a public bundle URL for ?game=dev. */
+export interface ShareableGame { catalogId?: string; publicLoadUrl?: string }
+/**
+ * The link a friend opens to land in this game and this room. A game they cannot open from
+ * a URL (a local file, an OPFS import, a dev drop-folder bundle) gets a room-only link, and
+ * `includesGame` says so — the friend needs their own copy.
+ */
+export function buildFriendLink(origin: string, config: NetworkConfig, game: ShareableGame): { url: string; includesGame: boolean } {
+    const url = new URL("/", origin);
+    let includesGame = false;
+    if (game.catalogId && game.catalogId !== "dev") { url.searchParams.set("game", game.catalogId); includesGame = true; }
+    else if (game.publicLoadUrl) { url.searchParams.set("game", "dev"); url.searchParams.set("load", game.publicLoadUrl); includesGame = true; }
+    url.searchParams.set("lanServer", config.serverUrl);
+    url.searchParams.set("room", config.room);
+    return { url: networkInviteUrl(url.toString(), config), includesGame };
+}
+
+/** A `?load=` value only names something a friend can open if it is a public http(s) URL. */
+export function publicLoadUrl(load: string | null, origin: string): string | undefined {
+    if (!load) return undefined;
+    let url: URL;
+    try { url = new URL(load, origin); } catch { return undefined; }
+    if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
+    if (url.pathname.startsWith("/__wgb") || url.pathname.startsWith("/apps/external-wgb")) return undefined;
+    const host = url.hostname;
+    if (host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host.endsWith(".localhost")) return undefined;
+    return url.origin === origin ? url.pathname + url.search : url.toString();
+}
+
+export type RememberedConsent = { choice: "offline" } | { choice: "connect"; serverUrl: string; room: string };
+export function loadRememberedConsent(game: string, storage: Pick<Storage, "getItem"> | null = typeof localStorage === "undefined" ? null : localStorage): RememberedConsent | null {
+    try {
+        const entry = JSON.parse(storage?.getItem(NETWORK_CONSENT_KEY) ?? "{}")?.[game];
+        if (entry?.choice === "offline") return { choice: "offline" };
+        if (entry?.choice === "connect") {
+            const config = normalizeNetworkConfig({ serverUrl: entry.serverUrl, room: entry.room });
+            if (config) return { choice: "connect", serverUrl: config.serverUrl, room: config.room };
+        }
+    } catch { /* Invalid or unavailable storage: ask again. */ }
+    return null;
+}
+export function saveRememberedConsent(game: string, value: RememberedConsent | null,
+    storage: Pick<Storage, "getItem" | "setItem"> | null = typeof localStorage === "undefined" ? null : localStorage): void {
+    try {
+        const all = JSON.parse(storage?.getItem(NETWORK_CONSENT_KEY) ?? "{}") ?? {};
+        if (value) all[game] = value; else delete all[game];
+        storage?.setItem(NETWORK_CONSENT_KEY, JSON.stringify(all));
+    } catch { /* Storage may be unavailable. */ }
+}
 
 export function normalizeNetworkConfig(value: unknown): NetworkConfig | null {
   if (value == null) return null;

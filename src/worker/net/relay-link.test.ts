@@ -21,6 +21,18 @@ function link(url: string, room: string, net: LanNetwork, options: RelayLinkOpti
     return transport;
 }
 describe("worker LAN transport", () => {
+    test("a server that refuses this page's Origin is named as such, not as unreachable", async () => {
+        const server = createLanServer({ port: 0, allowedOrigins: ["https://allowed.example"] });
+        const port = await server.listen(), net = machine(9);
+        const connection = link("http://127.0.0.1:" + port, "origin", net, { transports: ["polling"], timeoutMs: 4000,
+            origin: "https://other.example", extraHeaders: { origin: "https://other.example" } });
+        try {
+            await expect(connection.ready).rejects.toThrow("This server doesn't accept connections from this site (https://other.example). Set your own server.");
+        } finally { net.attach(null); await server.close(); }
+        const down = machine(10), unreachable = link("http://127.0.0.1:" + port, "origin", down, { transports: ["polling"], timeoutMs: 4000, origin: "https://other.example" });
+        try { await expect(unreachable.ready).rejects.not.toThrow("doesn't accept"); }
+        finally { down.attach(null); }
+    });
     test("private room invitation reaches server auth through RelayLink", async () => {
         const env="BOTTLESHIP_LAN_RELAY_INVITE_REGRESSION_KEY";
         const key=Uint8Array.from({length:32},(_,i)=>i);

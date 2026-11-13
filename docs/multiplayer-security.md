@@ -1,6 +1,6 @@
 # Multiplayer access and security
 
-Rust and TypeScript use the same room policy and HMAC-SHA256 invitation format. Rooms are **private by default**. A missing signing key causes startup to fail when private rooms are configured. Binding a listener to a public interface must not silently grant access to every room.
+The BottleShip page connects to a relay only after the user agreed, when a game first needs the network (see [multiplayer](multiplayer.md)); until then the server never sees the visitor's address. Rust and TypeScript use the same room policy and HMAC-SHA256 invitation format. Rooms are **private by default**. A missing signing key causes startup to fail when private rooms are configured. Binding a listener to a public interface must not silently grant access to every room.
 
 ## Public rooms
 

@@ -14,6 +14,27 @@ export interface RelayLinkOptions {
     invite?: string;
     transports?: ("websocket" | "polling")[];
     timeoutMs?: number;
+    /** The page origin the server judges; defaults to this realm's location. */
+    origin?: string;
+    /** Test hook: headers a non-browser client sends (a browser sets Origin itself). */
+    extraHeaders?: Record<string, string>;
+}
+/** Shown when the relay is up but refused this page's Origin (its allowedOrigins list). */
+export function relayOriginRejectedMessage(origin: string): string {
+    return `This server doesn't accept connections from this site (${origin}). Set your own server.`;
+}
+/**
+ * A browser cannot read why a cross-origin handshake failed: a refused Origin (403 without
+ * CORS headers, from either server) reads exactly like a server that is down. /health
+ * answers every origin, so an opaque answer there means the server is up and refused us.
+ */
+export async function explainRelayFailure(url: string, error: Error, origin: string | undefined): Promise<Error> {
+    if (!origin || (error as { type?: string }).type !== "TransportError") return error;
+    try {
+        const health = await fetch(new URL("/health", url), { mode: "no-cors", cache: "no-store", signal: AbortSignal.timeout(3000) });
+        if (health.type === "opaque" || health.ok) return Object.assign(new Error(relayOriginRejectedMessage(origin)), { code: "ORIGIN_REJECTED" });
+    } catch { /* Unreachable: the transport error is the answer. */ }
+    return error;
 }
 const clientIds = new WeakMap<LanNetwork, string>();
 export class RelayLink implements NetTransport {
@@ -81,7 +102,9 @@ export class RelayLink implements NetTransport {
             reconnectionDelay: 500,
             reconnectionDelayMax: 10_000,
             auth: { version: PROTOCOL_VERSION, room, clientId, node: Array.from(net.node), ...(options.invite ? {invite: options.invite} : {}) },
+            ...(options.extraHeaders ? { extraHeaders: options.extraHeaders } : {}),
         });
+        const origin = options.origin ?? (globalThis as { location?: { origin?: string } }).location?.origin;
         this.deadline = setTimeout(() => this.failInitial(new Error("LAN server readiness timed out")), timeout);
         this.socket.on("connect", () => {
             this.socket.io.engine.on("drain", () => {
@@ -130,10 +153,13 @@ export class RelayLink implements NetTransport {
             this.net.setConnected(false, reason);
 
         });
+        let explaining = false;
         this.socket.on("connect_error", error => {
             if (this.closed) return;
             this.net.setConnected(false, error.message);
-            if (!this.settled) this.failInitial(error);
+            if (this.settled || explaining) return;
+            explaining = true;
+            void explainRelayFailure(url, error, origin).then(explained => this.failInitial(explained));
         });
         this.socket.connect();
     }

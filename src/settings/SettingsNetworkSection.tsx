@@ -41,7 +41,7 @@ export default function SettingsNetworkSection({
   };
   return (
     <SettingsSection>
-      <Hint>Join the same room as your friends, then choose LAN multiplayer in the game.</Hint>
+      <Hint>A game asks before it first uses the network. Connecting here answers for this session: join the same room as your friends, then choose LAN multiplayer in the game.</Hint>
       <form onSubmit={connect}>
         <SettingsRow title="LAN server">
           <input aria-label="LAN server" type="url" required placeholder="https://lan.example.org"

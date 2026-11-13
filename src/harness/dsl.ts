@@ -115,6 +115,9 @@ export class HarnessChain {
     clearModals(): this { return this.push("clearModals", []); }
     /** Answer the MessageBox already on screen (onModal only pre-arms). */
     dismissModal(button: number | string = "ok", required = true): this { return this.push("dismissModal", [button, required]); }
+    /** The network permission prompt: "state" reads it; "create" / "join" (room, server)
+     *  connect and answer it; "offline" is "Not now". `?lanConsent=auto` answers it unattended. */
+    networkConsent(choice: "state" | "create" | "join" | "offline" = "state", room?: string, serverUrl?: string): this { return this.push("networkConsent", [choice, room, serverUrl]); }
     // These can run >60s; give the RPC envelope a deadline derived from the verb's
     // own (so the default 60s timeout doesn't spuriously abort long bring-up waits).
     waitUntil(predicate: () => boolean, opts?: { timeoutMs?: number; pollMs?: number }): this { return this.pushTimed("waitUntil", [predicate, opts], (opts?.timeoutMs ?? 30_000) + 5_000); }
