@@ -14,6 +14,7 @@ import {
 import type { DDrawContext } from "../../src/worker/modules/ddraw/context";
 import { BaseComObject } from "../../src/worker/core/com/base-com-object";
 import { System } from "../../src/worker/core/system";
+import { SystemResourceProvider } from "../../src/worker/core/resources/system-resource-provider";
 import { lostSurfaceCount, recountLostSurfaces } from "../../src/worker/core/gpu/gpu-device-loss-contract";
 
 const bytes = (v: unknown) => {
@@ -191,7 +192,7 @@ describe("DirectDraw COM objects", () => {
         withoutProcess(() => {
             registerDDrawCodecs();
             const provider = System.getInstance().resourceProvider;
-            const table = (provider as unknown as { comObjects: { create(h: number, o: unknown): void } }).comObjects;
+            const table = (provider as unknown as { comObjects: { create(h: number, o: unknown): void; release(h: number): unknown } }).comObjects;
             const mipState = renderSurface({ surfacePtr: 0x30000, width: 4, height: 2, surfaceLost: true });
             const root = new DirectDrawSurfaceObject(0x5400, renderSurface({ mipSublevels: [mipState], mipMapCount: 2 }));
             const mip = new DirectDrawSurfaceObject(0x5400, mipState);
@@ -204,8 +205,9 @@ describe("DirectDraw COM objects", () => {
             const restoredRoot = ctx.object(rootRef) as DirectDrawSurfaceObject;
             const restoredMip = ctx.object(mipRef) as DirectDrawSurfaceObject;
             expect(restoredRoot.getState().mipSublevels![0]).toBe(restoredMip.getState());
-            provider.unregisterComObject(root.handle);
-            provider.unregisterComObject(mip.handle);
+            // Replace the table entries without freeing handles that remain live after restore.
+            table.release(root.handle);
+            table.release(mip.handle);
             table.create(restoredRoot.handle, restoredRoot);
             table.create(restoredMip.handle, restoredMip);
             try {
@@ -213,6 +215,10 @@ describe("DirectDraw COM objects", () => {
                 g2.ref(restoredRoot, "root");
                 g2.ref(restoredMip, "mip");
                 expect(bytes(g2.objects)).toBe(first);
+                const resources = provider.captureState(() => 0);
+                for (const handle of [restoredRoot.handle, restoredMip.handle]) {
+                    expect(resources.freeCom).not.toContain(handle & SystemResourceProvider.COM_SLOT_MASK);
+                }
                 recountLostSurfaces(liveSurfaceStates([restoredRoot, restoredMip]));
                 expect(lostSurfaceCount()).toBe(1);
             } finally {
