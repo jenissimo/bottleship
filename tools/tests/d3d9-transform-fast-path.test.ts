@@ -3,6 +3,9 @@ import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { registerFastPathD3D9Functions } from "../../src/worker/modules/d3d9/fast-path";
 import { createStateExports } from "../../src/worker/modules/d3d9/state";
 import { devices } from "../../src/worker/modules/d3d9/shared-state";
+import { preserveMemBinding } from "./helpers/scoped-process-state";
+
+preserveMemBinding();
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;

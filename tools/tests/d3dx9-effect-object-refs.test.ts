@@ -15,7 +15,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { setObjectParam, retainReturnedObject } from "../../src/worker/modules/d3dx9/effect-values";
 import { EffectParamClass, EffectParamType, type EffectParameter } from "../../src/worker/modules/d3dx9/effect-state";
 import {
-    addComRef, getComRefCount, releaseComRef, trackComObject,
+    addComRef, getComRefCount, releaseComRef, trackComObject, unpinGuestRefcountStoreForTests,
 } from "../../src/worker/modules/d3d9/com-refs";
 
 const A = 0x0aaa0000;
@@ -33,6 +33,7 @@ let prevFlag: unknown;
 beforeAll(() => {
     prevFlag = (globalThis as Record<string, unknown>).__d3d9MirrorRefcount;
     (globalThis as Record<string, unknown>).__d3d9MirrorRefcount = true;
+    unpinGuestRefcountStoreForTests();
 });
 afterAll(() => { (globalThis as Record<string, unknown>).__d3d9MirrorRefcount = prevFlag; });
 
