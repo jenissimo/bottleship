@@ -76,9 +76,10 @@ class WorkerTimeAccounting {
      * next_tick arms the yield. `delayMs` is main_loop's return — the sleep v86 is about
      * to ask for, which is what separates "parked on purpose" from "scheduling latency".
      */
-    noteTickExit(delayMs: number): void {
-        if (this.tickEnteredAt < 0) return; // hook pair broken; do not invent a duration
-        const dt = performance.now() - this.tickEnteredAt;
+    noteTickExit(delayMs: number): number {
+        const now = performance.now();
+        if (this.tickEnteredAt < 0) return now; // hook pair broken; do not invent a duration
+        const dt = now - this.tickEnteredAt;
         this.tickEnteredAt = -1;
         this.ticks++;
         this.inTickMs += dt;
@@ -87,7 +88,11 @@ class WorkerTimeAccounting {
         let b = 0;
         while (b < TICK_BUCKETS_MS.length - 1 && dt > TICK_BUCKETS_MS[b]!) b++;
         this.tickHistogram[b]!++;
+        return now;
     }
+
+    /** Monotonic in-tick total without building a snapshot. */
+    get inTickTotalMs(): number { return this.inTickMs; }
 
     /** Bracket a named non-tick region. Re-entrant: only the outermost pair is timed. */
     enterNonTick(kind: NonTickKind): void {

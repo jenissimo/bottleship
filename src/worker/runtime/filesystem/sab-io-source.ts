@@ -475,6 +475,9 @@ export class SabIoSource implements ZipSource {
         return buf;
     }
 
+    /** Monotonic total of synchronous block time, without building stats(). */
+    get waitMsTotal(): number { return this._waitMs; }
+
     /** One request's total block time (0 when the response was already there). */
     private recordBlock(ms: number): void {
         this._waitMs += ms;

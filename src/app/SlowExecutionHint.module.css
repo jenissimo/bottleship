@@ -1,0 +1,47 @@
+/* Same layer and surface as the touch first-run card: above the control layer, below modals. */
+.hint {
+  position: absolute;
+  left: 50%;
+  bottom: max(16px, env(safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  z-index: 6;
+  width: min(92%, 440px);
+  padding: 16px 16px 12px;
+  border-radius: var(--r-md, 10px);
+  border: 1px solid var(--line-2, #23404c);
+  border-left: 3px solid var(--amber, #f6a623);
+  background: rgba(7, 13, 17, 0.96);
+  box-shadow: var(--sh-2, 0 12px 30px rgba(0, 0, 0, 0.5));
+  color: var(--fg-1, #e9f4f4);
+  font-family: var(--font-body);
+  animation: perf-hint-in 220ms ease-out;
+}
+
+.hint__title {
+  font-size: var(--fs-md, 1.05rem);
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.hint__body {
+  margin: 8px 0 0;
+  font-size: var(--fs-base, 0.94rem);
+  line-height: 1.5;
+  color: var(--fg-2, #8eabb4);
+}
+
+.hint__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+@keyframes perf-hint-in {
+  from { opacity: 0; transform: translate(-50%, 8px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hint { animation: none; }
+}

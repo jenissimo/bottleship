@@ -40,8 +40,10 @@ setChildSessionPublisher((port, record) => {
 /** Set by the page (set_jit_policy) or inherited by a child; applied at every v86 init. */
 // @transient(host JIT policy from the page, applies to every session in this worker by design)
 let hostJitMode: HostJitMode = "on";
+execHealth.setSinks((hint) => self.postMessage(hint), (snapshot) => statsOverlay.setExecHealth(snapshot));
 setChildBootContext(() => ({
   jitMode: hostJitMode,
+  jitReason: execHealth.getPolicyReason(),
   config: EmulatorConfig.getInstance().snapshotForChild(),
   registry: System.getInstance().registry.serialize(),
   namedObjects: namedObjects.snapshot(),
@@ -186,7 +188,9 @@ import { videoEngine } from "../video/video-engine";
 import { preemptionManager } from "./core/cpu/preemption-manager";
 import { writeGuestCode } from "./core/memory/guest-code";
 import { statsOverlay } from "./core/stats-overlay";
+import { execHealth, type JitReason } from "./core/execution-health";
 import { workerTime } from "./core/worker-time-accounting";
+import { readRetiredInsns } from "./core/cpu/cpu-views";
 import { hypercallDataManager } from "./core/cpu/hypercall-data";
 import { d3d9WasmArena } from "./backends/webgpu/d3d9/d3d9-wasm-arena";
 import { bootMark, dumpBootTimeline } from "./core/boot-timer";
@@ -2685,6 +2689,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         setBootOverlayActive(false);
         (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo?.markFirstFrame();
         (globalThis as { __wgbBlockCache?: { setProfilePhase(phase: string): void } }).__wgbBlockCache?.setProfilePhase("gameplay");
+        execHealth.noteFirstPresent(performance.now());
         self.postMessage({ type: "first_present" });
       });
 
@@ -3055,6 +3060,13 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           if (hostJitWrites.length) {
             Logger.log(LogCategory.SYSTEM, `[JIT] host mode "${hostJitMode}": set_jit_config ${hostJitWrites.map(([i, v]) => `${i}=${v}`).join(",")}`);
           }
+          const jitExports = cpu.wm.exports;
+          execHealth.attach({
+            readInsns: () => readRetiredInsns(cpu),
+            readInTickMs: () => workerTime.inTickTotalMs,
+            readSabWaitMs: () => (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo?.waitMsTotal ?? 0,
+            getJitConfig: typeof jitExports.get_jit_config === "function" ? (i: number) => jitExports.get_jit_config(i) : undefined,
+          });
           hypercallDataManager.initialize(cpu, preemptionManager.getHypercallPageBase());
           // Report the effective FPU mode this bundle booted with (manifest fpuStrict OR a
           // persisted dbg.relaxedFpu(false)) so the dev toolbar "FPU: Strict/Relaxed" button
@@ -3262,7 +3274,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
               allocateHeapSlab();
             }
           }
-        }); workerTime.noteTickExit(typeof t === "number" ? t : 0); };
+        }); execHealth.maybeSample(workerTime.noteTickExit(typeof t === "number" ? t : 0)); };
 
         // Replace yield-Worker with same-thread MessageChannel to eliminate cross-Worker
         // postMessage overhead (~14% CPU for Re-Volt at 1000 ticks/sec).
@@ -3549,6 +3561,7 @@ const handleWorkerMessage = (event: MessageEvent): void => {
     self.requestAnimationFrame = childFrameClock.request;
     self.cancelAnimationFrame = childFrameClock.cancel;
     if (isHostJitMode(childBoot.jitMode)) hostJitMode = childBoot.jitMode;
+    execHealth.setPolicy(hostJitMode, childBoot.jitReason ?? "default");
     if (childBoot.config) EmulatorConfig.getInstance().restoreForChild(childBoot.config);
     applySessionNetwork(EmulatorConfig.getInstance().network);
     const canvas = new OffscreenCanvas(640, 480);
@@ -3620,6 +3633,8 @@ const handleWorkerMessage = (event: MessageEvent): void => {
   if (message?.type === "set_jit_policy") {
     // Must arrive before load_bundle: the mode is applied when v86 initialises.
     if (isHostJitMode(message.mode)) hostJitMode = message.mode;
+    const reason = message.reason as JitReason | undefined;
+    execHealth.setPolicy(hostJitMode, reason === "query" || reason === "ios-webkit-27" ? reason : "default");
     // JIT_DISABLED only stops compiling; a replayed AOT recording would still run modules.
     if (hostJitMode === "off") (globalThis as Record<string, unknown>).__aotNoAutoLoad = true;
     return;
