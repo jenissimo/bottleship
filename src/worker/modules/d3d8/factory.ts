@@ -318,7 +318,7 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             // Resize canvas to match backbuffer (like DDraw SetDisplayMode does). Only a
             // FULLSCREEN device is a mode-set — a windowed backbuffer lives inside the
             // desktop and must not become SM_CXSCREEN. (Windowed @ +28 in d3d8.)
-            publishCreateDeviceHostView(view, pPresParams, hFocusWindow, bbWidth, bbHeight);
+            publishCreateDeviceHostView(view, pPresParams, bbWidth, bbHeight);
 
             // FULLSCREEN device: also resize the focus/device window's tracked client rect to
             // the back-buffer size, like real D3D8 does. Apps GetClientRect() the now-fullscreen

@@ -17,7 +17,8 @@ import { System } from "../../core/system";
 import { Logger, LogCategory } from "../../core/logger";
 import { Mem } from "../../core/memory/mem-accessor";
 import { isValidAddress } from "../../core/memory/address-guard";
-import { getAbsoluteWindowPosition, windows as sharedWindows } from "../../modules/user32/shared-state";
+import { windows as sharedWindows } from "../../modules/user32/shared-state";
+import { clearPresentedClientRect, setPresentedClientRect } from "../../backends/webgpu/shared/present-geometry";
 import { activateTopLevelWindow } from "../../modules/user32/activation-messages";
 
 const WM_SIZE = 0x0005;
@@ -160,16 +161,29 @@ export function resolveWindowedBackBufferExtent(
     return { width, height };
 }
 
+const MAX_PARENT_DEPTH = 32;
+
 /**
- * A WINDOWED device's back buffer is shown where its device window's client area is: the
- * host view gets the back-buffer size at that window's screen origin, so the pointer,
- * which is reported as a screen position, lands on the picture. A fullscreen device is a
- * mode set and goes through System.requestHostResize instead.
+ * A device presents into `hwnd`'s client area (0 = it owns the screen): the presenters show
+ * its frame where that client area lies inside the host view. Called on every Present, so
+ * it walks the parent chain without allocating; an unknown window is treated like a
+ * fullscreen device, which is what every present was before.
  */
-export function requestWindowedDeviceHostView(hwnd: number, width: number, height: number): void {
+export function publishPresentedClient(hwnd: number): void {
     const win = hwnd ? sharedWindows.get(hwnd >>> 0) : undefined;
-    const origin = win ? getAbsoluteWindowPosition(win) : null;
-    System.getInstance().requestHostViewAt(origin?.x ?? 0, origin?.y ?? 0, width, height);
+    if (!win) {
+        clearPresentedClientRect();
+        return;
+    }
+    let x = win.x, y = win.y;
+    let cur = win;
+    for (let depth = 0; depth < MAX_PARENT_DEPTH && (cur.style & WS_CHILD) !== 0 && cur.parent; depth++) {
+        const parent = sharedWindows.get(cur.parent);
+        if (!parent) break;
+        x += parent.x; y += parent.y;
+        cur = parent;
+    }
+    setPresentedClientRect(x, y, win.width, win.height);
 }
 
 /**

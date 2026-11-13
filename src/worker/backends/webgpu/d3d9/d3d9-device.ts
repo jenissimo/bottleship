@@ -112,7 +112,7 @@ import { pixelShaderComObjects, vertexDeclComObjects, vertexShaderComObjects } f
 // renderSpace only: the windowed regime is exactly where the guest picture space and the
 // guest POINTER space stop coinciding, so the verb has to be able to print both.
 import { windows as sharedUserWindows, getVirtualScreenRect } from "../../../modules/user32/shared-state";
-import { requestWindowedDeviceHostView } from "../../../runtime/windowing/fullscreen-window";
+import { publishPresentedClient } from "../../../runtime/windowing/fullscreen-window";
 import { getPresentRect } from "../shared/present-geometry";
 import { Op, opName } from "./shader/sm-enums";
 import { VS_FLOAT_REGISTER_COUNT } from "./shader/vs-codegen";
@@ -2292,8 +2292,9 @@ export class D3D9Device {
      * in real D3D9 — only override host/viewport when an explicit size was given.
      */
     private publishBackBufferView(width: number, height: number, fullscreen: boolean): void {
+        // A windowed device publishes nothing: its frame is placed at its window's client
+        // area inside the view on every Present.
         if (fullscreen) System.getInstance().requestHostResize(width, height, { modeSet: true });
-        else requestWindowedDeviceHostView(this.deviceWindowHwnd, width, height);
     }
 
     setBackBufferSize(width: number, height: number, fullscreen = false, hwnd = 0): void {
@@ -9236,6 +9237,8 @@ export class D3D9Device {
         }
 
         this.lastActualPresent = performance.now();
+        // Where the canvas present places this frame inside the host view.
+        if (guestSide) publishPresentedClient(this.deviceIsWindowed ? this.deviceWindowHwnd : 0);
         if (this.role !== "front") this.fetchAuditOnPresent();
         // Defensive: if the guest left an RT bound at Present, flush its work to that RT, then
         // return authority to the backbuffer so the present actually copies the scene to the canvas.

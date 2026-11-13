@@ -1005,9 +1005,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         this.setWindowed(view.getUint32(pPresentationParameters + 28, true) !== 0);
         const resetDeviceWindow = view.getUint32(pPresentationParameters + 24, true) >>> 0;
         if (resetDeviceWindow) this.presentWindow = resetDeviceWindow;
-        System.getInstance().requestHostResize(width, height, {
-            modeSet: this.presentsExclusiveFullscreen,
-        });
+        // Only a fullscreen Reset sets the mode; a windowed device's frame is placed at its
+        // window's client area inside the view on every Present.
+        if (this.presentsExclusiveFullscreen) {
+            System.getInstance().requestHostResize(width, height, { modeSet: true });
+        }
         this.renderTarget = createRenderTarget(width, height);
         this.dropPresentComposite();
         this.rtOverride = null;
@@ -2489,7 +2491,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                 // The render target is guest-sized and the canvas is host-sized; without both
                 // the post-fx chain reads src===out and aspect/integer scaling silently vanish.
                 { srcW: presentSource.width, srcH: presentSource.height,
-                  outW: canvasTex.width, outH: canvasTex.height, toCanvas: true },
+                  outW: canvasTex.width, outH: canvasTex.height, toCanvas: true, clientPlane: true },
             );
 
             // Composite GDI overlay (cursor / text / dialogs drawn via GDI on top of D3D8)
