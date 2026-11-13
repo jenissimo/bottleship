@@ -899,7 +899,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     // On real Windows this just calls SetLastError, ignoring dwType.
     exports['SetLastErrorEx'] = (ctx, mem, args) => {
         const system = System.getInstance();
-        if (system.process) system.process.lastError = args[0] >>> 0;
+        system.scheduler.setLastError(args[0] >>> 0);
         return 0;
     };
 

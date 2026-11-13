@@ -27,9 +27,10 @@ const FREED = 5, EXPANSION = 64, PRESET = 7;
 const CALLS: Array<[number, number, number, boolean]> = [
     [3, 0x11223344, 1, true],
     [PRESET, 0xdeadbeef, 1, true],
-    [FREED, 0x55, 0, false],          // not TlsAlloc'd: JS answers FALSE
+    [FREED, 0x55, 1, false],          // not TlsAlloc'd: WASM declines, JS stores it as NT does
     [EXPANSION, 0x6464, 1, false],    // expansion index: WASM declines, JS stores it in the TEB array
-    [70, 0x70, 0, false],
+    [70, 0x70, 1, false],
+    [1088, 0x70, 0, false],           // past TLS_INDEX_LIMIT: FALSE
     [0xffffffff, 1, 0, false],
     [3, 0, 1, true],                  // NULL is a legitimate value
     [9, 0x99, 1, true],
@@ -164,7 +165,7 @@ describe.skipIf(!existsSync(lib) || !existsSync(wasm))('TlsSetValue hypercall, e
         const expectServed = CALLS.filter(c => c[3]).length;
 
         expect(js.returns).toEqual(CALLS.map(c => c[2]));
-        expect(js.values).toEqual({ 3: 0, [PRESET]: 0xdeadbeef, [FREED]: 0, 9: 0x99, [EXPANSION]: 0x6464 });
+        expect(js.values).toEqual({ 3: 0, [PRESET]: 0xdeadbeef, [FREED]: 0x55, 9: 0x99, [EXPANSION]: 0x6464 });
         expect(js.arrayWords[9]).toBe(0x99);
         expect(js.arrayWords[PRESET]).toBe(0xdeadbeef);
         expect(js.arrayWords[EXPANSION]).toBe(0x6464);   // one storage for every index

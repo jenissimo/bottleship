@@ -682,7 +682,7 @@ describe("field policies", () => {
         }
         system.implicitTlsEntries = [];
         expect(snapshot(a)).toBe(free);
-        const stubs = { heap: STUBS(1), crt: STUBS(2), caseFold: STUBS(3), locale: STUBS(4), mbwc: STUBS(5), mbwcDeclined: false, math: STUBS(6) } as unknown as InlineStubState;
+        const stubs = { heap: STUBS(1), crt: STUBS(2), caseFold: STUBS(3), locale: STUBS(4), mbwc: STUBS(5), mbwcDeclined: false, math: STUBS(6), teb: STUBS(7) } as unknown as InlineStubState;
         a.loader.restoreInlineStubs(stubs);
         expect(a.loader.captureInlineStubs()).toEqual(stubs);
         const withStubs = snapshot(a);
@@ -693,6 +693,6 @@ describe("field policies", () => {
     });
 
     test("the schema is pinned", () => {
-        expect(schemaHash(MODULE_IMAGES_SCHEMA as unknown as SaveValue)).toBe("d20656b52f2472e7");
+        expect(schemaHash(MODULE_IMAGES_SCHEMA as unknown as SaveValue)).toBe("1bddd228a57c6e8c");
     });
 });

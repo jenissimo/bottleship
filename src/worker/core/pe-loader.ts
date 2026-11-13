@@ -28,6 +28,7 @@ import { writeLocaleStubs, resetLocaleInlineStubs, type LocaleInlineStubs } from
 import { serializeLocaleStubTable, writeLocaleStubDestLimit } from '../modules/kernel32/locale-data';
 import { writeMbwcStubs, resetMbwcInlineStubs, type MbwcInlineStubs } from '../modules/kernel32/mbwc-stubs';
 import { serializeMbwcStubTable, writeMbwcStubDestLimit } from '../modules/kernel32/codepage-lut';
+import { writeTebStubs, TEB_STUB_EXPORTS, type TebInlineStubs } from '../modules/kernel32/teb-stubs';
 import { loadDiagnostics } from './diagnostics/load-diagnostics';
 import { writeGuestCode, invalidateGuestCode } from './memory/guest-code';
 import { markGuestPagesDirty, zeroGuestRange } from './memory/guest-page-dirty';
@@ -78,6 +79,7 @@ export interface InlineStubState {
     mbwc: MbwcInlineStubs | null;
     mbwcDeclined: boolean;
     math: CrtMathStubs | null;
+    teb: TebInlineStubs | null;
 }
 
 export class PELoader {
@@ -271,6 +273,10 @@ export class PELoader {
      */
     private mathInlineStubs: CrtMathStubs | null = null;
 
+    /** Trap-free kernel32 LastError/TLS/FLS accessors over the TEB. Emitted on the first
+     *  kernel32 import; see kernel32/teb-stubs writeTebStubs. */
+    private tebInlineStubs: TebInlineStubs | null = null;
+
     /** Dynamically-linked C runtime modules that export the cdecl malloc/free pair
      *  and the MSVC operator new/delete aliases — all share one slab fast path. */
     private static readonly CRT_SLAB_MODULES = new Set<string>([
@@ -326,7 +332,7 @@ export class PELoader {
         return structuredClone({
             heap: this.heapInlineStubs, crt: this.crtInlineStubs, caseFold: this.caseFoldInlineStubs,
             locale: this.localeInlineStubs, mbwc: this.mbwcInlineStubs, mbwcDeclined: this.mbwcStubsDeclined,
-            math: this.mathInlineStubs,
+            math: this.mathInlineStubs, teb: this.tebInlineStubs,
         });
     }
 
@@ -339,6 +345,7 @@ export class PELoader {
         this.mbwcInlineStubs = saved.mbwc;
         this.mbwcStubsDeclined = saved.mbwcDeclined;
         this.mathInlineStubs = saved.math;
+        this.tebInlineStubs = saved.teb ?? null;
         const scheduler = System.getInstance().scheduler;
         for (const stubs of [saved.heap, saved.crt]) {
             if (stubs) scheduler?.registerNonPreemptibleRange(stubs.regionBase, stubs.regionEnd);
@@ -374,6 +381,48 @@ export class PELoader {
         this.mbwcStubsDeclined = false;
         resetMbwcInlineStubs();
         this.mathInlineStubs = null;
+        this.tebInlineStubs = null;
+        hypercallDataManager.setTebStubsBound(false);
+    }
+
+    /**
+     * Emit the TEB stubs and point every route to the exports at them: the image bodies are
+     * redirected here, not only when an importer's IAT names them, because the CRTs that
+     * storm FlsGetValue resolve it through GetProcAddress. Once bound, the WASM handlers that
+     * answer from the hypercall page's copy of LastError/FLS are routed to JS, which reads
+     * the TEB the stubs write.
+     */
+    private emitTebStubs(exportTable: Map<string, number>): TebInlineStubs | null {
+        const tmm = System.getInstance().process?.thunkMemoryManager;
+        const allowImage = !(globalThis as { __noImageIatBinding?: boolean }).__noImageIatBinding;
+        const functionIdOf = (name: string): number | undefined => {
+            const lower = name.toLowerCase();
+            for (const addr of [hleExportBindingAddress(this.thunkGenerator, 'kernel32', lower, allowImage),
+                exportTable.get(lower)]) {
+                const id = addr === undefined ? undefined : this.thunkGenerator.getStubByAddress(addr)?.functionId;
+                if (id) return id;
+            }
+            return this.thunkGenerator.findStubsByName('kernel32', name)[0]?.functionId;
+        };
+        const traps = {
+            tlsGetValue: functionIdOf('TlsGetValue'),
+            tlsSetValue: functionIdOf('TlsSetValue'),
+            flsSetValue: functionIdOf('FlsSetValue'),
+        };
+        if (!tmm || !traps.tlsGetValue || !traps.tlsSetValue || !traps.flsSetValue) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[PE] TEB stubs skipped: tmm=${!!tmm} traps=${JSON.stringify(traps)}`);
+            return null;
+        }
+        const stubs = writeTebStubs(tmm.stubAllocator, this.getMemory, {
+            tlsGetValue: traps.tlsGetValue, tlsSetValue: traps.tlsSetValue, flsSetValue: traps.flsSetValue,
+        });
+        for (const [exportKey, field] of Object.entries(TEB_STUB_EXPORTS)) {
+            redirectHleImageExport(this.thunkGenerator, 'kernel32', exportKey, stubs[field],
+                hleExportBindingAddress(this.thunkGenerator, 'kernel32', exportKey, allowImage));
+        }
+        hypercallDataManager.setTebStubsBound(true);
+        return stubs;
     }
 
     /**
@@ -1156,10 +1205,10 @@ export class PELoader {
             `[PE] TLS directory in "${moduleName}": template=0x${startOfRawData.toString(16)}-0x${endOfRawData.toString(16)} ` +
             `(${templateSize}+${sizeOfZeroFill} bytes), index@0x${addressOfIndex.toString(16)}, callbacks@0x${addressOfCallbacks.toString(16)}`);
 
-        // Allocate TLS index via scheduler (uses same slot space as TlsAlloc)
+        // An implicit-TLS index, disjoint from every index TlsAlloc/TlsSetValue can reach.
         const system = System.getInstance();
         const scheduler = system.scheduler;
-        const tlsIndex = scheduler.tlsAlloc();
+        const tlsIndex = scheduler.implicitTlsAlloc();
 
         if (tlsIndex === 0xFFFFFFFF) {
             Logger.error(LogCategory.SYSTEM, `[PE] TLS: Failed to allocate index for "${moduleName}" (all slots full)`);
@@ -1738,6 +1787,19 @@ export class PELoader {
                     }
                 }
 
+                // One-time trap-free TEB accessors (GetLastError/SetLastError, Tls/Fls Get/Set).
+                // The CRT's per-thread-data lookup brackets every FlsGetValue/TlsGetValue with
+                // GetLastError/SetLastError, thousands of times a frame. DEFAULT-ON; set
+                // window.__noTebStubs=true BEFORE loading a game for the A/B.
+                if (dllName === 'kernel32' && !this.tebInlineStubs
+                    && !(globalThis as { __noTebStubs?: boolean }).__noTebStubs) {
+                    try {
+                        this.tebInlineStubs = this.emitTebStubs(stubDll.exportTable);
+                    } catch (e) {
+                        Logger.warn(LogCategory.SYSTEM, `[PE] TEB stubs unavailable: ${e}`);
+                    }
+                }
+
                 // One-time inline x86 stub generation for the msvcrt cdecl CRT
                 // allocator pair (malloc/operator new + free/operator delete). Rides
                 // the same WASM slab arena as the kernel32 heap stubs. Generated on the
@@ -1879,6 +1941,12 @@ export class PELoader {
                         if (this.caseFoldInlineStubs && PELoader.CRT_SLAB_MODULES.has(dllName)) {
                             if (funcKey === 'tolower') inlineTarget = this.caseFoldInlineStubs.tolowerStub;
                             else if (funcKey === 'toupper') inlineTarget = this.caseFoldInlineStubs.toupperStub;
+                        }
+                        // TEB accessors: answered in guest code through FS.
+                        if (this.tebInlineStubs && dllName === 'kernel32'
+                            && !(globalThis as { __noTebStubs?: boolean }).__noTebStubs) {
+                            const field = TEB_STUB_EXPORTS[funcKey];
+                            if (field) inlineTarget = this.tebInlineStubs[field];
                         }
                         // Pure-compute math: real x86 in guest memory, no trap at all.
                         if (this.mathInlineStubs && PELoader.CRT_MATH_MODULES.has(dllName)) {

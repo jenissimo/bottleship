@@ -5,7 +5,7 @@ import { Logger, LogCategory } from '../logger';
 import { System } from '../system';
 import { profiler } from '../profiler';
 import { frameProfiler } from '../frame-profiler';
-import { ThunkMemoryManager, ThunkMemoryRegions, SEH_CATCH_COMPLETION_FUNCID } from './thunk-memory-manager';
+import { ThunkMemoryManager, ThunkMemoryRegions, SEH_CATCH_COMPLETION_FUNCID, ptrDerefTrampolineIndex } from './thunk-memory-manager';
 import {
     writeShadowTrampoline,
     writeOwnerDisarmScalarTrampoline,
@@ -5032,7 +5032,7 @@ export class ThunkDispatcher {
      *
      * @param dllName    DLL (e.g. 'opengl32')
      * @param funcName   Export name
-     * @param floatCount Number of floats to dereference (2 or 3)
+     * @param floatCount Number of dwords to dereference (1-4; 1 = a packed byte vector)
      * @param handler    Drain handler — dataPtr points to float0 bits
      * @param isStdcall  true for stdcall (RET 4), false for cdecl (RET)
      */
@@ -5048,9 +5048,10 @@ export class ThunkDispatcher {
                 `registerPtrDerefWriteBufferFunction: write-buffer not initialised, skipping ${dllName}:${funcName}`);
             return;
         }
-        if (floatCount !== 2 && floatCount !== 3) {
+        const firstTrampolineIdx = ptrDerefTrampolineIndex(floatCount);
+        if (firstTrampolineIdx === undefined) {
             Logger.warn(LogCategory.THUNK,
-                `registerPtrDerefWriteBufferFunction: floatCount must be 2 or 3, got ${floatCount} for ${dllName}:${funcName}`);
+                `registerPtrDerefWriteBufferFunction: floatCount must be 1..4, got ${floatCount} for ${dllName}:${funcName}`);
             return;
         }
 
@@ -5070,10 +5071,7 @@ export class ThunkDispatcher {
             return;
         }
 
-        // PtrDeref trampoline indices: 16=3F stdcall, 17=3F cdecl, 18=2F stdcall, 19=2F cdecl
-        const trampolineIdx = floatCount === 3
-            ? (16 + (isStdcall ? 0 : 1))
-            : (18 + (isStdcall ? 0 : 1));
+        const trampolineIdx = firstTrampolineIdx + (isStdcall ? 0 : 1);
         const trampolineAddr = this.writeBufTrampolineAddrs[trampolineIdx];
         if (!trampolineAddr) {
             Logger.warn(LogCategory.THUNK,

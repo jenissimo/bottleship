@@ -7,6 +7,9 @@
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
+import { TLS_INDEX_LIMIT } from '../../core/teb-manager';
+
+const ERROR_INVALID_PARAMETER = 87;
 
 export const exports: Record<string, ThunkImplementation> = (() => {
     const exports: Record<string, ThunkImplementation> = {};
@@ -29,8 +32,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         Logger.verbose(LogCategory.KERNEL32, `TlsGetValue(${dwTlsIndex})`);
         const scheduler = System.getInstance().scheduler;
-        if (!scheduler.tlsIsAllocated(dwTlsIndex)) {
-            scheduler.setLastError(87); // ERROR_INVALID_PARAMETER
+        // As NT (and the guest stub, kernel32/teb-stubs.ts): the allocation bitmap is not
+        // consulted — only an index past the expansion range fails.
+        if ((dwTlsIndex >>> 0) >= TLS_INDEX_LIMIT) {
+            scheduler.setLastError(ERROR_INVALID_PARAMETER);
             return 0;
         }
         // A NULL value is a successful result. Win32 makes it distinguishable from
@@ -45,7 +50,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         Logger.verbose(LogCategory.KERNEL32, `TlsSetValue(${dwTlsIndex}, 0x${lpTlsValue.toString(16)})`);
 
-        return System.getInstance().scheduler.tlsSetValue(dwTlsIndex, lpTlsValue) ? 1 : 0;
+        const scheduler = System.getInstance().scheduler;
+        if (scheduler.tlsSetValue(dwTlsIndex, lpTlsValue)) return 1;
+        scheduler.setLastError(ERROR_INVALID_PARAMETER);
+        return 0;
     };
 
     return exports;

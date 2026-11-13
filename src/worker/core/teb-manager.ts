@@ -23,6 +23,7 @@
  *   0x2C  ThreadLocalStoragePointer (-> TLS array)
  *   0x30  ProcessEnvironmentBlock (-> PEB)
  *   0x34  LastErrorValue
+ *   0xFB4 FlsData                 (-> RTL_FLS_DATA, allocated on the first FlsSetValue)
  */
 
 import { Logger, LogCategory } from './logger';
@@ -39,6 +40,7 @@ const TEB_CLIENT_ID_THREAD  = 0x24;
 const TEB_TLS_POINTER       = 0x2C;
 const TEB_PEB               = 0x30;
 const TEB_LAST_ERROR        = 0x34;
+const TEB_FLS_DATA          = 0xFB4;
 
 const TEB_SIZE = 4096;          // One page per TEB
 // A 32-bit NT 5.x PEB is 0x210 bytes. Anything we place at PEB+offset below that lands inside a
@@ -51,7 +53,32 @@ const PEB_SIZE = 0x230;
  *  TLS, the libgcc SjLj splice in hle-lib/native-leaves.ts) all read and write it, and no
  *  index that exists can land past its end. */
 export const TLS_INDEX_LIMIT = 64 + 1024;
-const TLS_ARRAY_SIZE = TLS_INDEX_LIMIT * 4;
+/**
+ * Implicit-TLS (`__declspec(thread)`) indices the loader writes to a module's `_tls_index`.
+ * On NT they index ThreadLocalStoragePointer, an array disjoint from the TlsAlloc slots
+ * (TEB+0xE10 / TlsExpansionSlots). Here the TlsAlloc slots share the TEB+0x2C array (the
+ * WASM Tls* handlers index it), so implicit indices get their own range PAST every index
+ * TlsAlloc/TlsSetValue can reach: a TlsSetValue on any valid index can then never
+ * overwrite a module's TLS block pointer, which is the NT guarantee.
+ */
+export const IMPLICIT_TLS_FIRST = TLS_INDEX_LIMIT;
+export const IMPLICIT_TLS_LIMIT = IMPLICIT_TLS_FIRST + 64;
+const TLS_ARRAY_SIZE = IMPLICIT_TLS_LIMIT * 4;
+/** FLS_MAXIMUM_AVAILABLE: indices 1..127 are valid, 0 never is. */
+export const FLS_INDEX_LIMIT = 128;
+/** RTL_FLS_DATA: a LIST_ENTRY, then Data[FLS_MAXIMUM_AVAILABLE] — the layout the guest stubs
+ *  (kernel32/teb-stubs.ts) index as [FlsData + 8 + 4*index]. */
+export const FLS_DATA_SLOTS_OFFSET = 8;
+const FLS_DATA_SIZE = FLS_DATA_SLOTS_OFFSET + FLS_INDEX_LIMIT * 4;
+/** TEB offsets the trap-free guest stubs address through fs:. The TLS array is the one
+ *  TEB+0x2C points at (see TLS_INDEX_LIMIT), not NT's in-TEB TlsSlots. */
+export const TEB_OFFSETS = {
+    clientIdProcess: TEB_CLIENT_ID_PROCESS,
+    clientIdThread: TEB_CLIENT_ID_THREAD,
+    tlsPointer: TEB_TLS_POINTER,
+    lastError: TEB_LAST_ERROR,
+    flsData: TEB_FLS_DATA,
+} as const;
 
 import { currentProcessId } from './process-identity';
 
@@ -390,6 +417,24 @@ export class TebManager {
         return true;
     }
 
+    /** A module's implicit-TLS block pointer (ThreadLocalStoragePointer[index]). */
+    syncImplicitTlsSlot(threadId: number, index: number, value: number): boolean {
+        if (index < IMPLICIT_TLS_FIRST || index >= IMPLICIT_TLS_LIMIT) return false;
+        const tlsAddr = this.tlsArrayMap.get(threadId);
+        const view = this.getView();
+        if (tlsAddr === undefined || !view) return false;
+        view.setUint32(tlsAddr + index * 4, value >>> 0, true);
+        return true;
+    }
+
+    readImplicitTlsSlot(threadId: number, index: number): number | undefined {
+        if (index < IMPLICIT_TLS_FIRST || index >= IMPLICIT_TLS_LIMIT) return undefined;
+        const tlsAddr = this.tlsArrayMap.get(threadId);
+        const view = this.getView();
+        if (tlsAddr === undefined || !view) return undefined;
+        return view.getUint32(tlsAddr + index * 4, true) >>> 0;
+    }
+
     /** A TLS slot value from the thread's guest TLS array; undefined when not array-backed. */
     readTlsSlot(threadId: number, index: number): number | undefined {
         if (index < 0 || index >= TLS_INDEX_LIMIT) return undefined;
@@ -398,6 +443,58 @@ export class TebManager {
         const view = this.getView();
         if (!view) return undefined;
         return view.getUint32(tlsAddr + index * 4, true);
+    }
+
+    /** The thread's RTL_FLS_DATA block, or 0 before its first FlsSetValue (as on NT, whose
+     *  FlsGetValue then fails with ERROR_INVALID_PARAMETER). */
+    getFlsDataAddress(threadId: number): number {
+        const teb = this.tebMap.get(threadId);
+        if (teb === undefined) return 0;
+        const view = this.getView();
+        return view ? view.getUint32(teb + TEB_FLS_DATA, true) >>> 0 : 0;
+    }
+
+    /** Allocate the thread's FLS block on first use and publish it at TEB+0xFB4. */
+    ensureFlsData(threadId: number, memoryManager: MemoryManager): number {
+        const existing = this.getFlsDataAddress(threadId);
+        if (existing !== 0) return existing;
+        const teb = this.tebMap.get(threadId);
+        const view = this.getView();
+        if (teb === undefined || !view || !this.getMemory) return 0;
+        const block = memoryManager.alloc(FLS_DATA_SIZE);
+        if (!block) return 0;
+        this.getMemory().fill(0, block, block + FLS_DATA_SIZE);
+        view.setUint32(teb + TEB_FLS_DATA, block >>> 0, true);
+        return block >>> 0;
+    }
+
+    /** An FLS slot of the thread; undefined when the index is invalid or the thread has no block. */
+    readFlsSlot(threadId: number, index: number): number | undefined {
+        if (index <= 0 || index >= FLS_INDEX_LIMIT) return undefined;
+        const block = this.getFlsDataAddress(threadId);
+        const view = this.getView();
+        if (block === 0 || !view) return undefined;
+        return view.getUint32(block + FLS_DATA_SLOTS_OFFSET + index * 4, true) >>> 0;
+    }
+
+    writeFlsSlot(threadId: number, index: number, value: number, memoryManager: MemoryManager): boolean {
+        if (index <= 0 || index >= FLS_INDEX_LIMIT) return false;
+        const block = this.ensureFlsData(threadId, memoryManager);
+        const view = this.getView();
+        if (block === 0 || !view) return false;
+        view.setUint32(block + FLS_DATA_SLOTS_OFFSET + index * 4, value >>> 0, true);
+        return true;
+    }
+
+    /** FlsFree: the slot reads as 0 in every thread when the index is handed out again. */
+    clearFlsSlotAllThreads(index: number): void {
+        if (index <= 0 || index >= FLS_INDEX_LIMIT) return;
+        const view = this.getView();
+        if (!view) return;
+        for (const threadId of this.tebMap.keys()) {
+            const block = this.getFlsDataAddress(threadId);
+            if (block !== 0) view.setUint32(block + FLS_DATA_SLOTS_OFFSET + index * 4, 0, true);
+        }
     }
 
     /** TlsFree: the slot reads as 0 in every thread when the index is handed out again. */
@@ -417,8 +514,10 @@ export class TebManager {
     releaseTeb(threadId: number, memory: MemoryReleaser): boolean {
         const teb = this.tebMap.get(threadId);
         const tls = this.tlsArrayMap.get(threadId);
+        const fls = this.getFlsDataAddress(threadId);
         this.tebMap.delete(threadId);
         this.tlsArrayMap.delete(threadId);
+        if (fls !== 0) memory.free(fls);
         if (tls !== undefined) memory.free(tls);
         if (teb !== undefined) memory.free(teb);
         return teb !== undefined || tls !== undefined;

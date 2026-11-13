@@ -520,7 +520,7 @@ function tryBlockThunkedDllLoad(
 
     const system = System.getInstance();
     if (system.process) {
-        system.process.lastError = 126; // ERROR_MOD_NOT_FOUND
+        system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
     }
     Logger.log(
         LogCategory.KERNEL32,
@@ -590,7 +590,7 @@ function initModuleFunctions(): void {
 
         Logger.log(LogCategory.KERNEL32, `GetModuleHandleA("${name}") -> 0 (not found)`);
         recordModuleHandleMiss('GetModuleHandleA', name, ctx, mem);
-        system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+        system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
         return { value: 0, stackCleanup: 4 };
     };
 
@@ -639,7 +639,7 @@ function initModuleFunctions(): void {
 
         Logger.verbose(LogCategory.KERNEL32, `GetModuleHandleW("${name}") -> 0 (not found)`);
         recordModuleHandleMiss('GetModuleHandleW', name, ctx, mem);
-        system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+        system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
         return { value: 0, stackCleanup: 4 };
     };
 
@@ -659,7 +659,7 @@ function initModuleFunctions(): void {
         if (dwFlags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
             moduleHandle = getLoadedModuleByAddress(lpModuleName);
             if (moduleHandle === 0) {
-                system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+                system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
                 if (phModule !== 0 && phModule + 4 <= mem.length) {
                     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                     view.setUint32(phModule, 0, true);
@@ -698,7 +698,7 @@ function initModuleFunctions(): void {
 
             if (moduleHandle === 0) {
                 Logger.verbose(LogCategory.KERNEL32, `GetModuleHandleExW("${name}") -> 0 (not found)`);
-                system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+                system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
                 if (phModule !== 0 && phModule + 4 <= mem.length) {
                     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                     view.setUint32(phModule, 0, true);
@@ -730,7 +730,7 @@ function initModuleFunctions(): void {
         if (dwFlags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
             moduleHandle = getLoadedModuleByAddress(lpModuleName);
             if (moduleHandle === 0) {
-                system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+                system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
                 if (phModule !== 0 && phModule + 4 <= mem.length) {
                     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                     view.setUint32(phModule, 0, true);
@@ -769,7 +769,7 @@ function initModuleFunctions(): void {
 
             if (moduleHandle === 0) {
                 Logger.verbose(LogCategory.KERNEL32, `GetModuleHandleExA("${name}") -> 0 (not found)`);
-                system.process!.lastError = 126;
+                system.scheduler.setLastError(126);
                 if (phModule !== 0 && phModule + 4 <= mem.length) {
                     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                     view.setUint32(phModule, 0, true);
@@ -870,7 +870,7 @@ function initModuleFunctions(): void {
         pinUntrackedModules();
 
         if (!validLoadLibrarySearchFlags(dwFlags, dllName)) {
-            System.getInstance().process!.lastError = 87; // ERROR_INVALID_PARAMETER
+            System.getInstance().scheduler.setLastError(87); // ERROR_INVALID_PARAMETER
             return { value: 0, stackCleanup: 12 };
         }
 
@@ -917,7 +917,7 @@ function initModuleFunctions(): void {
         };
         const notFound = (): ThunkResult => {
             Logger.log(LogCategory.KERNEL32, `LoadLibraryExW("${dllName}"): NOT FOUND`);
-            system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+            system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
             return { value: 0, stackCleanup: 12 };
         };
 
@@ -961,7 +961,7 @@ function initModuleFunctions(): void {
         pinUntrackedModules();
 
         if (!validLoadLibrarySearchFlags(dwFlags, dllName)) {
-            System.getInstance().process!.lastError = 87; // ERROR_INVALID_PARAMETER
+            System.getInstance().scheduler.setLastError(87); // ERROR_INVALID_PARAMETER
             return { value: 0, stackCleanup: 12 };
         }
 
@@ -1008,7 +1008,7 @@ function initModuleFunctions(): void {
         };
         const notFound = (): ThunkResult => {
             Logger.log(LogCategory.KERNEL32, `LoadLibraryExA("${dllName}"): NOT FOUND`);
-            system.process!.lastError = 126;
+            system.scheduler.setLastError(126);
             return { value: 0, stackCleanup: 12 };
         };
 
@@ -1092,7 +1092,7 @@ function initModuleFunctions(): void {
             if (verbose) {
                 Logger.verbose(LogCategory.KERNEL32, `LoadLibraryW("${dllName}") -> NOT FOUND`);
             }
-            system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+            system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
             return { value: 0, stackCleanup: 4 };
         };
 
@@ -1172,7 +1172,7 @@ function initModuleFunctions(): void {
 
             // Under HLE video stubs, deny MSS32 for Smacker/Bink callers.
             if (!EMU_NATIVE_VIDEO_DLLS && dllBaseName === 'mss32' && (isSmackerCaller || isBinkCaller)) {
-                system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+                system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
                 Logger.warn(LogCategory.KERNEL32, `LoadLibraryA("${dllName}") denied for caller "${callerName || "unknown"}"`);
                 return { value: 0, stackCleanup: 4 };
             }
@@ -1196,7 +1196,7 @@ function initModuleFunctions(): void {
             return { value: module.baseAddress, stackCleanup: 4 };
         };
         const notFound = (): ThunkResult => {
-            system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+            system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
             Logger.log(
                 LogCategory.KERNEL32,
                 `LoadLibraryA("${dllName}") -> NOT FOUND (err=126)${callerInfo}`
@@ -1416,7 +1416,7 @@ function initModuleFunctions(): void {
         if (!isOrdinal
             && EmulatorConfig.getInstance().osVersion.platformId === VER_PLATFORM_WIN32_WINDOWS
             && WIN9X_ABSENT_APIS.has(procName.toLowerCase())) {
-            system.process!.lastError = 127; // ERROR_PROC_NOT_FOUND
+            system.scheduler.setLastError(127); // ERROR_PROC_NOT_FOUND
             if (verbose) {
                 Logger.verbose(LogCategory.KERNEL32,
                     `GetProcAddress("${procName}") -> NULL (absent on Win9x)`);
@@ -1429,7 +1429,7 @@ function initModuleFunctions(): void {
         const hleName = hleModuleNameByBase(hModule);
         if (!isOrdinal && hleName && RELEASE_CRT_MODULE_RE.test(hleName)
             && DEBUG_CRT_ONLY_EXPORTS.has(procName.toLowerCase())) {
-            system.process!.lastError = 127;
+            system.scheduler.setLastError(127);
             return finish(0);
         }
 
@@ -1445,7 +1445,7 @@ function initModuleFunctions(): void {
         if (cached === 0 && hleModuleNameByBase(hModule) !== undefined) {
             getProcAddressCache.delete(cacheKey);
         } else if (cached === 0) {
-            system.process!.lastError = 127;
+            system.scheduler.setLastError(127);
             return finish(0);
         }
 
@@ -1477,7 +1477,7 @@ function initModuleFunctions(): void {
 
                 if (!mod.isExecutable) {
                     getProcAddressCache.set(cacheKey, 0);
-                    system.process!.lastError = 127;
+                    system.scheduler.setLastError(127);
                     return finish(0);
                 }
             }
@@ -1537,7 +1537,7 @@ function initModuleFunctions(): void {
         if (ptrCacheKey) {
             getProcAddressPointerCache.set(ptrCacheKey, 0);
         }
-        system.process!.lastError = 127; // ERROR_PROC_NOT_FOUND
+        system.scheduler.setLastError(127); // ERROR_PROC_NOT_FOUND
         Logger.warn(
             LogCategory.KERNEL32,
             `GetProcAddress(0x${hModule.toString(16)}, "${procName}") -> NULL (ERROR_PROC_NOT_FOUND)`
