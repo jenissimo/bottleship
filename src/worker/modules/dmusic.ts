@@ -1167,6 +1167,29 @@ export class DMusic implements IModule {
         port.ownsBuffer = false;
     }
 
+    /** A new IDirectSound8 from the dsound module, at 2 for `hWnd`; 0 when there is none. */
+    private createDirectSound(hWnd: number): number {
+        const exports = this.process.getModule("dsound")?.exports;
+        const create = exports?.["directsoundcreate8"];
+        const mem = Mem.getView();
+        if (!create || !mem) return 0;
+        const scratch = this.process.memory.alloc(4, "HEAP", "rw");
+        if (!scratch) return 0;
+        try {
+            Mem.writeUint32(scratch, 0);
+            const ctx = NO_CONTEXT;
+            if ((create(ctx, mem, [0, scratch, 0]) as number) !== S_OK) return 0;
+            const ds = Mem.readUint32(scratch) ?? 0;
+            if (ds && exports["idirectsound8_setcooperativelevel"]?.(ctx, mem, [ds, hWnd, 2]) !== S_OK) {
+                soundReference(this.process, ds, false, false);
+                return 0;
+            }
+            return ds;
+        } finally {
+            this.process.memory.free(scratch);
+        }
+    }
+
     private setDirectSound(obj: DirectMusicObject | PortObject, ptr: number): void {
         if (obj.directSound === ptr) return;
         soundReference(this.process, ptr, false, true);
@@ -1277,7 +1300,25 @@ export class DMusic implements IModule {
         // InitAudio(ppDirectMusic, ppDirectSound, hWnd, dwDefaultPathType, dwPChannelCount, dwFlags, pParams)
         e["IDirectMusicPerformance8_InitAudio"] = (_c, _m, a) => {
             const ppDirectSound = a[2]! >>> 0;
-            const hr = init(a[0]!, a[1]! >>> 0, ppDirectSound ? (Mem.readUint32(ppDirectSound) ?? 0) : 0);
+            if (!perfOf(a) || (ppDirectSound && !validPointer(ppDirectSound, 4, "rw"))) return E_POINTER;
+            let directSound = ppDirectSound ? (Mem.readUint32(ppDirectSound) ?? 0) : 0;
+            const created = !!ppDirectSound && !directSound;
+            if (created) {
+                directSound = this.createDirectSound(a[3]! >>> 0);
+                if (!directSound) return E_FAIL;
+            }
+            const finish = (hr: number): number => {
+                if (created) {
+                    if (hr === S_OK) Mem.writeUint32(ppDirectSound, directSound);
+                    else {
+                        const dm = perfOf(a)?.directMusic;
+                        if (dm?.directSound === directSound) this.setDirectSound(dm, 0);
+                        soundReference(this.process, directSound, false, false);
+                    }
+                }
+                return hr;
+            };
+            const hr = init(a[0]!, a[1]! >>> 0, directSound);
             const perf = perfOf(a);
             // InitAudio brings its own synthesizer: there is no AddPort to wait for.
             if (hr === S_OK && perf && !perf.engine) {
@@ -1286,9 +1327,9 @@ export class DMusic implements IModule {
                 this.attachEngine(perf, port);
                 const active = this.activatePort(port, true);
                 port.release();
-                if (!active) { this.detachPort(perf); return E_FAIL; }
+                if (!active) { this.detachPort(perf); return finish(E_FAIL); }
             }
-            return hr;
+            return finish(hr);
         };
 
         // HRESULT AddPort(IDirectMusicPort *pPort) — NULL adds the default port.
@@ -2197,8 +2238,8 @@ export class DMusic implements IModule {
 
     private static readonly PATH_RATE = 22050;
 
-    private ensurePathOutput(path: AudioPathObject): boolean {
-        if (path.sink) return true;
+    private ensurePathBuffer(path: AudioPathObject): boolean {
+        if (path.buffer) return true;
         const type = path.pathType;
         if (type !== DMUS_APATH_DYNAMIC_3D && type !== DMUS_APATH_DYNAMIC_MONO && type !== DMUS_APATH_DYNAMIC_STEREO) return false;
         const channels = type === DMUS_APATH_DYNAMIC_STEREO ? 2 : 1;
@@ -2206,16 +2247,19 @@ export class DMusic implements IModule {
             | (type === DMUS_APATH_DYNAMIC_3D ? DSBCAPS_CTRL3D : DSBCAPS_CTRLPAN);
         const buffer = createSinkBuffer(this.process, path.performance?.directMusic?.directSound ?? 0, channels, DMusic.PATH_RATE, flags);
         if (!buffer) return false;
-        const sink = new DirectSoundSink(this.process, buffer, channels, DMusic.PATH_RATE);
-        if (!sink.start()) {
-            soundReference(this.process, buffer, true, false);
-            return false;
-        }
         path.buffer = buffer;
-        path.sink = sink;
         path.channels = channels;
-        this.pathOutputs.add(path);
         this.wirePath(path);
+        return true;
+    }
+
+    private ensurePathOutput(path: AudioPathObject): boolean {
+        if (path.sink) return true;
+        if (!this.ensurePathBuffer(path)) return false;
+        const sink = new DirectSoundSink(this.process, path.buffer, path.channels, DMusic.PATH_RATE);
+        if (!sink.start()) return false;
+        path.sink = sink;
+        this.pathOutputs.add(path);
         this.startPump();
         return true;
     }
@@ -2274,7 +2318,7 @@ export class DMusic implements IModule {
         if (!ppObject || !validPointer(ppObject, 4, "w")) return E_POINTER;
         Mem.writeUint32(ppObject, 0);
         if (!path || (a[2]! >>> 0) !== DMUS_PATH_BUFFER || (a[3]! >>> 0) !== 0 || (a[5]! >>> 0) !== 0) return DMUS_E_NOT_FOUND;
-        if (!this.ensurePathOutput(path)) return DMUS_E_NOT_FOUND;
+        if (!this.ensurePathBuffer(path)) return DMUS_E_NOT_FOUND;
         const fn = this.process.getModule("dsound")?.exports["IDirectSoundBuffer8_QueryInterface"] as ThunkImplementation | undefined;
         const mem = Mem.getView();
         if (!fn || !mem) return DMUS_E_NOT_FOUND;

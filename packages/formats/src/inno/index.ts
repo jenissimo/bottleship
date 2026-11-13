@@ -46,6 +46,7 @@ export {
     type ExtractSink,
     type AssemblyStore,
 } from "./extractor";
+export { isGogSupportSave } from "./paths";
 export { filterExtractableFiles, handleCollision } from "./collisions";
 export { localesOfCheck, checkAllowsLanguage, detectInstallerLanguages, defaultLanguage } from "./check-lang";
 export { CaseInsensitivePathMap } from "./path-map";

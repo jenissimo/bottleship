@@ -319,7 +319,7 @@ export function materializeHleModuleImages(process: any): void {
     for (const { name, slot } of planned) {
         const base = hleImageBaseForSlot(slot);
         const descriptor = registry.getModules().find(m => m.name.toLowerCase() === name);
-        const declared = (descriptor?.functions ?? []).map(f => f.name);
+        const declared = (descriptor?.functions ?? []).map(f => ({ name: f.name, ordinal: f.ordinal }));
 
         // Size FIRST. allocateStubAt REGISTERS each stub at its address, so building a slot
         // the image cannot fit would leave live stub registrations pointing into memory that
@@ -374,7 +374,7 @@ export function materializeHleModuleImages(process: any): void {
                 const { code } = alias ?? generator.allocateStubAt(
                     address, name, fn.name, args, fn.callingConvention, cleanup,
                 );
-                exports.push({ name: fn.name, code });
+                exports.push({ name: fn.name, code, ordinal: fn.ordinal });
             } catch (e) {
                 Logger.verbose(LogCategory.SYSTEM, `[HleImages] ${name}:${fn.name} not stubbable — ${e}`);
             }

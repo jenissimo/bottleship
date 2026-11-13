@@ -28,7 +28,7 @@ export function createDirectDrawPaletteClipperExports(
                 setAuthorityCpu(state);
                 // Palette animation changes scanout even when the application never flips.
                 if ((state.caps & DDSCAPS_PRIMARYSURFACE) && !context.suppressPresent) {
-                    void context.presenter?.present(state, mem, { throttle: true });
+                    void context.presenter?.present(state, mem, { throttle: true, palette: true });
                 }
             }
         }

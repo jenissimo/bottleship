@@ -992,7 +992,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 return framePacer.waitForFrameSlot({ nonBlocking: true }).then(() => {
                     profiler.start("Blt:present");
                     if (!context.suppressPresent) {
-                        void context.presenter.present(dstState, mem, { throttle: true });
+                        void context.presenter.present(dstState, mem, { throttle: true, commit: true });
                     }
                     profiler.end("Blt:present");
                     rectPool.release(effSrcRect);
@@ -1312,7 +1312,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             if (context.surfaces.primary && thisPtr === context.surfaces.primary) {
                 return framePacer.waitForFrameSlot({ nonBlocking: true }).then(() => {
                     if (!context.suppressPresent) {
-                        void context.presenter.present(dstState, mem, { throttle: true });
+                        void context.presenter.present(dstState, mem, { throttle: true, commit: true });
                     }
                     return DD_OK;
                 });

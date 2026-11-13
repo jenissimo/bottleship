@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
     ExecutionHealth, SlowExecutionDetector, effectiveJit, jitReason, measureWindow, smoothMips,
     SAMPLE_INTERVAL_MS, SLOW_MIPS_RECOVER, SLOW_MIPS_THRESHOLD, SLOW_SUSTAIN_MS, SLOW_WARMUP_MS,
+    SLOW_MAX_HLE_PER_MINSN, SLOW_MAX_PRESENTS_PER_S,
     type ExecCounters, type ExecWindow, type PerfHintMessage,
 } from "../../src/worker/core/execution-health";
 import { StatsOverlay, formatJit, formatMips, type OverlayCtx } from "../../src/worker/core/stats-overlay";
@@ -10,11 +11,13 @@ import { perfHintText } from "../../src/app/perf-hint-text";
 const c = (atMs: number, insns: number, inTickMs: number, sabWaitMs = 0): ExecCounters =>
     ({ atMs, insns, inTickMs, sabWaitMs });
 
-/** A 500 ms window at `mips` busy MIPS and `busyShare`, no I/O. */
-function win(mips: number, busyShare = 0.9, ioShare = 0): ExecWindow {
+/** A 500 ms window at `mips` busy MIPS and `busyShare`, no I/O; density and present rate
+ *  unknown unless given. */
+function win(mips: number, busyShare = 0.9, ioShare = 0,
+             hlePerMInsn: number | null = null, presentsPerSec: number | null = null): ExecWindow {
     const ms = SAMPLE_INTERVAL_MS;
     const busyMs = ms * busyShare;
-    return { ms, busyMs, insns: mips * busyMs * 1000, busyShare, ioShare, busyMips: mips };
+    return { ms, busyMs, insns: mips * busyMs * 1000, busyShare, ioShare, busyMips: mips, hlePerMInsn, presentsPerSec };
 }
 
 describe("measureWindow — MIPS per BUSY ms, not per wall ms", () => {
@@ -39,6 +42,23 @@ describe("measureWindow — MIPS per BUSY ms, not per wall ms", () => {
 
     test("an empty or backwards window is refused", () => {
         expect(measureWindow(c(10, 0, 0), c(10, 5, 5))).toBeNull();
+    });
+
+    test("HLE density per million instructions and present rate per second", () => {
+        const w = measureWindow({ ...c(0, 0, 0), hleCalls: 1_000, presents: 10 },
+                                { ...c(500, 4_000_000, 400), hleCalls: 6_000, presents: 40 })!;
+        expect(w.hlePerMInsn).toBeCloseTo(1_250, 6);
+        expect(w.presentsPerSec).toBeCloseTo(60, 6);
+    });
+
+    test("missing sources or a reset counter read as unknown, never as zero", () => {
+        const plain = measureWindow(c(0, 0, 0), c(500, 4_000_000, 400))!;
+        expect(plain.hlePerMInsn).toBeNull();
+        expect(plain.presentsPerSec).toBeNull();
+        const reset = measureWindow({ ...c(0, 0, 0), hleCalls: 9_000, presents: 500 },
+                                    { ...c(500, 4_000_000, 400), hleCalls: 10, presents: 2 })!;
+        expect(reset.hlePerMInsn).toBeNull();
+        expect(reset.presentsPerSec).toBeNull();
     });
 });
 
@@ -136,6 +156,66 @@ describe("SlowExecutionDetector — sustained, busy, past warm-up, once", () => 
     });
 });
 
+describe("SlowExecutionDetector — two symptoms, not MIPS alone (#354)", () => {
+    /** Drive `seconds` of 500 ms windows from raw counters through measureWindow, the way
+     *  ExecutionHealth does, and report whether the hint fired. */
+    function profile(p: { busyMips: number; busyShare: number; hlePerSec: number; fps: number; seconds?: number }): boolean {
+        const d = new SlowExecutionDetector();
+        let prev: ExecCounters = { atMs: 0, insns: 0, inTickMs: 0, sabWaitMs: 0, hleCalls: 0, presents: 0 };
+        let fired = false;
+        for (let t = SAMPLE_INTERVAL_MS; t <= (p.seconds ?? 60) * 1000; t += SAMPLE_INTERVAL_MS) {
+            const busy = SAMPLE_INTERVAL_MS * p.busyShare;
+            const cur: ExecCounters = {
+                atMs: t,
+                insns: (prev.insns + p.busyMips * busy * 1000) >>> 0,
+                inTickMs: prev.inTickMs + busy,
+                sabWaitMs: 0,
+                hleCalls: prev.hleCalls! + p.hlePerSec * SAMPLE_INTERVAL_MS / 1000,
+                presents: prev.presents! + p.fps * SAMPLE_INTERVAL_MS / 1000,
+            };
+            fired = d.feed(measureWindow(prev, cur)!, t + 60_000) || fired;
+            prev = cur;
+        }
+        return fired;
+    }
+
+    test("HLE-heavy D3D7 title (The Forge): 7 busy MIPS, ~10k thunks/s, 40 fps — no hint", () => {
+        expect(profile({ busyMips: 7, busyShare: 0.8, hlePerSec: 10_000, fps: 40 })).toBe(false);
+    });
+
+    test("the same title in a heavy scene dropping under 20 fps is still HLE-bound — no hint", () => {
+        // ~1,800 calls per million instructions: the low MIPS are our thunks, not the host.
+        expect(profile({ busyMips: 7, busyShare: 0.8, hlePerSec: 10_000, fps: 15 })).toBe(false);
+    });
+
+    test("genuinely slow JIT-off host: guest-bound, 30 MIPS, 12 fps — hint", () => {
+        // 300 calls/s over 27M insns/s = ~11 per million: the guest's own code is the tick.
+        expect(profile({ busyMips: 30, busyShare: 0.9, hlePerSec: 300, fps: 12 })).toBe(true);
+    });
+
+    test("2D title paced to 30 fps by design — no hint, even with low busy MIPS", () => {
+        // A GDI-blitting 2D game whose busy time reads guest-bound and low: it still presents
+        // its own cadence, and that clears any slow time.
+        expect(profile({ busyMips: 40, busyShare: 0.7, hlePerSec: 200, fps: 30 })).toBe(false);
+        // The ordinary case: it sleeps between frames, so the window is too idle to judge.
+        expect(profile({ busyMips: 40, busyShare: 0.15, hlePerSec: 200, fps: 30 })).toBe(false);
+    });
+
+    test("slow-paced 2D/turn-based (10 fps) that is HLE-bound — no hint", () => {
+        expect(profile({ busyMips: 20, busyShare: 0.8, hlePerSec: 20_000, fps: 10 })).toBe(false);
+    });
+
+    test("a fluent window clears; an HLE-bound window neither adds nor clears", () => {
+        const d = new SlowExecutionDetector();
+        for (let i = 0; i < 4; i++) d.feed(win(30, 0.9, 0, 10, 10), 60_000);
+        expect(d.accumulatedSlowMs).toBe(4 * SAMPLE_INTERVAL_MS);
+        d.feed(win(30, 0.9, 0, SLOW_MAX_HLE_PER_MINSN + 1, 10), 60_000);
+        expect(d.accumulatedSlowMs).toBe(4 * SAMPLE_INTERVAL_MS);
+        d.feed(win(30, 0.9, 0, 10, SLOW_MAX_PRESENTS_PER_S), 60_000);
+        expect(d.accumulatedSlowMs).toBe(0);
+    });
+});
+
 describe("ExecutionHealth — sampling cadence and the hint message", () => {
     test("samples once per interval and posts one hint with the live JIT mode", () => {
         const h = new ExecutionHealth();
@@ -172,6 +252,28 @@ describe("ExecutionHealth — sampling cadence and the hint message", () => {
         insns = 1_000; inTick = 1_000;
         h.maybeSample(60_000);
         expect(h.snapshot().mips).toBeNull();
+    });
+
+    test("reads HLE and present counters per sample and reports them in the snapshot", () => {
+        const h = new ExecutionHealth();
+        const hints: PerfHintMessage[] = [];
+        h.setSinks((m) => hints.push(m), () => {});
+        let insns = 0, inTick = 0, hle = 0, presents = 0;
+        h.attach({
+            readInsns: () => insns, readInTickMs: () => inTick, readSabWaitMs: () => 0,
+            readHleCalls: () => hle, readPresents: () => presents,
+        });
+        h.noteFirstPresent(0);
+        // 30 s at 7 busy MIPS, 80% busy, 10k thunks/s, 40 fps: The Forge's shape.
+        for (let t = 0; t <= 30_000; t += 5) {
+            inTick += 4; insns = (insns + 4 * 7_000) >>> 0; hle += 50; presents += 0.2;
+            h.maybeSample(t);
+        }
+        expect(hints.length).toBe(0);
+        const s = h.snapshot();
+        expect(s.mips).toBeCloseTo(7, 6);
+        expect(s.hlePerMInsn).toBeGreaterThan(SLOW_MAX_HLE_PER_MINSN);
+        expect(s.presentsPerSec).toBeCloseTo(40, 0);
     });
 });
 

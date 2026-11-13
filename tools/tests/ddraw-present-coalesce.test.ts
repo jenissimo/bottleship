@@ -1,4 +1,6 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
+import { Logger } from "../../src/worker/core/logger";
 import { DDrawPresenter, type PresentClock } from "../../src/worker/modules/ddraw/presenter";
 import type { DirectDrawSurfaceState } from "../../src/worker/modules/ddraw/com-objects";
 
@@ -39,14 +41,14 @@ async function flush(): Promise<void> {
 
 const REFRESH = 1000 / 60;
 
-function presenterWithDrawLog(hold = false) {
+function presenterWithDrawLog() {
     const clock = new ManualClock();
     const presenter = Object.create(DDrawPresenter.prototype) as any;
     Object.assign(presenter, {
         presentCallCount: 0, pendingSurface: null, pendingOptions: null, pendingResolvers: [],
         pumpRunning: false, pumpQueued: false, presentClock: clock, latchedSince: -1,
-        refreshUnregister: null, backstopCancel: null, lastFlipAt: -Infinity, flipIntervalMs: 0,
-        lockedSince: -1, holdUntilFlip: () => hold,
+        refreshUnregister: null, backstopCancel: null,
+        lockedSince: -1,
     });
     const drawn: Array<{ options: any; at: number; surface: any }> = [];
     presenter.drawFrame = async (surface: unknown, options: unknown) => { drawn.push({ surface, options, at: clock.t }); };
@@ -111,44 +113,6 @@ test("a primary that stays locked is still drawn after the bounded hold", async 
     expect(drawn[0]!.at).toBeLessThanOrEqual(50 + REFRESH);
 });
 
-test("Flip, an implicit present 10 ms later, then 300 ms idle: the implicit present is drawn (Flip hold opted in)", async () => {
-    const { presenter, drawn, clock } = presenterWithDrawLog(true);
-    await presenter.present(primary, mem, flip);
-    expect(drawn).toHaveLength(1);
-    await clock.advance(10, REFRESH);
-    const late = { surfacePtr: 0x2000 } as DirectDrawSurfaceState;
-    void presenter.present(late, mem, implicit);
-    await clock.advance(300, REFRESH);
-    expect(drawn).toHaveLength(2);
-    expect(drawn[1]!.surface).toBe(late);
-    expect(drawn[1]!.at).toBeLessThanOrEqual(100 + REFRESH);
-});
-
-test("with the Flip hold opted in, front-buffer passes between Flips are not drawn", async () => {
-    const { presenter, drawn, clock } = presenterWithDrawLog(true);
-    for (let frame = 0; frame < 30; frame++) {
-        void presenter.present(primary, mem, flip);
-        await clock.advance(1.5, REFRESH);
-        void presenter.present(primary, mem, implicit);
-        await clock.advance(20, REFRESH);
-        void presenter.present(primary, mem, implicit);
-        await clock.advance(20, REFRESH);
-    }
-    expect(drawn).toHaveLength(30);
-    expect(drawn.every(d => d.options.flip === true)).toBe(true);
-});
-
-test("the opted-in Flip hold follows the guest's Flip cadence: a slow flipper's last implicit present is drawn after 1.5 intervals", async () => {
-    const { presenter, drawn, clock } = presenterWithDrawLog(true);
-    for (let i = 0; i < 4; i++) { void presenter.present(primary, mem, flip); await clock.advance(40, REFRESH); }
-    void presenter.present(primary, mem, flip);
-    await clock.advance(5, REFRESH);
-    void presenter.present(primary, mem, implicit);
-    await clock.advance(200, REFRESH);
-    expect(drawn).toHaveLength(6);
-    expect(drawn[5]!.at - drawn[4]!.at).toBeLessThanOrEqual(60 + REFRESH);
-});
-
 test("without refresh ticks an implicit present is still drawn by the backstop", async () => {
     const { presenter, drawn, clock } = presenterWithDrawLog();
     void presenter.present(primary, mem, implicit);
@@ -192,7 +156,7 @@ test("a primary that stays locked is drawn once per refresh after the first hold
 });
 
 test("a Flip superseded by an implicit present while a draw is in flight is still drawn at once", async () => {
-    const { presenter, drawn, clock } = presenterWithDrawLog(true);
+    const { presenter, drawn, clock } = presenterWithDrawLog();
     let release!: () => void;
     const p = presenter as any;
     const draw = p.drawFrame;
@@ -208,4 +172,25 @@ test("a Flip superseded by an implicit present while a draw is in flight is stil
     expect(drawn).toHaveLength(2);
     expect(drawn[1]!.surface).toBe(late);
     expect(drawn[1]!.at).toBe(1);
+});
+
+test("a manifest that still sets ddrawHoldPresentsUntilFlip loads, logs that the key is ignored, and holds nothing", async () => {
+    const cfg = EmulatorConfig.getInstance();
+    cfg.reset();
+    const logs: string[] = [];
+    const spy = spyOn(Logger, "log").mockImplementation(((_c: unknown, m: string) => { logs.push(m); }) as never);
+    try {
+        cfg.applyFromManifest({ formatVersion: 2, name: "t", entrypoint: "rom/game.exe", emulator: { ddrawHoldPresentsUntilFlip: true } });
+    } finally {
+        spy.mockRestore();
+        cfg.reset();
+    }
+    expect(logs.filter(m => m.includes("ddrawHoldPresentsUntilFlip is ignored"))).toHaveLength(1);
+    expect("ddrawHoldPresentsUntilFlip" in cfg).toBe(false);
+    const { presenter, drawn, clock } = presenterWithDrawLog();
+    await presenter.present(primary, mem, flip);
+    await clock.advance(2, REFRESH);
+    void presenter.present(primary, mem, implicit);
+    await clock.advance(REFRESH, REFRESH);
+    expect(drawn).toHaveLength(2);
 });

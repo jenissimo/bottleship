@@ -43,6 +43,12 @@ export interface HleImageExport {
     name: string;
     /** Machine code for this export's body — 16 bytes from ThunkGenerator.allocateStubAt. */
     code: Uint8Array;
+    /**
+     * 1-based export ordinal, when the descriptor declares a real one (e.g. an
+     * ordinal-only import table like twitchsdk's). Omit for sequential assignment
+     * (array position + 1) — every by-name-only caller's existing behavior.
+     */
+    ordinal?: number;
 }
 
 export interface HleModuleImage {
@@ -59,6 +65,53 @@ function align(value: number, to: number): number {
     return Math.ceil(value / to) * to;
 }
 
+/** Which EAT slot (ordinal - base) each input export lands in; -1 marks a gap. */
+interface OrdinalPlan {
+    base: number;
+    numberOfFunctions: number;
+    slotToExportIndex: number[];
+    /** The ordinal actually assigned to export i — exports[i].ordinal when declared. */
+    assigned: number[];
+}
+
+/**
+ * Real ordinals (e.g. twitchsdk's sparse [1,3,5,10,...]) size the export address table
+ * (EAT) by ORDINAL RANGE, not export count, with a zero RVA at every gap — that's the only
+ * way ordinal 3 resolves to export #2's body instead of whichever export happens to sit at
+ * array index 2.
+ *
+ * A module can mix declared and undeclared ordinals (dsound/dplayx do: a handful of real,
+ * documented ordinals alongside a majority of by-name-only exports nothing looks up by
+ * number) — every undeclared export gets a synthesized ordinal past the highest declared
+ * one, in array order, so it still lands in a real EAT slot without colliding with a real
+ * one. Omitting ordinal on EVERY export keeps the fully sequential behavior (array
+ * position + 1) every by-name-only module already had.
+ */
+function planOrdinals(exports: ReadonlyArray<{ ordinal?: number }>): OrdinalPlan {
+    if (exports.length === 0) return { base: 1, numberOfFunctions: 0, slotToExportIndex: [], assigned: [] };
+    const declared = exports.map(e => e.ordinal).filter((o): o is number => o !== undefined);
+    if (declared.length === 0) {
+        const assigned = exports.map((_, i) => i + 1);
+        return { base: 1, numberOfFunctions: exports.length, slotToExportIndex: exports.map((_, i) => i), assigned };
+    }
+    for (const ordinal of declared) {
+        if (!Number.isInteger(ordinal) || ordinal < 1 || ordinal > 0xffff) {
+            throw new Error(`Invalid export ordinal: ${ordinal}`);
+        }
+    }
+    const base = Math.min(...declared);
+    let nextFree = Math.max(...declared) + 1;
+    const assigned = exports.map(e => e.ordinal ?? nextFree++);
+    if (nextFree > 0x10000) throw new Error("Synthesized export ordinal exceeds 65535");
+    const numberOfFunctions = Math.max(...assigned) - base + 1;
+    const slotToExportIndex = new Array(numberOfFunctions).fill(-1);
+    exports.forEach((_e, i) => {
+        const slot = assigned[i] - base;
+        if (slotToExportIndex[slot] === -1) slotToExportIndex[slot] = i;
+    });
+    return { base, numberOfFunctions, slotToExportIndex, assigned };
+}
+
 interface ImageLayout {
     textSize: number;
     edataRva: number;
@@ -71,19 +124,27 @@ interface ImageLayout {
     nameBytes: Uint8Array[];
     edataSize: number;
     imageSize: number;
+    ordinalPlan: OrdinalPlan;
 }
 
-function layoutImage(moduleName: string, exportNames: readonly string[]): ImageLayout {
+function layoutImage(
+    moduleName: string,
+    exportNames: readonly string[],
+    exportsForOrdinals: ReadonlyArray<{ ordinal?: number }> = exportNames.map(() => ({})),
+): ImageLayout {
     const textSize = align(Math.max(exportNames.length, 1) * STUB_SIZE, SECTION_ALIGNMENT);
     const edataRva = TEXT_RVA + textSize;
 
     const dllNameBytes = asciiz(`${moduleName}.dll`);
     const nameBytes = exportNames.map(asciiz);
+    const ordinalPlan = planOrdinals(exportsForOrdinals);
 
     // IMAGE_EXPORT_DIRECTORY (40 bytes), then the three parallel arrays, then the strings.
+    // AddressOfFunctions is sized by ordinal RANGE (NumberOfFunctions); the Name/NameOrdinal
+    // arrays are sized by export COUNT (NumberOfNames) — a gap has no name.
     const exportDirSize = 40;
     const functionsRva = edataRva + exportDirSize;
-    const namesRva = functionsRva + exportNames.length * 4;
+    const namesRva = functionsRva + ordinalPlan.numberOfFunctions * 4;
     const ordinalsRva = namesRva + exportNames.length * 4;
     const stringsRva = ordinalsRva + exportNames.length * 2;
     let stringCursor = stringsRva;
@@ -99,7 +160,7 @@ function layoutImage(moduleName: string, exportNames: readonly string[]): ImageL
 
     return {
         textSize, edataRva, functionsRva, namesRva, ordinalsRva,
-        dllNameRva, nameRvas, dllNameBytes, nameBytes, edataSize, imageSize,
+        dllNameRva, nameRvas, dllNameBytes, nameBytes, edataSize, imageSize, ordinalPlan,
     };
 }
 
@@ -108,8 +169,12 @@ function layoutImage(moduleName: string, exportNames: readonly string[]): ImageL
  * allocating any stubs: a slot that cannot hold the image must leave no stub registered at
  * an address nothing ever publishes. Same layout code as the builder, so the two agree.
  */
-export function hleModuleImageSize(moduleName: string, exportNames: readonly string[]): number {
-    return layoutImage(moduleName, exportNames).imageSize;
+export function hleModuleImageSize(
+    moduleName: string,
+    exports: ReadonlyArray<string | { name: string; ordinal?: number }>,
+): number {
+    const asObjects = exports.map(e => typeof e === "string" ? { name: e } : e);
+    return layoutImage(moduleName, asObjects.map(e => e.name), asObjects).imageSize;
 }
 
 /**
@@ -126,8 +191,8 @@ export function buildHleModuleImage(
 ): HleModuleImage {
     const {
         textSize, edataRva, functionsRva, namesRva, ordinalsRva,
-        dllNameRva, nameRvas, dllNameBytes, nameBytes, edataSize, imageSize,
-    } = layoutImage(moduleName, exports.map(e => e.name));
+        dllNameRva, nameRvas, dllNameBytes, nameBytes, edataSize, imageSize, ordinalPlan,
+    } = layoutImage(moduleName, exports.map(e => e.name), exports);
 
     if (imageSize > slotSize) {
         throw new Error(
@@ -175,22 +240,36 @@ export function buildHleModuleImage(
     writeSection(view, bytes, SECTION_TABLE_OFFSET + SIZEOF_SECTION_HEADER, ".edata", edataRva, edataSize,
         IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
 
+    // EAT index (0-based, AddressOfFunctions slot) for export i — its assigned ordinal
+    // (declared or synthesized, see planOrdinals) biased by Base.
+    const eatIndexOf = (i: number): number => ordinalPlan.assigned[i] - ordinalPlan.base;
+
     const exportAddresses = new Map<string, number>();
     const ordinalAddresses = new Map<number, number>();
     for (let i = 0; i < exports.length; i++) {
+        // Stub BODIES stay packed sequentially in .text regardless of ordinal — only the
+        // EAT's RVA slot (below) depends on it.
         const rva = TEXT_RVA + i * STUB_SIZE;
         bytes.set(exports[i].code.subarray(0, STUB_SIZE), rva);
-        const address = (base + rva) >>> 0;
-        exportAddresses.set(exports[i].name, address);
-        ordinalAddresses.set(i + 1, address);
-        view.setUint32(functionsRva + i * 4, rva, true);
+        // Several names may alias one declared ordinal; the EAT and every name must agree.
+        const target = ordinalPlan.slotToExportIndex[eatIndexOf(i)];
+        exportAddresses.set(exports[i].name, (base + TEXT_RVA + target * STUB_SIZE) >>> 0);
+    }
+    for (let slot = 0; slot < ordinalPlan.numberOfFunctions; slot++) {
+        const exportIndex = ordinalPlan.slotToExportIndex[slot];
+        // A gap (an ordinal nothing declares) gets a zero RVA, same as a real PE's unused
+        // EAT slot — never another export's address, which is what sequential assignment
+        // handed out for every ordinal after the first gap.
+        const rva = exportIndex >= 0 ? TEXT_RVA + exportIndex * STUB_SIZE : 0;
+        view.setUint32(functionsRva + slot * 4, rva, true);
+        if (exportIndex >= 0) ordinalAddresses.set(ordinalPlan.base + slot, (base + rva) >>> 0);
     }
 
     if (exports.length > 0) {
-        view.setUint32(edataRva + 0x0c, dllNameRva, true);         // Name
-        view.setUint32(edataRva + 0x10, 1, true);                  // Base (first ordinal)
-        view.setUint32(edataRva + 0x14, exports.length, true);     // NumberOfFunctions
-        view.setUint32(edataRva + 0x18, exports.length, true);     // NumberOfNames
+        view.setUint32(edataRva + 0x0c, dllNameRva, true);                   // Name
+        view.setUint32(edataRva + 0x10, ordinalPlan.base, true);             // Base (first ordinal)
+        view.setUint32(edataRva + 0x14, ordinalPlan.numberOfFunctions, true); // NumberOfFunctions
+        view.setUint32(edataRva + 0x18, exports.length, true);               // NumberOfNames
         view.setUint32(edataRva + 0x1c, functionsRva, true);
         view.setUint32(edataRva + 0x20, namesRva, true);
         view.setUint32(edataRva + 0x24, ordinalsRva, true);
@@ -200,7 +279,7 @@ export function buildHleModuleImage(
         for (let slot = 0; slot < order.length; slot++) {
             const i = order[slot];
             view.setUint32(namesRva + slot * 4, nameRvas[i], true);
-            view.setUint16(ordinalsRva + slot * 2, i, true);       // biased by Base, so 0-based
+            view.setUint16(ordinalsRva + slot * 2, eatIndexOf(i), true);   // biased by Base, so 0-based
             bytes.set(nameBytes[i], nameRvas[i]);
         }
         bytes.set(dllNameBytes, dllNameRva);

@@ -116,6 +116,7 @@ const CP_TO_ENCODING: Record<number, string> = {
     1256: 'windows-1256', 1257: 'windows-1257', 1258: 'windows-1258',
     28591: 'iso-8859-1', 28592: 'iso-8859-2', 28595: 'iso-8859-5',
     65001: 'utf-8',
+
 };
 
 // CP437 (US OEM / IBM PC) — upper 128 code points (0x80–0xFF).
@@ -348,13 +349,6 @@ export class EmulatorConfig {
     // diverges under the f64 relaxed path and corrupts decode (NatalieBrooksSTH). Generic
     // capability (any bundle may declare it); mirrors real per-process x87 precision policy.
     public fpuStrict = false;
-
-    /**
-     * Opt-in: implicit primary presents of a guest that Flips wait for its next Flip
-     * (bounded) instead of being drawn at the next refresh. For titles whose front-buffer
-     * passes after a Flip are only incomplete because emulation stretches them.
-     */
-    public ddrawHoldPresentsUntilFlip = false;
 
     // ANSI code page (GetACP) — default 1252 (Western European)
     public ansiCodePage = 1252;
@@ -630,9 +624,8 @@ export class EmulatorConfig {
             Logger.log(LogCategory.SYSTEM, "EmulatorConfig: strict x87 FPU (relaxed-FPU disabled at boot, fpuStrict=true)");
         }
 
-        if (config.ddrawHoldPresentsUntilFlip) {
-            this.ddrawHoldPresentsUntilFlip = true;
-            Logger.log(LogCategory.SYSTEM, "EmulatorConfig: ddraw implicit presents wait for the next Flip (ddrawHoldPresentsUntilFlip=true)");
+        if (config.ddrawHoldPresentsUntilFlip !== undefined) {
+            Logger.log(LogCategory.SYSTEM, "EmulatorConfig: ddrawHoldPresentsUntilFlip is ignored and can be removed from the manifest: implicit primary presents draw the pixels committed at Unlock/Blt/BltFast");
         }
 
         // Apply per-game graphics quality override (layers on top of the global user pref)
@@ -767,7 +760,6 @@ export class EmulatorConfig {
         this.screenBackgroundColor = { ...DEFAULT_SCREEN_BACKGROUND };
         this.skipVideo = false;
         this.fpuStrict = false;
-        this.ddrawHoldPresentsUntilFlip = false;
         this.disabledDlls = [];
         this.appDirDlls = [];
         this.crtBinding = "auto";

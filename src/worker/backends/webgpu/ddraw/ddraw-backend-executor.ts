@@ -329,6 +329,13 @@ function surfacePixelsAreBlank(state: DirectDrawSurfaceState): boolean {
 /**
  * Main executor class for DirectDraw WebGPU rendering
  */
+/** Destroys textures parked until a submit; `list` is absent on executors built without it. */
+function destroyTextures(list: GPUTexture[] | undefined): void {
+    if (!list || list.length === 0) return;
+    for (const t of list) t.destroy();
+    list.length = 0;
+}
+
 export class DDrawWebGPUExecutor implements QueueWriteGuard {
     private device!: GPUDevice;
     private queue!: GPUQueue;
@@ -607,6 +614,11 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         this.mipGenerator = null;
         this.sampleViewCache = new WeakMap();
         this.lastAppliedMsaa = -1;
+        this.blitPass = null;
+        this.blitPassView = null;
+        this.blitScratch = null;
+        this.blitScratchView = null;
+        this.blitScratchGarbage.length = 0;
     }
 
     private onDeviceRecreated(device: GPUDevice): void {
@@ -817,6 +829,12 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
             this.dummyTexture = null;
             this.dummyTextureView = null;
         }
+        this.blitScratch?.destroy();
+        this.blitScratch = null;
+        this.blitScratchView = null;
+        destroyTextures(this.blitScratchGarbage);
+        this.blitPass = null;
+        this.blitPassView = null;
     }
 
     // ===== Debug API =====
@@ -847,6 +865,9 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         earlyTexSubmits: 0,    // mid-frame submits forced by a sampled texture being overwritten
         queueWriteSubmits: 0,  // submits forced by a queue-level write to a texture recorded work uses
         blitRingSubmits: 0,    // submits forced by a full colour-key uniform ring
+        blitSelfCopies: 0,     // src == dst blits that read a scratch copy of the source rect
+        blits: 0,              // colour-key/shader-copy blits encoded
+        blitPasses: 0,         // render passes those blits opened
     };
 
     /** Count non-finite positions in CPU-converted vertex data (diagnoses guest-side
@@ -2154,19 +2175,6 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
             this.syncSurfaceFromMemory(dstState);
         }
 
-
-        // End any active render pass
-        if (this.currentRenderPass) {
-            this.currentRenderPass.end();
-            this.currentRenderPass = null;
-            this.currentRenderTarget = null;
-        }
-
-        // Ensure encoder exists
-        if (!this.currentEncoder) {
-            this.currentEncoder = this.device.createCommandEncoder();
-        }
-
         // Decode colorkey to normalized RGBA based on source surface pixel format
         const srcFormat = detectPixelFormat(srcState.format);
         const colorKeyLow = decodeColorKeyToRGBA(colorKey.low, srcFormat);
@@ -2175,9 +2183,10 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         this.ensureBlitSlot();
         this.noteRecordedTexture(srcState.gpuTexture);
         this.noteRecordedTexture(dstState.gpuTexture);
+        const srcView = this.blitSourceView(srcState, dstState, srcRect);
         // Perform the blit
-        this.colorKeyBlitPipeline.blit(this.currentEncoder, {
-            srcView: srcState.gpuTextureView,
+        this.colorKeyBlitPipeline.encode(this.openBlitPass(dstState), {
+            srcView,
             srcWidth: srcState.width,
             srcHeight: srcState.height,
             dstView: dstState.gpuTextureView,
@@ -2264,23 +2273,14 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
             this.syncSurfaceFromMemory(dstState);
         }
 
-
-        if (this.currentRenderPass) {
-            this.currentRenderPass.end();
-            this.currentRenderPass = null;
-            this.currentRenderTarget = null;
-        }
-        if (!this.currentEncoder) {
-            this.currentEncoder = this.device.createCommandEncoder();
-        }
-
         this.ensureBlitSlot();
         this.noteRecordedTexture(srcState.gpuTexture);
         this.noteRecordedTexture(dstState.gpuTexture);
         // Dummy colorkey values; discard disabled by enableColorKey=false
         const zero = { r: 0, g: 0, b: 0, a: 0 };
-        this.colorKeyBlitPipeline.blit(this.currentEncoder, {
-            srcView: srcState.gpuTextureView,
+        const srcView = this.blitSourceView(srcState, dstState, srcRect);
+        this.colorKeyBlitPipeline.encode(this.openBlitPass(dstState), {
+            srcView,
             srcWidth: srcState.width,
             srcHeight: srcState.height,
             dstView: dstState.gpuTextureView,
@@ -3647,6 +3647,7 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                 this.msaaColorManager.flushGarbage();
                 // Destroy deferred TextureConverter buffers (resized mid-frame) so no "used while destroyed"
                 this.textureConverter.destroyPendingAfterSubmit();
+                destroyTextures(this.blitScratchGarbage);
                 // Destroy deferred VertexConverter buffers after submit to avoid "used while destroyed"
                 this.vertexConverter.destroyPendingAfterSubmit();
                 // Reuse global conversion buffer from offset 0 after each submit.
@@ -3673,6 +3674,7 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         this.depthManager.flushGarbage();
         this.msaaColorManager.flushGarbage();
         this.textureConverter.destroyPendingAfterSubmit();
+        destroyTextures(this.blitScratchGarbage);
         this.vertexConverter.destroyPendingAfterSubmit();
         this.vertexConverter.startFrame();
         this.depthManager.resetFrameDirtyFlags();
@@ -4059,6 +4061,83 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         state.needsColorClear = false;
         state.clearColor = undefined;
         this.surfacesNeedingClear.delete(state);
+    }
+
+    /** Scratch the source rect of a src == dst blit is copied into; replaced ones wait for a submit. */
+    private blitScratch: GPUTexture | null = null;
+    private blitScratchView: GPUTextureView | null = null;
+    private blitScratchGarbage: GPUTexture[] = [];
+
+    /**
+     * The view a blit samples. A blit whose source is its destination (a stretch or move
+     * within one surface) cannot sample the texture its pass renders to, so the source rect
+     * is copied into a reused scratch texture of the same size and format first, at the same
+     * coordinates, outside any pass. Windows defines an overlapping Blt as reading the source
+     * before writing, which the copy gives.
+     */
+    private blitSourceView(src: DirectDrawSurfaceState, dst: DirectDrawSurfaceState, rect: { left: number; top: number; right: number; bottom: number }): GPUTextureView {
+        if (src.gpuTexture !== dst.gpuTexture) return src.gpuTextureView!;
+        const tex = src.gpuTexture!;
+        if (!this.blitScratch || this.blitScratch.width !== tex.width || this.blitScratch.height !== tex.height
+            || this.blitScratch.format !== tex.format) {
+            if (this.blitScratch) this.blitScratchGarbage.push(this.blitScratch);
+            this.blitScratch = this.device.createTexture({
+                size: [tex.width, tex.height],
+                format: tex.format,
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+            });
+            this.blitScratchView = this.blitScratch.createView();
+        }
+        if (this.currentRenderPass) {
+            this.currentRenderPass.end();
+            this.currentRenderPass = null;
+            this.currentRenderTarget = null;
+        }
+        if (!this.currentEncoder) this.currentEncoder = this.device.createCommandEncoder();
+        const left = Math.max(0, Math.min(rect.left, rect.right)), top = Math.max(0, Math.min(rect.top, rect.bottom));
+        const right = Math.min(tex.width, Math.max(rect.left, rect.right)), bottom = Math.min(tex.height, Math.max(rect.top, rect.bottom));
+        if (right > left && bottom > top) {
+            this.currentEncoder.copyTextureToTexture(
+                { texture: tex, origin: { x: left, y: top } },
+                { texture: this.blitScratch, origin: { x: left, y: top } },
+                { width: right - left, height: bottom - top },
+            );
+        }
+        this.renderStats.blitSelfCopies++;
+        return this.blitScratchView!;
+    }
+
+    /** The open pass, when it is a blit pass, and the destination view it writes. */
+    private blitPass: GPURenderPassEncoder | null = null;
+    private blitPassView: GPUTextureView | null = null;
+
+    /**
+     * The pass a blit onto `dst` is encoded into. Consecutive blits to one destination share
+     * one pass; anything else that opens or ends a pass (a draw, a clear, a sync, a submit)
+     * leaves currentRenderPass pointing elsewhere, so the next blit opens a new one. Pending
+     * deferred clears of source and destination were encoded by encodePendingClear before
+     * this (it ends the open pass), so a shared pass never needs a clear of its own.
+     */
+    private openBlitPass(dst: DirectDrawSurfaceState): GPURenderPassEncoder {
+        const view = dst.gpuTextureView!;
+        if (this.currentRenderPass !== null && this.currentRenderPass === this.blitPass
+            && this.blitPassView === view) {
+            this.renderStats.blits++;
+            return this.blitPass;
+        }
+        if (this.currentRenderPass) {
+            this.currentRenderPass.end();
+            this.currentRenderPass = null;
+            this.currentRenderTarget = null;
+        }
+        if (!this.currentEncoder) this.currentEncoder = this.device.createCommandEncoder();
+        const pass = this.colorKeyBlitPipeline.beginPass(this.currentEncoder, view);
+        this.currentRenderPass = pass;
+        this.blitPass = pass;
+        this.blitPassView = view;
+        this.renderStats.blitPasses++;
+        this.renderStats.blits++;
+        return pass;
     }
 
     /** The colour-key pipeline's uniform ring holds a bounded number of unsubmitted blits. */

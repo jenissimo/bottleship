@@ -34,8 +34,6 @@ import { statsOverlay } from "../../core/stats-overlay";
 import { registerGpuDeviceObserver } from "../../core/gpu/gpu-device-lifecycle";
 import { beforeQueueWrite } from "../../backends/webgpu/shared/queue-write-guard";
 
-const FLIP_HOLD_MAX_MS = 100;
-const FLIP_HOLD_FLIP_INTERVALS = 1.5;
 const LOCK_HOLD_MAX_MS = 50;
 const REFRESH_BACKSTOP_MS = 50;
 
@@ -76,17 +74,18 @@ export class DDrawPresenter implements RenderActive {
     private lastPresentTime = 0;
     private pendingSurface: DirectDrawSurfaceState | null = null;
     private pendingOptions: { throttle?: boolean; flip?: boolean } | null = null;
+    /** Pixels of the pending implicit present, copied when the guest committed them. */
+    private pendingCommit: Uint8Array | null = null;
+    private commitBuffers: [Uint8Array | null, Uint8Array | null] = [null, null];
+    private commitInFlight: Uint8Array | null = null;
     private pendingResolvers: Array<{ resolve: () => void, reject: (reason?: unknown) => void }> = [];
     private pumpRunning = false;
     private pumpQueued = false;
     presentClock: PresentClock = defaultPresentClock;
     private latchedSince = -1;
     private lockedSince = -1;
-    holdUntilFlip: () => boolean = () => EmulatorConfig.getInstance().ddrawHoldPresentsUntilFlip;
     private refreshUnregister: (() => void) | null = null;
     private backstopCancel: (() => void) | null = null;
-    private lastFlipAt = -Infinity;
-    private flipIntervalMs = 0;
 
     // Phase-blend present mode (C). When enabled, guest Flips only SNAPSHOT into the interpolator;
     // a per-rAF callback (blendFrameUnreg) re-presents mix(prev,new,phase) at full refresh so a
@@ -156,6 +155,9 @@ export class DDrawPresenter implements RenderActive {
         }
         this.pendingSurface = null;
         this.pendingOptions = null;
+        this.pendingCommit = null;
+        this.commitBuffers = [null, null];
+        this.commitInFlight = null;
         this.pumpRunning = false;
 
         // Tear down phase-blend (interpolator holds device-bound GPU textures + an rAF callback).
@@ -275,16 +277,8 @@ export class DDrawPresenter implements RenderActive {
         }
     }
 
-    async present(surface: DirectDrawSurfaceState, _mem: Uint8Array, options: { throttle?: boolean; frameAlreadyMarked?: boolean; flip?: boolean; snapshotTextureView?: GPUTextureView } = {}): Promise<void> {
+    async present(surface: DirectDrawSurfaceState, _mem: Uint8Array, options: { throttle?: boolean; frameAlreadyMarked?: boolean; flip?: boolean; snapshotTextureView?: GPUTextureView; commit?: boolean; palette?: boolean } = {}): Promise<void> {
         this.presentCallCount++;
-        const now = this.presentClock.now();
-        if (options.flip) {
-            if (this.lastFlipAt > -Infinity) {
-                const interval = now - this.lastFlipAt;
-                this.flipIntervalMs = this.flipIntervalMs > 0 ? this.flipIntervalMs * 0.75 + interval * 0.25 : interval;
-            }
-            this.lastFlipAt = now;
-        }
         return new Promise<void>((resolve, reject) => {
             if (this.pendingSurface || this.pendingResolvers.length > 0) {
                 const supersededResolvers = this.pendingResolvers.splice(0);
@@ -294,8 +288,12 @@ export class DDrawPresenter implements RenderActive {
             }
 
             const supersededFlip = this.pendingSurface !== null && this.pendingOptions?.flip === true;
+            const keepCommit = options.palette === true && this.pendingSurface === surface && this.pendingCommit !== null;
             this.pendingSurface = surface;
             this.pendingOptions = supersededFlip && !options.flip ? { ...options, flip: true } : options;
+            this.pendingCommit = options.commit === true && !this.pendingOptions.flip && options.throttle === true
+                ? this.copyCommittedPixels(surface)
+                : keepCommit && !this.pendingOptions.flip ? this.pendingCommit : null;
             this.pendingResolvers.push({ resolve, reject });
             if (this.pendingOptions.flip) {
                 this.releaseRefreshLatch();
@@ -315,10 +313,8 @@ export class DDrawPresenter implements RenderActive {
      *   is drawn at the next refresh, once per refresh. A primary that is locked is held for
      *   at most LOCK_HOLD_MAX_MS from when it was first seen locked; one that stays locked
      *   is a continuous scanout writer and is drawn once per refresh after that.
-     * - Opt-in (manifest emulator.ddrawHoldPresentsUntilFlip): for a guest that Flips, the
-     *   latch waits for its next Flip, at most FLIP_HOLD_FLIP_INTERVALS of its Flip interval
-     *   (capped at FLIP_HOLD_MAX_MS), then draws the held state. Worst-case added latency of
-     *   an implicit present after a Flip: FLIP_HOLD_MAX_MS plus one refresh.
+     * - An implicit present from Unlock, Blt or BltFast draws the pixels copied at that call,
+     *   so a guest that keeps writing the front outside any lock is not sampled mid-pass.
      */
     private schedulePump(implicit: boolean): void {
         if (!implicit) {
@@ -337,14 +333,7 @@ export class DDrawPresenter implements RenderActive {
         this.armBackstop();
     }
 
-    private flipHoldMs(): number {
-        if (this.lastFlipAt === -Infinity || !this.holdUntilFlip()) return 0;
-        if (this.flipIntervalMs <= 0) return FLIP_HOLD_MAX_MS;
-        return Math.min(FLIP_HOLD_MAX_MS, this.flipIntervalMs * FLIP_HOLD_FLIP_INTERVALS);
-    }
-
     private implicitReady(now: number): boolean {
-        if (now - this.lastFlipAt < this.flipHoldMs()) return false;
         const locked = (this.pendingSurface as { activeLeaseId?: number } | null)?.activeLeaseId !== undefined;
         if (!locked) { this.lockedSince = -1; return true; }
         if (this.lockedSince < 0) this.lockedSince = this.latchedSince;
@@ -375,6 +364,32 @@ export class DDrawPresenter implements RenderActive {
         }, REFRESH_BACKSTOP_MS);
     }
 
+    /**
+     * An implicit present from Unlock, Blt or BltFast of the primary is a commit point: the
+     * guest has handed the surface back, and its pixels are what the screen shows until the
+     * next commit. The latch draws at the next refresh, so it keeps a copy of them; a guest
+     * that keeps writing the front outside any lock (a cached pointer after Flip) would
+     * otherwise be sampled half-way through at the refresh. Only a surface whose pixels the
+     * draw uploads from guest memory is copied, into one of two reused buffers: the one a
+     * draw is reading and the one the pending frame holds. A buffer can be longer than the
+     * surface; the pixels start at offset 0.
+     */
+    private copyCommittedPixels(surface: DirectDrawSurfaceState): Uint8Array | null {
+        if (!isRenderSurface(surface) || !surface.gpuDirty || !surface.surfacePtr) return null;
+        const bytes = surface.pitch * surface.height;
+        const mem = this.process.getCurrentMemory();
+        const start = surface.surfacePtr >>> 0;
+        if (bytes <= 0 || start + bytes > mem.length) return null;
+        const slot = this.commitBuffers[0] !== null && this.commitBuffers[0] === this.commitInFlight ? 1 : 0;
+        let buf = this.commitBuffers[slot];
+        if (!buf || buf.length < bytes) {
+            buf = new Uint8Array(bytes);
+            this.commitBuffers[slot] = buf;
+        }
+        buf.set(mem.subarray(start, start + bytes));
+        return buf;
+    }
+
     private pendingIsImplicit(): boolean {
         return this.pendingSurface !== null && this.pendingOptions?.throttle === true && !this.pendingOptions.flip;
     }
@@ -394,14 +409,17 @@ export class DDrawPresenter implements RenderActive {
             while (true) {
                 const frame = this.dequeuePendingFrame();
                 if (!frame) break;
-                const { surface, options, resolvers } = frame;
+                const { surface, options, resolvers, commit } = frame;
 
+                this.commitInFlight = commit;
                 try {
-                    await this.drawFrame(surface, options);
+                    await this.drawFrame(surface, options, commit);
                     for (const resolver of resolvers) resolver.resolve();
                 } catch (err) {
                     for (const resolver of resolvers) resolver.reject(err);
                     throw err;
+                } finally {
+                    this.commitInFlight = null;
                 }
             }
         } finally {
@@ -417,13 +435,15 @@ export class DDrawPresenter implements RenderActive {
         if (!this.pendingSurface) return null;
         const surface = this.pendingSurface;
         const options = this.pendingOptions;
+        const commit = this.pendingCommit;
         const resolvers = this.pendingResolvers.splice(0);
         this.pendingSurface = null;
         this.pendingOptions = null;
-        return { surface, options, resolvers };
+        this.pendingCommit = null;
+        return { surface, options, resolvers, commit };
     }
 
-    private async drawFrame(surface: DirectDrawSurfaceState, options?: { throttle?: boolean; frameAlreadyMarked?: boolean; snapshotTextureView?: GPUTextureView } | null): Promise<void> {
+    private async drawFrame(surface: DirectDrawSurfaceState, options?: { throttle?: boolean; frameAlreadyMarked?: boolean; snapshotTextureView?: GPUTextureView } | null, commit: Uint8Array | null = null): Promise<void> {
         let mem = this.process.getCurrentMemory();
         profiler.start("present");
         const presentStart = frameProfiler.startTimer();
@@ -516,13 +536,13 @@ export class DDrawPresenter implements RenderActive {
                         // Uploading from CPU would overwrite valid GPU pixels with stale/empty memory.
                         if (surface.gpuDirty) {
                             profiler.start("present:rgb565Upload");
-                            this.uploadRGB565SurfaceToGPU(surface, mem, device, queue);
+                            this.uploadRGB565SurfaceToGPU(surface, commit ?? mem, device, queue, commit ? 0 : surface.surfacePtr);
                             profiler.end("present:rgb565Upload");
                         }
                     } else if (isPalette8) {
                         if (surface.gpuDirty) {
                             profiler.start("present:palette8Upload");
-                            this.uploadPalette8SurfaceToGPU(surface, mem, device, queue);
+                            this.uploadPalette8SurfaceToGPU(surface, commit ?? mem, device, queue, commit ? 0 : surface.surfacePtr);
                             profiler.end("present:palette8Upload");
                         }
                     } else if (isRenderSurface(surface) && !surface.gpuTexture && awaitsTextureAfterRestore(surface)) {
@@ -544,7 +564,7 @@ export class DDrawPresenter implements RenderActive {
                         }
                         if (this.counters.frames < 10) Logger.log(LogCategory.DDRAW, `drawFrame: before flushAll frame=${this.counters.frames}`);
                         const _fa = performance.now();
-                        await ddrawModule.context.deferredUploadManager.flushAll(queue, mem);
+                        await ddrawModule.context.deferredUploadManager.flushAll(queue, mem, commit ? { surface, bytes: commit } : undefined);
                         // Other guest threads may grow WASM memory while the upload awaits.
                         mem = this.process.getCurrentMemory();
                         _pdFlushAll += performance.now() - _fa;
@@ -714,7 +734,7 @@ export class DDrawPresenter implements RenderActive {
                 }
             }
 
-            const imageData = this.surfaceToImageData(surface, mem);
+            const imageData = this.surfaceToImageData(surface, mem, commit);
             this.ctx.putImageData(imageData, 0, 0);
 
             // Asked HERE, not at the top of present(): the GPU path returns long before this
@@ -960,14 +980,15 @@ export class DDrawPresenter implements RenderActive {
         );
     }
 
-    private surfaceToImageData(surface: DirectDrawSurfaceState, mem: Uint8Array): ImageData {
+    private surfaceToImageData(surface: DirectDrawSurfaceState, mem: Uint8Array, commit: Uint8Array | null = null): ImageData {
         const { width, height, pitch, format, surfacePtr } = surface;
         // Use stored pitch only if >= computed (allows row padding, rejects invalid)
         const computedPitch = getSurfaceFormatLayout(format, width, height).pitch;
         const effectivePitch = (pitch && pitch >= computedPitch) ? pitch : computedPitch;
+        const fromCommit = commit !== null && effectivePitch * height <= commit.length;
 
         const palette = resolvePalette(surface);
-        const rgbaData = decodeSurfaceFormatToRgba8(mem, surfacePtr, width, height, effectivePitch, format, surface.rgbaScratch, surface.srcColorKey, palette);
+        const rgbaData = decodeSurfaceFormatToRgba8(fromCommit ? commit : mem, fromCommit ? 0 : surfacePtr, width, height, effectivePitch, format, surface.rgbaScratch, surface.srcColorKey, palette);
         surface.rgbaScratch = rgbaData;
 
         return new ImageData(new Uint8ClampedArray(rgbaData), width, height);
@@ -982,9 +1003,10 @@ export class DDrawPresenter implements RenderActive {
         surface: DirectDrawSurfaceState,
         mem: Uint8Array,
         device: GPUDevice,
-        queue: GPUQueue
+        queue: GPUQueue,
+        surfacePtr: number,
     ): void {
-        const { width, height, pitch, surfacePtr, format } = surface;
+        const { width, height, pitch, format } = surface;
 
         // Ensure RGBA target texture exists
         const needsRecreate = !surface.gpuTexture ||
@@ -1086,9 +1108,10 @@ export class DDrawPresenter implements RenderActive {
         surface: DirectDrawSurfaceState,
         mem: Uint8Array,
         device: GPUDevice,
-        queue: GPUQueue
+        queue: GPUQueue,
+        surfacePtr: number,
     ): void {
-        const { width, height, pitch, surfacePtr } = surface;
+        const { width, height, pitch } = surface;
 
         // Get executor early (needed for cache invalidation if texture is recreated)
         const system = System.getInstance();

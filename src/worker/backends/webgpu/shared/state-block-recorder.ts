@@ -35,12 +35,14 @@ export class KeyedStateBlockRecorder<E> {
         return result;
     }
 
-    record(entry: E): void {
+    record(entry: E): E | undefined {
         if (!this.active) return;
         const key = this.keyOf(entry);
         const existing = this.keyToIndex.get(key);
         if (existing !== undefined) {
+            const previous = this.entries[existing];
             this.entries[existing] = entry;
+            return previous;
         } else {
             this.keyToIndex.set(key, this.entries.length);
             this.entries.push(entry);

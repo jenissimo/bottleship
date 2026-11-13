@@ -1819,7 +1819,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     const isPrimary = (state.caps & DDSCAPS_PRIMARYSURFACE) !== 0;
                     if (isPrimary && context.presenter && !context.suppressPresent) {
                         const lcPresent = lockCostProfiler.now();
-                        void context.presenter.present(state, mem, { throttle: true });
+                        void context.presenter.present(state, mem, { throttle: true, commit: true });
                         lockCostProfiler.add(LP.upresent, lcPresent, ucClass);
                     }
                 } else {
@@ -1937,7 +1937,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     // Auto-present for primary surface (see v7 Unlock for details)
                     const isPrimary = (state.caps & DDSCAPS_PRIMARYSURFACE) !== 0;
                     if (isPrimary && context.presenter && !context.suppressPresent) {
-                        void context.presenter.present(state, mem, { throttle: true });
+                        void context.presenter.present(state, mem, { throttle: true, commit: true });
                     }
                 }
             }
@@ -1987,7 +1987,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     // Auto-present for primary surface (see v7 Unlock for details)
                     const isPrimary = (state.caps & DDSCAPS_PRIMARYSURFACE) !== 0;
                     if (isPrimary && context.presenter && !context.suppressPresent) {
-                        void context.presenter.present(state, mem, { throttle: true });
+                        void context.presenter.present(state, mem, { throttle: true, commit: true });
                     }
                 }
             }
@@ -2635,7 +2635,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 setAuthorityCpu(nextState);
                 nextAddr = nextState.attachedSurfaceAddr;
             }
-            if (!context.suppressPresent) void context.presenter?.present(state, mem, { throttle: true });
+            if (!context.suppressPresent) void context.presenter?.present(state, mem, { throttle: true, palette: true });
         }
 
         Logger.log(LogCategory.DDRAW, `SetPalette: Linked palette handle=0x${paletteObj.handle.toString(16)} to surface=0x${thisPtr.toString(16)}${isTexture ? ' [TEXTURE]' : ''}`);

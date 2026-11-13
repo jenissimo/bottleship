@@ -139,6 +139,41 @@ CLI invocation reconnects without it.
   overwrites init-time evidence in ~20s and it is gone before a late crash fires. Quiet the
   firehose category first — `logLevel("DDRAW","WARN")` (`logLevel()` resets) — rather than
   just enlarging the ring, which only postpones losing the same lines.
+- "WHICH GUEST CODE burns the CPU?" — two instruments, and they answer different questions:
+  - `eipProfile()` — cheap, covers every page, nothing armed. A sample is taken BETWEEN v86
+    slices, and a slice ends after a fixed instruction budget, so samples are
+    INSTRUCTION-weighted per activation, not wall time. Default `attribution:'exitSite'`
+    names the exit instruction of the JIT activation that spent the budget; it recompiles
+    (JIT cache clear, `warmupMs` warm-up, clear again on exit), so never take timings from
+    that window. `attribution:'nextEip'` (and the `nextEipTop` column) is the raw
+    `instruction_pointer`, which at a budget exit already holds the block entered NEXT — a
+    short leaf called from long code gets that code's share (a measured ~2% leaf read as
+    19-31%). Never rank functions from `nextEip`.
+  - `guestBlocks()` — EXACT `exec x instructions` per block from the trace2 census, the
+    number to quote. It arms at most 64 tier-2 pages (name others with `pages`/`ranges`) and
+    slows the guest while armed. When `eipProfile` and `guestBlocks` disagree on a hot block,
+    trust the counts.
+- "HOW MUCH Wasm does the hot guest code turn into?" — EXECUTED density, Wasm ops per
+  retired guest instruction, = sum(exec x ops_block) / sum(exec x instructions_block). A static
+  density over a module averages in every cold slow arm; this weights each block by its trace2
+  count. The census window dirties and recompiles the armed pages, so arming the journal right
+  before it captures their modules:
+  ```bash
+  bun tools/harness.ts jitPublications arm '{"blockMap":true}'
+  bun tools/harness.ts guestBlocks '{"ms":5000,"top":100000}' > gb.json   # every row, not the top 15
+  sleep 5   # disarming recompiles the pages WITHOUT the trace2 counter; let those publish
+  bun tools/harness.ts jitPublications seal
+  bun tools/harness.ts jitPublications export > pub.json
+  bun tools/harness.ts jitPublications clear
+  bun tools/bench-v86/jit-exec-density.mjs pub.json gb.json [--ranges ranges.json] [--json]
+  ```
+  Read `coverage` first: `matchedPct` is the share of counted instructions the map could price.
+  `unmapped` = blocks whose module was compiled before the arm (arm earlier); `tracedOnlyIns` =
+  matched only to copies compiled under the counter, whose ops include the instrument (wait
+  longer before `seal`). `executedDensityRange` spans a block's recompiled copies — a wide range
+  means the code changed during the window. Dispatcher/epilogue ops belong to no block and are
+  left out (`unattributedOps` per JIT module). Per function: `--ranges` with
+  `[{name, from, to}]` physical addresses. Groups: per guest module, per JIT module, per range.
 - A guest blocked on a **MessageBox** looks exactly like a freeze: the host draws it as DOM,
   so no canvas capture shows it and the one string naming the problem is invisible.
   `report().pendingModals` lists them (text, caption, how long it has waited);

@@ -503,9 +503,11 @@ export class HarnessChain {
     /** Where the GUEST burns CPU: symbolized EIP/page histogram over a sampling window.
      *  The instrument for a stall the thunk profiler can't see (level loads, decode loops) —
      *  a Chrome trace only says `wasm-function[N]`, this says `module+0xrva`. Read
-     *  `stoppedPct` first: high means the guest was parked, not computing. */
-    eipProfile(opts?: { ms?: number; intervalMs?: number; top?: number }): this {
-        return this.pushTimed("eipProfile", [opts], (opts?.ms ?? 3000) + 10_000);
+     *  `stoppedPct` first: high means the guest was parked, not computing. Samples are
+     *  instruction-weighted per slice; default `attribution:'exitSite'` names the code that
+     *  spent the slice (recompiles around the window), `'nextEip'` the block entered next. */
+    eipProfile(opts?: { ms?: number; intervalMs?: number; top?: number; attribution?: "exitSite" | "nextEip"; warmupMs?: number }): this {
+        return this.pushTimed("eipProfile", [opts], (opts?.ms ?? 3000) + (opts?.warmupMs ?? 1500) + 10_000);
     }
     /** GPU→CPU readback accounting: roundTrips (the real cost), memoHits, scratchHits,
      *  redundant (must be 0). {reset:true} zeroes after reading, so bracketing a

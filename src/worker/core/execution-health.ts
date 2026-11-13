@@ -9,8 +9,16 @@
  * slow host. A spin-wait is NOT excluded and need not be: it retires instructions at full
  * speed, so it reads high, never low.
  *
+ * Busy time is NOT guest time: it also holds every synchronous thunk (HLE) and whatever the
+ * presenter does inside a tick. Nothing always-on times thunks (frame-profiler does, only while
+ * armed), so the figure cannot be split, and a title whose tick is mostly HLE — hundreds of
+ * BltFast/DrawPrimitive per frame — reads a few MIPS at full speed with an idle host CPU
+ * (issue #354). The overlay therefore shows busy MIPS as an upper bound on host trouble, and the
+ * hint does not trust it alone: see SlowExecutionDetector for the two extra symptoms it needs.
+ *
  * Cost: a sample is a handful of counter reads every SAMPLE_INTERVAL_MS, taken from the tick
- * exit hook behind one comparison. Nothing is added to the guest path or per present.
+ * exit hook behind one comparison. Nothing is added to the guest path, per thunk or per present:
+ * the HLE-call and present counts are counters the dispatcher and RenderService already keep.
  */
 
 export const SAMPLE_INTERVAL_MS = 500;
@@ -35,6 +43,10 @@ export interface ExecCounters {
     inTickMs: number;
     /** Monotonic synchronous SAB wait, a slice of inTickMs. */
     sabWaitMs: number;
+    /** Monotonic count of HLE calls (OUT-trap thunks, fast and slow tier); absent = unknown. */
+    hleCalls?: number;
+    /** Monotonic count of presents the GUEST drove; absent = unknown. */
+    presents?: number;
 }
 
 export interface ExecWindow {
@@ -47,6 +59,18 @@ export interface ExecWindow {
     ioShare: number;
     /** Instructions per busy µs; null when the window was too idle to say. */
     busyMips: number | null;
+    /** HLE calls per million retired guest instructions — a property of the WORKLOAD, not of
+     *  host speed (a slow host runs the same code at the same call density). High means busy
+     *  time is mostly thunks, so busyMips says little about the host. Null = unknown. */
+    hlePerMInsn: number | null;
+    /** Guest presents per wall second; null = unknown (no source, or the counter was reset). */
+    presentsPerSec: number | null;
+}
+
+function delta(a: number | undefined, b: number | undefined): number | null {
+    if (a === undefined || b === undefined) return null;
+    const d = b - a;
+    return d >= 0 ? d : null; // a reset counter (new game load) is not a negative rate
 }
 
 export function measureWindow(a: ExecCounters, b: ExecCounters): ExecWindow | null {
@@ -57,10 +81,14 @@ export function measureWindow(a: ExecCounters, b: ExecCounters): ExecWindow | nu
     // Unsigned: the counter wraps every few seconds at game speed; a window is far shorter.
     const insns = (b.insns - a.insns) >>> 0;
     const busyShare = busyMs / ms;
+    const hle = delta(a.hleCalls, b.hleCalls);
+    const presents = delta(a.presents, b.presents);
     return {
         ms, busyMs, insns, busyShare,
         ioShare: sab / ms,
         busyMips: busyShare >= MIN_BUSY_SHARE_FOR_MIPS && busyMs > 0 ? insns / busyMs / 1000 : null,
+        hlePerMInsn: hle !== null && insns > 0 ? hle / (insns / 1e6) : null,
+        presentsPerSec: presents !== null ? presents * 1000 / ms : null,
     };
 }
 
@@ -115,9 +143,35 @@ export const SLOW_MAX_IO_SHARE = 0.1;
 export const SLOW_WARMUP_MS = 5_000;
 
 /**
+ * Above this many HLE calls per million guest instructions the window is HLE-bound: low busy
+ * MIPS there is our thunk time, not a slow host, and the window is no evidence either way.
+ *
+ * Why 500: at the SLOW_MIPS_THRESHOLD line (100 MIPS) a million instructions cost 10 ms of
+ * guest time; 500 calls at <=10 us each are <=5 ms, so below this density the guest's own code
+ * is still at least ~2/3 of busy time and a sub-100 reading really is the host. The Forge
+ * (issue #354: ~26k BltFast + ~2.5k DrawPrimitive per 3 s, i.e. >=9.5k calls/s, at 7 busy
+ * MIPS with busy share 0.5..1 = 3.5..7M insns/s) sits at >=1,350/M — 2.7x over the line.
+ */
+export const SLOW_MAX_HLE_PER_MINSN = 500;
+/**
+ * A window presenting at least this often is visibly running and CLEARS accumulated slow
+ * time: a slow-host hint on a game at 37-60 fps is wrong whatever the MIPS say. 20 sits under
+ * the 30 fps that 2D/turn-based titles pace themselves to by design, with room for a few
+ * dropped frames, and over the ~10-15 fps a starved host actually delivers.
+ */
+export const SLOW_MAX_PRESENTS_PER_S = 20;
+
+/**
  * Fires at most once: true from feed() on the window that completes SLOW_SUSTAIN_MS of slow,
- * busy, non-loading game time. Windows that cannot judge (idle, loading, before warm-up)
- * neither add nor clear; a clearly fast window clears.
+ * busy, non-loading game time. A window is SLOW only when all three hold:
+ *   1. busy MIPS below the JIT-mode line (the host is not running guest code fast);
+ *   2. the guest's own code dominates busy time (HLE density <= SLOW_MAX_HLE_PER_MINSN) —
+ *      otherwise (1) measures our thunks;
+ *   3. presents below SLOW_MAX_PRESENTS_PER_S — the user can see it. A game presenting
+ *      faster CLEARS, so a 30 fps-by-design title never accumulates.
+ * Windows that cannot judge (idle, loading, before warm-up, HLE-bound) neither add nor clear;
+ * a clearly fast window clears. An unknown density or present rate (no source) does not
+ * block — the MIPS evidence stands alone as before #354.
  */
 export class SlowExecutionDetector {
     private slowMs = 0;
@@ -126,7 +180,9 @@ export class SlowExecutionDetector {
     feed(w: ExecWindow, sinceFirstPresentMs: number | null, jit: JitEffective = "on"): boolean {
         if (this.fired) return false;
         if (sinceFirstPresentMs === null || sinceFirstPresentMs < SLOW_WARMUP_MS) return false;
+        if (w.presentsPerSec !== null && w.presentsPerSec >= SLOW_MAX_PRESENTS_PER_S) { this.slowMs = 0; return false; }
         if (w.busyMips === null || w.busyShare < SLOW_MIN_BUSY_SHARE || w.ioShare > SLOW_MAX_IO_SHARE) return false;
+        if (w.hlePerMInsn !== null && w.hlePerMInsn > SLOW_MAX_HLE_PER_MINSN) return false;
         const t = slowThresholds(jit);
         if (w.busyMips < t.slow) this.slowMs += w.ms;
         else if (w.busyMips >= t.recover) this.slowMs = 0;
@@ -152,6 +208,10 @@ export interface ExecHealthSnapshot {
     mips: number | null;
     /** Last window's busy share (0..1), null before the first window. */
     busyShare: number | null;
+    /** Last window's HLE calls per million guest instructions (null = unknown). */
+    hlePerMInsn: number | null;
+    /** Last window's guest presents per second (null = unknown). */
+    presentsPerSec: number | null;
     jit: JitEffective;
     reason: JitReason;
     slowMs: number;
@@ -162,6 +222,10 @@ export interface ExecHealthSources {
     readInsns(): number;
     readInTickMs(): number;
     readSabWaitMs(): number;
+    /** Existing monotonic HLE-call counter (dispatcher). Optional: absent = density unknown. */
+    readHleCalls?: () => number | undefined;
+    /** Existing monotonic guest-present counter (RenderService). Optional. */
+    readPresents?: () => number | undefined;
     getJitConfig?: (i: number) => number;
 }
 
@@ -171,6 +235,8 @@ export class ExecutionHealth {
     private nextAtMs = 0;
     private mips: number | null = null;
     private busyShare: number | null = null;
+    private hlePerMInsn: number | null = null;
+    private presentsPerSec: number | null = null;
     private firstPresentAtMs = -1;
     private detector = new SlowExecutionDetector();
     private jit: JitEffective = "unknown";
@@ -199,6 +265,8 @@ export class ExecutionHealth {
         this.nextAtMs = 0;
         this.mips = null;
         this.busyShare = null;
+        this.hlePerMInsn = null;
+        this.presentsPerSec = null;
         this.firstPresentAtMs = -1;
         this.detector = new SlowExecutionDetector();
     }
@@ -215,6 +283,7 @@ export class ExecutionHealth {
         const cur: ExecCounters = {
             atMs: nowMs, insns: src.readInsns() >>> 0,
             inTickMs: src.readInTickMs(), sabWaitMs: src.readSabWaitMs(),
+            hleCalls: src.readHleCalls?.(), presents: src.readPresents?.(),
         };
         const prev = this.prev;
         this.prev = cur;
@@ -226,6 +295,8 @@ export class ExecutionHealth {
         if (!w || w.ms > SAMPLE_INTERVAL_MS * 4) return;
         this.mips = smoothMips(this.mips, w);
         this.busyShare = w.busyShare;
+        this.hlePerMInsn = w.hlePerMInsn;
+        this.presentsPerSec = w.presentsPerSec;
         const since = this.firstPresentAtMs < 0 ? null : nowMs - this.firstPresentAtMs;
         if (this.detector.feed(w, since, this.jit) && this.onHint) {
             this.onHint({ type: "perf_hint", jit: this.jit, reason: this.reason, mips: Math.round(this.mips ?? w.busyMips ?? 0) });
@@ -235,7 +306,9 @@ export class ExecutionHealth {
 
     snapshot(): ExecHealthSnapshot {
         return {
-            mips: this.mips, busyShare: this.busyShare, jit: this.jit, reason: this.reason,
+            mips: this.mips, busyShare: this.busyShare,
+            hlePerMInsn: this.hlePerMInsn, presentsPerSec: this.presentsPerSec,
+            jit: this.jit, reason: this.reason,
             slowMs: this.detector.accumulatedSlowMs, hinted: this.detector.hasFired,
         };
     }

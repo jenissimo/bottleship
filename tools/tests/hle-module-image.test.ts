@@ -134,6 +134,75 @@ describe("HLE module image — PE header walk", () => {
     });
 });
 
+describe("HLE module image — real (sparse) ordinals", () => {
+    test("a sparse ordinal set resolves each ordinal to its OWN export, not array position", () => {
+        // [1, 3, 5] packed at array indices [0, 1, 2] — sequential assignment (the bug this
+        // guards) would have ordinal 2 "exist" pointing at index 1's body (ordinal 3's
+        // export) and ordinal 3 pointing at index 2's body (ordinal 5's), instead of ordinal
+        // 2 being absent and ordinal 3 resolving to its own export.
+        const exports: HleImageExport[] = [
+            { name: "ord_1", code: stub(1), ordinal: 1 },
+            { name: "ord_3", code: stub(2), ordinal: 3 },
+            { name: "ord_5", code: stub(3), ordinal: 5 },
+        ];
+        const image = buildHleModuleImage("ordinal-fixture", BASE, HLE_IMAGE_SLOT_SIZE, exports);
+
+        expect(image.ordinalAddresses.get(1)).toBe(image.exportAddresses.get("ord_1"));
+        expect(image.ordinalAddresses.get(3)).toBe(image.exportAddresses.get("ord_3"));
+        expect(image.ordinalAddresses.get(5)).toBe(image.exportAddresses.get("ord_5"));
+        // Every gap is genuinely absent, not some other export's address.
+        expect(image.ordinalAddresses.has(2)).toBe(false);
+        expect(image.ordinalAddresses.has(4)).toBe(false);
+
+        // And at the byte level: the EAT's gap slots are a zero RVA, same as a real PE's.
+        const b = image.bytes;
+        const oh = u32(b, 0x3c) + 4 + 20;
+        const edata = u32(b, oh + 0x60);
+        const base = u32(b, edata + 0x10);
+        const numberOfFunctions = u32(b, edata + 0x14);
+        expect(base).toBe(1);
+        expect(numberOfFunctions).toBe(5); // ordinals 1..5, base 1
+        const functions = u32(b, edata + 0x1c);
+        expect(u32(b, functions + (2 - base) * 4)).toBe(0); // gap: ordinal 2
+        expect(u32(b, functions + (4 - base) * 4)).toBe(0); // gap: ordinal 4
+        expect(u32(b, functions + (3 - base) * 4)).toBeGreaterThan(0); // real: ordinal 3
+    });
+
+    test("a module mixing declared and undeclared ordinals never collides", () => {
+        // Two real, documented ordinals among otherwise by-name-only exports — the shape
+        // dsound/dplayx actually ship.
+        const exports: HleImageExport[] = [
+            { name: "DllCanUnloadNow", code: stub(1) },
+            { name: "ord_6", code: stub(2), ordinal: 6 },
+            { name: "DirectSoundCreate", code: stub(3) },
+            { name: "ord_11", code: stub(4), ordinal: 11 },
+            { name: "DirectSoundEnumerateA", code: stub(5) },
+        ];
+        const image = buildHleModuleImage("dsound", BASE, HLE_IMAGE_SLOT_SIZE, exports);
+
+        // The two REAL ordinals land exactly where declared.
+        expect(image.ordinalAddresses.get(6)).toBe(image.exportAddresses.get("ord_6"));
+        expect(image.ordinalAddresses.get(11)).toBe(image.exportAddresses.get("ord_11"));
+
+        // Every export is still reachable by name, and every ordinal in the map is unique
+        // (no undeclared export silently landed on ordinal 6 or 11).
+        const seenAddresses = new Set<number>();
+        for (const name of ["DllCanUnloadNow", "DirectSoundCreate", "DirectSoundEnumerateA"]) {
+            const addr = image.exportAddresses.get(name);
+            expect(addr).toBeDefined();
+            seenAddresses.add(addr!);
+        }
+        const ordinalValues = [...image.ordinalAddresses.values()];
+        expect(new Set(ordinalValues).size).toBe(ordinalValues.length);
+        // The undeclared exports' synthesized ordinals are real addresses of THEIR OWN
+        // export, not ord_6's or ord_11's.
+        for (const [, addr] of image.ordinalAddresses) {
+            if (addr === image.exportAddresses.get("ord_6") || addr === image.exportAddresses.get("ord_11")) continue;
+            expect(seenAddresses.has(addr)).toBe(true);
+        }
+    });
+});
+
 describe("HLE image arena layout", () => {
     test("pinned slots are distinct and fit the arena", () => {
         const slots = Object.values(HLE_IMAGE_SLOT);
@@ -146,4 +215,20 @@ describe("HLE image arena layout", () => {
             expect(hleImageBaseForSlot(slot) % 0x10000).toBe(0);
         }
     });
+});
+
+for (const ordinals of [[0], [-1], [1.5], [65536], [65535, undefined]]) {
+    test(`invalid ordinal layout ${ordinals} fails before writing an image`, () => {
+        const exports = ordinals.map((ordinal, i) => ({ name: `f${i}`, code: stub(i), ordinal }));
+        expect(() => buildHleModuleImage("fixture", BASE, HLE_IMAGE_SLOT_SIZE, exports)).toThrow();
+    });
+}
+
+test("two export names can alias the same declared ordinal", () => {
+    const image = buildHleModuleImage("fixture", BASE, HLE_IMAGE_SLOT_SIZE, [
+        { name: "Canonical", code: stub(1), ordinal: 17 },
+        { name: "ord_17", code: stub(2), ordinal: 17 },
+    ]);
+    expect(image.exportAddresses.get("Canonical")).toBe(image.ordinalAddresses.get(17));
+    expect(image.exportAddresses.get("ord_17")).toBe(image.ordinalAddresses.get(17));
 });
