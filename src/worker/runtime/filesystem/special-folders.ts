@@ -3,6 +3,12 @@
  * shell32's SHGetFolderPath/SHGetSpecialFolderPath and the registry's
  * HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders, which older
  * programs (Flash Player projectors among them) read instead of calling shell32.
+ *
+ * Grown when a title needs a folder, not ahead of time. The next candidates, by what
+ * installers and games are known to read: Desktop, Programs, Start Menu, Startup,
+ * Favorites, Fonts, Templates, Recent, SendTo, Cache (more per-user Shell Folders values);
+ * Common AppData and Common Documents under HKLM\...\Explorer\Shell Folders; and the
+ * REG_EXPAND_SZ forms under User Shell Folders.
  */
 export const CSIDL_PERSONAL = 0x05;
 export const CSIDL_APPDATA = 0x1a;

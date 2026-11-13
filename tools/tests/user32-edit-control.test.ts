@@ -383,11 +383,15 @@ describe("EDIT WM_CHAR line feed (Ctrl+Enter)", () => {
         expect(sel(win)).toBe((10 << 16) | 10);
     });
 
-    test("a single-line edit ignores it", () => {
+    test("a single-line edit ignores it, and keeps a selection it would otherwise replace", () => {
         resetEditStatesForTests();
         const win = edit("ab");
         send(win, EM_SETSEL, 1, 1);
         send(win, WM_CHAR, 0x0a);
         expect(win.title).toBe("ab");
+        send(win, EM_SETSEL, 0, 2);
+        send(win, WM_CHAR, 0x0a);
+        expect(win.title).toBe("ab");
+        expect(sel(win)).toBe((2 << 16) | 0);
     });
 });
