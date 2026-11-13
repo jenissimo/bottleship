@@ -20,5 +20,16 @@ export const oledlgModule: ModuleDescriptor = {
         returnType: "u32", // BOOL
         callingConvention: "stdcall",
         description: "Add an IOleObject verb menu to an HMENU",
-    }],
+    },
+    // Variadic exports use cdecl: the caller owns stack cleanup.
+    ...(["OleUIPromptUserA", "OleUIPromptUserW"] as const).map((name) => ({
+        name,
+        params: [
+            { name: "nTemplate", type: "i32" as const, direction: "in" as const },
+            { name: "hwndParent", type: "handle" as const, direction: "in" as const },
+        ],
+        returnType: "i32" as const,
+        callingConvention: "cdecl" as const,
+        description: "Show an OLE prompt dialog built from a template resource",
+    }))],
 };
