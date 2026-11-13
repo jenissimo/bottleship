@@ -489,7 +489,8 @@ export default function App() {
     setNetworkStatus(status);
     if (status.state !== "offline") setNetworkTouched(true);
     const pending = consentAnswerRef.current;
-    if (!pending) return;
+    // Connected from Settings counts as the answer, as it does in the worker.
+    if (!pending) { if (status.state === "connected") consentDecisionRef.current = "granted"; return; }
     if (status.state === "connected") {
       consentAnswerRef.current = null;
       consentDecisionRef.current = "granted";
@@ -500,9 +501,10 @@ export default function App() {
       // Unattended: no one can fix the server, so the guest sees no network instead of a hang.
       consentAnswerRef.current = null;
       consentDecisionRef.current = "denied";
+      dropNetwork();
       answerConsent(pending, false);
     }
-  }, [answerConsent]);
+  }, [answerConsent, dropNetwork]);
   const consentHandlersRef = useRef({ handleConsentRequest, handleNetworkState });
   consentHandlersRef.current = { handleConsentRequest, handleNetworkState };
   const [quality, setQuality] = useState<QualityConfig>(() => loadQuality());
