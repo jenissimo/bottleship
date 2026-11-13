@@ -162,6 +162,7 @@ export class DDrawPresenter implements RenderActive {
         this.pendingOptions = null;
         this.pendingCommit = null;
         this.commitBuffers = [null, null];
+        this.commitInFlight = null;
         this.pumpRunning = false;
 
         // Tear down phase-blend (interpolator holds device-bound GPU textures + an rAF callback).
@@ -281,7 +282,7 @@ export class DDrawPresenter implements RenderActive {
         }
     }
 
-    async present(surface: DirectDrawSurfaceState, _mem: Uint8Array, options: { throttle?: boolean; frameAlreadyMarked?: boolean; flip?: boolean; snapshotTextureView?: GPUTextureView; commit?: boolean } = {}): Promise<void> {
+    async present(surface: DirectDrawSurfaceState, _mem: Uint8Array, options: { throttle?: boolean; frameAlreadyMarked?: boolean; flip?: boolean; snapshotTextureView?: GPUTextureView; commit?: boolean; palette?: boolean } = {}): Promise<void> {
         this.presentCallCount++;
         const now = this.presentClock.now();
         if (options.flip) {
@@ -300,11 +301,12 @@ export class DDrawPresenter implements RenderActive {
             }
 
             const supersededFlip = this.pendingSurface !== null && this.pendingOptions?.flip === true;
+            const keepCommit = options.palette === true && this.pendingSurface === surface && this.pendingCommit !== null;
             this.pendingSurface = surface;
             this.pendingOptions = supersededFlip && !options.flip ? { ...options, flip: true } : options;
             this.pendingCommit = options.commit === true && !this.pendingOptions.flip && options.throttle === true
                 ? this.copyCommittedPixels(surface)
-                : null;
+                : keepCommit && !this.pendingOptions.flip ? this.pendingCommit : null;
             this.pendingResolvers.push({ resolve, reject });
             if (this.pendingOptions.flip) {
                 this.releaseRefreshLatch();
@@ -754,7 +756,7 @@ export class DDrawPresenter implements RenderActive {
                 }
             }
 
-            const imageData = this.surfaceToImageData(surface, mem);
+            const imageData = this.surfaceToImageData(surface, mem, commit);
             this.ctx.putImageData(imageData, 0, 0);
 
             // Asked HERE, not at the top of present(): the GPU path returns long before this
@@ -1000,14 +1002,15 @@ export class DDrawPresenter implements RenderActive {
         );
     }
 
-    private surfaceToImageData(surface: DirectDrawSurfaceState, mem: Uint8Array): ImageData {
+    private surfaceToImageData(surface: DirectDrawSurfaceState, mem: Uint8Array, commit: Uint8Array | null = null): ImageData {
         const { width, height, pitch, format, surfacePtr } = surface;
         // Use stored pitch only if >= computed (allows row padding, rejects invalid)
         const computedPitch = getSurfaceFormatLayout(format, width, height).pitch;
         const effectivePitch = (pitch && pitch >= computedPitch) ? pitch : computedPitch;
+        const fromCommit = commit !== null && effectivePitch * height <= commit.length;
 
         const palette = resolvePalette(surface);
-        const rgbaData = decodeSurfaceFormatToRgba8(mem, surfacePtr, width, height, effectivePitch, format, surface.rgbaScratch, surface.srcColorKey, palette);
+        const rgbaData = decodeSurfaceFormatToRgba8(fromCommit ? commit : mem, fromCommit ? 0 : surfacePtr, width, height, effectivePitch, format, surface.rgbaScratch, surface.srcColorKey, palette);
         surface.rgbaScratch = rgbaData;
 
         return new ImageData(new Uint8ClampedArray(rgbaData), width, height);
