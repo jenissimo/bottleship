@@ -548,6 +548,10 @@ export class Performance {
         }
     }
 
+    statesOnOutput(output: object): readonly PerfSegmentState[] {
+        return this.states.filter(state => state.output === output && !state.ended);
+    }
+
     hasWaveOn(output: object): boolean {
         for (const s of this.states) if (s.output === output && s.segment.wave && !s.ended) return true;
         return false;
