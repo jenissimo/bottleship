@@ -36,6 +36,12 @@ node tools/bench-v86/call-abi/bench.mjs --emit wasm          # regenerate wasm/
 node tools/bench-v86/call-abi/bench.mjs --write-expected     # regenerate expected.json
 ```
 
+`core.mjs` holds the generator, arms, checks and timing loop; `bench.mjs` is the Node front end
+and `browser.html` runs the same core in a browser (`?rounds=16&n=1000000,2000000&warmup=5`,
+served over http from this directory). It checks the state the same way, shows the result and
+leaves it in `window.benchResult`. Browser timings use `performance.now()`, whose resolution
+depends on cross-origin isolation (reported as `crossOriginIsolated`).
+
 ## Timing
 
 Per round, every arm is timed at `n` and `2n`. The slope `(t(2n) - t(n)) / n` is the cost per

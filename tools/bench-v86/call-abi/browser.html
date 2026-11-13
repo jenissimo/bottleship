@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>call-abi bench</title></head>
+<body>
+<div id="status">loading</div>
+<pre id="out"></pre>
+<script type="module">
+import { MODULES, instantiateArms, makeRunner, bench, summarize } from './core.mjs';
+const Q = new URLSearchParams(location.search);
+const rounds = Number(Q.get('rounds') || 16), warmup = Number(Q.get('warmup') || 5);
+const ns = (Q.get('n') || '1000000,2000000').split(',').map(Number);
+const status = t => { document.getElementById('status').textContent = t; };
+try {
+    status('running');
+    await new Promise(r => setTimeout(r, Number(Q.get('delay') || 2000)));
+    const { arms, view } = await instantiateArms();
+    const runner = makeRunner(view, () => performance.now());
+    for (const arm of arms) for (const n of [0, 1, 1000, 1000003]) if (!runner.runChecked(arm, n).ok) throw new Error(`${arm.label}: wrong state after ${n} calls`);
+    const raw = bench(arms, runner, { rounds, ns, warmup });
+    const result = {
+        ua: navigator.userAgent, crossOriginIsolated: self.crossOriginIsolated, rounds, ns, warmup,
+        modules: Object.fromEntries(Object.entries(MODULES).map(([k, b]) => [k, b.length])),
+        summary: summarize(arms, raw, ns), raw,
+    };
+    document.getElementById('out').textContent = JSON.stringify(result, null, 1);
+    window.benchResult = result;
+    status('done');
+} catch (e) {
+    window.benchResult = { error: String(e) };
+    status('ERROR ' + e);
+}
+</script>
+</body>
+</html>
