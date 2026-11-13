@@ -20,6 +20,7 @@ import {
     loadIconFromPeBySize,
     resolveModuleBaseForIconPath,
 } from "./kernel32/icon-extractor";
+import { specialFolderPath } from "../runtime/filesystem/special-folders";
 
 /**
  * SHFILEOPSTRUCTA/W field offsets. shellapi.h wraps the whole header in
@@ -92,15 +93,7 @@ const ERROR_FILENAME_EXCED_RANGE = 206;
 const SEE_MASK_NOCLOSEPROCESS = 0x00000040;
 
 function getSpecialFolderPath(csidl: number): string {
-    switch (csidl & 0xff) {
-        case 0x05: return "C:\\My Documents";                         // CSIDL_PERSONAL
-        case 0x1a: return "C:\\Windows\\Application Data";            // CSIDL_APPDATA
-        case 0x1c: return "C:\\Windows\\Local Settings\\Application Data"; // CSIDL_LOCAL_APPDATA
-        case 0x24: return "C:\\Windows";                              // CSIDL_WINDOWS
-        case 0x25: return "C:\\Windows\\System";                      // CSIDL_SYSTEM
-        case 0x26: return "C:\\Program Files";                        // CSIDL_PROGRAM_FILES
-        default: return "C:\\";
-    }
+    return specialFolderPath(csidl) ?? "C:\\";
 }
 
 /**
