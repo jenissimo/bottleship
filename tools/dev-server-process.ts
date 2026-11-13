@@ -4,8 +4,12 @@ export function stopDevServerListener(devUrl: string): void {
     // Vite on the machine, including other agents' and other checkouts'.
     const port = new URL(devUrl).port || "5174";
     if (process.platform !== "win32") {
-        const pids = Bun.spawnSync(["lsof", "-ti", `tcp:${port}`, "-sTCP:LISTEN"]).stdout.toString().split(/\s+/).filter(Boolean);
-        if (pids.length > 0) Bun.spawnSync(["kill", ...pids]);
+        try {
+            const pids = Bun.spawnSync(["lsof", "-ti", `tcp:${port}`, "-sTCP:LISTEN"]).stdout.toString().split(/\s+/).filter(Boolean);
+            if (pids.length > 0) Bun.spawnSync(["kill", ...pids]);
+        } catch (error) {
+            console.warn(`[ensureVite] Could not stop the listener on port ${port}: ${String(error)}`);
+        }
         return;
     }
     Bun.spawnSync(["powershell", "-NoProfile", "-Command",
