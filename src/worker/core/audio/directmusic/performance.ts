@@ -557,6 +557,15 @@ export class Performance {
         return this.states.filter(state => state.audioPath === path && !state.ended);
     }
 
+    /** A released path must not remain reachable through live or queued states. */
+    forgetAudioPath(path: object): void {
+        for (const state of this.states) {
+            for (let current: PerfSegmentState | null = state; current; current = current.queued) {
+                if (current.audioPath === path) current.audioPath = null;
+            }
+        }
+    }
+
     hasWaveOn(output: object): boolean {
         for (const s of this.states) if (s.output === output && s.segment.wave && !s.ended) return true;
         return false;

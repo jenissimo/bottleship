@@ -401,8 +401,8 @@ export function registerDMusicCodecs(host: DMusicHost): void {
             if (d.sink) {
                 path.sink = host.newSink(d.buffer, d.channels);
                 path.sink.restoreState(d.sink);
-                host.wirePath(path);
             }
+            host.wirePath(path);
             return path;
         },
         link: (path, d: SavedAudioPath, ctx) => {
