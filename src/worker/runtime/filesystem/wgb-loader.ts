@@ -181,7 +181,7 @@ export interface WgbManifest {
          * (NatalieBrooksSTH music jumps). Mirrors real per-process x87 precision policy.
          */
         fpuStrict?: boolean;
-        /** See EmulatorConfig.ddrawHoldPresentsUntilFlip. */
+        /** Ignored (logged once): implicit primary presents draw the pixels committed at Unlock/Blt/BltFast. Kept readable for one release. */
         ddrawHoldPresentsUntilFlip?: boolean;
         /**
          * Per-game graphics quality overrides (anisotropy, brightness/contrast/saturation,
