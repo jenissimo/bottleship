@@ -82,7 +82,7 @@ describe("BltFast onto a surface whose pixels are on the GPU", () => {
         const before = dst.version;
 
         expect(blt(10, 6, DDBLTFAST_SRCCOLORKEY)).toBe(DD_OK);
-        expect(calls).toEqual([`gpu keyed 0,0,${SPRITE},${SPRITE} -> 10,6,${10 + SPRITE},${6 + SPRITE}`, "flush"]);
+        expect(calls).toEqual([`gpu keyed 0,0,${SPRITE},${SPRITE} -> 10,6,${10 + SPRITE},${6 + SPRITE}`]);
         expect(dstPixel(11, 6)).toBe(0);
         // The blit is a new version of the surface, written by the GPU: a copy of the old
         // version that was read back earlier must not pass for the current pixels.
@@ -97,7 +97,7 @@ describe("BltFast onto a surface whose pixels are on the GPU", () => {
         const { dst, calls, blt } = setup();
         setAuthorityGpu(dst);
         expect(blt(0, 8, 0)).toBe(DD_OK);
-        expect(calls).toEqual([`gpu copy 0,0,${SPRITE},${SPRITE} -> 0,8,${SPRITE},${8 + SPRITE}`, "flush"]);
+        expect(calls).toEqual([`gpu copy 0,0,${SPRITE},${SPRITE} -> 0,8,${SPRITE},${8 + SPRITE}`]);
     });
 
     test("a frame built on the CPU stays a memory copy", () => {

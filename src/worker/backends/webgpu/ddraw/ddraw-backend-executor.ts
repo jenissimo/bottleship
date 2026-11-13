@@ -846,6 +846,7 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         texSyncs: 0,           // syncSurfaceFromMemory calls from the stage-texture path
         earlyTexSubmits: 0,    // mid-frame submits forced by a sampled texture being overwritten
         queueWriteSubmits: 0,  // submits forced by a queue-level write to a texture recorded work uses
+        blitRingSubmits: 0,    // submits forced by a full colour-key uniform ring
     };
 
     /** Count non-finite positions in CPU-converted vertex data (diagnoses guest-side
@@ -2129,6 +2130,9 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
             return;
         }
 
+        // Draws prepared before this blit are encoded before it, and before its syncs.
+        if (this.currentBatch) this.flushBatch();
+
         // Sync source from CPU to GPU if needed
         // This ensures the source texture has the latest data before the blit
         if (surfaceSyncManager.needsGPUSync(srcState).needed) {
@@ -2171,6 +2175,7 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         const colorKeyLow = decodeColorKeyToRGBA(colorKey.low, srcFormat);
         const colorKeyHigh = decodeColorKeyToRGBA(colorKey.high, srcFormat);
 
+        this.ensureBlitSlot();
         this.noteRecordedTexture(srcState.gpuTexture);
         this.noteRecordedTexture(dstState.gpuTexture);
         // Perform the blit
@@ -2246,6 +2251,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                 `width=${srcState.width} height=${srcState.height} caps=0x${srcState.caps.toString(16)}`);
         }
 
+        // Draws prepared before this blit are encoded before it, and before its syncs.
+        if (this.currentBatch) this.flushBatch();
         if (surfaceSyncManager.needsGPUSync(srcState).needed) {
             this.syncSurfaceFromMemory(srcState);
         }
@@ -2274,6 +2281,7 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
             this.currentEncoder = this.device.createCommandEncoder();
         }
 
+        this.ensureBlitSlot();
         this.noteRecordedTexture(srcState.gpuTexture);
         this.noteRecordedTexture(dstState.gpuTexture);
         // Dummy colorkey values; discard disabled by enableColorKey=false
@@ -3640,6 +3648,7 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                 frameProfiler.endTimer("gpu", submitStart);
                 this.currentEncoder = null;
                 this.encoderEpoch++;
+                this.colorKeyBlitPipeline.slotsSubmitted();
                 // Flush garbage list after submit to safely destroy unused depth textures
                 this.depthManager.flushGarbage();
                 this.msaaColorManager.flushGarbage();
@@ -3737,6 +3746,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
 
         const encoder = this.currentEncoder;
         this.currentEncoder = null;
+        // The caller submits it right away, blits included.
+        this.colorKeyBlitPipeline.slotsSubmitted();
         // The caller submits this encoder (D3D8 single-submit present). Bump unconditionally:
         // if it was already null the frame boundary passed anyway, and a missed bump would let
         // a texture marked in frame N still match the epoch in frame N+1.
@@ -4028,6 +4039,14 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
     /** Submit recorded work, if any; for code that submits an encoder of its own. */
     flushPending(): void {
         if (!this.flushing && this.hasRecordedWork()) this.flush(false);
+    }
+
+    /** The colour-key pipeline's uniform ring holds a bounded number of unsubmitted blits. */
+    private ensureBlitSlot(): void {
+        if (this.colorKeyBlitPipeline.hasFreeSlot()) return;
+        this.renderStats.blitRingSubmits++;
+        this.flush(false);
+        if (!this.currentEncoder) this.currentEncoder = this.device.createCommandEncoder();
     }
 
     /** QueueWriteGuard: a queue-level write to `texture` must not run ahead of recorded work that uses it. */

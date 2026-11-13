@@ -14,6 +14,7 @@ import {
 import { uploadToGPUTexture, uploadRGB565ToGPU } from "../../src/worker/modules/ddraw/gpu-texture-utils";
 import { setAuthorityGpu } from "../../src/worker/modules/ddraw/surface-sync";
 import type { RenderSurface } from "../../src/worker/modules/ddraw/com-objects";
+import { useWebGpuFlags } from "./helpers/scoped-globals";
 
 const ops: string[] = [];
 const names = new Map<GPUTexture, string>();
@@ -48,7 +49,7 @@ function executor(): DDrawWebGPUExecutor {
         currentEncoder: null, currentRenderPass: null, currentRenderTarget: null, currentBatch: null,
         opLogArmed: 0, queue, debugFlags: { disableTextureOverwriteSubmit: false },
         device: { createCommandEncoder: () => ({ finish: () => ({}) }) },
-        renderStats: { flushes: 0, queueWriteSubmits: 0, clears: 0 },
+        renderStats: { flushes: 0, queueWriteSubmits: 0, blitRingSubmits: 0, clears: 0 },
         surfacesNeedingClear: new Set(),
         flushBatch: () => {}, resetBindFastPath: () => {}, ensureSurfaceGPUResources: () => {},
         vertexConverter: { flushParams: () => {}, destroyPendingAfterSubmit: () => {}, startFrame: () => {} },
@@ -57,7 +58,11 @@ function executor(): DDrawWebGPUExecutor {
         depthManager: { flushGarbage: () => {} },
         msaaColorManager: { flushGarbage: () => {} },
         textureConverter: { destroyPendingAfterSubmit: () => {} },
-        colorKeyBlitPipeline: { blit: () => { ops.push("blit"); } },
+        colorKeyBlitPipeline: {
+            blit: () => { ops.push("blit"); pending++; },
+            hasFreeSlot: () => pending < 256,
+            slotsSubmitted: () => { pending = 0; },
+        },
     };
     for (const [k, value] of Object.entries(fields)) {
         Object.defineProperty(e, k, { value, writable: true, configurable: true });
@@ -65,6 +70,7 @@ function executor(): DDrawWebGPUExecutor {
     return e as DDrawWebGPUExecutor;
 }
 
+let pending = 0;
 const RECT = { left: 0, top: 0, right: 4, bottom: 2 };
 const KEY = { low: 0, high: 0 };
 const PIXELS = new Uint8Array(4 * 2 * 4);
@@ -72,6 +78,7 @@ const PIXELS = new Uint8Array(4 * 2 * 4);
 let ex: DDrawWebGPUExecutor;
 beforeEach(() => {
     ops.length = 0;
+    pending = 0;
     ex = executor();
     registerQueueWriteGuard(ex);
 });
@@ -169,6 +176,30 @@ describe("a queue write to a texture that recorded work uses submits that work f
     });
 });
 
+describe("a blit keeps its place after draws prepared before it", () => {
+    test("batched draws are encoded before the blit, for both blit kinds", () => {
+        const set = (k: string, v: unknown) => Object.defineProperty(ex, k, { value: v, writable: true, configurable: true });
+        set("flushBatch", () => { ops.push("draws"); set("currentBatch", null); });
+        set("currentBatch", {});
+        ex.blitWithColorKey(surface(tex("a")), surface(tex("b")), RECT, RECT, KEY);
+        set("currentBatch", {});
+        ex.blitWithShaderCopy(surface(tex("c")), surface(tex("d")), RECT, RECT);
+        expect(ops).toEqual(["draws", "blit", "draws", "blit"]);
+    });
+});
+
+describe("unsubmitted blits are bounded by the colour-key uniform ring", () => {
+    test("the 257th blit in one encoder submits the first 256 first; a submit frees the ring", () => {
+        const a = tex("a"), b = tex("b");
+        for (let i = 0; i < 257; i++) ex.blitWithColorKey(surface(a), surface(b), RECT, RECT, KEY);
+        expect(ops.filter((o) => o === "submit")).toHaveLength(1);
+        expect(ops.indexOf("submit")).toBe(256);
+        expect(ex.renderStats.blitRingSubmits).toBe(1);
+        ex.flush(false);
+        expect(pending).toBe(0);
+    });
+});
+
 describe("validate-queue-writes", () => {
     const ROOT = join(import.meta.dir, "..", "..");
     const SCOPE = [
@@ -227,5 +258,33 @@ describe("validate-queue-writes", () => {
                 rmSync(dir, { recursive: true, force: true });
             }
         }
+    });
+});
+
+describe("ColorKeyBlitPipeline counts the slots its unsubmitted blits read", () => {
+    useWebGpuFlags("GPUShaderStage", "GPUBufferUsage");
+    test("hasFreeSlot turns false after RING_SLOTS blits and true again after slotsSubmitted", async () => {
+        const { ColorKeyBlitPipeline } = await import("../../src/worker/backends/webgpu/ddraw/colorkey-blit-pipeline");
+        const pass = { setPipeline() {}, setBindGroup() {}, setVertexBuffer() {}, setViewport() {}, setScissorRect() {}, draw() {}, end() {} };
+        const device = {
+            limits: { minUniformBufferOffsetAlignment: 256 },
+            createShaderModule: () => ({}), createBindGroupLayout: () => ({}), createPipelineLayout: () => ({}),
+            createSampler: () => ({}), createBuffer: () => ({ destroy() {} }), createRenderPipeline: () => ({}),
+            createBindGroup: () => ({}),
+        } as unknown as GPUDevice;
+        const q = { writeBuffer() {} } as unknown as GPUQueue;
+        const p = new ColorKeyBlitPipeline(device, q);
+        const encoder = { beginRenderPass: () => pass } as unknown as GPUCommandEncoder;
+        const config = {
+            srcView: {} as GPUTextureView, srcWidth: 4, srcHeight: 2, dstView: {} as GPUTextureView,
+            dstFormat: "rgba8unorm" as GPUTextureFormat, dstWidth: 4, dstHeight: 2, srcRect: RECT, dstRect: RECT,
+            colorKeyLow: { r: 0, g: 0, b: 0, a: 0 }, colorKeyHigh: { r: 0, g: 0, b: 0, a: 0 }, enableColorKey: true,
+        };
+        for (let i = 0; i < 255; i++) p.blit(encoder, config);
+        expect(p.hasFreeSlot()).toBe(true);
+        p.blit(encoder, config);
+        expect(p.hasFreeSlot()).toBe(false);
+        p.slotsSubmitted();
+        expect(p.hasFreeSlot()).toBe(true);
     });
 });
