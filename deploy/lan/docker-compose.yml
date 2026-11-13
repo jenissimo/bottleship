@@ -1,0 +1,36 @@
+# Self-hosted BottleShip multiplayer relay (bottleship-lan).
+#
+#   cp server.example.json server.json   # set allowedOrigins to the site your players use
+#   docker compose up -d --build
+#
+# No published port: an HTTPS reverse proxy on the shared network reaches the container
+# by name (forward host `bottleship-lan`, port 9001, WebSocket support on). Browsers on an
+# HTTPS page only connect to an HTTPS relay. See README.md next to this file.
+
+services:
+  bottleship-lan:
+    build:
+      context: ../../packages/lan-rust
+      dockerfile: ../../deploy/lan/Dockerfile
+    image: bottleship-lan:local
+    container_name: ${BS_LAN_CONTAINER:-bottleship-lan}
+    restart: unless-stopped
+    volumes:
+      - ./server.json:/etc/bottleship-lan/server.json:ro
+    # Private rooms need the invitation key; leave unset for public rooms.
+    environment:
+      - BOTTLESHIP_LAN_INVITE_KEY=${BOTTLESHIP_LAN_INVITE_KEY:-}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    pids_limit: 256
+    networks: [proxy]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+networks:
+  proxy:
+    external: true
+    name: ${BS_PROXY_NETWORK:-proxy}

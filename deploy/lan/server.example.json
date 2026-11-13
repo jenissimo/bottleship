@@ -1,0 +1,9 @@
+{
+  "host": "0.0.0.0",
+  "port": 9001,
+  "allowedOrigins": ["https://your-bottleship-site.example"],
+  "transports": ["polling", "websocket"],
+  "roomAccess": { "defaultVisibility": "public" },
+  "maxConnections": 256,
+  "maxRooms": 128
+}
