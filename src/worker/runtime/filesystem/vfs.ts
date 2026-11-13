@@ -720,6 +720,11 @@ export class VirtualFileSystem {
         if (!this.overlay && disp !== 3) {
             return 5; // ERROR_ACCESS_DENIED
         }
+        // A directory is not openable as a file: ERROR_ACCESS_DENIED, never "not found".
+        // Callers probe for a folder exactly this way and create it only on "not found".
+        if (this.directoryExists(full)) {
+            return 5;
+        }
         const relRom = this.relRomPath(full).toLowerCase();
         const existsInRom = !this.isRomWhiteout(full) && this.romIndex.has(relRom);
         const hasOverlay = this.overlay?.hasFile(full) ?? false;
