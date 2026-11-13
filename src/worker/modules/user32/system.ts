@@ -1730,10 +1730,19 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         // BITMAPFILEHEADER, not the name. (A ".bmp" name without the flag is still tried
         // as a file, as before.)
         if (type !== IMAGE_BITMAP || name <= 0xFFFF || !filename || !(isBmp || isFileLoad)) {
-            Logger.verbose(LogCategory.USER32, `${apiName}: Skipping load - type=${type} name<=0xFFFF=${name <= 0xFFFF} filename="${filename}" isBmp=${isBmp}`);
+            Logger.verbose(LogCategory.USER32, `${apiName}: Skipping load - type=${type} name<=0xFFFF=${name <= 0xFFFF} filename="${filename}" isBmp=${isBmp} isFileLoad=${isFileLoad}`);
             resourceData.loading = false;
             return handle;
         }
+
+        // LR_LOADFROMFILE answers NULL for a file that is missing or is not a bitmap, and a
+        // caller that probes several names relies on it. (A ".bmp" name without the flag
+        // keeps its pixel-less handle.)
+        const failedFileLoad = (): number => {
+            if (!isFileLoad) return handle;
+            system.resourceProvider.unregisterUserObject(handle);
+            return 0;
+        };
 
         const normalizedFilename = filename.replace(/\\/g, '/');
         const isSpru = normalizedFilename.toLowerCase().includes("spru");
@@ -1745,7 +1754,8 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             if (!fileHandle) {
                 Logger.warn(LogCategory.USER32, `${apiName}: File not found: "${normalizedFilename}"`);
                 if (spruLog) spruLog.fileOpened = false;
-                return handle;
+                if (isFileLoad) system.scheduler.setLastError(2 /* ERROR_FILE_NOT_FOUND */);
+                return failedFileLoad();
             }
             if (spruLog) {
                 spruLog.fileOpened = true;
@@ -1806,11 +1816,13 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
                 }
             } else {
                 Logger.warn(LogCategory.USER32, `${apiName}: Failed to parse BMP - header=${!!header} pixels=${!!pixels}`);
+                return failedFileLoad();
             }
         } catch (e) {
             const err = (e as Error).message;
             if (spruLog) spruLog.error = err;
             Logger.warn(LogCategory.USER32, `${apiName} BMP: Error loading "${normalizedFilename}": ${e}`);
+            return failedFileLoad();
         } finally {
             resourceData.loading = false;
         }
