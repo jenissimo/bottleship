@@ -157,7 +157,9 @@ function dumpThreads(): void {
             waitReason: `${t.waitReason}(${WAIT_REASON_LABEL[t.waitReason] ?? `UNKNOWN(${t.waitReason})`})`,
             timeoutAt: t.waitTimeoutAt || null,
             teb: `0x${(t.tebAddress >>> 0).toString(16)}`,
-            lastError: `0x${(t.lastError >>> 0).toString(16)}`,
+            // TEB+0x34 is the store; the record's copy is a cache the guest stubs never update.
+            lastError: `0x${((sched.tebManager.getTebAddress(t.threadId) !== undefined
+                ? sched.tebManager.readLastError(t.threadId) : t.lastError) >>> 0).toString(16)}`,
             stackBase: `0x${(t.stackBase >>> 0).toString(16)}`,
             stackTop: `0x${(t.stackTop >>> 0).toString(16)}`,
             entry: `0x${(t.startAddress >>> 0).toString(16)}`,

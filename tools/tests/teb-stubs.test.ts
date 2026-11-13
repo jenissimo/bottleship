@@ -24,7 +24,9 @@ const lib = fileURLToPath(new URL('../../vendor/v86/build/libv86.mjs', import.me
 const wasm = fileURLToPath(new URL('../../public/v86.wasm', import.meta.url));
 
 const BASE = 0x400000, ENTRY = BASE + 0x40, STUBS = BASE + 0x4000, RES = BASE + 0x6000, IMG = 0x8000;
-const RES_ESP = RES + 0x800, STACK = 0x200000, HEAP = 0x800000, CTL = 0x900;
+const RES_ESP = RES + 0x800, REGS = RES + 0x1000, STACK = 0x200000, HEAP = 0x800000, CTL = 0x900;
+/** Callee-saved EBX/ESI/EDI/EBP seeded before every call; a stub must hand them back. */
+const sentinels = (k: number) => [0x11110000 + k, 0x22220000 + k, 0x33330000 + k, 0x44440000 + k];
 
 type Api = 'GetLastError' | 'SetLastError' | 'TlsGetValue' | 'TlsSetValue' | 'FlsGetValue' | 'FlsSetValue';
 const API: Record<Api, { fid: number; pop: number; stub: TebStubName }> = {
@@ -64,10 +66,18 @@ const SCRIPT: Step[] = [
     js('JS TlsGetValue(0)', 0xbeef, () => Number(tlsApi.TlsGetValue!(null as never, new Uint8Array(0), [0])) >>> 0),
     { call: 'TlsSetValue', args: [2000, 1], want: 0 },
     { call: 'GetLastError', args: [], want: 87 },
+    { call: 'TlsSetValue', args: [700, 0x7007], want: 1 },       // TlsExpansionSlots range
+    js('JS TlsGetValue(700)', 0x7007, () => Number(tlsApi.TlsGetValue!(null as never, new Uint8Array(0), [700])) >>> 0),
+    js('JS TlsSetValue(1087)', 1, () => Number(tlsApi.TlsSetValue!(null as never, new Uint8Array(0), [1087, 0x1087]))),
+    { call: 'SetLastError', args: [3] },
+    { call: 'TlsGetValue', args: [1087], want: 0x1087 },         // the last index there is
+    { call: 'GetLastError', args: [], want: 0 },
+    { call: 'TlsGetValue', args: [64], want: 0 },
     js('FlsAlloc', 1, () => Number(flsApi.FlsAlloc!(null as never, new Uint8Array(0), []))),
-    { call: 'FlsGetValue', args: [1], want: 0 },                 // no FLS block yet: NT fails
-    { call: 'GetLastError', args: [], want: 87 },
-    { call: 'FlsSetValue', args: [1, 0x1111], want: 1 },         // stub traps: JS allocates the block
+    { call: 'SetLastError', args: [5] },
+    { call: 'FlsGetValue', args: [1], want: 0 },                 // FlsAlloc gave the caller its block
+    { call: 'GetLastError', args: [], want: 0 },                 // ...so this is a success
+    { call: 'FlsSetValue', args: [1, 0x1111], want: 1 },
     { call: 'FlsGetValue', args: [1], want: 0x1111 },
     { call: 'GetLastError', args: [], want: 0 },
     { call: 'FlsSetValue', args: [1, 0x2222], want: 1 },         // block exists: answered in guest
@@ -80,10 +90,18 @@ const SCRIPT: Step[] = [
     js('switch to thread 2', 0, env => env.switchTo(2)),
     { call: 'GetLastError', args: [], want: 0 },                 // thread 2's own TEB
     { call: 'TlsGetValue', args: [0], want: 0 },
-    { call: 'FlsGetValue', args: [1], want: 0 },
+    { call: 'FlsGetValue', args: [1], want: 0 },                 // thread 2 has no FLS block
     { call: 'GetLastError', args: [], want: 87 },
+    { call: 'FlsSetValue', args: [1, 0x3333], want: 1 },         // stub traps: JS allocates the block
+    { call: 'FlsGetValue', args: [1], want: 0x3333 },
     { call: 'SetLastError', args: [0xb0b0] },
     js('JS GetLastError on 2', 0xb0b0, jsGetLastError([])),
+    js('switch to thread 3 (TEB+0x2C = 0)', 0, env => env.switchTo(3)),
+    { call: 'TlsSetValue', args: [3, 0x3030], want: 1 },         // no TLS array: the trap tail answers
+    { call: 'TlsGetValue', args: [3], want: 0x3030 },
+    { call: 'GetLastError', args: [], want: 0 },
+    { call: 'TlsGetValue', args: [1088], want: 0 },              // range check precedes the array test
+    { call: 'GetLastError', args: [], want: 87 },
     js('switch to thread 1', 0, env => env.switchTo(1)),
     { call: 'GetLastError', args: [], want: 0x77 },
     js('JS GetLastError on 1', 0x77, jsGetLastError([])),
@@ -115,10 +133,15 @@ function image(viaStubs: boolean): Uint8Array {
     e(0xbc); u(STACK);                                                   // mov esp, STACK
     SCRIPT.forEach((step, k) => {
         if ('call' in step) {
+            const [sb, ss, sd, sp] = sentinels(k);
+            e(0xbb); u(sb); e(0xbe); u(ss); e(0xbf); u(sd); e(0xbd); u(sp);  // ebx, esi, edi, ebp
             for (let i = step.args.length - 1; i >= 0; i--) { e(0x68); u(step.args[i]); }
             e(0xb8); u(0xdeadbeef);                                      // EAX is not an input
             e(0xe8); u(target[step.call] - (p + 4));
             e(0xa3); u(RES + k * 4);                                     // mov [RES+k*4], eax
+            const r = REGS + k * 20;
+            e(0x89, 0x1d); u(r); e(0x89, 0x35); u(r + 4); e(0x89, 0x3d); u(r + 8);
+            e(0x89, 0x2d); u(r + 12); e(0x89, 0x25); u(r + 16);         // ebx esi edi ebp esp
         } else {
             e(0xb9); u(k); e(0xb8); u(CTL); e(0xba); u(0xb077); e(0xef); // JS step k
         }
@@ -140,9 +163,10 @@ function thread(id: number): Thread {
 
 interface Arm {
     results: number[];
+    regs: number[][];
     esp: number;
     apiCrossings: number;
-    teb: { lastError: number[]; tls0: number[]; fls1: Array<number | undefined>; flsBlock2: number };
+    teb: { lastError: number[]; tls: number[]; fls1: Array<number | undefined> };
 }
 
 async function runArm(viaStubs: boolean): Promise<Arm> {
@@ -164,11 +188,13 @@ async function runArm(viaStubs: boolean): Promise<Arm> {
         const memory = { alloc: (size: number) => { const a = bump; bump += (size + 0xfff) & ~0xfff; return a; } };
         const s = new Scheduler();
         s.tebManager.initProcess(mem, memory);
-        for (const id of [1, 2]) {
+        for (const id of [1, 2, 3]) {
             const t = thread(id);
             t.tebAddress = s.tebManager.allocateTeb(id, t.stackBase, t.stackTop, memory);
             (s as any).threads.set(id, t);
         }
+        // Thread 3 publishes no TLS array: the stubs must take their trap tails.
+        new DataView(mem().buffer, mem().byteOffset).setUint32(s.tebManager.getTebAddress(3)! + 0x2c, 0, true);
         (s as any).process = { memory };
         system.scheduler = s;
         system.process = { resetGeneration: 0, memory, getCurrentMemory: mem } as never;
@@ -217,13 +243,13 @@ async function runArm(viaStubs: boolean): Promise<Arm> {
         const t = s.tebManager;
         const out: Arm = {
             results: SCRIPT.map((_, k) => r32(RES + k * 4)),
+            regs: SCRIPT.map((_, k) => [0, 4, 8, 12, 16].map(o => r32(REGS + k * 20 + o))),
             esp: r32(RES_ESP),
             apiCrossings,
             teb: {
                 lastError: [t.readLastError(1), t.readLastError(2)],
-                tls0: [t.readTlsSlot(1, 0)!, t.readTlsSlot(2, 0)!],
+                tls: [t.readTlsSlot(1, 0)!, t.readTlsSlot(2, 0)!, t.readTlsSlot(1, 700)!, t.readTlsSlot(3, 3)!],
                 fls1: [t.readFlsSlot(1, 1), t.readFlsSlot(2, 1)],
-                flsBlock2: t.getFlsDataAddress(2),
             },
         };
         s.tlsFree(0);
@@ -251,14 +277,24 @@ describe.skipIf(!existsSync(lib) || !existsSync(wasm))('kernel32 TEB stubs, exec
                 return [`#${k} ${what}: got 0x${arm.results[k].toString(16)} want 0x${step.want.toString(16)}`];
             });
             expect(bad).toEqual([]);
-            expect(arm.esp).toBe(STACK);                                  // every RET N popped its arguments
-            expect(arm.teb).toEqual({ lastError: [0x77, 0xb0b0], tls0: [0xbeef, 0], fls1: [0x2222, undefined], flsBlock2: 0 });
+            // Per call: callee-saved registers intact and ESP back where the caller had it
+            // (every RET N, including the trap tails', popped exactly its arguments).
+            const clobbered = SCRIPT.flatMap((step, k) => {
+                if (!('call' in step)) return [];
+                const want = [...sentinels(k), STACK].map(v => v.toString(16)).join(' ');
+                const got = arm.regs[k].map(v => v.toString(16)).join(' ');
+                return got === want ? [] : [`#${k} ${step.call}: ebx esi edi ebp esp = ${got}, want ${want}`];
+            });
+            expect(clobbered).toEqual([]);
+            expect(arm.esp).toBe(STACK);
+            expect(arm.teb).toEqual({ lastError: [0x77, 0xb0b0], tls: [0xbeef, 0, 0x7007, 0x3030], fls1: [0x2222, 0x3333] });
         }
         const compared = (a: Arm) => SCRIPT.map((s, k) => (s.want === undefined ? null : a.results[k]));
         expect(compared(viaStubs)).toEqual(compared(viaTraps));
-        // The stubs cross only for the first FlsSetValue (the block is allocated in JS);
-        // without them every call crosses.
-        expect(viaStubs.apiCrossings).toBe(1);
+        // The stubs cross only where they cannot answer in guest code: thread 2's first
+        // FlsSetValue (its block is allocated in JS) and both TLS calls on thread 3, which
+        // has no TLS array. Without them every call crosses.
+        expect(viaStubs.apiCrossings).toBe(3);
         expect(viaTraps.apiCrossings).toBe(callSteps);
     }, 60000);
 });

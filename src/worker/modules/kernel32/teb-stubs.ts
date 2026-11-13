@@ -54,13 +54,20 @@ export function writeTebStubs(
     allocator: StubAllocator,
     getMemory: () => Uint8Array,
     traps: TebStubTraps,
+    regionSize = REGION_SIZE,
 ): TebInlineStubs {
-    const base = allocator.alloc(REGION_SIZE, 'THUNK_CODE', 'rx');
+    const base = allocator.alloc(regionSize, 'THUNK_CODE', 'rx');
     const mem = getMemory();
     const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     let off = base;
-    const w = (...bytes: number[]) => { for (const b of bytes) mem[off++] = b & 0xFF; };
-    const u32 = (v: number) => { dv.setUint32(off, v >>> 0, true); off += 4; };
+    // Bounds live inside the emitters: a check after the fact runs after the bytes it was
+    // meant to stop have landed in whatever follows the region.
+    const limit = base + regionSize;
+    const room = (n: number) => {
+        if (off + n > limit) throw new Error(`[teb-stubs] emit past the ${regionSize}B region`);
+    };
+    const w = (...bytes: number[]) => { room(bytes.length); for (const b of bytes) mem[off++] = b & 0xFF; };
+    const u32 = (v: number) => { room(4); dv.setUint32(off, v >>> 0, true); off += 4; };
     /** jcc rel32 (0F 8x) whose target is patched by `bind`. */
     const jcc = (cc: number): number => { w(0x0F, cc); const at = off; u32(0); return at; };
     const bind = (at: number) => dv.setInt32(at, off - (at + 4), true);
@@ -159,10 +166,6 @@ export function writeTebStubs(
         bind(noBlock); trap(traps.flsSetValue, 8);
     }
 
-    if (off > base + REGION_SIZE) {
-        throw new Error(`[teb-stubs] emitted ${off - base}B into a ${REGION_SIZE}B region`);
-    }
-
     Logger.log(LogCategory.SYSTEM,
         `TEB stubs emitted (${off - base}B) at 0x${base.toString(16)}: GetLastError=0x${getLastErrorStub.toString(16)} ` +
         `SetLastError=0x${setLastErrorStub.toString(16)} TlsGetValue=0x${tlsGetValueStub.toString(16)} ` +
@@ -171,6 +174,6 @@ export function writeTebStubs(
 
     return {
         getLastErrorStub, setLastErrorStub, tlsGetValueStub, tlsSetValueStub, flsGetValueStub, flsSetValueStub,
-        regionBase: base, regionEnd: base + REGION_SIZE,
+        regionBase: base, regionEnd: base + regionSize,
     };
 }

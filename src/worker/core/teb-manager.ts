@@ -53,7 +53,17 @@ const PEB_SIZE = 0x230;
  *  TLS, the libgcc SjLj splice in hle-lib/native-leaves.ts) all read and write it, and no
  *  index that exists can land past its end. */
 export const TLS_INDEX_LIMIT = 64 + 1024;
-const TLS_ARRAY_SIZE = TLS_INDEX_LIMIT * 4;
+/**
+ * Implicit-TLS (`__declspec(thread)`) indices the loader writes to a module's `_tls_index`.
+ * On NT they index ThreadLocalStoragePointer, an array disjoint from the TlsAlloc slots
+ * (TEB+0xE10 / TlsExpansionSlots). Here the TlsAlloc slots share the TEB+0x2C array (the
+ * WASM Tls* handlers index it), so implicit indices get their own range PAST every index
+ * TlsAlloc/TlsSetValue can reach: a TlsSetValue on any valid index can then never
+ * overwrite a module's TLS block pointer, which is the NT guarantee.
+ */
+export const IMPLICIT_TLS_FIRST = TLS_INDEX_LIMIT;
+export const IMPLICIT_TLS_LIMIT = IMPLICIT_TLS_FIRST + 64;
+const TLS_ARRAY_SIZE = IMPLICIT_TLS_LIMIT * 4;
 /** FLS_MAXIMUM_AVAILABLE: indices 1..127 are valid, 0 never is. */
 export const FLS_INDEX_LIMIT = 128;
 /** RTL_FLS_DATA: a LIST_ENTRY, then Data[FLS_MAXIMUM_AVAILABLE] — the layout the guest stubs
@@ -405,6 +415,24 @@ export class TebManager {
         if (!view) return false;
         view.setUint32(tlsAddr + index * 4, value >>> 0, true);
         return true;
+    }
+
+    /** A module's implicit-TLS block pointer (ThreadLocalStoragePointer[index]). */
+    syncImplicitTlsSlot(threadId: number, index: number, value: number): boolean {
+        if (index < IMPLICIT_TLS_FIRST || index >= IMPLICIT_TLS_LIMIT) return false;
+        const tlsAddr = this.tlsArrayMap.get(threadId);
+        const view = this.getView();
+        if (tlsAddr === undefined || !view) return false;
+        view.setUint32(tlsAddr + index * 4, value >>> 0, true);
+        return true;
+    }
+
+    readImplicitTlsSlot(threadId: number, index: number): number | undefined {
+        if (index < IMPLICIT_TLS_FIRST || index >= IMPLICIT_TLS_LIMIT) return undefined;
+        const tlsAddr = this.tlsArrayMap.get(threadId);
+        const view = this.getView();
+        if (tlsAddr === undefined || !view) return undefined;
+        return view.getUint32(tlsAddr + index * 4, true) >>> 0;
     }
 
     /** A TLS slot value from the thread's guest TLS array; undefined when not array-backed. */

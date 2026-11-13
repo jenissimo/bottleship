@@ -1239,10 +1239,10 @@ export class PELoader {
             `[PE] TLS directory in "${moduleName}": template=0x${startOfRawData.toString(16)}-0x${endOfRawData.toString(16)} ` +
             `(${templateSize}+${sizeOfZeroFill} bytes), index@0x${addressOfIndex.toString(16)}, callbacks@0x${addressOfCallbacks.toString(16)}`);
 
-        // Allocate TLS index via scheduler (uses same slot space as TlsAlloc)
+        // An implicit-TLS index, disjoint from every index TlsAlloc/TlsSetValue can reach.
         const system = System.getInstance();
         const scheduler = system.scheduler;
-        const tlsIndex = scheduler.tlsAlloc();
+        const tlsIndex = scheduler.implicitTlsAlloc();
 
         if (tlsIndex === 0xFFFFFFFF) {
             Logger.error(LogCategory.SYSTEM, `[PE] TLS: Failed to allocate index for "${moduleName}" (all slots full)`);

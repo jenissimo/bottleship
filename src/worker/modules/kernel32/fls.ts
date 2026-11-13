@@ -70,6 +70,8 @@ export const exports: Record<string, ThunkImplementation> = {
     FlsAlloc(ctx, mem, args) {
         ensureProcessLocalFls();
         if (nextSlot >= FLS_INDEX_LIMIT) return FLS_OUT_OF_INDEXES;
+        // As RtlFlsAlloc: the caller's block exists once it holds an index.
+        System.getInstance().scheduler.flsEnsureData();
         const index = nextSlot++;
         allocated.add(index);
         hypercallDataManager.ensureFlsCurrentThread(currentTid());

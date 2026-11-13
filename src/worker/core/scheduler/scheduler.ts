@@ -25,7 +25,7 @@ import { cpuViews, readEip, readEsp, readRetiredInsns, PROXY_BASELINE } from '..
 import { Mem } from '../memory/mem-accessor';
 import { ERROR_INVALID_HANDLE } from '../thunking/thunk-errors';
 import { setParkedStackProvider, guardStackWrite } from '../memory/stack-write-guard';
-import { TebManager, TLS_INDEX_LIMIT } from '../teb-manager';
+import { TebManager, TLS_INDEX_LIMIT, IMPLICIT_TLS_FIRST, IMPLICIT_TLS_LIMIT } from '../teb-manager';
 import {
     clearFpuSimdDirty,
     createDefaultFpuSnapshot,
@@ -3880,14 +3880,27 @@ export class Scheduler {
         return this.tebManager.writeFlsSlot(t.id, index >>> 0, value >>> 0, memory);
     }
 
+    /** RtlFlsAlloc gives the CALLING thread its block, so its FlsGetValue succeeds at once. */
+    flsEnsureData(): boolean {
+        const t = this.getCurrentThread();
+        const memory = this.process?.memory;
+        return !!t && !!memory && this.tebManager.ensureFlsData(t.id, memory) !== 0;
+    }
+
     flsClearSlotAllThreads(index: number): void {
         this.tebManager.clearFlsSlotAllThreads(index >>> 0);
     }
 
-    /**
-     * Initialize implicit TLS data for a new thread.
-     * Copies TLS template data for each PE module that uses __declspec(thread).
-     */
+    /** The loader's `_tls_index` for a module with a TLS directory: the lowest index of the
+     *  implicit range no registered module holds (see IMPLICIT_TLS_FIRST in teb-manager). */
+    implicitTlsAlloc(): number {
+        const used = new Set(System.getInstance().implicitTlsEntries.map(e => e.tlsIndex));
+        for (let index = IMPLICIT_TLS_FIRST; index < IMPLICIT_TLS_LIMIT; index++) {
+            if (!used.has(index)) return index;
+        }
+        return 0xFFFFFFFF;
+    }
+
     /** Give ONE thread its private copy of ONE module's TLS template. */
     private materializeTlsEntry(
         threadId: number,
@@ -3908,7 +3921,9 @@ export class Scheduler {
             memory.fill(0, tlsDataAddr + entry.templateSize, tlsDataAddr + totalSize);
         }
 
-        this.storeTlsValue(threadId, thread, entry.tlsIndex, tlsDataAddr >>> 0);
+        if (!this.tebManager.syncImplicitTlsSlot(threadId, entry.tlsIndex, tlsDataAddr >>> 0)) {
+            thread.tlsValues.set(entry.tlsIndex, tlsDataAddr >>> 0);
+        }
 
         Logger.log(LogCategory.THREAD,
             `  TLS slot ${entry.tlsIndex} (${entry.moduleName}): data=0x${tlsDataAddr.toString(16)} ` +
@@ -3931,7 +3946,7 @@ export class Scheduler {
         if (!memManager || !memory) return;
         for (const [threadId, thread] of this.threads) {
             // A materialized block is never at 0, so a nonzero array slot means "already has it".
-            const held = this.tebManager.readTlsSlot(threadId, entry.tlsIndex);
+            const held = this.tebManager.readImplicitTlsSlot(threadId, entry.tlsIndex);
             if (held !== undefined ? held !== 0 : thread.tlsValues.has(entry.tlsIndex)) continue;
             this.materializeTlsEntry(threadId, thread, entry, memory, memManager);
         }
