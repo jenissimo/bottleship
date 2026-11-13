@@ -19,8 +19,8 @@ import { useWebGpuFlags } from "./helpers/scoped-globals";
 const ops: string[] = [];
 const names = new Map<GPUTexture, string>();
 
-function tex(name: string): GPUTexture {
-    const t = { format: "rgba8unorm", label: name } as unknown as GPUTexture;
+function tex(name: string, width = 4, height = 2): GPUTexture {
+    const t = { format: "rgba8unorm", label: name, width, height } as unknown as GPUTexture;
     names.set(t, name);
     return t;
 }
@@ -35,7 +35,7 @@ function surface(texture: GPUTexture): RenderSurface {
         surfaceType: "render_surface", width: 4, height: 2, pitch: 16, caps: 0, surfacePtr: 0,
         surfacePtrAllocated: false, attachedSurfaceAddr: 0,
         format: { flags: 0x41, bpp: 32, rMask: 0xff0000, gMask: 0xff00, bMask: 0xff, aMask: 0xff000000 },
-        gpuTexture: texture, gpuTextureView: { tex: names.get(texture) } as unknown as GPUTextureView, gpuTextureFormat: "rgba8unorm",
+        gpuTexture: texture, gpuTextureView: { n: names.get(texture) } as unknown as GPUTextureView, gpuTextureFormat: "rgba8unorm",
         mode: "GPU_ONLY", version: 0, gpuDirty: false, everLocked: false, lastUploadVersion: 0, writeGeneration: 0,
     } as unknown as RenderSurface;
     setAuthorityGpu(s);
@@ -48,18 +48,35 @@ function executor(): DDrawWebGPUExecutor {
         deviceLost: false, flushing: false, encoderEpoch: 1, textureEpochs: new WeakMap(),
         currentEncoder: null, currentRenderPass: null, currentRenderTarget: null, currentBatch: null,
         opLogArmed: 0, queue, debugFlags: { disableTextureOverwriteSubmit: false },
-        device: { createCommandEncoder: () => ({ finish: () => ({}) }) },
-        renderStats: { flushes: 0, queueWriteSubmits: 0, blitRingSubmits: 0, clears: 0 },
+        device: {
+            createCommandEncoder: () => ({
+                finish: () => ({}),
+                copyTextureToTexture: (a: { texture: GPUTexture; origin: { x: number; y: number } }, b: { texture: { label: string }; origin: { x: number; y: number } }, size: { width: number; height: number }) => {
+                    ops.push(`copy:${names.get(a.texture)}@${a.origin.x},${a.origin.y}->${b.texture.label}@${b.origin.x},${b.origin.y}:${size.width}x${size.height}`);
+                },
+            }),
+            createTexture: (d: { size: [number, number]; format: string }) => {
+                scratchCreated++;
+                const label = `scratch${scratchCreated}`;
+                return { label, format: d.format, width: d.size[0], height: d.size[1], destroy: () => { ops.push(`destroy:${label}`); }, createView: () => ({ n: label }) };
+            },
+        },
+        blitScratchGarbage: [], blitScratch: null, blitScratchView: null, blitPass: null, blitPassView: null,
+        renderStats: { flushes: 0, queueWriteSubmits: 0, blitRingSubmits: 0, clears: 0, blits: 0, blitPasses: 0, blitSelfCopies: 0 },
         surfacesNeedingClear: new Set(),
         flushBatch: () => {}, resetBindFastPath: () => {}, ensureSurfaceGPUResources: () => {},
         vertexConverter: { flushParams: () => {}, destroyPendingAfterSubmit: () => {}, startFrame: () => {} },
         ringBufferManager: { flushGeometry: () => {}, flushUniforms: () => {}, flushLights: () => {}, flushStorageBuffer: () => {} },
-        clearPipeline: { destroyPendingAfterSubmit: () => {}, clear: (_e: unknown, v: { tex: string }) => { ops.push(`clear:${v.tex}`); } },
+        clearPipeline: { destroyPendingAfterSubmit: () => {}, clear: (_e: unknown, v: { n: string }) => { ops.push(`clear:${v.n}`); } },
         depthManager: { flushGarbage: () => {}, getDepthViewForTarget: () => undefined },
         msaaColorManager: { flushGarbage: () => {}, getColorViewForTarget: () => null },
         textureConverter: { destroyPendingAfterSubmit: () => {} },
         colorKeyBlitPipeline: {
-            blit: () => { ops.push("blit"); pending++; },
+            beginPass: (_e: unknown, view: unknown) => {
+                passes.push(`load:${(view as { n: string }).n}`);
+                return { end: () => { passes.push("end"); } };
+            },
+            encode: (_p: unknown, cfg: { srcView: { n: string } }) => { ops.push("blit"); sampled.push(cfg.srcView.n); pending++; },
             hasFreeSlot: () => pending < 256,
             slotsSubmitted: () => { pending = 0; },
         },
@@ -71,6 +88,9 @@ function executor(): DDrawWebGPUExecutor {
 }
 
 let pending = 0;
+let scratchCreated = 0;
+const passes: string[] = [];
+const sampled: string[] = [];
 const RECT = { left: 0, top: 0, right: 4, bottom: 2 };
 const KEY = { low: 0, high: 0 };
 const PIXELS = new Uint8Array(4 * 2 * 4);
@@ -78,7 +98,10 @@ const PIXELS = new Uint8Array(4 * 2 * 4);
 let ex: DDrawWebGPUExecutor;
 beforeEach(() => {
     ops.length = 0;
+    passes.length = 0;
+    sampled.length = 0;
     pending = 0;
+    scratchCreated = 0;
     ex = executor();
     registerQueueWriteGuard(ex);
 });
@@ -225,6 +248,88 @@ describe("a deferred clear of either surface is encoded before the blit", () => 
     });
 });
 
+describe("consecutive blits to one destination share one pass", () => {
+    test("a hundred blits onto one surface open one pass; another destination opens the next", () => {
+        const glyphs = tex("glyphs"), back = tex("back"), other = tex("other");
+        const dst = surface(back);
+        for (let i = 0; i < 100; i++) ex.blitWithColorKey(surface(glyphs), dst, RECT, RECT, KEY);
+        expect(passes).toEqual(["load:back"]);
+        ex.blitWithShaderCopy(surface(glyphs), surface(other), RECT, RECT);
+        ex.blitWithColorKey(surface(glyphs), dst, RECT, RECT, KEY);
+        expect(passes).toEqual(["load:back", "end", "load:other", "end", "load:back"]);
+        expect(ex.renderStats.blits).toBe(102);
+        expect(ex.renderStats.blitPasses).toBe(3);
+    });
+
+    test("a submit, or a pass someone else opened, ends the blit pass", () => {
+        const glyphs = tex("glyphs"), back = tex("back");
+        const dst = surface(back);
+        ex.blitWithColorKey(surface(glyphs), dst, RECT, RECT, KEY);
+        ex.flush(false);
+        ex.blitWithColorKey(surface(glyphs), dst, RECT, RECT, KEY);
+        (ex as unknown as { currentRenderPass: unknown }).currentRenderPass = { end: () => { passes.push("end-draw"); } };
+        ex.blitWithColorKey(surface(glyphs), dst, RECT, RECT, KEY);
+        expect(passes).toEqual(["load:back", "end", "load:back", "end-draw", "load:back"]);
+    });
+
+    test("a pending deferred clear of the destination ends the shared pass and is encoded before the next blit", () => {
+        const glyphs = tex("glyphs"), back = tex("back");
+        const dst = surface(back) as RenderSurface & { needsColorClear?: boolean; clearColor?: unknown };
+        ex.blitWithColorKey(surface(glyphs), dst, RECT, RECT, KEY);
+        dst.needsColorClear = true; dst.clearColor = { r: 0, g: 0, b: 0, a: 1 };
+        (ex as unknown as { surfacesNeedingClear: Set<unknown> }).surfacesNeedingClear.add(dst);
+        ex.blitWithColorKey(surface(glyphs), dst, RECT, RECT, KEY);
+        ex.blitWithColorKey(surface(glyphs), dst, RECT, RECT, KEY);
+        expect(passes).toEqual(["load:back", "end", "load:back"]);
+        expect(ops).toEqual(["blit", "clear:back", "blit", "blit"]);
+        expect(dst.needsColorClear).toBe(false);
+        expect((ex as unknown as { surfacesNeedingClear: Set<unknown> }).surfacesNeedingClear.size).toBe(0);
+    });
+});
+
+describe("a blit whose source is its destination samples a scratch copy (#327)", () => {
+    useWebGpuFlags("GPUTextureUsage");
+    const blits = [
+        ["colour-key", (s: RenderSurface, d: RenderSurface, r: typeof RECT) => ex.blitWithColorKey(s, d, r, RECT, KEY)],
+        ["shader copy", (s: RenderSurface, d: RenderSurface, r: typeof RECT) => ex.blitWithShaderCopy(s, d, r, RECT)],
+    ] as const;
+    for (const [kind, blit] of blits) {
+        test(`${kind}: the source rect is copied outside the pass and the blit never samples the destination's own view`, () => {
+            const back = tex("back", 8, 4);
+            const s = surface(back);
+            blit(s, s, { left: 1, top: 1, right: 5, bottom: 3 });
+            expect(ops).toEqual(["copy:back@1,1->scratch1@1,1:4x2", "blit"]);
+            expect(sampled).toEqual(["scratch1"]);
+            expect(passes).toEqual(["load:back"]);
+            expect(ex.renderStats.blitSelfCopies).toBe(1);
+        });
+    }
+
+    test("the scratch is reused, a different source size replaces it, and the old one is destroyed after the next submit", () => {
+        const a = tex("a", 8, 4), b = tex("b", 16, 8), other = tex("other");
+        const sa = surface(a), sb = surface(b);
+        ex.blitWithColorKey(sa, sa, RECT, RECT, KEY);
+        ex.blitWithColorKey(sa, sa, RECT, RECT, KEY);
+        expect(scratchCreated).toBe(1);
+        ex.blitWithColorKey(sb, sb, RECT, RECT, KEY);
+        expect(scratchCreated).toBe(2);
+        expect(ops).not.toContain("destroy:scratch1");
+        ex.flush(false);
+        expect(ops.at(-1)).toBe("destroy:scratch1");
+        ex.blitWithColorKey(surface(other), sb, RECT, RECT, KEY);
+        expect(sampled.at(-1)).toBe("other");
+    });
+
+    test("a copy into the scratch ends a shared blit pass on that surface", () => {
+        const glyphs = tex("glyphs"), back = tex("back", 8, 4);
+        const dst = surface(back);
+        ex.blitWithColorKey(surface(glyphs), dst, RECT, RECT, KEY);
+        ex.blitWithColorKey(dst, dst, RECT, RECT, KEY);
+        expect(passes).toEqual(["load:back", "end", "load:back"]);
+        expect(sampled).toEqual(["glyphs", "scratch1"]);
+    });
+});
+
 describe("unsubmitted blits are bounded by the colour-key uniform ring", () => {
     test("shader copies share the ring: the 257th submits the first 256 first", () => {
         const a = tex("a"), b = tex("b");
@@ -305,8 +410,48 @@ describe("validate-queue-writes", () => {
     });
 });
 
-describe("ColorKeyBlitPipeline counts the slots its unsubmitted blits read", () => {
+describe("ColorKeyBlitPipeline", () => {
     useWebGpuFlags("GPUShaderStage", "GPUBufferUsage");
+    test("differential: the pass commands are identical apart from begin/end", async () => {
+        const { ColorKeyBlitPipeline } = await import("../../src/worker/backends/webgpu/ddraw/colorkey-blit-pipeline");
+        const record = (log: string[]) => ({
+            setPipeline() { log.push("pipeline"); },
+            setBindGroup(_i: number, _g: unknown, off: number[]) { log.push(`bind ${off[0]}`); },
+            setVertexBuffer() { log.push("vb"); },
+            setViewport(x: number, y: number, w: number, h: number) { log.push(`vp ${x},${y},${w},${h}`); },
+            setScissorRect(x: number, y: number, w: number, h: number) { log.push(`sc ${x},${y},${w},${h}`); },
+            draw(n: number) { log.push(`draw ${n}`); },
+            end() { log.push("end"); },
+        });
+        const device = {
+            limits: { minUniformBufferOffsetAlignment: 256 },
+            createShaderModule: () => ({}), createBindGroupLayout: () => ({}), createPipelineLayout: () => ({}),
+            createSampler: () => ({}), createBuffer: () => ({ destroy() {} }), createRenderPipeline: () => ({}),
+            createBindGroup: () => ({}),
+        } as unknown as GPUDevice;
+        const writes: number[][] = [[], []];
+        const configs = [0, 1, 2].map((i) => ({
+            srcView: {} as GPUTextureView, srcWidth: 64, srcHeight: 64, dstView: {} as GPUTextureView,
+            dstFormat: "rgba8unorm" as GPUTextureFormat, dstWidth: 640, dstHeight: 480,
+            srcRect: { left: 8 * i, top: 0, right: 8 * i + 8, bottom: 8 },
+            dstRect: { left: 100 + 9 * i, top: 50, right: 108 + 9 * i, bottom: 58 },
+            colorKeyLow: { r: 0, g: 0, b: 0, a: 0 }, colorKeyHigh: { r: 0, g: 0, b: 0, a: 0 }, enableColorKey: true,
+        }));
+        const logs: string[][] = [[], []];
+        for (const k of [0, 1]) {
+            const q = { writeBuffer(_b: unknown, off: number, data: Float32Array) { writes[k].push(off, ...Array.from(data)); } } as unknown as GPUQueue;
+            const p = new ColorKeyBlitPipeline(device, q);
+            const encoder = { beginRenderPass: () => { logs[k].push("begin"); return record(logs[k]); } } as unknown as GPUCommandEncoder;
+            if (k === 0) for (const c of configs) p.blit(encoder, c);
+            else { const pass = p.beginPass(encoder, configs[0].dstView); for (const c of configs) p.encode(pass, c); pass.end(); }
+        }
+        const body = (log: string[]) => log.filter((l) => l !== "begin" && l !== "end");
+        expect(body(logs[1])).toEqual(body(logs[0]));
+        expect(writes[1]).toEqual(writes[0]);
+        expect(logs[0].filter((l) => l === "begin")).toHaveLength(3);
+        expect(logs[1].filter((l) => l === "begin")).toHaveLength(1);
+    });
+
     test("hasFreeSlot turns false after RING_SLOTS blits and true again after slotsSubmitted", async () => {
         const { ColorKeyBlitPipeline } = await import("../../src/worker/backends/webgpu/ddraw/colorkey-blit-pipeline");
         const pass = { setPipeline() {}, setBindGroup() {}, setVertexBuffer() {}, setViewport() {}, setScissorRect() {}, draw() {}, end() {} };
