@@ -14,6 +14,9 @@ import { registerCrtPathExports, type CrtPathHost } from "../../src/worker/modul
 import type { ThunkImplementation } from "../../src/worker/core/thunking/thunk-dispatcher";
 import { VirtualFileSystem } from "../../src/worker/runtime/filesystem/vfs";
 import type { ZipArchive, ZipEntry } from "@bottleship/formats/zip";
+import { preserveMemBinding } from "./helpers/scoped-process-state";
+
+preserveMemBinding();
 
 describe("a directory as an _access / open target", () => {
     let mem: Uint8Array;

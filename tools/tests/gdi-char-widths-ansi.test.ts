@@ -12,6 +12,9 @@ import { System } from "../../src/worker/core/system";
 import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
 import { createPaintingExports } from "../../src/worker/modules/gdi32/painting";
 import { ANSI_CHARSET, JOHAB_CHARSET, RUSSIAN_CHARSET, SHIFTJIS_CHARSET } from "../../src/worker/modules/gdi32/font-charset";
+import { preserveMemBinding } from "./helpers/scoped-process-state";
+
+preserveMemBinding();
 
 const HDC = 0x200a0, OUT = 0x2000;
 const system = System.getInstance();

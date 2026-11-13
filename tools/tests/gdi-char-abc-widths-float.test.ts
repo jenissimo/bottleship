@@ -18,6 +18,9 @@ import {
     ANSI_CHARSET, JOHAB_CHARSET, RUSSIAN_CHARSET, SHIFTJIS_CHARSET, SYMBOL_CHARSET,
 } from "../../src/worker/modules/gdi32/font-charset";
 import type { ThunkImplementation } from "../../src/worker/core/thunking/thunk-dispatcher";
+import { preserveMemBinding } from "./helpers/scoped-process-state";
+
+preserveMemBinding();
 
 const HDC = 0x200a0, ABC = 0x2000;
 const system = System.getInstance();
