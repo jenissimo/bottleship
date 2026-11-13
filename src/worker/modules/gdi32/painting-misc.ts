@@ -7,7 +7,8 @@ import { System } from '../../core/system';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { encodeAnsi } from '../codepage-utils';
-import { addFontResource, removeFontResource } from './font-resource';
+import { addFontResource, parseSfntFace, removeFontResource } from './font-resource';
+import { buildFot, parseFot } from './font-fot';
 import { PS_STYLE_MASK } from './gdi-objects';
 import { DEFAULT_CHARSET, fontSignature, systemDefaultCharset } from './font-charset';
 import { enumerateFontFamilies } from './font-enumeration';
@@ -169,6 +170,22 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
 
     // int AddFontResource{A,W}(LPCTSTR pszFilename) — the two differ only in how
     // the filename is decoded, so both names share one body.
+    // A FOT records the TTF's path at creation time, which may name a drive or directory that
+    // does not exist here; Windows then finds the file by name beside the FOT.
+    const readFotFont = async (fontPath: string, fotResolved: string): Promise<Uint8Array | null> => {
+        const vfs = System.getInstance().fileSystem;
+        const name = fontPath.split(/[\\/]/).pop() ?? fontPath;
+        const fotDir = fotResolved.slice(0, Math.max(fotResolved.lastIndexOf('\\'), fotResolved.lastIndexOf('/')));
+        for (const candidate of [fontPath, `${fotDir}\\${name}`, `C:\\WINDOWS\\Fonts\\${name}`]) {
+            const resolved = vfs.resolvePath(candidate);
+            const size = vfs.getFileSize(resolved);
+            if (size <= 0) continue;
+            const handle = await vfs.open(resolved, 0x80000000, 3);
+            if (handle) return await vfs.read(handle, size);
+        }
+        return null;
+    };
+
     const addFontResourceByPath = (api: string, path: string, flags = 0): number | Promise<number> => {
         Logger.verbose(LogCategory.GDI32, `${api}("${path}")`);
 
@@ -191,7 +208,15 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
                 const handle = await vfs.open(resolved, GENERIC_READ, OPEN_EXISTING);
                 if (!handle) return 0;
                 const data = await vfs.read(handle, size);
-                return await addFontResource(resolved, data, flags);
+                const fot = parseFot(data);
+                if (!fot) return await addFontResource(resolved, data, flags);
+                const fontData = await readFotFont(fot.fontPath, resolved);
+                if (!fontData) {
+                    Logger.warn(LogCategory.GDI32, `${api}: "${path}" references missing font "${fot.fontPath}"`);
+                    return 0;
+                }
+                // Keyed by the FOT path, which is what RemoveFontResource is later given.
+                return await addFontResource(resolved, fontData, flags);
             } catch (e) {
                 Logger.warn(LogCategory.GDI32, `${api}: read failed for "${path}": ${e}`);
                 return 0;
@@ -205,6 +230,62 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
         const vfs = System.getInstance().fileSystem;
         return removeFontResource(vfs.resolvePath(path), flags) ? 1 : 0;
     };
+
+    // BOOL CreateScalableFontResource{A,W}(DWORD fdwHidden, LPCTSTR lpszFontRes,
+    //                                      LPCTSTR lpszFontFile, LPCTSTR lpszCurrentPath)
+    const createScalableFontResource = (api: string, hidden: number, fotPath: string, fontFile: string, curPath: string): number => {
+        const ERROR_FILE_NOT_FOUND = 2;
+        const ERROR_INVALID_PARAMETER = 87;
+        const ERROR_FILE_EXISTS = 80;
+        const vfs = System.getInstance().fileSystem;
+        const scheduler = System.getInstance().scheduler;
+        Logger.verbose(LogCategory.GDI32, `${api}(hidden=${hidden}, "${fotPath}", "${fontFile}", "${curPath}")`);
+
+        if (!fotPath || !fontFile) {
+            scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        const fotResolved = vfs.resolvePath(fotPath);
+        // An existing FOT is never overwritten; callers that re-run at every start rely on this.
+        if (vfs.getFileSize(fotResolved) > 0) {
+            scheduler.setLastError(ERROR_FILE_EXISTS);
+            return 0;
+        }
+        const isFullPath = /^[A-Za-z]:[\\/]|^[\\/]/.test(fontFile);
+        const fontPath = isFullPath || !curPath ? fontFile : `${curPath.replace(/[\\/]+$/, '')}\\${fontFile}`;
+        const fontResolved = vfs.resolvePath(fontPath);
+        const fontSize = vfs.getFileSize(fontResolved);
+        if (fontSize <= 0) {
+            scheduler.setLastError(ERROR_FILE_NOT_FOUND);
+            return 0;
+        }
+        const fontHandle = vfs.openSync(fontResolved, 0x80000000, 3);
+        const fontData = fontHandle ? vfs.readSync(fontHandle, fontSize) : null;
+        const face = fontData ? parseSfntFace(fontData)?.family : null;
+        if (!face) {
+            scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        const handle = vfs.openSync(fotResolved, 0x40000000, 1);
+        if (!handle) {
+            scheduler.setLastError(ERROR_FILE_NOT_FOUND);
+            return 0;
+        }
+        vfs.writeSync(handle, buildFot(fontPath, face));
+        return 1;
+    };
+
+    exports['CreateScalableFontResourceA'] = (_ctx, mem, args): number =>
+        createScalableFontResource('CreateScalableFontResourceA', args[0],
+            args[1] ? Marshaler.readString(mem, args[1]) : '',
+            args[2] ? Marshaler.readString(mem, args[2]) : '',
+            args[3] ? Marshaler.readString(mem, args[3]) : '');
+
+    exports['CreateScalableFontResourceW'] = (_ctx, mem, args): number =>
+        createScalableFontResource('CreateScalableFontResourceW', args[0],
+            args[1] ? Marshaler.readWideString(mem, args[1]) : '',
+            args[2] ? Marshaler.readWideString(mem, args[2]) : '',
+            args[3] ? Marshaler.readWideString(mem, args[3]) : '');
 
     // int AddFontResourceA(LPCSTR pszFilename)
     exports['AddFontResourceA'] = (ctx, mem, args): number | Promise<number> =>
