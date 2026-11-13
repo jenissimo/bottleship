@@ -32,8 +32,10 @@ The LAN server is `bottleship-lan`, a small Rust program in
 From the repository root:
 
 ```sh
-cargo run --release --locked --manifest-path packages/lan-rust/Cargo.toml -- --host 127.0.0.1 --port 9001
+cargo run --release --locked --manifest-path packages/lan-rust/Cargo.toml -- --host 127.0.0.1 --port 9001 --public-rooms
 ```
+
+These quick-start commands explicitly enable public, name-only rooms. The default is private rooms with signed invitations; see [multiplayer access and security](multiplayer-security.md) for mixed room policies, key setup and gateway permissions.
 
 Then use `http://127.0.0.1:9001` as the server address. `GET /health` answers
 `{"service":"bottleship-lan","version":1}`.
@@ -42,7 +44,7 @@ To let other machines on your network connect, listen on all interfaces and give
 others your machine's address:
 
 ```sh
-cargo run --release --locked --manifest-path packages/lan-rust/Cargo.toml -- --host 0.0.0.0 --port 9001
+cargo run --release --locked --manifest-path packages/lan-rust/Cargo.toml -- --host 0.0.0.0 --port 9001 --public-rooms
 ```
 
 When BottleShip itself is served over HTTPS (as the public site is), the browser only

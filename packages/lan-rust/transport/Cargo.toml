@@ -11,7 +11,7 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 engineioxide = { path = "vendor/engineioxide", default-features = false }
 engineioxide-core = "=0.2.2"
-tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-std"] }
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-std"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 hyper = { version = "1.9", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

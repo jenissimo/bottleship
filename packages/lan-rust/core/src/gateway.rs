@@ -78,6 +78,19 @@ impl BindingRegistry {
     pub fn clear(&mut self) {
         self.bindings.clear()
     }
+    /// No live (unreleased) generation occupies the slot.
+    pub fn is_released_or_absent(&self, proto: u8, port: u16) -> bool {
+        self.bindings.get(&(proto, port)).is_none_or(|b| b.released)
+    }
+    /// Drop a released tombstone; a live binding is kept.
+    pub fn forget(&mut self, proto: u8, port: u16) -> bool {
+        if self.bindings.get(&(proto, port)).is_some_and(|b| b.released) {
+            self.bindings.remove(&(proto, port));
+            true
+        } else {
+            false
+        }
+    }
 }
 #[derive(Debug, Default, Clone, Copy)]
 struct Counts {

@@ -11,6 +11,7 @@ import type { UdpPeerLeaseRequest } from "./netplay-wire";
 import { NetResolveError, type ResolveRequest, type ResolveResult, type ResolveReply, parseIpv6, parseIpv4, isExternalIpv6Node, validBindingGeneration } from "./netplay-wire";
 
 export interface RelayLinkOptions {
+    invite?: string;
     transports?: ("websocket" | "polling")[];
     timeoutMs?: number;
 }
@@ -79,7 +80,7 @@ export class RelayLink implements NetTransport {
             reconnection: true,
             reconnectionDelay: 500,
             reconnectionDelayMax: 10_000,
-            auth: { version: PROTOCOL_VERSION, room, clientId, node: Array.from(net.node) },
+            auth: { version: PROTOCOL_VERSION, room, clientId, node: Array.from(net.node), ...(options.invite ? {invite: options.invite} : {}) },
         });
         this.deadline = setTimeout(() => this.failInitial(new Error("LAN server readiness timed out")), timeout);
         this.socket.on("connect", () => {

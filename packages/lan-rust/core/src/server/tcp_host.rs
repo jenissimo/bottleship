@@ -40,7 +40,6 @@ fn allowed(config: &TcpListenerConfig, node: Node) -> bool {
 }
 impl Core {
     fn tcp_host_admit(&mut self, c: ConnId, id: u32, now: u64, effects: &mut Vec<Effect>) -> bool {
-        if !self.rate(c, 128, now, effects) { return false; }
         let state = &mut self.participants.get_mut(&c).unwrap().tcp_host;
         if id == 0 || id <= state.last_request {
             self.disconnect(c, now, "TCP Host request identity reused", effects); return false;
@@ -53,7 +52,7 @@ impl Core {
     pub(super) fn tcp_host_open(&mut self, c: ConnId, id: u32, request: TcpHostRequest, now: u64, effects: &mut Vec<Effect>) {
         if !self.tcp_host_admit(c,id,now,effects) { return; }
         let binding = BindingToken { proto: request.proto, local_port: request.local_port, generation: Some(request.binding_generation) };
-        let Some(config) = self.routes.config.tcp_listeners.iter().find(|v| v.id == request.listener_id).cloned() else {
+        let Some(config) = self.routes.config.tcp_listeners.iter().find(|v| v.id == request.listener_id && self.participants[&c].gateway.tcp_listeners.contains(&v.id)).cloned() else {
             effects.push(reply(c,id,10013)); return;
         };
         if binding.proto != 2 || binding.local_port == 0 || binding.generation == Some(0) {
@@ -130,8 +129,7 @@ impl Core {
         }
         false
     }
-    pub(super) fn tcp_host_cancel(&mut self, c: ConnId, id: u32, now:u64, effects:&mut Vec<Effect>) {
-        if !self.rate(c,16,now,effects) { return; }
+    pub(super) fn tcp_host_cancel(&mut self, c: ConnId, id: u32, _now:u64, effects:&mut Vec<Effect>) {
         let state = &mut self.participants.get_mut(&c).unwrap().tcp_host;
         let ops: Vec<_> = state.pending.iter().filter_map(|(op,p)| (p.request_id == id).then_some(*op)).collect();
         for op in ops {
@@ -144,8 +142,7 @@ impl Core {
             effects.push(close(c,a.native_id));
         }
     }
-    pub(super) fn tcp_host_release(&mut self,c:ConnId,id:u32,now:u64,effects:&mut Vec<Effect>) {
-        if !self.rate(c,16,now,effects) { return; }
+    pub(super) fn tcp_host_release(&mut self,c:ConnId,id:u32,_now:u64,effects:&mut Vec<Effect>) {
         let state = &mut self.participants.get_mut(&c).unwrap().tcp_host;
         if let Some(a) = state.active.remove(&id) {
             effects.push(close(c,a.native_id));

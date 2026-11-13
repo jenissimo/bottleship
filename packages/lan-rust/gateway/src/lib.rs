@@ -1250,6 +1250,9 @@ impl Actor {
                     }
                 }
             }
+            GatewayInput::ForgetPort { proto, port } => {
+                self.bindings.forget(proto, port);
+            }
             GatewayInput::ReleasePort {
                 proto,
                 port,

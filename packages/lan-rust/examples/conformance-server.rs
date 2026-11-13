@@ -8,7 +8,7 @@ use std::{
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let mut config = if args.is_empty() {
-        ServerConfig::default()
+        ServerConfig { room_access: bottleship_lan_core::access::RoomAccessConfig { default_visibility: bottleship_lan_core::access::Visibility::Public, ..Default::default() }, ..Default::default() }
     } else {
         if args.len() != 2 || args[0] != "--config" {
             return Err("Usage: conformance-server [--config file.json]".into());

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { createLanServer } from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import { LanNetwork } from "../../src/worker/net/lan-network";
 import { RelayLink } from "../../src/worker/net/relay-link";
 import { WsaSocketTable, WsaFailure, WSA, ipv4Address } from "../../src/worker/modules/wsa-network";

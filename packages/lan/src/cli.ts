@@ -1,5 +1,6 @@
 import { createLanServer, type LanServerOptions } from "./server";
 import { readFile } from "node:fs/promises";
+import { RoomAccess } from "./access";
 
 const args = process.argv.slice(2);
 function value(flag: string, fallback: string): string {
@@ -9,7 +10,7 @@ function value(flag: string, fallback: string): string {
     return args[index + 1];
 }
 if (args.includes("--help")) {
-    console.log("bottleship-lan [--config server.json] [--host 127.0.0.1] [--port 9001] [--origin https://bottleship.example]");
+    console.log("bottleship-lan [--config server.json] [--host 127.0.0.1] [--port 9001] [--origin https://bottleship.example] [--public-rooms] [--invite ROOM --ttl 3600 --gateway-routes ID,ID --udp-listeners ID --tcp-listeners ID]");
     process.exit(0);
 }
 const configPath = value("--config", "");
@@ -19,6 +20,15 @@ const port = Number(value("--port", String(config.port ?? 9001)));
 if (!Number.isInteger(port) || port < 0 || port > 65535) throw new RangeError("Invalid port");
 const host = value("--host", config.host ?? "127.0.0.1");
 const origin = value("--origin", "");
+if (args.includes("--public-rooms")) config.roomAccess = {...config.roomAccess, defaultVisibility:"public"};
+if (args.includes("--invite")) {
+    const ttl=Number(value("--ttl","3600")),now=Math.floor(Date.now()/1000);
+    const list=(flag:string)=>value(flag,"").split(",").filter(Boolean);
+    console.log(new RoomAccess(config.roomAccess).sign(value("--invite",""),now+ttl,{
+        routes:list("--gateway-routes"),udpListeners:list("--udp-listeners"),tcpListeners:list("--tcp-listeners"),
+    },now));
+    process.exit(0);
+}
 const server = createLanServer({ ...config, host, port, allowedOrigins: origin ? origin === "*" ? "*" : origin.split(",") : config.allowedOrigins });
 const actualPort = await server.listen();
 console.log("bottleship-lan listening on http://" + host + ":" + actualPort + " (WebSocket + HTTP long-polling)");

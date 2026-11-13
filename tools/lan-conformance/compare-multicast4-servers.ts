@@ -4,7 +4,7 @@ import {spawn,type ChildProcessWithoutNullStreams} from "node:child_process";
 import {createHash} from "node:crypto";
 import {copyFileSync,existsSync,mkdirSync,readFileSync,readdirSync,writeFileSync} from "node:fs";
 import {join,relative,resolve} from "node:path";
-import {createLanServer} from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import {runMulticast4BlackBox} from "../../packages/lan-rust/core/tests/js/multicast4-black-box";
 const args=process.argv.slice(2),options=new Map<string,string>();
 for(let i=0;i<args.length;i+=2){

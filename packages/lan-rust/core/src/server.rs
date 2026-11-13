@@ -1,4 +1,5 @@
 use crate::{
+    access::{AccessPolicy, GatewayPermissions},
     ConnId,
     config::{ConfigError, Limits},
     gateway::{BindingRegistry, BindingToken},
@@ -14,7 +15,7 @@ mod tcp_host;
 use host::HostState;
 use tcp_host::TcpHostState;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreError(pub String);
 impl std::fmt::Display for CoreError {
@@ -73,6 +74,12 @@ pub enum GatewayInput {
         proto: u8,
         port: u16,
         generation: u32,
+    },
+    /// Drop the released tombstone of a port slot that Core reclaimed under its
+    /// port-slot budget. A live binding is never forgotten.
+    ForgetPort {
+        proto: u8,
+        port: u16,
     },
     LeaseUdpPeer {
         request_id: u32,
@@ -230,6 +237,11 @@ struct Active {
 }
 struct Participant {
     join: JoinRequest,
+    gateway: GatewayPermissions,
+    access_expires_at: u64,
+    /// Port slot -> released. Released slots are reclaimable oldest-first.
+    port_slots: HashMap<(u8,u16),bool>,
+    released_slots: std::collections::VecDeque<(u8,u16)>,
     bindings: BindingRegistry,
     multicast_bindings: BindingRegistry,
     window_start: u64,
@@ -249,6 +261,10 @@ pub struct Core {
     rooms: HashMap<String, HashMap<Node, Peer>>,
     participants: HashMap<ConnId, Participant>,
     next_operation: u64,
+    access: AccessPolicy,
+    epoch_unix_ms: u64,
+    binding_entries: usize,
+    binding_budget: usize,
 }
 fn emit(to: ConnId, event: ServerEvent, reliable: bool, source: Option<ConnId>) -> Effect {
     let retained_bytes = event.retained_bytes();
@@ -278,14 +294,19 @@ fn lease_reply(to: ConnId, id: u32, code: u32) -> Effect {
     )
 }
 impl Core {
-    pub fn new(limits: Limits, routes: Routes) -> Result<Self, ConfigError> {
+    pub fn new(limits: Limits, routes: Routes, access: AccessPolicy, epoch_unix_ms: u64) -> Result<Self, ConfigError> {
         limits.validate()?;
+        let binding_budget = limits.max_binding_entries.unwrap_or(usize::MAX);
         Ok(Self {
             limits,
             routes,
             rooms: HashMap::new(),
             participants: HashMap::new(),
             next_operation: 0,
+            access,
+            epoch_unix_ms,
+            binding_entries: 0,
+            binding_budget,
         })
     }
     /// Authenticated identity for trusted gateway construction; unknown/retired
@@ -306,6 +327,8 @@ impl Core {
         now_ms: u64,
     ) -> Result<Vec<Effect>, CoreError> {
         let join = JoinRequest::decode(auth).map_err(|e| CoreError(e.to_string()))?;
+        let admission = self.access.authorize(&join.room, auth.get("invite"), self.epoch_unix_ms.saturating_add(now_ms) / 1000)
+            .map_err(|_| CoreError("LAN access denied".into()))?;
         self.prune(now_ms);
         if connection == 0 || self.participants.contains_key(&connection) {
             return Err(CoreError("Connection identity is already used".into()));
@@ -323,15 +346,15 @@ impl Core {
                 self.disconnect(old, now_ms, "Connection replaced", &mut effects);
             }
         } else {
-            if !self.rooms.contains_key(&join.room) && self.rooms.len() >= self.limits.max_rooms {
-                return Err(CoreError("LAN room limit reached".into()));
+            if !self.rooms.contains_key(&join.room) {
+                while self.rooms.len() >= self.limits.max_rooms {
+                    if !self.evict_offline_room() { return Err(CoreError("LAN room limit reached".into())); }
+                }
             }
-            if self
-                .rooms
-                .get(&join.room)
-                .is_some_and(|r| r.len() >= self.limits.max_peers_per_room)
-            {
-                return Err(CoreError("LAN room is full".into()));
+            if let Some(room) = self.rooms.get_mut(&join.room) {
+                while room.len() >= self.limits.max_peers_per_room {
+                    if !Self::evict_offline_peer(room) { return Err(CoreError("LAN room is full".into())); }
+                }
             }
         }
         self.rooms.entry(join.room.clone()).or_default().insert(
@@ -342,10 +365,10 @@ impl Core {
                 expires_at: u64::MAX,
             },
         );
-        let mut ready = json!({"version":1,"node":join.node,"ipv4":wire::node_ipv4(&join.node),"gatewayIpv4":self.routes.advertised_ipv4(),"gatewayIpv6":[],"udpMulticast4V1":true});
+        let mut ready = json!({"version":1,"node":join.node,"ipv4":wire::node_ipv4(&join.node),"gatewayIpv4":self.routes.advertised_ipv4_for(&admission.gateway.routes),"gatewayIpv6":[],"udpMulticast4V1":true});
         ready["gatewayIpv6"] = Value::Array(
             self.routes
-                .advertised_ipv6()
+                .advertised_ipv6_for(&admission.gateway.routes)
                 .into_iter()
                 .map(|a| {
                     let ip = a
@@ -361,11 +384,11 @@ impl Core {
                 })
                 .collect(),
         );
-        if !self.routes.config.udp_listeners.is_empty() {
-            ready["udpHostListenV1"] = json!({"listeners":self.routes.config.udp_listeners.iter().map(|l|json!({"id":l.id,"allowedNodes":l.allowed_nodes()})).collect::<Vec<_>>()});
+        if self.routes.config.udp_listeners.iter().any(|l|admission.gateway.udp_listeners.contains(&l.id)) {
+            ready["udpHostListenV1"] = json!({"listeners":self.routes.config.udp_listeners.iter().filter(|l|admission.gateway.udp_listeners.contains(&l.id)).map(|l|json!({"id":l.id,"allowedNodes":l.allowed_nodes()})).collect::<Vec<_>>()});
         }
-        if !self.routes.config.tcp_listeners.is_empty() {
-            ready["tcpHostListenV1"] = json!({"listeners":self.routes.config.tcp_listeners.iter().map(|l| {
+        if self.routes.config.tcp_listeners.iter().any(|l|admission.gateway.tcp_listeners.contains(&l.id)) {
+            ready["tcpHostListenV1"] = json!({"listeners":self.routes.config.tcp_listeners.iter().filter(|l|admission.gateway.tcp_listeners.contains(&l.id)).map(|l| {
                 let nodes: Vec<Node> = l.allowed_hosts.iter().map(|host| {
                     let b = host.parse::<std::net::Ipv4Addr>().expect("validated TCP listener ACL").octets();
                     [2, 1, b[0], b[1], b[2], b[3]]
@@ -377,6 +400,10 @@ impl Core {
             connection,
             Participant {
                 join,
+                gateway: admission.gateway,
+                port_slots: HashMap::new(),
+                released_slots: Default::default(),
+                access_expires_at: admission.expires_at.map(|s|s.saturating_mul(1000).saturating_sub(self.epoch_unix_ms)).unwrap_or(u64::MAX),
                 bindings: BindingRegistry::default(),
                 multicast_bindings: BindingRegistry::default(),
                 window_start: now_ms,
@@ -401,6 +428,14 @@ impl Core {
     }
     pub fn apply(&mut self, command: Command) -> Vec<Effect> {
         let mut effects = vec![];
+        let expired: Vec<_> = match &command {
+            Command::Wire {connection,now_ms,..} | Command::Input {connection,now_ms,..} =>
+                self.participants.get(connection).filter(|p|p.access_expires_at<=*now_ms).map(|_|vec![(*connection,*now_ms)]).unwrap_or_default(),
+            Command::Tick {now_ms} =>
+                self.participants.iter().filter_map(|(id,p)|(p.access_expires_at<=*now_ms).then_some((*id,*now_ms))).collect(),
+            _ => vec![],
+        };
+        for (id,now) in expired { self.disconnect(id, now, "LAN invitation expired", &mut effects); }
         match command {
             Command::Wire {
                 connection,
@@ -411,6 +446,7 @@ impl Core {
                 if !self.participants.contains_key(&connection) {
                     return effects;
                 }
+                if !self.rate(connection, wire::message_size(&name, &args), now_ms, &mut effects) { return effects; }
                 match wire::decode_event(&name,&args){
      Ok(event)=>self.input(connection,event,now_ms,&mut effects),
      Err(DecodeError::Fatal(_))=>self.disconnect(connection,now_ms,"Invalid LAN event",&mut effects),
@@ -426,7 +462,7 @@ impl Core {
                 event,
                 now_ms,
             } => {
-                if self.participants.contains_key(&connection) {
+                if self.participants.contains_key(&connection) && self.rate(connection, event.rate_size(), now_ms, &mut effects) {
                     self.input(connection, event, now_ms, &mut effects)
                 }
             }
@@ -438,22 +474,8 @@ impl Core {
                 now_ms,
             } => {
                 if reliable {
-                    self.disconnect(
-                        to,
-                        now_ms,
-                        "Reliable output capacity exceeded",
-                        &mut effects,
-                    );
-                    if let Some(source) = source {
-                        if source != to {
-                            self.disconnect(
-                                source,
-                                now_ms,
-                                "Reliable destination failed",
-                                &mut effects,
-                            )
-                        }
-                    }
+                    // A sender cannot retire another participant by filling its output.
+                    self.disconnect(source.unwrap_or(to), now_ms, "Reliable output capacity exceeded", &mut effects);
                 }
             }
             Command::GatewayEvent { connection, event } => {
@@ -467,6 +489,72 @@ impl Core {
             Command::Tick { now_ms } => self.prune(now_ms),
         }
         effects
+    }
+    pub fn binding_entry_count(&self) -> usize { self.binding_entries }
+    fn reserve_port_state(&mut self, connection: ConnId, event: &InboundEvent, now_ms:u64, effects:&mut Vec<Effect>) -> bool {
+        let key=match event {
+            InboundEvent::Frame {datagram,generation:Some(_)} if wire::external_node(&datagram.node) || datagram.proto==1 => Some((datagram.proto,datagram.src_port)),
+            InboundEvent::Multicast4 {datagram,generation:Some(_)} => Some((1,datagram.datagram.src_port)),
+            InboundEvent::ReleasePort {proto,port,..} => Some((*proto,*port)),
+            InboundEvent::LeaseUdpPeer {request,..} => Some((request.proto,request.local_port)),
+            InboundEvent::OpenUdpHost {request,..} => Some((request.proto,request.local_port)),
+            InboundEvent::OpenTcpHost {request,..} => Some((request.proto,request.local_port)),
+            _ => None,
+        };
+        let Some(slot)=key.filter(|(proto,port)|*proto<=7 && *port!=0) else {return true;};
+        let released=matches!(event,InboundEvent::ReleasePort{..});
+        let p=self.participants.get_mut(&connection).unwrap();
+        if let Some(state)=p.port_slots.get_mut(&slot) {
+            if released && !*state { p.released_slots.push_back(slot); }
+            *state=released;
+            Self::compact_released(p);
+            return true;
+        }
+        if p.port_slots.len()>=self.limits.max_bindings_per_peer || self.binding_entries>=self.binding_budget {
+            // Reclaim this connection's oldest released tombstone instead of retiring an
+            // honest peer whose ephemeral ports cycle. Only live bindings are retirement.
+            let Some((proto,port))=self.reclaim_released_slot(connection) else {
+                self.disconnect(connection,now_ms,"LAN binding state limit exceeded",effects);return false;
+            };
+            effects.push(Effect::NativeOperation{connection,input:GatewayInput::ForgetPort{proto,port}});
+        }
+        let p=self.participants.get_mut(&connection).unwrap();
+        p.port_slots.insert(slot,released);
+        if released { p.released_slots.push_back(slot); Self::compact_released(p); }
+        self.binding_entries+=1;
+        true
+    }
+    /// Oldest released slot whose bindings are all tombstones; forgets it in Core.
+    /// Losing a tombstone only lets this participant's own stale generation of that
+    /// port be admitted again; it never touches another participant's state.
+    fn reclaim_released_slot(&mut self, connection: ConnId) -> Option<(u8,u16)> {
+        let p=self.participants.get_mut(&connection)?;
+        while let Some(slot)=p.released_slots.pop_front() {
+            if p.port_slots.get(&slot)==Some(&true)
+                && p.bindings.is_released_or_absent(slot.0,slot.1)
+                && p.multicast_bindings.is_released_or_absent(slot.0,slot.1) {
+                p.port_slots.remove(&slot);
+                p.bindings.forget(slot.0,slot.1);
+                p.multicast_bindings.forget(slot.0,slot.1);
+                self.binding_entries-=1;
+                return Some(slot);
+            }
+        }
+        None
+    }
+    /// Keep the reclaim queue proportional to the slot table under port reuse.
+    fn compact_released(p:&mut Participant) {
+        if p.released_slots.len()>p.port_slots.len().saturating_mul(2)+16 {
+            let slots=&p.port_slots;let mut seen=HashSet::new();
+            p.released_slots.retain(|slot|slots.get(slot)==Some(&true) && seen.insert(*slot));
+        }
+    }
+    fn authorized_target(&self, connection: ConnId, datagram: &Datagram) -> Result<Target, ResolveError> {
+        let target = self.routes.target(datagram)?;
+        if !self.participants[&connection].gateway.routes.contains(&self.routes.route_id(target.route_id)) {
+            return Err(ResolveError::new(ResolveCode::AccessDenied, "Native route access denied"));
+        }
+        Ok(target)
     }
     fn rate(
         &mut self,
@@ -500,9 +588,6 @@ impl Core {
         now_ms: u64,
         effects: &mut Vec<Effect>,
     ) -> bool {
-        if !self.rate(connection, 64, now_ms, effects) {
-            return false;
-        }
         let p = self.participants.get_mut(&connection).unwrap();
         if id == 0 || id <= p.last_udp_request {
             self.disconnect(connection, now_ms, "UDP request identity reused", effects);
@@ -518,6 +603,7 @@ impl Core {
         now_ms: u64,
         effects: &mut Vec<Effect>,
     ) {
+        if !self.reserve_port_state(connection, &event, now_ms, effects) { return; }
         match event {
             InboundEvent::Multicast4 {
                 datagram,
@@ -537,10 +623,7 @@ impl Core {
                 datagram,
                 generation,
             } => {
-                if !self.rate(connection, 12 + datagram.payload.len(), now_ms, effects) {
-                    return;
-                }
-                if datagram.proto == 1 {
+                        if datagram.proto == 1 {
                     self.participants
                         .get_mut(&connection)
                         .unwrap()
@@ -585,7 +668,7 @@ impl Core {
                     if self.host_outbound(connection, binding, &datagram, effects) {
                         return;
                     }
-                    match self.routes.target(&datagram) {
+                    match self.authorized_target(connection, &datagram) {
                         Ok(target) => effects.push(Effect::NativeOperation {
                             connection,
                             input: GatewayInput::Frame {
@@ -658,10 +741,7 @@ impl Core {
                 port,
                 generation,
             } => {
-                if !self.rate(connection, 16, now_ms, effects) {
-                    return;
-                }
-                let p = self.participants.get_mut(&connection).unwrap();
+                        let p = self.participants.get_mut(&connection).unwrap();
                 if proto == 1 {
                     p.multicast_bindings.release(proto, port, generation);
                 }
@@ -692,7 +772,7 @@ impl Core {
                     );
                     return;
                 }
-                let route_ids = match self.routes.selected_route_ids(&request) {
+                let route_ids = match self.routes.selected_route_ids_for(&request, &p.gateway.routes) {
                     Ok(ids) => ids,
                     Err(error) => {
                         self.resolve_error(connection, id, error, effects);
@@ -794,7 +874,7 @@ impl Core {
                     dst_port: request.remote_port,
                     payload: bytes::Bytes::new(),
                 };
-                let target = match self.routes.target(&d) {
+                let target = match self.authorized_target(connection, &d) {
                     Ok(t) => t,
                     Err(_) => {
                         effects.push(lease_reply(connection, id, 10013));
@@ -829,10 +909,7 @@ impl Core {
                 })
             }
             InboundEvent::CancelUdpPeer { id } => {
-                if !self.rate(connection, 16, now_ms, effects) {
-                    return;
-                }
-                let p = self.participants.get_mut(&connection).unwrap();
+                        let p = self.participants.get_mut(&connection).unwrap();
                 let operations: Vec<_> = p
                     .pending
                     .iter()
@@ -863,10 +940,7 @@ impl Core {
                 }
             }
             InboundEvent::ReleaseUdpPeer { id } => {
-                if !self.rate(connection, 16, now_ms, effects) {
-                    return;
-                }
-                if let Some(active) = self
+                        if let Some(active) = self
                     .participants
                     .get_mut(&connection)
                     .unwrap()
@@ -1148,7 +1222,7 @@ impl Core {
                 return;
             }
         }
-        let reply = match self.routes.resolve(&pending.request) {
+        let reply = match self.routes.resolve_for(&pending.request, &self.participants[&connection].gateway.routes) {
             Ok(result) => json!({"result":result}),
             Err(error) => json!({"error":error}),
         };
@@ -1206,6 +1280,7 @@ impl Core {
         let Some(p) = self.participants.remove(&connection) else {
             return;
         };
+        self.binding_entries -= p.port_slots.len();
         for pending in p.resolving.values() {
             effects.push(Effect::CancelResolve {
                 connection,
@@ -1247,15 +1322,30 @@ impl Core {
                     recipient,
                     json_event("peerLeft", vec![json!({"node":p.join.node})]),
                     true,
-                    None,
+                    Some(connection),
                 ));
             }
         }
+        self.prune(now_ms);
+    }
+    fn evict_offline_peer(room: &mut HashMap<Node, Peer>) -> bool {
+        let oldest=room.iter().filter(|(_,p)|p.connection.is_none()).min_by_key(|(n,p)|(p.expires_at,**n)).map(|(n,_)|*n);
+        oldest.is_some_and(|node|room.remove(&node).is_some())
+    }
+    fn evict_offline_room(&mut self) -> bool {
+        let oldest=self.rooms.iter().filter(|(_,r)|r.values().all(|p|p.connection.is_none()))
+            .min_by_key(|(name,r)|(r.values().map(|p|p.expires_at).max().unwrap_or(0),(*name).clone())).map(|(name,_)|name.clone());
+        oldest.is_some_and(|name|self.rooms.remove(&name).is_some())
     }
     fn prune(&mut self, now_ms: u64) {
+        let offline_limit=self.limits.max_offline_peers_per_room.min(self.limits.max_peers_per_room);
         self.rooms.retain(|_, room| {
             room.retain(|_, peer| peer.connection.is_some() || peer.expires_at > now_ms);
+            while room.values().filter(|p|p.connection.is_none()).count()>offline_limit { Self::evict_offline_peer(room); }
             !room.is_empty()
         });
+        while self.rooms.values().filter(|r|r.values().all(|p|p.connection.is_none())).count()>self.limits.max_offline_rooms {
+            self.evict_offline_room();
+        }
     }
 }

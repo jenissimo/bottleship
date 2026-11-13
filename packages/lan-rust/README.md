@@ -5,11 +5,13 @@ Standalone LAN relay and configured native game-server gateway for BottleShip. I
 Rust 1.94 or newer is required. Dependencies are pinned in Cargo.lock.
 
 ```sh
-cargo run --release --locked -- --host 127.0.0.1 --port 9001
+cargo run --release --locked -- --host 127.0.0.1 --port 9001 --public-rooms
 cargo run --release --locked -- --config server.json
 ```
 
 Set the emulator network configuration to the server URL and the same room for each participant. GET /health returns {"service":"bottleship-lan","version":1}. Stop the production CLI with Ctrl-C; shutdown waits for transport and native socket retirement. No publication or deployment is performed by this package.
+
+Rooms default to private and require a signing key supplied through the environment. The quick start above explicitly enables public rooms. Room membership grants no native access by itself. See [room policies, signed invitations and gateway permissions](../../docs/multiplayer-security.md).
 
 ## Configuration
 
@@ -47,7 +49,7 @@ Set the emulator network configuration to the server URL and the same room for e
 
 Route host is the configured native destination. Optional address is the address visible to the guest; optional names are guest DNS aliases. Unconfigured DNS names and native destinations are refused. IPv6 routes may use a numeric scopeId. RAW routes additionally declare protocols:["raw"], ipProtocols and, when appropriate, rawMode:"exclusive". Native destination ownership is shared across participants so exclusive raw capture cannot silently conflict with another participant.
 
-Server limits retain the TS reference names and defaults: maxRooms128, maxPeersPerRoom64, maxBufferedFrames64, maxBufferedBytes1048576, maxFramesPerSecond2000, maxBytesPerSecond4194304 and reconnectGraceMs60000. Rust additionally bounds the process through maxConnections256, maxNativeParticipants256, maxDnsOperations64 and dnsTimeoutMs10000. All are JSON fields in camelCase. allowedOrigins defaults to "*", matching the reference; explicit origin lists are recommended for an installation with a known web client.
+Server limits share the TS names and defaults: maxRooms128, maxPeersPerRoom64, maxBufferedFrames64, maxBufferedBytes1048576, maxFramesPerSecond2000, maxBytesPerSecond4194304 and reconnectGraceMs60000. Both servers also enforce maxConnections256, maxTcpConnections1024, authorizationTimeoutMs5000, maxOfflineRooms32, maxOfflinePeersPerRoom16, maxBindingsPerPeer1024 and maxBindingEntries (unset: maxConnections × maxBindingsPerPeer). See the [security guide](../../docs/multiplayer-security.md) for quota and retirement semantics. Rust additionally bounds native participants through maxNativeParticipants256, maxDnsOperations64 and dnsTimeoutMs10000. All are JSON fields in camelCase. allowedOrigins defaults to "*", matching the reference; explicit origin lists are recommended for an installation with a known web client.
 
 Guest DNS requests resolve only configured route hosts. Cancellation and timeout fence late results, but cannot interrupt an in-progress OS resolver call. The server's resolver permit stays held until that call finishes; repeated cancellation cannot create unlimited detached lookups. dnsTimeoutMs bounds the result wait, not the lifetime of the OS call.
 
@@ -94,7 +96,7 @@ For example, add this inside `gateway`:
 }
 ```
 
-Select the listener in the emulator's network configuration with `"winsock": {"provider": "native", "hostListener": "game-tcp"}`. The server advertises `tcpHostListenV1` only when TCP listeners are configured; an actual listener still requires a successful bind and READY. Its source ACL, participant, binding generation and lease govern incoming connections. The source ACL controls connecting native IP addresses; any participant admitted to the server can request a configured listener ID, subject to its owner limit. Closing the listener leaves already accepted connections alive.
+Select the listener in the emulator's network configuration with `"winsock": {"provider": "native", "hostListener": "game-tcp"}`. The server advertises `tcpHostListenV1` only when TCP listeners are configured; an actual listener still requires a successful bind and READY. Its source ACL, participant, binding generation and lease govern incoming connections. The source ACL controls connecting native IP addresses; only participants whose room policy or signed invitation grants that listener ID can request it, subject to its owner limit. Closing the listener leaves already accepted connections alive.
 
 The Rust accepted-socket path supports ordinary TCP streams. Native urgent/OOB data and `SO_OOBINLINE` on accepted sockets are not yet fully supported, even when a native outbound helper is configured. Configuring a listener does not imply complete Winsock or DirectPlay compatibility.
 

@@ -1,4 +1,5 @@
 //! Owned loopback integration of the synchronous Core with a real Gateway actor.
+#[path="../../core/tests/common/mod.rs"] mod common;
 use bottleship_lan_core::{
     Command, Core, Effect, GatewayEvent, GatewayInput, InboundEvent, ServerEvent, TcpChildKey,
     config::{GatewayConfig, Limits}, gateway::{BindingToken, DestinationPolicy},
@@ -57,7 +58,7 @@ async fn core_listener_keeps_established_child_after_real_listener_close() {
     let config:GatewayConfig=serde_json::from_value(json!({"tcpListeners":[{
         "id":"owned","bindHost":"127.0.0.1","advertisedHost":"127.0.0.1","port":0,
         "allowedHosts":["127.0.0.1"],"maxPending":8}]})).unwrap();
-    let mut core=Core::new(Limits::default(),Routes::new(config.clone()).unwrap()).unwrap();
+    let mut core=common::core(Limits::default(),Routes::new(config.clone()).unwrap()).unwrap();
     core.join(1,&json!({"version":1,"room":"test","clientId":"owned-participant-00000001","node":[2,0,0,0,0,1]}),0).unwrap();
     let policy=Arc::new(Mutex::new(DestinationPolicy::default()));
     let (handle,mut events)=Gateway::spawn(1,config,policy.clone(),GatewayOptions::default()).unwrap();

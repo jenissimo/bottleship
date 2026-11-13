@@ -1,4 +1,5 @@
 //! Pure, synchronous LAN state machine. The caller serializes commands; no I/O or tasks live here.
+pub mod access;
 pub mod config;
 pub mod gateway;
 pub mod routes;

@@ -9,7 +9,8 @@ use http_body::Body;
 use http_body_util::Full;
 use tokio_util::future::FutureExt as _;
 
-use engineioxide_core::{Packet, ProtocolVersion, Sid, TransportType};
+use bytes::Buf;
+use engineioxide_core::{Packet, PacketParseError, ProtocolVersion, Sid, TransportType};
 
 use crate::{
     DisconnectReason, body::ResponseBody, engine::EngineIo, errors::Error,
@@ -183,9 +184,32 @@ where
         return Err(Error::TransportMismatch);
     }
 
-    let (parts, body) = req.into_parts();
+    let (parts, mut body) = req.into_parts();
     let content_type = parts.headers.get(CONTENT_TYPE);
-    let packets = payload::decoder(body, content_type, protocol, engine.config.max_payload);
+    // Buffer the bounded body so every packet start can be checked before the upstream
+    // decoder calls `Packet::parse` (see `super::parse_packet`).
+    let max_payload = engine.config.max_payload;
+    let mut buffered = bytes::BytesMut::new();
+    while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+        let error = match frame {
+            Ok(frame) => match frame.into_data() {
+                Ok(data) if (buffered.len() + data.remaining()) as u64 <= max_payload => {
+                    bytes::BufMut::put(&mut buffered, data);
+                    continue;
+                }
+                Ok(_) => PacketParseError::PayloadTooLarge { max: max_payload },
+                Err(_) => continue,
+            },
+            Err(_) => PacketParseError::InvalidPacketPayload,
+        };
+        engine.close_session(sid, DisconnectReason::PacketParsingError);
+        return Err(error.into());
+    }
+    if !super::payload_packet_types_are_ascii(&buffered) {
+        engine.close_session(sid, DisconnectReason::PacketParsingError);
+        return Err(PacketParseError::InvalidPacketType(None).into());
+    }
+    let packets = payload::decoder(Full::new(buffered.freeze()), content_type, protocol, max_payload);
     futures_util::pin_mut!(packets);
 
     while let Some(packet) = packets.next().await {

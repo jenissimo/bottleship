@@ -427,7 +427,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         this.backplane.configureWinsock(config?.winsock);
         this.active = null; this.backplane.attach(null);
         if (!config) { this.network.configureDirectPlay4(); this.network.configureDirectPlay8(); this.network.configureWinsock(); return; }
-        const link = new RelayLink(config.serverUrl, config.room, this.backplane);
+        const link = new RelayLink(config.serverUrl, config.room, this.backplane, {invite: config.invite});
         this.active = { key, link }; this.backplane.attach(link);
         try {
             await link.ready;

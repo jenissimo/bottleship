@@ -1,7 +1,7 @@
 import {expect,test} from "bun:test";
 import {RootNetworkNamespace} from "../../src/worker/core/network-namespace";
 import {LanNetwork,type LanDatagram} from "../../src/worker/net/lan-network";
-import {createLanServer} from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import {PROTO_UDP} from "../../src/worker/net/netplay-wire";
 class ControlWorker extends EventTarget{
  private ports:MessagePort[]=[];

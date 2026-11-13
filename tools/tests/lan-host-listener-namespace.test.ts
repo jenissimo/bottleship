@@ -1,6 +1,6 @@
 import {test,expect} from "bun:test";
 import {createSocket,type Socket as UdpSocket} from "node:dgram";
-import {createLanServer} from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import {RootNetworkNamespace,ChildProcessNetworkNamespace} from "../../src/worker/core/network-namespace";
 import {LanNetwork} from "../../src/worker/net/lan-network";
 const pause=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));

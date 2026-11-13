@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help") {
         println!(
-            "bottleship-lan [--config server.json] [--host 127.0.0.1] [--port 9001] [--origin https://bottleship.example]"
+            "bottleship-lan [--config server.json] [--host 127.0.0.1] [--port 9001] [--origin https://bottleship.example] [--public-rooms] [--invite ROOM --ttl 3600 --gateway-routes ID,ID --udp-listeners ID --tcp-listeners ID]"
         );
         return Ok(());
     }
@@ -38,6 +38,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             Origins::List(origin.split(',').map(str::to_owned).collect())
         };
+    }
+    if args.iter().any(|arg| arg == "--public-rooms") {
+        config.room_access.default_visibility = bottleship_lan_core::access::Visibility::Public;
+    }
+    if let Some(room) = value(&args, "--invite")? {
+        config.validate().map_err(std::io::Error::other)?;
+        let ttl: u64 = value(&args, "--ttl")?.unwrap_or_else(|| "3600".into()).parse()?;
+        let list = |flag: &str| -> Result<Vec<String>, String> {
+            Ok(value(&args, flag)?.filter(|s| !s.is_empty()).map(|s|s.split(',').map(str::to_owned).collect()).unwrap_or_default())
+        };
+        let gateway = bottleship_lan_core::access::GatewayPermissions {
+            routes:list("--gateway-routes")?, udp_listeners:list("--udp-listeners")?, tcp_listeners:list("--tcp-listeners")?,
+        };
+        let access = bottleship_lan_core::access::AccessPolicy::from_environment(config.room_access)?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+        println!("{}", access.sign(&room, now.checked_add(ttl).ok_or("Invalid invitation TTL")?, gateway, now)?);
+        return Ok(());
     }
     let server = LanServer::bind(config).await?;
     println!(

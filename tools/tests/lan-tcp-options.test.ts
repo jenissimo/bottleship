@@ -1,7 +1,7 @@
 import { beforeAll, expect, spyOn, test } from "bun:test";
 import { createServer, Socket } from "node:net";
 import { buildNativeForTests, nativeTestHelper } from "../../packages/lan/native/testing";
-import { createLanServer } from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import { NativeHelperSocket } from "../../packages/lan/src/native-helper";
 import { LanNetwork } from "../../src/worker/net/lan-network";
 import { RelayLink } from "../../src/worker/net/relay-link";

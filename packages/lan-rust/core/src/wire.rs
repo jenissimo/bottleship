@@ -401,6 +401,38 @@ pub enum InboundEvent {
         id: u32,
     },
 }
+/// Count all application messages before decoding, including unknown and malformed
+/// events. Streaming JSON measurement avoids allocating a second attacker-sized tree.
+pub fn message_size(name: &str, args: &[Arg]) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self,b:&[u8])->std::io::Result<usize>{self.0=self.0.saturating_add(b.len());Ok(b.len())}
+        fn flush(&mut self)->std::io::Result<()>{Ok(())}
+    }
+    let mut count=Count(name.len()+2);
+    for arg in args {
+        match arg {
+            Arg::Binary(b)=>count.0=count.0.saturating_add(b.len()),
+            Arg::Json(v)=>{let _=serde_json::to_writer(&mut count,v);}
+        }
+        count.0=count.0.saturating_add(1);
+    }
+    count.0
+}
+impl InboundEvent {
+    /// Direct core callers use the same admission point; frame envelopes are exact.
+    pub fn rate_size(&self)->usize {
+        match self {
+            Self::Frame{datagram,..}=>12+datagram.payload.len(),
+            Self::Multicast4{datagram,..}=>MULTICAST4_DGRAM_HEADER+datagram.datagram.payload.len(),
+            Self::Resolve{request,..}=>64+request.host.len(),
+            Self::OpenTcpHost{request,..}=>128+request.listener_id.len(),
+            Self::OpenUdpHost{request,..}=>128+request.listener_id.len(),
+            Self::LeaseUdpPeer{..}=>128,
+            _=>32,
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
     Fatal(WireError),

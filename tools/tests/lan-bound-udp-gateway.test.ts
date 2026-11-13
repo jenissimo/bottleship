@@ -1,7 +1,7 @@
 import {expect,test} from "bun:test";
 import {buildBoundUdpHelper} from "../lan-conformance/build-bound-udp-helper";
 import {createSocket,type Socket} from "node:dgram";
-import {createLanServer} from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import {parseIpv6} from "../../packages/lan/src/ip-address";
 import {LanNetwork} from "../../src/worker/net/lan-network";
 import {RelayLink} from "../../src/worker/net/relay-link";

@@ -1,3 +1,4 @@
+mod common;
 use bottleship_lan_core::{config::*, routes::*, wire::*, *};
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -7,7 +8,7 @@ fn auth(id: u8, room: &str) -> Value {
     json!({"version":1,"room":room,"clientId":format!("multicast-participant-{id:08}"),"node":[2,0,0,1,0,id]})
 }
 fn core() -> Core {
-    Core::new(
+    common::core(
         Limits::default(),
         Routes::new(GatewayConfig::default()).unwrap(),
     )
@@ -273,7 +274,7 @@ fn multicast_does_not_claim_native_legacy_bindings_but_observes_peer_rebind() {
         json!({"routes":[{"host":"127.0.0.1","ports":[9000],"protocols":["udp"]}]}),
     )
     .unwrap();
-    let mut c = Core::new(Limits::default(), Routes::new(config).unwrap()).unwrap();
+    let mut c = common::core(Limits::default(), Routes::new(config).unwrap()).unwrap();
     c.join(1, &auth(1, "a"), 0).unwrap();
     c.join(2, &auth(2, "a"), 0).unwrap();
     assert_eq!(
@@ -314,7 +315,8 @@ fn multicast_does_not_claim_native_legacy_bindings_but_observes_peer_rebind() {
 #[test]
 fn rate_budget_counts_the_full_twenty_byte_envelope() {
     let mut c = core();
-    c.limits.max_bytes_per_second = 27;
+    // Full 20-byte multicast envelope, payload, event name and generation.
+    c.limits.max_bytes_per_second = bottleship_lan_core::wire::message_size("frame",&[Arg::Binary(raw(G,2,1,b"1234567")),Arg::Json(json!(1))]);
     c.join(1, &auth(1, "a"), 0).unwrap();
     c.join(2, &auth(2, "a"), 0).unwrap();
     assert_eq!(

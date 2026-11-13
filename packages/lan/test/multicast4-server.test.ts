@@ -1,7 +1,7 @@
 /// <reference types="bun" />
 import { expect, test } from "bun:test";
 import { io, type Socket } from "socket.io-client";
-import { createLanServer } from "../src/server";
+import { createPublicLanServer as createLanServer } from "./public-server";
 import { encodeDatagram, PROTO_UDP, type ClientEvents, type ServerEvents, type LanReady } from "../src/protocol";
 
 type Client = Socket<ServerEvents, ClientEvents>;

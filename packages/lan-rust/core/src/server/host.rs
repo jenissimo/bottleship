@@ -71,9 +71,6 @@ impl Core {
         now: u64,
         effects: &mut Vec<Effect>,
     ) -> bool {
-        if !self.rate(connection, 128, now, effects) {
-            return false;
-        }
         let host = &mut self.participants.get_mut(&connection).unwrap().host;
         if id == 0 || id <= host.last_request {
             self.disconnect(connection, now, "UDP Host request identity reused", effects);
@@ -114,7 +111,7 @@ impl Core {
             .config
             .udp_listeners
             .iter()
-            .find(|l| l.id == request.listener_id)
+            .find(|l| l.id == request.listener_id && self.participants[&c].gateway.udp_listeners.contains(&l.id))
             .cloned()
         else {
             effects.push(reply(c, id, 10013));
@@ -211,10 +208,7 @@ impl Core {
         }
         false
     }
-    pub(super) fn host_cancel(&mut self, c: ConnId, id: u32, now: u64, effects: &mut Vec<Effect>) {
-        if !self.rate(c, 16, now, effects) {
-            return;
-        }
+    pub(super) fn host_cancel(&mut self, c: ConnId, id: u32, _now: u64, effects: &mut Vec<Effect>) {
         let host = &mut self.participants.get_mut(&c).unwrap().host;
         let pending: Vec<_> = host
             .pending
@@ -240,10 +234,7 @@ impl Core {
             effects.push(native_release(c, a.native_id));
         }
     }
-    pub(super) fn host_release(&mut self, c: ConnId, id: u32, now: u64, effects: &mut Vec<Effect>) {
-        if !self.rate(c, 16, now, effects) {
-            return;
-        }
+    pub(super) fn host_release(&mut self, c: ConnId, id: u32, _now: u64, effects: &mut Vec<Effect>) {
         if let Some(a) = self
             .participants
             .get_mut(&c)

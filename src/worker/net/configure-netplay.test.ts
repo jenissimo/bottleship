@@ -1,6 +1,6 @@
 /// <reference types="bun" />
 import { expect, test } from "bun:test";
-import { createLanServer } from "../../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../../packages/lan/test/public-server";
 import { configureNetplay, getNetplayState } from "./configure-netplay";
 import { lanNetwork } from "./lan-network";
 

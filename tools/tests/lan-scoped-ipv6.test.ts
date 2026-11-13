@@ -2,7 +2,7 @@ import { beforeAll, expect, test } from "bun:test";
 import { networkInterfaces } from "node:os";
 import { createSocket } from "node:dgram";
 import { createServer, type Socket } from "node:net";
-import { createLanServer } from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import { buildNativeForTests, nativeTestHelper } from "../../packages/lan/native/testing";
 import { parseIpv6 } from "../../packages/lan/src/ip-address";
 import { LanNetwork } from "../../src/worker/net/lan-network";

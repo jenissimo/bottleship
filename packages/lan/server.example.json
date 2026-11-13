@@ -4,9 +4,17 @@
   "allowedOrigins": [
     "http://localhost:5174"
   ],
+  "roomAccess": {
+    "defaultVisibility": "private",
+    "inviteKeyEnv": "BOTTLESHIP_LAN_INVITE_KEY",
+    "rooms": {
+      "lobby": { "visibility": "public" }
+    }
+  },
   "gateway": {
     "routes": [
       {
+        "id": "example-game",
         "host": "127.0.0.1",
         "address": "203.0.113.10",
         "names": [

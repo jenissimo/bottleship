@@ -4,6 +4,7 @@ export interface WinsockNetworkPolicy { provider: "native"; hostListener: string
 export interface NetworkConfig {
   serverUrl: string;
   room: string;
+  invite?: string;
   directPlay8?: DirectPlay8NetworkPolicy;
   directPlay4?: DirectPlay4NetworkPolicy;
   winsock?: WinsockNetworkPolicy;
@@ -20,7 +21,7 @@ export const NETWORK_SETTINGS_KEY = "bottleship_network_v1";
 export function normalizeNetworkConfig(value: unknown): NetworkConfig | null {
   if (value == null) return null;
   if (typeof value !== "object") throw new Error("Network settings must contain a server URL and room.");
-  const { serverUrl, room, directPlay8, directPlay4, winsock } = value as Partial<NetworkConfig>;
+  const { serverUrl, room, invite, directPlay8, directPlay4, winsock } = value as Partial<NetworkConfig>;
   if (winsock !== undefined && (!winsock || winsock.provider !== "native" ||
       typeof winsock.hostListener !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(winsock.hostListener)))
     throw new Error("Native Winsock requires a configured TCP Host listener ID.");
@@ -35,6 +36,7 @@ export function normalizeNetworkConfig(value: unknown): NetworkConfig | null {
   if (typeof serverUrl !== "string" || typeof room !== "string") {
     throw new Error("Enter a LAN server URL and room.");
   }
+  if (invite !== undefined && (typeof invite !== "string" || invite.length > 4096 || !/^bs1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/.test(invite))) throw new Error("Invalid room invitation.");
   const name = room.trim();
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
     throw new Error("Room names use 1–64 letters, numbers, underscores or hyphens.");
@@ -48,14 +50,15 @@ export function normalizeNetworkConfig(value: unknown): NetworkConfig | null {
       || url.search || url.hash || url.pathname !== "/") {
     throw new Error("Use an HTTP(S) server address without a path, query or credentials.");
   }
-  return { serverUrl: url.origin, room: name, ...(directPlay8 ? {directPlay8: {provider: "native" as const, hostListener: directPlay8.hostListener}} : {}),
+  return { serverUrl: url.origin, room: name, ...(invite ? {invite} : {}), ...(directPlay8 ? {directPlay8: {provider: "native" as const, hostListener: directPlay8.hostListener}} : {}),
     ...(winsock ? {winsock: {provider: "native" as const, hostListener: winsock.hostListener}} : {}),
     ...(directPlay4 ? {directPlay4: {provider: "native" as const, tcpHostListener: directPlay4.tcpHostListener, udpHostListener: directPlay4.udpHostListener}} : {}) };
 }
 
-export function networkConfigFromLocation(search: string, saved: NetworkConfig | null): NetworkConfig | null {
+export function networkConfigFromLocation(search: string, saved: NetworkConfig | null, hash = ""): NetworkConfig | null {
   const params = new URLSearchParams(search);
-  if (!params.has("dp4Provider") && !params.has("dp4TcpHostListener") && !params.has("dp4UdpHostListener") && !params.has("lanServer") && !params.has("room") && !params.has("dp8Provider") && !params.has("dp8HostListener") && !params.has("winsockProvider") && !params.has("winsockHostListener")) return saved;
+  const fragment = new URLSearchParams(hash.replace(/^#/, ""));
+  if (!fragment.has("lanInvite") && !params.has("dp4Provider") && !params.has("dp4TcpHostListener") && !params.has("dp4UdpHostListener") && !params.has("lanServer") && !params.has("room") && !params.has("dp8Provider") && !params.has("dp8HostListener") && !params.has("winsockProvider") && !params.has("winsockHostListener")) return saved;
   const provider = params.get("dp8Provider");
   if (provider !== null && provider !== "native") throw new Error("Invalid DirectPlay provider.");
   const directPlay8 = params.has("dp8Provider") || params.has("dp8HostListener") ?
@@ -70,6 +73,7 @@ export function networkConfigFromLocation(search: string, saved: NetworkConfig |
     {provider: "native" as const, tcpHostListener: params.get("dp4TcpHostListener") ?? saved?.directPlay4?.tcpHostListener ?? "",
       udpHostListener: params.get("dp4UdpHostListener") ?? saved?.directPlay4?.udpHostListener ?? ""} : saved?.directPlay4;
   return normalizeNetworkConfig({
+    invite: fragment.get("lanInvite") ?? ((params.get("room") ?? saved?.room) === saved?.room && (params.get("lanServer") ?? saved?.serverUrl) === saved?.serverUrl ? saved?.invite : undefined),
     directPlay4,
     winsock,
     serverUrl: params.get("lanServer") ?? saved?.serverUrl,
@@ -100,7 +104,15 @@ export function networkInviteUrl(href: string, config: NetworkConfig | null): st
   if (config?.winsock) {
     url.searchParams.set("winsockProvider", "native"); url.searchParams.set("winsockHostListener", config.winsock.hostListener);
   } else { url.searchParams.delete("winsockProvider"); url.searchParams.delete("winsockHostListener"); }
+  const fragment = new URLSearchParams(url.hash.replace(/^#/, ""));
+  if (config?.invite) fragment.set("lanInvite", config.invite); else fragment.delete("lanInvite");
+  url.hash = fragment.toString();
   return url.toString();
+}
+
+export function networkConfigForStorage(config: NetworkConfig | null): NetworkConfig | null {
+  if (!config) return null;
+  const saved = {...config}; delete saved.invite; return saved;
 }
 
 export function loadNetworkConfig(): NetworkConfig | null {
@@ -108,6 +120,6 @@ export function loadNetworkConfig(): NetworkConfig | null {
   let saved: NetworkConfig | null = null;
   try { saved = normalizeNetworkConfig(JSON.parse(localStorage.getItem(NETWORK_SETTINGS_KEY) ?? "null")); }
   catch { /* Ignore invalid persisted preferences. */ }
-  try { return networkConfigFromLocation(window.location.search, saved); }
+  try { return networkConfigFromLocation(window.location.search, saved, window.location.hash); }
   catch { return null; }
 }

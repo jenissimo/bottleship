@@ -1,5 +1,5 @@
 import {expect,test} from "bun:test";
-import {createLanServer} from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import {RootNetworkNamespace,ChildProcessNetworkNamespace,type NetworkNamespaceBoot} from "../../src/worker/core/network-namespace";
 import {LanNetwork} from "../../src/worker/net/lan-network";
 import type {TcpHostLease} from "../../src/worker/net/tcp-host-lease-rpc";

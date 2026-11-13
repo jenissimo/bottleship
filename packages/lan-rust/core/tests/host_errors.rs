@@ -1,8 +1,9 @@
+mod common;
 use bottleship_lan_core::{config::*, gateway::*, routes::*, wire::*, *};
 use serde_json::json;
 fn setup() -> (Core, u64, BindingToken) {
     let cfg:GatewayConfig=serde_json::from_value(json!({"udpListeners":[{"id":"host","bindHost":"127.0.0.1","advertisedHost":"127.0.0.1","port":0,"allowedHosts":["127.0.0.1"]}]})).unwrap();
-    let mut c = Core::new(Limits::default(), Routes::new(cfg).unwrap()).unwrap();
+    let mut c = common::core(Limits::default(), Routes::new(cfg).unwrap()).unwrap();
     c.join(
         1,
         &json!({"version":1,"room":"room","clientId":"error-participant-01","node":[2,0,0,0,0,1]}),

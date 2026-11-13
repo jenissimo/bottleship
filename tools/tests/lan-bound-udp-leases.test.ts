@@ -1,7 +1,7 @@
 import {expect,test} from "bun:test";
 import {createSocket,type Socket} from "node:dgram";
 import {io,type Socket as ClientSocket} from "socket.io-client";
-import {createLanServer} from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import {asBytes,decodeDatagram,encodeDatagram,ipv4ToNode,PROTO_UDP,PROTOCOL_VERSION,type ClientEvents,type ServerEvents,type UdpPeerLeaseReply} from "../../packages/lan/src/protocol";
 import {buildBoundUdpHelper} from "../lan-conformance/build-bound-udp-helper";
 const wait=async(check:()=>boolean|Promise<boolean>,label:string)=>{const end=Date.now()+5000;while(!await check()){if(Date.now()>end)throw Error("Timeout: "+label);await new Promise(r=>setTimeout(r,2));}};

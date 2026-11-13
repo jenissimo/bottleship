@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { createServer, type Socket as NativeSocket } from "node:net";
 import { createSocket } from "node:dgram";
-import { createLanServer } from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import { LanNetwork, NetResolveError } from "../../src/worker/net/lan-network";
 import { RelayLink } from "../../src/worker/net/relay-link";
 import { parseIpv6 } from "../../packages/lan/src/ip-address";

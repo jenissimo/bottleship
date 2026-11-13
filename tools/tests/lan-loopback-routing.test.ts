@@ -4,7 +4,7 @@ import { LanNetwork } from "../../src/worker/net/lan-network";
 import { WsaSocketTable, ipv4Address } from "../../src/worker/modules/wsa-network";
 import { DirectPlay8Session } from "../../src/worker/modules/dpnet/peer";
 import type { SessionDesc } from "../../src/worker/modules/dplayx/session";
-import { createLanServer } from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 
 async function until(check: () => boolean) {
     const deadline = Date.now() + 3000;

@@ -1,3 +1,4 @@
+mod common;
 use bottleship_lan_core::{config::*, gateway::*, routes::*, wire::*, *};
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -5,7 +6,7 @@ fn auth(node: u8, room: &str) -> Value {
     json!({"version":1,"room":room,"clientId":format!("participant-{node:08}"),"node":[2,0,0,0,0,node]})
 }
 fn plain() -> Core {
-    Core::new(
+    common::core(
         Limits::default(),
         Routes::new(GatewayConfig::default()).unwrap(),
     )
@@ -13,7 +14,7 @@ fn plain() -> Core {
 }
 fn routed() -> Core {
     let config:GatewayConfig=serde_json::from_value(json!({"routes":[{"host":"127.0.0.1","names":["echo.test"],"ports":[9000],"protocols":["udp","tcp"]}]})).unwrap();
-    Core::new(Limits::default(), Routes::new(config).unwrap()).unwrap()
+    common::core(Limits::default(), Routes::new(config).unwrap()).unwrap()
 }
 fn send(core: &mut Core, c: u64, event: InboundEvent) -> Vec<Effect> {
     core.apply(Command::Input {
@@ -132,7 +133,7 @@ fn broadcast_excludes_sender_and_other_rooms() {
     assert!(matches!(e.as_slice(), [Effect::Emit { to: 2, .. }]));
 }
 #[test]
-fn reliable_rejection_retires_both_but_udp_does_not() {
+fn sr08_reliable_rejection_retires_only_sender_but_udp_does_not() {
     let mut c = plain();
     c.join(1, &auth(1, "a"), 0).unwrap();
     c.join(2, &auth(2, "a"), 0).unwrap();
@@ -151,13 +152,13 @@ fn reliable_rejection_retires_both_but_udp_does_not() {
         reliable: true,
         now_ms: 0,
     });
-    assert_eq!(c.participant_count(), 0);
-    assert_eq!(
-        e.iter()
-            .filter(|e| matches!(e, Effect::Disconnect { .. }))
-            .count(),
-        2
-    );
+    assert_eq!(c.participant_count(), 1);
+    assert!(c.connection_node(2).is_some());
+    assert!(e.iter().any(|e|matches!(e,Effect::Disconnect{connection:1,..})));
+    assert!(!e.iter().any(|e|matches!(e,Effect::Disconnect{connection:2,..})));
+    // Even a failed departure notice cannot cascade into the recipient.
+    c.apply(Command::DeliveryRejected{to:2,source:Some(1),reliable:true,now_ms:0});
+    assert!(c.connection_node(2).is_some());
 }
 #[test]
 fn replaced_connection_cannot_retire_successor() {

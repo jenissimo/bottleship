@@ -2,7 +2,7 @@ import {expect,test} from "bun:test";
 import {createConnection,type Socket as NativeSocket} from "node:net";
 import {once} from "node:events";
 import {io} from "socket.io-client";
-import {createLanServer} from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import {asBytes,decodeDatagram,encodeDatagram} from "../../packages/lan/src/protocol";
 import {CREDIT,DATA,FIN,SYN,SYNACK,TCP_WINDOW,decodeTcpFrame,encodeTcpFrame} from "../../packages/lan/src/tcp-protocol";
 

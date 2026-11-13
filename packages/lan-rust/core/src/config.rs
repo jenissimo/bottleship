@@ -20,6 +20,14 @@ pub struct Limits {
     pub max_frames_per_second: u32,
     pub max_bytes_per_second: usize,
     pub reconnect_grace_ms: u64,
+    pub max_offline_rooms: usize,
+    pub max_offline_peers_per_room: usize,
+    pub max_bindings_per_peer: usize,
+    /// Process-wide port-slot cap. `None` (the default) means maxConnections ×
+    /// maxBindingsPerPeer, so peers within their own budget can never exhaust it;
+    /// the server fills it in before constructing Core. Core alone treats `None`
+    /// as no separate global cap.
+    pub max_binding_entries: Option<usize>,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -31,6 +39,10 @@ impl Default for Limits {
             max_frames_per_second: 2000,
             max_bytes_per_second: 4194304,
             reconnect_grace_ms: 60000,
+            max_offline_rooms: 32,
+            max_offline_peers_per_room: 16,
+            max_bindings_per_peer: 1024,
+            max_binding_entries: None,
         }
     }
 }
@@ -47,10 +59,21 @@ impl Limits {
             || self.max_frames_per_second == 0
             || self.max_bytes_per_second == 0
             || self.reconnect_grace_ms > 86400000
+            || self.max_offline_rooms > 65536
+            || self.max_offline_peers_per_room > 4096
+            || !(1..=65536).contains(&self.max_bindings_per_peer)
+            || self
+                .max_binding_entries
+                .is_some_and(|n| !(1..=65536 * 65536).contains(&n))
         {
             return Err(err("Invalid LAN limit"));
         }
         Ok(())
+    }
+    /// Global port-slot budget for a server admitting at most `max_connections`.
+    pub fn binding_entry_budget(&self, max_connections: usize) -> usize {
+        self.max_binding_entries
+            .unwrap_or_else(|| max_connections.saturating_mul(self.max_bindings_per_peer))
     }
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +91,8 @@ pub enum RawMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteConfig {
+    #[serde(default)]
+    pub id: Option<String>,
     pub host: String,
     #[serde(default)]
     pub address: Option<String>,
@@ -86,7 +111,8 @@ pub struct RouteConfig {
 impl RouteConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let len = |s: &str| s.encode_utf16().count();
-        if self.host.is_empty()
+        if self.id.as_ref().is_some_and(|s| !crate::access::valid_name(s))
+            || self.host.is_empty()
             || len(&self.host) > 253
             || self.protocols.is_empty()
             || self.ports.len() > 256
@@ -287,8 +313,12 @@ impl GatewayConfig {
         {
             return Err(err("Invalid gateway limits"));
         }
-        for r in &self.routes {
-            r.validate()?
+        let mut route_ids = std::collections::HashSet::new();
+        for (index, r) in self.routes.iter().enumerate() {
+            r.validate()?;
+            if !route_ids.insert(r.id.clone().unwrap_or_else(|| format!("route-{index}"))) {
+                return Err(err("Duplicate native route identity"));
+            }
         }
         let mut ids = std::collections::HashSet::new();
         for listener in &self.udp_listeners {

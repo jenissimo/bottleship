@@ -7,6 +7,9 @@ license = "Apache-2.0"
 description = "Ordered protocol-v1 state machine for BottleShip LAN"
 
 [dependencies]
+base64 = "=0.22.1"
+hmac = "=0.13.0"
+sha2 = "=0.11.0"
 bytes = "=1.12.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"

@@ -68,6 +68,7 @@ fn spawn(
     let cfg = GatewayConfig {
         native_helper_path: Some(helper.into()),
         routes: vec![RouteConfig {
+            id: None,
             host: host.to_string(),
             address: Some(alias.to_string()),
             scope_id: None,

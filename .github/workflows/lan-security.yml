@@ -1,0 +1,63 @@
+name: LAN security
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dependencies:
+    name: LAN dependency advisory audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      # No install is needed to inspect locked versions. Network failures, partial
+      # responses and every returned advisory fail this required job.
+      - run: bun tools/security/audit-lan-dependencies.ts
+
+  regressions:
+    name: LAN attack regressions and Rust/TS parity
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/lan-security
+      BOTTLESHIP_RUST_UDP_HELPER: ${{ github.workspace }}/packages/lan/native/build/udp-bound-helper
+      BOTTLESHIP_RUST_STARTUP_FIXTURE: ${{ github.workspace }}/target/lan-security/debug/examples/startup_stall
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bun install --frozen-lockfile
+      - name: Build native test helpers
+        run: |
+          bun packages/lan/native/build-udp.ts
+          bun packages/lan/native/build.ts --tests
+          cargo build --locked --manifest-path packages/lan-rust/gateway/Cargo.toml --example startup_stall
+      - name: Rust tests including malformed wire and queue exhaustion
+        run: |
+          for part in core native gateway transport; do
+            cargo test --locked --manifest-path packages/lan-rust/$part/Cargo.toml
+          done
+          cargo test --locked --manifest-path packages/lan-rust/Cargo.toml
+      - name: TypeScript attack regressions and audit failure policy
+        run: bun test packages/lan/test tools/tests/lan-dependency-audit.test.ts
+      - name: Same real clients against both servers over WebSocket and polling
+        run: |
+          cargo build --locked --manifest-path packages/lan-rust/Cargo.toml --example conformance-server
+          bun tools/lan-conformance/security-access.ts target/lan-security/debug/examples/conformance-server

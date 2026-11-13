@@ -21,6 +21,10 @@ This copy adds explicit public ownership hooks, not private-field access or unsa
 - Closed queues are drained on retirement, releasing all queued guards.
 - Engine.IO HTTP error JSON uses numeric protocol codes (0/1/2/3/5), preserving
   existing Engine.IO v4 client compatibility; unknown/stale SID returns code 1.
+- WebSocket text and polling POST packets whose first byte is not ASCII are rejected
+  before engineioxide-core 0.2.2 `Packet::parse`, which otherwise panics on a six-byte
+  packet starting with a multi-byte character (`&value[1..6]`). Polling buffers the
+  body (bounded by maxPayload) to check every packet start before decoding.
 
 The LAN adapter uses the EngineIoHandler synchronous callbacks directly, avoiding
 Socketioxide's unbounded per-message task spawning. It implements the root namespace

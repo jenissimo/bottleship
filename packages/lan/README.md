@@ -16,7 +16,7 @@ From this directory:
 
 ```sh
 bun install
-bun run start --host 127.0.0.1 --port 9001
+bun run start --host 127.0.0.1 --port 9001 --public-rooms
 bun test
 bun run typecheck
 ```
@@ -51,7 +51,7 @@ The default listener is loopback. To listen on a LAN interface and restrict brow
 origins, run:
 
 ```sh
-bun run start --host 0.0.0.0 --port 9001 --origin https://bottleship.example
+bun run start --host 0.0.0.0 --port 9001 --public-rooms --origin https://bottleship.example
 ```
 
 Multiple origins can be comma-separated. An HTTPS emulator page requires an HTTPS
@@ -59,8 +59,11 @@ relay URL: terminate TLS at a reverse proxy and forward both normal HTTP request
 and WebSocket upgrades under `/socket.io/`. The root path `/health` returns the
 service name and protocol version. The relay does not host game files.
 
-Rooms currently use knowledge of the room name as admission. There is no account
-service or public room directory; use unguessable room names for private sessions.
+Rooms default to private and require a signing key supplied through the environment.
+The quick starts explicitly enable public name-only rooms. Public/private policies,
+signed invitations and separate native gateway permissions are described in
+[Multiplayer access and security](../../docs/multiplayer-security.md). There is no
+account service or public room directory.
 The resume identity is random, lives in worker memory and only protects an
 address lease from being claimed by another participant.
 
@@ -70,14 +73,14 @@ Protocol version 1 uses Socket.IO 4 over Engine.IO. This is not a raw WebSocket
 endpoint. The handshake auth object is:
 
 ```ts
-{ version: 1, room: string, clientId: string, node: number[6] }
+{ version: 1, room: string, clientId: string, node: number[6], invite?: string }
 ```
 
 A locally generated node has the form `02:00:00:01:b:c` (`c` in 1-254),
 corresponding to IPv4 `10.1.b.c`, so every default guest shares one /16. The
 relay verifies and reserves this address without changing it after game sockets
-have bound. A reconnect by the same identity retains its lease for 60 seconds; a
-fresh identity cannot take an existing lease. The server emits
+have bound. A reconnect by the same identity can reuse its lease for up to 60 seconds;
+while cached, a fresh identity cannot claim it. Offline leases yield under quota pressure. The server emits
 `ready { version, node, ipv4, gatewayIpv4, gatewayIpv6 }` after accepting the participant.
 
 `frame(bytes, bindingGeneration?)` carries an optional nonzero uint32 generation
@@ -157,9 +160,12 @@ semantics belong to the emulator.
 Default resource limits are 128 rooms, 64 address leases per room, 2,000 frames
 and 4 MiB per second per participant, and 64 frames/1 MiB of server output per
 recipient. Invalid frames or excessive sending disconnect the participant.
-Congestion drops unreliable frames; reliable-channel overflow disconnects the
-affected endpoints so stream failure is visible. Application buffers and
-disconnected address leases are bounded.
+Congestion drops unreliable frames; reliable relay overflow disconnects the sender.
+The recipient remains connected and receives departure through a separate bounded
+control reserve. Defaults also cap Engine.IO sessions at 256, TCP connections at
+1024, unauthenticated lifetime at 5 seconds, offline rooms at 32, offline leases
+per room at 16, port-state slots per peer at 1024 (the oldest released slot is reclaimed first) and process-wide slots at maxConnections × maxBindingsPerPeer.
+All application events share the rate budget. See the security guide for details.
 
 `createLanServer(options)` in `src/server.ts` exposes listener, origin, room,
 rate, queue and lease limits for self-hosted integrations.

@@ -10,6 +10,7 @@
     "noEmit": true,
     "types": ["vite/client"],
     "paths": {
+      "@bottleship/lan/*": ["./packages/lan/src/*"],
       "@bottleship/formats/*": ["./packages/formats/src/*"],
       "@bottleship/repack/*": ["./packages/repack/src/*"]
     }

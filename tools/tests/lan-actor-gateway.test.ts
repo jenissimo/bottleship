@@ -5,7 +5,7 @@ import {RootNetworkNamespace} from "../../src/worker/core/network-namespace";
 import {LanNetwork} from "../../src/worker/net/lan-network";
 import {createWsaActorTable} from "../../src/worker/modules/wsa-actor-table";
 import {WsaFailure,WSA,ipv4Address,ipv6Address} from "../../src/worker/modules/wsa-network";
-import {createLanServer} from "../../packages/lan/src/server";
+import { createPublicLanServer as createLanServer } from "../../packages/lan/test/public-server";
 import {parseIpv6} from "../../packages/lan/src/ip-address";
 const pause=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(check:()=>boolean,reason:string):Promise<void>{

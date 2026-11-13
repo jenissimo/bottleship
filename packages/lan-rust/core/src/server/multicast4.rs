@@ -1,5 +1,5 @@
 use super::*;
-use crate::wire::{MULTICAST4_DGRAM_HEADER, Multicast4Datagram};
+use crate::wire::Multicast4Datagram;
 impl Core {
     pub(super) fn multicast4_input(
         &mut self,
@@ -13,14 +13,6 @@ impl Core {
         // client direction must use the exact, non-address group namespace.
         if !packet.is_outbound() {
             self.disconnect(connection, now_ms, "Invalid multicast direction", effects);
-            return;
-        }
-        if !self.rate(
-            connection,
-            MULTICAST4_DGRAM_HEADER + packet.datagram.payload.len(),
-            now_ms,
-            effects,
-        ) {
             return;
         }
         let binding = BindingToken {

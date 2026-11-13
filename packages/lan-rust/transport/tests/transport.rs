@@ -411,6 +411,7 @@ async fn malformed_sid_never_allocates_a_replacement_session() {
 }
 #[tokio::test]
 async fn authorization_rejection_is_connect_error_before_physical_close() {
+    for _ in 0..8 {
     let mut server = bind("127.0.0.1:0".parse().unwrap(), Config::default())
         .await
         .unwrap();
@@ -445,6 +446,7 @@ async fn authorization_rejection_is_connect_error_before_physical_close() {
     let closed = item(&mut server).await;
     assert!(matches!(closed.kind, IncomingKind::Closed { .. }));
     server.shutdown().await;
+    }
 }
 
 #[tokio::test]
@@ -695,5 +697,76 @@ async fn incomplete_binary_is_bounded_and_retired_without_application_message() 
     let close = item(&mut server).await;
     assert!(matches!(close.kind, IncomingKind::Closed { .. }));
     assert_eq!(server.handle.metrics().ingress, Usage::default());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn sr07_unicode_packet_retires_only_sender_and_returns_all_credits() {
+    let mut server=bind("127.0.0.1:0".parse().unwrap(),Config::default()).await.unwrap();
+    let (mut attacker,id)=websocket(&mut server).await;
+    attacker.send(Message::Text("4é".into())).await.unwrap();
+    let closed=item(&mut server).await;
+    assert_eq!(closed.connection,id);assert!(matches!(closed.kind,IncomingKind::Closed{..}));drop(closed);
+    let _=attacker.close(None).await;
+    let (mut healthy,healthy_id)=websocket(&mut server).await;
+    assert_ne!(id,healthy_id);assert!(server.handle.is_live(healthy_id));
+    healthy.close(None).await.unwrap();drop(item(&mut server).await);
+    let handle=server.handle.clone();
+    server.shutdown().await;
+    assert_eq!(handle.metrics().sessions,0);
+    assert_eq!(handle.metrics().ingress.records,0);
+    assert_eq!(handle.metrics().output.records,0);
+}
+static CHAR_BOUNDARY_PANICS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[tokio::test]
+async fn sr07_multibyte_engine_packet_type_is_rejected_without_panic_on_both_transports() {
+    // engineioxide-core slices value[1..6] for six-byte Engine.IO packets before it
+    // checks the type byte. Count that panic explicitly: a panicking connection task
+    // may otherwise look like an ordinary close.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if info.to_string().contains("char boundary") {
+            CHAR_BOUNDARY_PANICS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        previous(info)
+    }));
+    let mut server=bind("127.0.0.1:0".parse().unwrap(),Config::default()).await.unwrap();
+    let (mut attacker,id)=websocket(&mut server).await;
+    attacker.send(Message::Text("\u{e9}abcd".into())).await.unwrap();
+    let closed=item(&mut server).await;
+    assert_eq!(closed.connection,id);assert!(matches!(closed.kind,IncomingKind::Closed{..}));drop(closed);
+    let (sid,polled)=polling(&mut server).await;
+    let path=format!("/socket.io/?EIO=4&transport=polling&sid={sid}");
+    let (status,_)=request(server.address,"POST",&path,"\u{e9}abcd",None).await;
+    assert_eq!(status,400);
+    let closed=item(&mut server).await;
+    assert_eq!(closed.connection,polled);assert!(matches!(closed.kind,IncomingKind::Closed{..}));drop(closed);
+    let (mut healthy,healthy_id)=websocket(&mut server).await;
+    assert!(server.handle.is_live(healthy_id));
+    healthy.close(None).await.unwrap();drop(item(&mut server).await);
+    server.shutdown().await;
+    assert_eq!(CHAR_BOUNDARY_PANICS.load(std::sync::atomic::Ordering::SeqCst),0);
+}
+#[tokio::test]
+async fn sr08_data_exhaustion_preserves_reserved_departure_capacity_and_session_credit() {
+    let mut server=bind("127.0.0.1:0".parse().unwrap(),Config{output_records:1,max_connections:2,..Default::default()}).await.unwrap();
+    let (sid,recipient)=polling(&mut server).await;
+    let (mut sender,sender_id)=websocket(&mut server).await;
+    let data=||Egress{recipient,event:ServerEvent::Json{name:"frameTest",args:vec![serde_json::json!(1)]},retained_bytes:16,reliable:true,sender:Some(sender_id)};
+    let held=server.handle.try_emit(data()).unwrap();
+    assert!(server.handle.try_emit(data()).is_err());
+    // Exactly the notification emitted by Core retirement, after the offender aborts.
+    let receipt=server.handle.abort(sender_id,"sender overfilled another recipient").unwrap();
+    let closed=item(&mut server).await;
+    let notice=server.handle.try_emit(Egress{recipient,event:ServerEvent::Json{name:"peerLeft",args:vec![serde_json::json!({"node":[2,0,0,0,0,1]})]},retained_bytes:64,reliable:true,sender:Some(sender_id)}).unwrap();
+    drop(closed);
+    let _=sender.close(None).await;receipt.retired().await;
+    assert_eq!(server.handle.metrics().sessions,2,"departure must retain the sender admission credit until drain");
+    assert!(server.handle.is_live(recipient));
+    let path=format!("/socket.io/?EIO=4&transport=polling&sid={sid}");
+    let (status,payload)=request(server.address,"GET",&path,"",None).await;
+    assert_eq!(status,200);assert!(payload.contains("peerLeft"));assert!(payload.contains("frameTest"));
+    held.released().await;notice.released().await;
+    assert!(server.handle.is_live(recipient));
     server.shutdown().await;
 }
