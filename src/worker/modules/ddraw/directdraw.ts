@@ -10,6 +10,7 @@ import { memoryWatch } from "../../core/memory/memory-watch";
 import {
     EMU_DDRAW_DEFAULT_CAPS,
     DDCAPS2_CANRENDERWINDOWED,
+    DDCAPS_OVERLAY,
     MEM_SURFACE_BASE,
     MEM_SURFACE_SIZE,
 } from "../../core/cpu/emulator-config";
@@ -49,6 +50,11 @@ import {
     DDSCAPS_MIPMAP,
     DDSCAPS_3DDEVICE,
     DDSCAPS_VIDEOMEMORY,
+    DDSCAPS_OVERLAY,
+    DDPF_FOURCC,
+    DDERR_NOOVERLAYHW,
+    DDERR_INVALIDPIXELFORMAT,
+    isSupportedFourCC,
     DDSURFACEDESC_SIZE,
     DDSURFACEDESC2_SIZE,
     E_FAIL,
@@ -346,6 +352,30 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                 `(DDERR_NOCOLORKEYHW); no DirectDraw hardware supports one`);
             view.setUint32(lplpSurf, 0, true);
             return DDERR_NOCOLORKEYHW;
+        }
+
+        // An overlay is a hardware plane: without DDCAPS_OVERLAY the create fails and the
+        // caller (a movie player, typically) falls back to blitting RGB itself. Handing it
+        // a surface whose UpdateOverlay shows nothing plays the movie into the dark.
+        if ((rawDesc.caps & DDSCAPS_OVERLAY) !== 0
+            && (EmulatorConfig.getInstance().ddrawCaps.dwCaps & DDCAPS_OVERLAY) === 0) {
+            Logger.log(LogCategory.DDRAW,
+                `CreateSurface: refused — DDSCAPS_OVERLAY without overlay hardware (DDERR_NOOVERLAYHW)`);
+            view.setUint32(lplpSurf, 0, true);
+            return DDERR_NOOVERLAYHW;
+        }
+
+        // A FourCC surface is creatable only in a format GetFourCCCodes reports. The flag
+        // decides that this IS a FourCC request; a zero code is then as unlisted as any other.
+        const declaresFourCC = (rawDesc.flags & DDSD_PIXELFORMAT) !== 0
+            && ((rawDesc.pixelFormat?.flags ?? 0) & DDPF_FOURCC) !== 0;
+        const requestedFourCC = (rawDesc.pixelFormat?.fourCC ?? 0) >>> 0;
+        if (declaresFourCC && !isSupportedFourCC(requestedFourCC)) {
+            Logger.log(LogCategory.DDRAW,
+                `CreateSurface: refused — unsupported FourCC 0x${requestedFourCC.toString(16)} ` +
+                `(DDERR_INVALIDPIXELFORMAT)`);
+            view.setUint32(lplpSurf, 0, true);
+            return DDERR_INVALIDPIXELFORMAT;
         }
 
         if (lpDesc && (rawDesc.flags & DDSD_PIXELFORMAT) !== 0) {
@@ -1944,6 +1974,9 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             const state = obj.getState();
             const address = context.resourceProvider.getAddressForHandle(obj.handle);
             if (!address) continue;
+            // Only root surfaces are enumerated; the implicit members of a flip or mip
+            // chain are reached through GetAttachedSurface.
+            if (state.implicitChainMember) continue;
 
             // DOESEXIST flag: only enumerate existing surfaces
             if (!(dwFlags & DDENUMSURFACES_DOESEXIST)) continue;
@@ -2011,9 +2044,10 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                 if (useV1Desc) writeSurfaceDescV1(mem, descAddr, surfDesc);
                 else writeSurfaceDesc(mem, descAddr, surfDesc);
 
-                // NOTE: Not calling AddRef here — many games don't
-                // Release the surface in their EnumSurfaces callback, so AddRef would leak refs.
-                // The surface stays alive as long as the DirectDraw object owns it.
+                // The callback owns a reference to every surface it is handed and is the one
+                // to Release it; a guest that keeps the pointer and releases it later would
+                // otherwise free a surface it never held.
+                context.resourceProvider.getComObjectByAddress(surfAddr)?.addRef(surfAddr);
 
                 Logger.log(LogCategory.SYSTEM,
                     `IDirectDraw7_EnumSurfaces: callback #${index} surface=0x${surfAddr.toString(16)} ` +

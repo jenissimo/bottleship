@@ -22,6 +22,8 @@ export const DDERR_NOCOLORKEYHW = 0x887600DC;       // MAKE_DDHRESULT(220)
 export const DDERR_CANNOTDETACHSURFACE = 0x88760014; // MAKE_DDHRESULT(20)
 export const DDERR_INVALIDOBJECT = 0x88760082;       // MAKE_DDHRESULT(130)
 export const DDERR_SURFACENOTATTACHED = 0x887600D2;  // MAKE_DDHRESULT(210)
+export const DDERR_NOOVERLAYHW = 0x88760104;         // MAKE_DDHRESULT(260)
+export const DDERR_INVALIDPIXELFORMAT = 0x88760091;  // MAKE_DDHRESULT(145)
 
 // SetCooperativeLevel flags (DDSCL_* from ddraw.h)
 export const DDSCL_FULLSCREEN     = 0x00000001;
@@ -64,6 +66,8 @@ const fourCC = (s: string): number =>
 export const SUPPORTED_FOURCC_CODES: ReadonlyArray<number> = [
     fourCC("DXT1"), fourCC("DXT2"), fourCC("DXT3"), fourCC("DXT4"), fourCC("DXT5"),
 ];
+/** Whether a FourCC surface can be created: the one support set GetFourCCCodes also reports. */
+export const isSupportedFourCC = (code: number): boolean => SUPPORTED_FOURCC_CODES.includes(code >>> 0);
 
 export const DDBD_8  = 0x00000800;
 export const DDBD_16 = 0x00000400;

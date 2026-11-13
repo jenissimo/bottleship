@@ -100,7 +100,7 @@ export function invokeGuestWndProcSync(
     const callbackManager = system.process?.dispatcher?.callbackManager;
     if (!callbackManager) return null;
 
-    const thunkReturnAddr = new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(ctx.esp, true);
+    const thunkReturnAddr = thunkReturnAddrOf(ctx, mem);
     const reusedFrame = isCallbackStub(thunkReturnAddr, callbackManager);
     const frameId = suspendCaller(ctx, thunkReturnAddr, callbackManager, reusedFrame, stackCleanup, tag);
     if (frameId === 0) {
@@ -140,6 +140,16 @@ type CallbackManager = NonNullable<NonNullable<System['process']>['dispatcher']>
 function isCallbackStub(thunkReturnAddr: number, callbackManager: CallbackManager): boolean {
     const stubRange = callbackManager.getStubPoolRange();
     return thunkReturnAddr >= stubRange.base && thunkReturnAddr < stubRange.end;
+}
+
+/**
+ * Where the calling thunk returns to. A thunk resumed after an async park carries it in the
+ * context: its [ESP] slot holds the spin-loop address for as long as the thread is parked.
+ */
+function thunkReturnAddrOf(ctx: X86Context, mem: Uint8Array): number {
+    const carried = (ctx as X86Context & { returnAddr?: number }).returnAddr;
+    if (carried !== undefined) return carried >>> 0;
+    return new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(ctx.esp, true);
 }
 
 /** The suspended frame guest callbacks run under for this thunk call; 0 on failure. */
@@ -191,7 +201,7 @@ export function sendToTopLevelSync(
     });
     if (!callbackManager || own.length === 0) return value;
 
-    const thunkReturnAddr = new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(ctx.esp, true);
+    const thunkReturnAddr = thunkReturnAddrOf(ctx, mem);
     const reusedFrame = isCallbackStub(thunkReturnAddr, callbackManager);
     const frameId = suspendCaller(ctx, thunkReturnAddr, callbackManager, reusedFrame, stackCleanup, tag);
     if (frameId === 0) {
