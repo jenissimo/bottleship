@@ -1302,11 +1302,22 @@ export class DMusic implements IModule {
             const ppDirectSound = a[2]! >>> 0;
             if (!perfOf(a) || (ppDirectSound && !validPointer(ppDirectSound, 4, "rw"))) return E_POINTER;
             let directSound = ppDirectSound ? (Mem.readUint32(ppDirectSound) ?? 0) : 0;
-            if (ppDirectSound && !directSound) {
+            const created = !!ppDirectSound && !directSound;
+            if (created) {
                 directSound = this.createDirectSound(a[3]! >>> 0);
                 if (!directSound) return E_FAIL;
-                Mem.writeUint32(ppDirectSound, directSound);
             }
+            const finish = (hr: number): number => {
+                if (created) {
+                    if (hr === S_OK) Mem.writeUint32(ppDirectSound, directSound);
+                    else {
+                        const dm = perfOf(a)?.directMusic;
+                        if (dm?.directSound === directSound) this.setDirectSound(dm, 0);
+                        soundReference(this.process, directSound, false, false);
+                    }
+                }
+                return hr;
+            };
             const hr = init(a[0]!, a[1]! >>> 0, directSound);
             const perf = perfOf(a);
             // InitAudio brings its own synthesizer: there is no AddPort to wait for.
@@ -1316,9 +1327,9 @@ export class DMusic implements IModule {
                 this.attachEngine(perf, port);
                 const active = this.activatePort(port, true);
                 port.release();
-                if (!active) { this.detachPort(perf); return E_FAIL; }
+                if (!active) { this.detachPort(perf); return finish(E_FAIL); }
             }
-            return hr;
+            return finish(hr);
         };
 
         // HRESULT AddPort(IDirectMusicPort *pPort) — NULL adds the default port.
