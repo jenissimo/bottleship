@@ -1127,6 +1127,7 @@ export class DMusic implements IModule {
     private releaseEndedStates(perf: PerformanceObject): void {
         for (const [state, obj] of perf.stateObjects) {
             if (!state.ended) continue;
+            state.audioPath = null;
             perf.stateObjects.delete(state);
             obj.release();
         }
@@ -1385,8 +1386,10 @@ export class DMusic implements IModule {
             if (!perf || !seg) return E_POINTER;
             if (!perf.engine) return DMUS_E_NOT_INIT;
             if (!seg.segment) return E_FAIL;
+            const requestedPath = pathPtr ? this.object<AudioPathObject>(pathPtr) : null;
+            const path = requestedPath instanceof AudioPathObject ? requestedPath : null;
             const state = perf.engine.playSegment(seg.segment, flags >>> 0);
-            const path = pathPtr ? this.object<AudioPathObject>(pathPtr) : null;
+            if (state) state.audioPath = path ?? this.defaultAudioPath(perf);
             if (state && seg.segment.wave && path instanceof AudioPathObject && this.ensurePathOutput(path)) state.output = path;
             if (state) this.holdStateSegment(this.stateObject(perf, state), seg);
             return this.publishState(perf, state, seg, ppState);
@@ -1402,18 +1405,32 @@ export class DMusic implements IModule {
             if (!perf) return E_POINTER;
             const seg = a[1] ? this.object<SegmentObject>(a[1]) : null;
             const state = a[2] ? this.object<SegmentStateObject>(a[2]) : null;
-            perf.engine?.stop(seg?.segment ?? null, state?.state ?? null, a[4]! >>> 0);
+            // Only when both are NULL does Stop mean everything; one with nothing playing
+            // behind it (an unloaded segment, an ended state) stops nothing.
+            const segment = seg?.segment ?? null, engineState = state?.state ?? null;
+            if ((a[1] || a[2]) && !segment && !engineState) return S_OK;
+            perf.engine?.stop(segment, engineState, a[4]! >>> 0);
             this.releaseEndedStates(perf);
             return S_OK;
         };
-        // StopEx(pObjectToStop, i64StopTime, dwFlags): a segment, a state, or NULL for all.
+        // StopEx(pObjectToStop, i64StopTime, dwFlags): a segment, a state, an audio path
+        // (everything playing on it), or NULL for everything.
         e["IDirectMusicPerformance8_StopEx"] = (_c, _m, a) => {
             const perf = perfOf(a);
             if (!perf) return E_POINTER;
+            const flags = a[4]! >>> 0;
             const target = a[1] ? this.object<DMusicObject>(a[1]) : null;
-            perf.engine?.stop(
-                target instanceof SegmentObject ? target.segment : null,
-                target instanceof SegmentStateObject ? target.state : null, a[4]! >>> 0);
+            if (!a[1]) {
+                perf.engine?.stop(null, null, flags);
+            } else if (target instanceof AudioPathObject) {
+                for (const state of perf.engine?.statesOnAudioPath(target) ?? []) {
+                    perf.engine?.stop(null, state, flags);
+                }
+            } else if (target instanceof SegmentObject) {
+                if (target.segment) perf.engine?.stop(target.segment, null, flags);
+            } else if (target instanceof SegmentStateObject) {
+                if (target.state) perf.engine?.stop(null, target.state, flags);
+            }
             this.releaseEndedStates(perf);
             return S_OK;
         };
@@ -1600,10 +1617,7 @@ export class DMusic implements IModule {
         };
 
         const audioPath = (perf: PerformanceObject | null, type: number, ppOut: number): number => {
-            const path = new AudioPathObject();
-            path.performance = perf;
-            path.pathType = type;
-            return this.publish(path, ppOut);
+            return this.publish(this.createAudioPath(perf, type), ppOut);
         };
         e["IDirectMusicPerformance8_CreateAudioPath"] = (_c, _m, a) => audioPath(perfOf(a), 0, a[3]! >>> 0);
         e["IDirectMusicPerformance8_CreateStandardAudioPath"] = (_c, _m, a) => audioPath(perfOf(a), a[1]! >>> 0, a[4]! >>> 0);
@@ -1611,8 +1625,7 @@ export class DMusic implements IModule {
             const perf = perfOf(a);
             if (!perf || !a[1]) return E_POINTER;
             if (!validPointer(a[1] >>> 0, 4, "w")) return E_POINTER;
-            perf.defaultAudioPath ??= new AudioPathObject();
-            return this.queryInterface(perf.defaultAudioPath, IID_IUnknown, a[1] >>> 0);
+            return this.queryInterface(this.defaultAudioPath(perf), IID_IUnknown, a[1] >>> 0);
         };
     }
 
@@ -1957,6 +1970,8 @@ export class DMusic implements IModule {
             const fromState = perf.engine.primaryState();
             const from = fromState ? perf.stateObjects.get(fromState)?.segment ?? null : null;
             const result = perf.engine.autoTransition(to?.segment ?? null, a[3]! & 0xffff, a[4]! >>> 0);
+            if (result.transitionState) result.transitionState.audioPath = this.defaultAudioPath(perf);
+            if (result.toState) result.toState.audioPath = this.defaultAudioPath(perf);
             const saving = savestatesEnabled();
             if (result.transition && result.transitionState) {
                 // The transition segment is a COM object only for a caller that takes it.
@@ -2242,11 +2257,26 @@ export class DMusic implements IModule {
         return true;
     }
 
+    private createAudioPath(perf: PerformanceObject | null, type: number): AudioPathObject {
+        const path = new AudioPathObject();
+        path.performance = perf;
+        path.pathType = type;
+        this.wirePath(path);
+        return path;
+    }
+
+    private defaultAudioPath(perf: PerformanceObject): AudioPathObject {
+        return perf.defaultAudioPath ??= this.createAudioPath(perf, 0);
+    }
+
     private wirePath(path: AudioPathObject): void {
         path.onDestroy = () => {
             const perf = path.performance;
             if (perf?.engine) {
                 perf.engine.endWavesOn(path);
+                perf.engine.forgetAudioPath(path);
+                // Ended states can still be held by guest COM interfaces.
+                for (const state of perf.stateObjects.keys()) if (state.audioPath === path) state.audioPath = null;
                 this.releaseEndedStates(perf);
             }
             this.pathOutputs.delete(path);
