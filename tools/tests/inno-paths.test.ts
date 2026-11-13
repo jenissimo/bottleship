@@ -6,7 +6,8 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { normalizeInnoDestination } from "../../packages/formats/src/inno/paths";
+import { isGogSupportSave, normalizeInnoDestination } from "../../packages/formats/src/inno/paths";
+import { filterExtractableFiles } from "../../packages/formats/src/inno/collisions";
 
 const bare = { allowBareRelative: true };
 
@@ -49,6 +50,14 @@ describe("normalizeInnoDestination", () => {
             .toBe("__support/gog_installer.dll");
     });
 
+    it("resolves GOG's __support\\save tree into the app directory as a fallback", () => {
+        expect(normalizeInnoDestination("{app}\\__support\\save\\Conquests\\conquests.biq"))
+            .toBe("Conquests/conquests.biq");
+        expect(isGogSupportSave("{app}\\__support\\save\\Conquests\\LSANS.TTF")).toBe(true);
+        expect(isGogSupportSave("{app}\\__support\\app\\x.cfg")).toBe(false);
+        expect(isGogSupportSave("{app}\\Conquests\\LSANS.fot")).toBe(false);
+    });
+
     it("rejects installer-runtime and unresolved constants", () => {
         expect(normalizeInnoDestination("{tmp}\\background.jpg", bare)).toBeNull();
         expect(normalizeInnoDestination("{commonappdata}\\GOG.com\\uninstall.dll", bare)).toBeNull();
@@ -61,5 +70,24 @@ describe("normalizeInnoDestination", () => {
         expect(normalizeInnoDestination("C:\\absolute\\x.dll", bare)).toBeNull();
         expect(normalizeInnoDestination("\\leading\\x.dll", bare)).toBeNull();
         expect(normalizeInnoDestination("", bare)).toBeNull();
+    });
+});
+
+describe("filterExtractableFiles with __support\\save", () => {
+    const file = (destination: string, location: number) =>
+        ({ destination, location, externalSize: 0n, options: 0, additionalLocations: [], galaxyChecksumType: "none" }) as never;
+    const data = Array.from({ length: 3 }, () => ({ options: 0, zlibFilter: false }) as never);
+
+    it.each([false, true])("direct entries win regardless of input order (reverse=%s)", (reverse) => {
+        const entries = [
+            file("{app}\\__support\\save\\Conquests\\conquests.biq", 0),
+            file("{app}\\__support\\save\\Conquests\\LSANS.TTF", 1),
+            file("{app}\\Conquests\\LSANS.TTF", 2),
+        ];
+        const picked = filterExtractableFiles(reverse ? entries.reverse() : entries, data);
+        const byPath = new Map(picked.map((s) => [s.relPath, s.file.location]));
+        expect(byPath.get("Conquests/conquests.biq")).toBe(0);
+        expect(byPath.get("Conquests/LSANS.TTF")).toBe(2);
+        expect(picked.length).toBe(2);
     });
 });
