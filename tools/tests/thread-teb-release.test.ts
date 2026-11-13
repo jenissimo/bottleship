@@ -14,7 +14,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Scheduler } from "../../src/worker/core/scheduler/scheduler";
 import { STACK_SIZE_PARAM_IS_A_RESERVATION, type Thread, type KernelThreadObject } from "../../src/worker/core/scheduler/types";
-import { TLS_INDEX_LIMIT } from "../../src/worker/core/teb-manager";
+import { TLS_INDEX_LIMIT, IMPLICIT_TLS_LIMIT } from "../../src/worker/core/teb-manager";
 import { hypercallDataManager } from "../../src/worker/core/cpu/hypercall-data";
 import { System } from "../../src/worker/core/system";
 import { newObjectGraph, restoreObjectGraph } from "../../src/worker/savestate/object-codecs";
@@ -24,7 +24,8 @@ import { registerCoreParticipants } from "../../src/worker/savestate/core-partic
 const MB = 1024 * 1024;
 const MEM_BYTES = 64 * MB;
 const TEB_SIZE = 0x1000;
-const TLS_ARRAY_BYTES = TLS_INDEX_LIMIT * 4;
+/** The TlsAlloc slots plus the implicit-TLS range past them (teb-manager IMPLICIT_TLS_FIRST). */
+const TLS_ARRAY_BYTES = IMPLICIT_TLS_LIMIT * 4;
 
 /** Bump allocator with an exact-fit free list, so a released block really comes back. */
 class FakeMemory {
