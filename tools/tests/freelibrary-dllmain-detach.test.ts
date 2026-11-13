@@ -1,7 +1,10 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { System } from "../../src/worker/core/system";
 import { ModuleRegistry, type LoadedPEModule } from "../../src/worker/core/module-registry";
-import { exports as api, captureModuleRefs } from "../../src/worker/modules/kernel32/module/module";
+import { exports as api, captureModuleRefs, resetModuleRefs } from "../../src/worker/modules/kernel32/module/module";
+
+// Helpers restore System.process; drop their process-owned refs before another fixture captures them.
+afterEach(resetModuleRefs);
 
 type Res = { value: number; suspendedForCallback?: boolean };
 

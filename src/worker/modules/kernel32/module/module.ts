@@ -1300,10 +1300,20 @@ function initModuleFunctions(): void {
             return { value: 0, stackCleanup: 4 };
         }
         mod.initialized = false;
-        const { callbackId } = callbackManager.invokeCallback(
-            (hModule + mod.entryPoint) >>> 0, [hModule, DLL_PROCESS_DETACH, 0], 0, () => { unload(); return 1; },
-            false, 'FreeLibrary DllMain', frameId,
-        );
+        let callbackId: number;
+        try {
+            ({ callbackId } = callbackManager.invokeCallback(
+                (hModule + mod.entryPoint) >>> 0, [hModule, DLL_PROCESS_DETACH, 0], 0, () => { unload(); return 1; },
+                false, 'FreeLibrary DllMain', frameId,
+            ));
+        } catch (error) {
+            mod.initialized = true;
+            dynamicLoadRefs.set(hModule, 1);
+            callbackManager.abandonSuspendedFrame(frameId);
+            // Setup can throw after changing guest ESP/EIP. Preserve the fatal error;
+            // abandoning a frame releases ownership but does not restore the CPU.
+            throw error;
+        }
         if (!callbackId) {
             callbackManager.abandonSuspendedFrame(frameId);
             mod.initialized = true;
