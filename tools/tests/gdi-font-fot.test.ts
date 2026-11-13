@@ -35,6 +35,7 @@ beforeEach(() => {
     system.scheduler = { setLastError: (n: number) => { lastError = n; } } as never;
     system.fileSystem = {
         resolvePath: (path: string) => path.toLowerCase(),
+        fileExists: (path: string) => files.has(path),
         getFileSize: (path: string) => files.get(path)?.length ?? 0,
         open: async (path: string) => ({ path }),
         read: async (h: { path: string }) => files.get(h.path)!,
@@ -94,4 +95,18 @@ test('AddFontResource of a FOT installs the TTF it names, found beside the FOT w
 test('AddFontResource of a FOT whose font cannot be found fails', async () => {
     files.set('c:\\game\\lsans.fot', buildFot('y:\\gone\\OTHER.TTF', 'Other'));
     expect(await add('c:\\game\\lsans.fot')).toBe(0);
+});
+
+test('CreateScalableFontResource does not replace an existing empty FOT', async () => {
+    files.set('c:\\game\\lsans.fot', new Uint8Array());
+    expect(await create('c:\\game\\lsans.fot', 'lsans.ttf', 'c:\\game')).toBe(0);
+    expect(lastError).toBe(ERROR_FILE_EXISTS);
+    expect(files.get('c:\\game\\lsans.fot')).toHaveLength(0);
+});
+
+test('hidden resources fail explicitly until process-scoped font visibility is available', async () => {
+    expect(await exports['CreateScalableFontResourceA'](null as never, memory,
+        [1, put(16, 'c:\\game\\lsans.fot'), put(256, 'lsans.ttf'), put(512, 'c:\\game')])).toBe(0);
+    expect(lastError).toBe(120);
+    expect(files.has('c:\\game\\lsans.fot')).toBe(false);
 });

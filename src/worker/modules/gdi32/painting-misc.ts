@@ -241,13 +241,18 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
         const scheduler = System.getInstance().scheduler;
         Logger.verbose(LogCategory.GDI32, `${api}(hidden=${hidden}, "${fotPath}", "${fontFile}", "${curPath}")`);
 
-        if (!fotPath || !fontFile) {
+        if (!fotPath || !fontFile || hidden < 0 || hidden > 1) {
             scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        // Hidden resources require process-scoped font visibility, which is not implemented.
+        if (hidden) {
+            scheduler.setLastError(120); // ERROR_CALL_NOT_IMPLEMENTED
             return 0;
         }
         const fotResolved = vfs.resolvePath(fotPath);
         // An existing FOT is never overwritten; callers that re-run at every start rely on this.
-        if (vfs.getFileSize(fotResolved) > 0) {
+        if (vfs.fileExists(fotResolved)) {
             scheduler.setLastError(ERROR_FILE_EXISTS);
             return 0;
         }
