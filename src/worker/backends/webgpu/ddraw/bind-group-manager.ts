@@ -85,6 +85,15 @@ function toWebGPUMipmapFilter(d3d: number): GPUMipmapFilterMode {
  * Manages GPU bind groups with caching and LRU eviction.
  * Caches samplers by (minFilter, magFilter) hash; supports min≠mag for DX7 games.
  */
+/** One level of the MegaBatch bind-group cache: the next sampled stage's view → sampler, or, after the last one, the storage buffer. */
+interface MegaBatchCacheNode {
+    byView: WeakMap<GPUTextureView, Map<GPUSampler, MegaBatchCacheNode>> | null;
+    byBuffer: WeakMap<GPUBuffer, GPUBindGroup> | null;
+}
+
+/** Cached MegaBatch bind groups before the whole cache is dropped and rebuilt on demand. */
+export const MEGA_BATCH_CACHE_LIMIT = 4096;
+
 export class BindGroupManager {
     private device: GPUDevice;
 
@@ -100,6 +109,16 @@ export class BindGroupManager {
         GPURenderPipeline,
         Map<GPUBuffer, Map<GPUTextureView | null, LruCache<GPUSampler, GPUBindGroup>>>
     >();
+
+    // MegaBatch bind groups bound to a whole storage buffer, keyed by resource identity:
+    // sampledMask, then per sampled stage (in stage order) its view (the dummy for an empty
+    // stage 0) and effective GPUSampler, then the storage buffer. Views and buffers are weak
+    // keys, so a recreated view or a replaced ring buffer misses and its old entries go with
+    // the object; the whole cache is dropped after MEGA_BATCH_CACHE_LIMIT groups and on
+    // clearCache. Content updates of a live texture or buffer keep the group: a bind group
+    // holds resources, not contents.
+    private megaBatchCache = new Map<number, MegaBatchCacheNode>();
+    private megaBatchCached = 0;
 
     private readonly maxCacheSize: number;
 
@@ -381,11 +400,11 @@ export class BindGroupManager {
     }
 
     /**
-     * Create a MegaBatch bind group.
-     * Unlike regular bind groups, MegaBatch bind groups are NOT cached because:
-     * 1. Storage buffer is bound without dynamic offset
-     * 2. Each MegaBatch may use different portions of the storage buffer
-     * 3. Storage buffer contents change frequently
+     * Create or reuse a MegaBatch bind group. A group bound to the whole storage buffer
+     * depends only on resource identities (the layout for sampledMask, the buffer, each
+     * sampled stage's view and effective sampler), not on the buffer's or textures'
+     * contents, so it is reused across batches; see megaBatchCache for the key. A group
+     * bound to a sub-range of the buffer is built each time.
      */
     createMegaBatchBindGroup(
         storageBuffer: GPUBuffer,
@@ -395,6 +414,52 @@ export class BindGroupManager {
         dummyTextureView: GPUTextureView | null,
         storageOffset: number = 0,
         storageSize?: number
+    ): GPUBindGroup {
+        if (storageOffset !== 0 || storageSize !== undefined) {
+            return this.buildMegaBatchBindGroup(storageBuffer, sampledMask, views, samplers, dummyTextureView, storageOffset, storageSize);
+        }
+        let node: MegaBatchCacheNode | undefined = this.megaBatchCache.get(sampledMask);
+        if (!node) { node = { byView: new WeakMap(), byBuffer: null }; this.megaBatchCache.set(sampledMask, node); }
+        for (let s = 0; s < MAX_FFP_SAMPLED_STAGES; s++) {
+            if ((sampledMask & (1 << s)) === 0) continue;
+            const view = s === 0 ? (views[0] || dummyTextureView) : views[s];
+            if (!view) {
+                return this.buildMegaBatchBindGroup(storageBuffer, sampledMask, views, samplers, dummyTextureView, 0, undefined);
+            }
+            const sampler = this.getOrCreateStageSampler(samplers[s]);
+            let bySampler: Map<GPUSampler, MegaBatchCacheNode> | undefined = node.byView!.get(view);
+            if (!bySampler) { bySampler = new Map(); node.byView!.set(view, bySampler); }
+            let next: MegaBatchCacheNode | undefined = bySampler.get(sampler);
+            if (!next) { next = { byView: new WeakMap(), byBuffer: null }; bySampler.set(sampler, next); }
+            node = next;
+        }
+        if (!node.byBuffer) node.byBuffer = new WeakMap();
+        let bg = node.byBuffer.get(storageBuffer);
+        if (!bg) {
+            if (this.megaBatchCached >= MEGA_BATCH_CACHE_LIMIT) {
+                this.resetMegaBatchCache();
+                return this.createMegaBatchBindGroup(storageBuffer, sampledMask, views, samplers, dummyTextureView);
+            }
+            bg = this.buildMegaBatchBindGroup(storageBuffer, sampledMask, views, samplers, dummyTextureView, 0, undefined);
+            node.byBuffer.set(storageBuffer, bg);
+            this.megaBatchCached++;
+        }
+        return bg;
+    }
+
+    private resetMegaBatchCache(): void {
+        this.megaBatchCache = new Map();
+        this.megaBatchCached = 0;
+    }
+
+    private buildMegaBatchBindGroup(
+        storageBuffer: GPUBuffer,
+        sampledMask: number,
+        views: ReadonlyArray<GPUTextureView | null>,
+        samplers: ReadonlyArray<StageSamplerState>,
+        dummyTextureView: GPUTextureView | null,
+        storageOffset: number,
+        storageSize: number | undefined,
     ): GPUBindGroup {
         const layout = this.getOrCreateMegaBatchBindGroupLayout(sampledMask);
 
@@ -424,6 +489,7 @@ export class BindGroupManager {
     clearCache(): void {
         this.bindGroupLayoutCache.clear();
         this.megaBatchLayoutCache.clear();
+        this.resetMegaBatchCache();
         this.samplers.clear();
     }
 }
