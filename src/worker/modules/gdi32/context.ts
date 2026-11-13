@@ -1601,6 +1601,8 @@ export class GDIContext {
             this.invalidateImageDataCache(bitmapDC!);
         }
         this.bitmapImageBitmapReady.delete(hbitmap);
+        // A decode still in flight is of the pixels just replaced; disowning it drops its result.
+        this.bitmapImageBitmapCache.delete(hbitmap);
         this.bitmapVersions.set(hbitmap, (this.bitmapVersions.get(hbitmap) || 0) + 1);
         return { data, width: fresh.width, height: fresh.height };
     }
@@ -1725,12 +1727,21 @@ export class GDIContext {
                     try {
                         const bitmapPromise = createImageBitmap(imageData);
                         this.bitmapImageBitmapCache.set(hbitmap, bitmapPromise);
+                        // The decode outlives this call, and the handle may not: a bitmap deleted
+                        // meanwhile has its slot reused, and a late result stored under the
+                        // handle would paint the NEXT bitmap with this one's pixels.
                         bitmapPromise.then((bm) => {
+                            if (this.bitmapImageBitmapCache.get(hbitmap) !== bitmapPromise) {
+                                bm.close();
+                                return;
+                            }
                             this.bitmapImageBitmapReady.set(hbitmap, bm);
                             this.bitmapImageBitmapCache.delete(hbitmap);
                         }).catch((e) => {
                             Logger.warn(LogCategory.GDI32, `createBitmapDC: Failed to cache ImageBitmap: ${e}`);
-                            this.bitmapImageBitmapCache.delete(hbitmap);
+                            if (this.bitmapImageBitmapCache.get(hbitmap) === bitmapPromise) {
+                                this.bitmapImageBitmapCache.delete(hbitmap);
+                            }
                         });
                     } catch (e) {
                         Logger.warn(LogCategory.GDI32, `createBitmapDC: createImageBitmap failed: ${e}`);
@@ -2381,6 +2392,16 @@ export class GDIContext {
     getTextAlign(hdc: number): number {
         if (!this.contexts.has(hdc)) return 0xFFFFFFFF; // GDI_ERROR
         return this.ensureState(hdc).textAlign;
+    }
+
+    getTextColor(hdc: number): number {
+        if (!this.contexts.has(hdc)) return 0xFFFFFFFF; // CLR_INVALID
+        return this.ensureState(hdc).textColorValue >>> 0;
+    }
+
+    getBkMode(hdc: number): number {
+        if (!this.contexts.has(hdc)) return 0;
+        return this.ensureState(hdc).bkMode;
     }
 
     textOut(hdc: number, x: number, y: number, text: string): boolean {

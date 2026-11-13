@@ -2043,6 +2043,13 @@ export class Msvcrt implements IModule {
         return (flags & mask) !== 0 ? 1 : 0;
     }
 
+    /** The CRT's _dosmaperr for a failed open: the Win32 error decides errno, not "ENOENT" for all. */
+    private static errnoForOpenFailure(win32Error: number): number {
+        if (win32Error === 5 || win32Error === 32) return 13;      // ACCESS_DENIED / SHARING_VIOLATION -> EACCES
+        if (win32Error === 80 || win32Error === 183) return 17;    // FILE_EXISTS / ALREADY_EXISTS -> EEXIST
+        return 2;                                                  // FILE/PATH_NOT_FOUND -> ENOENT
+    }
+
     private open(pathPtr: number, oflag: number, wide = false): number {
         // _wopen differs only in the filename encoding; flags and fd ownership
         // follow the same path as _open (MSVC CRT open-wopen contract).
@@ -2083,7 +2090,7 @@ export class Msvcrt implements IModule {
         const vfs = System.getInstance().fileSystem;
         const handle = vfs.openSync(path, access, disposition);
         if (!handle) {
-            this.setErrno(2);
+            this.setErrno(Msvcrt.errnoForOpenFailure(vfs.classifyOpenFailure(path, disposition)));
             return -1;
         }
         if ((oflag & O_APPEND) !== 0) {

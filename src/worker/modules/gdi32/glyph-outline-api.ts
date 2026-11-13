@@ -1,13 +1,11 @@
 import type { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { System } from '../../core/system';
-import { EmulatorConfig, getCodePageDecoder, isSingleByteCodePage } from '../../core/emulator-config-manager';
+import { EmulatorConfig, getCodePageDecoder } from '../../core/emulator-config-manager';
+import { decodeAnsiCharCode } from './font-charset';
 import { MemoryGuard } from '../../core/memory/mem-guard';
 import { isValidAddress } from '../../core/memory/address-guard';
 import { Logger, LogCategory } from '../../core/logger';
 
-const GLYPH_DBCS_LABELS: Readonly<Record<number, string>> = { 932: 'shift_jis', 936: 'gbk', 949: 'euc-kr', 950: 'big5' };
-// @transient(pure host decoders for glyph character codes)
-const glyphDecoders = new Map<number, TextDecoder>();
 
 export function registerGlyphOutlineExports(exports: Record<string, ThunkImplementation>): void {
     // GLYPHMETRICS layout (offsets in bytes): +0 gmBlackBoxX (UINT) +4 gmBlackBoxY (UINT)
@@ -44,14 +42,8 @@ export function registerGlyphOutlineExports(exports: Record<string, ThunkImpleme
      *  e.g. CP932 uChar=0x82A0 is the bytes 0x82,0xA0, the Shift-JIS encoding of 'あ') on a
      *  multi-byte one. Masking to the low byte alone silently decoded the lead byte only. */
     function decodeAnsiChar(uChar: number, codePage: number): string {
-        const bytes = !isSingleByteCodePage(codePage) && uChar > 0xFF
-            ? new Uint8Array([(uChar >> 8) & 0xFF, uChar & 0xFF])
-            : new Uint8Array([uChar & 0xFF]);
-        const label = GLYPH_DBCS_LABELS[codePage];
-        if (!label) return getCodePageDecoder(codePage).decode(bytes);
-        let decoder = glyphDecoders.get(codePage);
-        if (!decoder) { decoder = new TextDecoder(label); glyphDecoders.set(codePage, decoder); }
-        return decoder.decode(bytes);
+        return decodeAnsiCharCode(uChar, codePage)
+            ?? getCodePageDecoder(codePage).decode(new Uint8Array([uChar & 0xFF]));
     }
 
     // GetGlyphOutlineA/W(hdc, uChar, uFormat, lpgm, cbBuffer, lpvBuffer, lpmat2). uChar is a

@@ -231,6 +231,8 @@ export function registerCrtPathExports(exports: Record<string, ThunkImplementati
             return -1;
         }
         const vfs = System.getInstance().fileSystem;
+        // _access asks about the path's attributes, so a directory answers like a file.
+        if (vfs.directoryExists(path)) return 0;
         if (vfs.hasRomFile(path)) return 0;
         const handle = vfs.openSync(path, 0x80000000, 3);
         if (handle) return 0;
