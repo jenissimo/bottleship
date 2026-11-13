@@ -79,6 +79,11 @@ export const TRACK_FIELDS = {
 
 export interface SavedAudioPath extends SavedDMusicBase {
     pathType: number;
+    volume: number;
+    volumeFrom: number;
+    volumeTarget: number;
+    volumeStarted: number;
+    volumeDuration: number;
     performance: number;
     buffer: number;
     channels: number;
@@ -87,7 +92,7 @@ export interface SavedAudioPath extends SavedDMusicBase {
 
 export const AUDIO_PATH_FIELDS = {
     ...DMUSIC_OBJECT_FIELDS, primaryVtable: 'derive', interfaces: 'derive', pathType: 'save', performance: 'save',
-    buffer: 'save', sink: 'save', channels: 'save',
+    buffer: 'save', sink: 'save', channels: 'save', volume: 'save', volumeFrom: 'save', volumeTarget: 'save', volumeStarted: 'save', volumeDuration: 'save',
 } as const satisfies Record<string, FieldPolicy>;
 
 export interface SavedPort extends SavedDMusicBase {
@@ -178,6 +183,7 @@ export interface SavedModule {
     performances: number[];
     ports: number[];
     pathOutputs: number[];
+    volumeFades: number[];
     messages: Array<[address: number, state: number]>;
     pumpTimer: number;
 }
@@ -186,6 +192,7 @@ export interface DMusicModuleState {
     performances: PerformanceObject[];
     ports: PortObject[];
     pathOutputs: AudioPathObject[];
+    volumeFades: AudioPathObject[];
     messages: Array<[number, SegmentStateObject | null]>;
     pumpTimer: number | null;
 }
@@ -193,7 +200,7 @@ export interface DMusicModuleState {
 export const DMUSIC_MODULE_FIELDS = {
     name: 'transient', exports: 'host', vtables: 'derive', process: 'host', ports: 'save', performances: 'save',
     loading: 'transient', pumpTimer: 'save', collectionObjects: 'derive', mixLeft: 'transient', mixRight: 'transient',
-    messages: 'save', pathOutputs: 'save', decodedWaves: 'transient',
+    messages: 'save', pathOutputs: 'save', volumeFades: 'save', decodedWaves: 'transient',
 } as const satisfies Record<string, FieldPolicy>;
 
 export const DMUSIC_SCHEMA = {
@@ -212,7 +219,7 @@ export const DMUSIC_SCHEMA = {
     synthChannel: SYNTH_CHANNEL_FIELDS,
     synthVoice: SYNTH_VOICE_FIELDS,
     sink: SINK_FIELDS,
-    savedModule: stateKeys<SavedModule>({ performances: true, ports: true, pathOutputs: true, messages: true, pumpTimer: true }),
+    savedModule: stateKeys<SavedModule>({ performances: true, ports: true, pathOutputs: true, volumeFades: true, messages: true, pumpTimer: true }),
     messageRow: ['address', 'segment state or -1'],
     savedPort: stateKeys<SavedPort>({
         base: true, addresses: true, sampleRate: true, audioChannels: true, voices: true, channelGroups: true, directSound: true,
@@ -224,7 +231,7 @@ export const DMUSIC_SCHEMA = {
     }),
     notificationRow: ['type', 'state', 'musicTime', 'ageMs'],
     savedSegmentState: stateKeys<SavedSegmentState>({ base: true, addresses: true, performance: true, segment: true, state: true }),
-    savedAudioPath: stateKeys<SavedAudioPath>({ base: true, addresses: true, pathType: true, performance: true, buffer: true, channels: true, sink: true }),
+    savedAudioPath: stateKeys<SavedAudioPath>({ base: true, addresses: true, pathType: true, volume: true, volumeFrom: true, volumeTarget: true, volumeStarted: true, volumeDuration: true, performance: true, buffer: true, channels: true, sink: true }),
     savedEngine: stateKeys<PerformanceData>({
         now: true, tempo: true, masterTempo: true, randomState: true, states: true, events: true, transpose: true, drumChannels: true,
         installed: true, defaultCollection: true,
@@ -390,12 +397,18 @@ export function registerDMusicCodecs(host: DMusicHost): void {
         tag: 'dmusic-audiopath',
         matches: (o): o is AudioPathObject => o instanceof AudioPathObject,
         capture: (o, ref): SavedAudioPath => ({
-            ...base(o), pathType: o.pathType, performance: optional(o.performance, ref, 'performance'), buffer: o.buffer,
+            ...base(o), pathType: o.pathType, volume: o.volume, volumeFrom: o.volumeFrom, volumeTarget: o.volumeTarget,
+            volumeStarted: o.volumeStarted, volumeDuration: o.volumeDuration, performance: optional(o.performance, ref, 'performance'), buffer: o.buffer,
             channels: o.channels, sink: o.sink?.captureState() ?? null,
         }),
         restore: (d: SavedAudioPath) => {
             const path = rebuild(() => new AudioPathObject(), d);
             path.pathType = d.pathType;
+            path.volume = d.volume;
+            path.volumeFrom = d.volumeFrom;
+            path.volumeTarget = d.volumeTarget;
+            path.volumeStarted = d.volumeStarted;
+            path.volumeDuration = d.volumeDuration;
             path.buffer = d.buffer;
             path.channels = d.channels;
             if (d.sink) {
@@ -627,7 +640,7 @@ export function registerDMusicCodecs(host: DMusicHost): void {
 export function registerDMusicParticipant(host: DMusicHost): () => void {
     registerDMusicCodecs(host);
     return savestateParticipants.add({
-        id: 'dmusic', version: 6, order: 64, covers: ['dmusic'], schema: DMUSIC_SCHEMA as unknown as SaveValue,
+        id: 'dmusic', version: 7, order: 64, covers: ['dmusic'], schema: DMUSIC_SCHEMA as unknown as SaveValue,
         capture: (ctx): SaveValue => {
             const refusal = host.idleRefusal();
             if (refusal) throw new CaptureRefusal(refusal);
@@ -636,6 +649,7 @@ export function registerDMusicParticipant(host: DMusicHost): () => void {
                 performances: state.performances.map((o, i) => ctx.ref(o, `dmusic performance ${i}`)),
                 ports: state.ports.map((o, i) => ctx.ref(o, `dmusic port ${i}`)),
                 pathOutputs: state.pathOutputs.map((o, i) => ctx.ref(o, `dmusic audio path ${i}`)),
+                volumeFades: state.volumeFades.map((o, i) => ctx.ref(o, `dmusic volume fade ${i}`)),
                 messages: state.messages.map(([address, obj]) => [address, obj ? ctx.ref(obj, `dmusic message 0x${address.toString(16)}`) : NONE]),
                 pumpTimer: state.pumpTimer ?? NONE,
             };
@@ -647,6 +661,7 @@ export function registerDMusicParticipant(host: DMusicHost): () => void {
                 performances: saved.performances.map(r => ctx.object(r) as PerformanceObject),
                 ports: saved.ports.map(r => ctx.object(r) as PortObject),
                 pathOutputs: saved.pathOutputs.map(r => ctx.object(r) as AudioPathObject),
+                volumeFades: saved.volumeFades.map(r => ctx.object(r) as AudioPathObject),
                 messages: saved.messages.map(([address, r]) => [address, r === NONE ? null : ctx.object(r) as SegmentStateObject]),
                 pumpTimer: saved.pumpTimer === NONE ? null : saved.pumpTimer,
             });

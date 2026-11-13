@@ -179,6 +179,11 @@ export class AudioPathObject extends DMusicObject {
     buffer = 0;
     sink: DirectSoundSink | null = null;
     channels = 2;
+    volume = 0;
+    volumeFrom = 0;
+    volumeTarget = 0;
+    volumeStarted = 0;
+    volumeDuration = 0;
 }
 
 export class ComposerObject extends DMusicObject {
