@@ -78,7 +78,7 @@ import { DDraw } from "./modules/ddraw";
 import { getOverlayCompositePlan } from "./modules/user32/dialog-overlay";
 import { dropVideoPlaneDirty, getVideoPlanePlan, isVideoPlaneDirty, notifyVideoPlaneComposited } from "./video/video-plane-policy";
 import { getVirtualScreenRect } from "./modules/user32/shared-state";
-import { setPresentRectListener } from "./backends/webgpu/shared/present-geometry";
+import { guestViewOnPlane, setGuestView, setPresentRectListener } from "./backends/webgpu/shared/present-geometry";
 import { flushHeldWindowDCs } from "./modules/user32/window";
 import { DInput } from "./modules/dinput";
 import { DPlayX } from "./modules/dplayx";
@@ -626,10 +626,12 @@ const gdiPresentOnce = () => {
     // compositors (and the host's pointer mapping) where the guest picture lands. Read from
     // the same authority the plane itself is sized by — the plane's own dimensions are frozen
     // for the duration of a held paint bracket and would answer for the previous mode.
+    // The picture is the part of that screen the host surface shows (present-geometry).
     if (backend.publishGuestPresentRect) {
       const vs = getVirtualScreenRect();
-      backend.publishGuestPresentRect(
+      const view = guestViewOnPlane(
         Math.max(1, Math.round(vs.right - vs.left)), Math.max(1, Math.round(vs.bottom - vs.top)));
+      backend.publishGuestPresentRect(view.w, view.h);
     }
 
     // Include dirty clears (hasOverlayContent=false after clearOverlay) so the GPU
@@ -2663,6 +2665,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         // "resize" with the display-fit size, and that is its single writer.
         state.width = width;
         state.height = height;
+        setGuestView(x, y, width, height);
         syncOverlayToGuestScreen();
         Logger.log(LogCategory.SYSTEM,
           `hostResize: guest view ${width}x${height} at (${x},${y}) (canvas=${state.canvas?.width ?? 0}x${state.canvas?.height ?? 0})`);

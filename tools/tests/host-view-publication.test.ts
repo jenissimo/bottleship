@@ -7,7 +7,7 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { System, type HostView } from '../../src/worker/core/system';
 import { Mem } from '../../src/worker/core/memory/mem-accessor';
-import { windows, type WindowInfo } from '../../src/worker/modules/user32/shared-state';
+import { getVirtualScreenRect, windows, type WindowInfo } from '../../src/worker/modules/user32/shared-state';
 import { createWindowExports } from '../../src/worker/modules/user32/window';
 import { requestWindowedDeviceHostView } from '../../src/worker/runtime/windowing/fullscreen-window';
 import { publishCreateDeviceHostView } from '../../src/worker/modules/d3d8/device-lifecycle';
@@ -164,6 +164,25 @@ test('while DirectDraw holds the display exclusively a shown window does not rep
         expect(published).toEqual([]);
         expect(System.getInstance().hostView).toEqual({ x: 0, y: 0, width: 640, height: 480 });
     } finally { system.ddrawContext = savedDdraw; }
+});
+
+test('a window larger than the screen publishes the part of it that is on the screen', () => {
+    const screen = getVirtualScreenRect();
+    const sw = screen.right - screen.left, sh = screen.bottom - screen.top;
+    makeWindow(HWND, 0, 0, 0, sw + 384, sh + 288);
+    call('ShowWindow', [HWND, SW_SHOW]);
+    expect(published).toEqual([{ x: 0, y: 0, width: sw, height: sh }]);
+    windows.get(HWND)!.style |= WS_POPUP;
+    call('SetWindowPos', [HWND, 0, -100, 50, sw + 384, sh + 288, SWP_NOZORDER | SWP_NOACTIVATE]);
+    expect(published.at(-1)).toEqual({ x: 0, y: 50, width: sw, height: sh - 50 });
+});
+
+test('a window wholly off the screen shows the screen', () => {
+    const screen = getVirtualScreenRect();
+    const sw = screen.right - screen.left, sh = screen.bottom - screen.top;
+    makeWindow(HWND, 0, sw + 10, 0, 200, 100);
+    call('ShowWindow', [HWND, SW_SHOW]);
+    expect(published).toEqual([{ x: 0, y: 0, width: sw, height: sh }]);
 });
 
 test('popups and children do not publish a view when shown', () => {

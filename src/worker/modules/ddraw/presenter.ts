@@ -24,6 +24,7 @@ import {
 import { DDSCAPS_TEXTURE } from "./constants";
 import { ensureGpuTextureForBlt } from "./surface-blt-flip";
 import type { DDrawContext } from "./context";
+import { isDDrawExclusiveFullscreen } from "./gdi-visibility";
 import { getOverlayCompositePlan } from "../user32/dialog-overlay";
 import { getVideoPlanePlan, notifyVideoPlaneComposited } from "../../video/video-plane-policy";
 import { markGpuSyncedFromCpu, surfaceSyncManager } from "./surface-sync";
@@ -50,6 +51,17 @@ const defaultPresentClock: PresentClock = {
     onRefresh: (callback) => framePacer.registerOnFrame(callback),
     setTimer: (callback, ms) => { const id = setTimeout(callback, ms); return () => clearTimeout(id); },
 };
+
+/**
+ * Where the primary's frame goes on the canvas: source (guest) and output (canvas) sizes for the
+ * post-fx chain's scaling, and whether the primary is a screen plane that shows only the host
+ * view. Exclusive DirectDraw owns the whole screen whatever its window is, so it is never cropped.
+ */
+export function primaryPresentGeometry(
+    srcW: number, srcH: number, outW: number, outH: number, ddrawContext: Parameters<typeof isDDrawExclusiveFullscreen>[0],
+): { srcW: number; srcH: number; outW: number; outH: number; toCanvas: true; screenPlane: boolean } {
+    return { srcW, srcH, outW, outH, toCanvas: true, screenPlane: !isDDrawExclusiveFullscreen(ddrawContext) };
+}
 
 export class DDrawPresenter implements RenderActive {
     private process: Process;
@@ -608,12 +620,12 @@ export class DDrawPresenter implements RenderActive {
                         undefined,
                         // Source (guest) + output (canvas) dims → post-fx chain does
                         // integer/aspect scaling + FXAA texel sizing.
-                        { srcW: surface.width, srcH: surface.height, outW: canvasTex.width, outH: canvasTex.height, toCanvas: true }
+                        primaryPresentGeometry(surface.width, surface.height, canvasTex.width, canvasTex.height, system.ddrawContext)
                     );
                     this.lastPresented = { view: presentTextureView, width: surface.width, height: surface.height };
 
                     // Composite overlays (video plane → GDI → worker FPS). Shared with presentBlend.
-                    this.compositeFrameOverlays(webgpu, targetView, encoder, surface.width, surface.height);
+                    this.compositeFrameOverlays(webgpu, targetView, encoder, false);
 
                     const submitStart = frameProfiler.startTimer();
                     const _ds = performance.now();
@@ -806,8 +818,7 @@ export class DDrawPresenter implements RenderActive {
         webgpu: WebGPUBackend,
         targetView: GPUTextureView,
         encoder: GPUCommandEncoder,
-        width: number,
-        height: number,
+        wholePlane: boolean,
     ): void {
         const system = System.getInstance();
         const videoPlan = getVideoPlanePlan();
@@ -817,16 +828,16 @@ export class DDrawPresenter implements RenderActive {
 
         // 1. Video overlay plane (fallback sink).
         if (videoPlan.onScreen) {
-            webgpu.blit(videoPlan.canvas!, targetView, encoder);
+            webgpu.blit(videoPlan.canvas!, targetView, encoder, wholePlane);
             notifyVideoPlaneComposited(videoPlan);
         }
 
         // 2. GDI overlay on top (whole overlay, or only live dialog rects when the flip chain owns screen).
         if (overlay && system.gdiContext.hasOverlayContent()) {
             if (dialogRects?.length) {
-                webgpu.blitRects(overlay, targetView, encoder, dialogRects);
+                webgpu.blitRects(overlay, targetView, encoder, dialogRects, wholePlane);
             } else {
-                webgpu.blit(overlay, targetView, encoder);
+                webgpu.blit(overlay, targetView, encoder, wholePlane);
             }
             if (system.gdiContext.isOverlayDirty()) {
                 system.gdiContext.clearOverlayDirty();
@@ -874,7 +885,8 @@ export class DDrawPresenter implements RenderActive {
 
         const clearColor = EmulatorConfig.getInstance().screenBackgroundColor;
         this.interpolator.present(targetView, encoder, now, clearColor);
-        this.compositeFrameOverlays(webgpu, targetView, encoder, this.lastBlendWidth, this.lastBlendHeight);
+        // The interpolated frame is drawn uncropped, so its overlays are not cropped to the view either.
+        this.compositeFrameOverlays(webgpu, targetView, encoder, true);
         queue.submit([encoder.finish()]);
 
         if (system.gpuResourceManager) {

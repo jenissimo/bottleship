@@ -14,7 +14,7 @@ import { getWindowClass, getWindowClassByName, getWindowClassId } from './class'
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { hasPendingStartupShowWindow, takeStartupShowWindow } from '../../core/process-startup-info';
-import { WindowInfo, windows, getWindowByHandle, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, markWindowPaintCycleRan, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, isWindowPosZOrderRequestValid, shouldSeedPaintFromParent, tryLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect } from './shared-state';
+import { WindowInfo, windows, getWindowByHandle, getCursorDisplayCount, updateCursorDisplayCount, isGuestCursorVisible, syncHostCursorToGuestState, installCursorAndUpdateHostVisibility, getAbsoluteWindowPosition, markGuestCustomPaint, markWindowPaintCycleRan, killWindowTimers, registerWindowDestroyFinalizer, reorderChildInParent, isWindowPosZOrderRequestValid, shouldSeedPaintFromParent, tryLockWindowUpdate, isWindowUpdateLocked, hasSystemControlChildren, getChildWindowExclusions, isEffectivelyVisible, getAncestorClipRect, getVirtualScreenRect } from './shared-state';
 import {
     invalidateWindow,
     validateWindow,
@@ -298,6 +298,21 @@ function trySuspendForSyncWindowMessage(
     return { suspended: true, callbackId: first.callbackId, frameId, reusedFrame };
 }
 
+/**
+ * A top-level window's client rectangle clipped to the screen, as the host view shows it:
+ * the planes it is cut from end at the screen's edge. A window wholly off the screen
+ * shows the screen.
+ */
+function clientRectOnScreen(win: WindowInfo): { x: number; y: number; width: number; height: number } {
+    const screen = getVirtualScreenRect();
+    const x0 = Math.max(screen.left, win.x), y0 = Math.max(screen.top, win.y);
+    const x1 = Math.min(screen.right, win.x + win.width), y1 = Math.min(screen.bottom, win.y + win.height);
+    if (x1 <= x0 || y1 <= y0) {
+        return { x: screen.left, y: screen.top, width: screen.right - screen.left, height: screen.bottom - screen.top };
+    }
+    return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+}
+
 /** Shared SetWindowPos / DeferWindowPos geometry apply; the rectangle is the CLIENT one. */
 function applyWindowPosGeometry(
     hWnd: number,
@@ -352,7 +367,11 @@ function applyWindowPosGeometry(
 
     if (moving || resizing) {
         syncWindowDCsToGeometry(hWnd);
-        System.getInstance().followHostViewWindow(hWnd, window.x, window.y, window.width, window.height);
+        const system = System.getInstance();
+        if (system.hostViewOwner === hWnd) {
+            const view = clientRectOnScreen(window);
+            system.followHostViewWindow(hWnd, view.x, view.y, view.width, view.height);
+        }
     }
 
     if (!options?.skipDialogOverlayRepaint && !(uFlags & 0x0008 /* SWP_NOREDRAW */)
@@ -1954,7 +1973,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             // whatever rectangle the window has.
             if (show && !isChild && !(live.style & WS_POPUP)
                 && !System.getInstance().ddrawContext?.cooperative?.exclusive) {
-                System.getInstance().requestHostViewOfWindow(hWnd, live.x, live.y, live.width, live.height);
+                const view = clientRectOnScreen(live);
+                System.getInstance().requestHostViewOfWindow(hWnd, view.x, view.y, view.width, view.height);
             }
             if (isAnimateControlWindow(live)) onAnimateShowWindow(hWnd, nCmdShow);
             return resultValue;
