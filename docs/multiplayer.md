@@ -69,6 +69,9 @@ others your machine's address:
 cargo run --release --locked --manifest-path packages/lan-rust/Cargo.toml -- --host 0.0.0.0 --port 9001 --public-rooms
 ```
 
+For a server on the internet, [deploy/lan](../deploy/lan/README.md) has a Docker Compose
+setup behind an HTTPS reverse proxy.
+
 When BottleShip itself is served over HTTPS (as the public site is), the browser only
 connects to an HTTPS server. Put the relay behind an HTTPS reverse proxy that forwards
 both ordinary requests and WebSocket upgrades at `/socket.io/`. Origin restrictions,
