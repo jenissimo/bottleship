@@ -142,7 +142,6 @@ function isCallbackStub(thunkReturnAddr: number, callbackManager: CallbackManage
     return thunkReturnAddr >= stubRange.base && thunkReturnAddr < stubRange.end;
 }
 
-/** The suspended frame guest callbacks run under for this thunk call; 0 on failure. */
 /**
  * Where the calling thunk returns to. A thunk resumed after an async park carries it in the
  * context: its [ESP] slot holds the spin-loop address for as long as the thread is parked.
@@ -153,6 +152,7 @@ function thunkReturnAddrOf(ctx: X86Context, mem: Uint8Array): number {
     return new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(ctx.esp, true);
 }
 
+/** The suspended frame guest callbacks run under for this thunk call; 0 on failure. */
 function suspendCaller(
     ctx: X86Context,
     thunkReturnAddr: number,
