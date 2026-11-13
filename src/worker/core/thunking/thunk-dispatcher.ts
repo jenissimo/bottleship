@@ -5813,6 +5813,17 @@ export class ThunkDispatcher {
     }
 
     /**
+     * HLE calls dispatched so far: OUT traps served by the fast-path tier plus those that
+     * reached a JS implementation on the slow path. Both counters already exist on their
+     * paths; this read costs nothing per call. Tier-0 write-buffer entries (cheap state
+     * setters drained in bulk) are not counted. Used by execution-health as a host-speed-
+     * independent measure of how HLE-bound a window was.
+     */
+    getHleCallCount(): number {
+        return this.fastPathCallCount + this.thunkCount;
+    }
+
+    /**
      * Get post-return ESP for the last completed thunk.
      * Used by scheduler to construct a post-return context when EIP is in thunk region.
      */

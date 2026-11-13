@@ -3090,6 +3090,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
             readInsns: () => readRetiredInsns(cpu),
             readInTickMs: () => workerTime.inTickTotalMs,
             readSabWaitMs: () => (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo?.waitMsTotal ?? 0,
+            // Existing counters, read once per sample: HLE density and present rate are the
+            // two symptoms the slow hint needs besides low busy MIPS (issue #354).
+            readHleCalls: () => System.getInstance().process?.dispatcher?.getHleCallCount?.(),
+            readPresents: () => System.getInstance().services?.render?.getGuestPresentSerial(),
             getJitConfig: typeof jitExports.get_jit_config === "function" ? (i: number) => jitExports.get_jit_config(i) : undefined,
           });
           hypercallDataManager.initialize(cpu, preemptionManager.getHypercallPageBase());
