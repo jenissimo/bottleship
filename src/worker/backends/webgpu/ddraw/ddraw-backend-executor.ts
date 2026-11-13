@@ -4032,7 +4032,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
 
     /** QueueWriteGuard: a queue-level write to `texture` must not run ahead of recorded work that uses it. */
     beforeQueueWrite(texture: GPUTexture): void {
-        if (!this.hasRecordedWork()) return;
+        // The bisecting switch turns off every early submit, this one included.
+        if (this.debugFlags.disableTextureOverwriteSubmit || !this.hasRecordedWork()) return;
         if (this.textureEpochs.get(texture) !== this.encoderEpoch) return;
         this.renderStats.queueWriteSubmits++;
         if (this.opLogArmed > 0) this.opLog(`SUBMIT-BEFORE-WRITE epoch=${this.encoderEpoch}`);

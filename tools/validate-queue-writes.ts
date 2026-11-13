@@ -10,9 +10,10 @@
  * Two checks:
  * - Every writeTexture / copyExternalImageToTexture call has a `beforeQueueWrite(` or a
  *   full executor flush within the lines before it (same function in practice).
- * - A pinned per-file census of those calls and of `.submit(`: a new site anywhere in scope
- *   fails here until it is added to the pins, i.e. until someone has decided whether it
- *   writes a texture recorded work can use.
+ * - A pinned per-file census of those calls, of `.submit(`, and of the submits that have a
+ *   guard in the lines before them: a new site anywhere in scope, or a guard removed from
+ *   before a submit, fails here until the pins are updated, i.e. until someone has decided
+ *   whether it writes a texture recorded work can use.
  *
  * Usage: bun tools/validate-queue-writes.ts [--root <dir>]
  */
@@ -31,7 +32,7 @@ const SCOPE_FILES = [
     "src/worker/backends/webgpu/shared/texture-converter.ts",
 ];
 
-interface Census { writeTexture: number; copyExternalImageToTexture: number; submit: number }
+interface Census { writeTexture: number; copyExternalImageToTexture: number; submit: number; guardedSubmit: number }
 
 /**
  * Submits are pinned with what they write: only fresh textures, buffers, the canvas, or a
@@ -40,28 +41,29 @@ interface Census { writeTexture: number; copyExternalImageToTexture: number; sub
 const PINS: Record<string, Census> = {
     // dummy pixel + authored mips (guarded), canvas upload (after flush); flush itself,
     // two copySurface paths (after flush), fresh-texture clear.
-    "src/worker/backends/webgpu/ddraw/ddraw-backend-executor.ts": { writeTexture: 2, copyExternalImageToTexture: 1, submit: 4 },
+    "src/worker/backends/webgpu/ddraw/ddraw-backend-executor.ts": { writeTexture: 2, copyExternalImageToTexture: 1, submit: 4, guardedSubmit: 2 },
     // vertex conversion readback: buffers only.
-    "src/worker/backends/webgpu/ddraw/compute/vertex-converter.ts": { writeTexture: 0, copyExternalImageToTexture: 0, submit: 1 },
+    "src/worker/backends/webgpu/ddraw/compute/vertex-converter.ts": { writeTexture: 0, copyExternalImageToTexture: 0, submit: 1, guardedSubmit: 0 },
     // mip levels of a texture (guarded).
-    "src/worker/backends/webgpu/ddraw/mip-generator.ts": { writeTexture: 0, copyExternalImageToTexture: 0, submit: 1 },
+    "src/worker/backends/webgpu/ddraw/mip-generator.ts": { writeTexture: 0, copyExternalImageToTexture: 0, submit: 1, guardedSubmit: 1 },
     // canvas readback, canvas present, phase blend, palette convert (after flush), RGB565 convert (guarded).
-    "src/worker/modules/ddraw/presenter.ts": { writeTexture: 0, copyExternalImageToTexture: 0, submit: 5 },
+    "src/worker/modules/ddraw/presenter.ts": { writeTexture: 0, copyExternalImageToTexture: 0, submit: 5, guardedSubmit: 2 },
     // debug readback; fresh-texture clear; partial, RGB565 x2 and full uploads (guarded).
-    "src/worker/modules/ddraw/gpu-texture-utils.ts": { writeTexture: 4, copyExternalImageToTexture: 0, submit: 2 },
+    "src/worker/modules/ddraw/gpu-texture-utils.ts": { writeTexture: 4, copyExternalImageToTexture: 0, submit: 2, guardedSubmit: 0 },
     // debug surface probe (after flush).
-    "src/worker/modules/ddraw/index.ts": { writeTexture: 0, copyExternalImageToTexture: 0, submit: 1 },
+    "src/worker/modules/ddraw/index.ts": { writeTexture: 0, copyExternalImageToTexture: 0, submit: 1, guardedSubmit: 1 },
     // Blt copy branch (after the GPU-path flush).
-    "src/worker/modules/ddraw/surface-blt-flip.ts": { writeTexture: 0, copyExternalImageToTexture: 0, submit: 1 },
+    "src/worker/modules/ddraw/surface-blt-flip.ts": { writeTexture: 0, copyExternalImageToTexture: 0, submit: 1, guardedSubmit: 0 },
     // readback copy (after flush).
-    "src/worker/modules/ddraw/surface-sync.ts": { writeTexture: 0, copyExternalImageToTexture: 0, submit: 1 },
+    "src/worker/modules/ddraw/surface-sync.ts": { writeTexture: 0, copyExternalImageToTexture: 0, submit: 1, guardedSubmit: 0 },
     // CPU-fallback upload x2 (guarded), readback of a texture into a buffer.
-    "src/worker/backends/webgpu/shared/texture-converter.ts": { writeTexture: 2, copyExternalImageToTexture: 0, submit: 1 },
+    "src/worker/backends/webgpu/shared/texture-converter.ts": { writeTexture: 2, copyExternalImageToTexture: 0, submit: 1, guardedSubmit: 0 },
 };
 
 /** How far back a guard may sit before the write it covers. */
 const GUARD_WINDOW = 40;
-const GUARD = /\bbeforeQueueWrite\(|\bflush\(\)|\bflush\?\.\(\)|\bflushPending\(\)/;
+/** The guard itself, or an executor submit by name; a bare `flush(` of something else does not count. */
+const GUARD = /\bbeforeQueueWrite\(|\bflushPending\(\)|\b(?:this|executor|ddrawExecutor|exec)\??\.flush\(/;
 
 function* walk(dir: string): Generator<string> {
     if (!existsSync(dir)) return;
@@ -87,17 +89,20 @@ const seen = new Set<string>();
 for (const file of [...files].sort()) {
     const rel = relative(ROOT, file).split("\\").join("/");
     const lines = readFileSync(file, "utf8").split("\n");
-    const census: Census = { writeTexture: 0, copyExternalImageToTexture: 0, submit: 0 };
+    const census: Census = { writeTexture: 0, copyExternalImageToTexture: 0, submit: 0, guardedSubmit: 0 };
+    const guardedAt = (i: number): boolean =>
+        lines.slice(Math.max(0, i - GUARD_WINDOW), i).some((l) => !isComment(l) && GUARD.test(l));
     lines.forEach((line, i) => {
         if (isComment(line)) return;
         const write = /\.writeTexture\(/.test(line) ? "writeTexture"
             : /\.copyExternalImageToTexture\(/.test(line) ? "copyExternalImageToTexture" : null;
-        if (/\.submit\(/.test(line)) census.submit++;
+        if (/\.submit\(/.test(line)) {
+            census.submit++;
+            if (guardedAt(i)) census.guardedSubmit++;
+        }
         if (!write) return;
         census[write]++;
-        const from = Math.max(0, i - GUARD_WINDOW);
-        const guarded = lines.slice(from, i).some((l) => !isComment(l) && GUARD.test(l));
-        if (!guarded) {
+        if (!guardedAt(i)) {
             problems.push(`${rel}:${i + 1}: ${write} without beforeQueueWrite(texture) (or a flush) in the ${GUARD_WINDOW} lines before it`);
         }
     });
