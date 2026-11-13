@@ -1,0 +1,69 @@
+{
+ "modules": {
+  "leaves": "99d1d9701ee07f30ef3084c7ed0f77716ed8eb696ff4377ea442c75195bf48d2",
+  "same-call-mem": "ecafbc742123b82e1e8af1ad75dd3a6223f9e2e634d601d67188159a18383787",
+  "same-call-reg": "a6713b8859d3b280387562663e560eb96f210a0118f185fd3e867bbf70c53cbe",
+  "other-indirect-mem": "ea12bc1f3b0f1565c0dcc9509916360227211b0e4784fe4be78404a02a075ead",
+  "other-indirect-reg": "5d33ed7dc57c7f946b2a8eb85a478ba080b6005a25f416b37101320a357903ad",
+  "other-import-mem": "d00a27b0da08e5e25eab0df0db58012bbf950fc195e2623643561d8751f150fa",
+  "other-import-reg": "4e33664e242b73a44fea5dc6785b1af6b2f785f719fde859bb0ee6eac3710184"
+ },
+ "states": [
+  {
+   "n": 0,
+   "state": [
+    1,
+    4,
+    7,
+    10,
+    13,
+    16,
+    19,
+    22
+   ],
+   "calls": 0
+  },
+  {
+   "n": 1,
+   "state": [
+    5,
+    4,
+    17,
+    10,
+    13,
+    16,
+    19,
+    23
+   ],
+   "calls": 1
+  },
+  {
+   "n": 1000,
+   "state": [
+    4001,
+    4,
+    10007,
+    10,
+    13,
+    16,
+    19,
+    1022
+   ],
+   "calls": 1000
+  },
+  {
+   "n": 1000003,
+   "state": [
+    4000013,
+    4,
+    10000037,
+    10,
+    13,
+    16,
+    19,
+    1000025
+   ],
+   "calls": 1000003
+  }
+ ]
+}
