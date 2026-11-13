@@ -156,6 +156,25 @@ describe("pending load", () => {
         expect(await (await storage.gameDir("a")).read("pending-load.json")).not.toBeNull();
     });
 
+    test("a pending file that exists but cannot be read is an error, and the request stays for the next boot", async () => {
+        const storage = memoryStorage();
+        const mem = new Uint8Array(RAM_CHUNK_SIZE).fill(5);
+        await savedSlot(storage, "a", mem, registry([]));
+        await writePendingLoad(storage, "a", "one", 1000);
+        const dir = (await storage.gameDir("a")) as MemoryDir;
+        const read = dir.read.bind(dir);
+        let fail = 1;
+        dir.read = async (name: string) => {
+            if (name === "pending-load.json" && fail-- > 0) throw Object.assign(new Error("busy"), { name: "NotReadableError" });
+            return read(name);
+        };
+        await expect(run(storage, "a", new Uint8Array(mem.length))).rejects.toThrow("busy");
+        expect(await dir.read("pending-load.json")).not.toBeNull();
+        const into = new Uint8Array(mem.length);
+        expect((await run(storage, "a", into)).kind).toBe("restored");
+        expect(into).toEqual(mem);
+    });
+
     test("expires", async () => {
         const storage = memoryStorage();
         await savedSlot(storage, "a", new Uint8Array(RAM_CHUNK_SIZE), registry([]));
