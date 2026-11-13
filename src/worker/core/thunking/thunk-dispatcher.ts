@@ -2,6 +2,7 @@ import { ThunkGenerator, ThunkStub } from './thunk-generator';
 import { restartableCheck } from './restartable';
 import { CallbackManager } from './callback-manager';
 import { Logger, LogCategory } from '../logger';
+import { noteDllAttached } from '../dll-thread-notify';
 import { System } from '../system';
 import { profiler } from '../profiler';
 import { frameProfiler } from '../frame-profiler';
@@ -4243,6 +4244,7 @@ export class ThunkDispatcher {
                     postEsp: (esp + 4 + cleanupBytes) >>> 0,
                     entryEsp: esp >>> 0,
                     complete: (_ret: number): number | null => {
+                        noteDllAttached(dllInits[next]!.baseAddress);
                         next++;
                         return next < dllInits.length && invokeInit(next) ? null : baseAddress;
                     },
@@ -4283,6 +4285,7 @@ export class ThunkDispatcher {
 
             let initIndex = 0;
             const completeThunk = (_ret: number): number | null => {
+                noteDllAttached(dllInits[initIndex]!.baseAddress);
                 initIndex++;
                 if (initIndex < dllInits.length) {
                     const next = dllInits[initIndex];
@@ -6561,6 +6564,11 @@ export class ThunkDispatcher {
         // DllMain result reporter (from bootloader hook)
         if (marker === 0x000a) {
             const result = cpu.reg32[1] >>> 0; // ECX holds the result
+            const entry = cpuViews(cpu).reg32[6]! >>> 0;  // ESI: the {hModule, entry} row just called
+            if (!this.isDataViewValid()) this.updateMemoryCache();
+            if (this.cachedMem8 && entry + 4 <= this.cachedMem8.length) {
+                noteDllAttached(new DataView(this.cachedMem8.buffer, this.cachedMem8.byteOffset).getUint32(entry, true));
+            }
             Logger.warn(LogCategory.SYSTEM, `[DIAG] DllMain call finished. Result (EAX): 0x${result.toString(16)}`);
             return;
         }

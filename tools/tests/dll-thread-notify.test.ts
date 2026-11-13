@@ -9,7 +9,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { SHIPPING_JIT, applyCodegenSwitches } from "../jit-config/shipping.mjs";
 import {
-    DLL_THREAD_ATTACH, DLL_THREAD_DETACH, disableThreadLibraryCalls, layNotifyChain, layNotifyChainForRet, markThreadAttached, noteDllInitialized,
+    DLL_THREAD_ATTACH, DLL_THREAD_DETACH, disableThreadLibraryCalls, layNotifyChain, layNotifyChainForRet, markThreadAttached, noteDllAttached, noteDllInitialized,
     noteDllUnloaded, resetDllThreadNotify, takeThreadDetach, threadNotifyTargets,
 } from "../../src/worker/core/dll-thread-notify";
 import type { LoadedPEModule, ModuleRegistry } from "../../src/worker/core/module-registry";
@@ -23,6 +23,7 @@ const mod = (name: string, base: number, entry: number, extra: Partial<LoadedPEM
 const registry = (mods: LoadedPEModule[]) => ({ getAllModules: () => mods }) as unknown as ModuleRegistry;
 
 beforeEach(() => resetDllThreadNotify());
+const ready = (base: number) => { noteDllInitialized(base); noteDllAttached(base); };
 
 describe("thread notification targets", () => {
     test("initialization order, not registry order; the EXE, stubs, uninitialized and entry-less modules are skipped", () => {
@@ -32,8 +33,8 @@ describe("thread notification targets", () => {
             mod("stub", 0x2a000000, 0x10, { isRealDll: false }),
             mod("noentry", 0x30000000, 0), mod("queued", 0x31000000, 0x10, { initialized: false }),
         ];
-        noteDllInitialized(0x20000000);
-        noteDllInitialized(0x10000000);
+        ready(0x20000000);
+        ready(0x10000000);
         expect(threadNotifyTargets(registry(mods))).toEqual([
             { base: 0x20000000, entry: 0x20000200 }, { base: 0x10000000, entry: 0x10000100 },
         ]);
@@ -41,12 +42,21 @@ describe("thread notification targets", () => {
 
     test("DisableThreadLibraryCalls removes a DLL until it is unloaded", () => {
         const mods = [mod("a", 0x10000000, 0x100), mod("b", 0x20000000, 0x200)];
-        noteDllInitialized(0x10000000); noteDllInitialized(0x20000000);
+        ready(0x10000000); ready(0x20000000);
         disableThreadLibraryCalls(0x10000000);
         expect(threadNotifyTargets(registry(mods)).map(t => t.base)).toEqual([0x20000000]);
         noteDllUnloaded(0x10000000);
-        noteDllInitialized(0x10000000);
+        ready(0x10000000);
         expect(threadNotifyTargets(registry(mods)).map(t => t.base)).toEqual([0x20000000, 0x10000000]);
+    });
+
+    test("a DLL whose DLL_PROCESS_ATTACH has not returned yet is not notified (loader lock)", () => {
+        const mods = [mod("a", 0x10000000, 0x100), mod("b", 0x20000000, 0x200)];
+        ready(0x10000000);
+        noteDllInitialized(0x20000000);
+        expect(threadNotifyTargets(registry(mods)).map(t => t.base)).toEqual([0x10000000]);
+        noteDllAttached(0x20000000);
+        expect(threadNotifyTargets(registry(mods)).map(t => t.base)).toEqual([0x10000000, 0x20000000]);
     });
 
     test("a thread owes its detach once", () => {
@@ -167,7 +177,7 @@ describe("scheduler: thread start and exit", () => {
 
     test("CreateThread enters the first DllMain; the chain ends in the start routine with [exit stub, parameter]", () => {
         const { s, mem, view } = setup(mods());
-        noteDllInitialized(0x10000000); noteDllInitialized(0x20000000);
+        ready(0x10000000); ready(0x20000000);
         s.createThread(START_ADDR, PARAM, 1 << 20, 0, 0, mem, true);
         const t = (s as any).threads.get((s as any).nextThreadId - 1);
         const stub = (s as any).threadExitStubAddr;
@@ -180,7 +190,7 @@ describe("scheduler: thread start and exit", () => {
         for (const [list, notify] of [[mods(), false], [[], true]] as const) {
             resetDllThreadNotify();
             const { s, mem, view } = setup([...list]);
-            noteDllInitialized(0x10000000);
+            ready(0x10000000);
             s.createThread(START_ADDR, PARAM, 1 << 20, 0, 0, mem, notify);
             const t = (s as any).threads.get((s as any).nextThreadId - 1);
             expect(t.context.eip >>> 0).toBe(START_ADDR);
@@ -190,7 +200,7 @@ describe("scheduler: thread start and exit", () => {
 
     test("returning into the exit stub runs DLL_THREAD_DETACH in reverse first, then the thread ends", () => {
         const { s, mem, view, cpu } = setup(mods());
-        noteDllInitialized(0x10000000); noteDllInitialized(0x20000000);
+        ready(0x10000000); ready(0x20000000);
         s.createThread(START_ADDR, PARAM, 1 << 20, 0, 0, mem, true);
         const id = (s as any).nextThreadId - 1, t = (s as any).threads.get(id);
         (s as any).currentThreadId = id; t.state = ThreadState.RUNNING;
@@ -213,7 +223,7 @@ describe("scheduler: thread start and exit", () => {
 
     test("ExitThread returns through the pivot into the detach chain, once", () => {
         const { s, mem, view } = setup(mods());
-        noteDllInitialized(0x10000000); noteDllInitialized(0x20000000);
+        ready(0x10000000); ready(0x20000000);
         s.createThread(START_ADDR, PARAM, 1 << 20, 0, 0, mem, true);
         const id = (s as any).nextThreadId - 1;
         (s as any).currentThreadId = id; (s as any).threads.get(id).state = ThreadState.RUNNING;

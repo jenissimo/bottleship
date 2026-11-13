@@ -21,6 +21,8 @@ export const DLL_THREAD_DETACH = 3;
 const initOrder: number[] = [];
 // @transient(DisableThreadLibraryCalls of the running process; a savestate restore drops it and those DLLs are notified again)
 const disabled = new Set<number>();
+// @transient(DLLs whose DllMain(DLL_PROCESS_ATTACH) is queued or running; a savestate restore drops it)
+const attaching = new Set<number>();
 // @transient(threads that received DLL_THREAD_ATTACH and still owe DLL_THREAD_DETACH; a savestate restore drops it)
 const attachedThreads = new Set<number>();
 
@@ -32,14 +34,25 @@ export interface ThreadNotifyTarget {
 export function resetDllThreadNotify(): void {
     initOrder.length = 0;
     disabled.clear();
+    attaching.clear();
     attachedThreads.clear();
 }
 
-/** A DLL's DllMain(DLL_PROCESS_ATTACH) was queued: it takes its place in initialization order. */
+/**
+ * A DLL's DllMain(DLL_PROCESS_ATTACH) was queued: it takes its place in initialization order,
+ * and threads are notified only once that call has returned (noteDllAttached). Windows holds
+ * the loader lock meanwhile, so a thread never sees DLL_THREAD_ATTACH of an uninitialized DLL.
+ */
 export function noteDllInitialized(base: number): void {
     const at = initOrder.indexOf(base >>> 0);
     if (at >= 0) initOrder.splice(at, 1);
     initOrder.push(base >>> 0);
+    attaching.add(base >>> 0);
+}
+
+/** DllMain(DLL_PROCESS_ATTACH) of this DLL returned. */
+export function noteDllAttached(base: number): void {
+    attaching.delete(base >>> 0);
 }
 
 /** A DLL was unloaded: it leaves the order, and its DisableThreadLibraryCalls goes with it. */
@@ -47,6 +60,7 @@ export function noteDllUnloaded(base: number): void {
     const at = initOrder.indexOf(base >>> 0);
     if (at >= 0) initOrder.splice(at, 1);
     disabled.delete(base >>> 0);
+    attaching.delete(base >>> 0);
 }
 
 export function disableThreadLibraryCalls(base: number): void {
@@ -58,7 +72,7 @@ export function threadNotifyTargets(registry: ModuleRegistry): ThreadNotifyTarge
     const rank = new Map(initOrder.map((base, i) => [base, i]));
     return registry.getAllModules()
         .filter(m => m.isRealDll && !m.isExecutable && m.initialized && m.entryPoint !== 0
-            && !disabled.has(m.baseAddress >>> 0))
+            && !disabled.has(m.baseAddress >>> 0) && !attaching.has(m.baseAddress >>> 0))
         .sort((a, b) => (rank.get(a.baseAddress >>> 0) ?? Infinity) - (rank.get(b.baseAddress >>> 0) ?? Infinity))
         .map(m => ({ base: m.baseAddress >>> 0, entry: (m.baseAddress + m.entryPoint) >>> 0 }));
 }

@@ -15,6 +15,7 @@ import type { Process } from "../process";
 import type { ThunkResult } from "../thunking/thunk-dispatcher";
 import { Mem } from "../memory/mem-accessor";
 import type { DllInitEntry } from "../pe-loader";
+import { noteDllAttached } from "../dll-thread-notify";
 
 const S_OK = 0x00000000;
 const REGDB_E_CLASSNOTREG = 0x80040154;
@@ -161,6 +162,7 @@ function runDllMainChain(
 
     let initIndex = 0;
     const chainDllMain = (_ret: number): number | null => {
+        noteDllAttached(dllInits[initIndex]!.baseAddress);
         initIndex++;
         if (initIndex < dllInits.length) {
             const next = dllInits[initIndex]!;
