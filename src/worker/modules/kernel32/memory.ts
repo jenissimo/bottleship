@@ -2513,8 +2513,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                         if (process.memory.getSize(base) === size) freeHeapBlock(process, base);
                     }
                 }
-                const blocker = process.memory.liveBlockOverlapping?.(address, alignedSize,
-                    (base) => virtualAllocRegions.has(base));
+                const blocker = process.memory.liveBlockOverlapping?.(address, alignedSize, (base) => {
+                    const reserved = virtualAllocRegions.get(base);
+                    return reserved !== undefined
+                        && base + Math.ceil(reserved / ALLOC_GRANULARITY) * ALLOC_GRANULARITY <= address;
+                });
                 if (blocker) {
                     profiler.end("VirtualAlloc:alloc");
                     System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);

@@ -114,6 +114,39 @@ describe("VirtualAlloc at a fixed address claims the range from the anonymous al
         expect(pool).not.toBe(0);
     });
 
+    test("growing a reservation in place fails where it would run into another reservation", () => {
+        let lastError = 0;
+        (System.getInstance() as any).scheduler.setLastError = (e: number) => { lastError = e; };
+        const pool = alloc(MB, RESERVE);
+        const next = alloc(MB, RESERVE);
+        expect(next).toBe(pool + MB);
+        expect(alloc(0x4000, COMMIT, next + 0x38000)).toBe(next + 0x38000);
+        view.setUint32(next + 0x3a5fc, 0xB10C, true);
+
+        const growAt = pool + MB - 0x60000;
+        expect(call("VirtualFree", [pool, 0, RELEASE])).toBe(1);
+        const lower = alloc(MB - 0x60000, RESERVE, pool);
+        expect(lower).toBe(pool);
+        expect(alloc(MB, RESERVE, growAt)).toBe(0);
+        expect(lastError).toBe(487);
+        expect(state(next + 0x3a000)).toBe(0x1000);
+        expect(view.getUint32(next + 0x3a5fc, true)).toBe(0xB10C);
+
+        expect(alloc(0x10000, RESERVE, growAt)).toBe(growAt);
+        expect(alloc(0x60000, RESERVE, growAt)).toBe(0);
+        expect(alloc(0x10000, RESERVE, next - 0x10000)).toBe(next - 0x10000);
+    });
+
+    test("a reservation that ends inside a granule keeps the rest of that granule", () => {
+        let lastError = 0;
+        (System.getInstance() as any).scheduler.setLastError = (e: number) => { lastError = e; };
+        const pool = alloc(0x5000, RESERVE);
+        expect(pool).not.toBe(0);
+        expect(alloc(0x1000, RESERVE, pool + 0x8000)).toBe(0);
+        expect(lastError).toBe(487);
+        expect(alloc(0x10000, RESERVE, pool + 0x10000)).toBe(pool + 0x10000);
+    });
+
     test("with the free cache on, a released block re-reserved at its address is evicted from the cache, not aliased", () => {
         (globalThis as any).vaCacheEnable(true);
         const block = alloc(0x10000);
