@@ -1,6 +1,7 @@
 /**
  * Worker-side frame-time overlay: collects inter-present intervals and renders them to an
- * OffscreenCanvas (160×90) that the present paths composite at top-right.
+ * OffscreenCanvas (216×90) that the present paths composite at top-right. The fps row also
+ * carries the host's guest speed and JIT mode from execution-health.ts.
  *
  * It is an INSTRUMENT, so the labels must be literally true:
  *  - ONE window backs both the numbers and the graph, and the panel prints its size and the
@@ -11,20 +12,24 @@
  *  - A percentile is printed only when its defining rank is an actual observation
  *    (n * (1 - p) >= 1), otherwise "n/a" — same rule and vocabulary as the frame-tail report
  *    in frame-time-distribution.ts / analyze-trace.ts. 0.1% would need 1000 samples, which a
- *    148-frame window cannot support, so the second slot reports the observed worst frame
+ *    204-frame window cannot support, so the second slot reports the observed worst frame
  *    under its own name ("min") instead of a rank nothing stands behind.
  *  - The vertical scale is printed next to the graph, because an autoscaled trace with no
  *    axis is a picture that cannot be wrong.
  */
 
+import { slowThresholds, type ExecHealthSnapshot, type JitEffective } from "./execution-health";
+
 /** Panel geometry. WINDOW is derived from the plot width: one sample, one pixel column. */
-const CANVAS_W = 160;
-const CANVAS_H = 90;
+export const STATS_CANVAS_W = 216; // widest fps row: "120 fps · 1234 MIPS · JIT notail"
+export const STATS_CANVAS_H = 90;
+const CANVAS_W = STATS_CANVAS_W;
+const CANVAS_H = STATS_CANVAS_H;
 const PLOT_X0 = 6;
-const PLOT_X1 = 153;
+const PLOT_X1 = 209;
 const PLOT_Y0 = 44;
 const PLOT_H = 42;
-export const STATS_WINDOW_FRAMES = PLOT_X1 - PLOT_X0 + 1; // 148
+export const STATS_WINDOW_FRAMES = PLOT_X1 - PLOT_X0 + 1; // 204
 
 /** The rank must be backed by an observation: n * (1 - p) >= 1. */
 const P_LOW = 0.99;
@@ -80,6 +85,10 @@ export class StatsOverlay {
     private lastRedrawTime = 0;
     private sortBuf = new Float64Array(STATS_WINDOW_FRAMES);
 
+    // Host execution speed (execution-health.ts), sampled off the present path.
+    private execMips: number | null = null;
+    private execJit: JitEffective = "unknown";
+
     // Axis kept across redraws so it only moves when the data leaves it — hysteresis on the
     // SCALE, never on the samples.
     private axisLo = 0;
@@ -96,6 +105,12 @@ export class StatsOverlay {
 
     isEnabled(): boolean {
         return this.enabled;
+    }
+
+    /** Latest execution-health sample; drawn on the next redraw. */
+    setExecHealth(s: Pick<ExecHealthSnapshot, "mips" | "jit">): void {
+        this.execMips = s.mips;
+        this.execJit = s.jit;
     }
 
     getCanvas(): OffscreenCanvas | null {
@@ -267,19 +282,24 @@ export class StatsOverlay {
         const fpsColor = fpsMean === null ? "#94a3b8"
             : ["#f87171", "#facc15", "#4ade80"][this.band("mean", fpsMean, [30, 55])]!;
 
-        // Row 1 — mean fps and the mean frame time it is the reciprocal of.
-        ctx.font = "bold 11px monospace";
-        ctx.fillStyle = "#94a3b8";
-        ctx.fillText("FPS", 6, 15);
+        // Row 1 — mean fps, then how fast the host runs the guest and whether the JIT does it:
+        // a low fps reads differently next to 400 MIPS than next to 30.
+        const fpsText = fpsMean === null ? "n/a" : Math.round(fpsMean).toString();
         ctx.font = "bold 15px monospace";
         ctx.fillStyle = fpsColor;
-        ctx.fillText(fpsMean === null ? "n/a" : Math.round(fpsMean).toString(), 34, 15);
-
-        ctx.font = "11px monospace";
-        ctx.fillStyle = "#94a3b8";
-        ctx.fillText("ft", 88, 15);
-        ctx.fillStyle = "#e2e8f0";
-        ctx.fillText(s.meanMs === null ? "n/a" : s.meanMs.toFixed(1) + "ms", 104, 15);
+        ctx.fillText(fpsText, 6, 15);
+        let x = 6 + fpsText.length * 15 * MONO_ADVANCE + 3;
+        const seg = (text: string, color: string): void => {
+            ctx.fillStyle = color;
+            ctx.fillText(text, x, 15);
+            x += text.length * 10 * MONO_ADVANCE;
+        };
+        ctx.font = "10px monospace";
+        seg("fps · ", "#94a3b8");
+        const mipsSlow = this.execMips !== null && this.execMips < slowThresholds(this.execJit).slow;
+        seg(formatMips(this.execMips), this.execMips === null ? "#64748b" : mipsSlow ? "#fca5a5" : "#e2e8f0");
+        seg(" · ", "#94a3b8");
+        seg(formatJit(this.execJit), this.execJit === "off" ? "#f87171" : this.execJit === "on" ? "#e2e8f0" : "#facc15");
 
         // Row 2 — the tail. "1%" is the p99 frame time; "min" is the observed worst frame,
         // named for what it is because no rank finer than 1% fits this window.
@@ -293,6 +313,11 @@ export class StatsOverlay {
         ctx.fillText("min", 62, 30);
         ctx.fillStyle = fpsMin === null ? "#64748b" : fpsMin >= 20 ? "#86efac" : "#fca5a5";
         ctx.fillText(fpsMin === null ? "n/a" : Math.round(fpsMin).toString(), 88, 30);
+
+        ctx.fillStyle = "#94a3b8";
+        ctx.fillText("ft", 124, 30);
+        ctx.fillStyle = "#e2e8f0";
+        ctx.fillText(s.meanMs === null ? "n/a" : s.meanMs.toFixed(1) + "ms", 142, 30);
 
         // Row 3 — the window the two rows above and the graph below all describe.
         ctx.font = "9px monospace";
@@ -330,7 +355,7 @@ export class StatsOverlay {
 
         // Newest sample is pinned to the right edge and the trace grows leftwards, so a point
         // never moves horizontally as the window fills — a left-anchored trace with a
-        // full-window step marches across the panel for its first 148 frames.
+        // full-window step marches across the panel for its first window of frames.
         const startIdx = (this.frameIdx - n + STATS_WINDOW_FRAMES) % STATS_WINDOW_FRAMES;
         const xOf = (i: number) => PLOT_X1 - (n - 1 - i);
         const yOf = (i: number) => {
@@ -408,6 +433,17 @@ function niceStep(x: number): number {
     // Past the ladder, keep growing by decades: a step that stops growing turns the axis
     // walk into thousands of iterations on an absurd (but finite) interval.
     return Math.pow(10, Math.ceil(Math.log10(x)));
+}
+
+/** "412 MIPS"; "-- MIPS" until a busy window exists (an idle guest says nothing about speed). */
+export function formatMips(mips: number | null): string {
+    if (mips === null || !Number.isFinite(mips)) return "-- MIPS";
+    return `${mips >= 10 ? Math.round(mips) : mips.toFixed(1)} MIPS`;
+}
+
+/** "JIT" when on, otherwise the mode the engine is really in. */
+export function formatJit(jit: JitEffective): string {
+    return jit === "on" ? "JIT" : jit === "unknown" ? "JIT ?" : `JIT ${jit}`;
 }
 
 function fmtScale(v: number): string {

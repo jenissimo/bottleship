@@ -85,6 +85,7 @@ import {
 } from "../input/pointer-kind";
 import { setHapticsEnabled } from "../input/haptics";
 import { TouchFirstRunHint } from "./TouchFirstRunHint";
+import { SlowExecutionHint, type PerfHint } from "./SlowExecutionHint";
 import type { HostAction } from "../input/bindings";
 
 async function writeOpfsFile(dir: FileSystemDirectoryHandle, name: string, blob: Blob): Promise<void> {
@@ -378,6 +379,8 @@ export default function App() {
   const [debugGpuOpen, setDebugGpuOpen] = useState(false);
   const [frameAnalysisOpen, setFrameAnalysisOpen] = useState(false);
   const [statsOverlayEnabled, setStatsOverlayEnabled] = useState(false);
+  const [perfHint, setPerfHint] = useState<PerfHint | null>(null);
+  const dismissPerfHint = useCallback(() => setPerfHint(null), []);
   const [fpuStrictEnabled, setFpuStrictEnabled] = useState(false);
   // AOT code cache. Recording is a
   // two-step ritual whose failure mode is silent — a `stop` that never ran keeps nothing —
@@ -1079,7 +1082,7 @@ export default function App() {
         maxTouchPoints: navigator.maxTouchPoints,
         search: window.location.search,
       });
-      globalWorker.postMessage({ type: "set_jit_policy", mode: jitPolicy.mode });
+      globalWorker.postMessage({ type: "set_jit_policy", mode: jitPolicy.mode, reason: jitPolicy.reason });
       if (jitPolicy.reason !== "default") console.info(`[bs] JIT ${jitPolicy.mode} (${jitPolicy.reason}); ?jit=1 forces it on`);
 
       // A self re-exec asked us to reload (see the "reexec" message). Hand the worker the
@@ -1521,9 +1524,14 @@ export default function App() {
           setLoadingProgress({ phase, percent: percent ?? 0, label, indeterminate: !determinate });
         }
       }
+      if (event.data?.type === "perf_hint") {
+        const { jit, reason, mips } = event.data as PerfHint;
+        setPerfHint({ jit, reason, mips });
+      }
       if (event.data?.type === "first_present") {
         // The guest composited its first real frame — crossfade the launch overlay out.
         setIsLoadingApp(false);
+        setPerfHint(null);
         setLoadingProgress((prev) => (prev ? { ...prev, fadingOut: true } : null));
         if (loadingFadeTimerRef.current !== null) window.clearTimeout(loadingFadeTimerRef.current);
         loadingFadeTimerRef.current = window.setTimeout(() => {
@@ -3423,6 +3431,14 @@ export default function App() {
             moveKeys={activeLayout.moveKeys}
             onMoveKeys={activeLayout.chooseMoveKeys}
             edgeToEdge={immersive}
+          />
+        )}
+        {workerStatus === "ready" && perfHint && (
+          <SlowExecutionHint
+            hint={perfHint}
+            statsOverlayOn={statsOverlayEnabled}
+            onShowStats={() => handleToggleStatsOverlay(true)}
+            onDismiss={dismissPerfHint}
           />
         )}
         {workerStatus === "ready" && (

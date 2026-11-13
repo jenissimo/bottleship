@@ -28,6 +28,7 @@ import {
     type NonTickKind, type WorkerTimeSnapshot,
 } from "../../core/worker-time-accounting";
 import type { SabIoSource } from "../../runtime/filesystem/sab-io-source";
+import { execHealth } from "../../core/execution-health";
 
 type IoSnapshot = ReturnType<SabIoSource["stats"]>;
 
@@ -155,6 +156,10 @@ export function computeIdlePartition(
 }
 
 export function registerIdleCommands(svc: HarnessService): void {
+    /** execHealth() — what the stats overlay and the slow-execution hint see: smoothed busy
+     *  MIPS, the last window's busy share, live JIT mode, and the hint detector's state. */
+    svc.register("execHealth", () => execHealth.snapshot());
+
     /** idleMark() — open the window. The ledgers are monotonic, so a report is a
      *  difference; without a mark, boot's own multi-second stalls dominate every read. */
     svc.register("idleMark", () => {

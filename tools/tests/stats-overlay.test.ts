@@ -61,7 +61,7 @@ function armed(): StatsOverlay {
 
 describe("window ranks — a percentile is printed only when its rank is an observation", () => {
     test("the window is exactly the plot width, one sample per pixel column", () => {
-        expect(STATS_WINDOW_FRAMES).toBe(148);
+        expect(STATS_WINDOW_FRAMES).toBe(204);
     });
 
     test("p99 needs >= 100 samples; 99 is n/a", () => {
@@ -87,24 +87,25 @@ describe("window ranks — a percentile is printed only when its rank is an obse
 
     test("one hitch in a full window is below the 1% rank and must NOT move p99", () => {
         const o = armed();
-        // 147 x 10ms + 1 x 100ms. k = ceil(0.99 * 148) = 147 -> 147th smallest = 10ms.
-        feed(o, [...Array.from({ length: 147 }, () => 10), 100]);
+        // 203 x 10ms + 1 x 100ms. k = ceil(0.99 * 204) = 202 -> 202nd smallest = 10ms.
+        feed(o, [...Array.from({ length: 203 }, () => 10), 100]);
         const s = o.stats();
         expect(s.n).toBe(STATS_WINDOW_FRAMES);
         expect(s.p99Ms).toBe(10);
         // ...but the worst frame is reported under its own name, so the hitch is not hidden.
         expect(s.maxMs).toBe(100);
-        expect(s.meanMs).toBeCloseTo((146 * 10 + 10 + 100) / 148, 10);
+        expect(s.meanMs).toBeCloseTo((202 * 10 + 10 + 100) / 204, 10);
     });
 
-    test("two hitches cross the 1% rank and p99 reports the hitch", () => {
+    test("hitches past the 1% rank make p99 report the hitch", () => {
         const o = armed();
-        feed(o, [...Array.from({ length: 146 }, () => 10), 100, 100]);
+        // k = ceil(0.99 * 204) = 202: three hitches put one at rank 202, two would not.
+        feed(o, [...Array.from({ length: 201 }, () => 10), 100, 100, 100]);
         const s = o.stats();
         expect(s.p99Ms).toBe(100);
     });
 
-    test("the ring evicts: only the newest 148 samples are in the window", () => {
+    test("the ring evicts: only the newest 204 samples are in the window", () => {
         const o = armed();
         feed(o, Array.from({ length: 300 }, () => 33)); // fill with a steady cadence
         feed(o, Array.from({ length: STATS_WINDOW_FRAMES }, () => 20)); // then replace it whole
@@ -148,7 +149,7 @@ describe("window ranks — a percentile is printed only when its rank is an obse
 describe("drawing — no path state leaks between redraws", () => {
     test("the background fill sees ONLY the background subpath, on every redraw", () => {
         const o = armed();
-        feed(o, Array.from({ length: 148 }, (_, i) => 33 + (i % 7)));
+        feed(o, Array.from({ length: 204 }, (_, i) => 33 + (i % 7)));
         const ctx = new RecordingCtx();
         // Three redraws through ONE context: the bug only appears from the second onward,
         // because the first starts with an empty path.
@@ -156,7 +157,7 @@ describe("drawing — no path state leaks between redraws", () => {
             ctx.reset();
             o.drawInto(ctx.asCtx());
             expect(ctx.fills.length).toBeGreaterThanOrEqual(2);
-            expect(ctx.fills[0]).toEqual([{ op: "roundRect", args: [0, 0, 160, 90, 4] }]);
+            expect(ctx.fills[0]).toEqual([{ op: "roundRect", args: [0, 0, 216, 90, 4] }]);
         }
     });
 
@@ -204,7 +205,7 @@ describe("graph geometry — the newest sample never moves", () => {
         }
         // One and only one x for the newest sample, whatever the fill level: a left-anchored
         // trace would walk it across the panel while the window fills.
-        expect([...seen]).toEqual([153]);
+        expect([...seen]).toEqual([209]);
     });
 
     test("the oldest sample walks in from the right as the window fills, one column per frame", () => {
@@ -215,11 +216,11 @@ describe("graph geometry — the newest sample never moves", () => {
             return ctx.strokes[ctx.strokes.length - 1][0].args[0];
         };
         feed(o, [33, 33]);
-        expect(oldestX()).toBe(152);
+        expect(oldestX()).toBe(208);
         feed(o, Array.from({ length: 10 }, () => 33));
-        expect(oldestX()).toBe(142);
+        expect(oldestX()).toBe(198);
         feed(o, Array.from({ length: 500 }, () => 33));
-        expect(oldestX()).toBe(153 - (STATS_WINDOW_FRAMES - 1)); // 6 = the plot's left edge
+        expect(oldestX()).toBe(209 - (STATS_WINDOW_FRAMES - 1)); // 6 = the plot's left edge
     });
 
     test("all n samples are plotted — nothing is decimated or smoothed", () => {
@@ -244,7 +245,7 @@ describe("scale — legible, and never clipping a real excursion", () => {
 
     test("a sub-frame wobble at 30fps is not stretched over the full height", () => {
         const o = armed();
-        for (let i = 0; i < 148; i++) o.updateMetrics(i % 2 === 0 ? 33.3 : 33.4);
+        for (let i = 0; i < 204; i++) o.updateMetrics(i % 2 === 0 ? 33.3 : 33.4);
         const [lo, hi] = bounds(o);
         // Data spans ~0.03 fps; the axis must be far wider than that, and printed.
         expect(hi - lo).toBeGreaterThanOrEqual(30 * 0.25);
@@ -265,7 +266,7 @@ describe("scale — legible, and never clipping a real excursion", () => {
 
     test("the axis is stable while the data stays inside it (hysteresis on the SCALE only)", () => {
         const o = armed();
-        feed(o, Array.from({ length: 148 }, () => 33.3));
+        feed(o, Array.from({ length: 204 }, () => 33.3));
         const first = scaleLabel(o);
         for (let i = 0; i < 20; i++) {
             o.updateMetrics(33.3 + (i % 5) * 0.05);

@@ -920,9 +920,10 @@ export class WebGPUBackend implements RenderBackend {
             this.statsBindGroup = null;
         }
 
-        // Compute NDC coordinates for a 160×90 quad at top-right with 8px margin
-        const overlayW = 160;
-        const overlayH = 90;
+        // NDC quad at top-right with 8px margin, sized by the panel the overlay drew.
+        const overlayW = this.statsTexture?.width ?? 0;
+        const overlayH = this.statsTexture?.height ?? 0;
+        if (!overlayW || !overlayH) return;
         const marginX = 8;
         const marginY = 8;
 
