@@ -343,3 +343,10 @@ test("GetKerningPairsA/W report zero kerning pairs instead of failing", () => {
     expect(exports['GetKerningPairsA']!({}, mem, [0, 0, 0])).toBe(0);
     expect(exports['GetKerningPairsW']!({}, mem, [0, 0, 0])).toBe(0);
 });
+
+test("unhinted and unknown format flags fail instead of returning an untransformed approximation", () => {
+    const { mem, exports } = setupThunks();
+    for (const flag of [0x100, 0x200]) {
+        expect(exports['GetGlyphOutlineW']!({}, mem, [0, 65, GGO_BITMAP | flag, 0x100, 0, 0, 0])).toBe(GDI_ERROR);
+    }
+});

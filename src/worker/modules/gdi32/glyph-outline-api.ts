@@ -20,7 +20,6 @@ export function registerGlyphOutlineExports(exports: Record<string, ThunkImpleme
     }
 
     const GLYPHMETRICS_SIZE = 20;
-    const GGO_GLYPH_INDEX = 0x0080;
 
     /** A FIXED (wingdi.h) at `addr`: a 16.16 value, low word fractional, high word integer. */
     function readFixed(view: DataView, addr: number): number {
@@ -63,7 +62,7 @@ export function registerGlyphOutlineExports(exports: Record<string, ThunkImpleme
         const lpmat2 = args[6]!;
         const GDI_ERROR = 0xFFFFFFFF;
 
-        if ((uFormat & GGO_GLYPH_INDEX) !== 0) return GDI_ERROR;
+        if ((uFormat & ~0x0f) !== 0) return GDI_ERROR;
         if (lpmat2) {
             if (!isValidAddress(mem, lpmat2, 16, 'r')) return GDI_ERROR;
             if (!isIdentityMat2(mem, lpmat2)) return GDI_ERROR;
