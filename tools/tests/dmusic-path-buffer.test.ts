@@ -76,16 +76,20 @@ function riff(): Uint8Array {
 
     test("an audio path hands back its own DirectSound buffer for DMUS_PATH_BUFFER, and frees it with the path", () => {
         const released: number[] = [];
-        let made = 0;
+        let made = 0, plays = 0, locks = 0;
         const dsound = { exports: {
             directsoundcreate: (_c: unknown, _m: unknown, a: number[]) => { Mem.writeUint32(a[1]!, 0x7000); return 0; },
             idirectsound8_createsoundbuffer: (_c: unknown, _m: unknown, a: number[]) => { made++; Mem.writeUint32(a[2]!, 0x7100); return 0; },
+            idirectsoundbuffer8_getcaps: (_c: unknown, _m: unknown, a: number[]) => { Mem.writeUint32(a[1]! + 8, 4096); return 0; },
+            idirectsoundbuffer8_play: () => { plays++; return 0; },
+            idirectsoundbuffer8_lock: () => { locks++; return E_FAIL; },
+            idirectsoundbuffer8_stop: () => 0,
             IDirectSoundBuffer8_QueryInterface: (_c: unknown, _m: unknown, a: number[]) => { Mem.writeUint32(a[2]!, a[0]!); return 0; },
             IDirectSoundBuffer8_Release: (_c: unknown, _m: unknown, a: number[]) => { released.push(a[0]!); return 0; },
             IDirectSound8_Release: () => 0,
         } };
         internals.process.getModule = (name: string) => (name === "dsound" ? dsound : undefined);
-        const {ptr: perf} = make<PerformanceObject>(CLSID_DirectMusicPerformance);
+        const {ptr: perf, obj: performance} = make<PerformanceObject>(CLSID_DirectMusicPerformance);
         const PP = 0x640, GUID_NULL = 0x660, IID = 0x680;
         expect(call("IDirectMusicPerformance8_CreateStandardAudioPath", [perf, 8, 2, 1, PP])).toBe(0);
         const path = Mem.readUint32(PP)!;
@@ -94,9 +98,18 @@ function riff(): Uint8Array {
         expect(Mem.readUint32(0x6a0)).toBe(0x7100);
         expect(get(0x6000)).toBe(0); // the same buffer every time
         expect(made).toBe(1);
+        expect(plays).toBe(0); expect(locks).toBe(0);
+        expect(internals.pathOutputs.size).toBe(0); expect(internals.pumpTimer).toBeNull();
         expect(get(0x6000, 1)).not.toBe(0); // a path has one buffer
         expect(get(0x3000)).not.toBe(0);    // performance stage: nothing to hand back
         expect(Mem.readUint32(0x6a0)).toBe(0);
+        performance.engine = new Performance(new DlsSynth(22050, 2));
+        const segment = make<SegmentObject>(CLSID_DirectMusicSegment);
+        segment.obj.segment = PerfSegment.fromWave({ channels: [new Float32Array(22050)], rate: 22050, frames: 22050 });
+        expect(call("IDirectMusicPerformance8_PlaySegmentEx", [perf, segment.ptr, 0, 0, 0x80, 0, 0, 0, 0, path])).toBe(0);
+        expect(made).toBe(1); expect(plays).toBe(1);
+        expect(internals.pathOutputs.size).toBe(1); expect(internals.pumpTimer).not.toBeNull();
+        expect((rp.getComObjectByAddress(path) as any).sink).not.toBeNull();
         const obj = rp.getComObjectByAddress(path) as DMusicObject;
         obj.forceRelease();
         expect(released).toContain(0x7100);
