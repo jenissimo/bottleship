@@ -18,7 +18,7 @@
  */
 
 import type { HarnessService } from "../service";
-import { createJitPublicationCapture } from "../jit-publications";
+import { createJitPublicationCapture, readJitBlockMap } from "../jit-publications";
 import { cpu } from "../serialize";
 import { aotCache } from "../../core/cpu/aot-cache";
 
@@ -163,18 +163,35 @@ export function registerCodegenCommands(svc: HarnessService): void {
         })) };
     });
     let publications: ReturnType<typeof createJitPublicationCapture> | undefined;
+    // The block map is a v86 switch the capture turned on; it goes off with the capture.
+    const blockMapOff = () => cpu()?.wm?.exports?.jit_block_map_set_enabled?.(0);
+    /**
+     * jitPublications(action, options) — journal of every module v86 publishes (bytes, table slot,
+     * publication order). `arm {blockMap:true}` also records each module's block map (guest block
+     * address, instruction count, body byte range): the input to executed-density joins with
+     * guestBlocks (tools/bench-v86/jit-exec-density.mjs). Only modules compiled AFTER arming are
+     * captured, so arm before the code of interest is (re)compiled.
+     */
     svc.register("jitPublications", async (args) => {
         const [action, options] = args;
         const g = globalThis as any;
         switch (action) {
-            case "arm":
-                if (cpu()?.["jit_publication_capture_version"] !== 1) throw new Error('Loaded v86 lacks publication hook; rebuild JS and reload worker');
+            case "arm": {
+                const c = cpu();
+                if (c?.["jit_publication_capture_version"] !== 1) throw new Error('Loaded v86 lacks publication hook; rebuild JS and reload worker');
                 if (publications || g.__jitPublicationCapture) throw new Error('Clear previous JIT capture first');
-                publications = createJitPublicationCapture((options ?? {}) as any);
+                const { blockMap, ...limits } = (options ?? {}) as { blockMap?: boolean; maxRecords?: number; maxBytes?: number };
+                const w = c.wm?.exports;
+                if (blockMap && typeof w?.jit_block_map_set_enabled !== 'function') throw new Error('Loaded v86 lacks jit_block_map_*; rebuild vendor/v86 (build-wasm.sh)');
+                publications = createJitPublicationCapture(limits,
+                    blockMap ? () => readJitBlockMap(w, c.wasm_memory.buffer) : undefined);
+                if (blockMap) w.jit_block_map_set_enabled(1);
                 g.__jitPublicationCapture = publications;
                 return publications.status();
+            }
             case "seal":
                 publications?.seal();
+                blockMapOff();
                 if (g.__jitPublicationCapture === publications) g.__jitPublicationCapture = undefined;
                 return publications?.status() ?? null;
             case "export":
@@ -182,6 +199,7 @@ export function registerCodegenCommands(svc: HarnessService): void {
                 return publications.export();
             case "clear":
                 publications?.seal();
+                blockMapOff();
                 if (g.__jitPublicationCapture === publications) g.__jitPublicationCapture = undefined;
                 publications = undefined;
                 return { cleared: true };
