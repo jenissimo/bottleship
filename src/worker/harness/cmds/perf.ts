@@ -29,7 +29,7 @@ import { cpu, sys, symbolize, proc } from "../serialize";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { type FrameTail } from "../../core/frame-time-distribution";
 import { dbg, type FastmemStats } from "../../core/debug/dbg-commands";
-import { guestCodeInvalidationStats } from "../../core/memory/guest-code";
+import { guestCodeInvalidationStats, invalidateAllGuestCode } from "../../core/memory/guest-code";
 import { getWasmGrowthStats } from "../../core/cpu/cpu-views";
 import { hypercallDataManager } from "../../core/cpu/hypercall-data";
 import { compareScenes, probeScene, type SceneProbe } from "./scene";
@@ -1730,27 +1730,31 @@ class EipHistogram {
 export function exitSiteSupported(ex: TraceExports | undefined): boolean {
     return typeof ex?.set_jit_exit_site_sampling === "function"
         && typeof ex?.get_jit_exit_site_sampling === "function"
-        && typeof ex?.jit_exit_site_eip === "function"
-        && typeof ex?.jit_clear_cache_js === "function";
+        && typeof ex?.jit_exit_site_eip === "function";
 }
 
+// @transient(harness measurement window lock; restored in finally, never part of a guest snapshot)
 let exitSiteWindowOpen = false;
 
 /** Run `body` with exit-site sampling compiled in. The switch shapes generated code, so it
  *  only reaches modules compiled after it flips: clear, let the hot set recompile for
  *  `warmupMs`, and on the way out restore the previous state and clear again so the session
  *  goes back to the code it was running. One window at a time — a second caller would
- *  restore the switch under the first. */
-export async function withExitSiteSampling<T>(ex: TraceExports, warmupMs: number, body: () => Promise<T>): Promise<T> {
+ *  restore the switch under the first. The full clear goes through guest-code.ts, the one owner
+ *  of JIT invalidation; tests pass their own. */
+export async function withExitSiteSampling<T>(
+    ex: TraceExports, warmupMs: number, body: () => Promise<T>,
+    clearAll: () => boolean = invalidateAllGuestCode,
+): Promise<T> {
     if (exitSiteWindowOpen) throw new HarnessError("an exit-site eipProfile window is already open", HarnessErrorCode.INTERNAL);
     exitSiteWindowOpen = true;
     const prev = ex.get_jit_exit_site_sampling() >>> 0;
     try {
-        if (prev !== 1) { ex.set_jit_exit_site_sampling(1); ex.jit_clear_cache_js(); }
+        if (prev !== 1) { ex.set_jit_exit_site_sampling(1); clearAll(); }
         if (warmupMs > 0) await new Promise((r) => setTimeout(r, warmupMs));
         return await body();
     } finally {
-        if (prev !== 1) { ex.set_jit_exit_site_sampling(prev); ex.jit_clear_cache_js(); }
+        if (prev !== 1) { ex.set_jit_exit_site_sampling(prev); clearAll(); }
         exitSiteWindowOpen = false;
     }
 }
