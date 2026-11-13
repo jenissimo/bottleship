@@ -16,18 +16,17 @@ import { wgbEtag } from "./wgb-etag";
  *   BS_AUTH_REALM  realm shown in the browser prompt (default "BottleShip")
  */
 import path from "path";
-import { realpathSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { createHash, timingSafeEqual } from "node:crypto";
 
 const DIST = path.resolve(process.env.BS_DIST_DIR ?? path.join(import.meta.dir, "..", "dist"));
 const APPS = process.env.BS_APPS_DIR ? path.resolve(process.env.BS_APPS_DIR) : null;
 // Symlinks resolved once: the mount itself may be one, but nothing inside it may point out.
-const APPS_REAL = APPS ? resolveDir(APPS) : null;
+const APPS_REAL = APPS ? await resolveDir(APPS) : null;
 
-function resolveDir(dir: string): string {
+async function resolveDir(dir: string): Promise<string> {
     try {
-        return realpathSync(dir);
+        return await realpath(dir);
     } catch {
         console.error(`BS_APPS_DIR "${dir}" does not exist or cannot be read`);
         process.exit(1);

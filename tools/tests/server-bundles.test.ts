@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -8,6 +8,16 @@ const root = mkdtempSync(path.join(tmpdir(), "bs-server-"));
 const dist = path.join(root, "dist");
 const apps = path.join(root, "apps");
 const outside = path.join(root, "outside.txt");
+
+const canSymlink = (() => {
+    const target = path.join(root, "link-target"), link = path.join(root, "link-probe");
+    writeFileSync(target, "probe");
+    try { symlinkSync(target, link); return true; }
+    catch (error) {
+        if (!["EPERM", "EACCES", "ENOSYS", "ENOTSUP"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+        return false;
+    } finally { rmSync(link, { force: true }); rmSync(target, { force: true }); }
+})();
 
 beforeAll(() => {
     mkdirSync(path.join(dist, "assets"), { recursive: true });
@@ -20,9 +30,9 @@ beforeAll(() => {
     writeFileSync(path.join(apps, "page.html"), "<script>alert(1)</script>");
     writeFileSync(path.join(apps, "notes.txt"), "not a bundle");
     writeFileSync(outside, "secret");
-    symlinkSync(outside, path.join(apps, "escape.wgb"));
-    symlinkSync(path.join(apps, "ok.wgb"), path.join(apps, "alias.wgb"));
-    symlinkSync(path.join(apps, "page.html"), path.join(apps, "htmllink.wgb"));
+    if (canSymlink) symlinkSync(outside, path.join(apps, "escape.wgb"));
+    if (canSymlink) symlinkSync(path.join(apps, "ok.wgb"), path.join(apps, "alias.wgb"));
+    if (canSymlink) symlinkSync(path.join(apps, "page.html"), path.join(apps, "htmllink.wgb"));
     mkdirSync(path.join(apps, "dir.wgb"));
 });
 
@@ -62,7 +72,7 @@ async function start(env: Record<string, string> = {}): Promise<Running> {
     running.push(r);
     return r;
 }
-afterAll(async () => { for (const r of running) await r.stop(); });
+afterAll(async () => { try { for (const r of running) await r.stop(); } finally { rmSync(root, { recursive: true, force: true }); } });
 
 describe("/apps", () => {
     test("serves a bundle, inert if opened as a page, with Range", async () => {
@@ -82,7 +92,7 @@ describe("/apps", () => {
         expect((await fetch(base + "/apps/page.html")).status).toBe(404);
         expect((await fetch(base + "/apps/notes.txt")).status).toBe(404);
     });
-    test("a symlink out of the folder is not followed; one inside is", async () => {
+    test.skipIf(!canSymlink)("a symlink out of the folder is not followed; one inside is", async () => {
         const { base } = await start();
         const esc = await fetch(base + "/apps/escape.wgb");
         expect(esc.status).toBe(404);
@@ -104,7 +114,7 @@ describe("/apps", () => {
         expect(r.headers.get("content-security-policy")).toBe("sandbox");
         expect(r.headers.get("content-disposition")).toBe("attachment");
     });
-    test("a link named .wgb that points at another file type is not served, however it is requested", async () => {
+    test.skipIf(!canSymlink)("a link named .wgb that points at another file type is not served, however it is requested", async () => {
         const { base } = await start();
         for (const p of ["/apps/htmllink.wgb", "/%61pps/htmllink.wgb"]) {
             const r = await fetch(base + p);
