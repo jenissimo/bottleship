@@ -5,6 +5,7 @@ import { combaseModule } from "../api/combase.api";
 import { shcoreModule } from "../api/shcore.api";
 import { kernelbaseModule } from "../api/kernelbase.api";
 import { lgvidModule } from "../api/lgvid.api";
+import { avicap32Module } from '../api/avicap32.api';
 import { oledlgModule } from "../api/oledlg.api";
 import { dnsapiModule } from "../api/dnsapi.api";
 import { winhttpModule } from "../api/winhttp.api";
@@ -96,6 +97,7 @@ export class APIRegistry {
         this.registerModule(kernelbaseModule);
         this.registerModule(lgvidModule);
         this.registerModule(oledlgModule);
+        this.registerModule(avicap32Module);
         this.registerModule(dnsapiModule);
         this.registerModule(winhttpModule);
         this.registerModule(msiModule);
