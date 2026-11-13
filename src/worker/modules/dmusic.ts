@@ -1344,8 +1344,16 @@ export class DMusic implements IModule {
             if (!perf || !seg) return E_POINTER;
             if (!perf.engine) return DMUS_E_NOT_INIT;
             if (!seg.segment) return E_FAIL;
-            const state = perf.engine.playSegment(seg.segment, flags >>> 0);
             const path = pathPtr ? this.object<AudioPathObject>(pathPtr) : null;
+            if (pathPtr && !(path instanceof AudioPathObject)) return E_INVALIDARG;
+            const state = perf.engine.playSegment(seg.segment, flags >>> 0);
+            if (state) {
+                if (!path) {
+                    perf.defaultAudioPath ??= new AudioPathObject();
+                    perf.defaultAudioPath.performance ??= perf;
+                }
+                state.audioPath = path ?? perf.defaultAudioPath;
+            }
             if (state && seg.segment.wave && path instanceof AudioPathObject && this.ensurePathOutput(path)) state.output = path;
             if (state) this.holdStateSegment(this.stateObject(perf, state), seg);
             return this.publishState(perf, state, seg, ppState);
@@ -1379,15 +1387,13 @@ export class DMusic implements IModule {
             if (!a[1]) {
                 perf.engine?.stop(null, null, flags);
             } else if (target instanceof AudioPathObject) {
-                for (const state of perf.engine?.statesOnOutput(target) ?? []) {
-                    if (state.output === target) perf.engine?.stop(null, state, flags);
+                for (const state of perf.engine?.statesOnAudioPath(target) ?? []) {
+                    perf.engine?.stop(null, state, flags);
                 }
             } else if (target instanceof SegmentObject) {
                 if (target.segment) perf.engine?.stop(target.segment, null, flags);
             } else if (target instanceof SegmentStateObject) {
                 if (target.state) perf.engine?.stop(null, target.state, flags);
-            } else {
-                return E_INVALIDARG;
             }
             this.releaseEndedStates(perf);
             return S_OK;

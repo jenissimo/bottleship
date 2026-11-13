@@ -500,6 +500,7 @@ describe("dmusic with music playing", () => {
         expect(primary2!.state!.parts.map(p => p.variation)).toEqual(s.primary.state!.parts.map(p => p.variation));
         expect(sting2!.state!.pattern).toBe(motif2!.segment!.fixedPattern!.pattern);
         expect(effect2!.state!.output).toBe(path2);
+        expect(effect2!.state!.audioPath).toBe(path2);
         expect(effect2!.state!.wavePosition).toBe(s.effect.state!.wavePosition);
         for (const [b, l] of [[primary2, s.primary], [effect2, s.effect], [sting2, s.sting], [queued2, s.queued]] as const) {
             expect(BaseComObject.captureComBase(b!)).toEqual(BaseComObject.captureComBase(l));
@@ -597,6 +598,8 @@ describe("dmusic saved fields of the playing objects", () => {
     test("every saved value of a port, a performance, a segment state, an audio path and the module comes back", () => {
         scene();
         const snap = capture();
+        const pathState = (s: Snapshot): SavedAudioPath => s.objects.find(([tag, data]) =>
+            tag === "dmusic-audiopath" && (data as unknown as SavedAudioPath).sink !== null)![1] as unknown as SavedAudioPath;
         const edit = (change: (s: Snapshot) => void, check?: (back: { roots: DMusicObject[] }) => void): void => {
             const copy: Snapshot = { ...structuredClone({ objects: snap.objects, section: snap.section }), blobs: snap.blobs, refs: snap.refs };
             change(copy);
@@ -615,7 +618,7 @@ describe("dmusic saved fields of the playing objects", () => {
         edit((s) => { of<SavedPort>(s, "dmusic-port").sink = null; });
         for (const key of ["bufferBytes", "scratch", "writeOffset", "silentBytes"] as const) {
             edit((s) => { of<SavedPort>(s, "dmusic-port").sink![key] += 4; });
-            edit((s) => { of<SavedAudioPath>(s, "dmusic-audiopath").sink![key] += 4; });
+            edit((s) => { pathState(s).sink![key] += 4; });
         }
         edit((s) => { of<SavedPort>(s, "dmusic-port").sink!.playing = false; });
         edit((s) => { of<SavedPort>(s, "dmusic-port").synth.masterGain = 0.25; });
@@ -627,9 +630,10 @@ describe("dmusic saved fields of the playing objects", () => {
             expect(restoredOf(back, PerformanceObject).directMusic).toBeNull();
         });
         edit((s) => { of<SavedPerformance>(s, "dmusic-performance").engine!.now += 1; });
-        for (const key of ["pathType", "buffer", "channels"] as const) edit((s) => { of<SavedAudioPath>(s, "dmusic-audiopath")[key] += 1; });
-        edit((s) => { of<SavedAudioPath>(s, "dmusic-audiopath").performance = -1; });
+        for (const key of ["pathType", "buffer", "channels"] as const) edit((s) => { pathState(s)[key] += 1; });
+        edit((s) => { pathState(s).performance = -1; });
         edit((s) => { of<SavedSegmentState>(s, "dmusic-segment-state").state!.grooveLevel += 1; });
+        edit((s) => { of<SavedSegmentState>(s, "dmusic-segment-state").state!.audioPath = -1; });
         edit((s) => { of<SavedSegmentState>(s, "dmusic-segment-state", 3).performance = -1; });
         edit((s) => { s.section.pumpTimer += 1; });
         edit((s) => { s.section.messages[0]![0] += 8; });
@@ -666,7 +670,7 @@ describe("dmusic saved fields of the playing objects", () => {
             .toEqual(keys(SYNTH_VOICE_FIELDS).filter(k => k !== "channel" && k !== "region"));
         expect(Object.keys(port.sink!).sort()).toEqual(keys(SINK_FIELDS));
         expect(Object.keys(of<SavedPort>(capture(), "dmusic-port")).sort()).toEqual(DMUSIC_SCHEMA.savedPort);
-        expect(savestateParticipants.schemas().dmusic).toEqual({ version: 5, schemaHash: "2c7000ebe28c598d" });
+        expect(savestateParticipants.schemas().dmusic).toEqual({ version: 6, schemaHash: "72276d60aaf8fa66" });
     });
 });
 
@@ -753,6 +757,9 @@ describe("dmusic object lifetimes", () => {
             flags.__savestates = saving;
             const c = content();
             const { perf, port } = audio();
+            // Include the lazily created default path in the baseline allocation count.
+            call("IDirectMusicPerformance8_GetDefaultAudioPath", [ptrOf(perf), OUT]);
+            at<AudioPathObject>(view().getUint32(OUT, true)).release();
             const composer = make<ComposerObject>(CLSID_DirectMusicComposer);
             expect(call("IDirectMusicStyle8_GetDefaultBand", [ptrOf(c.race), OUT])).toBe(0);
             const band = at<DMusicObject>(view().getUint32(OUT, true));

@@ -74,29 +74,55 @@ function riff(): Uint8Array {
 }
 
 
-    test("StopEx on an audio path stops only what plays on that path; an empty target stops nothing", () => {
-        const {obj: perf, ptr: perfPtr} = make<PerformanceObject>(CLSID_DirectMusicPerformance);
-        const stops: unknown[][] = [];
-        (perf as any).engine = { stop: (seg: unknown, state: unknown, flags: number) => stops.push([seg, state, flags]) };
-        const PP = 0x640;
-        call("IDirectMusicPerformance8_CreateStandardAudioPath", [perfPtr, 8, 2, 1, PP]);
-        const pathA = Mem.readUint32(PP)!;
-        call("IDirectMusicPerformance8_CreateStandardAudioPath", [perfPtr, 8, 2, 1, PP]);
-        const pathB = Mem.readUint32(PP)!;
-        const a = rp.getComObjectByAddress(pathA) as any, b = rp.getComObjectByAddress(pathB) as any;
-        objects.push(a, b);
-        const s1 = { id: 1, output: a }, s2 = { id: 2, output: b }, s3 = { id: 3, output: a };
-        (perf.engine as any).statesOnOutput = (path: unknown) => [s1, s2, s3].filter(state => state.output === path);
 
-        expect(call("IDirectMusicPerformance8_StopEx", [perfPtr, pathA, 0, 0, 0x40])).toBe(0);
-        expect(stops).toEqual([[null, s1, 0x40], [null, s3, 0x40]]);
-
-        stops.length = 0;
-        const {ptr: unloaded} = make<SegmentObject>(CLSID_DirectMusicSegment); // nothing loaded behind it
-        expect(call("IDirectMusicPerformance8_StopEx", [perfPtr, unloaded, 0, 0, 0])).toBe(0);
-        expect(call("IDirectMusicPerformance8_Stop", [perfPtr, unloaded, 0, 0, 0])).toBe(0);
-        expect(stops).toEqual([]);
-
-        expect(call("IDirectMusicPerformance8_StopEx", [perfPtr, 0, 0, 0, 0])).toBe(0);
-        expect(stops).toEqual([[null, null, 0]]);
+for (const type of [8, 4]) {
+    test(`PlaySegmentEx tracks non-wave segments on path type ${type}`, () => {
+        const { obj: perf, ptr } = make<PerformanceObject>(CLSID_DirectMusicPerformance);
+        perf.engine = new Performance(new DlsSynth(22050, 2));
+        const path = (kind: number) => {
+            call("IDirectMusicPerformance8_CreateStandardAudioPath", [ptr, kind, 2, 1, 0x640]);
+            const address = Mem.readUint32(0x640)!;
+            const obj = rp.getComObjectByAddress(address) as DMusicObject; objects.push(obj);
+            return { address, obj };
+        };
+        const a = path(type), b = path(type);
+        const play = (output: number) => {
+            const segment = make<SegmentObject>(CLSID_DirectMusicSegment);
+            segment.obj.segment = new PerfSegment(); segment.obj.segment.length = 3072;
+            expect(call("IDirectMusicPerformance8_PlaySegmentEx", [ptr, segment.ptr, 0, 0, 0x80, 0, 0, 0, 0, output])).toBe(0);
+            return segment.obj.segment;
+        };
+        const first = play(a.address), other = play(b.address), third = play(a.address);
+        perf.engine.render(new Float32Array(16), new Float32Array(16), 16);
+        expect(perf.engine.statesOnAudioPath(a.obj)).toHaveLength(2);
+        expect(perf.engine.statesOnAudioPath(a.obj).every(s => s.output === null)).toBe(true);
+        expect(call("IDirectMusicPerformance8_StopEx", [ptr, a.address, 0, 0, 0])).toBe(0);
+        expect(perf.engine.isPlaying(first, null)).toBe(false);
+        expect(perf.engine.isPlaying(third, null)).toBe(false);
+        expect(perf.engine.isPlaying(other, null)).toBe(true);
+        expect(perf.engine.statesOnAudioPath(a.obj)).toHaveLength(0);
+        expect(call("IDirectMusicPerformance8_StopEx", [ptr, 0xdead, 0, 0, 0])).toBe(0);
+        const unloaded = make<SegmentObject>(CLSID_DirectMusicSegment);
+        expect(call("IDirectMusicPerformance8_StopEx", [ptr, unloaded.ptr, 0, 0, 0])).toBe(0);
+        expect(call("IDirectMusicPerformance8_Stop", [ptr, unloaded.ptr, 0, 0, 0])).toBe(0);
+        expect(perf.engine.isPlaying(other, null)).toBe(true);
+        expect(call("IDirectMusicPerformance8_StopEx", [ptr, 0, 0, 0, 0])).toBe(0);
+        expect(perf.engine.isPlaying(other, null)).toBe(false);
     });
+}
+
+test("a null PlaySegmentEx path is owned by the default audio path", () => {
+    const { obj: perf, ptr } = make<PerformanceObject>(CLSID_DirectMusicPerformance);
+    perf.engine = new Performance(new DlsSynth(22050, 2));
+    const segment = make<SegmentObject>(CLSID_DirectMusicSegment);
+    segment.obj.segment = new PerfSegment(); segment.obj.segment.length = 3072;
+    expect(call("IDirectMusicPerformance8_PlaySegmentEx", [ptr, segment.ptr, 0, 0, 0x80, 0, 0, 0, 0, 0])).toBe(0);
+    call("IDirectMusicPerformance8_GetDefaultAudioPath", [ptr, 0x640]);
+    const path = Mem.readUint32(0x640)!;
+    objects.push(rp.getComObjectByAddress(path) as DMusicObject);
+    perf.engine.render(new Float32Array(16), new Float32Array(16), 16);
+    expect(perf.engine.isPlaying(segment.obj.segment, null)).toBe(true);
+    expect(perf.engine.statesOnAudioPath(perf.defaultAudioPath!)).toHaveLength(1);
+    expect(call("IDirectMusicPerformance8_StopEx", [ptr, path, 0, 0, 0])).toBe(0);
+    expect(perf.engine.isPlaying(segment.obj.segment, null)).toBe(false);
+});

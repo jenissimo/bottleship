@@ -148,7 +148,7 @@ export const ENGINE_FIELDS = {
 export const ENGINE_STATE_FIELDS = {
     segment: 'save', primary: 'save', startTime: 'save', base: 'save', repeatsLeft: 'save', started: 'save', ended: 'save',
     queued: 'save', fresh: 'save', stopAt: 'save', pattern: 'save', patternStyle: 'save', patternStart: 'save', patternEnd: 'save',
-    parts: 'save', sequentialVariation: 'save', grooveLevel: 'save', wavePosition: 'save', output: 'save',
+    parts: 'save', sequentialVariation: 'save', grooveLevel: 'save', wavePosition: 'save', output: 'save', audioPath: 'save',
 } as const satisfies Record<string, FieldPolicy>;
 
 export const SYNTH_FIELDS = {
@@ -234,7 +234,7 @@ export const DMUSIC_SCHEMA = {
     savedEngineState: stateKeys<PerfSegmentStateData>({
         primary: true, startTime: true, base: true, repeatsLeft: true, started: true, ended: true, queued: true, fresh: true, stopAt: true,
         patternStyle: true, pattern: true, patternStart: true, patternEnd: true, variations: true, sequentialVariation: true,
-        grooveLevel: true, wavePosition: true, output: true,
+        grooveLevel: true, wavePosition: true, output: true, audioPath: true,
     }),
     patternIndex: '-1 none, -2 the segment\'s fixed pattern, else an index into the segment\'s styles / the style\'s patterns',
     savedSynth: stateKeys<SynthData>({ masterGain: true, noteCounter: true, stats: true, channels: true, voices: true }),
@@ -627,7 +627,7 @@ export function registerDMusicCodecs(host: DMusicHost): void {
 export function registerDMusicParticipant(host: DMusicHost): () => void {
     registerDMusicCodecs(host);
     return savestateParticipants.add({
-        id: 'dmusic', version: 5, order: 64, covers: ['dmusic'], schema: DMUSIC_SCHEMA as unknown as SaveValue,
+        id: 'dmusic', version: 6, order: 64, covers: ['dmusic'], schema: DMUSIC_SCHEMA as unknown as SaveValue,
         capture: (ctx): SaveValue => {
             const refusal = host.idleRefusal();
             if (refusal) throw new CaptureRefusal(refusal);
