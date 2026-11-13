@@ -1688,7 +1688,7 @@ export class WinMM implements IModule {
 
     registerSavestate(): () => void {
         return savestateParticipants.add({
-            id: 'winmm', version: 5, order: 63, covers: ['winmm'], schema: WINMM_SCHEMA as unknown as SaveValue,
+            id: 'winmm', version: 6, order: 63, covers: ['winmm'], schema: WINMM_SCHEMA as unknown as SaveValue,
             capture: (ctx) => {
                 let state: WinMMState;
                 try {

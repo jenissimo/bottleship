@@ -152,19 +152,6 @@ export function registerWinmmCapsExports(exports: Record<string, ThunkImplementa
     for (const name of ["midiConnect", "midiDisconnect"]) {
         exports[name] = () => MMSYSERR_INVALHANDLE;
     }
-    // The stream API is the same output device by another name.
-    exports["midiStreamOpen"] = (ctx, mem, args) => {
-        const phms = args[0] >>> 0;
-        if (phms && phms + 4 <= mem.length) {
-            new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(phms, 0, true);
-        }
-        return MMSYSERR_BADDEVICEID;
-    };
-    for (const name of ["midiStreamClose", "midiStreamOut", "midiStreamPause",
-                        "midiStreamPosition", "midiStreamProperty", "midiStreamRestart",
-                        "midiStreamStop"]) {
-        exports[name] = () => MMSYSERR_INVALHANDLE;
-    }
 
     // ==================== Mixer Functions ====================
 
