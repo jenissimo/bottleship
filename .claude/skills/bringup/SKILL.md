@@ -153,6 +153,10 @@ CLI invocation reconnects without it.
     number to quote. It arms at most 64 tier-2 pages (name others with `pages`/`ranges`) and
     slows the guest while armed. When `eipProfile` and `guestBlocks` disagree on a hot block,
     trust the counts.
+- Errors the user SEES in the browser console are not in the worker log stream.
+  `bun tools/harness.ts console <sec> [--all]` captures the page's and the emulator worker's
+  console (errors/warnings/uncaught exceptions) over a window, deduplicated by template with
+  the emitting frame. For errors tied to an action, start it in the background, then act.
 - A guest blocked on a **MessageBox** looks exactly like a freeze: the host draws it as DOM,
   so no canvas capture shows it and the one string naming the problem is invisible.
   `report().pendingModals` lists them (text, caption, how long it has waited);

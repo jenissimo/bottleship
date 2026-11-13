@@ -61,6 +61,7 @@ import { readdirSync } from "node:fs";
 import { readCanvasGeometry } from "./cdp-geometry";
 import { watchWorkerHealth, formatWorkerHealth } from "./cdp-worker-health";
 import { listCrashes, formatCrash } from "./cdp-crashes";
+import { watchConsole } from "./cdp-console";
 import { DEFAULT_TRACE_CATEGORIES } from "./cdp-core";
 import { applyDevice, tap, touchDrag, longPress, twoFingerTap, pinch, touchTimeline, pageShot, type TimelineFinger } from "./cdp-touch";
 import { hostClick, hostMove } from "./cdp-mouse";
@@ -947,6 +948,22 @@ async function cmdRegress(rest: string[]): Promise<void> {
 }
 
 /** reload — hard-reload the page (replaces cdp-reload; HMR is off, so reload to pick up worker edits). */
+/** `console [sec] [--all]` — the browser console of the page and the emulator worker over
+ *  a window (errors/warnings/exceptions; `--all` adds log/info), deduplicated by template.
+ *  Runtime.enable replays what the console already buffered, so earlier messages show too. */
+async function cmdConsole(args: string[]): Promise<void> {
+    const seconds = Number(args.find((a) => !a.startsWith("--")) ?? 5);
+    const levels = args.includes("--all")
+        ? new Set(["error", "warning", "assert", "log", "info", "debug"])
+        : undefined;
+    const session = await ensureSession();
+    const r = await watchConsole(session, seconds, { levels });
+    console.log(`console: ${r.total} message(s), ${r.templates.length} distinct, over ${seconds}s (+ buffered)`);
+    for (const t of r.templates.slice(0, 40)) {
+        console.log(`${String(t.count).padStart(6)}  [${t.realm}/${t.level}] ${t.sample.replace(/\s+/g, " ").slice(0, 400)}${t.where ? `  @ ${t.where}` : ""}`);
+    }
+}
+
 async function cmdReload(): Promise<void> {
     const session = await ensureSession();
     await reloadPageAndWait(session);
@@ -1011,9 +1028,10 @@ async function main(): Promise<void> {
         case "workers": await cmdWorkers(rest); break;
         case "crashes": await cmdCrashes(rest); break;
         case "reload": await cmdReload(); break;
+        case "console": await cmdConsole(rest); break;
         case "regress": await cmdRegress(rest); break;
         case undefined:
-            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png] [--mirror] [--verify]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|workers <sec> [--heap]|crashes [minutes]|reload|regress [--only <glob>]|device <profile>|tap <x> <y>|<any-harness-command> [args...] [--parent]>");
+            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png] [--mirror] [--verify]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|workers <sec> [--heap]|crashes [minutes]|console [sec] [--all]|reload|regress [--only <glob>]|device <profile>|tap <x> <y>|<any-harness-command> [args...] [--parent]>");
             process.exit(0);
             break;
         // Any other token is dispatched as a harness RPC command (report, stubs, backtrace,
