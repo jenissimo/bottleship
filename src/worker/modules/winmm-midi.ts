@@ -2,6 +2,7 @@ import { currentGmBank, gmBankAvailable, loadGmBank } from "../core/audio/gm-ban
 import { Logger, LogCategory } from "../core/logger";
 import { Mem } from "../core/memory/mem-accessor";
 import { System } from "../core/system";
+import { ThreadState } from "../core/scheduler/types";
 import { TimeService } from "../runtime/time";
 import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { pickDefined, type FieldPolicy } from "../savestate/participant";
@@ -138,6 +139,14 @@ export class WinmmMidiOut {
             case CALLBACK_EVENT:
                 if (h.callback) System.getInstance().scheduler.setEvent(h.callback);
                 break;
+            case CALLBACK_THREAD: {
+                const system = System.getInstance();
+                const thread = h.callback ? system.scheduler.getThreadStateById(h.callback) : null;
+                if (thread && thread.state !== ThreadState.TERMINATED) {
+                    system.windowManager.postMessage(0, message, h.handle, param1, 0, 0, h.callback, undefined, 0, false);
+                }
+                break;
+            }
         }
     }
 
