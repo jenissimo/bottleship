@@ -293,11 +293,57 @@ describe("Ctrl types control characters", () => {
         }, true);
     });
 
-    test("without Shift those three keys have no control character and type as before", () => {
+    test("without Shift those three keys have no control character and post nothing", () => {
         withCtrl((_r, char) => {
-            expect(char({ code: "Digit2", key: "2", keyCode: 0x32 })).toBe(0x32);
-            expect(char({ code: "Digit6", key: "6", keyCode: 0x36 })).toBe(0x36);
-            expect(char({ code: "Minus", key: "-", keyCode: 0xbd })).toBe(0x2d);
+            expect(char({ code: "Digit2", key: "2", keyCode: 0x32 })).toBeNull();
+            expect(char({ code: "Digit6", key: "6", keyCode: 0x36 })).toBeNull();
+            expect(char({ code: "Minus", key: "-", keyCode: 0xbd })).toBeNull();
+        });
+    });
+
+    const NO_COLUMN: Array<[string, Press]> = [
+        ["Ctrl+1", { code: "Digit1", key: "1", keyCode: 0x31 }],
+        ["Ctrl+0", { code: "Digit0", key: "0", keyCode: 0x30 }],
+        ["Ctrl+;", { code: "Semicolon", key: ";", keyCode: 0xba }],
+        ["Ctrl+=", { code: "Equal", key: "=", keyCode: 0xbb }],
+        ["Ctrl+,", { code: "Comma", key: ",", keyCode: 0xbc }],
+        ["Ctrl+.", { code: "Period", key: ".", keyCode: 0xbe }],
+        ["Ctrl+/", { code: "Slash", key: "/", keyCode: 0xbf }],
+        ["Ctrl+`", { code: "Backquote", key: "`", keyCode: 0xc0 }],
+        ["Ctrl+'", { code: "Quote", key: "'", keyCode: 0xde }],
+        ["Ctrl+Tab", { code: "Tab", key: "Tab", keyCode: 0x09 }],
+        ["Ctrl+Numpad5", { code: "Numpad5", key: "5", keyCode: 0x65 }],
+        ["Ctrl+Numpad*", { code: "NumpadMultiply", key: "*", keyCode: 0x6a }],
+    ];
+    for (const shift of [false, true]) {
+        test(`keys with no kbdus Ctrl column post nothing${shift ? " with Shift too" : ""}, whatever the host typed`, () => {
+            withCtrl((_r, char) => {
+                for (const [name, p] of NO_COLUMN) expect([name, char(p)]).toEqual([name, null]);
+            }, shift);
+        });
+    }
+
+    test("a host layout's printable text under Ctrl alone is not typed (German Ctrl+ü, Ctrl+ß, Ctrl+Shift+2 '\"')", () => {
+        withCtrl((_r, char) => {
+            expect(char({ code: "BracketLeft", key: "ü", keyCode: 0xba })).toBeNull();
+            expect(char({ code: "Minus", key: "ß", keyCode: 0xdb })).toBe(0x1b);
+            expect(char({ code: "KeyY", key: "z", keyCode: 0x5a })).toBe(0x1a);
+        });
+        withCtrl((_r, char) => {
+            expect(char({ code: "Digit2", key: "\"", keyCode: 0x32 })).toBe(0x00);
+            expect(char({ code: "Digit3", key: "§", keyCode: 0x33 })).toBeNull();
+        }, true);
+    });
+
+    test("AltGr text with Ctrl+Alt still posts the host character; without Ctrl the keys type as before", () => {
+        withCtrl((r, char, releaseCtrl) => {
+            const altGr = r.press({ code: "AltRight", key: "AltGraph", keyCode: VK_MENU, ctrl: true, alt: true, altGraph: true });
+            expect(char({ code: "KeyE", key: "€", keyCode: 0x45, alt: true, altGraph: true })).toBe(0x80);
+            expect(char({ code: "Digit2", key: "²", keyCode: 0x32, alt: true, altGraph: true })).toBe(0xb2);
+            r.release(altGr);
+            releaseCtrl();
+            expect(char({ code: "Digit1", key: "1", keyCode: 0x31 })).toBe(0x31);
+            expect(char({ code: "Tab", key: "Tab", keyCode: 0x09 })).toBe(0x09);
         });
     });
 
@@ -384,11 +430,40 @@ describe("ToAscii and ToUnicode honour Ctrl in the caller's key state", () => {
             expect(word()).toBe(0x0a);
         });
 
-        test(`${name}: Ctrl without Shift reads the Shift bit of the caller's state (Ctrl+2 is not 0x00)`, () => {
+        test(`${name}: Ctrl without Shift reads the Shift bit of the caller's state (Ctrl+2 types nothing, not 0x00)`, () => {
             state(true, false, false);
             mem[OUT] = 0xee; mem[OUT + 1] = 0xee;
-            expect(call(name, 0x32)).toBe(1);
-            expect(word()).toBe(0x32);
+            expect(call(name, 0x32)).toBe(0);
+            expect(word()).toBe(0xeeee);
+        });
+
+        test(`${name}: keys with no Ctrl column give 0 and write nothing, with and without Shift`, () => {
+            for (const shift of [false, true]) {
+                state(true, false, shift);
+                mem[OUT] = 0xee; mem[OUT + 1] = 0xee;
+                for (const vk of [0x31, 0x36, 0xbd, 0xba, 0xbc, 0xbf, 0xc0, 0xde, 0x09, 0x65]) {
+                    if (shift && (vk === 0x36 || vk === 0xbd)) continue;
+                    expect([vk, call(name, vk)]).toEqual([vk, 0]);
+                }
+                expect(word()).toBe(0xeeee);
+            }
+        });
+
+        test(`${name}: a held key's host text under Ctrl alone is not returned`, () => {
+            const r = rig();
+            const system = System.getInstance() as unknown as { inputManager: InputManager };
+            const saved = system.inputManager;
+            system.inputManager = r.im;
+            try {
+                r.press({ code: "BracketLeft", key: "ü", keyCode: 0xba });
+                state(true, false, false);
+                mem[OUT] = 0xee; mem[OUT + 1] = 0xee;
+                expect(exports[name]!({} as never, mem, name === "ToUnicode" ? [0xba, 0x1a, STATE, OUT, 4, 0] : [0xba, 0x1a, STATE, OUT, 0])).toBe(0);
+                expect(word()).toBe(0xeeee);
+                state(false, false, false);
+                expect(exports[name]!({} as never, mem, name === "ToUnicode" ? [0xba, 0x1a, STATE, OUT, 4, 0] : [0xba, 0x1a, STATE, OUT, 0])).toBe(1);
+                expect(word()).toBe(name === "ToUnicode" ? 0xfc : 0xfc);
+            } finally { system.inputManager = saved; }
         });
 
         test(`${name}: Ctrl in the caller's state wins over a held key's host character`, () => {
