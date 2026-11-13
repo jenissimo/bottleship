@@ -204,6 +204,8 @@ export class PerfSegmentState {
     grooveLevel = 0;
     wavePosition = 0;
     output: object | null = null;
+    /** Playback ownership, independent of where waveform samples are mixed. */
+    audioPath: object | null = null;
 
     constructor(segment: PerfSegment, primary: boolean, startTime: number) {
         this.segment = segment;
@@ -232,6 +234,7 @@ export interface PerfSegmentStateData {
     grooveLevel: number;
     wavePosition: number;
     output: number;
+    audioPath: number;
 }
 
 const NONE = -1;
@@ -263,6 +266,7 @@ export function capturePerfSegmentState(
         patternStyle, pattern, patternStart: s.patternStart, patternEnd: s.patternEnd,
         variations: s.parts.map((part) => part.variation), sequentialVariation: [...s.sequentialVariation],
         grooveLevel: s.grooveLevel, wavePosition: s.wavePosition, output: s.output ? outputRef(s.output) : NONE,
+        audioPath: s.audioPath ? outputRef(s.audioPath) : NONE,
     };
 }
 
@@ -300,6 +304,7 @@ export function linkPerfSegmentState(
 ): void {
     s.queued = d.queued === NONE ? null : stateOf(d.queued);
     s.output = d.output === NONE ? null : outputOf(d.output);
+    s.audioPath = d.audioPath === NONE ? null : outputOf(d.audioPath);
 }
 
 export interface PerformanceData {
@@ -545,6 +550,19 @@ export class Performance {
 
             this.now = t1;
             done += count;
+        }
+    }
+
+    statesOnAudioPath(path: object): readonly PerfSegmentState[] {
+        return this.states.filter(state => state.audioPath === path && !state.ended);
+    }
+
+    /** A released path must not remain reachable through live or queued states. */
+    forgetAudioPath(path: object): void {
+        for (const state of this.states) {
+            for (let current: PerfSegmentState | null = state; current; current = current.queued) {
+                if (current.audioPath === path) current.audioPath = null;
+            }
         }
     }
 
