@@ -17,7 +17,7 @@ import { System } from "../../core/system";
 import { Logger, LogCategory } from "../../core/logger";
 import { Mem } from "../../core/memory/mem-accessor";
 import { isValidAddress } from "../../core/memory/address-guard";
-import { getVirtualScreenRect, windows as sharedWindows } from "../../modules/user32/shared-state";
+import { virtualScreenHeight, virtualScreenWidth, windows as sharedWindows } from "../../modules/user32/shared-state";
 import { clearPresentedClientRect, setPresentedClientRect } from "../../backends/webgpu/shared/present-geometry";
 import { activateTopLevelWindow } from "../../modules/user32/activation-messages";
 
@@ -196,12 +196,12 @@ export function publishPresentedClient(hwnd: number): void {
     }
     setPresentedClientRect(x, y, win.width, win.height);
     if (!loggedOffScreenClients.has(hwnd >>> 0)) {
-        const screen = getVirtualScreenRect();
-        if (x < screen.left || y < screen.top || x + win.width > screen.right || y + win.height > screen.bottom) {
+        const screenW = virtualScreenWidth(), screenH = virtualScreenHeight();
+        if (x < 0 || y < 0 || x + win.width > screenW || y + win.height > screenH) {
             loggedOffScreenClients.add(hwnd >>> 0);
             Logger.log(LogCategory.SYSTEM,
                 `Present: the client area of hwnd=0x${(hwnd >>> 0).toString(16)} (${x},${y} ${win.width}x${win.height}) `
-                + `reaches past the screen (${screen.left},${screen.top}-${screen.right},${screen.bottom}); only its on-screen part is shown`);
+                + `reaches past the screen (0,0-${screenW},${screenH}); only its on-screen part is shown`);
         }
     }
 }

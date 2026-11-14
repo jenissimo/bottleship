@@ -8,6 +8,7 @@ import { Logger } from '../../src/worker/core/logger';
 import { WebGPUBackend } from '../../src/worker/backends/webgpu/webgpu-backend';
 import { System, type HostView } from '../../src/worker/core/system';
 import { getVirtualScreenRect, windows, type WindowInfo } from '../../src/worker/modules/user32/shared-state';
+import * as user32State from '../../src/worker/modules/user32/shared-state';
 import {
     clearPresentedClientRect, presentedClientPlacement, setGuestView, setPresentedClientRect,
 } from '../../src/worker/backends/webgpu/shared/present-geometry';
@@ -258,4 +259,30 @@ test('a client area reaching past the screen is logged once per window, one insi
         publishPresentedClient(CHILD);
     } finally { spy.mockRestore(); }
     expect(logs.filter(m => m.includes('reaches past the screen'))).toHaveLength(1);
+});
+
+test('the off-screen check builds no rectangle per Present and still sees a screen that shrinks under the window', () => {
+    const logs: string[] = [];
+    const logSpy = spyOn(Logger, 'log').mockImplementation(((_c: unknown, m: string) => { logs.push(m); }) as never);
+    const rectSpy = spyOn(user32State, 'getVirtualScreenRect');
+    const sys = System.getInstance();
+    const savedMode = sys.emulatedDisplayMode;
+    try {
+        sys.emulatedDisplayMode = { width: 800, height: 600, bpp: 32, refreshRate: 60 };
+        const SHRUNK = 0x51530;
+        makeWindow(SHRUNK, 0, 100, 100, 640, 480);
+        for (let i = 0; i < 3; i++) publishPresentedClient(SHRUNK);
+        expect(logs.filter(m => m.includes('reaches past the screen'))).toHaveLength(0);
+        sys.emulatedDisplayMode = { width: 640, height: 480, bpp: 32, refreshRate: 60 };
+        publishPresentedClient(SHRUNK);
+        publishPresentedClient(SHRUNK);
+        expect(logs.filter(m => m.includes('reaches past the screen'))).toHaveLength(1);
+        expect(logs.find(m => m.includes('reaches past the screen'))).toContain('(0,0-640,480)');
+        expect(rectSpy).not.toHaveBeenCalled();
+    } finally {
+        sys.emulatedDisplayMode = savedMode;
+        windows.delete(0x51530);
+        rectSpy.mockRestore();
+        logSpy.mockRestore();
+    }
 });
