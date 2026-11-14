@@ -75,6 +75,13 @@ function makeCryptHasher(algId: number): CryptHasher | null {
     return null;
 }
 
+/** Probe the header before reading its count, then the entire SID before consuming bytes. */
+function readableSidLength(mem: Uint8Array, address: number): number | undefined {
+    if (!address || address + 8 > mem.length || !isValidAddress(mem, address, 8, "r")) return undefined;
+    const length = 8 + mem[address + 1]! * 4;
+    return address + length <= mem.length && isValidAddress(mem, address, length, "r") ? length : undefined;
+}
+
 export class Advapi32 implements IModule {
     name = "advapi32";
     exports: Record<string, ThunkImplementation> = {};
@@ -1922,10 +1929,14 @@ export class Advapi32 implements IModule {
             const tokenInfoLength = args[3] >>> 0;
             const pReturnLength = args[4] >>> 0;
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            if (!pReturnLength || pReturnLength + 4 > mem.length || !isValidAddress(mem, pReturnLength, 4, "rw")) {
+                system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return { value: 0, stackCleanup: 20 };
+            }
             const layout = tokenInformationLayout(tokenInfoClass);
             if (layout) {
-                if (pReturnLength && pReturnLength + 4 <= mem.length) view.setUint32(pReturnLength, layout.size, true);
-                if (tokenInfoLength < layout.size || !pTokenInfo || !isValidAddress(mem, pTokenInfo, layout.size, "rw")) {
+                view.setUint32(pReturnLength, layout.size, true);
+                if (tokenInfoLength < layout.size || !pTokenInfo || pTokenInfo + layout.size > mem.length || !isValidAddress(mem, pTokenInfo, layout.size, "rw")) {
                     system.scheduler.setLastError(tokenInfoLength < layout.size ? ERROR_INSUFFICIENT_BUFFER : ERROR_INVALID_PARAMETER);
                     return { value: 0, stackCleanup: 20 };
                 }
@@ -1933,11 +1944,13 @@ export class Advapi32 implements IModule {
                 return { value: 1, stackCleanup: 20 };
             }
             if (pTokenInfo && tokenInfoLength >= 4) {
+                if (pTokenInfo + 4 > mem.length || !isValidAddress(mem, pTokenInfo, 4, "rw")) {
+                    system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                    return { value: 0, stackCleanup: 20 };
+                }
                 view.setUint32(pTokenInfo, 0, true);
             }
-            if (pReturnLength && pReturnLength + 4 <= mem.length) {
-                view.setUint32(pReturnLength, Math.min(4, tokenInfoLength), true);
-            }
+            view.setUint32(pReturnLength, Math.min(4, tokenInfoLength), true);
             return { value: 1, stackCleanup: 20 }; // TRUE
         };
 
@@ -1951,23 +1964,22 @@ export class Advapi32 implements IModule {
         // DWORD GetLengthSid(PSID)
         this.exports["GetLengthSid"] = (ctx, mem, args) => {
             const pSid = args[0] >>> 0;
-            if (!pSid || pSid + 8 > mem.length) return { value: 0, stackCleanup: 4 };
-            return { value: 8 + mem[pSid + 1]! * 4, stackCleanup: 4 };
+            return { value: readableSidLength(mem, pSid) ?? 0, stackCleanup: 4 };
         };
 
         // BOOL CopySid(DWORD nDestinationSidLength, PSID pDestinationSid, PSID pSourceSid)
         this.exports["CopySid"] = (ctx, mem, args) => {
             const destLength = args[0] >>> 0, dest = args[1] >>> 0, src = args[2] >>> 0;
-            if (!src || src + 8 > mem.length) {
+            const length = readableSidLength(mem, src);
+            if (length === undefined) {
                 system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
                 return { value: 0, stackCleanup: 12 };
             }
-            const length = 8 + mem[src + 1]! * 4;
             if (destLength < length) {
                 system.scheduler.setLastError(ERROR_INSUFFICIENT_BUFFER);
                 return { value: 0, stackCleanup: 12 };
             }
-            if (!dest || !isValidAddress(mem, dest, length, "rw") || src + length > mem.length) {
+            if (!dest || dest + length > mem.length || !isValidAddress(mem, dest, length, "rw")) {
                 system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
                 return { value: 0, stackCleanup: 12 };
             }
@@ -1978,9 +1990,9 @@ export class Advapi32 implements IModule {
         // BOOL EqualSid(PSID, PSID)
         this.exports["EqualSid"] = (ctx, mem, args) => {
             const a = args[0] >>> 0, b = args[1] >>> 0;
-            if (!a || !b || a + 8 > mem.length || b + 8 > mem.length) return { value: 0, stackCleanup: 8 };
-            const length = 8 + mem[a + 1]! * 4;
-            if (mem[a] !== mem[b] || mem[a + 1] !== mem[b + 1] || a + length > mem.length || b + length > mem.length) {
+            const length = readableSidLength(mem, a), otherLength = readableSidLength(mem, b);
+            if (length === undefined || otherLength === undefined) return { value: 0, stackCleanup: 8 };
+            if (length !== otherLength || mem[a] !== mem[b]) {
                 return { value: 0, stackCleanup: 8 };
             }
             for (let i = 0; i < length; i++) if (mem[a + i] !== mem[b + i]) return { value: 0, stackCleanup: 8 };

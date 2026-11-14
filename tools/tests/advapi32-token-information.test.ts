@@ -10,6 +10,9 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { Advapi32 } from "../../src/worker/modules/advapi32";
 import { System } from "../../src/worker/core/system";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
+import { preserveMemBinding } from "./helpers/scoped-process-state";
+
+preserveMemBinding();
 
 const ERROR_INSUFFICIENT_BUFFER = 122;
 const BUF = 0x2000, LEN = 0x1f00;
