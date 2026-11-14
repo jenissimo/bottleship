@@ -15,7 +15,10 @@
 
 import { System } from "../../core/system";
 import { Logger, LogCategory } from "../../core/logger";
-import { getAbsoluteWindowPosition, windows as sharedWindows } from "../../modules/user32/shared-state";
+import { Mem } from "../../core/memory/mem-accessor";
+import { isValidAddress } from "../../core/memory/address-guard";
+import { virtualScreenHeight, virtualScreenWidth, windows as sharedWindows } from "../../modules/user32/shared-state";
+import { clearPresentedClientRect, setPresentedClientRect } from "../../backends/webgpu/shared/present-geometry";
 import { activateTopLevelWindow } from "../../modules/user32/activation-messages";
 
 const WM_SIZE = 0x0005;
@@ -70,6 +73,25 @@ export function resizeFullscreenWindowToMode(
 }
 
 /**
+ * The client size of a device window as tracked right now, either dimension possibly zero,
+ * or null when neither window map knows the handle.
+ */
+export function deviceWindowClientSize(hwnd: number): { width: number; height: number } | null {
+    if (!hwnd) return null;
+    const shared = sharedWindows.get(hwnd >>> 0);
+    const winObj = System.getInstance().windowManager?.getWindow(hwnd >>> 0);
+    if (shared && shared.width > 0 && shared.height > 0) {
+        return { width: shared.width | 0, height: shared.height | 0 };
+    }
+    if (winObj && winObj.rect.w > 0 && winObj.rect.h > 0) {
+        return { width: winObj.rect.w | 0, height: winObj.rect.h | 0 };
+    }
+    if (shared) return { width: Math.max(0, shared.width | 0), height: Math.max(0, shared.height | 0) };
+    if (winObj) return { width: Math.max(0, winObj.rect.w | 0), height: Math.max(0, winObj.rect.h | 0) };
+    return null;
+}
+
+/**
  * The CLIENT extent a device window gives a WINDOWED device whose present parameters
  * declare a zero back-buffer size.
  *
@@ -80,32 +102,128 @@ export function resizeFullscreenWindowToMode(
  * everything derived from it — the viewport, the XYZRHW divisor, the pointer inverse —
  * then falls back to the host canvas, which is two coordinate spaces conflated again.
  *
- * Null when neither window map knows the handle: inventing an extent for a window we never
- * tracked would be a guess, and the caller's own fallback is at least visible.
+ * Null when neither window map knows the handle, and when the window is known but its
+ * client area is empty in either dimension (deviceWindowClientSize tells the two apart).
  */
 export function deviceWindowClientExtent(hwnd: number): { width: number; height: number } | null {
-    if (!hwnd) return null;
-    const shared = sharedWindows.get(hwnd >>> 0);
-    if (shared && shared.width > 0 && shared.height > 0) {
-        return { width: shared.width | 0, height: shared.height | 0 };
+    const size = deviceWindowClientSize(hwnd);
+    return size && size.width > 0 && size.height > 0 ? size : null;
+}
+
+/** What a zero back-buffer dimension becomes when the device window's client area is empty too. */
+export const EMPTY_CLIENT_BACK_BUFFER_EXTENT = 8;
+
+/**
+ * The back-buffer extent a windowed device's present parameters declare, with a zero
+ * dimension resolved from the device window's client area and written BACK into the
+ * caller's struct (BackBufferWidth @ +0, BackBufferHeight @ +4 in both D3D8 and D3D9).
+ *
+ * wined3d resolves a zero dimension from the client area for both generations
+ * (wined3d_swapchain_state_init at creation, wined3d_swapchain_resize_buffers on Reset),
+ * and at creation it uses 8 for a dimension whose client size is zero as well: a window
+ * that exists but has not been sized yet. On Reset wined3d takes the client size as it
+ * is, so an empty client area gives a zero extent there; using 8 on Reset too is our
+ * choice, so a device reset while its window is still empty keeps a usable back buffer.
+ * A window nobody tracks is a different case and is left alone, so the caller's own
+ * fallback stays visible instead of an invented extent.
+ *
+ * A fullscreen device with a zero extent is malformed; it is left for the parameter
+ * validator to refuse.
+ */
+export function resolveWindowedBackBufferExtent(
+    mem: Uint8Array,
+    pPresentationParameters: number,
+    hwnd: number,
+    fullscreen: boolean,
+    source: string,
+    category: LogCategory,
+): { width: number; height: number } {
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    let width = view.getUint32(pPresentationParameters + 0, true) >>> 0;
+    let height = view.getUint32(pPresentationParameters + 4, true) >>> 0;
+    if (fullscreen || (width > 0 && height > 0)) return { width, height };
+
+    const client = deviceWindowClientSize(hwnd);
+    if (!client) {
+        Logger.warn(category,
+            `${source}: windowed device declares a ${width}x${height} back buffer and window `
+            + `0x${hwnd.toString(16)} is not tracked — the guest render space stays undeclared`);
+        return { width, height };
     }
-    const winObj = System.getInstance().windowManager?.getWindow(hwnd >>> 0);
-    if (winObj && winObj.rect.w > 0 && winObj.rect.h > 0) {
-        return { width: winObj.rect.w | 0, height: winObj.rect.h | 0 };
+    const empty = client.width <= 0 || client.height <= 0;
+    width = width || client.width || EMPTY_CLIENT_BACK_BUFFER_EXTENT;
+    height = height || client.height || EMPTY_CLIENT_BACK_BUFFER_EXTENT;
+    // The runtime writes the resolved values back; an app is entitled to read them.
+    if (isValidAddress(mem, pPresentationParameters, 8, "rw")) {
+        Mem.writeUint32(pPresentationParameters + 0, width);
+        Mem.writeUint32(pPresentationParameters + 4, height);
     }
-    return null;
+    Logger.log(category,
+        `${source}: windowed zero back buffer resolved to the client area of `
+        + `hwnd=0x${hwnd.toString(16)} (${client.width}x${client.height}${empty ? ", empty" : ""}) -> ${width}x${height}`);
+    return { width, height };
+}
+
+const MAX_PARENT_DEPTH = 32;
+
+// @transient(log-once marks for device windows whose client area reaches past the screen; diagnostics only)
+const loggedOffScreenClients = new Set<number>();
+
+// @transient(the window the last windowed Present went to; the next Present sets it again)
+let windowedDeviceWindow = 0;
+// @transient(installed by the host view policy at start-up)
+let deviceWindowListener: (() => void) | null = null;
+
+/** Called whenever the window windowed Presents go to changes (the host view policy re-derives V). */
+export function setPresentingDeviceWindowListener(listener: (() => void) | null): void {
+    deviceWindowListener = listener;
+}
+
+/** The window a windowed device presented into last, 0 when the last Present owned the screen. */
+export function presentingDeviceWindow(): number {
+    return windowedDeviceWindow;
 }
 
 /**
- * A WINDOWED device's back buffer is shown where its device window's client area is: the
- * host view gets the back-buffer size at that window's screen origin, so the pointer,
- * which is reported as a screen position, lands on the picture. A fullscreen device is a
- * mode set and goes through System.requestHostResize instead.
+ * A device presents into `hwnd`'s client area (0 = it owns the screen): the presenters show
+ * its frame where that client area lies inside the host view. Called on every Present, so
+ * it walks the parent chain without allocating; an unknown window is treated like a
+ * fullscreen device, which is what every present was before. The child walk repeats
+ * getAbsoluteWindowPosition's on purpose: that helper allocates a cycle-guard Set per
+ * call, and this runs on every Present.
+ *
+ * A client area that reaches past the screen is shown as far as the screen goes, as on
+ * Windows; that is logged once per window, since such a package needs a larger desktop.
  */
-export function requestWindowedDeviceHostView(hwnd: number, width: number, height: number): void {
+export function publishPresentedClient(hwnd: number): void {
     const win = hwnd ? sharedWindows.get(hwnd >>> 0) : undefined;
-    const origin = win ? getAbsoluteWindowPosition(win) : null;
-    System.getInstance().requestHostViewAt(origin?.x ?? 0, origin?.y ?? 0, width, height);
+    const deviceWindow = win ? hwnd >>> 0 : 0;
+    if (deviceWindow !== windowedDeviceWindow) {
+        windowedDeviceWindow = deviceWindow;
+        deviceWindowListener?.();
+    }
+    if (!win) {
+        clearPresentedClientRect();
+        return;
+    }
+    let x = win.x, y = win.y;
+    let cur = win;
+    for (let depth = 0; depth < MAX_PARENT_DEPTH && (cur.style & WS_CHILD) !== 0 && cur.parent; depth++) {
+        const parent = sharedWindows.get(cur.parent);
+        if (!parent) break;
+        x += parent.x; y += parent.y;
+        cur = parent;
+    }
+    setPresentedClientRect(x, y, win.width, win.height);
+    if (!loggedOffScreenClients.has(hwnd >>> 0)) {
+        const screenW = virtualScreenWidth(), screenH = virtualScreenHeight();
+        if (x < 0 || y < 0 || x + win.width > screenW || y + win.height > screenH) {
+            loggedOffScreenClients.add(hwnd >>> 0);
+            Logger.log(LogCategory.SYSTEM,
+                `Present: the client area of hwnd=0x${(hwnd >>> 0).toString(16)} (${x},${y} ${win.width}x${win.height}) `
+                + `reaches past the screen (0,0-${screenW},${screenH}); only its on-screen part is shown`);
+        }
+    }
 }
 
 /**

@@ -29,7 +29,7 @@ import {
 } from '../../backends/webgpu/d3d9/multisample';
 import { resolveD3D9StretchRectPolicy } from '../../backends/webgpu/d3d9/copy-policy';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
-import { deviceWindowClientExtent, resizeFullscreenWindowToMode } from '../../runtime/windowing/fullscreen-window';
+import { resolveWindowedBackBufferExtent, resizeFullscreenWindowToMode } from '../../runtime/windowing/fullscreen-window';
 import {
     acknowledgeDeviceReset,
     deviceCooperativeLevel,
@@ -343,29 +343,7 @@ function resolvePresentBackBufferExtent(
     fullscreen: boolean,
     source: string,
 ): { width: number; height: number } {
-    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-    let width = view.getUint32(pPresentationParameters + 0, true) >>> 0;
-    let height = view.getUint32(pPresentationParameters + 4, true) >>> 0;
-    if (fullscreen || (width > 0 && height > 0)) return { width, height };
-
-    const client = deviceWindowClientExtent(hwnd);
-    if (!client) {
-        Logger.warn(LogCategory.D3D9,
-            `${source}: windowed device declares a 0x0 back buffer and window 0x${hwnd.toString(16)} `
-            + "is not tracked — the guest render space stays undeclared");
-        return { width, height };
-    }
-    width = width || client.width;
-    height = height || client.height;
-    // The runtime writes the resolved values back; an app is entitled to read them.
-    if (isValidAddress(mem, pPresentationParameters, 8, "rw")) {
-        Mem.writeUint32(pPresentationParameters + 0, width);
-        Mem.writeUint32(pPresentationParameters + 4, height);
-    }
-    Logger.log(LogCategory.D3D9,
-        `${source}: windowed 0x0 back buffer resolved to the client area of `
-        + `hwnd=0x${hwnd.toString(16)} -> ${width}x${height}`);
-    return { width, height };
+    return resolveWindowedBackBufferExtent(mem, pPresentationParameters, hwnd, fullscreen, source, LogCategory.D3D9);
 }
 
 export function createDeviceExports(): Record<string, ThunkImplementation> {

@@ -144,6 +144,7 @@ export class WindowManager {
     private windowStateProvider: ((hwnd: number) => { visible: boolean; disabled: boolean } | undefined) | null = null;
     private activationObservers: ((hwnd: number) => void)[] = [];
     private foregroundQueueObservers: ForegroundQueueObserver[] = [];
+    private foregroundWindowObservers: (() => void)[] = [];
 
     constructor() { }
 
@@ -233,6 +234,11 @@ export class WindowManager {
      * Observers are deduped by identity so a re-`initialize()` on a game switch cannot
      * grow a second copy of the same one.
      */
+    /** Called after the foreground WINDOW changed, also between windows of one thread. */
+    registerForegroundWindowObserver(observer: () => void): void {
+        if (!this.foregroundWindowObservers.includes(observer)) this.foregroundWindowObservers.push(observer);
+    }
+
     registerForegroundQueueObserver(observer: ForegroundQueueObserver): void {
         if (!this.foregroundQueueObservers.includes(observer)) this.foregroundQueueObservers.push(observer);
     }
@@ -250,6 +256,7 @@ export class WindowManager {
         const nextThreadId = next ? (this.windows.get(next)?.creatorThreadId ?? 0) : 0;
         this.foregroundHwnd = next;
         this.foregroundThreadId = nextThreadId;
+        if (prevHwnd !== next) for (const observer of this.foregroundWindowObservers) observer();
         if ((prevHwnd !== 0) === (next !== 0) && prevThreadId === nextThreadId) return;
         const prev = prevHwnd ? { hwnd: prevHwnd, threadId: prevThreadId } : null;
         const incoming = next ? { hwnd: next, threadId: nextThreadId } : null;

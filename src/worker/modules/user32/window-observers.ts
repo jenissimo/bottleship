@@ -9,6 +9,7 @@
 import type { WindowManager } from '../../runtime/windowing/window-manager';
 import { recordLastActive } from './activation-messages';
 import { getChildZOrder, getWindowHitTestState, releaseCursorClipOnForegroundSwitch } from './shared-state';
+import { installHostViewPolicy } from '../../runtime/windowing/host-view-policy';
 
 export function installUser32WindowObservers(wm: WindowManager): void {
     // WindowFromPoint hit-tests siblings in Z-order, and user32 owns that list.
@@ -23,4 +24,6 @@ export function installUser32WindowObservers(wm: WindowManager): void {
     // switches; without this the pointer stays trapped in the rect of an app that is no
     // longer in front.
     wm.registerForegroundQueueObserver(releaseCursorClipOnForegroundSwitch);
+    // The host view frames the foreground window, so it is re-derived when that changes.
+    installHostViewPolicy(wm);
 }

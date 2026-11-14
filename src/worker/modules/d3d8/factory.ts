@@ -4,6 +4,7 @@
 
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
+import { resolveWindowedBackBufferExtent } from '../../runtime/windowing/fullscreen-window';
 import { System } from '../../core/system';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
 import { FFPRenderer } from '../../backends/webgpu/shared';
@@ -268,6 +269,11 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
 
             // Read presentation parameters
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            // A windowed device may leave a back-buffer dimension zero: the client area of
+            // the device window (hDeviceWindow @ +24, else the focus window; Windowed @ +28).
+            resolveWindowedBackBufferExtent(
+                mem, pPresParams, (view.getUint32(pPresParams + 24, true) || hFocusWindow) >>> 0,
+                view.getUint32(pPresParams + 28, true) === 0, 'D3D8 CreateDevice', LogCategory.SYSTEM);
             const bbWidth = view.getUint32(pPresParams + 0, true) || 800;
             const bbHeight = view.getUint32(pPresParams + 4, true) || 600;
 
@@ -312,7 +318,7 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             // Resize canvas to match backbuffer (like DDraw SetDisplayMode does). Only a
             // FULLSCREEN device is a mode-set — a windowed backbuffer lives inside the
             // desktop and must not become SM_CXSCREEN. (Windowed @ +28 in d3d8.)
-            publishCreateDeviceHostView(view, pPresParams, hFocusWindow, bbWidth, bbHeight);
+            publishCreateDeviceHostView(view, pPresParams, bbWidth, bbHeight);
 
             // FULLSCREEN device: also resize the focus/device window's tracked client rect to
             // the back-buffer size, like real D3D8 does. Apps GetClientRect() the now-fullscreen

@@ -81,6 +81,7 @@ import {
     type DirectThunkReturn,
 } from './owner-draw';
 import { beginSyncDestroyDelivery } from './destroy-sync';
+import { refreshHostView } from "../../runtime/windowing/host-view-policy";
 import {
     postInitialActivationMessages,
     activateTopLevelWindow,
@@ -298,21 +299,6 @@ function trySuspendForSyncWindowMessage(
     return { suspended: true, callbackId: first.callbackId, frameId, reusedFrame };
 }
 
-/**
- * A top-level window's client rectangle clipped to the screen, as the host view shows it:
- * the planes it is cut from end at the screen's edge. A window wholly off the screen
- * shows the screen.
- */
-function clientRectOnScreen(win: WindowInfo): { x: number; y: number; width: number; height: number } {
-    const screen = getVirtualScreenRect();
-    const x0 = Math.max(screen.left, win.x), y0 = Math.max(screen.top, win.y);
-    const x1 = Math.min(screen.right, win.x + win.width), y1 = Math.min(screen.bottom, win.y + win.height);
-    if (x1 <= x0 || y1 <= y0) {
-        return { x: screen.left, y: screen.top, width: screen.right - screen.left, height: screen.bottom - screen.top };
-    }
-    return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
-}
-
 /** Shared SetWindowPos / DeferWindowPos geometry apply; the rectangle is the CLIENT one. */
 function applyWindowPosGeometry(
     hWnd: number,
@@ -367,11 +353,7 @@ function applyWindowPosGeometry(
 
     if (moving || resizing) {
         syncWindowDCsToGeometry(hWnd);
-        const system = System.getInstance();
-        if (system.hostViewOwner === hWnd) {
-            const view = clientRectOnScreen(window);
-            system.followHostViewWindow(hWnd, view.x, view.y, view.width, view.height);
-        }
+        if ((window.style & 0x40000000 /* WS_CHILD */) === 0) refreshHostView();
     }
 
     if (!options?.skipDialogOverlayRepaint && !(uFlags & 0x0008 /* SWP_NOREDRAW */)
@@ -1625,10 +1607,10 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             }
         }
         windows.delete(hWnd);
-        System.getInstance().forgetHostViewWindow(hWnd);
         removeWindowPlacement(hWnd);
         removeWindowUpdate(hWnd);
         System.getInstance().windowManager.destroyWindow(hWnd);
+        refreshHostView();
         Logger.verbose(LogCategory.USER32, `finalizeDestroy: removed window 0x${hWnd.toString(16)}`);
     };
     registerWindowDestroyFinalizer(finalizeDestroy);
@@ -1969,13 +1951,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 }
             }
 
-            // While DirectDraw holds the display exclusively the mode set is the view,
-            // whatever rectangle the window has.
-            if (show && !isChild && !(live.style & WS_POPUP)
-                && !System.getInstance().ddrawContext?.cooperative?.exclusive) {
-                const view = clientRectOnScreen(live);
-                System.getInstance().requestHostViewOfWindow(hWnd, view.x, view.y, view.width, view.height);
-            }
+            if (!isChild) refreshHostView();
             if (isAnimateControlWindow(live)) onAnimateShowWindow(hWnd, nCmdShow);
             return resultValue;
         };

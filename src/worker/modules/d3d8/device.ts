@@ -14,7 +14,7 @@ import type { D3D8DeviceAdapter } from '../../backends/webgpu/d3d8/d3d8-device-a
 import { writeDeviceCaps8 } from './caps';
 import { deviceCooperativeLevel } from '../../core/gpu/gpu-device-loss-contract';
 import { createPresentRegion, type PresentRect } from '../../backends/webgpu/shared/present-region';
-import { deviceWindowClientExtent } from '../../runtime/windowing/fullscreen-window';
+import { deviceWindowClientExtent, publishPresentedClient } from '../../runtime/windowing/fullscreen-window';
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
@@ -130,6 +130,8 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         if (!device) return D3DERR_INVALIDCALL;
         const pSourceRect = args[1] >>> 0;
         const pDestRect = args[2] >>> 0;
+        // Where the canvas present places this frame inside the host view.
+        publishPresentedClient(device.presentsExclusiveFullscreen ? 0 : ((args[3] >>> 0) || device.presentWindow));
         if (!pSourceRect && !pDestRect) return device.present();
         presentRegion.hasSrc = readPresentRect(pSourceRect, presentRegion.src);
         presentRegion.hasDst = readPresentRect(pDestRect, presentRegion.dst);
