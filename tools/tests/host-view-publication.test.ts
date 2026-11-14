@@ -22,6 +22,9 @@ const WS_CHILD = 0x40000000;
 const SWP_NOSIZE = 0x0001;
 const SWP_NOZORDER = 0x0004;
 const SWP_NOACTIVATE = 0x0010;
+const SWP_NOMOVE = 0x0002;
+const SWP_SHOWWINDOW = 0x0040;
+const SWP_HIDEWINDOW = 0x0080;
 const SW_SHOW = 5;
 
 const HWND = 0x44470;
@@ -285,4 +288,34 @@ test('the device-window listener runs only when the presented window changes, no
         publishPresentedClient(0);
         clearPresentedClientRect();
     }
+});
+
+test('SetWindowPos SHOW/HIDE of an outside top-level window re-derives the view from the final visibility', () => {
+    const ONLY_VIS = SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+    makeWindow(HWND, FRAMED, 40, 40, 560, 400);
+    makeWindow(OTHER, 0, 0, 0, 300, 200);
+    System.getInstance().refreshHostView();
+    expect(view()).toEqual({ x: 40, y: 40, width: 560, height: 400 });
+    call('SetWindowPos', [OTHER, 0, 0, 0, 0, 0, ONLY_VIS | SWP_SHOWWINDOW]);
+    expect(windows.get(OTHER)!.visible).toBe(true);
+    expect(view()).toEqual({ x: 0, y: 0, width: 640, height: 480 });
+    call('SetWindowPos', [OTHER, 0, 0, 0, 0, 0, ONLY_VIS | SWP_HIDEWINDOW]);
+    expect(windows.get(OTHER)!.visible).toBe(false);
+    expect(view()).toEqual({ x: 40, y: 40, width: 560, height: 400 });
+});
+
+test('a move combined with SHOW or HIDE is judged on the final state, without an intermediate publication', () => {
+    makeWindow(HWND, FRAMED, 40, 40, 560, 400);
+    makeWindow(OTHER, 0, 100, 100, 300, 200);
+    System.getInstance().refreshHostView();
+    published.length = 0;
+    call('SetWindowPos', [OTHER, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW]);
+    expect(windows.get(OTHER)!.visible).toBe(true);
+    expect(published).toEqual([{ x: 0, y: 0, width: 640, height: 480 }]);
+    call('SetWindowPos', [OTHER, 0, 100, 100, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE]);
+    published.length = 0;
+    call('SetWindowPos', [OTHER, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW]);
+    expect(windows.get(OTHER)!.visible).toBe(false);
+    expect(view()).toEqual({ x: 40, y: 40, width: 560, height: 400 });
+    expect(published).toEqual([]);
 });

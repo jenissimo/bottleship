@@ -353,7 +353,6 @@ function applyWindowPosGeometry(
 
     if (moving || resizing) {
         syncWindowDCsToGeometry(hWnd);
-        if ((window.style & 0x40000000 /* WS_CHILD */) === 0) refreshHostView();
     }
 
     if (!options?.skipDialogOverlayRepaint && !(uFlags & 0x0008 /* SWP_NOREDRAW */)
@@ -2181,6 +2180,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
             const wmWin = System.getInstance().windowManager.getWindow(hWnd);
             if (wmWin) wmWin.visible = live.visible;
+            if (!(live.style & WS_CHILD) && (moved || resized || showing || hiding)) refreshHostView();
 
             if (!(flags & SWP_NOREDRAW) && live.parent && wasVisible
                 && (hiding || moved || resized || !(flags & SWP_NOZORDER))) {
