@@ -1,4 +1,5 @@
 import { aotCache } from "../../src/worker/core/cpu/aot-cache";
+import { installFakeOpfs } from "./fixtures/fake-opfs";
 
 const PAGE = 4096;
 const assert = (ok: unknown, message: string) => { if (!ok) throw new Error(message); };
@@ -41,9 +42,46 @@ function deferEngineHash() {
 
 // install() replaces globals and deferEngineHash() an aotCache method; `bun test` runs every file
 // in one process, so both go back when this file is done, pass or fail.
-const replacedGlobals = ["System", "preemption", "__wasmDump"].map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)] as const);
+const replacedGlobals = ["System", "preemption", "__wasmDump", "navigator"].map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)] as const);
 const ownFingerprint = Object.getOwnPropertyDescriptor(aotCache, "engineFingerprint");
 try {
+    // Persist a marked unit, load it in a new session with the SAME version identity,
+    // then capture unrelated pages. Loading is not evidence that its dependencies
+    // still match: even unchanged guest pages cannot establish host compatibility.
+    for (const captureFresh of [true, false]) {
+        installFakeOpfs();
+        const memory = new Uint8Array(PAGE * 4);
+        install(memory);
+        deferEngineHash().resolve("engine");
+        const wasm = (globalThis as any).preemption.getWasmExports();
+        wasm.jit_aot_module_page_at = (_idx: number, n: number) => (n + 2) * PAGE;
+        (globalThis as any).__wasmDump.out = [{ start: 2 * PAGE, table_index: 7,
+            len: 4, bytes: new Uint8Array([0x36, 0x2, 0xAA, 0xBB]) }];
+        assert((await aotCache.snapshot()).units === 1, "old fixture not captured");
+        assert("saved" in await aotCache.save("app:snapshot-regression"), "old fixture not persisted");
+
+        install(memory);
+        deferEngineHash().resolve("engine");
+        if (captureFresh) memory[2 * PAGE] = 0xFF;
+        const loaded = await aotCache.load("app:snapshot-regression");
+        assert("loaded" in loaded && loaded.loaded === 1, "old fixture not loaded");
+        assert(aotCache.getUnits()[0].bytes[0] === 0x36, "old marker missing before snapshot");
+        assert((await aotCache.verify()).mismatch === Number(captureFresh), "fixture page mismatch not established");
+        if (!captureFresh) (globalThis as any).__wasmDump.out = [];
+        const result = await aotCache.snapshot();
+        const stale = aotCache.getUnits().some(u => u.bytes[0] === 0x36);
+        console.log(`snapshot carry-over: loaded=1 fresh=${Number(captureFresh)} units=${result.units} oldMarker=${stale}`);
+        assert(!stale, "snapshot carried a loaded unit into the new recording");
+        assert(result.units === Number(captureFresh), "snapshot did not contain exactly the fresh capture");
+        if (captureFresh) {
+            assert(aotCache.getUnits()[0].pages.length === 2, "fresh multi-page unit lost");
+            assert("saved" in await aotCache.save("app:snapshot-regression"), "fresh snapshot not persisted");
+            const reloaded = await aotCache.load("app:snapshot-regression");
+            assert("loaded" in reloaded && reloaded.loaded === 1, "new store contains old units");
+            assert(aotCache.getUnits()[0].bytes[0] === 0, "old bytes survived save/load");
+        }
+    }
+
     // snapshot must copy both pages before awaiting the capture-time engine hash.
     {
         const memory = new Uint8Array(PAGE * 4); memory[0] = 0x11; memory[PAGE] = 0x22;
@@ -85,4 +123,4 @@ try {
     aotCache.clear();
 }
 
-console.log("PASS aot-cache-versioning: coherent-copy + production-version identity-refusal");
+console.log("PASS aot-cache-versioning: no-loaded-carry-over + empty-capture + save/load + coherent-copy + production-version identity-refusal");
