@@ -323,21 +323,11 @@ export class AotCache {
                 Logger.warn(LogCategory.SYSTEM, "[AOT] snapshot refused: JIT version identity changed while hashing");
                 return { units: 0, skipped: skipped + captured.length };
             }
-            // A newly captured unit SUPERSEDES a loaded one covering the same page rather
-            // than joining it. Both describe the same guest code, only one can own the page
-            // at replay, and the loser is refused as a duplicate — so keeping both would
-            // grow the persisted set every generation while the useful half stayed constant.
-            // The fresh capture wins because its page bytes were hashed from the live guest
-            // just now, and the stale one may predate a patch.
-            const supersededPages = new Set<number>();
-            for (const u of snapshotUnits) for (const p of u.pages) supersededPages.add(p.physPage);
-            const kept = this.units.filter((u) => !u.pages.some((p) => supersededPages.has(p.physPage)));
-            const dropped = this.units.length - kept.length;
-            this.units = kept.concat(snapshotUnits);
-            if (dropped > 0) {
-                Logger.log(LogCategory.SYSTEM,
-                    `[AOT] snapshot superseded ${dropped} earlier unit(s) covering the same pages`);
-            }
+            // A recording contains only bytes captured in this session. A loaded unit's
+            // version tuple and guest-page hashes do not prove that all of its runtime
+            // dependencies still match, even when no fresh capture covers its pages.
+            // Replaying it (or merely loading it) must not carry it into a new recording.
+            this.units = snapshotUnits;
             this.loadedVersion = sourceVersion;
         } catch {
             Logger.warn(LogCategory.SYSTEM, "[AOT] snapshot refused: cannot recheck JIT version identity");
@@ -477,8 +467,8 @@ export class AotCache {
         // picture — i.e. when this session actually loaded what was already there. A session
         // that booted with auto-load off (an A/B arm, and `__aotNoAutoLoad` persists in
         // localStorage across reloads) starts with an empty set and would otherwise DELETE
-        // every unit an earlier recording saved. Recording is meant to accumulate over
-        // several play sessions; silently replacing the set with a subset is the opposite.
+        // every unit file an earlier recording saved without first reading the store.
+        // The new index always names only the current snapshot's units.
         if (this.loadedFromStore) {
             const wanted = new Set(this.units.map(u => `${u.entryPage.toString(16)}.wasm`));
             wanted.add("index.json");
@@ -487,7 +477,7 @@ export class AotCache {
             Logger.warn(LogCategory.SYSTEM,
                 "[AOT] save: this session did not load the store, so earlier unit files are left on "
                 + "disk but index.json now names only this session's units — the next boot loads ONLY "
-                + "these. Re-record from a session that loads the cache to keep the earlier ones.");
+                + "these. Record with auto-load disabled to capture fresh replacements.");
         }
 
         for (const u of this.units) {
