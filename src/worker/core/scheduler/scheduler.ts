@@ -5301,7 +5301,10 @@ export class Scheduler {
         for (const t of this.threads.values()) {
             if (t.handle === handle) return t;
         }
-        return null;
+        // Any other handle to the thread object (DuplicateHandle of GetCurrentThread(), a
+        // duplicate of the creation handle) names the same thread.
+        const kobj = this.resourceProvider.getKernelObject(handle >>> 0) as KernelThreadObject | null;
+        return kobj?.kind === 'thread' ? this.threads.get(kobj.threadId) ?? null : null;
     }
 
     private computeYieldMs(requestedMs: number, maxMs = 50): number {
