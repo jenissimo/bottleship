@@ -4,7 +4,7 @@
 
 import { System } from '../../core/system';
 import { Logger, LogCategory } from '../../core/logger';
-import { requestWindowedDeviceHostView, resizeFullscreenWindowToMode } from '../../runtime/windowing/fullscreen-window';
+import { resizeFullscreenWindowToMode } from '../../runtime/windowing/fullscreen-window';
 import {
     createComObject,
     deviceBackBufferSurfaces,
@@ -93,18 +93,14 @@ export function resizeFullscreenDeviceWindow(hwnd: number, width: number, height
 }
 
 /**
- * CreateDevice's host view from its D3DPRESENT_PARAMETERS (Windowed @ +28, hDeviceWindow
- * @ +24 with the focus window as the fallback): a fullscreen device is a mode set, a
- * windowed one shows its back buffer at the device window's screen origin.
+ * CreateDevice's host view from its D3DPRESENT_PARAMETERS (Windowed @ +28): a fullscreen
+ * device is a mode set. A windowed device publishes nothing; its frame is shown where its
+ * window's client area lies inside the view (publishPresentedClient on every Present).
  */
-export function publishCreateDeviceHostView(
-    view: DataView, pPresParams: number, hFocusWindow: number, width: number, height: number,
-): void {
+export function publishCreateDeviceHostView(view: DataView, pPresParams: number, width: number, height: number): void {
     if (view.getUint32(pPresParams + 28, true) === 0) {
         System.getInstance().requestHostResize(width, height, { modeSet: true });
-        return;
     }
-    requestWindowedDeviceHostView((view.getUint32(pPresParams + 24, true) || hFocusWindow) >>> 0, width, height);
 }
 
 // BeginScene/EndScene pairing (wined3d dlls/wined3d/device.c:3718-3743): real D3D8

@@ -10,8 +10,14 @@ import { setD3D9FloatCapabilityContract } from "./shared/float-format-policy";
 import { setD3D9VolumeCapabilityContract } from "./shared/volume-policy";
 import { setD3D9MsaaCapabilityContract } from "./d3d9/multisample";
 import { setD3D9WebGpuCapabilityLimits } from "./shared/webgpu-capability-limits";
-import { appendOverlayRectQuads, coversTarget, guestViewOnPlane, overlayDestRect, publishComputedPresentRect, wholePlaneView } from "./shared/present-geometry";
+import {
+    appendOverlayRectQuads, coversTarget, guestViewOnPlane, overlayDestRect, presentedClientPlacement, publishComputedPresentRect, wholePlaneView,
+} from "./shared/present-geometry";
+
 import { instrumentGpuDeviceCensus } from "./shared/gpu-memory-census";
+
+/** A placement with no area: nothing of the source is drawn. */
+const NOTHING: readonly [number, number, number, number] = [0, 0, 0, 0];
 
 /** Backoff between requestDevice attempts while recovering, in ms. The list also fixes how
  *  many attempts there are: a GPU that has not come back by ~4s is gone, and retrying past
@@ -782,6 +788,8 @@ export class WebGPUBackend implements RenderBackend {
             srcW?: number; srcH?: number; outW?: number; outH?: number; toCanvas?: boolean;
             /** The source is an image of the whole guest screen: show the host view's part of it. */
             screenPlane?: boolean;
+            /** The source is an image of a windowed device's client area: show it where that lies in the host view. */
+            clientPlane?: boolean;
         }
     ): void {
         if (!this.device || !this.format) return;
@@ -801,7 +809,15 @@ export class WebGPUBackend implements RenderBackend {
             // canvas publishes nothing, which degrades to the full-canvas fallback.
             let srcW = present?.srcW, srcH = present?.srcH;
             let sourceUv: readonly [number, number, number, number] | undefined;
-            if (present?.screenPlane && srcW && srcH) {
+            let destPlace: readonly [number, number, number, number] | undefined;
+            if (present?.clientPlane) {
+                const placed = presentedClientPlacement();
+                if (!placed.whole) {
+                    srcW = placed.viewW; srcH = placed.viewH;
+                    destPlace = placed.empty ? NOTHING : placed.place;
+                    sourceUv = placed.uv;
+                }
+            } else if (present?.screenPlane && srcW && srcH) {
                 const view = guestViewOnPlane(srcW, srcH);
                 if (!view.whole) {
                     const uv = this.screenPlaneUv;
@@ -829,6 +845,7 @@ export class WebGPUBackend implements RenderBackend {
                 outputWidth: present?.outW,
                 outputHeight: present?.outH,
                 sourceUv,
+                destPlace,
             });
             return;
         }

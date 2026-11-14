@@ -66,6 +66,8 @@ export function presentD3D9FrameToCanvas(
             srcW, srcH,
             outW: currentTexture.width, outH: currentTexture.height,
             toCanvas: true,
+            // A windowed device's frame is its window's client area, placed inside the host view.
+            clientPlane: true,
         },
     );
 

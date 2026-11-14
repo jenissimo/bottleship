@@ -189,7 +189,7 @@ describe("presentD3D9FrameToCanvas — the one composite route", () => {
         const args = f.log.drawTexture[0]!;
         expect(args[0]).toBe(src);
         expect(args[3]).toBe(true); // opaque: the PostFx chain
-        expect(args[8]).toEqual({ srcW: 1280, srcH: 960, outW: 1600, outH: 1200, toCanvas: true });
+        expect(args[8]).toEqual({ srcW: 1280, srcH: 960, outW: 1600, outH: 1200, toCanvas: true, clientPlane: true });
     });
 
     test("an empty rect list composites no GDI; no rect list composites all of it", () => {
