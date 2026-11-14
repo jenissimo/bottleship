@@ -8,6 +8,7 @@ import { System } from "../core/system";
 import { RegistryValue } from "../runtime/filesystem/registry";
 import { Logger, LogCategory } from "../core/logger";
 import { encodeAnsi } from "./codepage-utils";
+import { tokenInformationLayout } from "./advapi32-token";
 import { Md5, Sha1 } from "@bottleship/formats/unpack";
 
 const HKEY_CLASSES_ROOT = 0x80000000;
@@ -72,6 +73,13 @@ function makeCryptHasher(algId: number): CryptHasher | null {
         return { update: (d) => h.update(d), digest: () => h.finalize(), size: 20 };
     }
     return null;
+}
+
+/** Probe the header before reading its count, then the entire SID before consuming bytes. */
+function readableSidLength(mem: Uint8Array, address: number): number | undefined {
+    if (!address || address + 8 > mem.length || !isValidAddress(mem, address, 8, "r")) return undefined;
+    const length = 8 + mem[address + 1]! * 4;
+    return address + length <= mem.length && isValidAddress(mem, address, length, "r") ? length : undefined;
 }
 
 export class Advapi32 implements IModule {
@@ -1921,15 +1929,74 @@ export class Advapi32 implements IModule {
             const tokenInfoLength = args[3] >>> 0;
             const pReturnLength = args[4] >>> 0;
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            // TokenType = 1 (TokenPrimary), TokenElevationType = 2 (not elevated)
-            // For TokenGroups/TokenPrivileges return empty (GroupCount=0)
+            if (!pReturnLength || pReturnLength + 4 > mem.length || !isValidAddress(mem, pReturnLength, 4, "rw")) {
+                system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return { value: 0, stackCleanup: 20 };
+            }
+            const layout = tokenInformationLayout(tokenInfoClass);
+            if (layout) {
+                view.setUint32(pReturnLength, layout.size, true);
+                if (tokenInfoLength < layout.size || !pTokenInfo || pTokenInfo + layout.size > mem.length || !isValidAddress(mem, pTokenInfo, layout.size, "rw")) {
+                    system.scheduler.setLastError(tokenInfoLength < layout.size ? ERROR_INSUFFICIENT_BUFFER : ERROR_INVALID_PARAMETER);
+                    return { value: 0, stackCleanup: 20 };
+                }
+                layout.write(view, pTokenInfo);
+                return { value: 1, stackCleanup: 20 };
+            }
             if (pTokenInfo && tokenInfoLength >= 4) {
+                if (pTokenInfo + 4 > mem.length || !isValidAddress(mem, pTokenInfo, 4, "rw")) {
+                    system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                    return { value: 0, stackCleanup: 20 };
+                }
                 view.setUint32(pTokenInfo, 0, true);
             }
-            if (pReturnLength && pReturnLength + 4 <= mem.length) {
-                view.setUint32(pReturnLength, Math.min(4, tokenInfoLength), true);
-            }
+            view.setUint32(pReturnLength, Math.min(4, tokenInfoLength), true);
             return { value: 1, stackCleanup: 20 }; // TRUE
+        };
+
+        // PDWORD GetSidSubAuthority(PSID, DWORD) / PUCHAR GetSidSubAuthorityCount(PSID): plain
+        // address arithmetic on the SID, unchecked, as on Windows.
+        this.exports["GetSidSubAuthority"] = (ctx, mem, args) =>
+            ({ value: ((args[0] >>> 0) + 8 + (args[1] >>> 0) * 4) >>> 0, stackCleanup: 8 });
+        this.exports["GetSidSubAuthorityCount"] = (ctx, mem, args) =>
+            ({ value: ((args[0] >>> 0) + 1) >>> 0, stackCleanup: 4 });
+
+        // DWORD GetLengthSid(PSID)
+        this.exports["GetLengthSid"] = (ctx, mem, args) => {
+            const pSid = args[0] >>> 0;
+            return { value: readableSidLength(mem, pSid) ?? 0, stackCleanup: 4 };
+        };
+
+        // BOOL CopySid(DWORD nDestinationSidLength, PSID pDestinationSid, PSID pSourceSid)
+        this.exports["CopySid"] = (ctx, mem, args) => {
+            const destLength = args[0] >>> 0, dest = args[1] >>> 0, src = args[2] >>> 0;
+            const length = readableSidLength(mem, src);
+            if (length === undefined) {
+                system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return { value: 0, stackCleanup: 12 };
+            }
+            if (destLength < length) {
+                system.scheduler.setLastError(ERROR_INSUFFICIENT_BUFFER);
+                return { value: 0, stackCleanup: 12 };
+            }
+            if (!dest || dest + length > mem.length || !isValidAddress(mem, dest, length, "rw")) {
+                system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return { value: 0, stackCleanup: 12 };
+            }
+            mem.copyWithin(dest, src, src + length);
+            return { value: 1, stackCleanup: 12 };
+        };
+
+        // BOOL EqualSid(PSID, PSID)
+        this.exports["EqualSid"] = (ctx, mem, args) => {
+            const a = args[0] >>> 0, b = args[1] >>> 0;
+            const length = readableSidLength(mem, a), otherLength = readableSidLength(mem, b);
+            if (length === undefined || otherLength === undefined) return { value: 0, stackCleanup: 8 };
+            if (length !== otherLength || mem[a] !== mem[b]) {
+                return { value: 0, stackCleanup: 8 };
+            }
+            for (let i = 0; i < length; i++) if (mem[a + i] !== mem[b + i]) return { value: 0, stackCleanup: 8 };
+            return { value: 1, stackCleanup: 8 };
         };
 
         // CheckTokenMembership - check if a SID is in the current token
