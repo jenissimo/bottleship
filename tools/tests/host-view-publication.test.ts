@@ -1,9 +1,9 @@
 /**
  * The host surface shows one rectangle V of the virtual screen, chosen by one rule
  * (host-view-policy): the client rectangle of the foreground window's root, clipped to the
- * screen, or the screen when that root covers it, is a popup, is not there, when exclusive
- * DirectDraw owns the display, when a visible top-level window outside V would be cut away,
- * or when the "show the whole desktop" setting is on. V is published only when it changes.
+ * screen, or the screen when that root covers it, is a popup no windowed device presents
+ * into, is not there, when exclusive DirectDraw owns the display, when a visible top-level
+ * window outside V would be cut away, or when the "show the whole desktop" setting is on. V is published only when it changes.
  */
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { System, type HostView } from '../../src/worker/core/system';
@@ -13,6 +13,8 @@ import { createWindowExports } from '../../src/worker/modules/user32/window';
 import { installHostViewPolicy, selectHostView } from '../../src/worker/runtime/windowing/host-view-policy';
 import { EmulatorConfig } from '../../src/worker/core/emulator-config-manager';
 import { WindowManager } from '../../src/worker/runtime/windowing/window-manager';
+import { publishPresentedClient, setPresentingDeviceWindowListener } from '../../src/worker/runtime/windowing/fullscreen-window';
+import { clearPresentedClientRect } from '../../src/worker/backends/webgpu/shared/present-geometry';
 
 const WS_VISIBLE = 0x10000000;
 const WS_POPUP = 0x80000000;
@@ -234,4 +236,53 @@ test('installing the policy registers it with the window manager', () => {
     makeWindow(HWND, FRAMED, 40, 40, 560, 400);
     registered[0]();
     expect(view()).toEqual({ x: 40, y: 40, width: 560, height: 400 });
+    setPresentingDeviceWindowListener(null);
+});
+
+test('a popup root is framed while a windowed device presents into it or into its child, and not otherwise', () => {
+    installHostViewPolicy({ registerForegroundWindowObserver: () => {} } as never);
+    try {
+        makeWindow(HWND, POPUP, 40, 40, 560, 400);
+        System.getInstance().refreshHostView();
+        expect(published).toEqual([]);
+        publishPresentedClient(HWND);
+        expect(view()).toEqual({ x: 40, y: 40, width: 560, height: 400 });
+        publishPresentedClient(HWND);
+        expect(published).toHaveLength(1);
+        publishPresentedClient(0);
+        expect(view()).toEqual({ x: 0, y: 0, width: 640, height: 480 });
+        makeWindow(OTHER, (WS_CHILD | WS_VISIBLE) >>> 0, 0, 0, 560, 400, { parent: HWND });
+        publishPresentedClient(OTHER);
+        expect(view()).toEqual({ x: 40, y: 40, width: 560, height: 400 });
+        makeWindow(THIRD, POPUP, 100, 100, 200, 100);
+        publishPresentedClient(THIRD);
+        expect(view()).toEqual({ x: 0, y: 0, width: 640, height: 480 });
+        expect(published).toEqual([
+            { x: 40, y: 40, width: 560, height: 400 }, { x: 0, y: 0, width: 640, height: 480 },
+            { x: 40, y: 40, width: 560, height: 400 }, { x: 0, y: 0, width: 640, height: 480 },
+        ]);
+    } finally {
+        publishPresentedClient(0);
+        clearPresentedClientRect();
+        setPresentingDeviceWindowListener(null);
+    }
+});
+
+test('the device-window listener runs only when the presented window changes, not on every Present', () => {
+    let calls = 0;
+    setPresentingDeviceWindowListener(() => { calls++; });
+    try {
+        makeWindow(HWND, POPUP, 40, 40, 560, 400);
+        for (let i = 0; i < 3; i++) publishPresentedClient(HWND);
+        expect(calls).toBe(1);
+        publishPresentedClient(0);
+        publishPresentedClient(0);
+        expect(calls).toBe(2);
+        publishPresentedClient(0x7777);
+        expect(calls).toBe(2);
+    } finally {
+        setPresentingDeviceWindowListener(null);
+        publishPresentedClient(0);
+        clearPresentedClientRect();
+    }
 });

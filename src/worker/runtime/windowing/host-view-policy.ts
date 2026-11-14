@@ -3,8 +3,9 @@
  *
  * - V is the client rectangle of the foreground window's root, clipped to the screen. The
  *   root is found through WS_CHILD parents and through the owners of popups, so an owned
- *   dialog keeps its game window framed; a popup root (a launcher dialog, a borderless
- *   window) is not framed.
+ *   dialog keeps its game window framed. A popup root (a launcher dialog, a borderless
+ *   window) is framed only when a windowed device presents into it, so a borderless
+ *   windowed game smaller than the screen fills the host surface and a launcher does not.
  * - A root that covers the screen, exclusive DirectDraw (which owns the display), and the
  *   "show the whole desktop" setting give the screen.
  * - A visible top-level window outside V that is not in the root's owner chain (an
@@ -20,6 +21,7 @@ import { System, type HostView } from "../../core/system";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { getVirtualScreenRect, windows, type WindowInfo } from "../../modules/user32/shared-state";
 import type { WindowManager } from "./window-manager";
+import { presentingDeviceWindow, setPresentingDeviceWindowListener } from "./fullscreen-window";
 
 const WS_POPUP = 0x80000000;
 const WS_CHILD = 0x40000000;
@@ -40,6 +42,13 @@ function foregroundRoot(hwnd: number): WindowInfo | undefined {
         win = owner;
     }
     return win && isTopLevel(win) ? win : undefined;
+}
+
+/** A windowed device presents into `root` or into one of its WS_CHILD descendants. */
+function presentsIntoRoot(root: WindowInfo): boolean {
+    let win = windows.get(presentingDeviceWindow());
+    for (let i = 0; win && i < MAX_CHAIN && !isTopLevel(win) && win.parent; i++) win = windows.get(win.parent);
+    return win === root;
 }
 
 function inOwnerChain(root: WindowInfo, win: WindowInfo): boolean {
@@ -64,7 +73,8 @@ export function selectHostView(out: HostView): void {
     if (system.ddrawContext?.cooperative?.exclusive) return;
 
     const root = foregroundRoot(system.windowManager?.getForegroundHwnd?.() ?? 0);
-    if (!root || !root.visible || (root.style & (WS_POPUP | WS_MINIMIZE)) !== 0) return;
+    if (!root || !root.visible || (root.style & WS_MINIMIZE) !== 0) return;
+    if ((root.style & WS_POPUP) !== 0 && !presentsIntoRoot(root)) return;
 
     const x0 = Math.max(screen.left, root.x), y0 = Math.max(screen.top, root.y);
     const x1 = Math.min(screen.right, root.x + root.width), y1 = Math.min(screen.bottom, root.y + root.height);
@@ -93,4 +103,5 @@ export function refreshHostView(): void {
 export function installHostViewPolicy(wm: WindowManager): void {
     System.getInstance().setHostViewSelector(selectHostView);
     wm.registerForegroundWindowObserver(refreshHostView);
+    setPresentingDeviceWindowListener(refreshHostView);
 }

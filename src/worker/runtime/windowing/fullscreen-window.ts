@@ -169,6 +169,21 @@ const MAX_PARENT_DEPTH = 32;
 // @transient(log-once marks for device windows whose client area reaches past the screen; diagnostics only)
 const loggedOffScreenClients = new Set<number>();
 
+// @transient(the window the last windowed Present went to; the next Present sets it again)
+let windowedDeviceWindow = 0;
+// @transient(installed by the host view policy at start-up)
+let deviceWindowListener: (() => void) | null = null;
+
+/** Called whenever the window windowed Presents go to changes (the host view policy re-derives V). */
+export function setPresentingDeviceWindowListener(listener: (() => void) | null): void {
+    deviceWindowListener = listener;
+}
+
+/** The window a windowed device presented into last, 0 when the last Present owned the screen. */
+export function presentingDeviceWindow(): number {
+    return windowedDeviceWindow;
+}
+
 /**
  * A device presents into `hwnd`'s client area (0 = it owns the screen): the presenters show
  * its frame where that client area lies inside the host view. Called on every Present, so
@@ -182,6 +197,11 @@ const loggedOffScreenClients = new Set<number>();
  */
 export function publishPresentedClient(hwnd: number): void {
     const win = hwnd ? sharedWindows.get(hwnd >>> 0) : undefined;
+    const deviceWindow = win ? hwnd >>> 0 : 0;
+    if (deviceWindow !== windowedDeviceWindow) {
+        windowedDeviceWindow = deviceWindow;
+        deviceWindowListener?.();
+    }
     if (!win) {
         clearPresentedClientRect();
         return;
