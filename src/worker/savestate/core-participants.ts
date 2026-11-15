@@ -156,7 +156,7 @@ const SCHEMAS = {
         stub: stateKeys<ThunkStub>({ address: true, dllName: true, functionName: true, functionId: true, argCount: true, stackCleanupBytes: true, absentDll: true, redirectedTo: true }),
     },
     resources: { state: stateKeys<ResourceProviderState>({ com: true, gdi: true, kernel: true, user: true, file: true, attributes: true, addressToHandle: true, handleToAddress: true, handleToPrimaryAddress: true, surfacePtrs: true, counters: true, freeCom: true, freeUser: true, freeFile: true, comGenerations: true, userGenerations: true }), kernelRecords: KERNEL_RECORDS },
-    hypercallPage: stateKeys<HypercallState>({ registered: true, enabled: true, slabControlAddr: true, mutexMirrorAddr: true, eaglTokenCfgAddr: true, eventTable: true, flsAllocated: true, flsValues: true, flsCurrentTid: true, captureHwnd: true, suspendSlots: true, suspendTable: true, wasmStringWritersOff: true }),
+    hypercallPage: stateKeys<HypercallState>({ registered: true, enabled: true, slabControlAddr: true, mutexMirrorAddr: true, eaglTokenCfgAddr: true, eventTable: true, flsAllocated: true, flsValues: true, flsCurrentTid: true, captureHwnd: true, suspendSlots: true, suspendTable: true, wasmStringWritersOff: true, tebStubsBound: true }),
     scheduler: { state: stateKeys<SchedulerState>({ threads: true, currentThreadId: true, nextThreadId: true, mainThreadId: true, runQueue: true, bootstrapUntilFirstWait: true, tlsSlots: true, nextTlsIndex: true, criticalSectionOwners: true, csLockSemaphores: true, stackPool: true, stackBytesPooled: true, stackBytesReserved: true, ownedStackBases: true, mainStack: true, threadExitStubAddr: true, apcDispatchStub: true, apcDispatchGeneration: true, alertedWaitResults: true, reapQueue: true, reapRetryQueue: true, teb: true, sync: true, dllNotify: true, threadStartStubAddr: true }), thread: THREAD_FIELDS },
     timerWheel: stateKeys<ReturnType<TimerWheel['captureState']>>({ nextId: true, entries: true }),
     dispatcher: {
@@ -211,7 +211,7 @@ export function registerCoreParticipants(): void {
     });
     const moduleImages = moduleImagesHooks(() => ({ registry: process().moduleRegistry, loader: process().loader }));
     savestateParticipants.add({
-        id: 'module-images', version: 1, order: 7, schema: schema(MODULE_IMAGES_SCHEMA),
+        id: 'module-images', version: 2, order: 7, schema: schema(MODULE_IMAGES_SCHEMA),
         capture: (ctx) => refusing('module images', () => moduleImages.capture(ctx)),
         verify: moduleImages.verify,
         restore: moduleImages.restore,
@@ -222,15 +222,14 @@ export function registerCoreParticipants(): void {
         restore: (s, ctx) => System.getInstance().resourceProvider.restoreState(as<ResourceProviderState>(s), r => ctx.object(r)),
     });
     savestateParticipants.add({
-        id: 'hypercall-page', version: 1, order: 11, schema: schema(SCHEMAS.hypercallPage),
+        id: 'hypercall-page', version: 2, order: 11, schema: schema(SCHEMAS.hypercallPage),
         capture: () => save(hypercallDataManager.captureState()),
         restore: (s) => hypercallDataManager.restoreState(as<HypercallState>(s)),
     });
-    // scheduler v2: TEB TLS arrays hold all 1088 TlsAlloc indices (teb-manager.ts). A v1
-    // snapshot's arrays are 64 slots in guest RAM, so restoring one would let a key >= 64 be
-    // written past its end.
+    // scheduler v4: native inline/expansion TLS and a distinct implicit vector,
+    // including allocator-owned expansion/FLS blocks. Older guest layouts are incompatible.
     savestateParticipants.add({
-        id: 'scheduler', version: 3, order: 20, schema: schema(SCHEMAS.scheduler),
+        id: 'scheduler', version: 4, order: 20, schema: schema(SCHEMAS.scheduler),
         capture: (ctx) => {
             const state = refusing('scheduler', () => System.getInstance().scheduler.captureState((o, w) => ctx.ref(o, w)));
             refusing('scheduler', () => rewindRestartableParks(state, ctx));

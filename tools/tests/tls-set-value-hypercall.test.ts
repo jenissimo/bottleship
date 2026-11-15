@@ -27,9 +27,12 @@ const FREED = 5, EXPANSION = 64, PRESET = 7;
 const CALLS: Array<[number, number, number, boolean]> = [
     [3, 0x11223344, 1, true],
     [PRESET, 0xdeadbeef, 1, true],
-    [FREED, 0x55, 0, false],          // not TlsAlloc'd: JS answers FALSE
+    [FREED, 0x55, 1, false],          // not TlsAlloc'd: WASM declines, JS stores it as NT does
     [EXPANSION, 0x6464, 1, false],    // expansion index: WASM declines, JS stores it in the TEB array
-    [70, 0x70, 0, false],
+    [70, 0x70, 1, false],
+    [105, 0x105, 1, false],
+    [1087, 0x1087, 1, false],
+    [1088, 0x70, 0, false],           // past TLS_INDEX_LIMIT: FALSE
     [0xffffffff, 1, 0, false],
     [3, 0, 1, true],                  // NULL is a legitimate value
     [9, 0x99, 1, true],
@@ -66,7 +69,8 @@ function thread(): Thread {
 interface ArmResult {
     returns: number[];
     values: Record<number, number>;
-    arrayWords: number[];
+    nativeWords: number[];
+    implicitSentinels: number[];
     lastError: number;
     tebLastError: number;
     jsCalls: number;
@@ -115,6 +119,8 @@ async function runArm(routed: boolean): Promise<ArmResult> {
         expect(s.tlsFree(FREED)).toBe(true);
         expect(s.tlsSetValue(PRESET, 0xaaaa)).toBe(true);
 
+        const implicit = guest().getUint32(t.tebAddress + 0x2c, true);
+        for (const i of [0,7,63,64,1087]) guest().setUint32(implicit+i*4,0xaa0000+i,true);
         let jsCalls = 0;
         cpu.io.register_write(0xb077, null, undefined, undefined, (fid: number) => {
             if (fid !== FID) return;
@@ -132,19 +138,23 @@ async function runArm(routed: boolean): Promise<ArmResult> {
 
         const returns = CALLS.map((_, i) => cpu.read32s(RES + i * 4) >>> 0);
         const values: Record<number, number> = {};
-        for (const i of [3, PRESET, FREED, 9, EXPANSION]) values[i] = s.tlsGetValue(i);
-        const array = teb.getTlsArrayAddress(1)!;
-        const arrayWords = Array.from({ length: EXPANSION + 1 }, (_, i) => guest().getUint32(array + i * 4, true));
+        for (const i of [3, PRESET, FREED, 9, EXPANSION,70,105,1087]) values[i] = s.tlsGetValue(i);
+        const expansion = guest().getUint32(t.tebAddress + 0xf94, true);
+        expect(expansion).not.toBe(0);
+        // Independently decode literal NT32 fields; never use the JS value accessor as oracle.
+        const nativeWords = Array.from({length:1088},(_,i) => guest().getUint32(
+            i<64 ? t.tebAddress+0xe10+i*4 : expansion+(i-64)*4,true));
+        const implicitSentinels=[0,7,63,64,1087].map(i=>guest().getUint32(implicit+i*4,true));
         const served = page().getUint32(OFF_HC_HANDLER_CALLS + HANDLER * 4, true);
         const fellBack = page().getUint32(OFF_HC_HANDLER_FALLBACKS + HANDLER * 4, true);
         expect(s.tlsFree(9)).toBe(true);
         const afterFree = {
-            slot: guest().getUint32(array + 9 * 4, true),
+            slot: guest().getUint32(t.tebAddress + 0xe10 + 9 * 4, true),
             published: page().getUint8(OFF_HC_TLS_ALLOCATED + 9),
             other: page().getUint8(OFF_HC_TLS_ALLOCATED + 3),
         };
         return {
-            returns, values, arrayWords, lastError: t.lastError,
+            returns, values, nativeWords, implicitSentinels, lastError: t.lastError,
             tebLastError: guest().getUint32(t.tebAddress + 0x34, true),
             jsCalls, served, fellBack, afterFree,
         };
@@ -164,16 +174,19 @@ describe.skipIf(!existsSync(lib) || !existsSync(wasm))('TlsSetValue hypercall, e
         const expectServed = CALLS.filter(c => c[3]).length;
 
         expect(js.returns).toEqual(CALLS.map(c => c[2]));
-        expect(js.values).toEqual({ 3: 0, [PRESET]: 0xdeadbeef, [FREED]: 0, 9: 0x99, [EXPANSION]: 0x6464 });
-        expect(js.arrayWords[9]).toBe(0x99);
-        expect(js.arrayWords[PRESET]).toBe(0xdeadbeef);
-        expect(js.arrayWords[EXPANSION]).toBe(0x6464);   // one storage for every index
+        expect(js.values).toEqual({ 3: 0, [PRESET]: 0xdeadbeef, [FREED]: 0x55, 9: 0x99, [EXPANSION]: 0x6464,70:0x70,105:0x105,1087:0x1087 });
+        expect(js.nativeWords[9]).toBe(0x99);
+        expect(js.nativeWords[PRESET]).toBe(0xdeadbeef);
+        expect(js.nativeWords[105]).toBe(0x105);
+        expect(js.nativeWords[1087]).toBe(0x1087);
+        expect(js.nativeWords[EXPANSION]).toBe(0x6464);   // one storage for every index
         expect(js.jsCalls).toBe(CALLS.length);
         expect(js.served + js.fellBack).toBe(0);
 
         expect(hc.returns).toEqual(js.returns);
         expect(hc.values).toEqual(js.values);
-        expect(hc.arrayWords).toEqual(js.arrayWords);
+        expect(hc.nativeWords).toEqual(js.nativeWords);
+        for(const arm of [js,hc]) expect(arm.implicitSentinels).toEqual([0,7,63,64,1087].map(i=>0xaa0000+i));
         expect([hc.lastError, hc.tebLastError]).toEqual([js.lastError, js.tebLastError]);
         expect(hc.jsCalls).toBe(CALLS.length - expectServed);
         expect(hc.served).toBe(expectServed);

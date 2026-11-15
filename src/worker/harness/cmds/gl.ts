@@ -33,6 +33,7 @@ import {
 } from "../../modules/opengl32/context";
 import { armGLFrameCapture, cancelGLFrameCapture, takeGLFrameCapture, summarizeGLComponents, type GLFrameCaptureOptions } from "../../modules/opengl32/frame-capture";
 import type { OpenGLContext, GLTextureObject } from "../../modules/opengl32/context";
+import { armGLWorkDigest, readGLWorkDigest, offGLWorkDigest, type GLWorkOptions } from "../../modules/opengl32/work-digest";
 
 function glCtx(): OpenGLContext {
     const mod = getModule("opengl32") as { getContext?: () => OpenGLContext | null } | undefined;
@@ -107,6 +108,15 @@ export function describeGLDrawPacket(I: Int32Array, F: Float32Array, i: number, 
 }
 
 export function registerGlCommands(svc: HarnessService): void {
+    /** Absolute GL guest-present window; engine demo frames are an independent oracle. */
+    svc.register("glWorkDigest", (args) => {
+        const opts = (args[0] ?? {}) as GLWorkOptions & { phase?: "arm" | "read" | "off" };
+        if (opts.phase === "off") return offGLWorkDigest();
+        const ctx = glCtx();
+        if (opts.phase === "arm") return armGLWorkDigest(ctx, opts);
+        if (opts.phase !== undefined && opts.phase !== "read") throw new HarnessError("glWorkDigest phase must be arm|read|off", HarnessErrorCode.BAD_ARGS);
+        return { ...readGLWorkDigest(ctx), currentFrame: ctx.frameId };
+    });
     svc.register("glFrame", async (args) => {
         const opts = (args[0] ?? {}) as GLFrameCaptureOptions & { timeoutMs?: number };
         const ctx = glCtx(); // fail fast when the title is not GL

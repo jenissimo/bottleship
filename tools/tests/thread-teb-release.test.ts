@@ -14,7 +14,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Scheduler } from "../../src/worker/core/scheduler/scheduler";
 import { STACK_SIZE_PARAM_IS_A_RESERVATION, type Thread, type KernelThreadObject } from "../../src/worker/core/scheduler/types";
-import { TEB_BLOCK_SIZE, TLS_INDEX_LIMIT } from "../../src/worker/core/teb-manager";
+import { TEB_BLOCK_SIZE, TLS_INDEX_LIMIT, IMPLICIT_TLS_LIMIT } from "../../src/worker/core/teb-manager";
 import { hypercallDataManager } from "../../src/worker/core/cpu/hypercall-data";
 import { System } from "../../src/worker/core/system";
 import { newObjectGraph, restoreObjectGraph } from "../../src/worker/savestate/object-codecs";
@@ -23,6 +23,9 @@ import { registerCoreParticipants } from "../../src/worker/savestate/core-partic
 
 const MB = 1024 * 1024;
 const MEM_BYTES = 64 * MB;
+const TEB_SIZE = 0x1000;
+/** The TlsAlloc slots plus the implicit-TLS range past them (teb-manager IMPLICIT_TLS_FIRST). */
+const TLS_ARRAY_BYTES = IMPLICIT_TLS_LIMIT * 4;
 
 /** Bump allocator with an exact-fit free list, so a released block really comes back. */
 class FakeMemory {
@@ -102,7 +105,8 @@ describe("scheduler: a reaped thread's TEB and TLS array go back to the allocato
         const teb = s.tebManager.getTebAddress(id)!;
         for (const i of [0, 12, 63]) s.tebManager.syncTlsSlot(id, i, 0xabc000 + i);
         for (const i of [0, 12, 63]) expect(view.getUint32(teb + 0xe10 + i * 4, true)).toBe(0xabc000 + i);
-        expect(view.getUint32(teb + 0x2c, true)).toBe(teb + 0xe10);
+        expect(view.getUint32(teb + 0x2c, true)).toBe(s.tebManager.getTlsArrayAddress(id)!);
+        expect(view.getUint32(teb + 0x2c, true)).not.toBe(teb + 0xe10);
     });
 
     test("create/exit churn reuses one TEB and one TLS array instead of growing", () => {
@@ -114,7 +118,7 @@ describe("scheduler: a reaped thread's TEB and TLS array go back to the allocato
             const id = spawn(s, mem);
             tebs.add(s.tebManager.getTebAddress(id)!);
             arrays.add(s.tebManager.getTlsArrayAddress(id)!);
-            expect(memory.live.size).toBe(baseline + 2);          // stack + TEB block (TLS array inside it)
+            expect(memory.live.size).toBe(baseline + 3);          // stack + TEB + independent loader TLS vector
             kill(s, id);
             reap(s);
             expect(thread(s, id)).toBeUndefined();
@@ -141,12 +145,12 @@ describe("scheduler: a reaped thread's TEB and TLS array go back to the allocato
             for (const i of [0, 5, 64, TLS_INDEX_LIMIT - 1]) s.tebManager.syncTlsSlot(id, i, (id << 16) | i);
             s.tebManager.syncLastError(id, 0x1000 + id);
         }
-        const deadTebs = dead.map(id => s.tebManager.getTebAddress(id)!);
+        const deadTebs = dead.flatMap(id => { const teb = s.tebManager.getTebAddress(id)!; return [teb, view.getUint32(teb + 0xf94, true)]; });
         for (const id of dead) kill(s, id);
         reap(s);
         // Two new threads take the freed blocks (exact fit) and zero them.
         const fresh = [spawn(s, mem), spawn(s, mem)];
-        expect(fresh.map(id => s.tebManager.getTebAddress(id)).sort()).toEqual([...deadTebs].sort());
+        for (const id of fresh) expect(deadTebs).toContain(s.tebManager.getTebAddress(id)!);
         for (const id of live) {
             for (const i of [0, 5, 64, TLS_INDEX_LIMIT - 1]) expect(s.tebManager.readTlsSlot(id, i)).toBe((id << 16) | i);
             expect(s.tebManager.readLastError(id)).toBe(0x1000 + id);
@@ -165,6 +169,8 @@ describe("scheduler: a reaped thread's TEB and TLS array go back to the allocato
         // Another owner takes the block (TEB with the TLS array inside) and fills it.
         expect(memory.alloc(TEB_BLOCK_SIZE)).toBe(teb);
         mem.fill(0x5a, teb, teb + TEB_BLOCK_SIZE);
+        expect(memory.alloc(TLS_ARRAY_BYTES)).toBe(array);
+        mem.fill(0x5a, array, array + TLS_ARRAY_BYTES);
         expect(s.tlsFree(index)).toBe(true);                       // clearTlsSlotAllThreads walks the maps
         s.setLastErrorForThread(id, 0x77);                          // a late completion for the dead thread
         expect(view.getUint32(array + index * 4, true)).toBe(0x5a5a5a5a);

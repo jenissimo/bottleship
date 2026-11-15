@@ -38,8 +38,7 @@ describe("native splices: libgcc SjLj frame registration", () => {
             expect(s.mask.length).toBe(s.body.length);
             for (let i = 0; i < s.body.length; i++) expect(s.body[i]! & ~s.mask[i]!).toBe(0);
             for (const o of s.same) expect(Array.from(s.mask.subarray(o, o + 4))).toEqual([0, 0, 0, 0]);
-            for (let i = 0; i < s.code.length; i++) expect(s.mask[s.offset + i] === 0xff || s.mask[s.offset + i] === 0).toBe(true);
-            expect(s.offset + s.code.length).toBeLessThanOrEqual(s.body.length);
+            expect(s.offset + 5).toBeLessThanOrEqual(s.body.length);
         }
     });
 
@@ -50,33 +49,26 @@ describe("native splices: libgcc SjLj frame registration", () => {
         expect(hits.map(h => h.address)).toEqual(at);
     });
 
-    test("only the TLS block is rewritten and the jump lands on the original epilogue", () => {
+    test("only a complete five-byte JMP is published; original tail and epilogue stay intact", () => {
         const { mem, module, at } = image();
-        const before = mem.slice();
-        expect(applyNativeSplices(mem, module).length).toBe(2);
+        const before = mem.slice(); let code = BASE + 0x3000;
+        expect(applyNativeSplices(mem, module, { alloc(n) { const a=code; code+=(n+15)&~15; return a; } }).length).toBe(2);
         NATIVE_SPLICES.forEach((s, n) => {
-            const a = at[n]!;
-            for (let i = 0; i < s.body.length; i++) {
-                const inside = i >= s.offset && i < s.offset + s.code.length;
-                expect(mem[a + i]).toBe(inside ? s.code[i - s.offset]! : before[a + i]!);
-            }
-            const end = s.offset + s.code.length;
-            expect(s.code[s.code.length - 2]).toBe(0xeb);
-            const target = end + ((s.code[s.code.length - 1]! << 24) >> 24);
-            expect(target).toBe(n === 0 ? 0x2c : 0x24);
+            const a=at[n]!, patch=a+s.offset;
+            for(let i=0;i<s.body.length;i++) if(i<s.offset || i>=s.offset+5) expect(mem[a+i]).toBe(before[a+i]);
+            expect(mem[patch]).toBe(0xe9);
+            const target=patch+5+new DataView(mem.buffer).getInt32(patch+1,true);
+            expect(target).toBeGreaterThanOrEqual(BASE+0x3000);
+            expect(target).toBeLessThan(code);
+            expect(mem[a+s.continuation]).toBe(n===0 ? 0x8d : 0x8b);
         });
-        expect(Array.from(mem.subarray(at[0]! + 0x2c, at[0]! + 0x34))).toEqual([0x8d, 0x65, 0xf4, 0x5b, 0x5e, 0x5f, 0x5d, 0xc3]);
-        expect(Array.from(mem.subarray(at[1]! + 0x24, at[1]! + 0x29))).toEqual([0x8b, 0x5d, 0xfc, 0xc9, 0xc3]);
     });
-
-    test("the splice reads the slot array through fs:[0x2C] and never touches LastError", () => {
-        const [reg, unreg] = NATIVE_SPLICES;
-        expect(Array.from(reg!.code)).toEqual([
-            0x8b, 0x4a, 0x30, 0x64, 0xa1, 0x2c, 0, 0, 0, 0x8b, 0x14, 0x88, 0x89, 0x17, 0x89, 0x3c, 0x88, 0xeb, 0xc1,
-        ]);
-        expect(Array.from(unreg!.code)).toEqual([
-            0x8b, 0x48, 0x30, 0x64, 0xa1, 0x2c, 0, 0, 0, 0x89, 0x1c, 0x88, 0xeb, 0xc4,
-        ]);
+    test("no allocator or failed allocation leaves the original bytes untouched", () => {
+        const {mem,module}=image(); const before=mem.slice();
+        expect(applyNativeSplices(mem,module)).toEqual([]);
+        expect(mem).toEqual(before);
+        expect(applyNativeSplices(mem,module,{alloc(){throw new Error("allocation failed");}})).toEqual([]);
+        expect(mem).toEqual(before);
     });
 
     test("a body whose state operands disagree is left alone", () => {

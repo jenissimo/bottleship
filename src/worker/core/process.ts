@@ -1,3 +1,4 @@
+import { MemoryAllocationError } from './memory/allocation-error';
 
 import { ThunkDispatcher, type DeferredWrite } from './thunking/thunk-dispatcher';
 import { toPlainGuestMemory } from './memory/guest-memory';
@@ -343,7 +344,7 @@ export class MemoryManager {
                     `next=0x${b.next.toString(16)} slabTop=0x${(b.slabTop ?? b.limit).toString(16)}`
                   : `${kind} (absent)`;
             const high = bucketKind === 'HEAP' ? this.bucketState.get('HEAP_HIGH') : undefined;
-            throw new Error(
+            throw new MemoryAllocationError(
                 `MemoryManager: ${bucketKind} exhausted (requested 0x${aligned.toString(16)}; ` +
                 `${describe(bucketKind, bucket)}` +
                 `${bucketKind === 'HEAP' ? `; ${describe('HEAP_HIGH', high)}` : ''})`);

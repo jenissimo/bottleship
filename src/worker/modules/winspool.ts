@@ -3,6 +3,7 @@ import { Process } from "../core/process";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { Marshaler } from "../core/memory/marshaler";
 import { Logger, LogCategory } from "../core/logger";
+import { System } from "../core/system";
 
 // Windows Print Spooler API (winspool.drv)
 // Minimal stub implementation for legacy applications that check for printer availability
@@ -28,7 +29,7 @@ export class Winspool implements IModule {
             Logger.log(LogCategory.SYSTEM, `OpenPrinterA: pPrinterName="${printerName}", phPrinter=0x${phPrinter.toString(16)}`);
 
             // Always fail - no printer available in emulated environment
-            process.lastError = ERROR_INVALID_PRINTER_NAME;
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_PRINTER_NAME);
             return { value: 0, stackCleanup: 12 }; // FALSE
         };
 
@@ -41,7 +42,7 @@ export class Winspool implements IModule {
             const printerName = pPrinterName ? Marshaler.readWideString(mem, pPrinterName) : "(default)";
             Logger.log(LogCategory.SYSTEM, `OpenPrinterW: pPrinterName="${printerName}", phPrinter=0x${phPrinter.toString(16)}`);
 
-            process.lastError = ERROR_INVALID_PRINTER_NAME;
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_PRINTER_NAME);
             return { value: 0, stackCleanup: 12 }; // FALSE
         };
 
@@ -52,7 +53,7 @@ export class Winspool implements IModule {
             Logger.log(LogCategory.SYSTEM, `ClosePrinter: hPrinter=0x${hPrinter.toString(16)}`);
 
             if (hPrinter === 0) {
-                process.lastError = ERROR_INVALID_HANDLE;
+                System.getInstance().scheduler.setLastError(ERROR_INVALID_HANDLE);
                 return { value: 0, stackCleanup: 4 }; // FALSE
             }
 
@@ -112,7 +113,7 @@ export class Winspool implements IModule {
                 view.setUint32(pcbNeeded, 256, true);
             }
 
-            process.lastError = ERROR_INSUFFICIENT_BUFFER;
+            System.getInstance().scheduler.setLastError(ERROR_INSUFFICIENT_BUFFER);
             return { value: 0, stackCleanup: 20 }; // FALSE
         };
 
@@ -131,7 +132,7 @@ export class Winspool implements IModule {
                 view.setUint32(pcbNeeded, 256, true);
             }
 
-            process.lastError = ERROR_INSUFFICIENT_BUFFER;
+            System.getInstance().scheduler.setLastError(ERROR_INSUFFICIENT_BUFFER);
             return { value: 0, stackCleanup: 20 }; // FALSE
         };
 
@@ -202,7 +203,7 @@ export class Winspool implements IModule {
             }
 
             const ERROR_FILE_NOT_FOUND = 2;
-            process.lastError = ERROR_FILE_NOT_FOUND;
+            System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
             return { value: 0, stackCleanup: 8 }; // FALSE
         };
 
@@ -220,7 +221,7 @@ export class Winspool implements IModule {
             }
 
             const ERROR_FILE_NOT_FOUND = 2;
-            process.lastError = ERROR_FILE_NOT_FOUND;
+            System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
             return { value: 0, stackCleanup: 8 }; // FALSE
         };
     }

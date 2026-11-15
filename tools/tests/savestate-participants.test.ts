@@ -332,7 +332,7 @@ describe("participant schemas", () => {
     test("each participant reports its version and a hash of its field policy", () => {
         registerCoreParticipants();
         const schemas = savestateParticipants.schemas();
-        expect(schemas.scheduler!.version).toBe(3);
+        expect(schemas.scheduler!.version).toBe(4);
         expect(schemas.scheduler!.schemaHash).toMatch(/^[0-9a-f]{16}$/);
         expect(schemas.scheduler!.schemaHash).not.toBe(schemas.cpu!.schemaHash);
         expect(schemaHash({ a: "save", b: "host" })).toBe(schemaHash({ b: "host", a: "save" }));
@@ -347,16 +347,16 @@ describe("schema pin and mutation", () => {
         const schemas = savestateParticipants.schemas();
         for (const u of undo) u();
         expect(schemas).toEqual({
-            "kernel32": { version: 4, schemaHash: "6bbba5ed115386df" },
-            "module-images": { version: 1, schemaHash: "d20656b52f2472e7" },
+            "kernel32": { version: 5, schemaHash: "6bbba5ed115386df" },
+            "module-images": { version: 2, schemaHash: "1bddd228a57c6e8c" },
             "time": { version: 1, schemaHash: "728d1b2522148901" },
             "address-space": { version: 1, schemaHash: "a1c4ce059654c36f" },
             "memory-manager": { version: 1, schemaHash: "4a5dbc8ebbd40e94" },
             "kernel32-memory": { version: 2, schemaHash: "4e2a2400e2517640" },
             "thunk-generator": { version: 1, schemaHash: "2673e673145253a5" },
             "resources": { version: 1, schemaHash: "de537d8b445269ef" },
-            "hypercall-page": { version: 1, schemaHash: "5ea73324ac1a4cda" },
-            "scheduler": { version: 3, schemaHash: "fdd4fb1af912be88" },
+            "hypercall-page": { version: 2, schemaHash: "89ee00cc9204cc00" },
+            "scheduler": { version: 4, schemaHash: "fdd4fb1af912be88" },
             "timer-wheel": { version: 1, schemaHash: "3e2f3b81b4d37775" },
             "dispatcher": { version: 1, schemaHash: "88687a30dd0036f2" },
             "loaded-modules": { version: 1, schemaHash: "1294dbb9b5a4d85f" },

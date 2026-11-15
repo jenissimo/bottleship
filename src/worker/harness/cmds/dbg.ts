@@ -18,6 +18,7 @@ import type { HarnessService } from "../service";
 import { PROXY_BASELINE, syncProxyBaselineFlag } from '../../core/cpu/cpu-views';
 import { dbg } from "../../core/debug/dbg-commands";
 import { System } from "../../core/system";
+import { hypercallDataManager } from "../../core/cpu/hypercall-data";
 import { getSehUnwindTrace } from "../../core/seh-dispatch";
 import { guestCodeInvalidationStats, takeGuestCodeAuditPages } from "../../core/memory/guest-code";
 import { localeFastPathStats } from "../../modules/kernel32/locale";
@@ -618,6 +619,24 @@ export function registerDbgCommands(svc: HarnessService): void {
     svc.register("d3d9PipelineMemoProfile", (args) => {
         const opts = (args[0] ?? {}) as { reset?: boolean };
         return d3d9PipelineMemoProfileStats(!!opts.reset);
+    });
+
+    /** Requested boot flags; current binding state is separate and is not hot-unbound. */
+    svc.register("getWorkerFlags", () => {
+        const g = globalThis as Record<string, unknown>;
+        const applied = g[APPLIED_WORKER_FLAGS] as Set<string> | undefined;
+        return {
+            applied: Object.fromEntries(Array.from(applied ?? []).map(name => [name, g[name] ?? null])),
+            tebStubsDisabled: !!g.__noTebStubs,
+            glColorPtrDerefWbufDisabled: g.__noGlColorPtrDerefWbuf === true,
+            appliesOnNextLoad: true,
+            bindings: {
+                tebStubsBound: hypercallDataManager.areTebStubsBound(),
+                colorPtrDeref: Object.fromEntries(["glColor4ubv", "glColor4fv", "glColor3fv"].map(name => [
+                    name, System.getInstance().process?.dispatcher?.getPtrDerefWriteBufferBinding("opengl32", name) ?? null,
+                ])),
+            },
+        };
     });
 
     svc.register("setWorkerFlag", (args) => {
