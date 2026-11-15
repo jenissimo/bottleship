@@ -107,6 +107,14 @@ const OPS = new Map(Object.entries({
     0xc4: ["i64.extend32_s", "alu", 1, 1],
 }).map(([k, v]) => [Number(k), v]));
 
+const SIMD_OPS = new Map([
+    [0, ["v128.load", "mem", 1, 1]],
+    [11, ["v128.store", "mem", 2, 0]],
+    [78, ["v128.and", "alu", 2, 1]],
+    [80, ["v128.or", "alu", 2, 1]],
+    [205, ["i64x2.shr_u", "alu", 2, 1]],
+]);
+
 // ── abstract operand stack ─────────────────────────────────────────────────
 //
 // Every slot is either TOP (unknown) or an unsigned interval [lo, hi] of a known-bounded i32. A
@@ -311,9 +319,7 @@ export function moduleStats(bytes, label = "", { ops: opsTable = OPS, sites = fa
     for (let ii = 0; ii < list.length; ii++) {
         const ins = list[ii];
         const v128 = ins.op === 0xfd;
-        const known = v128
-            ? [ins.imm.subop === 0 ? "v128.load" : "v128.store", "mem", ins.imm.subop === 0 ? 1 : 2, ins.imm.subop === 0 ? 1 : 0]
-            : opsTable.get(ins.op);
+        const known = v128 ? SIMD_OPS.get(ins.imm.subop) : opsTable.get(ins.op);
         if (!known) {                                                          // self-check 4
             throw new Error(`${label}: unknown opcode 0x${ins.op.toString(16)} at ${where(ins)}`
                 + " — a decode hole mis-attributes every byte after it");
