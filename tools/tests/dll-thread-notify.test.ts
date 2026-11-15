@@ -506,10 +506,10 @@ describe("dispatcher: a load's DLL_PROCESS_ATTACH waits for another thread's not
         d.kickV86IfIdleForAsyncWake = () => {};
         d._restoreAsyncContext = (_i: unknown, _c: unknown, value: number) => { restored.push(value); };
         const cpu = { instruction_pointer: [0x7000], reg32: [0, 0, 0, 0, 0x200] };
-        const load = (thread: number) => {
-            notify.noteDllInitialized(B, 99);
+        const load = (thread: number, base = B) => {
+            notify.noteDllInitialized(base, 99);
             d._onAsyncComplete(Promise.resolve(),
-                { value: B, stackCleanup: 4, dllInits: [{ baseAddress: B, entryPoint: ENTRY, name: "b" }] },
+                { value: base, stackCleanup: 4, dllInits: [{ baseAddress: base, entryPoint: base + 0x100, name: "dll" }] },
                 { epoch: d.asyncEpoch, functionId: 1, threadId: thread, asyncParkGeneration: 1, esp: 0x200, returnAddr: 0x401000, startTime: performance.now() },
                 cpu, 1, "kernel32:LoadLibraryA", performance.now());
         };
@@ -520,7 +520,7 @@ describe("dispatcher: a load's DLL_PROCESS_ATTACH waits for another thread's not
         const f = fixture();
         f.notify.acquire(1);
         f.load(2);
-        expect(f.notify.loaderBusyFor(1)).toBe(true);
+        expect(f.notify.loaderBusyFor(2)).toBe(true);
         for (let i = 0; i < 3; i++) f.poll();
         expect(f.calls).toEqual([]);
         expect(f.d.pendingAsyncRestores.length).toBe(1);
@@ -548,6 +548,45 @@ describe("dispatcher: a load's DLL_PROCESS_ATTACH waits for another thread's not
         f.notify.release(1);
         f.poll();
         expect(started).toBe(1);
+    });
+
+    test("two completed loads with the loader idle: one runs, the other follows after it returns", () => {
+        const f = fixture();
+        const A = 0x28000000;
+        f.load(1, A);
+        f.load(2, B);
+        expect(f.notify.holder()).toBe(1);
+        f.setThread(2); f.poll(); f.poll();
+        expect(f.calls).toEqual([]);
+        f.setThread(1); f.poll();
+        expect(f.calls).toEqual([[A + 0x100, A, 1, 0]]);
+        f.setThread(2); f.poll();
+        expect(f.calls.length).toBe(1);
+        expect(f.completions[0]!(1)).toBe(A);
+        f.poll();
+        expect(f.calls).toEqual([[A + 0x100, A, 1, 0], [ENTRY, B, 1, 0]]);
+        expect(f.completions[1]!(1)).toBe(B);
+        expect(f.d.pendingAsyncRestores.length).toBe(0);
+        expect(f.notify.holder()).toBe(-1);
+    });
+
+    test("the chain owner loads reentrantly although another thread's load is queued; that one follows the release", () => {
+        const f = fixture();
+        const C = 0x38000000;
+        f.notify.acquire(1);
+        f.load(2, B);
+        f.setThread(2); f.poll();
+        expect(f.calls).toEqual([]);
+        f.setThread(1);
+        f.load(1, C);
+        f.poll();
+        expect(f.calls).toEqual([[C + 0x100, C, 1, 0]]);
+        expect(f.completions[0]!(1)).toBe(C);
+        f.setThread(2); f.poll();
+        expect(f.calls.length).toBe(1);
+        f.notify.release(1);
+        f.poll();
+        expect(f.calls).toEqual([[C + 0x100, C, 1, 0], [ENTRY, B, 1, 0]]);
     });
 
     test("a load from inside the owner's own notification call runs at once (reentrant)", () => {

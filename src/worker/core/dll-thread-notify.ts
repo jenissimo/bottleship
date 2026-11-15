@@ -51,6 +51,8 @@ export interface DllThreadNotifyState {
     /** [DLL base, thread whose load queued its DLL_PROCESS_ATTACH (0 = process start)] */
     attaching: number[][];
     owner: number;
+    /** Thread whose queued loads hold the loader while no chain runs (-1 = none). */
+    loadHolder?: number;
 }
 
 export class DllThreadNotify {
@@ -58,8 +60,15 @@ export class DllThreadNotify {
     private disabled = new Set<number>();
     /** DLLs whose DllMain(DLL_PROCESS_ATTACH) is queued or running, with the loading thread. */
     private attaching = new Map<number, number>();
-    /** Thread running notification calls (0 = none). */
+    /** Thread running DLL_THREAD_ATTACH/DETACH calls (0 = none). */
     private owner = 0;
+    /**
+     * With no notification chain running, the loader belongs to ONE thread with queued process
+     * attaches: the first to queue, kept until all of its own have returned. Queued loads of other
+     * threads wait behind it rather than behind each other, so two completed loads never block
+     * each other, and the owner of a running chain can still load reentrantly.
+     */
+    private loadHolder = -1;
 
     /** `onIdle` runs whenever the loader may have become free for a waiting thread. */
     constructor(private readonly onIdle: () => void = () => undefined) {}
@@ -69,6 +78,7 @@ export class DllThreadNotify {
         this.disabled.clear();
         this.attaching.clear();
         this.owner = 0;
+        this.loadHolder = -1;
     }
 
     captureState(): DllThreadNotifyState {
@@ -77,6 +87,7 @@ export class DllThreadNotify {
             disabled: [...this.disabled],
             attaching: [...this.attaching].map(([base, tid]) => [base, tid]),
             owner: this.owner,
+            loadHolder: this.loadHolder,
         };
     }
 
@@ -87,6 +98,7 @@ export class DllThreadNotify {
         for (const base of state.disabled) this.disabled.add(base >>> 0);
         for (const [base, tid] of state.attaching) this.attaching.set(base! >>> 0, tid! >>> 0);
         this.owner = state.owner >>> 0;
+        this.loadHolder = state.loadHolder ?? -1;
     }
 
     /**
@@ -105,7 +117,9 @@ export class DllThreadNotify {
     /** The queued DLL_PROCESS_ATTACH of `base` will run on `threadId` (an async load completes there). */
     claim(base: number, threadId: number): void {
         const b = base >>> 0;
-        if (this.attaching.has(b)) this.attaching.set(b, threadId >>> 0);
+        if (!this.attaching.has(b)) return;
+        this.attaching.set(b, threadId >>> 0);
+        this.onIdle();
     }
 
     /** DllMain(DLL_PROCESS_ATTACH) of this DLL returned, or will never be called. */
@@ -126,12 +140,24 @@ export class DllThreadNotify {
         this.disabled.add(base >>> 0);
     }
 
-    /** Whether `threadId` must wait before running notification calls. */
+    /** The thread the loader belongs to now: a running chain's owner, else the load holder; -1 = free. */
+    holder(): number {
+        if (this.owner !== 0) return this.owner;
+        if (this.loadHolder >= 0) {
+            for (const loader of this.attaching.values()) if (loader === this.loadHolder) return this.loadHolder;
+        }
+        this.loadHolder = -1;
+        for (const loader of this.attaching.values()) { this.loadHolder = loader; break; }
+        return this.loadHolder;
+    }
+
+    /**
+     * Whether `threadId` must wait before running entry-point calls (its notification chain, or
+     * the process attaches of a load it completed): the loader belongs to another thread.
+     */
     loaderBusyFor(threadId: number): boolean {
-        const tid = threadId >>> 0;
-        if (this.owner !== 0 && this.owner !== tid) return true;
-        for (const loader of this.attaching.values()) if (loader !== tid) return true;
-        return false;
+        const h = this.holder();
+        return h >= 0 && h !== (threadId >>> 0);
     }
 
     /** `threadId` runs its notification calls; the caller checked loaderBusyFor first. */
@@ -150,6 +176,7 @@ export class DllThreadNotify {
         const tid = threadId >>> 0;
         let freed = false;
         if (this.owner === tid) { this.owner = 0; freed = true; }
+        if (this.loadHolder === tid) { this.loadHolder = -1; freed = true; }
         for (const [base, loader] of this.attaching) {
             if (loader === tid && tid !== 0) { this.attaching.delete(base); freed = true; }
         }
