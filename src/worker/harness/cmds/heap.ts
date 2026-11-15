@@ -33,9 +33,10 @@ export function registerHeapCommands(svc: HarnessService): void {
      *  is the answer it actually saw.
      *
      *  vaQuery("stacks") runs it over every thread's [stackBase, stackTop) midpoint and
-     *  judges the answer: Win32 describes a stack by its RESERVATION, so AllocationBase
-     *  must be the stack base and RegionSize the whole run — a page-granular answer hands
-     *  every stack-bounds helper inverted or 4KB-wide bounds. */
+     *  judges the answer: AllocationBase must be the stack base, and the region must start
+     *  at the queried page and end at the stack top — a page-granular answer hands every
+     *  stack-bounds helper inverted or 4KB-wide bounds, one measured from the reservation
+     *  puts the top a whole stack too high. */
     svc.register("vaQuery", (args) => {
         const target = args[0];
         if (target !== "stacks") {
@@ -49,9 +50,11 @@ export function registerHeapCommands(svc: HarnessService): void {
         for (const t of scheduler.threads.values()) {
             const base = t.stackBase >>> 0, top = t.stackTop >>> 0;
             if (!(top > base)) continue;
-            const mbi = queryVirtualMemory((base + Math.floor((top - base) / 2)) & ~0xFFF);
+            const page = (base + Math.floor((top - base) / 2)) & ~0xFFF;
+            const mbi = queryVirtualMemory(page);
             const reservationReported = mbi?.allocationBase === `0x${base.toString(16)}`
-                && (mbi?.regionSize as number) === top - base;
+                && mbi?.baseAddress === `0x${page.toString(16)}`
+                && (mbi?.regionSize as number) === ((((top + 0xFFF) & ~0xFFF) >>> 0) - page);
             rows.push({
                 thread: t.id,
                 stackBase: `0x${base.toString(16)}`,
