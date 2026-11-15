@@ -32,8 +32,9 @@ export interface WglState {
     currentHdc: number;
     /** Guest copy of the WGL extensions string, allocated on first query (0 = none yet). */
     extensionsString: number;
-    /** wglSwapIntervalEXT's last accepted interval (1 = the driver default, vsync on). */
-    swapInterval: number;
+    /** wglSwapIntervalEXT intervals by window (key: HWND, or the HDC of a DC without one);
+     *  a window that never set one has the default 1. */
+    swapIntervals: Record<string, number>;
 }
 
 export function createWglState(): WglState {
@@ -44,7 +45,7 @@ export function createWglState(): WglState {
         currentHglrc: 0,
         currentHdc: 0,
         extensionsString: 0,
-        swapInterval: 1,
+        swapIntervals: {},
     };
 }
 
@@ -55,7 +56,7 @@ export function resetWglState(state: WglState): void {
     state.currentHglrc = 0;
     state.currentHdc = 0;
     state.extensionsString = 0;
-    state.swapInterval = 1;
+    state.swapIntervals = {};
 }
 
 /**
@@ -287,7 +288,7 @@ export function createWglExports(
     // once per process; callers query it every frame in some engines.
     const extensionsString = (): number => {
         if (state.extensionsString) return state.extensionsString;
-        const bytes = new TextEncoder().encode("WGL_ARB_extensions_string WGL_EXT_extensions_string WGL_EXT_swap_control\0");
+        const bytes = new TextEncoder().encode("WGL_ARB_extensions_string WGL_EXT_extensions_string\0");
         const addr = ctx.process.memory.alloc(bytes.length) >>> 0;
         if (!addr) return 0;
         ctx.process.getCurrentMemory().set(bytes, addr);
@@ -298,19 +299,33 @@ export function createWglExports(
     // WGL_EXT_extensions_string: the same string, no HDC. Engines (Unity's GL renderer)
     // resolve it through wglGetProcAddress and call it without checking for NULL.
     exports['wglGetExtensionsStringEXT'] = (): number => extensionsString();
-    // WGL_EXT_swap_control. Presentation follows the host's frame cadence whatever the
-    // interval, so the value is only remembered and reported back; a negative interval
-    // (adaptive vsync) needs WGL_EXT_swap_control_tear, which we do not advertise.
+    // WGL_EXT_swap_control entry points. Engines (Unity's GL renderer) resolve and call
+    // wglSwapIntervalEXT whether or not the extension is listed, so a NULL here is a jump
+    // to address 0. Presentation does not pace by the interval yet, which is why
+    // WGL_EXT_swap_control stays out of the extensions string; the calls still keep the
+    // extension's contract: the interval belongs to the window of the current context, not
+    // to the context, a call with no current context fails with ERROR_DC_NOT_FOUND, and a
+    // negative interval (WGL_EXT_swap_control_tear, not offered) with ERROR_INVALID_DATA.
+    const currentWindowKey = (): string => {
+        const hdc = state.currentHdc >>> 0;
+        let hwnd = 0;
+        try { hwnd = System.getInstance().gdiContext?.getDCWindow?.(hdc) >>> 0; } catch { hwnd = 0; }
+        return hwnd ? `w${hwnd}` : `d${hdc}`;
+    };
+    const setLastError = (code: number): void => {
+        try { System.getInstance().scheduler?.setLastError?.(code); } catch { /* no thread */ }
+    };
     exports['wglSwapIntervalEXT'] = (_c, _m, args): number => {
         const interval = args[0] | 0;
-        if (interval < 0) {
-            System.getInstance().scheduler.setLastError(13); // ERROR_INVALID_DATA, as the extension specifies
-            return 0;
-        }
-        state.swapInterval = interval;
+        if (!state.currentHglrc) { setLastError(0x591); return 0; } // ERROR_DC_NOT_FOUND
+        if (interval < 0) { setLastError(13); return 0; }           // ERROR_INVALID_DATA
+        state.swapIntervals[currentWindowKey()] = interval;
         return 1;
     };
-    exports['wglGetSwapIntervalEXT'] = (): number => state.swapInterval >>> 0;
+    exports['wglGetSwapIntervalEXT'] = (): number => {
+        if (!state.currentHglrc) return 1;
+        return (state.swapIntervals[currentWindowKey()] ?? 1) >>> 0;
+    };
 
     return exports;
 }

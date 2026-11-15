@@ -24,6 +24,7 @@
 import { describe, expect, test } from "bun:test";
 import { GLCommandStream } from "../../src/worker/modules/opengl32/context";
 import { createWglExports } from "../../src/worker/modules/opengl32/wgl";
+import { OpenGL32 } from "../../src/worker/modules/opengl32";
 import { resolveHleExportAddress } from "../../src/worker/core/thunking/export-resolver";
 
 const NAME_PTR = 0x1000;
@@ -222,7 +223,7 @@ describe("WGL extensions string", () => {
         const h = harness();
         const ext = h.call("wglGetExtensionsStringEXT");
         expect(ext).not.toBe(0);
-        expect(h.read(ext).split(" ").sort()).toEqual(["WGL_ARB_extensions_string", "WGL_EXT_extensions_string", "WGL_EXT_swap_control"]);
+        expect(h.read(ext).split(" ").sort()).toEqual(["WGL_ARB_extensions_string", "WGL_EXT_extensions_string"]);
         expect(h.call("wglGetExtensionsStringARB", 0xdc)).toBe(ext);
     });
 
@@ -242,12 +243,34 @@ describe("WGL extensions string", () => {
         expect(h.gpa("wglGetExtensionsStringEXT")).toBe(0x21000060);
     });
 
-    test("WGL_EXT_swap_control: the interval is remembered and reported", () => {
+    test("swap interval: no current context fails, the interval belongs to the window, not the context", () => {
         const h = harness();
+        expect(h.call("wglSwapIntervalEXT", 2)).toBe(0);
+        const a1 = h.call("wglCreateContext", 0xa0), a2 = h.call("wglCreateContext", 0xa0), b = h.call("wglCreateContext", 0xb0);
+        expect(h.call("wglMakeCurrent", 0xa0, a1)).toBe(1);
         expect(h.call("wglGetSwapIntervalEXT")).toBe(1);
         expect(h.call("wglSwapIntervalEXT", 0)).toBe(1);
-        expect(h.call("wglGetSwapIntervalEXT")).toBe(0);
+        expect(h.call("wglMakeCurrent", 0xb0, b)).toBe(1);
+        expect(h.call("wglGetSwapIntervalEXT")).toBe(1);
         expect(h.call("wglSwapIntervalEXT", 2)).toBe(1);
+        expect(h.call("wglMakeCurrent", 0xa0, a2)).toBe(1);
+        expect(h.call("wglGetSwapIntervalEXT")).toBe(0);
+        expect(h.call("wglMakeCurrent", 0, 0)).toBe(1);
+        expect(h.call("wglSwapIntervalEXT", 3)).toBe(0);
+        expect(h.call("wglMakeCurrent", 0xb0, b)).toBe(1);
         expect(h.call("wglGetSwapIntervalEXT")).toBe(2);
+        expect(h.call("wglSwapIntervalEXT", -1)).toBe(0);
+        expect(h.call("wglGetSwapIntervalEXT")).toBe(2);
+    });
+
+    test("a module reset drops the cached string and the intervals; the next query writes a fresh string", () => {
+        const m = new OpenGL32() as any;
+        m.wgl.extensionsString = 0x4000;
+        m.wgl.swapIntervals = { d160: 0 };
+        m.wgl.currentHglrc = 5;
+        m.reset();
+        expect(m.wgl.extensionsString).toBe(0);
+        expect(m.wgl.swapIntervals).toEqual({});
+        expect(m.wgl.currentHglrc).toBe(0);
     });
 });

@@ -251,7 +251,7 @@ export const WGL_STATE_FIELDS = {
     currentHglrc: "save",
     currentHdc: "save",
     extensionsString: "save",
-    swapInterval: "save",
+    swapIntervals: "save",
 } as const satisfies Record<keyof WglState, FieldPolicy>;
 
 export const WGL_CONTEXT_FIELDS = {
