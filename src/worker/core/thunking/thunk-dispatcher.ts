@@ -3688,6 +3688,11 @@ export class ThunkDispatcher {
         const deferredWrites = (typeof res === 'object' && res !== null) ? res.deferredWrites : undefined;
         const dllInits = typeof res === 'object' && res !== null ? (res as ThunkResult).dllInits : undefined;
         const startCallbackChain = (typeof res === 'object' && res !== null) ? (res as ThunkResult).startCallbackChain : undefined;
+        // The load finished on the host; its DLL_PROCESS_ATTACH calls belong to the parked thread.
+        if (dllInits && info.threadId !== undefined) {
+            const notify = this.ensureScheduler().dllNotify;
+            for (const init of dllInits) notify?.claim(init.baseAddress, info.threadId);
+        }
 
         // Faithful invariant: a parked thread has ≤1 outstanding async syscall (it cannot issue
         // another until this one returns). A duplicate here means a double-park / lost resume.
@@ -3970,13 +3975,15 @@ export class ThunkDispatcher {
         for (let i = 0; i < this.pendingAsyncRestores.length; i++) {
             const tid = this.pendingAsyncRestores[i].info.threadId;
             if (tid === undefined || (tid >>> 0) === ((currentTid ?? -1) >>> 0)) continue;
+            if (this.pendingWaitsForLoader(this.pendingAsyncRestores[i])) continue;
             if (scheduler.wakeThreadForAsyncCompletion(tid) && switchTarget < 0) switchTarget = tid >>> 0;
         }
 
         // ── Phase 2 — RESUME: apply the current thread's own completion, if at a safe point.
         if (currentTid !== null) {
             const idx = this.indexOfPendingRestoreForThread(currentTid);
-            if (idx >= 0 && this.canApplyCurrentThreadRestore(cpu, this.pendingAsyncRestores[idx])) {
+            if (idx >= 0 && !this.pendingWaitsForLoader(this.pendingAsyncRestores[idx])
+                && this.canApplyCurrentThreadRestore(cpu, this.pendingAsyncRestores[idx])) {
                 const pending = this.pendingAsyncRestores[idx];
                 scheduler.wakeThreadForAsyncCompletion(currentTid);     // WAITING→READY (idempotent)
                 scheduler.markThreadRunningAfterAsyncWake(currentTid, cpu);  // READY→RUNNING + restore this thread's own register file
@@ -4001,6 +4008,19 @@ export class ThunkDispatcher {
             }
         }
         return false;
+    }
+
+    /**
+     * A completion that runs DLL_PROCESS_ATTACH calls (LoadLibrary, an in-process COM server) stays
+     * queued, its thread parked with its genuine return frame, while another thread holds the
+     * loader: one running its DLL_THREAD_ATTACH/DETACH calls or another load's process attach.
+     * The same thread (a load from inside its own notification) is never held. Later polls apply
+     * it once the loader is free.
+     */
+    private pendingWaitsForLoader(pending: PendingAsyncRestore): boolean {
+        const tid = pending.info.threadId;
+        if (!pending.dllInits?.length || tid === undefined) return false;
+        return this.ensureScheduler().dllNotify?.loaderBusyFor(tid) === true;
     }
 
     /** Max consecutive transient (target-page-not-writable) validation retries before escalating. */

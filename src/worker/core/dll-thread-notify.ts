@@ -102,6 +102,12 @@ export class DllThreadNotify {
         this.attaching.set(b, loaderThreadId >>> 0);
     }
 
+    /** The queued DLL_PROCESS_ATTACH of `base` will run on `threadId` (an async load completes there). */
+    claim(base: number, threadId: number): void {
+        const b = base >>> 0;
+        if (this.attaching.has(b)) this.attaching.set(b, threadId >>> 0);
+    }
+
     /** DllMain(DLL_PROCESS_ATTACH) of this DLL returned, or will never be called. */
     noteDllAttached(base: number): void {
         if (this.attaching.delete(base >>> 0)) this.onIdle();

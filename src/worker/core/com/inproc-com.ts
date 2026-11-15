@@ -483,6 +483,8 @@ async function loadDllThenCreate(
 
     return {
         value: S_OK,
+        // Carried so the dispatcher holds this completion while another thread has the loader.
+        dllInits: dllInits.length > 0 ? dllInits : undefined,
         startCallbackChain: ({ esp, returnAddr, mem }) => {
             // Runs at the dispatcher's safe apply point: thread RUNNING, CPU live. ctx carries the genuine
             // guest return (returnAddr) so the chain's suspended frame records the real caller. Returns

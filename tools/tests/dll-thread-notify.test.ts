@@ -470,3 +470,91 @@ describe("scheduler: thread start and exit", () => {
         expect(old.dllNotify.loaderBusyFor(id)).toBe(false);
     });
 });
+
+describe("dispatcher: a load's DLL_PROCESS_ATTACH waits for another thread's notification calls", () => {
+    const B = 0x30000000, ENTRY = B + 0x100;
+    function fixture() {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { ThunkDispatcher } = require("../../src/worker/core/thunking/thunk-dispatcher");
+        const d = new ThunkDispatcher({ add_listener() {} } as any, { getStubById: () => undefined } as any) as any;
+        const ram = new WebAssembly.Memory({ initial: 1, maximum: 3 });
+        const notify = new DllThreadNotify();
+        let tid = 2;
+        const calls: number[][] = [];
+        const completions: Array<(ret: number) => number | null> = [];
+        const restored: number[] = [];
+        d.ensureScheduler = () => ({
+            dllNotify: notify,
+            getCurrentThreadId: () => tid,
+            getCurrentThread: () => ({ id: tid, kernelPinCount: 0 }),
+            wakeThreadForAsyncCompletion: () => true,
+            markThreadRunningAfterAsyncWake() {},
+            requestSwitchToThread() {},
+            isThreadAsyncParked: () => true,
+            validateAsyncRestoreTarget: () => ({ ok: true }),
+            rejectAsyncRestore() {},
+        });
+        d._callbackManager = {
+            reset() {},
+            getStubPoolRange: () => ({ base: 0, end: 0 }),
+            saveSuspendedThunkContext: () => 7,
+            invokeCallback: (entry: number, args: number[], _a: number, complete: (r: number) => number | null) => {
+                calls.push([entry, ...args]); completions.push(complete); return { callbackId: 1 };
+            },
+        };
+        d.updateMemoryCache = () => { d.cachedMem8 = new Uint8Array(ram.buffer); };
+        d.kickV86IfIdleForAsyncWake = () => {};
+        d._restoreAsyncContext = (_i: unknown, _c: unknown, value: number) => { restored.push(value); };
+        const cpu = { instruction_pointer: [0x7000], reg32: [0, 0, 0, 0, 0x200] };
+        const load = (thread: number) => {
+            notify.noteDllInitialized(B, 99);
+            d._onAsyncComplete(Promise.resolve(),
+                { value: B, stackCleanup: 4, dllInits: [{ baseAddress: B, entryPoint: ENTRY, name: "b" }] },
+                { epoch: d.asyncEpoch, functionId: 1, threadId: thread, asyncParkGeneration: 1, esp: 0x200, returnAddr: 0x401000, startTime: performance.now() },
+                cpu, 1, "kernel32:LoadLibraryA", performance.now());
+        };
+        return { d, notify, calls, completions, restored, load, poll: () => d.tryApplyPendingAsyncRestoreAtSafePoint(cpu), setThread: (t: number) => { tid = t; } };
+    }
+
+    test("T1 in its THREAD_ATTACH calls, T2's LoadLibrary completes: no process attach until T1 releases, then exactly one", () => {
+        const f = fixture();
+        f.notify.acquire(1);
+        f.load(2);
+        expect(f.notify.loaderBusyFor(1)).toBe(true);
+        for (let i = 0; i < 3; i++) f.poll();
+        expect(f.calls).toEqual([]);
+        expect(f.d.pendingAsyncRestores.length).toBe(1);
+        f.notify.release(1);
+        f.poll();
+        expect(f.calls).toEqual([[ENTRY, B, 1, 0]]);
+        expect(f.d.pendingAsyncRestores.length).toBe(0);
+        expect(f.completions[0]!(1)).toBe(B);
+        expect(f.notify.loaderBusyFor(1)).toBe(false);
+        f.poll();
+        expect(f.calls.length).toBe(1);
+    });
+
+    test("an in-process COM server's DLL_PROCESS_ATTACH chain waits the same way", () => {
+        const f = fixture();
+        f.notify.acquire(1);
+        f.notify.noteDllInitialized(B, 99);
+        let started = 0;
+        f.d._onAsyncComplete(Promise.resolve(),
+            { value: 0, dllInits: [{ baseAddress: B, entryPoint: ENTRY, name: "b" }], startCallbackChain: () => { started++; return true; } },
+            { epoch: f.d.asyncEpoch, functionId: 1, threadId: 2, asyncParkGeneration: 1, esp: 0x200, returnAddr: 0x401000, startTime: performance.now() },
+            {}, 4, "ole32:CoCreateInstance", performance.now());
+        f.poll(); f.poll();
+        expect(started).toBe(0);
+        f.notify.release(1);
+        f.poll();
+        expect(started).toBe(1);
+    });
+
+    test("a load from inside the owner's own notification call runs at once (reentrant)", () => {
+        const f = fixture();
+        f.notify.acquire(2);
+        f.load(2);
+        f.poll();
+        expect(f.calls).toEqual([[ENTRY, B, 1, 0]]);
+    });
+});
