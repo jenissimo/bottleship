@@ -9,6 +9,10 @@ function prebakeDisplayList(
     ctx: OpenGLContext,
     commands: Array<{ fn: string; args: number[] }>,
 ): GLPrebakedItem[] | null {
+    // A nested list or an in-list enable may turn lighting on after replay starts.
+    // Preserve vertex-time inherited attributes/materials through ordinary replay.
+    if (commands.some(cmd => cmd.fn === 'glCallList' || cmd.fn === 'glCallLists' ||
+        (cmd.fn === 'glEnable' && cmd.args[0] === 0x0b50))) return null;
     const seq: GLPrebakedItem[] = [];
 
     // Vertex attribute simulation state for baking
@@ -19,6 +23,7 @@ function prebakeDisplayList(
 
     let inPrim = false;
     let primMode = 0;
+    let finalColorCommand: { fn: string; args: number[] } | null = null;
     const primBuf: number[] = [];
 
     const mem = ctx.process.getCurrentMemory();
@@ -30,6 +35,7 @@ function prebakeDisplayList(
             bakeColor[0], bakeColor[1], bakeColor[2], bakeColor[3],
             bakeNormal[0], bakeNormal[1], bakeNormal[2],
             bakeTexCoord0[0], bakeTexCoord0[1], bakeTexCoord1[0], bakeTexCoord1[1],
+            0, 0, 0, // secondary RGB, computed at replay
         );
     }
 
@@ -55,6 +61,10 @@ function prebakeDisplayList(
                     }
                 }
                 primBuf.length = 0;
+                if (finalColorCommand) {
+                    seq.push({ kind: 'cmd', fn: finalColorCommand.fn, args: finalColorCommand.args });
+                    finalColorCommand = null;
+                }
                 break;
             }
             // --- Vertex ---
@@ -98,6 +108,13 @@ function prebakeDisplayList(
                 seq.push({ kind: 'cmd', fn, args });
                 break;
         }
+        // Preserve post-list current color/CM state without replaying every baked
+        // vertex. Canonical scalar bits also freeze vector arguments at compile time.
+        if (/^glColor[34](f|ub|fv|ubv)$/.test(fn)) {
+            const colorCommand = { fn: 'glColor4f', args: Array.from(new Uint32Array(bakeColor.buffer)) };
+            if (inPrim) finalColorCommand = colorCommand;
+            else seq.push({ kind: 'cmd', ...colorCommand });
+        }
     }
 
     return seq;
@@ -110,7 +127,11 @@ export function createListExports(ctx: OpenGLContext): Record<string, ThunkImple
         const dl = ctx.displayLists.get(list >>> 0);
         if (!dl) return;
 
-        if (dl.prebaked) {
+        // Lighting needs vertex-time materials and inherited current color. Raw replay
+        // preserves those semantics; baked object geometry remains the unlit fast path.
+        if (dl.prebaked && !ctx.enableFlags.has(0x0b50 /* GL_LIGHTING */) &&
+            !dl.commands.some(cmd => cmd.fn === 'glCallList' || cmd.fn === 'glCallLists' ||
+                (cmd.fn === 'glEnable' && cmd.args[0] === 0x0b50))) {
             // Fast path: use pre-baked vertex data
             const glModule = ctx.process.getModule("opengl32") as any;
             const table = glModule?.exports as Record<string, ThunkImplementation> | undefined;

@@ -14,13 +14,17 @@ import { GL_MODELVIEW, GL_LESS, GL_ONE, GL_ZERO, GL_ALWAYS, GL_BACK, GL_CCW, GL_
          GL_TEXTURE, GL_CONSTANT, GL_PRIMARY_COLOR, GL_PREVIOUS,
          GL_SRC_COLOR, GL_ONE_MINUS_SRC_COLOR, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
          GL_COMBINE, GL_RENDER, NAME_STACK_MAX_DEPTH,
+         GL_COLOR_MATERIAL, GL_FRONT, GL_AMBIENT, GL_DIFFUSE, GL_SPECULAR,
+         GL_EMISSION, GL_AMBIENT_AND_DIFFUSE,
        } from "./constants";
 
 // ---- Draw command types ----
 
-/** Floats per vertex in the flat buffer: [x,y,z,w, r,g,b,a, nx,ny,nz, s0,t0,s1,t1]; after
+/** Floats per vertex in the flat buffer: [x,y,z,w, r,g,b,a, nx,ny,nz, s0,t0,s1,t1, sr,sg,sb]; after
  *  transformFlatVerts with GL_FOG enabled, nx (VERT_FOG_DIST) holds the eye-space |z_e|. */
-export const VERT_FLOATS = 15;
+export const VERT_FLOATS = 18;
+/** Separate specular RGB, added after texture application. */
+export const VERT_SECONDARY_COLOR = 15;
 
 export const VERT_FOG_DIST = 8;
 
@@ -542,6 +546,11 @@ export interface OpenGLContext {
     materialFrontSpecular: Float32Array;
     materialFrontEmission: Float32Array;
     materialFrontShininess: number;
+    materialBackAmbient: Float32Array;
+    materialBackDiffuse: Float32Array;
+    materialBackSpecular: Float32Array;
+    materialBackEmission: Float32Array;
+    materialBackShininess: number;
     lightModelAmbient: Float32Array;
 
     // Color material
@@ -672,6 +681,39 @@ export interface OpenGLContext {
     texGenT: GLTexGenState;
     texGenR: GLTexGenState;
     texGenQ: GLTexGenState;
+}
+
+function copyMaterialColor(target: Float32Array, color: ArrayLike<number>): void {
+    for (let i = 0; i < 4; i++) target[i] = color[i];
+}
+
+/** Color material is persistent state, not just a lighting-time multiplier. */
+export function applyColorMaterial(ctx: OpenGLContext, color: ArrayLike<number> = ctx.currentColor): void {
+    if (!ctx.enableFlags.has(GL_COLOR_MATERIAL)) return;
+    const front = ctx.colorMaterialFace !== GL_BACK;
+    const back = ctx.colorMaterialFace !== GL_FRONT;
+    switch (ctx.colorMaterialParam) {
+        case GL_AMBIENT:
+            if (front) copyMaterialColor(ctx.materialFrontAmbient, color);
+            if (back) copyMaterialColor(ctx.materialBackAmbient, color);
+            break;
+        case GL_DIFFUSE:
+            if (front) copyMaterialColor(ctx.materialFrontDiffuse, color);
+            if (back) copyMaterialColor(ctx.materialBackDiffuse, color);
+            break;
+        case GL_SPECULAR:
+            if (front) copyMaterialColor(ctx.materialFrontSpecular, color);
+            if (back) copyMaterialColor(ctx.materialBackSpecular, color);
+            break;
+        case GL_EMISSION:
+            if (front) copyMaterialColor(ctx.materialFrontEmission, color);
+            if (back) copyMaterialColor(ctx.materialBackEmission, color);
+            break;
+        case GL_AMBIENT_AND_DIFFUSE:
+            if (front) { copyMaterialColor(ctx.materialFrontAmbient, color); copyMaterialColor(ctx.materialFrontDiffuse, color); }
+            if (back) { copyMaterialColor(ctx.materialBackAmbient, color); copyMaterialColor(ctx.materialBackDiffuse, color); }
+            break;
+    }
 }
 
 export interface GLLightState {
@@ -809,6 +851,11 @@ export function createOpenGLContext(process: Process): OpenGLContext {
         materialFrontSpecular: new Float32Array([0, 0, 0, 1]),
         materialFrontEmission: new Float32Array([0, 0, 0, 1]),
         materialFrontShininess: 0,
+        materialBackAmbient: new Float32Array([0.2, 0.2, 0.2, 1]),
+        materialBackDiffuse: new Float32Array([0.8, 0.8, 0.8, 1]),
+        materialBackSpecular: new Float32Array([0, 0, 0, 1]),
+        materialBackEmission: new Float32Array([0, 0, 0, 1]),
+        materialBackShininess: 0,
         lightModelAmbient: new Float32Array([0.2, 0.2, 0.2, 1]),
 
         colorMaterialFace: 0x0408, // GL_FRONT_AND_BACK
@@ -846,7 +893,7 @@ export function createOpenGLContext(process: Process): OpenGLContext {
         proxyTextureInternalFormat: 0,
 
         immediateMode: false,
-        immediateFlatBuf: new Float32Array(65536 * 15),
+        immediateFlatBuf: new Float32Array(65536 * VERT_FLOATS),
         immediateFlatCount: 0,
         immediatePrimMode: 0,
         currentColor: new Float32Array([1, 1, 1, 1]),

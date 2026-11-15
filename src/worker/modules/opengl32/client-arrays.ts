@@ -712,7 +712,7 @@ export function gatherVertices(
     const fog = ctx.enableFlags.has(GL_FOG);
     let space = VertexSpace.OBJECT;
     const posArr = ctx.vertexArray;
-    if (allowClipCache && !texGen && !fog && cvaUsable(ctx, CVA_POS, lo, hi)) {
+    if (allowClipCache && !texGen && !fog && !ctx.enableFlags.has(0x0b50 /* GL_LIGHTING */) && cvaUsable(ctx, CVA_POS, lo, hi)) {
         refreshCvaMvp(ctx);
         cvaFill(ctx, v, CVA_POS, lo, hi);
         gatherFromCache(ctx, CVA_POS, idx, count, dst, dstBase, SLOT_POS);
@@ -751,6 +751,9 @@ export function gatherVertices(
     gatherUnit(ctx, v, idx, count, dst, dstBase, 0, CVA_TC0, SLOT_TC0, lo, hi);
     gatherUnit(ctx, v, idx, count, dst, dstBase, 1, CVA_TC1, SLOT_TC1, lo, hi);
 
+    for (let i = 0, b = dstBase; i < count; i++, b += VERT_FLOATS) {
+        dst[b+15] = dst[b+16] = dst[b+17] = 0;
+    }
     return space;
 }
 

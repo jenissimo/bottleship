@@ -17,7 +17,7 @@ import { colorSeedPixels, readbackSourceRect, resolveReadback } from "./opengl-r
 import { scissorRect, viewportRect } from "./opengl-render-space";
 import { registerGpuDeviceObserver } from "../../../core/gpu/gpu-device-lifecycle";
 import {
-    GLCommandStream, GLDrawCommandType, GLTextureObject, VERT_FLOATS, VERT_FOG_DIST,
+    GLCommandStream, GLDrawCommandType, GLTextureObject, VERT_FLOATS, VERT_FOG_DIST, VERT_SECONDARY_COLOR,
     CMD_I32, CMD_F32, CI_TYPE,
     CI_MODE, CI_VERT_OFFSET, CI_VERT_COUNT, CI_FLAGS, CI_DEPTH_FUNC, CI_BLEND_SRC, CI_BLEND_DST,
     CI_ALPHA_FUNC, CI_CULL_FACE, CI_FRONT_FACE, CI_TEX_ID0, CI_TEX_ID1, CI_TEXENV0, CI_TEXENV1,
@@ -127,7 +127,7 @@ interface SelectedVertices {
     topology: OpenGLTopology;
 }
 
-const VERTEX_FLOAT_STRIDE = 13; // clip.xyzw + color.rgba + uv0.xy + uv1.xy + eye-space fog distance
+const VERTEX_FLOAT_STRIDE = 16; // clip.xyzw + color.rgba + uv0.xy + uv1.xy + fog distance + secondary.rgb
 const VERTEX_BYTE_STRIDE = VERTEX_FLOAT_STRIDE * 4;
 const UNIFORM_BLOCK_SIZE = 144;
 
@@ -976,6 +976,9 @@ export class OpenGLBackendExecutor {
             out[idx++] = src[si+13];    // s1
             out[idx++] = src[si+14];    // t1
             out[idx++] = src[si + VERT_FOG_DIST];
+            out[idx++] = this.clamp01(src[si + VERT_SECONDARY_COLOR]);
+            out[idx++] = this.clamp01(src[si + VERT_SECONDARY_COLOR + 1]);
+            out[idx++] = this.clamp01(src[si + VERT_SECONDARY_COLOR + 2]);
             si += VERT_FLOATS;
         }
 
@@ -1285,6 +1288,7 @@ export class OpenGLBackendExecutor {
                         { shaderLocation: 2, offset: 32, format: "float32x2" },
                         { shaderLocation: 3, offset: 40, format: "float32x2" },
                         { shaderLocation: 4, offset: 48, format: "float32" },
+                        { shaderLocation: 5, offset: 52, format: "float32x3" },
                     ],
                 }],
             },
@@ -1619,6 +1623,7 @@ struct VertexIn {
     @location(2) uv0: vec2f,
     @location(3) uv1: vec2f,
     @location(4) fogDist: f32,
+    @location(5) secondary: vec3f,
 };
 
 struct VertexOut {
@@ -1627,6 +1632,7 @@ struct VertexOut {
     @location(1) uv0: vec2f,
     @location(2) uv1: vec2f,
     @location(3) fogCoord: f32,
+    @location(4) secondary: vec3f,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -1783,6 +1789,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
     out.uv0 = input.uv0;
     out.uv1 = input.uv1;
     out.fogCoord = input.fogDist;
+    out.secondary = input.secondary;
     return out;
 }
 
@@ -1804,7 +1811,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4f {
                             uniforms.comb1Rgb, uniforms.comb1Alpha, uniforms.envColor1, uniforms.texFormat1);
     }
 
-    color = vec4f(clamp(color.rgb, vec3f(0.0), vec3f(1.0)), clamp(color.a, 0.0, 1.0));
+    // Separate specular bypasses every texture unit, then participates in fog.
+    // Its RGB must not alter the diffuse/texture alpha used by the alpha test.
+    color = vec4f(clamp(color.rgb + input.secondary, vec3f(0.0), vec3f(1.0)), clamp(color.a, 0.0, 1.0));
 
     if (uniforms.alphaTestEnabled != 0u && !alphaTestPass(color.a, uniforms.alphaRef, uniforms.alphaFunc)) {
         discard;

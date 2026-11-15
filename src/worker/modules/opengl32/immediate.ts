@@ -11,7 +11,7 @@ import {
     CF_DEPTH_RANGE_NEAR, CF_DEPTH_RANGE_FAR,
     DF_DEPTH_TEST, DF_DEPTH_MASK, DF_BLEND, DF_ALPHA_TEST, DF_CULL, DF_FOG,
     DF_COLOR_MASK_R, DF_COLOR_MASK_G, DF_COLOR_MASK_B, DF_COLOR_MASK_A, DF_STENCIL_TEST, DF_SCISSOR,
-    writeTexEnvSlots, boundTextureStorageId,
+    writeTexEnvSlots, boundTextureStorageId, applyColorMaterial,
 } from "./context";
 import {
     GL_TRIANGLES, GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN, GL_QUADS, GL_QUAD_STRIP,
@@ -23,6 +23,7 @@ import {
 import { Logger, LogCategory } from "../../core/logger";
 import { guestViews } from "./client-arrays";
 import { captureGLDrawEmissionIfArmed, type GLDrawEmissionCapture } from "./frame-capture";
+import { applyLightingFlat, immediateMaterialIndex, resetImmediateMaterials } from "./lighting";
 
 /** @transient(float bit-conversion scratch, written before every read) */
 const _f32ab = new ArrayBuffer(4);
@@ -63,6 +64,7 @@ function pushVertex(ctx: OpenGLContext, x: number, y: number, z: number, w: numb
     buf[b+8]  = ctx.currentNormal[0]; buf[b+9]  = ctx.currentNormal[1]; buf[b+10] = ctx.currentNormal[2];
     buf[b+11] = ctx.currentTexCoord[0][0]; buf[b+12] = ctx.currentTexCoord[0][1];
     buf[b+13] = ctx.currentTexCoord[1][0]; buf[b+14] = ctx.currentTexCoord[1][1];
+    buf[b+15] = immediateMaterialIndex(ctx); buf[b+16] = buf[b+17] = 0;
     ctx.immediateFlatCount++;
 }
 
@@ -79,7 +81,7 @@ export function immediateReserveVertex(ctx: OpenGLContext): number {
     return base;
 }
 
-/** Copy one 15-float vertex. Explicit stores, not subarray()/set(): the view pair
+/** Copy one interleaved vertex. Explicit stores, not subarray()/set(): the view pair
  *  allocated per vertex dominated primitive assembly. */
 function copyVert(src: Float32Array, srcVert: number, dst: Float32Array, d: number): void {
     const s = srcVert * VERT_FLOATS;
@@ -87,6 +89,7 @@ function copyVert(src: Float32Array, srcVert: number, dst: Float32Array, d: numb
     dst[d+4]  = src[s+4];  dst[d+5]  = src[s+5];  dst[d+6]  = src[s+6];  dst[d+7]  = src[s+7];
     dst[d+8]  = src[s+8];  dst[d+9]  = src[s+9];  dst[d+10] = src[s+10];
     dst[d+11] = src[s+11]; dst[d+12] = src[s+12]; dst[d+13] = src[s+13]; dst[d+14] = src[s+14];
+    dst[d+15] = src[s+15]; dst[d+16] = src[s+16]; dst[d+17] = src[s+17];
 }
 
 /**
@@ -430,8 +433,9 @@ export function emitArenaDraw(
         if (ctx.enableFlags.has(GL_TEXTURE_GEN_S) || ctx.enableFlags.has(GL_TEXTURE_GEN_T)) {
             applyTexGenFlat(ctx, arena.data, base, count);
         }
-        transformFlatVerts(ctx, arena.data, base, count);
     }
+    applyLightingFlat(ctx, arena.data, base, count, mode, ctx.immediateFlatCount > 0);
+    if (!preTransformed) transformFlatVerts(ctx, arena.data, base, count);
 
     pushGLDrawCommand(ctx, mode, base, count, capture);
 }
@@ -452,6 +456,7 @@ export function emitDrawCommandFromPrebaked(ctx: OpenGLContext, mode: number, fl
     if (ctx.enableFlags.has(GL_TEXTURE_GEN_S) || ctx.enableFlags.has(GL_TEXTURE_GEN_T)) {
         applyTexGenFlat(ctx, arena.data, base, count);
     }
+    applyLightingFlat(ctx, arena.data, base, count, mode, ctx.immediateFlatCount > 0);
     transformFlatVerts(ctx, arena.data, base, count);
 
     pushGLDrawCommand(ctx, mode, base, count, capture);
@@ -468,6 +473,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.immediateMode = true;
         ctx.immediatePrimMode = args[0] >>> 0;
         ctx.immediateFlatCount = 0;
+        resetImmediateMaterials(ctx);
         return 0;
     };
 
@@ -479,6 +485,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.immediateMode = false;
         emitDrawCommandFlat(ctx, ctx.immediatePrimMode, ctx.immediateFlatBuf, ctx.immediateFlatCount);
         ctx.immediateFlatCount = 0;
+        resetImmediateMaterials(ctx);
         return 0;
     };
 
@@ -603,6 +610,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = bitsToF32(args[1]);
         ctx.currentColor[2] = bitsToF32(args[2]);
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4f'] = (_c, _m, args): number => {
@@ -610,6 +618,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = bitsToF32(args[1]);
         ctx.currentColor[2] = bitsToF32(args[2]);
         ctx.currentColor[3] = bitsToF32(args[3]);
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3ub'] = (_c, _m, args): number => {
@@ -617,6 +626,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = (args[1] & 0xFF) / 255;
         ctx.currentColor[2] = (args[2] & 0xFF) / 255;
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4ub'] = (_c, _m, args): number => {
@@ -624,6 +634,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = (args[1] & 0xFF) / 255;
         ctx.currentColor[2] = (args[2] & 0xFF) / 255;
         ctx.currentColor[3] = (args[3] & 0xFF) / 255;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3d'] = (_c, _m, args): number => {
@@ -631,6 +642,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = args[1] as number;
         ctx.currentColor[2] = args[2] as number;
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4d'] = (_c, _m, args): number => {
@@ -638,6 +650,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = args[1] as number;
         ctx.currentColor[2] = args[2] as number;
         ctx.currentColor[3] = args[3] as number;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3b'] = (_c, _m, args): number => {
@@ -645,6 +658,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = ((args[1] << 24) >> 24) / 127;
         ctx.currentColor[2] = ((args[2] << 24) >> 24) / 127;
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4b'] = (_c, _m, args): number => {
@@ -652,6 +666,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = ((args[1] << 24) >> 24) / 127;
         ctx.currentColor[2] = ((args[2] << 24) >> 24) / 127;
         ctx.currentColor[3] = ((args[3] << 24) >> 24) / 127;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3i'] = (_c, _m, args): number => {
@@ -659,6 +674,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = (args[1] | 0) / 2147483647;
         ctx.currentColor[2] = (args[2] | 0) / 2147483647;
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4i'] = (_c, _m, args): number => {
@@ -666,6 +682,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = (args[1] | 0) / 2147483647;
         ctx.currentColor[2] = (args[2] | 0) / 2147483647;
         ctx.currentColor[3] = (args[3] | 0) / 2147483647;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3s'] = (_c, _m, args): number => {
@@ -673,6 +690,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = ((args[1] << 16) >> 16) / 32767;
         ctx.currentColor[2] = ((args[2] << 16) >> 16) / 32767;
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4s'] = (_c, _m, args): number => {
@@ -680,6 +698,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = ((args[1] << 16) >> 16) / 32767;
         ctx.currentColor[2] = ((args[2] << 16) >> 16) / 32767;
         ctx.currentColor[3] = ((args[3] << 16) >> 16) / 32767;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3ui'] = (_c, _m, args): number => {
@@ -687,6 +706,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = (args[1] >>> 0) / 4294967295;
         ctx.currentColor[2] = (args[2] >>> 0) / 4294967295;
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4ui'] = (_c, _m, args): number => {
@@ -694,6 +714,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = (args[1] >>> 0) / 4294967295;
         ctx.currentColor[2] = (args[2] >>> 0) / 4294967295;
         ctx.currentColor[3] = (args[3] >>> 0) / 4294967295;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3us'] = (_c, _m, args): number => {
@@ -701,6 +722,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = (args[1] & 0xFFFF) / 65535;
         ctx.currentColor[2] = (args[2] & 0xFFFF) / 65535;
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4us'] = (_c, _m, args): number => {
@@ -708,6 +730,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = (args[1] & 0xFFFF) / 65535;
         ctx.currentColor[2] = (args[2] & 0xFFFF) / 65535;
         ctx.currentColor[3] = (args[3] & 0xFFFF) / 65535;
+        applyColorMaterial(ctx);
         return 0;
     };
 
@@ -719,6 +742,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = dv.getFloat32(ptr+4, true);
         ctx.currentColor[2] = dv.getFloat32(ptr+8, true);
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4fv'] = (_c, _m, args): number => {
@@ -728,6 +752,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = dv.getFloat32(ptr+4, true);
         ctx.currentColor[2] = dv.getFloat32(ptr+8, true);
         ctx.currentColor[3] = dv.getFloat32(ptr+12, true);
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3dv'] = (_c, _m, args): number => {
@@ -737,6 +762,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = dv.getFloat64(ptr+8, true);
         ctx.currentColor[2] = dv.getFloat64(ptr+16, true);
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4dv'] = (_c, _m, args): number => {
@@ -746,6 +772,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = dv.getFloat64(ptr+8, true);
         ctx.currentColor[2] = dv.getFloat64(ptr+16, true);
         ctx.currentColor[3] = dv.getFloat64(ptr+24, true);
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3bv'] = (_c, _m, args): number => {
@@ -754,6 +781,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = ((mem[ptr + 1] << 24) >> 24) / 127;
         ctx.currentColor[2] = ((mem[ptr + 2] << 24) >> 24) / 127;
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4bv'] = (_c, _m, args): number => {
@@ -762,6 +790,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = ((mem[ptr + 1] << 24) >> 24) / 127;
         ctx.currentColor[2] = ((mem[ptr + 2] << 24) >> 24) / 127;
         ctx.currentColor[3] = ((mem[ptr + 3] << 24) >> 24) / 127;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3ubv'] = (_c, _m, args): number => {
@@ -770,6 +799,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = mem[ptr + 1] / 255;
         ctx.currentColor[2] = mem[ptr + 2] / 255;
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4ubv'] = (_c, _m, args): number => {
@@ -778,6 +808,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = mem[ptr + 1] / 255;
         ctx.currentColor[2] = mem[ptr + 2] / 255;
         ctx.currentColor[3] = mem[ptr + 3] / 255;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3iv'] = (_c, _m, args): number => {
@@ -787,6 +818,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = dv.getInt32(ptr+4, true) / 2147483647;
         ctx.currentColor[2] = dv.getInt32(ptr+8, true) / 2147483647;
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4iv'] = (_c, _m, args): number => {
@@ -796,6 +828,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = dv.getInt32(ptr+4, true) / 2147483647;
         ctx.currentColor[2] = dv.getInt32(ptr+8, true) / 2147483647;
         ctx.currentColor[3] = dv.getInt32(ptr+12, true) / 2147483647;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3sv'] = (_c, _m, args): number => {
@@ -805,6 +838,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = dv.getInt16(ptr+2, true) / 32767;
         ctx.currentColor[2] = dv.getInt16(ptr+4, true) / 32767;
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4sv'] = (_c, _m, args): number => {
@@ -814,6 +848,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = dv.getInt16(ptr+2, true) / 32767;
         ctx.currentColor[2] = dv.getInt16(ptr+4, true) / 32767;
         ctx.currentColor[3] = dv.getInt16(ptr+6, true) / 32767;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3uiv'] = (_c, _m, args): number => {
@@ -823,6 +858,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = dv.getUint32(ptr + 4, true) / 4294967295;
         ctx.currentColor[2] = dv.getUint32(ptr + 8, true) / 4294967295;
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4uiv'] = (_c, _m, args): number => {
@@ -832,6 +868,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = dv.getUint32(ptr + 4, true) / 4294967295;
         ctx.currentColor[2] = dv.getUint32(ptr + 8, true) / 4294967295;
         ctx.currentColor[3] = dv.getUint32(ptr + 12, true) / 4294967295;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor3usv'] = (_c, _m, args): number => {
@@ -841,6 +878,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = dv.getUint16(ptr + 2, true) / 65535;
         ctx.currentColor[2] = dv.getUint16(ptr + 4, true) / 65535;
         ctx.currentColor[3] = 1;
+        applyColorMaterial(ctx);
         return 0;
     };
     exports['glColor4usv'] = (_c, _m, args): number => {
@@ -850,6 +888,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         ctx.currentColor[1] = dv.getUint16(ptr + 2, true) / 65535;
         ctx.currentColor[2] = dv.getUint16(ptr + 4, true) / 65535;
         ctx.currentColor[3] = dv.getUint16(ptr + 6, true) / 65535;
+        applyColorMaterial(ctx);
         return 0;
     };
 
@@ -984,6 +1023,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
     exports['glTexCoord1fv'] = (_c, _m, args): number => {
         const ptr = args[0] >>> 0;
         ctx.currentTexCoord[ctx.activeTextureUnit][0] = getMemDV(ctx).getFloat32(ptr, true);
+        ctx.currentTexCoord[ctx.activeTextureUnit][1] = 0;
         return 0;
     };
     exports['glTexCoord2fv'] = (_c, _m, args): number => {
@@ -1010,6 +1050,7 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
     exports['glTexCoord1dv'] = (_c, _m, args): number => {
         const ptr = args[0] >>> 0;
         ctx.currentTexCoord[ctx.activeTextureUnit][0] = getMemDV(ctx).getFloat64(ptr, true);
+        ctx.currentTexCoord[ctx.activeTextureUnit][1] = 0;
         return 0;
     };
     exports['glTexCoord2dv'] = (_c, _m, args): number => {
@@ -1058,10 +1099,40 @@ export function createImmediateExports(ctx: OpenGLContext): Record<string, Thunk
         tc[0] = dv.getInt32(ptr, true); tc[1] = dv.getInt32(ptr+4, true); tc[2] = dv.getInt32(ptr+8, true); tc[3] = dv.getInt32(ptr+12, true);
         return 0;
     };
-    exports['glTexCoord1sv'] = exports['glTexCoord1iv'];
-    exports['glTexCoord2sv'] = exports['glTexCoord2iv'];
-    exports['glTexCoord3sv'] = exports['glTexCoord3iv'];
-    exports['glTexCoord4sv'] = exports['glTexCoord4iv'];
+    exports['glTexCoord1sv'] = (_c, _m, args): number => {
+        const ptr = args[0] >>> 0;
+        const dv = getMemDV(ctx);
+        const tc = ctx.currentTexCoord[ctx.activeTextureUnit];
+        tc[0] = dv.getInt16(ptr, true);
+        return 0;
+    };
+    exports['glTexCoord2sv'] = (_c, _m, args): number => {
+        const ptr = args[0] >>> 0;
+        const dv = getMemDV(ctx);
+        const tc = ctx.currentTexCoord[ctx.activeTextureUnit];
+        tc[0] = dv.getInt16(ptr, true);
+        tc[1] = dv.getInt16(ptr+2, true);
+        return 0;
+    };
+    exports['glTexCoord3sv'] = (_c, _m, args): number => {
+        const ptr = args[0] >>> 0;
+        const dv = getMemDV(ctx);
+        const tc = ctx.currentTexCoord[ctx.activeTextureUnit];
+        tc[0] = dv.getInt16(ptr, true);
+        tc[1] = dv.getInt16(ptr+2, true);
+        tc[2] = dv.getInt16(ptr+4, true);
+        return 0;
+    };
+    exports['glTexCoord4sv'] = (_c, _m, args): number => {
+        const ptr = args[0] >>> 0;
+        const dv = getMemDV(ctx);
+        const tc = ctx.currentTexCoord[ctx.activeTextureUnit];
+        tc[0] = dv.getInt16(ptr, true);
+        tc[1] = dv.getInt16(ptr+2, true);
+        tc[2] = dv.getInt16(ptr+4, true);
+        tc[3] = dv.getInt16(ptr+6, true);
+        return 0;
+    };
 
     return exports;
 }
@@ -1165,6 +1236,7 @@ export function registerWriteBufferGLFunctions(dispatcher: any, ctx: OpenGLConte
             ctx.immediateMode = true;
             ctx.immediatePrimMode = mem32[ptr >> 2] >>> 0;
             ctx.immediateFlatCount = 0;
+            resetImmediateMaterials(ctx);
         });
 
     // --- glVertex3f (x, y, z) ---
@@ -1211,6 +1283,7 @@ export function registerWriteBufferGLFunctions(dispatcher: any, ctx: OpenGLConte
             ctx.currentColor[1] = bitsToF32(mem32[(ptr + 4) >> 2]);
             ctx.currentColor[2] = bitsToF32(mem32[(ptr + 8) >> 2]);
             ctx.currentColor[3] = bitsToF32(mem32[(ptr + 12) >> 2]);
+            applyColorMaterial(ctx);
         });
 
     // --- glColor3f (r, g, b) ---
@@ -1221,6 +1294,7 @@ export function registerWriteBufferGLFunctions(dispatcher: any, ctx: OpenGLConte
             ctx.currentColor[1] = bitsToF32(mem32[(ptr + 4) >> 2]);
             ctx.currentColor[2] = bitsToF32(mem32[(ptr + 8) >> 2]);
             ctx.currentColor[3] = 1.0;
+            applyColorMaterial(ctx);
         });
 
     // --- glColor4ub (r, g, b, a) — byte args packed as separate u32 words in ring buffer ---
@@ -1231,6 +1305,7 @@ export function registerWriteBufferGLFunctions(dispatcher: any, ctx: OpenGLConte
             ctx.currentColor[1] = (mem32[(ptr + 4) >> 2] & 0xFF) / 255;
             ctx.currentColor[2] = (mem32[(ptr + 8) >> 2] & 0xFF) / 255;
             ctx.currentColor[3] = (mem32[(ptr + 12) >> 2] & 0xFF) / 255;
+            applyColorMaterial(ctx);
         });
 
     Logger.log(LogCategory.SYSTEM,
