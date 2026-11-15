@@ -24,6 +24,7 @@
 import { describe, expect, test } from "bun:test";
 import { GLCommandStream } from "../../src/worker/modules/opengl32/context";
 import { createWglExports } from "../../src/worker/modules/opengl32/wgl";
+import { OpenGL32 } from "../../src/worker/modules/opengl32";
 import { resolveHleExportAddress } from "../../src/worker/core/thunking/export-resolver";
 
 const NAME_PTR = 0x1000;
@@ -195,5 +196,81 @@ describe("resolveHleExportAddress", () => {
             },
         };
         expect(resolveHleExportAddress(dispatcher, "msvcrt", "_acmdln")).toBe(0x00401234);
+    });
+});
+
+describe("WGL extensions string", () => {
+    function harness() {
+        const mem = new Uint8Array(0x8000);
+        const allocs: number[] = [];
+        let next = 0x4000;
+        const ctx: any = {
+            process: {
+                getCurrentMemory: () => mem,
+                dispatcher: makeDispatcher({}),
+                memory: { alloc: (n: number) => { const a = next; next += (n + 7) & ~7; allocs.push(a); return a; } },
+            },
+            stringCache: new Map(),
+            commands: new GLCommandStream(),
+        };
+        const api = createWglExports(ctx, () => ({ width: 640, height: 480 }));
+        const call = (name: string, ...args: number[]) => (api[name]!({ esp: 0 } as any, mem, args as any) as number) >>> 0;
+        const read = (p: number) => { let e = p; while (mem[e]) e++; return new TextDecoder().decode(mem.subarray(p, e)); };
+        return { call, read, allocs };
+    }
+
+    test("wglGetExtensionsStringEXT exists and names what has entry points behind it; ARB returns the same string", () => {
+        const h = harness();
+        const ext = h.call("wglGetExtensionsStringEXT");
+        expect(ext).not.toBe(0);
+        expect(h.read(ext).split(" ").sort()).toEqual(["WGL_ARB_extensions_string", "WGL_EXT_extensions_string"]);
+        expect(h.call("wglGetExtensionsStringARB", 0xdc)).toBe(ext);
+    });
+
+    test("the string is written once per process, however often it is queried", () => {
+        const h = harness();
+        const first = h.call("wglGetExtensionsStringEXT");
+        for (let i = 0; i < 50; i++) {
+            expect(h.call("wglGetExtensionsStringARB", 0xdc)).toBe(first);
+            expect(h.call("wglGetExtensionsStringEXT")).toBe(first);
+        }
+        expect(h.allocs.length).toBe(1);
+    });
+
+    test("wglGetProcAddress hands out the EXT entry point once it is registered", () => {
+        const h = makeHarness({ "opengl32:wglgetextensionsstringext": 0x21000060 });
+        h.makeCurrent();
+        expect(h.gpa("wglGetExtensionsStringEXT")).toBe(0x21000060);
+    });
+
+    test("swap interval: no current context fails, the interval belongs to the window, not the context", () => {
+        const h = harness();
+        expect(h.call("wglSwapIntervalEXT", 2)).toBe(0);
+        const a1 = h.call("wglCreateContext", 0xa0), a2 = h.call("wglCreateContext", 0xa0), b = h.call("wglCreateContext", 0xb0);
+        expect(h.call("wglMakeCurrent", 0xa0, a1)).toBe(1);
+        expect(h.call("wglGetSwapIntervalEXT")).toBe(1);
+        expect(h.call("wglSwapIntervalEXT", 0)).toBe(1);
+        expect(h.call("wglMakeCurrent", 0xb0, b)).toBe(1);
+        expect(h.call("wglGetSwapIntervalEXT")).toBe(1);
+        expect(h.call("wglSwapIntervalEXT", 2)).toBe(1);
+        expect(h.call("wglMakeCurrent", 0xa0, a2)).toBe(1);
+        expect(h.call("wglGetSwapIntervalEXT")).toBe(0);
+        expect(h.call("wglMakeCurrent", 0, 0)).toBe(1);
+        expect(h.call("wglSwapIntervalEXT", 3)).toBe(0);
+        expect(h.call("wglMakeCurrent", 0xb0, b)).toBe(1);
+        expect(h.call("wglGetSwapIntervalEXT")).toBe(2);
+        expect(h.call("wglSwapIntervalEXT", -1)).toBe(0);
+        expect(h.call("wglGetSwapIntervalEXT")).toBe(2);
+    });
+
+    test("a module reset drops the cached string and the intervals; the next query writes a fresh string", () => {
+        const m = new OpenGL32() as any;
+        m.wgl.extensionsString = 0x4000;
+        m.wgl.swapIntervals = { d160: 0 };
+        m.wgl.currentHglrc = 5;
+        m.reset();
+        expect(m.wgl.extensionsString).toBe(0);
+        expect(m.wgl.swapIntervals).toEqual({});
+        expect(m.wgl.currentHglrc).toBe(0);
     });
 });

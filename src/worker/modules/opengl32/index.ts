@@ -11,7 +11,7 @@ import { createMatrixExports } from "./matrix";
 import { createQueryExports } from "./query";
 import { createImmediateExports, registerWriteBufferGLFunctions } from "./immediate";
 import { createTextureExports } from "./texture";
-import { createWglExports, createWglState, type WglState } from "./wgl";
+import { createWglExports, createWglState, resetWglState, type WglState } from "./wgl";
 import { createListExports } from "./lists";
 import { createArrayExports } from "./arrays";
 import { createMultitextureExports } from "./multitexture";
@@ -72,7 +72,7 @@ export class OpenGL32 implements IModule {
 
     registerSavestate(): () => void {
         return savestateParticipants.add({
-            id: 'opengl32', version: 2, order: 59, covers: ['opengl32', 'glu32'], schema: OPENGL32_SCHEMA as unknown as SaveValue,
+            id: 'opengl32', version: 3, order: 59, covers: ['opengl32', 'glu32'], schema: OPENGL32_SCHEMA as unknown as SaveValue,
             prepare: () => prepareOpenGL(this.context),
             capture: (io) => {
                 if (!this.context) throw new Error("opengl32: the module is not initialized");
@@ -178,6 +178,9 @@ export class OpenGL32 implements IModule {
             resetOpenGLContext(this.context);
             resetImmediateMaterials(this.context);
         }
+        // The next game gets fresh WGL state: the cached extensions string lived in the old
+        // guest memory, and contexts and swap intervals belonged to the old windows.
+        resetWglState(this.wgl);
         this.restoreDebt = createRestoreDebt();
     }
 }
