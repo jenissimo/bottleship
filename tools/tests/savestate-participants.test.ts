@@ -332,7 +332,7 @@ describe("participant schemas", () => {
     test("each participant reports its version and a hash of its field policy", () => {
         registerCoreParticipants();
         const schemas = savestateParticipants.schemas();
-        expect(schemas.scheduler!.version).toBe(2);
+        expect(schemas.scheduler!.version).toBe(3);
         expect(schemas.scheduler!.schemaHash).toMatch(/^[0-9a-f]{16}$/);
         expect(schemas.scheduler!.schemaHash).not.toBe(schemas.cpu!.schemaHash);
         expect(schemaHash({ a: "save", b: "host" })).toBe(schemaHash({ b: "host", a: "save" }));
@@ -356,7 +356,7 @@ describe("schema pin and mutation", () => {
             "thunk-generator": { version: 1, schemaHash: "2673e673145253a5" },
             "resources": { version: 1, schemaHash: "de537d8b445269ef" },
             "hypercall-page": { version: 1, schemaHash: "5ea73324ac1a4cda" },
-            "scheduler": { version: 2, schemaHash: "9ca6e9ac5f1ca162" },
+            "scheduler": { version: 3, schemaHash: "fdd4fb1af912be88" },
             "timer-wheel": { version: 1, schemaHash: "3e2f3b81b4d37775" },
             "dispatcher": { version: 1, schemaHash: "88687a30dd0036f2" },
             "loaded-modules": { version: 1, schemaHash: "1294dbb9b5a4d85f" },

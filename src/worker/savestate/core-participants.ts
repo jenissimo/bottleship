@@ -157,7 +157,7 @@ const SCHEMAS = {
     },
     resources: { state: stateKeys<ResourceProviderState>({ com: true, gdi: true, kernel: true, user: true, file: true, attributes: true, addressToHandle: true, handleToAddress: true, handleToPrimaryAddress: true, surfacePtrs: true, counters: true, freeCom: true, freeUser: true, freeFile: true, comGenerations: true, userGenerations: true }), kernelRecords: KERNEL_RECORDS },
     hypercallPage: stateKeys<HypercallState>({ registered: true, enabled: true, slabControlAddr: true, mutexMirrorAddr: true, eaglTokenCfgAddr: true, eventTable: true, flsAllocated: true, flsValues: true, flsCurrentTid: true, captureHwnd: true, suspendSlots: true, suspendTable: true, wasmStringWritersOff: true }),
-    scheduler: { state: stateKeys<SchedulerState>({ threads: true, currentThreadId: true, nextThreadId: true, mainThreadId: true, runQueue: true, bootstrapUntilFirstWait: true, tlsSlots: true, nextTlsIndex: true, criticalSectionOwners: true, csLockSemaphores: true, stackPool: true, stackBytesPooled: true, stackBytesReserved: true, ownedStackBases: true, mainStack: true, threadExitStubAddr: true, apcDispatchStub: true, apcDispatchGeneration: true, alertedWaitResults: true, reapQueue: true, reapRetryQueue: true, teb: true, sync: true }), thread: THREAD_FIELDS },
+    scheduler: { state: stateKeys<SchedulerState>({ threads: true, currentThreadId: true, nextThreadId: true, mainThreadId: true, runQueue: true, bootstrapUntilFirstWait: true, tlsSlots: true, nextTlsIndex: true, criticalSectionOwners: true, csLockSemaphores: true, stackPool: true, stackBytesPooled: true, stackBytesReserved: true, ownedStackBases: true, mainStack: true, threadExitStubAddr: true, apcDispatchStub: true, apcDispatchGeneration: true, alertedWaitResults: true, reapQueue: true, reapRetryQueue: true, teb: true, sync: true, dllNotify: true, threadStartStubAddr: true }), thread: THREAD_FIELDS },
     timerWheel: stateKeys<ReturnType<TimerWheel['captureState']>>({ nextId: true, entries: true }),
     dispatcher: {
         state: stateKeys<ReturnType<ThunkDispatcher['captureState']>>({ wbufTail: true, asyncEpoch: true, uef: true, callbacks: true }),
@@ -230,7 +230,7 @@ export function registerCoreParticipants(): void {
     // snapshot's arrays are 64 slots in guest RAM, so restoring one would let a key >= 64 be
     // written past its end.
     savestateParticipants.add({
-        id: 'scheduler', version: 2, order: 20, schema: schema(SCHEMAS.scheduler),
+        id: 'scheduler', version: 3, order: 20, schema: schema(SCHEMAS.scheduler),
         capture: (ctx) => {
             const state = refusing('scheduler', () => System.getInstance().scheduler.captureState((o, w) => ctx.ref(o, w)));
             refusing('scheduler', () => rewindRestartableParks(state, ctx));

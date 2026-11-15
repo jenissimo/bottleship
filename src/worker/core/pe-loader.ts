@@ -948,6 +948,8 @@ export class PELoader {
             // Runtime LoadLibrary* path can defer this to thunk-dispatcher callback flow.
             if (invokeDllMain && entryPointRVA !== 0) {
                 module.initialized = true;
+                const sched = System.getInstance().scheduler;
+                sched?.dllNotify.noteDllInitialized(baseAddress, sched.getCurrentThread()?.id ?? 0);
                 this.pendingDllInits.push({
                     baseAddress,
                     entryPoint: baseAddress + entryPointRVA,
@@ -970,6 +972,9 @@ export class PELoader {
                 searchDirectories: dependencyDirectories, reason: String(e) });
             if (registered) {
                 this.moduleRegistry.unregister(dllNameLower);
+                for (const p of this.pendingDllInits) {
+                    if (p.name === dllNameLower) System.getInstance().scheduler?.dllNotify.noteDllUnloaded(p.baseAddress);
+                }
                 this.pendingDllInits = this.pendingDllInits.filter(p => p.name !== dllNameLower);
                 Logger.warn(LogCategory.SYSTEM,
                     `[PE] Load of "${dllName}" failed after registration — unregistered half-linked module: ${e}`);

@@ -1208,8 +1208,8 @@ export class ThunkDispatcher {
     /**
      * Handle thread exit stub.
      */
-    private handleSchedulerThreadExitStub(cpu: any, mem: Uint8Array): void {
-        this.ensureScheduler().handleThreadExitStub(cpu, mem);
+    private handleSchedulerThreadExitStub(cpu: any, mem: Uint8Array): "chain" | "parked" | "ended" {
+        return this.ensureScheduler().handleThreadExitStub(cpu, mem);
     }
 
     // =========================================================================
@@ -2648,8 +2648,37 @@ export class ThunkDispatcher {
             this.callSchedulerOnThunkEnter(cpu);
         }
 
+        // Thread start stubs use ids above the thunk table: ordinary thunk calls never reach the check.
+        if (functionId >= MAX_THUNK_ID && this.ensureScheduler().isThreadStartId?.(functionId)) {
+            const started = this.ensureScheduler().handleThreadStartStub(functionId, cpu, this.cachedMem8!);
+            this.lastExpectedEspAfterReturn = 0;
+            if (started === "parked") {
+                // Waiting for the loader: its context resumes at the stub; this CPU just idles.
+                const ipRaw = this.cachedIpRaw;
+                if (ipRaw) ipRaw[0] = this.spinLoopAddress; else cpuViews(cpu).instructionPointer[0] = this.spinLoopAddress;
+                this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.SPIN_LOOP, 0);
+                return;
+            }
+            this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.CALLBACK_STUB, 0);
+            return;
+        }
+
         if (this.isSchedulerThreadExitId(functionId)) {
-            this.handleSchedulerThreadExitStub(cpu, this.cachedMem8!);
+            const exiting = this.handleSchedulerThreadExitStub(cpu, this.cachedMem8!);
+            if (exiting === "chain") {
+                // DllMain(DLL_THREAD_DETACH) runs first; EIP and ESP are already on the chain.
+                this.lastExpectedEspAfterReturn = 0;
+                this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.CALLBACK_STUB, 0);
+                return;
+            }
+            if (exiting === "parked") {
+                // Waiting for the loader with the exit code on its stack: leave that stack alone.
+                const ipRaw = this.cachedIpRaw;
+                if (ipRaw) ipRaw[0] = this.spinLoopAddress; else cpuViews(cpu).instructionPointer[0] = this.spinLoopAddress;
+                this.lastExpectedEspAfterReturn = 0;
+                this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.SPIN_LOOP, 0);
+                return;
+            }
             // Note: Set EIP to spin loop BEFORE calling onThunkComplete.
             // Without this, v86 resumes the thunk stub's RET N on the terminated
             // thread's stack > jumps to garbage > #UD crash. Also redirect [ESP] so a
@@ -3659,6 +3688,11 @@ export class ThunkDispatcher {
         const deferredWrites = (typeof res === 'object' && res !== null) ? res.deferredWrites : undefined;
         const dllInits = typeof res === 'object' && res !== null ? (res as ThunkResult).dllInits : undefined;
         const startCallbackChain = (typeof res === 'object' && res !== null) ? (res as ThunkResult).startCallbackChain : undefined;
+        // The load finished on the host; its DLL_PROCESS_ATTACH calls belong to the parked thread.
+        if (dllInits && info.threadId !== undefined) {
+            const notify = this.ensureScheduler().dllNotify;
+            for (const init of dllInits) notify?.claim(init.baseAddress, info.threadId);
+        }
 
         // Faithful invariant: a parked thread has ≤1 outstanding async syscall (it cannot issue
         // another until this one returns). A duplicate here means a double-park / lost resume.
@@ -3941,13 +3975,15 @@ export class ThunkDispatcher {
         for (let i = 0; i < this.pendingAsyncRestores.length; i++) {
             const tid = this.pendingAsyncRestores[i].info.threadId;
             if (tid === undefined || (tid >>> 0) === ((currentTid ?? -1) >>> 0)) continue;
+            if (this.pendingWaitsForLoader(this.pendingAsyncRestores[i])) continue;
             if (scheduler.wakeThreadForAsyncCompletion(tid) && switchTarget < 0) switchTarget = tid >>> 0;
         }
 
         // ── Phase 2 — RESUME: apply the current thread's own completion, if at a safe point.
         if (currentTid !== null) {
             const idx = this.indexOfPendingRestoreForThread(currentTid);
-            if (idx >= 0 && this.canApplyCurrentThreadRestore(cpu, this.pendingAsyncRestores[idx])) {
+            if (idx >= 0 && !this.pendingWaitsForLoader(this.pendingAsyncRestores[idx])
+                && this.canApplyCurrentThreadRestore(cpu, this.pendingAsyncRestores[idx])) {
                 const pending = this.pendingAsyncRestores[idx];
                 scheduler.wakeThreadForAsyncCompletion(currentTid);     // WAITING→READY (idempotent)
                 scheduler.markThreadRunningAfterAsyncWake(currentTid, cpu);  // READY→RUNNING + restore this thread's own register file
@@ -3972,6 +4008,19 @@ export class ThunkDispatcher {
             }
         }
         return false;
+    }
+
+    /**
+     * A completion that runs DLL_PROCESS_ATTACH calls (LoadLibrary, an in-process COM server) stays
+     * queued, its thread parked with its genuine return frame, while another thread holds the
+     * loader: one running its DLL_THREAD_ATTACH/DETACH calls or another load's process attach.
+     * The same thread (a load from inside its own notification) is never held. Later polls apply
+     * it once the loader is free.
+     */
+    private pendingWaitsForLoader(pending: PendingAsyncRestore): boolean {
+        const tid = pending.info.threadId;
+        if (!pending.dllInits?.length || tid === undefined) return false;
+        return this.ensureScheduler().dllNotify?.loaderBusyFor(tid) === true;
     }
 
     /** Max consecutive transient (target-page-not-writable) validation retries before escalating. */
@@ -4013,6 +4062,8 @@ export class ThunkDispatcher {
      *  restore that failed validation terminally or exhausted its transient retries. */
     private rejectPendingAsyncRestore(pending: PendingAsyncRestore, cpu: any, source: string, reason: string): void {
         const info = pending.info;
+        // Its queued DLL_PROCESS_ATTACH calls will not run: they no longer hold the loader.
+        for (const init of pending.dllInits ?? []) this.ensureScheduler().dllNotify.noteDllAttached(init.baseAddress);
         const threadId = info.threadId;
         if (threadId === undefined) {
             Logger.error(LogCategory.THUNK,
@@ -4209,6 +4260,12 @@ export class ThunkDispatcher {
         const baseName = completionName.includes(':') ? completionName.split(':')[1] : completionName;
         const isLoadLibrary = baseName === 'LoadLibraryExW' || baseName === 'LoadLibraryExA' ||
             baseName === 'LoadLibraryW' || baseName === 'LoadLibraryA';
+        // Each queued DLL_PROCESS_ATTACH holds the loader for other threads until it returned,
+        // or until it is clear it will not run: every path below settles every entry.
+        const dllNotify = this.ensureScheduler().dllNotify;
+        const settleFrom = (index: number): void => {
+            for (let i = index; i < (dllInits?.length ?? 0); i++) dllNotify.noteDllAttached(dllInits![i]!.baseAddress);
+        };
 
         if (dllInits && dllInits.length > 0 && isLoadLibrary && this._callbackManager) {
             const baseAddress = returnValue >>> 0;
@@ -4238,8 +4295,11 @@ export class ThunkDispatcher {
                     postEsp: (esp + 4 + cleanupBytes) >>> 0,
                     entryEsp: esp >>> 0,
                     complete: (_ret: number): number | null => {
+                        dllNotify.noteDllAttached(dllInits[next]!.baseAddress);
                         next++;
-                        return next < dllInits.length && invokeInit(next) ? null : baseAddress;
+                        if (next < dllInits.length && invokeInit(next)) return null;
+                        settleFrom(next);
+                        return baseAddress;
                     },
                 };
                 let next = 0;
@@ -4260,6 +4320,7 @@ export class ThunkDispatcher {
                 if (invokeInit(0)) {
                     System.getInstance().scheduler.wakeCurrentThreadForCallbackDispatch();
                 } else {
+                    settleFrom(0);
                     this._restoreAsyncContext(info, cpu, returnValue, cleanupBytes, completionName, deferredWrites);
                 }
                 return;
@@ -4272,12 +4333,14 @@ export class ThunkDispatcher {
             );
             if (!dllMainFrameId) {
                 Logger.error(LogCategory.THUNK, `[DllMain] Failed to save suspended thunk frame for ${completionName}`);
+                settleFrom(0);
                 this._restoreAsyncContext(info, cpu, returnValue, cleanupBytes, completionName, deferredWrites);
                 return;
             }
 
             let initIndex = 0;
             const completeThunk = (_ret: number): number | null => {
+                dllNotify.noteDllAttached(dllInits[initIndex]!.baseAddress);
                 initIndex++;
                 if (initIndex < dllInits.length) {
                     const next = dllInits[initIndex];
@@ -4296,6 +4359,7 @@ export class ThunkDispatcher {
                         return null;
                     } catch (e) {
                         Logger.warn(LogCategory.THUNK, `[DllMain] Failed to invoke ${next.name}: ${e}`);
+                        settleFrom(initIndex);
                         return baseAddress;
                     }
                 }
@@ -4304,19 +4368,25 @@ export class ThunkDispatcher {
             };
 
             const first = dllInits[0];
-            this._callbackManager.invokeCallback(
-                first.entryPoint,
-                [first.baseAddress, 1, 0],
-                0,
-                completeThunk,
-                false,
-                'DllMainChain',
-                dllMainFrameId
-            );
+            try {
+                this._callbackManager.invokeCallback(
+                    first.entryPoint,
+                    [first.baseAddress, 1, 0],
+                    0,
+                    completeThunk,
+                    false,
+                    'DllMainChain',
+                    dllMainFrameId
+                );
+            } catch (e) {
+                settleFrom(0);
+                throw e;
+            }
 
             return;
         }
 
+        settleFrom(0);
         this._restoreAsyncContext(info, cpu, returnValue, cleanupBytes, completionName, deferredWrites);
     }
 
@@ -6556,6 +6626,12 @@ export class ThunkDispatcher {
         // DllMain result reporter (from bootloader hook)
         if (marker === 0x000a) {
             const result = cpu.reg32[1] >>> 0; // ECX holds the result
+            const row = cpuViews(cpu).reg32[6]! >>> 0;  // ESI: the {hModule, entry} row just called
+            if (!this.isDataViewValid()) this.updateMemoryCache();
+            if (this.cachedMem8 && row + 4 <= this.cachedMem8.length) {
+                this.ensureScheduler().dllNotify.noteDllAttached(
+                    new DataView(this.cachedMem8.buffer, this.cachedMem8.byteOffset).getUint32(row, true));
+            }
             Logger.warn(LogCategory.SYSTEM, `[DIAG] DllMain call finished. Result (EAX): 0x${result.toString(16)}`);
             return;
         }

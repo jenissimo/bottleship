@@ -678,7 +678,7 @@ export class Msvcrt implements IModule {
                 stackSize,
                 0,
                 0,
-                mem,
+                mem, true,
             );
             if (handle === 0) {
                 sched.setLastError(8);
@@ -705,7 +705,7 @@ export class Msvcrt implements IModule {
                 stackSize,
                 creationFlags,
                 thrdAddr,
-                mem,
+                mem, true,
             );
             if (handle === 0) {
                 sched.setLastError(8);
@@ -715,12 +715,16 @@ export class Msvcrt implements IModule {
         };
         exports["_endthread"] = (ctx, mem, args) => {
             Logger.log(LogCategory.KERNEL32, "_endthread()");
+            const detach = System.getInstance().scheduler.exitThreadThroughStub(ctx.esp >>> 0, 0, 0, mem);
+            if (detach) return detach;
             System.getInstance().scheduler.exitThread(0);
             return { value: 0, terminated: true, stackCleanup: 0 };
         };
         exports["_endthreadex"] = (ctx, mem, args) => {
             const retCode = args[0] >>> 0;
             Logger.log(LogCategory.KERNEL32, `_endthreadex(code=0x${retCode.toString(16)})`);
+            const detach = System.getInstance().scheduler.exitThreadThroughStub(ctx.esp >>> 0, retCode, 4, mem);
+            if (detach) return detach;
             System.getInstance().scheduler.exitThread(retCode);
             return { value: 0, terminated: true, stackCleanup: 4 };
         };

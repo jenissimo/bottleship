@@ -9,6 +9,7 @@ import { avicap32Module } from '../api/avicap32.api';
 import { oledlgModule } from "../api/oledlg.api";
 import { dnsapiModule } from "../api/dnsapi.api";
 import { winhttpModule } from "../api/winhttp.api";
+import { mscoreeModule } from "../api/mscoree.api";
 import { msiModule } from "../api/msi.api";
 import { xinput1_3Module } from "../api/xinput1_3.api";
 import { msvcp140Module } from "../api/msvcp140.api";
@@ -100,6 +101,7 @@ export class APIRegistry {
         this.registerModule(avicap32Module);
         this.registerModule(dnsapiModule);
         this.registerModule(winhttpModule);
+        this.registerModule(mscoreeModule);
         this.registerModule(msiModule);
         this.registerModule(xinput1_3Module);
         this.registerModule(msvcp140Module);

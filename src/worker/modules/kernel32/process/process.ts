@@ -1347,7 +1347,7 @@ export const exports: Record<string, ThunkImplementation> = {
             dwStackSize,
             dwCreationFlags,
             lpThreadId,
-            mem
+            mem, true
         );
 
         if (handle === 0) {
@@ -1447,6 +1447,9 @@ export const exports: Record<string, ThunkImplementation> = {
     'ExitThread': (ctx, mem, args) => {
         const exitCode = args[0] >>> 0;
         Logger.log(LogCategory.KERNEL32, `ExitThread(code=0x${exitCode.toString(16)})`);
+        // A thread owed DLL_THREAD_DETACH ends in its exit stub, which delivers it first.
+        const detach = System.getInstance().scheduler.exitThreadThroughStub(ctx.esp >>> 0, exitCode, 4, mem);
+        if (detach) return detach;
         System.getInstance().scheduler.exitThread(exitCode);
         return { value: 0, terminated: true };
     },
@@ -2712,7 +2715,7 @@ export const exports: Record<string, ThunkImplementation> = {
             dwStackSize,
             dwCreationFlags,
             lpThreadId,
-            mem
+            mem, true
         );
 
         if (handle === 0) {

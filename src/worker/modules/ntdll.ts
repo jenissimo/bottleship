@@ -195,7 +195,7 @@ export class Ntdll implements IModule {
                 stackSize,
                 flags,
                 0,
-                mem
+                mem, true
             );
 
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);

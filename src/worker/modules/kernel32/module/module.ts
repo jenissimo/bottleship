@@ -1273,6 +1273,7 @@ function initModuleFunctions(): void {
         // pointer into the old code keeps working instead of faulting.
         const unload = (): void => {
             registry!.unregister(mod.name);
+            System.getInstance().scheduler.dllNotify.noteDllUnloaded(hModule);
             for (const [k, v] of loadLibraryHandleCache) {
                 if (v === hModule) loadLibraryHandleCache.delete(k);
             }

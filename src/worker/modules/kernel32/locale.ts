@@ -1003,7 +1003,7 @@ export const exports: Record<string, ThunkImplementation> = {
     'DisableThreadLibraryCalls': (ctx, mem, args) => {
         const hModule = args[0];
         Logger.verbose(LogCategory.KERNEL32, `DisableThreadLibraryCalls(hModule=0x${hModule.toString(16)})`);
-        // No-op for emulation - we don't send thread notifications anyway
+        System.getInstance().scheduler.dllNotify.disableThreadLibraryCalls(hModule >>> 0);
         return 1; // TRUE = success
     },
 

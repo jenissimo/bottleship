@@ -11,6 +11,7 @@
  * 7. No circular dependencies — one-way data flow
  */
 
+import { DLL_NOTIFY_WAITING, DLL_THREAD_ATTACH, DLL_THREAD_DETACH, DllNotifyPhase, DllThreadNotify, layNotifyChain, notifyChainBytes, type DllThreadNotifyState } from '../dll-thread-notify';
 import { Logger, LogCategory } from '../logger';
 import { invalidateGuestCode } from '../memory/guest-code';
 import { Process } from '../process';
@@ -131,6 +132,8 @@ export interface SavedThread {
     suspendCount: number; priority: number; backgroundMode: boolean; tebAddress: number; kernelPinCount: number;
     apcQueue: Array<{ routine: number; arg0: number; arg1: number; arg2: number; arg3: number | null; kind: ApcKind }>;
     quitPosted: boolean; quitExitCode: number; asyncParkGeneration: number;
+    /** DllNotifyPhase plus DLL_NOTIFY_WAITING; absent in savestates that predate it (= NONE). */
+    dllNotify?: number;
 }
 
 export const THREAD_FIELDS = {
@@ -140,6 +143,7 @@ export const THREAD_FIELDS = {
     lastError: 'save', suspendCount: 'save', priority: 'save', backgroundMode: 'save',
     lastSwitchTime: 'host', lastSwitchInsn: 'derive', tebAddress: 'save', kernelPinCount: 'save',
     apcQueue: 'save', quitPosted: 'save', quitExitCode: 'save', asyncParkGeneration: 'save',
+    dllNotify: 'save',
 } as const satisfies Record<keyof Thread, 'save' | 'derive' | 'host' | 'transient'>;
 
 type SavedThreadField = { [K in keyof typeof THREAD_FIELDS]: (typeof THREAD_FIELDS)[K] extends 'save' ? K : never }[keyof typeof THREAD_FIELDS];
@@ -172,6 +176,9 @@ export interface SchedulerState {
     reapRetryQueue: number[];
     teb: { peb: number; params: number; tebs: number[][]; tls: number[][] };
     sync: { events: number[]; semaphores: number[]; mutexes: number[] };
+    /** DLL thread-notification bookkeeping; absent in savestates that predate it. */
+    dllNotify?: DllThreadNotifyState;
+    threadStartStubAddr?: number;
 }
 
 export class Scheduler {
@@ -215,6 +222,17 @@ export class Scheduler {
     // at 0x7c07").
     private threadExitStubAddr = 0;
     private readonly threadExitStubSize = 32;
+    // Thread start stubs (THUNK_DATA, allocated on first use): +0 enters a new guest thread's
+    // DLL_THREAD_ATTACH calls, +16 is where the last of them returns before the start routine.
+    // (0x7fff0002 and 0x7fff0003 are the SEH dispatch result and catch completion.)
+    private readonly threadStartFunctionId = 0x7fff0010;
+    private readonly threadAttachedFunctionId = 0x7fff0011;
+    private threadStartStubAddr = 0;
+    private static readonly THREAD_START_STUB_SIZE = 32;
+    /** DLL_THREAD_ATTACH/DETACH bookkeeping and the loader serialization behind it. */
+    readonly dllNotify = new DllThreadNotify(() => this.wakeLoaderWaiters());
+    /** Threads parked with DLL_NOTIFY_WAITING (cheap early-out for wakeLoaderWaiters). */
+    private loaderWaiters = 0;
     private readonly defaultStackSize = 1024 * 1024;
     /** One unmapped page below each thread stack (Windows' PAGE_GUARD page). */
     private static readonly STACK_GUARD = 0x1000;
@@ -809,6 +827,7 @@ export class Scheduler {
                 tebAddress: t.tebAddress, kernelPinCount: t.kernelPinCount,
                 apcQueue: t.apcQueue.map(a => ({ routine: a.routine, arg0: a.arg0, arg1: a.arg1, arg2: a.arg2, arg3: a.arg3 ?? null, kind: a.kind })),
                 quitPosted: t.quitPosted, quitExitCode: t.quitExitCode, asyncParkGeneration: t.asyncParkGeneration,
+                dllNotify: t.dllNotify ?? DllNotifyPhase.NONE,
             } satisfies SavedThread);
         }
         return {
@@ -835,6 +854,8 @@ export class Scheduler {
             reapRetryQueue: [...this.reapRetryQueue],
             teb: this.tebManager.captureState(),
             sync: this.syncObjects.captureState(),
+            dllNotify: this.dllNotify.captureState(),
+            threadStartStubAddr: this.threadStartStubAddr,
         };
     }
 
@@ -859,6 +880,7 @@ export class Scheduler {
                 tebAddress: saved.tebAddress, kernelPinCount: saved.kernelPinCount,
                 apcQueue: saved.apcQueue.map(a => ({ routine: a.routine, arg0: a.arg0, arg1: a.arg1, arg2: a.arg2, arg3: a.arg3 ?? undefined, kind: a.kind })),
                 quitPosted: saved.quitPosted, quitExitCode: saved.quitExitCode, asyncParkGeneration: saved.asyncParkGeneration,
+                dllNotify: saved.dllNotify ?? DllNotifyPhase.NONE,
             };
             this.threads.set(t.id, t);
         }
@@ -886,6 +908,10 @@ export class Scheduler {
         this.reapRetryQueue = [...state.reapRetryQueue];
         this.tebManager.restoreState(state.teb);
         this.syncObjects.restoreState(state.sync);
+        this.dllNotify.restoreState(state.dllNotify);
+        this.threadStartStubAddr = state.threadStartStubAddr ?? 0;
+        this.loaderWaiters = 0;
+        for (const t of this.threads.values()) if ((t.dllNotify ?? 0) & DLL_NOTIFY_WAITING) this.loaderWaiters++;
         this.fpuLiveOwnerThreadId = null;
         this.switchRequested = false;
         for (const t of this.threads.values()) {
@@ -953,6 +979,9 @@ export class Scheduler {
         // If we keep a stale threadExitStubAddr, the next writeThreadExitStub() (CreateThread)
         // overwrites guest HEAP/COM memory at that address → vtable corruption → EIP 0x7c07.
         this.threadExitStubAddr = 0;
+        this.threadStartStubAddr = 0;
+        this.dllNotify.reset();
+        this.loaderWaiters = 0;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -2230,10 +2259,13 @@ export class Scheduler {
 
     createThread(
         startAddress: number, parameter: number, stackSize: number,
-        creationFlags: number, outThreadId: number, memory: Uint8Array
+        creationFlags: number, outThreadId: number, memory: Uint8Array,
+        notifyDlls = false,
     ): number {
         if (!this.process) return 0;
         this.writeThreadExitStub();
+        if (notifyDlls) this.writeThreadStartStub();
+        const notify = notifyDlls && this.threadStartStubAddr !== 0;
 
         const size = threadStackReserve(stackSize, creationFlags, this.imageStackReserve, this.defaultStackSize);
         // Windows puts a PAGE_GUARD page below every thread stack, so an overflow raises
@@ -2264,7 +2296,10 @@ export class Scheduler {
         } as KernelThreadObject);
 
         const isSuspended = (creationFlags & CREATE_SUSPENDED) !== 0;
-        const context = createInitialContext(startAddress, esp);
+        // A guest-created thread enters through the start stub, which runs its DLL_THREAD_ATTACH
+        // calls once it gets the loader (and only then picks the DLLs), then the start routine
+        // with the frame above. Host-created threads (winmm timer, callback queue) start directly.
+        const context = createInitialContext(notify ? this.threadStartStubAddr : startAddress, esp);
 
         let tebAddress = 0;
         if (this.process.memory) {
@@ -2286,6 +2321,7 @@ export class Scheduler {
             apcQueue: [],
             quitPosted: false, quitExitCode: 0,
             asyncParkGeneration: 0,
+            dllNotify: notify ? DllNotifyPhase.START : DllNotifyPhase.NONE,
         };
 
         this.threads.set(threadId, thread);
@@ -2387,7 +2423,11 @@ export class Scheduler {
         // A terminated thread leaves the shared table: its handle can be handed to a new
         // thread, and the WASM handler must not answer for the dead one.
         hypercallDataManager.forgetThreadSuspendCount(thread.handle >>> 0);
+        if ((thread.dllNotify ?? 0) & DLL_NOTIFY_WAITING) this.loaderWaiters--;
+        thread.dllNotify = DllNotifyPhase.NONE;
         this.setThreadState(thread, ThreadState.TERMINATED);
+        // Whatever loader serialization it held is free: a terminated owner can never return it.
+        this.dllNotify.releaseThread(threadId);
         thread.exitCode = safeExitCode;
         thread.waitInfo = null;
         thread.context = null;
@@ -4459,18 +4499,159 @@ export class Scheduler {
         return functionId === this.threadExitFunctionId;
     }
 
-    handleThreadExitStub(cpu: V86Cpu, mem: Uint8Array): void {
+    isThreadStartId(functionId: number): boolean {
+        return functionId === this.threadStartFunctionId || functionId === this.threadAttachedFunctionId;
+    }
+
+    /**
+     * The exit stub: the start routine returned, or ExitThread / _endthreadex came here with
+     * the exit code on top of the stack. A thread that is owed DLL_THREAD_DETACH (whether or not
+     * it got DLL_THREAD_ATTACH: the initial thread and DLLs loaded after the thread started are
+     * notified too) waits for the loader, then runs the detach calls in reverse initialization
+     * order; the chain returns past the stub's PUSH EAX with the exit code on top again, and the
+     * second pass ends the thread. Returns "chain" when EIP/ESP now point at the first entry
+     * point, "parked" when the thread waits for the loader, "ended" when it terminated.
+     */
+    handleThreadExitStub(cpu: V86Cpu, mem: Uint8Array): "chain" | "parked" | "ended" {
         const thread = this.getCurrentThread();
-        if (!thread || thread.state === ThreadState.TERMINATED) return;
+        if (!thread || thread.state === ThreadState.TERMINATED) return "ended";
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const esp = readEsp(cpu);
-        if (esp + 4 > mem.length) return;
-
+        if (esp + 4 > mem.length) return "ended";
         const exitCode = view.getUint32(esp, true);
+
+        const phase = (thread.dllNotify ?? 0) & ~DLL_NOTIFY_WAITING;
+        if (phase === DllNotifyPhase.DETACHING) {
+            this.dllNotify.release(thread.id);
+        } else if (phase !== DllNotifyPhase.NONE && this.process?.moduleRegistry) {
+            const retry = (this.threadExitStubAddr + 1) >>> 0;
+            if (this.dllNotify.loaderBusyFor(thread.id)) {
+                this.parkForLoader(thread, cpu, retry);
+                return "parked";
+            }
+            const targets = this.dllNotify.targets(this.process.moduleRegistry).reverse();
+            if (targets.length > 0) {
+                if (this.notifyChainFits(thread, esp, notifyChainBytes(targets.length), mem.length)) {
+                    const chain = layNotifyChain(view, esp, targets, DLL_THREAD_DETACH, retry);
+                    this.dllNotify.acquire(thread.id);
+                    thread.dllNotify = DllNotifyPhase.DETACHING;
+                    this.enterNotifyChain(cpu, targets[0]!.entry, chain);
+                    return "chain";
+                }
+                Logger.warn(LogCategory.THREAD,
+                    `T${thread.id}: no room for DLL_THREAD_DETACH below esp=0x${esp.toString(16)}; ending without it`);
+            }
+        }
         Logger.log(LogCategory.THREAD, `Thread ${thread.id} returned via exitStub, exitCode=0x${exitCode.toString(16)}`);
         this.terminateThread(thread.id, exitCode);
         this.requestSwitch();
+        return "ended";
+    }
+
+    /**
+     * ExitThread / _endthreadex / _endthread of a thread that is owed DLL_THREAD_DETACH: return
+     * into the exit stub with the exit code in EAX instead of ending here, so the detach calls run
+     * in the thread (after waiting for the loader if needed). `cleanup` is the thunk's own stack
+     * cleanup. Returns the thunk result to use, or null to end the thread directly as before.
+     */
+    exitThreadThroughStub(esp: number, exitCode: number, cleanup: number, mem: Uint8Array): { value: number; stackCleanup: number } | null {
+        const thread = this.getCurrentThread();
+        if (!thread || !this.process?.moduleRegistry) return null;
+        const phase = (thread.dllNotify ?? 0) & ~DLL_NOTIFY_WAITING;
+        if (phase === DllNotifyPhase.NONE || phase === DllNotifyPhase.DETACHING) return null;
+        if (!this.dllNotify.loaderBusyFor(thread.id)
+            && this.dllNotify.targets(this.process.moduleRegistry).length === 0) return null;
+        // The stub pushes EAX into the slot above the popped arguments, the one ExitThread's
+        // caller pushed its return address or first argument into: that word is stack the
+        // caller owns. Check it and the return slot before touching either.
+        const slot = esp >>> 0;
+        const pushAt = (esp + 4 + cleanup - 4) >>> 0;
+        if (!this.notifyChainFits(thread, (slot + 4) >>> 0, 4, mem.length)
+            || !this.notifyChainFits(thread, (pushAt + 4) >>> 0, 4, mem.length)) return null;
+        this.writeThreadExitStub();
+        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(slot, this.threadExitStubAddr >>> 0, true);
+        return { value: exitCode >>> 0, stackCleanup: cleanup };
+    }
+
+    /**
+     * The start stubs. At +0 a new guest thread takes the loader (waiting while another thread
+     * holds it), picks the DLLs to notify now, and runs their DLL_THREAD_ATTACH calls; the chain
+     * returns into +16, which gives the loader back and enters the start routine with
+     * [exit stub, parameter] on top, the frame CreateThread laid. Returns "chain" when EIP/ESP
+     * point at guest code to run, "parked" when the thread waits for the loader.
+     */
+    handleThreadStartStub(functionId: number, cpu: V86Cpu, mem: Uint8Array): "chain" | "parked" {
+        const thread = this.getCurrentThread();
+        if (!thread) return "parked";
+        const esp = readEsp(cpu);
+        const phase = (thread.dllNotify ?? 0) & ~DLL_NOTIFY_WAITING;
+        if (functionId === this.threadAttachedFunctionId) {
+            if (phase === DllNotifyPhase.ATTACHING) this.dllNotify.release(thread.id);
+            thread.dllNotify = DllNotifyPhase.RUNNING;
+            this.enterNotifyChain(cpu, thread.startAddress, esp);
+            return "chain";
+        }
+        if (phase === DllNotifyPhase.START && this.process?.moduleRegistry) {
+            if (this.dllNotify.loaderBusyFor(thread.id)) {
+                this.parkForLoader(thread, cpu, this.threadStartStubAddr);
+                return "parked";
+            }
+            const targets = this.dllNotify.targets(this.process.moduleRegistry);
+            if (targets.length > 0 && this.notifyChainFits(thread, esp, notifyChainBytes(targets.length), mem.length)) {
+                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+                const chain = layNotifyChain(view, esp, targets, DLL_THREAD_ATTACH,
+                    (this.threadStartStubAddr + 16) >>> 0);
+                this.dllNotify.acquire(thread.id);
+                thread.dllNotify = DllNotifyPhase.ATTACHING;
+                this.enterNotifyChain(cpu, targets[0]!.entry, chain);
+                return "chain";
+            }
+        }
+        thread.dllNotify = DllNotifyPhase.RUNNING;
+        this.enterNotifyChain(cpu, thread.startAddress, esp);
+        return "chain";
+    }
+
+    /** [top - bytes, top) is stack the thread may write: its own stack, or writable committed memory. */
+    private notifyChainFits(thread: Thread, top: number, bytes: number, memLength: number): boolean {
+        const hi = top >>> 0;
+        if (bytes > hi) return false;
+        const lo = (hi - bytes) >>> 0;
+        if (hi > memLength) return false;
+        if (lo >= (thread.stackBase >>> 0) && hi <= (thread.stackTop >>> 0)) return true;
+        const region = this.process?.addressSpace?.getRegion(lo);
+        return !!region && region.base <= lo && region.base + region.size >= hi
+            && region.perms.includes("w") && region.protection !== 0x01;
+    }
+
+    private enterNotifyChain(cpu: V86Cpu, eip: number, esp: number): void {
+        const v = cpuViews(cpu);
+        v.reg32[4] = esp >>> 0;
+        if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
+        v.instructionPointer[0] = eip >>> 0;
+    }
+
+    /** Park the running thread until the loader is free for it; it then resumes at `retryEip`. */
+    private parkForLoader(thread: Thread, cpu: V86Cpu, retryEip: number): void {
+        const ctx = this.saveCurrentThreadContext(cpu);
+        ctx.eip = retryEip >>> 0;
+        thread.dllNotify = (thread.dllNotify ?? 0) | DLL_NOTIFY_WAITING;
+        this.loaderWaiters++;
+        this.blockThread(thread, WaitReason.SLEEP, [], false, null, false, 0, ctx);
+        this.requestSwitch();
+    }
+
+    /** The loader may be free: wake every parked thread it is free for (each retries its stub). */
+    private wakeLoaderWaiters(): void {
+        if (this.loaderWaiters <= 0) return;
+        for (const t of this.threads.values()) {
+            if (!((t.dllNotify ?? 0) & DLL_NOTIFY_WAITING) || this.dllNotify.loaderBusyFor(t.id)) continue;
+            if (t.state !== ThreadState.WAITING || t.waitInfo?.reason !== WaitReason.SLEEP) continue;
+            t.dllNotify = (t.dllNotify ?? 0) & ~DLL_NOTIFY_WAITING;
+            this.loaderWaiters--;
+            this.wakeThread(t, 0);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -5566,6 +5747,9 @@ export class Scheduler {
             apcQueue: [],
             quitPosted: false, quitExitCode: 0,
             asyncParkGeneration: 0,
+            // The initial process thread gets no DLL_THREAD_ATTACH but owes DLL_THREAD_DETACH
+            // if it ends with ExitThread while the process lives on.
+            dllNotify: DllNotifyPhase.RUNNING,
         };
 
         this.threads.set(threadId, thread);
@@ -5635,5 +5819,30 @@ export class Scheduler {
         mem[this.threadExitStubAddr + off++] = 0xEF; // OUT DX, EAX
         while (off < this.threadExitStubSize) mem[this.threadExitStubAddr + off++] = 0x90; // NOP
         invalidateGuestCode(this.threadExitStubAddr, this.threadExitStubSize);
+    }
+
+    /** +0: enter a new thread's DLL_THREAD_ATTACH calls; +16: the last of them returns here. */
+    private writeThreadStartStub(): void {
+        if (!this.process) return;
+        if (this.threadStartStubAddr === 0) {
+            try {
+                this.threadStartStubAddr = this.process.memory.alloc(Scheduler.THREAD_START_STUB_SIZE, 'THUNK_DATA') >>> 0;
+            } catch (e) {
+                Logger.error(LogCategory.THREAD, `Failed to allocate thread-start stub: ${e}`);
+                return;
+            }
+        }
+        const mem = this.process.getCurrentMemory();
+        const base = this.threadStartStubAddr;
+        if (base + Scheduler.THREAD_START_STUB_SIZE > mem.length) return;
+        const put = (at: number, id: number): void => {
+            const b = [0xB8, id & 0xFF, (id >>> 8) & 0xFF, (id >>> 16) & 0xFF, (id >>> 24) & 0xFF,  // MOV EAX, id
+                0xBA, 0x77, 0xB0, 0x00, 0x00,                                                    // MOV EDX, 0xB077
+                0xEF];                                                                            // OUT DX, EAX
+            for (let i = 0; i < 16; i++) mem[base + at + i] = i < b.length ? b[i]! : 0x90;
+        };
+        put(0, this.threadStartFunctionId);
+        put(16, this.threadAttachedFunctionId);
+        invalidateGuestCode(base, Scheduler.THREAD_START_STUB_SIZE);
     }
 }
