@@ -38,7 +38,6 @@ import {
 import { planProcessCrt, processCrtBinding, type CrtScanImport } from './crt-binding';
 import { parsePeImports } from '@bottleship/formats/pe';
 import { applyBaseRelocations } from './pe-relocations';
-import { noteDllInitialized, resetDllThreadNotify } from './dll-thread-notify';
 import { nameOrdinalImports, readExportNameDirectory, shippedExportNames } from './pe-export-names';
 import { normalizeDllBaseName, resolveThunkedDllAlias } from './dll-aliases';
 import { dllSearchDirectories } from './dll-search-order';
@@ -366,7 +365,6 @@ export class PELoader {
     /** Clear per-process caches (heap inline stubs, etc.) tied to specific guest
      *  memory addresses. Called from Process.reset() before thunk memory is regenerated. */
     resetCaches(): void {
-        resetDllThreadNotify();
         this.heapInlineStubs = null;
         this.crtInlineStubs = null;
         this.caseFoldInlineStubs = null;
@@ -950,7 +948,8 @@ export class PELoader {
             // Runtime LoadLibrary* path can defer this to thunk-dispatcher callback flow.
             if (invokeDllMain && entryPointRVA !== 0) {
                 module.initialized = true;
-                noteDllInitialized(baseAddress);
+                const sched = System.getInstance().scheduler;
+                sched?.dllNotify.noteDllInitialized(baseAddress, sched.getCurrentThread()?.id ?? 0);
                 this.pendingDllInits.push({
                     baseAddress,
                     entryPoint: baseAddress + entryPointRVA,
@@ -973,6 +972,9 @@ export class PELoader {
                 searchDirectories: dependencyDirectories, reason: String(e) });
             if (registered) {
                 this.moduleRegistry.unregister(dllNameLower);
+                for (const p of this.pendingDllInits) {
+                    if (p.name === dllNameLower) System.getInstance().scheduler?.dllNotify.noteDllUnloaded(p.baseAddress);
+                }
                 this.pendingDllInits = this.pendingDllInits.filter(p => p.name !== dllNameLower);
                 Logger.warn(LogCategory.SYSTEM,
                     `[PE] Load of "${dllName}" failed after registration — unregistered half-linked module: ${e}`);

@@ -255,6 +255,10 @@ export interface Thread {
     // Monotonic token for async HLE parking. A pending async restore is valid
     // only for the same thread id and generation that produced it.
     asyncParkGeneration: number;
+
+    // DLL_THREAD_ATTACH/DETACH phase (DllNotifyPhase) plus DLL_NOTIFY_WAITING while the thread
+    // waits for the loader. Absent = NONE: the thread is never notified.
+    dllNotify?: number;
 }
 
 // ─── State Transition Validation ────────────────────────────────────────────────

@@ -15,7 +15,6 @@ import type { Process } from "../process";
 import type { ThunkResult } from "../thunking/thunk-dispatcher";
 import { Mem } from "../memory/mem-accessor";
 import type { DllInitEntry } from "../pe-loader";
-import { noteDllAttached } from "../dll-thread-notify";
 
 const S_OK = 0x00000000;
 const REGDB_E_CLASSNOTREG = 0x80040154;
@@ -146,8 +145,10 @@ function runDllMainChain(
     dllPath: string,
     dllGetClassObject: number,
 ): ThunkResult | null {
+    // Each queued DLL_PROCESS_ATTACH holds the loader for other threads until it returned or
+    // will not run; settleDllInits marks the rest on every path that does not run them.
     const callbackManager = process.dispatcher.callbackManager;
-    if (!callbackManager) return null;
+    if (!callbackManager) { settleDllInits(dllInits, 0); return null; }
 
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     // Prefer the return address pinned by tryInprocCoCreateInstance (captured before any async
@@ -158,11 +159,11 @@ function runDllMainChain(
         stackCleanup,
         "inproc-DllMain",
     );
-    if (!frameId) return null;
+    if (!frameId) { settleDllInits(dllInits, 0); return null; }
 
     let initIndex = 0;
     const chainDllMain = (_ret: number): number | null => {
-        noteDllAttached(dllInits[initIndex]!.baseAddress);
+        settleDllInits(dllInits, initIndex, initIndex + 1);
         initIndex++;
         if (initIndex < dllInits.length) {
             const next = dllInits[initIndex]!;
@@ -197,6 +198,7 @@ function runDllMainChain(
         "inproc-DllMain",
         frameId,
     );
+    if (callbackId === 0) settleDllInits(dllInits, 0);
 
     return {
         value: S_OK,
@@ -204,6 +206,12 @@ function runDllMainChain(
         callbackId,
         stackCleanup,
     };
+}
+
+/** DllMain(DLL_PROCESS_ATTACH) of dllInits[from..to) returned or will not run. */
+function settleDllInits(dllInits: DllInitEntry[], from: number, to = dllInits.length): void {
+    const notify = System.getInstance().scheduler?.dllNotify;
+    for (let i = from; i < Math.min(to, dllInits.length); i++) notify?.noteDllAttached(dllInits[i]!.baseAddress);
 }
 
 /** Continue an in-flight suspended thunk; DllMain completeThunk returns null to stay suspended. */
@@ -469,6 +477,7 @@ async function loadDllThenCreate(
     const getClassObject = process.moduleRegistry.getExportAddress(module.name, "DllGetClassObject");
     if (!getClassObject) {
         Logger.warn(LogCategory.COM, `inproc: ${dllPath} has no DllGetClassObject export`);
+        settleDllInits(dllInits, 0);
         return null;
     }
 

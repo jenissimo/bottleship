@@ -1,7 +1,6 @@
 // Locale and string conversion functions for kernel32
 // GetACP, GetOEMCP, WideCharToMultiByte, MultiByteToWideChar, etc.
 
-import { disableThreadLibraryCalls } from '../../core/dll-thread-notify';
 import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
@@ -1004,7 +1003,7 @@ export const exports: Record<string, ThunkImplementation> = {
     'DisableThreadLibraryCalls': (ctx, mem, args) => {
         const hModule = args[0];
         Logger.verbose(LogCategory.KERNEL32, `DisableThreadLibraryCalls(hModule=0x${hModule.toString(16)})`);
-        disableThreadLibraryCalls(hModule >>> 0);
+        System.getInstance().scheduler.dllNotify.disableThreadLibraryCalls(hModule >>> 0);
         return 1; // TRUE = success
     },
 

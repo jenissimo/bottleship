@@ -2,7 +2,6 @@ import { ThunkGenerator, ThunkStub } from './thunk-generator';
 import { restartableCheck } from './restartable';
 import { CallbackManager } from './callback-manager';
 import { Logger, LogCategory } from '../logger';
-import { noteDllAttached } from '../dll-thread-notify';
 import { System } from '../system';
 import { profiler } from '../profiler';
 import { frameProfiler } from '../frame-profiler';
@@ -1209,7 +1208,7 @@ export class ThunkDispatcher {
     /**
      * Handle thread exit stub.
      */
-    private handleSchedulerThreadExitStub(cpu: any, mem: Uint8Array): boolean {
+    private handleSchedulerThreadExitStub(cpu: any, mem: Uint8Array): "chain" | "parked" | "ended" {
         return this.ensureScheduler().handleThreadExitStub(cpu, mem);
     }
 
@@ -2649,11 +2648,35 @@ export class ThunkDispatcher {
             this.callSchedulerOnThunkEnter(cpu);
         }
 
+        // Thread start stubs use ids above the thunk table: ordinary thunk calls never reach the check.
+        if (functionId >= MAX_THUNK_ID && this.ensureScheduler().isThreadStartId?.(functionId)) {
+            const started = this.ensureScheduler().handleThreadStartStub(functionId, cpu, this.cachedMem8!);
+            this.lastExpectedEspAfterReturn = 0;
+            if (started === "parked") {
+                // Waiting for the loader: its context resumes at the stub; this CPU just idles.
+                const ipRaw = this.cachedIpRaw;
+                if (ipRaw) ipRaw[0] = this.spinLoopAddress; else cpuViews(cpu).instructionPointer[0] = this.spinLoopAddress;
+                this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.SPIN_LOOP, 0);
+                return;
+            }
+            this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.CALLBACK_STUB, 0);
+            return;
+        }
+
         if (this.isSchedulerThreadExitId(functionId)) {
-            if (this.handleSchedulerThreadExitStub(cpu, this.cachedMem8!)) {
+            const exiting = this.handleSchedulerThreadExitStub(cpu, this.cachedMem8!);
+            if (exiting === "chain") {
                 // DllMain(DLL_THREAD_DETACH) runs first; EIP and ESP are already on the chain.
                 this.lastExpectedEspAfterReturn = 0;
                 this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.CALLBACK_STUB, 0);
+                return;
+            }
+            if (exiting === "parked") {
+                // Waiting for the loader with the exit code on its stack: leave that stack alone.
+                const ipRaw = this.cachedIpRaw;
+                if (ipRaw) ipRaw[0] = this.spinLoopAddress; else cpuViews(cpu).instructionPointer[0] = this.spinLoopAddress;
+                this.lastExpectedEspAfterReturn = 0;
+                this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.SPIN_LOOP, 0);
                 return;
             }
             // Note: Set EIP to spin loop BEFORE calling onThunkComplete.
@@ -4019,6 +4042,8 @@ export class ThunkDispatcher {
      *  restore that failed validation terminally or exhausted its transient retries. */
     private rejectPendingAsyncRestore(pending: PendingAsyncRestore, cpu: any, source: string, reason: string): void {
         const info = pending.info;
+        // Its queued DLL_PROCESS_ATTACH calls will not run: they no longer hold the loader.
+        for (const init of pending.dllInits ?? []) this.ensureScheduler().dllNotify.noteDllAttached(init.baseAddress);
         const threadId = info.threadId;
         if (threadId === undefined) {
             Logger.error(LogCategory.THUNK,
@@ -4215,6 +4240,12 @@ export class ThunkDispatcher {
         const baseName = completionName.includes(':') ? completionName.split(':')[1] : completionName;
         const isLoadLibrary = baseName === 'LoadLibraryExW' || baseName === 'LoadLibraryExA' ||
             baseName === 'LoadLibraryW' || baseName === 'LoadLibraryA';
+        // Each queued DLL_PROCESS_ATTACH holds the loader for other threads until it returned,
+        // or until it is clear it will not run: every path below settles every entry.
+        const dllNotify = this.ensureScheduler().dllNotify;
+        const settleFrom = (index: number): void => {
+            for (let i = index; i < (dllInits?.length ?? 0); i++) dllNotify.noteDllAttached(dllInits![i]!.baseAddress);
+        };
 
         if (dllInits && dllInits.length > 0 && isLoadLibrary && this._callbackManager) {
             const baseAddress = returnValue >>> 0;
@@ -4244,9 +4275,11 @@ export class ThunkDispatcher {
                     postEsp: (esp + 4 + cleanupBytes) >>> 0,
                     entryEsp: esp >>> 0,
                     complete: (_ret: number): number | null => {
-                        noteDllAttached(dllInits[next]!.baseAddress);
+                        dllNotify.noteDllAttached(dllInits[next]!.baseAddress);
                         next++;
-                        return next < dllInits.length && invokeInit(next) ? null : baseAddress;
+                        if (next < dllInits.length && invokeInit(next)) return null;
+                        settleFrom(next);
+                        return baseAddress;
                     },
                 };
                 let next = 0;
@@ -4267,6 +4300,7 @@ export class ThunkDispatcher {
                 if (invokeInit(0)) {
                     System.getInstance().scheduler.wakeCurrentThreadForCallbackDispatch();
                 } else {
+                    settleFrom(0);
                     this._restoreAsyncContext(info, cpu, returnValue, cleanupBytes, completionName, deferredWrites);
                 }
                 return;
@@ -4279,13 +4313,14 @@ export class ThunkDispatcher {
             );
             if (!dllMainFrameId) {
                 Logger.error(LogCategory.THUNK, `[DllMain] Failed to save suspended thunk frame for ${completionName}`);
+                settleFrom(0);
                 this._restoreAsyncContext(info, cpu, returnValue, cleanupBytes, completionName, deferredWrites);
                 return;
             }
 
             let initIndex = 0;
             const completeThunk = (_ret: number): number | null => {
-                noteDllAttached(dllInits[initIndex]!.baseAddress);
+                dllNotify.noteDllAttached(dllInits[initIndex]!.baseAddress);
                 initIndex++;
                 if (initIndex < dllInits.length) {
                     const next = dllInits[initIndex];
@@ -4304,6 +4339,7 @@ export class ThunkDispatcher {
                         return null;
                     } catch (e) {
                         Logger.warn(LogCategory.THUNK, `[DllMain] Failed to invoke ${next.name}: ${e}`);
+                        settleFrom(initIndex);
                         return baseAddress;
                     }
                 }
@@ -4312,19 +4348,25 @@ export class ThunkDispatcher {
             };
 
             const first = dllInits[0];
-            this._callbackManager.invokeCallback(
-                first.entryPoint,
-                [first.baseAddress, 1, 0],
-                0,
-                completeThunk,
-                false,
-                'DllMainChain',
-                dllMainFrameId
-            );
+            try {
+                this._callbackManager.invokeCallback(
+                    first.entryPoint,
+                    [first.baseAddress, 1, 0],
+                    0,
+                    completeThunk,
+                    false,
+                    'DllMainChain',
+                    dllMainFrameId
+                );
+            } catch (e) {
+                settleFrom(0);
+                throw e;
+            }
 
             return;
         }
 
+        settleFrom(0);
         this._restoreAsyncContext(info, cpu, returnValue, cleanupBytes, completionName, deferredWrites);
     }
 
@@ -6564,10 +6606,11 @@ export class ThunkDispatcher {
         // DllMain result reporter (from bootloader hook)
         if (marker === 0x000a) {
             const result = cpu.reg32[1] >>> 0; // ECX holds the result
-            const entry = cpuViews(cpu).reg32[6]! >>> 0;  // ESI: the {hModule, entry} row just called
+            const row = cpuViews(cpu).reg32[6]! >>> 0;  // ESI: the {hModule, entry} row just called
             if (!this.isDataViewValid()) this.updateMemoryCache();
-            if (this.cachedMem8 && entry + 4 <= this.cachedMem8.length) {
-                noteDllAttached(new DataView(this.cachedMem8.buffer, this.cachedMem8.byteOffset).getUint32(entry, true));
+            if (this.cachedMem8 && row + 4 <= this.cachedMem8.length) {
+                this.ensureScheduler().dllNotify.noteDllAttached(
+                    new DataView(this.cachedMem8.buffer, this.cachedMem8.byteOffset).getUint32(row, true));
             }
             Logger.warn(LogCategory.SYSTEM, `[DIAG] DllMain call finished. Result (EAX): 0x${result.toString(16)}`);
             return;
