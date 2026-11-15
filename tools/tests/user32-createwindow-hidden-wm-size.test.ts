@@ -96,10 +96,13 @@ function show(hwnd: number, cmd: number): number[] {
     const before = invoked.length;
     createWindowExports()['ShowWindow']!({ esp: ESP } as never, mem, [hwnd, cmd] as never);
     drain();
-    return invoked.slice(before).map((c) => c.args[1]);
+    // Activation is now sent in this chain too; this file isolates size/move/show.
+    // The exact activation sequence is covered by user32-show-activation-sync.test.
+    return invoked.slice(before).map((c) => c.args[1]).filter(isGeometryMessage);
 }
 
-const received = (): number[] => invoked.map((c) => c.args[1]);
+const isGeometryMessage = (msg: number): boolean => [WM_NCCREATE, WM_CREATE, WM_SHOWWINDOW, WM_SIZE, WM_MOVE].includes(msg);
+const received = (): number[] => invoked.map((c) => c.args[1]).filter(isGeometryMessage);
 
 test('a window created hidden is not told its size until it is first shown', () => {
     const hwnd = create(WS_OVERLAPPEDWINDOW);
@@ -169,10 +172,12 @@ test('WM_SIZE and WM_MOVE follow a WM_SHOWWINDOW that suspended into the guest, 
     const before = invoked.length;
     createWindowExports()['ShowWindow']!({ esp: ESP } as never, mem, [hwnd, SW_SHOWNORMAL] as never);
     expect(invoked.slice(before).map((c) => c.args[1])).toEqual([WM_SHOWWINDOW]);
-    invoked[before]!.complete?.(0);
-    expect(invoked.slice(before).map((c) => c.args[1])).toEqual([WM_SHOWWINDOW, WM_SIZE]);
-    invoked[before + 1]!.complete?.(0);
-    expect(invoked.slice(before).map((c) => c.args[1])).toEqual([WM_SHOWWINDOW, WM_SIZE, WM_MOVE]);
+    let next = before;
+    // Finish sent activation callbacks one at a time; SIZE must not precede them.
+    do { invoked[next++]!.complete?.(0); } while (invoked[next] && !isGeometryMessage(invoked[next]!.args[1]));
+    expect(invoked.slice(before).map((c) => c.args[1]).filter(isGeometryMessage)).toEqual([WM_SHOWWINDOW, WM_SIZE]);
+    invoked[next]!.complete?.(0);
+    expect(invoked.slice(before).map((c) => c.args[1]).filter(isGeometryMessage)).toEqual([WM_SHOWWINDOW, WM_SIZE, WM_MOVE]);
 });
 
 test('ShowWindow from inside WM_CREATE delivers the size once and CreateWindowEx adds none', () => {

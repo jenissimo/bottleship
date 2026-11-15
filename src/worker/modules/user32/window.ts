@@ -200,6 +200,82 @@ function finishWindowPosRepaint(hWnd: number): void {
     System.getInstance().windowManager.postMessage(hWnd, WM_PAINT_GEO, 0, 0);
 }
 
+interface SyncActivationPlan {
+    steps: ActivationStep[];
+    previous: number;
+    target: number;
+}
+
+/** Plan without changing the active slot: the outgoing WndProc must still see itself
+ * active until its WM_NCACTIVATE/WM_ACTIVATE have returned. Other input queues retain
+ * their existing asynchronous delivery rather than executing on this guest stack. */
+function planSyncActivation(target: number): SyncActivationPlan | undefined {
+    const system = System.getInstance(), wm = system.windowManager;
+    const previous = wm.getActiveHwnd(), win = windows.get(target);
+    if (!win || (win.style & 0x40000000) || isWindowInitInProgress(target)) return;
+    if (previous === target && !needsActivationDelivery(target)) return;
+    const currentThread = system.scheduler.getCurrentThreadId();
+    if ([target, previous].some(hwnd => hwnd && wm.getWindowOwnerThread(hwnd)
+        && wm.getWindowOwnerThread(hwnd) !== currentThread)) {
+        activateTopLevelWindow(target);
+        return;
+    }
+    return { previous, target, steps: buildPendingActivationSteps(target, win.wndProc, previous) };
+}
+
+/** Reuse the ShowWindow/SetWindowPos suspended frame (or nested direct return) for
+ * the sent activation chain, and abandon stale steps after guest reentry. */
+function createSyncActivationDelivery(
+    ctx: any, plan: SyncActivationPlan | undefined, label: string, stackCleanup: number,
+    frame: { id: number; direct?: { returnAddr: number; postEsp: number } },
+) {
+    let suspension: ReturnType<typeof trySuspendForSyncWindowMessage> | undefined;
+    const identities = new Map(plan?.steps.map(s => [s.hwnd, windows.get(s.hwnd)]));
+    const targetInfo = plan ? windows.get(plan.target) : undefined;
+    let index = 0, committed = false;
+    let focusAfterCommit = 0;
+    const run = (complete: () => number | null): number | null => {
+        if (!plan) return complete();
+        const wm = System.getInstance().windowManager;
+        while (index < plan.steps.length) {
+            const step = plan.steps[index]!;
+            const outgoing = step.hwnd === plan.previous && (step.msg === 0x86 || step.msg === 6)
+                && step.wParam === 0 && plan.previous !== plan.target;
+            if (wm.getActiveHwnd() !== (committed ? plan.target : plan.previous)) return complete();
+            if (!committed && !outgoing) {
+                if (plan.target && (windows.get(plan.target) !== targetInfo
+                    || !targetInfo?.visible || targetInfo.pendingDestroy || isWindowInitInProgress(plan.target))) return complete();
+                if (plan.target) wm.setActiveWindow(plan.target);
+                else wm.clearActiveWindow(plan.previous);
+                if (plan.previous !== plan.target) markPendingActivation(plan.previous);
+                if (plan.target) markActivationDelivered(plan.target); // Before the first incoming guest callback.
+                committed = true;
+                focusAfterCommit = wm.getFocusHwnd();
+            }
+            index++;
+            const live = windows.get(step.hwnd);
+            if (!live || live !== identities.get(step.hwnd) || live.pendingDestroy) continue;
+            if (committed && plan.target && (!targetInfo?.visible || targetInfo.pendingDestroy)) return complete();
+            if (step.msg === 7 && wm.getFocusHwnd() !== focusAfterCommit) continue;
+            const owner = wm.getWindowOwnerThread(step.hwnd);
+            if (owner && owner !== System.getInstance().scheduler.getCurrentThreadId()) {
+                wm.postMessage(step.hwnd, step.msg, step.wParam, step.lParam);
+                continue;
+            }
+            const sent = trySuspendForSyncWindowMessage(ctx, step.hwnd, step.msg, step.wParam, step.lParam,
+                label, stackCleanup, () => run(complete), frame.id || undefined, frame.direct);
+            if (sent.suspended) {
+                suspension = sent;
+                frame.id = sent.frameId;
+                frame.direct = sent.directThunkReturn;
+                return null;
+            }
+        }
+        return complete();
+    };
+    return { run, get suspension() { return suspension; } };
+}
+
 function trySuspendForSyncWindowMessage(
     ctx: any,
     hWnd: number,
@@ -1897,9 +1973,10 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             return resultValue;
         }
 
+        let activationPlan: SyncActivationPlan | undefined;
         const applyShowState = (): number => {
             const live = windows.get(hWnd);
-            if (!live) return resultValue;
+            if (live !== window || live.pendingDestroy) return resultValue;
 
             if (nCmdShow === 2 || nCmdShow === 6 || nCmdShow === 7 || nCmdShow === 11) {
                 live.style = (live.style | WS_MINIMIZE) & ~WS_MAXIMIZE;
@@ -1934,14 +2011,13 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                                 && (next.style & WS_CHILD) === 0
                                 && (next.style & 0x08000000 /* WS_DISABLED */) === 0;
                         }) ?? 0;
-                        if (successor) activateTopLevelWindow(successor);
+                        if (successor) activationPlan = planSyncActivation(successor);
                         else {
-                            // Nothing takes over: activation goes to no window, and the
-                            // app is told so (Wine show_window → activate_other_window).
-                            for (const s of deactivateWithoutSuccessor(hWnd)) {
-                                wm.postMessage(s.hwnd, s.msg, s.wParam, s.lParam);
-                            }
-                            wm.clearActiveWindow(hWnd);
+                            const owner = wm.getWindowOwnerThread(hWnd);
+                            const sync = !owner || owner === System.getInstance().scheduler.getCurrentThreadId();
+                            const steps = deactivateWithoutSuccessor(hWnd, sync);
+                            if (sync) activationPlan = { previous: hWnd, target: 0, steps };
+                            else for (const s of steps) wm.postMessage(s.hwnd, s.msg, s.wParam, s.lParam);
                         }
                     }
                 } else if (isEffectivelyVisible(live)) {
@@ -1965,7 +2041,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             if (show && !noActivate && !isChild) {
                 const wm = System.getInstance().windowManager;
                 if (wm.getActiveHwnd() !== hWnd || needsActivationDelivery(hWnd)) {
-                    activateTopLevelWindow(hWnd);
+                    activationPlan = planSyncActivation(hWnd);
                 }
             }
 
@@ -1986,7 +2062,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const minMaxBefore = window.style & (WS_MINIMIZE | WS_MAXIMIZE);
         const sendPendingSizeMove = (): number | null => {
             const live = windows.get(hWnd);
-            if (!live || !show || !live.sizeMovePending) return resultValue;
+            if (live !== window || live.pendingDestroy || !show || !live.sizeMovePending) return resultValue;
             if (!visibilityChanged && (live.style & (WS_MINIMIZE | WS_MAXIMIZE)) === minMaxBefore) return resultValue;
             live.sizeMovePending = false;
             const sizeType = (live.style & WS_MAXIMIZE) !== 0 ? 2 : ((live.style & WS_MINIMIZE) !== 0 ? 1 : 0);
@@ -2012,7 +2088,15 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         };
         const showThenSizeMove = (): number | null => {
             applyShowState();
-            return sendPendingSizeMove();
+            const frame = { id: chainFrameId, direct: chainDirect };
+            const activation = createSyncActivationDelivery(ctx, activationPlan, 'ShowWindow', stackCleanup, frame);
+            const result = activation.run(() => {
+                chainFrameId = frame.id;
+                chainDirect = frame.direct;
+                return sendPendingSizeMove();
+            });
+            if (activation.suspension?.suspended) pendingSizeMoveSuspension = activation.suspension;
+            return result;
         };
 
         // USER sends WM_SHOWWINDOW synchronously before SetWindowPos changes WS_VISIBLE.
@@ -2034,8 +2118,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 };
             }
         }
-        applyShowState();
-        if (sendPendingSizeMove() === null && pendingSizeMoveSuspension) {
+        if (showThenSizeMove() === null && pendingSizeMoveSuspension) {
             const s: { callbackId: number; reusedFrame: boolean } = pendingSizeMoveSuspension;
             return {
                 value: resultValue,
@@ -2139,6 +2222,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             flags: Mem.readUint32(ptr + 24) ?? uFlags,
         });
 
+        let activationPlan: SyncActivationPlan | undefined;
         const applyWindowPos = (pos: WindowPosValue, ptr: number): boolean => {
             const live = windows.get(hWnd);
             if (!live) return false;
@@ -2221,7 +2305,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 noteDialogOverlayCandidate(live);
             }
             if (!(flags & SWP_NOACTIVATE) && !(live.style & WS_CHILD) && !hiding) {
-                activateTopLevelWindow(hWnd);
+                activationPlan = planSyncActivation(hWnd);
             }
             Logger.verbose(LogCategory.USER32,
                 `SetWindowPos result: win.x=${live.x} win.y=${live.y} win.w=${live.width} win.h=${live.height} flags=0x${flags.toString(16)}`);
@@ -2234,6 +2318,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (!hasGuestWndProc || !process) {
             const pos = { insertAfter: hWndInsertAfter, x, y, cx, cy, flags: uFlags };
             const changed = applyWindowPos(pos, 0);
+            // Built-in/sentinel windows have no guest callback stack to suspend.
+            if (activationPlan) activateTopLevelWindow(activationPlan.target);
             if (changed) finishWindowPosRepaint(hWnd);
             return onComplete ? onComplete() : 1;
         }
@@ -2243,80 +2329,43 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const windowPosPtr = process.memory.alloc(28, 'HEAP', 'rw');
         if (!windowPosPtr) return 0;
         writeWindowPos(windowPosPtr, { insertAfter: hWndInsertAfter, x, y, cx, cy, flags: uFlags });
-        const thunkReturnAddr = Mem.readUint32(ctx.esp) ?? 0;
-        const saveFrame = (): number => {
-            const frameId = existingFrameId || callbackManager.saveSuspendedThunkContext(
-                { ...ctx, returnAddr: thunkReturnAddr }, stackCleanup, 'SetWindowPos');
-            if (frameId) onFrame?.(frameId);
-            return frameId;
-        };
-
-        if (uFlags & SWP_NOSENDCHANGING) {
-            const changed = applyWindowPos(readWindowPos(windowPosPtr), windowPosPtr);
-            if (!changed) {
-                process.memory.free(windowPosPtr);
-                return onComplete ? onComplete() : 1;
-            }
-            const frameId = saveFrame();
-            if (!frameId) {
-                process.memory.free(windowPosPtr);
-                return 0;
-            }
-            const changedCall = callbackManager.invokeCallback(
-                wndProc, [hWnd, 0x0047 /* WM_WINDOWPOSCHANGED */, 0, windowPosPtr], 0,
-                () => {
-                    process.memory.free(windowPosPtr);
-                    finishWindowPosRepaint(hWnd);
-                    return onComplete ? onComplete() : 1;
-                },
-                false, 'SetWindowPos:WM_WINDOWPOSCHANGED', frameId);
-            if (!changedCall.callbackId) {
-                process.memory.free(windowPosPtr);
-                return 0;
-            }
-            return {
-                value: 1,
-                suspendedForCallback: true,
-                callbackId: changedCall.callbackId,
-                stackCleanup,
-                skipStackCheck: true,
-            };
-        }
-
-        const frameId = saveFrame();
-        if (!frameId) {
-            process.memory.free(windowPosPtr);
-            return 0;
-        }
-
+        const frame = { id: existingFrameId, direct: undefined as { returnAddr: number; postEsp: number } | undefined };
+        let suspension: ReturnType<typeof trySuspendForSyncWindowMessage> | undefined;
+        let freed = false;
         const finish = (): number | null => {
-            process.memory.free(windowPosPtr);
-            finishWindowPosRepaint(hWnd);
+            if (!freed) { process.memory.free(windowPosPtr); freed = true; }
+            if (windows.get(hWnd) === window) finishWindowPosRepaint(hWnd);
             return onComplete ? onComplete() : 1;
         };
-        const afterChanging = (): number | null => {
-            if (!windows.has(hWnd)) return finish();
-            const changed = applyWindowPos(readWindowPos(windowPosPtr), windowPosPtr);
-            if (!changed) return finish();
-            const changedCall = callbackManager.invokeCallback(
-                wndProc, [hWnd, 0x0047 /* WM_WINDOWPOSCHANGED */, 0, windowPosPtr], 0,
-                () => finish(), false, 'SetWindowPos:WM_WINDOWPOSCHANGED', frameId);
-            return changedCall.callbackId ? null : finish();
+        const send = (message: number, complete: () => number | null): number | null => {
+            if (windows.get(hWnd) !== window || window.pendingDestroy) return finish();
+            const call = trySuspendForSyncWindowMessage(ctx, hWnd, message, 0, windowPosPtr,
+                'SetWindowPos', stackCleanup, complete, frame.id || undefined, frame.direct);
+            if (!call.suspended) return complete();
+            suspension = call;
+            frame.id = call.frameId;
+            frame.direct = call.directThunkReturn;
+            if (frame.id) onFrame?.(frame.id);
+            return null;
         };
-
-        const first = callbackManager.invokeCallback(
-            wndProc, [hWnd, 0x0046 /* WM_WINDOWPOSCHANGING */, 0, windowPosPtr], 0,
-            afterChanging, false, 'SetWindowPos:WM_WINDOWPOSCHANGING', frameId);
-        if (!first.callbackId) {
-            process.memory.free(windowPosPtr);
-            return 0;
-        }
+        const afterChanging = (): number | null => {
+            if (windows.get(hWnd) !== window || window.pendingDestroy) return finish();
+            const changed = applyWindowPos(readWindowPos(windowPosPtr), windowPosPtr);
+            const activation = createSyncActivationDelivery(ctx, activationPlan, 'SetWindowPos', stackCleanup, frame);
+            const result = activation.run(() => changed ? send(0x0047 /* WM_WINDOWPOSCHANGED */, finish) : finish());
+            if (activation.suspension?.suspended) suspension = activation.suspension;
+            return result;
+        };
+        const result = uFlags & SWP_NOSENDCHANGING
+            ? afterChanging() : send(0x0046 /* WM_WINDOWPOSCHANGING */, afterChanging);
+        if (result !== null || !suspension?.suspended) return result ?? finish();
         return {
             value: 1,
             suspendedForCallback: true,
-            callbackId: first.callbackId,
+            callbackId: suspension.callbackId,
             stackCleanup,
             skipStackCheck: true,
+            preserveCallbackReturnAddress: suspension.reusedFrame,
         };
     };
 
