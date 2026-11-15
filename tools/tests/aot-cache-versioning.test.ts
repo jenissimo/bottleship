@@ -1,5 +1,6 @@
 import { aotCache } from "../../src/worker/core/cpu/aot-cache";
 import { installFakeOpfs } from "./fixtures/fake-opfs";
+import { getContainerDir } from "../../src/worker/runtime/filesystem/container-store";
 
 const PAGE = 4096;
 const assert = (ok: unknown, message: string) => { if (!ok) throw new Error(message); };
@@ -10,6 +11,8 @@ const deferred = <T,>() => {
 };
 
 type Identity = { lo: number; hi: number; abi: number; mask: number };
+
+const hostScript = { status: 200, bytes: new Uint8Array([0x48, 0x41]) };
 
 function install(memory: Uint8Array, identity: Identity = { lo: 1, hi: 0, abi: 1, mask: 0x01FB_FDEF }) {
     const wasm = {
@@ -28,6 +31,12 @@ function install(memory: Uint8Array, identity: Identity = { lo: 1, hi: 0, abi: 1
     (globalThis as any).System = { getInstance: () => ({ process: { v86: { cpu } } }) };
     (globalThis as any).preemption = { getWasmExports: () => wasm };
     (globalThis as any).__wasmDump = { out: [{ start: 0, table_index: 7, len: 4, bytes: new Uint8Array([0, 1, 2, 3]) }] };
+    (globalThis as any).location = { href: "https://host.invalid/assets/emulator.worker.js" };
+    (globalThis as any).fetch = async (url: string) => {
+        if (url !== "https://host.invalid/assets/emulator.worker.js") throw new Error(`unexpected fetch ${url}`);
+        return new Response(hostScript.bytes.slice(), { status: hostScript.status });
+    };
+    (aotCache as any).hostSha = null;
     aotCache.clear();
     return identity;
 }
@@ -42,7 +51,7 @@ function deferEngineHash() {
 
 // install() replaces globals and deferEngineHash() an aotCache method; `bun test` runs every file
 // in one process, so both go back when this file is done, pass or fail.
-const replacedGlobals = ["System", "preemption", "__wasmDump", "navigator"].map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)] as const);
+const replacedGlobals = ["System", "preemption", "__wasmDump", "navigator", "location", "fetch"].map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)] as const);
 const ownFingerprint = Object.getOwnPropertyDescriptor(aotCache, "engineFingerprint");
 try {
     // Persist a marked unit, load it in a new session with the SAME version identity,
@@ -80,6 +89,73 @@ try {
             assert("loaded" in reloaded && reloaded.loaded === 1, "new store contains old units");
             assert(aotCache.getUnits()[0].bytes[0] === 0, "old bytes survived save/load");
         }
+    }
+
+    // The same engine under a different host build is a different identity: units saved by
+    // one worker script must not load into another, and still load into the one that saved them.
+    {
+        installFakeOpfs();
+        const memory = new Uint8Array(PAGE * 4);
+        const hostA = new Uint8Array([0x41, 0x01]);
+        const hostB = new Uint8Array([0x42, 0x02]);
+        hostScript.bytes = hostA;
+        install(memory);
+        deferEngineHash().resolve("engine");
+        assert((await aotCache.snapshot()).units === 1, "host fixture not captured");
+        const saved = await aotCache.save("app:host-identity");
+        assert("saved" in saved, "host fixture not persisted");
+
+        hostScript.bytes = hostB;
+        install(memory);
+        deferEngineHash().resolve("engine");
+        const other = await aotCache.load("app:host-identity");
+        console.log(`host identity: other host -> ${JSON.stringify(other)}`);
+        assert(!("loaded" in other), "units saved under one host build loaded under another");
+        assert(aotCache.getUnits().length === 0, "foreign host units reached the cache");
+        assert("key" in other && "key" in saved && other.key !== saved.key, "host build did not change the key");
+
+        hostScript.bytes = hostA;
+        install(memory);
+        deferEngineHash().resolve("engine");
+        const same = await aotCache.load("app:host-identity");
+        assert("loaded" in same && same.loaded === 1, "units did not load under the host that saved them");
+
+        const container = await getContainerDir("app:host-identity", false);
+        const dir = await (await container!.getDirectoryHandle("aot")).getDirectoryHandle((saved as { key: string }).key);
+        const indexHandle = await dir.getFileHandle("index.json");
+        const original = await (await indexHandle.getFile()).text();
+        for (const legacy of [{ abi: 6 }, { host: undefined }]) {
+            const index = JSON.parse(original);
+            index.version = { ...index.version, ...legacy };
+            const w = await indexHandle.createWritable();
+            await w.write(new TextEncoder().encode(JSON.stringify(index)));
+            await w.close();
+            install(memory);
+            deferEngineHash().resolve("engine");
+            const old = await aotCache.load("app:host-identity");
+            assert(!("loaded" in old) && aotCache.getUnits().length === 0,
+                `a stored identity with ${JSON.stringify(legacy)} was accepted`);
+        }
+        const restore = await indexHandle.createWritable();
+        await restore.write(new TextEncoder().encode(original));
+        await restore.close();
+
+        process.env.DEV = "1";
+        install(memory);
+        deferEngineHash().resolve("engine");
+        const dev = await aotCache.version().then(() => null, (e: unknown) => String(e));
+        delete process.env.DEV;
+        assert(dev?.includes("dev server"), "a dev-server worker produced a persistence identity");
+
+        hostScript.status = 404;
+        install(memory);
+        deferEngineHash().resolve("engine");
+        const unreadable = await aotCache.version().then(() => null, (e: unknown) => String(e));
+        assert(unreadable?.includes("host script unreadable"), "an unreadable host script produced an identity");
+        const refused = await aotCache.load("app:host-identity").catch((e: unknown) => ({ error: String(e) }));
+        assert(!("loaded" in refused) && aotCache.getUnits().length === 0, "units loaded without a host identity");
+        hostScript.status = 200;
+        hostScript.bytes = new Uint8Array([0x48, 0x41]);
     }
 
     // snapshot must copy both pages before awaiting the capture-time engine hash.
@@ -123,4 +199,4 @@ try {
     aotCache.clear();
 }
 
-console.log("PASS aot-cache-versioning: no-loaded-carry-over + empty-capture + save/load + coherent-copy + production-version identity-refusal");
+console.log("PASS aot-cache-versioning: host-identity (A->B refused, A->A loads, old ABI/missing host refused, dev refused, unreadable refused) + no-loaded-carry-over + empty-capture + save/load + coherent-copy + production-version identity-refusal");

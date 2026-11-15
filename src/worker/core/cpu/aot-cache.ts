@@ -132,6 +132,8 @@ interface AotVersion {
     abi: number;
     /** SHA-256 of the engine binary — the honest stand-in for "codegen commit". */
     engine: string;
+    /** SHA-256 of the worker script that recorded the units: a host-only change keeps the engine. */
+    host: string;
     /** Version and supported-index set of Rust's JIT configuration ABI. */
     jitConfigAbi: number;
     jitConfigSupportedMask: number;
@@ -154,12 +156,13 @@ interface AotVersion {
     mem8Base: number;
 }
 
-const AOT_ABI = 6;
+const AOT_ABI = 7;
 
 export class AotCache {
     private units: AotUnit[] = [];
     private live: LiveUnit[] = [];
     private engineSha: string | null = null;
+    private hostSha: string | null = null;
     private loadedVersion: AotVersion | null = null;
     /** True once `load()` has read the persisted set in THIS session. `save()` may only
      *  prune the store when this holds — see the pruning branch there. */
@@ -389,6 +392,19 @@ export class AotCache {
         return this.engineSha;
     }
 
+    private async hostFingerprint(): Promise<string> {
+        if (this.hostSha) return this.hostSha;
+        if (import.meta.env?.DEV) {
+            throw new Error("AOT persistence disabled on the dev server: the worker entry does not identify its imported modules");
+        }
+        const href = (globalThis as { location?: { href?: string } }).location?.href;
+        if (!href) throw new Error("host script location unavailable; refusing AOT cache identity");
+        const r = await fetch(href);
+        if (!r.ok) throw new Error(`host script unreadable (HTTP ${r.status}); refusing AOT cache identity`);
+        this.hostSha = hex(await crypto.subtle.digest("SHA-256", await r.arrayBuffer()));
+        return this.hostSha;
+    }
+
     async version(): Promise<AotVersion> {
         const w = this.wasm();
         const cpu = this.cpu();
@@ -414,9 +430,11 @@ export class AotCache {
         // an old artifact keys differently rather than colliding with a real one.
         const mem8Base = typeof w.get_mem8_base === "function" ? w.get_mem8_base() >>> 0 : -1;
         const engine = await this.engineFingerprint();
+        const host = await this.hostFingerprint();
         return {
             abi: AOT_ABI,
             engine,
+            host,
             jitConfigAbi,
             jitConfigSupportedMask,
             jitCodegenFingerprintLo,
