@@ -137,6 +137,10 @@ export function validatePrologueBytes(bytes: Uint8Array): string | null {
         if (b === 0x64 && b1 === 0xA1) { i += 6; continue; }
         // xor r32, r32 (33 /r reg-reg)
         if (b === 0x33 && b1 !== undefined && (b1 & 0xC0) === 0xC0) { i += 2; continue; }
+        // xor r32, r32 (31 /r reg-reg, the Delphi/Borland encoding)
+        if (b === 0x31 && b1 !== undefined && (b1 & 0xC0) === 0xC0) { i += 2; continue; }
+        // mov r8, [r32+disp8] (8A /r, mod=01, no SIB: e.g. Delphi's `mov cl,[edx+1]`)
+        if (b === 0x8A && b1 !== undefined && (b1 & 0xC0) === 0x40 && (b1 & 0x07) !== 0x04) { i += 3; continue; }
         return `unsupported prologue byte 0x${b.toString(16)} at +${i} — extend validatePrologueBytes if this is a real, position-independent instruction`;
     }
     if (i !== bytes.length) return `prologueLen ${bytes.length} splits an instruction (decoder landed at +${i})`;
