@@ -83,6 +83,47 @@ test('malformed vertex extent fails closed before hashing recycled arena bytes',
     const ctx = context(); ctx.commands.i32[CI_VERT_COUNT] = 9;
     const w = new GLWorkWindow(9); expect(w.begin(ctx, 20)).toBeUndefined(); expect(w.status).toBe('failed');
 });
+test('optional aligned dword counter samples actual current memory at begin and seal', () => {
+    const ctx = context(); let memory = new Uint8Array(0x20000);
+    ctx.process = { getCurrentMemory: () => memory, addressSpace: { validateRange: () => true } } as unknown as OpenGLContext['process'];
+    new DataView(memory.buffer).setUint32(0x10000, 633, true);
+    const w = new GLWorkWindow(9, { counterAddress: 0x10000 }), row = w.begin(ctx, 20)!;
+    expect(row.counterBegin?.value).toBe(633);
+    memory = new Uint8Array(0x20000); new DataView(memory.buffer).setUint32(0x10000, 634, true);
+    submitted(row); w.finish(row, 21); const report = w.read();
+    expect(report.frames[0]!.counterEnd?.value).toBe(634); expect(report.counterCoverage.changedWithinFrame).toBe(1);
+    report.frames[0]!.counterBegin!.value = 999; expect(w.read().frames[0]!.counterBegin!.value).toBe(633);
+    for (const a of [-4, 0, 0x10001, 0xffffffff, 0x100000000, NaN]) expect(() => new GLWorkWindow(9, { counterAddress: a })).toThrow();
+});
+test('missing/unreadable memory never reports zero and duplicate/regression/saturation are explicit', () => {
+    const ctx = context(), missing = new GLWorkWindow(9, { counterAddress: 0x10000 });
+    const r = missing.begin(ctx, 20)!; submitted(r); missing.finish(r, 21);
+    expect(missing.read().frames[0]!.counterBegin?.value).toBeNull(); expect(missing.read().counterCoverage.unavailable).toBe(1);
+    const mem = new Uint8Array(0x20000), view = new DataView(mem.buffer);
+    let readable = true;
+    ctx.process = { getCurrentMemory: () => mem, addressSpace: { validateRange: () => readable } } as unknown as OpenGLContext['process'];
+    const w = new GLWorkWindow(9, { counterAddress: 0x10000, frames: 4 });
+    for (const [i, n] of [1, 1, 0, 0xffffffff].entries()) {
+        ctx.frameId = 10 + i; view.setUint32(0x10000, n, true); const row = w.begin(ctx, 20 + i)!; submitted(row); w.finish(row, 21 + i);
+    }
+    expect(w.read().counterCoverage).toEqual({ unavailable: 0, duplicates: 1, regressions: 1, saturated: 1, changedWithinFrame: 0 });
+    readable = false; ctx.frameId = 20; const blocked = new GLWorkWindow(19, { counterAddress: 0x10000 });
+    expect(blocked.begin(ctx, 30)!.counterBegin?.value).toBeNull();
+    const empty = new Uint8Array(0); ctx.process.getCurrentMemory = () => empty;
+    ctx.frameId = 21; expect(new GLWorkWindow(20, { counterAddress: 0x10000 }).begin(ctx, 31)!.counterBegin?.value).toBeNull();
+});
+
+test('counter OFF/reset stops all memory reads and detached views stay unavailable', () => {
+    const ctx = context(); let reads = 0; const memory = new Uint8Array(0x20000);
+    ctx.process = { getCurrentMemory() { reads++; return memory; }, addressSpace: { validateRange: () => true } } as unknown as OpenGLContext['process'];
+    armGLWorkDigest(ctx, { counterAddress: 0x10000 }); ctx.frameId = 11;
+    const row = beginGLWorkPresent(ctx, 20)!; submitted(row); finishGLWorkPresent(row, 21); expect(reads).toBe(2);
+    offGLWorkDigest(); ctx.frameId++;
+    expect(beginGLWorkPresent(ctx, 21)).toBeUndefined(); expect(reads).toBe(2);
+    structuredClone(memory.buffer, { transfer: [memory.buffer] });
+    const w = new GLWorkWindow(11, { counterAddress: 0x10000 });
+    expect(w.begin(ctx, 21)!.counterBegin?.value).toBeNull();
+});
 test('count-only mode exposes observer mode and leaves digest absent', () => {
     const ctx = context(), w = new GLWorkWindow(9, { hash: false }), row = w.begin(ctx, 20)!;
     expect(row.digest).toBeNull(); expect(row.vertices).toBe(3); expect(row.types).toEqual([0, 1, 0, 0]);

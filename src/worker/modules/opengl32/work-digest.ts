@@ -7,12 +7,24 @@ import {
 export interface GLWorkExecutorAudit {
     encodedDraws: number; encodedVertices: number; submissions: number; fallback: boolean;
 }
+export interface GLCounterSample { value: number | null; unavailable: string | null; }
 export interface GLWorkFrame extends GLWorkExecutorAudit {
     frame: number; hostSerialBefore: number | null; hostSerialAfter: number | null;
     commands: number; types: number[]; draws: number; vertices: number;
     digest: string | null; executorCalled: boolean; returned: boolean; error: string | null;
+    counterBegin: GLCounterSample | null; counterEnd: GLCounterSample | null;
 }
-export interface GLWorkOptions { startFrame?: number; frames?: number; hash?: boolean; }
+export interface GLWorkOptions { startFrame?: number; frames?: number; hash?: boolean; counterAddress?: number; }
+/** Never read a stale/detached memory view or substitute zero for an unavailable dword. */
+function counter(ctx: OpenGLContext | null, address: number): GLCounterSample {
+    try {
+        const p = ctx?.process, mem = p?.getCurrentMemory?.();
+        if (!p || !mem || mem.buffer.byteLength === 0 || address + 4 > mem.byteLength) return { value: null, unavailable: 'current memory extent unavailable' };
+        if (p.addressSpace?.validateRange(address, 4, 'r') !== true) return { value: null, unavailable: 'guest range is not readable' };
+        if (p.pageTableManager?.isRangeAccessible?.(address, 4, false) === false) return { value: null, unavailable: 'guest page is inaccessible' };
+        return { value: new DataView(mem.buffer, mem.byteOffset + address, 4).getUint32(0, true), unavailable: null };
+    } catch (e) { return { value: null, unavailable: String(e) }; }
+}
 const MAX_FRAMES = 4096;
 const MAX_WORDS = 16_000_000;
 
@@ -71,6 +83,8 @@ export class GLWorkWindow {
     readonly startFrame: number;
     readonly endFrame: number;
     readonly hashing: boolean;
+    readonly counterAddress: number | null;
+    private counterContext: OpenGLContext | null = null;
     status: 'armed' | 'complete' | 'failed' | 'off' = 'armed';
     failure: string | null = null;
     readonly rows: GLWorkFrame[] = [];
@@ -81,6 +95,9 @@ export class GLWorkWindow {
         this.endFrame = this.startFrame + n - 1;
         if (opts.hash !== undefined && typeof opts.hash !== 'boolean') throw new Error('hash must be boolean');
         this.hashing = opts.hash !== false;
+        const address = opts.counterAddress;
+        if (address !== undefined && (!Number.isSafeInteger(address) || address < 0x10000 || address > 0xfffffffc || address % 4 !== 0)) throw new Error('aligned readable user dword address required');
+        this.counterAddress = address ?? null;
     }
     begin(ctx: OpenGLContext, hostSerial: number | null): GLWorkFrame | undefined {
         if (this.status !== 'armed' || ctx.frameId < this.startFrame) return;
@@ -92,23 +109,36 @@ export class GLWorkWindow {
             const work = canonical(ctx, this.hashing);
             const row: GLWorkFrame = { frame: ctx.frameId, hostSerialBefore: hostSerial, hostSerialAfter: null,
                 ...work, encodedDraws: 0, encodedVertices: 0, submissions: 0, fallback: false,
-                executorCalled: false, returned: false, error: null };
+                executorCalled: false, returned: false, error: null,
+                counterBegin: this.counterAddress === null ? null : counter(ctx, this.counterAddress), counterEnd: null };
+            this.counterContext = ctx;
             this.rows.push(row); return row;
         } catch (e) { this.fail(String(e)); return; }
     }
     finish(row: GLWorkFrame, hostSerial: number | null): void {
         if (this.status !== 'armed' || this.rows.at(-1) !== row) return;
         row.hostSerialAfter = hostSerial;
+        row.counterEnd = this.counterAddress === null ? null : counter(this.counterContext, this.counterAddress);
         if (!row.executorCalled || !row.returned || row.error || row.submissions === 0) this.fail('frame was not successfully submitted');
         else if (hostSerial === null || row.hostSerialBefore === null || hostSerial !== row.hostSerialBefore + 1) this.fail('host present serial is unavailable or discontinuous');
         else if (row.frame === this.endFrame) this.status = 'complete';
     }
     fail(reason: string): void { this.status = 'failed'; this.failure = reason; }
     read() {
+        const coverage = { unavailable: 0, duplicates: 0, regressions: 0, saturated: 0, changedWithinFrame: 0 };
+        let previous: number | null = null;
+        if (this.counterAddress !== null) for (const row of this.rows) {
+            const a = row.counterBegin?.value ?? null, b = row.counterEnd?.value ?? null;
+            if (a === null || b === null) coverage.unavailable++;
+            if (a === 0xffffffff || b === 0xffffffff) coverage.saturated++;
+            if (a !== null && b !== null && a !== b) coverage.changedWithinFrame++;
+            if (previous !== null && a !== null) { if (a === previous) coverage.duplicates++; if (a < previous) coverage.regressions++; }
+            previous = b;
+        }
         return { status: this.status, failure: this.failure, startFrame: this.startFrame, endFrame: this.endFrame,
             hashing: this.hashing, observer: 'GL work digest; instrumented when armed; submission is not GPU completion',
-            textureContentsIncluded: false, engineFramesInferred: false,
-            frames: this.rows.map(r => ({ ...r, types: [...r.types] })) };
+            textureContentsIncluded: false, engineFramesInferred: false, counterAddress: this.counterAddress, counterCoverage: coverage,
+            frames: this.rows.map(r => ({ ...r, types: [...r.types], counterBegin: r.counterBegin ? { ...r.counterBegin } : null, counterEnd: r.counterEnd ? { ...r.counterEnd } : null })) };
     }
 }
 /** @transient(harness observer, never guest/save state) */
