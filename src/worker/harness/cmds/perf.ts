@@ -429,6 +429,21 @@ const traceExports = (): TraceExports | undefined =>
 
 type ArmResult = { ok: true; window: CountedWindow } | { ok: false; reason: string };
 
+/** RPC metadata only: the live counter reader and timer remain owned by countedWindow. */
+function countedWindowReport(window: CountedWindow): Omit<CountedWindow, "retired"> {
+    return {
+        armedAtMs: window.armedAtMs,
+        presentSerialBegin: window.presentSerialBegin,
+        watchedPages: window.watchedPages,
+        watchedRequested: window.watchedRequested,
+        watchedTier2: window.watchedTier2,
+        tier2Total: window.tier2Total,
+        requestedPages: window.requestedPages,
+        requestedDropped: window.requestedDropped,
+        armedRequested: window.armedRequested,
+    };
+}
+
 /**
  * Zero the recorder, then instrument pages. `trace2_reset` is the only zeroing primitive
  * (it clears BLOCK_EXEC_COUNTS and de-instruments), and `trace2_watch_page` is what flips
@@ -671,7 +686,7 @@ function countedGuestBlocks(top: number, window: CountedWindow | null, render: R
             note: `REFUSED: recorder is disarmed at read time (trace2_enabled=0, watched=${watchedNow}) — something reset or `
                 + "unwatched it mid-window (dbg.trace2Reset/trace2UnwatchAll, jitRegions, or a game switch), so these counts "
                 + "cover an unknown prefix of the window rather than the window.",
-            window: { ...window, disarmedMidWindow: true },
+            window: { ...countedWindowReport(window), disarmedMidWindow: true },
         };
     }
     const n = w.trace2_block_snapshot() >>> 0;
@@ -1546,7 +1561,7 @@ export function registerPerfCommands(svc: HarnessService): void {
             countedRanges = ranges;
             return arm.ok
                 ? {
-                    phase: "arm", armed: true, window: { ...arm.window, armedAtMs: Math.round(arm.window.armedAtMs) },
+                    phase: "arm", armed: true, window: { ...countedWindowReport(arm.window), armedAtMs: Math.round(arm.window.armedAtMs) },
                     biasCaveat: BIAS, note: `${RESET_NOTE} Drive the scene, then guestBlocks({phase:'read'}).`,
                 }
                 : { phase: "arm", armed: false, refused: arm.reason };
