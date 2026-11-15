@@ -9,6 +9,7 @@
  */
 
 import { OpenGLFrameInput } from "./opengl-types";
+import type { GLWorkExecutorAudit } from "../../../modules/opengl32/work-digest";
 import { OpenGLPipelineConfig, pipelineConfigKey } from "./opengl-pipeline-factory";
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
 import { registerBackendQualitySupport } from "../shared/quality-capabilities";
@@ -279,7 +280,7 @@ export class OpenGLBackendExecutor {
         return Math.max(1, Math.min(scale, maxDim / guestW, maxDim / guestH));
     }
 
-    executeFrame(input: OpenGLFrameInput): void {
+    executeFrame(input: OpenGLFrameInput, audit?: GLWorkExecutorAudit): void {
         const device = this.backend.getDevice();
         const queue = this.backend.getQueue();
         const context = this.backend.getContext();
@@ -491,6 +492,7 @@ export class OpenGLBackendExecutor {
                     pass.setBindGroup(0, bindGroup, [uniformOffset]);
                     pass.setVertexBuffer(0, this.vertexBuffer!, vertexOffset, prepared.byteLength);
                     pass.draw(prepared.vertexCount, 1, 0, 0);
+                    if (audit) { audit.encodedDraws++; audit.encodedVertices += prepared.vertexCount; }
                     drawsIssued++;
                     break;
                 }
@@ -524,6 +526,7 @@ export class OpenGLBackendExecutor {
                 );
                 this.compositeStatsOverlay(targetView, encoder);
                 queue.submit([encoder.finish()]);
+                if (audit) { audit.submissions++; audit.fallback = true; }
                 this.offscreenInitialized = false;
                 Logger.log(
                     LogCategory.SYSTEM,
@@ -558,6 +561,7 @@ export class OpenGLBackendExecutor {
         this.blitOffscreenToCanvas(targetView, encoder, screenW, screenH);
         this.compositeStatsOverlay(targetView, encoder);
         queue.submit([encoder.finish()]);
+        if (audit) audit.submissions++;
 
         Logger.verbose(
             LogCategory.SYSTEM,

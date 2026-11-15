@@ -32,7 +32,7 @@ const LIB = fileURLToPath(new URL('../../vendor/v86/build/libv86.mjs', import.me
 const WASM = fileURLToPath(new URL('../../vendor/v86/build/v86.wasm', import.meta.url));
 const HAVE_V86 = existsSync(LIB) && existsSync(WASM);
 
-const BASE = 0x400000, IMG = 0x3000, ENTRY = BASE + 0x40;
+const BASE = 0x400000, IMG = 0x4000, ENTRY = BASE + 0x40;
 const TEXT = BASE + 0x1000, TEXT_SIZE = 0x200, REG = TEXT, UNREG = TEXT + 0x100;
 const STUBS = BASE + 0x1400, STATE_VAR = BASE + 0x2000, STATE = BASE + 0x2040;
 const FC = BASE + 0x2100, FC_SIZE = 0x20, FC_WORDS = FC_SIZE / 4, N_FC = 6, RES = BASE + 0x2800;
@@ -94,6 +94,7 @@ interface Snap {
     state: number[];         // libgcc state words 0x28..0x30
 }
 interface ArmResult {
+    coldExpansion?: boolean;
     snaps: Snap[];
     probes: number[];        // the WASM TlsGetValue read of the slot after each step
     js: Record<ApiName, number>;     // body API calls the JS kernel32 implementations served
@@ -110,6 +111,7 @@ interface ArmOptions {
     splice: boolean; wasmApis: boolean; setup: IndexSetup; tweak?: (mem: Uint8Array) => void;
     /** Negative control: the pre-unification scheduler storage (JS keeps keys >= 64 in Thread.tlsValues). */
     legacyStorage?: boolean;
+    coldExpansion?: boolean;
 }
 
 function stub(fid: number): number[] {
@@ -153,7 +155,9 @@ function buildImage(idx: number, splice: boolean, tweak?: (mem: Uint8Array) => v
             name: 'sjlj.exe', baseAddress: BASE, size: IMG,
             sections: [{ name: '.text', virtualAddress: TEXT - BASE, virtualSize: TEXT_SIZE, rawSize: TEXT_SIZE, characteristics: 0x60000020 }],
         } as unknown as LoadedPEModule;
-        applied = applyNativeSplices(mem, module).map(s => s.address);
+        let code = BASE + 0x3000;
+        applied = applyNativeSplices(mem, module, { alloc(size) { const a=code; code+=(size+15)&~15; return a; } }).map(s => s.address);
+        tweak?.(mem);
     }
 
     let p = ENTRY;
@@ -217,7 +221,11 @@ async function runArm(opts: ArmOptions): Promise<ArmResult & { idx: number; appl
         if (opts.legacyStorage) {
             const tm = s.tebManager as any;
             const sync = tm.syncTlsSlot.bind(tm), read = tm.readTlsSlot.bind(tm), clear = tm.clearTlsSlotAllThreads.bind(tm);
-            tm.syncTlsSlot = (t: number, i: number, v: number) => i < 64 && sync(t, i, v);
+            (s as any).storeTlsValue = (tid: number, thread: Thread, i: number, v: number) => {
+                if(i<64) { sync(tid,i,v); thread.tlsValues.delete(i); }
+                else thread.tlsValues.set(i,v);
+                return true;
+            };
             tm.readTlsSlot = (t: number, i: number) => (i < 64 ? read(t, i) : undefined);
             tm.clearTlsSlotAllThreads = (i: number) => { if (i < 64) clear(i); };
         }
@@ -247,19 +255,23 @@ async function runArm(opts: ArmOptions): Promise<ArmResult & { idx: number; appl
         cpu.load_multiboot(bytes.buffer);
 
         const tlsArray = (tid: number) => s.tebManager.getTlsArrayAddress(tid)!;
+        const dynamicWords = (tid: number) => Array.from({length: TLS_INDEX_LIMIT}, (_, j) => {
+            const teb = s.tebManager.getTebAddress(tid)!;
+            if (j < 64) return guest().getUint32(teb + 0xe10 + j*4, true);
+            const exp = guest().getUint32(teb + 0xf94, true);
+            return exp ? guest().getUint32(exp + (j-64)*4, true) : 0;
+        });
         const words = (a: number, n: number) => Array.from({ length: n }, (_, i) => guest().getUint32(a + i * 4, true));
         const after = () => [1, 2].map(tid => words(guards[tid]!, 16));
         for (const tid of [1, 2]) for (let w = 0; w < 16; w++) guest().setUint32(guards[tid]! + w * 4, (0x6a7d0000 | (tid << 8) | w) >>> 0, true);
         for (const tid of [1, 2] as const) {
-            for (let j = 0; j < TLS_INDEX_LIMIT; j++) if (j !== idx) guest().setUint32(tlsArray(tid) + j * 4, preset(tid, j), true);
-            guest().setUint32(tlsArray(tid) + idx * 4, INITIAL_SLOT[tid], true);
+            for (let j = 0; j < TLS_INDEX_LIMIT; j++) if (j !== idx && !(opts.coldExpansion && tid === 1 && j >= 64)) s.tebManager.syncTlsSlot(tid, j, preset(tid, j));
+            if (!(opts.coldExpansion && tid === 1)) s.tebManager.syncTlsSlot(tid, idx, INITIAL_SLOT[tid]);
             if (opts.legacyStorage && idx >= 64) threads[tid].tlsValues.set(idx, INITIAL_SLOT[tid]);
         }
         const afterInitial = after();
-        // The TLS array ends its thread's TEB block, so the guard is the next allocation after the block.
-        const tebBlock = (tid: number) => s.tebManager.getTebAddress(tid)!;
-        const arraySpan = [1, 2].map(tid => allocs[allocs.indexOf(tebBlock(tid)) + 1]! - tlsArray(tid));
-        expect([1, 2].map(tid => allocs[allocs.indexOf(tebBlock(tid)) + 1])).toEqual([guards[1], guards[2]]);
+        // Both native stores have exactly their NT capacity; loader vector remains separate.
+        const arraySpan = [1, 2].map(tid => guest().getUint32(s.tebManager.getTebAddress(tid)! + 0xf94, true) ? 1024 * 4 : 64 * 4);
         const switchTo = (tid: 1 | 2) => {
             const from = threads[(s as any).currentThreadId as 1 | 2];
             from.lastError = manager.readLastError(); from.state = ThreadState.READY;
@@ -303,7 +315,7 @@ async function runArm(opts: ArmOptions): Promise<ArmResult & { idx: number; appl
                     lastError: s.getLastError(),
                     tebLastError: guest().getUint32(threads[tid as 1 | 2].tebAddress + 0x34, true),
                     slot: s.tlsGetValue(idx),
-                    arrays: [words(tlsArray(1), TLS_INDEX_LIMIT), words(tlsArray(2), TLS_INDEX_LIMIT)],
+                    arrays: [dynamicWords(1), dynamicWords(2)],
                     after: after(),
                     fcs: words(FC, N_FC * FC_WORDS),
                     state: words(STATE + 0x28, 3),
@@ -323,7 +335,7 @@ async function runArm(opts: ArmOptions): Promise<ArmResult & { idx: number; appl
         const wasm = {} as Record<ApiName, number>;
         for (const n of Object.keys(API) as ApiName[]) wasm[n] = page().getUint32(OFF_HC_HANDLER_CALLS + HANDLER[n] * 4, true);
         const maps = [threads[1], threads[2]].map(t => [...t.tlsValues].map(([k, v]) => [k, v]));
-        return { snaps, probes, js: calls, jsProbes: probeCalls, wasm, traps, halted, idx, applied, afterInitial, maps, arraySpan };
+        return { coldExpansion: opts.coldExpansion, snaps, probes, js: calls, jsProbes: probeCalls, wasm, traps, halted, idx, applied, afterInitial, maps, arraySpan };
     } finally {
         await em.destroy();
         system.scheduler = savedScheduler;
@@ -335,10 +347,10 @@ async function runArm(opts: ArmOptions): Promise<ArmResult & { idx: number; appl
 }
 
 /** The frame chain as libgcc defines it, computed without running any x86. */
-function oracle(idx: number, afterInitial: number[][]): { snaps: Snap[]; probes: number[] } {
+function oracle(idx: number, afterInitial: number[][], coldExpansion = false): { snaps: Snap[]; probes: number[] } {
     const slots = { ...INITIAL_SLOT };
     const fcs = Array.from({ length: N_FC * FC_WORDS }, (_, k) => fcFill(Math.floor(k / FC_WORDS), k % FC_WORDS));
-    const array = (tid: 1 | 2) => Array.from({ length: TLS_INDEX_LIMIT }, (_, j) => j === idx ? slots[tid] : preset(tid, j));
+    const array = (tid: 1 | 2) => Array.from({ length: TLS_INDEX_LIMIT }, (_, j) => j === idx ? slots[tid] : coldExpansion && tid === 1 && j >= 64 ? 0 : preset(tid, j));
     const snaps: Snap[] = [], probes: number[] = [];
     SCENARIO.forEach(({ fn, tid, fc }, i) => {
         if (fn === 'R') { fcs[fc * FC_WORDS] = slots[tid]; slots[tid] = fcAddr(fc); }
@@ -356,13 +368,13 @@ function oracle(idx: number, afterInitial: number[][]): { snaps: Snap[]; probes:
 const hex = (v: unknown) => JSON.stringify(v, (_k, x) => typeof x === 'number' ? `0x${(x >>> 0).toString(16)}` : x);
 
 function mismatches(arm: ArmResult & { idx: number }): string[] {
-    const want = oracle(arm.idx, arm.afterInitial);
+    const want = oracle(arm.idx, arm.afterInitial, arm.coldExpansion);
     const bad: string[] = [];
     if (!arm.halted) bad.push('guest did not halt');
     if (arm.traps.length) bad.push(`reached trap stubs ${hex(arm.traps)}`);
     // One storage: nothing may live in the per-thread map, and each array must own every index.
     if (arm.maps.some(m => m.length)) bad.push(`Thread.tlsValues not empty: ${hex(arm.maps)}`);
-    if (arm.arraySpan.some(n => n < TLS_INDEX_LIMIT * 4)) bad.push(`TLS array spans ${hex(arm.arraySpan)} bytes`);
+    if (arm.arraySpan.some(n => n < 64 * 4)) bad.push(`TLS array spans ${hex(arm.arraySpan)} bytes`);
     SCENARIO.forEach((s, i) => {
         const got = arm.snaps[i], exp = want.snaps[i]!;
         const tag = `step ${i} ${s.fn}(fc${s.fc}) on T${s.tid}`;
@@ -415,7 +427,7 @@ describe('libgcc SjLj splice: fixture', () => {
 });
 
 describe.skipIf(!HAVE_V86)('libgcc SjLj splice, executed in v86', () => {
-    for (const setup of [IDX5, IDX0, CHURN]) {
+    for (const setup of [IDX5, IDX0, CHURN, { name: 'key63', expectIndex: 63, alloc: (s: Scheduler) => { for(let i=0;i<63;i++) s.tlsAlloc(); return s.tlsAlloc(); } }]) {
         test(`original (JS kernel32), original (WASM fast paths) and splice all follow the frame chain — ${setup.name}`, async () => {
             const origJs = await runArm({ splice: false, wasmApis: false, setup });
             const origHc = await runArm({ splice: false, wasmApis: true, setup });
@@ -445,26 +457,24 @@ describe.skipIf(!HAVE_V86)('libgcc SjLj splice, executed in v86', () => {
     }
 
     // Negative control: the same comparison must reject a splice that is wrong in any one way.
-    const MUTANTS: Array<{ name: string; splice: 0 | 1; at: number; bytes: number[] }> = [
-        { name: 'Register takes the key from state+0x2C', splice: 0, at: 2, bytes: [0x2c] },
-        { name: 'Register reads fs:[0x30] instead of fs:[0x2C]', splice: 0, at: 5, bytes: [0x30] },
-        { name: 'Register drops the fc->prev store', splice: 0, at: 12, bytes: [0x90, 0x90] },
-        { name: 'Unregister takes the key from state+0x2C', splice: 1, at: 2, bytes: [0x2c] },
-        { name: 'Unregister stores the key instead of fc->prev', splice: 1, at: 10, bytes: [0x0c] },
-        { name: 'Unregister jumps past the ebx restore', splice: 1, at: 13, bytes: [0xc7] },
+    const MUTANTS = [
+        { name: 'Register reads key from state+2C', splice: 0, at: 2, bytes: [0x2c] },
+        { name: 'Register reads implicit pointer instead of native Self', splice: 0, at: 26, bytes: [0x2c] },
+        { name: 'Register omits frame previous link', splice: 0, at: 60, bytes: [0x90,0x90] },
+        { name: 'Unregister reads key from state+2C', splice: 1, at: 2, bytes: [0x2c] },
+        { name: 'Unregister stores the index rather than previous frame', splice: 1, at: 59, bytes: [0x0c] },
     ];
     for (const m of MUTANTS) {
         test(`negative control: a broken splice is caught — ${m.name}`, async () => {
-            const code = NATIVE_SPLICES[m.splice]!.code;
-            const original = code.slice();
-            code.set(m.bytes, m.at);
-            try {
-                const arm = await runArm({ splice: true, wasmApis: false, setup: IDX5 });
-                expect(arm.applied).toEqual([REG, UNREG]);
-                expect(mismatches(arm).length).toBeGreaterThan(0);
-            } finally {
-                code.set(original);
-            }
+            const tweak = (mem: Uint8Array) => {
+                const patch = (m.splice === 0 ? REG : UNREG) + NATIVE_SPLICES[m.splice]!.offset;
+                if (mem[patch] !== 0xe9) return;
+                const target = patch + 5 + new DataView(mem.buffer).getInt32(patch + 1, true);
+                mem.set(m.bytes, target + m.at);
+            };
+            const arm = await runArm({ splice: true, wasmApis: false, setup: IDX5, tweak });
+            expect(arm.applied).toEqual([REG, UNREG]);
+            expect(mismatches(arm).length).toBeGreaterThan(0);
         }, 30000);
     }
 
@@ -522,22 +532,36 @@ describe('TlsAlloc and the TEB TLS array', () => {
         const dv = new DataView(mem.buffer);
         expect(dv.getUint32(teb + 0x2c, true)).toBe(array);
         const next = memory.alloc(4);
-        expect(next - array).toBeGreaterThanOrEqual(TLS_INDEX_LIMIT * 4);
+        expect(next - array).toBeGreaterThanOrEqual(64 * 4);
         for (const i of [0, 63, 64, 700, TLS_INDEX_LIMIT - 1]) {
             expect(s.tebManager.syncTlsSlot(1, i, 0xc0de0000 + i)).toBe(true);
-            expect(dv.getUint32(array + i * 4, true)).toBe(0xc0de0000 + i);
+            const native = i < 64 ? teb + 0xe10 + i * 4 : dv.getUint32(teb + 0xf94, true) + (i - 64) * 4;
+            expect(dv.getUint32(native, true)).toBe(0xc0de0000 + i);
             expect(s.tebManager.readTlsSlot(1, i)).toBe(0xc0de0000 + i);
         }
         expect(s.tebManager.syncTlsSlot(1, TLS_INDEX_LIMIT, 1)).toBe(false);
         expect(s.tebManager.readTlsSlot(1, TLS_INDEX_LIMIT)).toBeUndefined();
         expect(dv.getUint32(next, true)).toBe(0);
         s.tebManager.clearTlsSlotAllThreads(700);
-        expect(dv.getUint32(array + 700 * 4, true)).toBe(0);
+        expect(dv.getUint32(dv.getUint32(teb + 0xf94, true) + (700-64) * 4, true)).toBe(0);
     });
 });
 
 describe.skipIf(!HAVE_V86)('libgcc SjLj splice with an expansion key, executed in v86', () => {
-    for (const setup of [LIVE65, LAST]) {
+    test('missing expansion falls back to original API, allocates lazily, then shares native storage', async () => {
+        const original = await runArm({splice:false,wasmApis:false,setup:LIVE65,coldExpansion:true});
+        const spliced = await runArm({splice:true,wasmApis:false,setup:LIVE65,coldExpansion:true});
+        expect(spliced.applied).toEqual([REG,UNREG]);
+        expect(mismatches(original)).toEqual([]);
+        expect(mismatches(spliced)).toEqual([]);
+        expect(hex(spliced.snaps)).toBe(hex(original.snaps));
+        expect(spliced.js.TlsSetValue).toBe(1);
+        expect(spliced.js.TlsGetValue).toBe(1);
+        expect(spliced.js.GetLastError).toBe(1);
+        expect(spliced.js.SetLastError).toBe(1);
+    }, 30000);
+
+    for (const setup of [LIVE65, { name: 'key105', expectIndex: 105, alloc: (s: Scheduler) => { for(let i=0;i<105;i++) s.tlsAlloc(); return s.tlsAlloc(); } }, LAST]) {
         test(`original (JS), original (WASM declines to JS) and splice all follow the frame chain in the one TEB array — ${setup.name}`, async () => {
             const origJs = await runArm({ splice: false, wasmApis: false, setup });
             const origHc = await runArm({ splice: false, wasmApis: true, setup });

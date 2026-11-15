@@ -16,6 +16,7 @@ import { writeHeapSlabStubs } from '../../src/worker/modules/kernel32/heap-slab-
 import { writeCrtSlabStubs, writeGetcStub, writeCaseFoldStubs } from '../../src/worker/modules/crt-slab-stubs';
 import { writeLocaleStubs } from '../../src/worker/modules/kernel32/locale-stubs';
 import { writeMbwcStubs } from '../../src/worker/modules/kernel32/mbwc-stubs';
+import { writeTebStubs } from '../../src/worker/modules/kernel32/teb-stubs';
 import {
     writeShadowTrampoline,
     writeOwnerDisarmScalarTrampoline,
@@ -120,6 +121,10 @@ const cases: Record<string, (ctx: Ctx) => Snapshot> = {
         const r = writeMbwcStubs(ctx.allocator, ctx.getMemory, SLAB_CTL, 1252, true, TRAP_A, TRAP_B);
         return { result: r, hashes: { region: sha(ctx.mem, r.regionBase, r.regionEnd) } };
     },
+    tebStubs: (ctx) => {
+        const r = writeTebStubs(ctx.allocator, ctx.getMemory, { tlsGetValue: 0x101, tlsSetValue: 0x102, flsSetValue: 0x103 });
+        return { result: r, hashes: { region: sha(ctx.mem, r.regionBase, r.regionEnd) } };
+    },
     shadowTrampolineSampler: (ctx) => {
         const r = writeShadowTrampoline(
             ctx.allocator, ctx.getMemory, RING_CTRL, RING_DATA, RING_CAP, OWNER_GLOBAL, SAMPLER_SPEC);
@@ -198,6 +203,7 @@ const EXPECTED: Record<string, Snapshot> = {
     caseFoldStubs: {"result":{"tolowerStub":4096,"toupperStub":4108,"regionBase":4096,"regionEnd":4128},"hashes":{"region":"361bd870014fab9f407fc15d3cfe66b4e9468a933f6d6ca6aae0640e20fb0946"}},
     localeStubs: {"result":{"getLocaleInfoWStub":4096,"tableAddr":131072,"regionBase":4096,"regionEnd":4608},"hashes":{"region":"b393bd49291ee6c29070494be5f94fdd2e20de66702baeca337f7f487c6303ab"}},
     mbwcStubs: {"result":{"mbToWcStub":4096,"wcToMbStub":4570,"tableAddr":131072,"codePage":1252,"regionBase":4096,"regionEnd":5632},"hashes":{"region":"60837cbfa0d2213d9d44b4db927a172c19ad782330c129662a1065054d51dc79"}},
+    tebStubs: {"result":{"getLastErrorStub":4096,"setLastErrorStub":4103,"tlsGetValueStub":4116,"tlsSetValueStub":4193,"flsGetValueStub":4268,"flsSetValueStub":4334,"regionBase":4096,"regionEnd":4480},"hashes":{"region":"feeca8832f64af1cf9b2ce573c5980c0c145cc65ef2cafd0074f2940ffdaf8d3"}},
     shadowTrampolineSampler: {"result":{"trampAddr":5136,"shadowBase":4100,"slotCount":256,"sentinel":2147483648,"skipCounterAddr":4096,"dataRegionBase":4096,"dataRegionEnd":5124,"codeRegionBase":5136,"codeRegionEnd":5392},"hashes":{"code":"e20e8f6c5fd9413703a668ac8d6f2b4020da3b7e1a727cbe47ab0c01a6c8fa51","data":"496f0eda84c76c10945e95128f4f8b16a640633720f19ab135d044da70da04fc"}},
     shadowTrampolineRenderStateNoOwner: {"result":{"trampAddr":5136,"shadowBase":4100,"slotCount":256,"sentinel":2147483648,"skipCounterAddr":4096,"dataRegionBase":4096,"dataRegionEnd":5124,"codeRegionBase":5136,"codeRegionEnd":5392},"hashes":{"code":"7597cccb6d6fb035cc72331aa3c084d7ae9a821ff754cfb2271b7d7da068264a","data":"496f0eda84c76c10945e95128f4f8b16a640633720f19ab135d044da70da04fc"}},
     ownerDisarmScalarTrampoline: {"result":{"trampAddr":4096,"codeRegionBase":4096,"codeRegionEnd":4224},"hashes":{"code":"79a3e4be0e25e8a1b31e6301a8f71eb32b5c9dec4c46834baacfc764a9ef2aa2"}},
@@ -233,6 +239,17 @@ describe('an emitter that outgrows its region writes nothing outside it', () => 
         } finally {
             reasons.length -= added;
         }
+    });
+});
+
+describe('the TEB stubs refuse to emit past their region', () => {
+    it('throws before the first byte past the region lands', () => {
+        const ctx = mkCtx();
+        const base = 0x1000, REGION = 128;   // the real emission is ~316B
+        ctx.mem.fill(0xA5, base + REGION, base + REGION + 0x400);
+        expect(() => writeTebStubs(ctx.allocator, ctx.getMemory,
+            { tlsGetValue: 1, tlsSetValue: 2, flsSetValue: 3 }, REGION)).toThrow(/emit past/);
+        for (let i = 0; i < 0x400; i++) expect(`+${i}:${ctx.mem[base + REGION + i]}`).toBe(`+${i}:165`);
     });
 });
 

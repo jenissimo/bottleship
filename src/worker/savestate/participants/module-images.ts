@@ -28,7 +28,7 @@ export const MODULE_IMAGES_SCHEMA = {
     state: stateKeys<ModuleImagesState>({ images: true, nextDllBase: true, freeDllRanges: true, implicitTls: true, hleBound: true, inlineStubs: true }),
     image: MODULE_IMAGE_FIELDS,
     tls: stateKeys<ImplicitTlsEntry>({ tlsIndex: true, templateStart: true, templateSize: true, zeroFillSize: true, moduleName: true }),
-    inlineStubs: stateKeys<InlineStubState>({ heap: true, crt: true, caseFold: true, locale: true, mbwc: true, mbwcDeclined: true, math: true }),
+    inlineStubs: stateKeys<InlineStubState>({ heap: true, crt: true, caseFold: true, locale: true, mbwc: true, mbwcDeclined: true, math: true, teb: true }),
 };
 
 export type ImageLoader = Pick<PELoader, 'readImageFile' | 'parseExportTable' | 'captureInlineStubs' | 'restoreInlineStubs'>;

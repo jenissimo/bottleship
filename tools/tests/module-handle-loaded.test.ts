@@ -101,16 +101,16 @@ describe("GetModuleHandle observes loaded HLE images without loading them", () =
             for (const name of ["ws2_32.dll", "wsock32.dll", "user32.dll"]) {
                 expect(hleImageBase(name)).toBeDefined();
                 expect(lookup(api, name)).toBe(0);
-                expect(process.lastError).toBe(126);
+                expect(System.getInstance().scheduler.getLastError()).toBe(126);
                 expect(isHleModuleLoaded(name)).toBe(false);
             }
             expect(loadedHleModules()).toEqual(before);
         });
         test(api + " observes an import and preserves native registry priority", () => {
             markHleModuleLoaded("ws2_32.dll");
-            process.lastError = 1234;
+            System.getInstance().scheduler.setLastError(1234);
             expect(lookup(api, "C:\\Windows\\System32\\WS2_32.DLL")).toBe(hleImageBase("ws2_32"));
-            expect(process.lastError).toBe(1234);
+            expect(System.getInstance().scheduler.getLastError()).toBe(1234);
             expect(isHleModuleLoaded("wsock32")).toBe(false);
             process.moduleRegistry.register(module("ws2_32.dll", 0x12000000));
             expect(lookup(api, "ws2_32.dll")).toBe(0x12000000);
@@ -130,7 +130,7 @@ describe("GetModuleHandle observes loaded HLE images without loading them", () =
             config.disabledDlls = ["ws2_32"];
             const name = writeName("ws2_32.dll", api.endsWith("W"));
             expect((await call(api, api.includes("Ex") ? [name, 0, 0] : [name])).value).toBe(0);
-            expect(process.lastError).toBe(126);
+            expect(System.getInstance().scheduler.getLastError()).toBe(126);
             expect(isHleModuleLoaded("ws2_32")).toBe(false);
         });
     }
@@ -204,7 +204,7 @@ describe("GetModuleHandle observes loaded HLE images without loading them", () =
                 view.setUint32(OUT, 0xdeadbeef, true);
                 expect(call(api, [4, missing, OUT]).value).toBe(0);
                 expect(view.getUint32(OUT, true)).toBe(0);
-                expect(process.lastError).toBe(126);
+                expect(System.getInstance().scheduler.getLastError()).toBe(126);
             }
             markHleModuleLoaded("ws2_32");
             expect(call(api, [4, address, OUT]).value).toBe(1);

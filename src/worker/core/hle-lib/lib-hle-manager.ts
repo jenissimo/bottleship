@@ -229,7 +229,7 @@ class LibHleManager {
             return;
         }
         this.nativeLeafSites.push(...applyNativeLeaves(image, module));
-        this.nativeLeafSites.push(...applyNativeSplices(image, module));
+        this.nativeLeafSites.push(...applyNativeSplices(image, module, System.getInstance().process?.thunkMemoryManager?.stubAllocator));
     }
 
     getNativeLeafSites(): NativeLeafSite[] {

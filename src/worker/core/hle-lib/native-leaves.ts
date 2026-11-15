@@ -13,6 +13,7 @@
 import { Logger, LogCategory } from '../logger';
 import { writeGuestCode } from '../memory/guest-code';
 import type { LoadedPEModule } from '../module-registry';
+import type { StubAllocator } from '../thunking/thunk-memory-manager';
 
 /**
  * __int64 _ftol(void): ST(0) truncated toward zero, popped, returned in EDX:EAX.
@@ -105,13 +106,14 @@ export interface NativeSplice {
     mask: Uint8Array;
     same: readonly number[];
     offset: number;
-    code: Uint8Array;
+    /** Original epilogue reached after a successful TLS operation. */
+    continuation: number;
 }
 
 export const NATIVE_SPLICES: readonly NativeSplice[] = [
     {
         name: '_Unwind_SjLj_Register', toolchain: 'mingw-gcc3', same: [11, 59, 77, 121], offset: 0x58,
-        code: hex('8b4a3064a12c0000008b14888917893c88ebc1'),
+        continuation: 0x2c,
         body: hex('5589e557565383ec0c8b15000000008b7d0885d2741e8b422c85c078298b722c85f675348b42288907897a28'
             + '8d65f45b5e5f5dc3e8000000008b15000000008b422c85c079d7e8000000008b15000000008b722c85f674cc8b'
             + '5a30e80000000083ec0c89c653e80000000089c356e800000000891f893c24a1000000008b583053e800000000'
@@ -123,7 +125,7 @@ export const NATIVE_SPLICES: readonly NativeSplice[] = [
     },
     {
         name: '_Unwind_SjLj_Unregister', toolchain: 'mingw-gcc3', same: [11, 54, 71], offset: 0x52,
-        code: hex('8b483064a12c000000891c88ebc4'),
+        continuation: 0x24,
         body: hex('5589e553518b45088b18a10000000085c0741d8b502c85d278278b482c85c975318958288b5dfcc9c38db426'
             + '00000000e800000000a1000000008b502c85d279d9e800000000a1000000008b482c85c974cf5252538b583053'
             + 'e8000000005a85c05975c08b5dfcc9e900000000'),
@@ -167,11 +169,72 @@ export function findNativeSplices(
     return out;
 }
 
-export function applyNativeSplices(mem: Uint8Array, module: LoadedPEModule): NativeLeafSite[] {
+/**
+ * The original TLS block is too small for native inline/expansion selection.
+ * Publish its JMP only after the allocator-owned trampoline is completely written.
+ * Missing expansion or invalid index returns to the original API path (lazy allocation).
+ */
+export function applyNativeSplices(mem: Uint8Array, module: LoadedPEModule, allocator?: StubAllocator): NativeLeafSite[] {
     const replaced: NativeLeafSite[] = [];
-    if (!nativeSplicesEnabled()) return replaced;
+    if (!nativeSplicesEnabled() || !allocator) return replaced;
     for (const { splice, ...site } of findNativeSplices(mem, module)) {
-        if (!writeGuestCode(mem, splice.code, site.address + splice.offset)) continue;
+        const register = splice.name === '_Unwind_SjLj_Register';
+        const patch = site.address + splice.offset;
+        const bytes: number[] = [];
+        const e = (...b: number[]) => bytes.push(...b);
+        const u = (v: number) => { for (let i = 0; i < 4; i++) bytes.push((v >>> (i * 8)) & 255); };
+        const jumps: Array<{ at: number; target: number }> = [];
+        const branch = (op: number[], target = -1) => { e(...op); const at = bytes.length; u(0); if (target >= 0) jumps.push({ at, target }); return at; };
+        const bind = (at: number) => { const d = bytes.length - at - 4; for (let i=0;i<4;i++) bytes[at+i]=(d >>> (i*8))&255; };
+        // EDX (Register) / EAX (Unregister) holds libgcc's shared state pointer.
+        e(0x8b, register ? 0x4a : 0x48, 0x30); // ecx = dynamic TLS index
+        e(0x81, 0xf9); u(1088);
+        const invalid = branch([0x0f, 0x83]);
+        e(0x83, 0xf9, 64);
+        const expansion = branch([0x0f, 0x83]);
+        e(0x64, 0xa1); u(0x18); // native TEB Self
+        e(0x05); u(0xe10);
+        const ready = branch([0xe9]);
+        bind(expansion);
+        e(0x64, 0xa1); u(0xf94);
+        e(0x85, 0xc0);
+        const absent = branch([0x0f, 0x84]);
+        e(0x83, 0xe9, 64);
+        bind(ready);
+        if (register) e(0x8b, 0x14, 0x88, 0x89, 0x17, 0x89, 0x3c, 0x88);
+        else e(0x89, 0x1c, 0x88);
+        branch([0xe9], site.address + splice.continuation);
+        bind(invalid); bind(absent);
+        // Restore the only original register clobbered by the selector, and replay
+        // whole displaced instructions. Remaining original bytes are untouched.
+        if (register) {
+            e(0x8b, 0x5a, 0x30); // original mov ebx,[edx+30h]
+            const callTarget = patch + 8 + new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getInt32(patch + 4, true);
+            branch([0xe8], callTarget); // original GetLastError
+            branch([0xe9], patch + 8);
+        } else {
+            // The selector overwrote EAX=state; its stable relocated global supplies it.
+            e(0xa1); u(u32At(mem, site.address + splice.same[0]!));
+            e(0x52, 0x52, 0x53, 0x8b, 0x58, 0x30);
+            branch([0xe9], patch + 6);
+        }
+        let trampoline: number;
+        try {
+            trampoline = allocator.alloc(bytes.length, 'THUNK_CODE', 'rx');
+            if (!trampoline || trampoline + bytes.length > mem.length) continue;
+            const code = Uint8Array.from(bytes);
+            const view = new DataView(code.buffer);
+            for (const j of jumps) view.setInt32(j.at, j.target - (trampoline + j.at + 4), true);
+            if (!writeGuestCode(mem, code, trampoline)) continue;
+        } catch {
+            Logger.warn(LogCategory.SYSTEM, '[HLE-lib] native splice allocation/emission failed; original body retained');
+            continue;
+        }
+        // Publication errors propagate: a post-write invalidator failure must not be
+        // misreported as an unchanged original body.
+        const jump = new Uint8Array(5); jump[0] = 0xe9;
+        new DataView(jump.buffer).setInt32(1, trampoline - patch - 5, true);
+        if (!writeGuestCode(mem, jump, patch)) continue;
         replaced.push(site);
         Logger.log(LogCategory.SYSTEM,
             `[HLE-lib] native splice ${site.crt} ${site.name} @ ${site.module}+0x${(site.address - module.baseAddress).toString(16)} applied`);

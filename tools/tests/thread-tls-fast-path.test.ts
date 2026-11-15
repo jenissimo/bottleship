@@ -91,12 +91,20 @@ describe('TlsSetValue fast path', () => {
         } finally { scheduler.tlsFree(index); }
     });
 
-    test('unallocated index defers to the slow path without side effects', () => {
+    test('unallocated index is stored as NT stores it, LastError untouched', () => {
         const index = scheduler.tlsAlloc();
         scheduler.tlsFree(index);
-        expect(call('TlsSetValue', [index, 7])).toBeNull();
+        expect(call('TlsSetValue', [index, 7])).toBe(1);
+        expect(scheduler.tlsGetValue(index)).toBe(7);
         expect(scheduler.getLastError()).toBe(LASTERROR_SENTINEL);
-        expect(slowValue(tlsApi.TlsSetValue!(null as never, memory, [index, 7]))).toBe(0);
+        scheduler.tlsSetValue(index, 0);
+    });
+
+    test('index past the expansion range defers to the slow path, which fails with ERROR_INVALID_PARAMETER', () => {
+        expect(call('TlsSetValue', [1088, 7])).toBeNull();
+        expect(scheduler.getLastError()).toBe(LASTERROR_SENTINEL);
+        expect(slowValue(tlsApi.TlsSetValue!(null as never, memory, [1088, 7]))).toBe(0);
+        expect(scheduler.getLastError()).toBe(87);
     });
 });
 

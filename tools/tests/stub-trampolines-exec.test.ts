@@ -70,6 +70,8 @@ function buildImage(preserve: boolean): { bytes: Uint8Array; calls: Call[]; stub
         stubs.ptr3f = wbuf[16];               // PtrDeref3F, stdcall
         stubs.shaderConst = wbuf[20];
         stubs.zeroArg = wbuf[21];
+        stubs.ptr1d = wbuf[22];               // PtrDeref1D (glColor4ubv), stdcall
+        stubs.ptr4f = wbuf[24];               // PtrDeref4F (glColor4fv), stdcall
 
         // Guest state the stubs consult.
         dv.setUint32(OWNER, DEV, true);
@@ -107,6 +109,9 @@ function buildImage(preserve: boolean): { bytes: Uint8Array; calls: Call[]; stub
             { stub: 'wbuf3', args: [4, 5, 6], ringHead: CAPACITY - 8 },   // ring full -> OUT
             { stub: 'zeroArg', args: [] },
             { stub: 'zeroArg', args: [], ringHead: CAPACITY - 8 },
+            { stub: 'ptr1d', args: [PAYLOAD] },
+            { stub: 'ptr4f', args: [PAYLOAD] },
+            { stub: 'ptr4f', args: [PAYLOAD], ringHead: CAPACITY - 8 },  // ring full -> OUT
         ];
 
         // Driver: per call, seed callee-saved sentinels, push args, call, record the state.
@@ -209,7 +214,7 @@ describe.skipIf(!HAVE_V86)('guest stub trampolines, executed', () => {
         expect(eax(11)).toBe(5);                                  // Release answered in guest
         expect(a.obj).toEqual([5, 9, 1]);                         // 5->6->5; foreign & 1->0 untouched
         expect(a.owner).toBe(0);                                  // disarmed
-        expect(a.outs).toEqual([fid(9), fid(10), fid(12), fid(16), fid(19), fid(23), fid(25)]);
+        expect(a.outs).toEqual([fid(9), fid(10), fid(12), fid(16), fid(19), fid(23), fid(25), fid(28)]);
         const ring = a.ring;
         const expected = [
             fid(0), DEV, 5, 7,
@@ -227,6 +232,8 @@ describe.skipIf(!HAVE_V86)('guest stub trampolines, executed', () => {
             fid(21), 0xa0000000, 0xa0000001, 0xa0000002,
             fid(22), DEV, 4, 2, ...Array.from({ length: 8 }, (_, i) => 0xa0000000 + i),
             fid(24), 0,
+            fid(26), 0xa0000000,
+            fid(27), 0xa0000000, 0xa0000001, 0xa0000002, 0xa0000003,
         ];
         expect(ring.map(v => v.toString(16))).toEqual(expected.map(v => (v >>> 0).toString(16)));
     }, 60_000);

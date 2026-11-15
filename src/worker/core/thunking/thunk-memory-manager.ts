@@ -91,6 +91,20 @@ export interface StubAllocator {
  * materialisation and update_eflags — on stubs that run tens of thousands of times a frame.
  * `__stubsPreserveEflags` restores the saving frame, for A/B. Read at emit time.
  */
+const PTR_DEREF_1D_TRAMPOLINE = 22;
+const PTR_DEREF_4F_TRAMPOLINE = 24;
+/** Write-buffer trampoline that copies `dwordCount` dwords from its one pointer argument
+ *  (stdcall; cdecl is the next index), or undefined when none is emitted for that count. */
+export function ptrDerefTrampolineIndex(dwordCount: number): number | undefined {
+    switch (dwordCount) {
+        case 1: return PTR_DEREF_1D_TRAMPOLINE;
+        case 2: return 18;
+        case 3: return 16;
+        case 4: return PTR_DEREF_4F_TRAMPOLINE;
+        default: return undefined;
+    }
+}
+
 export function stubsPreserveEflags(): boolean {
     return (globalThis as { __stubsPreserveEflags?: boolean }).__stubsPreserveEflags === true;
 }
@@ -662,7 +676,7 @@ export class ThunkMemoryManager {
         capacity: number,
     ): number[] {
         const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const addrs: number[] = new Array(22);  // 16 standard + 4 PtrDeref + 1 shader-constant + 1 zero-arg
+        const addrs: number[] = new Array(26);  // 16 standard + 4 PtrDeref + shader-constant + zero-arg + 4 PtrDeref
         let off = base;
         const lean = (globalThis as { __wbufLeanTrampolines?: boolean }).__wbufLeanTrampolines === true;
         // pushfd shifts every stack argument by 4 when the saving frame is emitted.
@@ -780,12 +794,15 @@ export class ThunkMemoryManager {
         // --- PtrDeref trampolines ---
         // These dereference a float* pointer inline, writing the actual float values
         // to the ring buffer.  Indices: 16=PtrDeref3F stdcall, 17=PtrDeref3F cdecl,
-        //                               18=PtrDeref2F stdcall, 19=PtrDeref2F cdecl.
+        //                               18=PtrDeref2F stdcall, 19=PtrDeref2F cdecl,
+        // and, emitted after index 21 so the earlier layout is unchanged:
+        //                               22=PtrDeref1D stdcall, 23=PtrDeref1D cdecl,
+        //                               24=PtrDeref4F stdcall, 25=PtrDeref4F cdecl.
         // Drain side is identical to scalar variants (reads floatCount u32s from ring).
-        for (let floatCount = 3; floatCount >= 2; floatCount--) {
+        const emitPtrDeref = (floatCount: number, firstIdx: number): void => {
             for (let isStdcallInt = 0; isStdcallInt <= 1; isStdcallInt++) {
                 const isStdcall = isStdcallInt === 0;
-                const idx = floatCount === 3 ? (16 + isStdcallInt) : (18 + isStdcallInt);
+                const idx = firstIdx + isStdcallInt;
                 addrs[idx] = off;
 
                 const stride = (floatCount + 1) * 4;  // funcId + N floats
@@ -858,7 +875,9 @@ export class ThunkMemoryManager {
                 // Patch jge rel32
                 dv.setInt32(jgePatchOff, overflowAddr - (jgePatchOff + 4), true);
             }
-        }
+        };
+        emitPtrDeref(3, 16);
+        emitPtrDeref(2, 18);
 
         // --- D3D9 shader-constant trampoline (index 20) ---
         // IDirect3DDevice9_Set*ShaderConstantF(this, StartRegister, pConstantData, Vector4fCount)
@@ -1078,6 +1097,9 @@ export class ThunkMemoryManager {
             w8(0xC3);
             dv.setInt32(zeroJgePatchOff, zeroOverflowAddr - (zeroJgePatchOff + 4), true);
         }
+
+        emitPtrDeref(1, PTR_DEREF_1D_TRAMPOLINE);
+        emitPtrDeref(4, PTR_DEREF_4F_TRAMPOLINE);
 
         if (off > base + 0xA00) {
             throw new Error(`Write-buffer trampolines overrun their area: ${off - base} bytes`);

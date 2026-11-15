@@ -6,6 +6,7 @@ import { frameProfiler } from "../../core/frame-profiler";
 import { statsOverlay } from "../../core/stats-overlay";
 import { captureGLFrameIfArmed } from "./frame-capture";
 import { guestDrawableSize } from "./drawable";
+import { beginGLWorkPresent, finishGLWorkPresent, failGLWorkPresent } from "./work-digest";
 
 export class OpenGLPresenter implements RenderActive {
     readonly suppressGdiOverlay = true;
@@ -23,7 +24,9 @@ export class OpenGLPresenter implements RenderActive {
 
         // Claim screen ownership on every present. Fast-path wglMakeCurrent may bypass the
         // JS handler, so present() is the reliable point to mark the GL renderer active.
-        System.getInstance().services.render.setActive(this);
+        const render = System.getInstance().services.render;
+        render.setActive(this);
+        const work = beginGLWorkPresent(ctx, render.getPresentSerial?.() ?? null);
 
         if (!ctx.executor) {
             Logger.warn(LogCategory.SYSTEM,
@@ -43,11 +46,18 @@ export class OpenGLPresenter implements RenderActive {
             ctx.executor.setDrawableSize(d.width, d.height);
             const [dw, dh] = ctx.executor.getDrawableSize();
             captureGLFrameIfArmed(ctx, dw, dh);
-            ctx.executor.executeFrame({
-                commands: ctx.commands,
-                vertArena: ctx.vertArena.data,
-                textures: ctx.textures,
-            });
+            if (work) work.executorCalled = true;
+            try {
+                ctx.executor.executeFrame({
+                    commands: ctx.commands,
+                    vertArena: ctx.vertArena.data,
+                    textures: ctx.textures,
+                }, work);
+                if (work) work.returned = true;
+            } catch (e) {
+                failGLWorkPresent(work, e);
+                throw e;
+            }
         }
 
         // Commands and the vertex arena they point into are frame-scoped: reuse the
@@ -58,6 +68,7 @@ export class OpenGLPresenter implements RenderActive {
         // Notify render service
         const system = System.getInstance();
         system.services.render.notifyPresent("opengl");
+        finishGLWorkPresent(work, render.getPresentSerial?.() ?? null);
 
         // Frame profiler & stats overlay
         frameProfiler.markFrame("opengl");

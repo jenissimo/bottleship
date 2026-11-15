@@ -1,3 +1,4 @@
+import { MemoryAllocationError } from './memory/allocation-error';
 /**
  * TEB/PEB Manager
  *
@@ -20,9 +21,12 @@
  *   0x20  ClientId.UniqueProcess  (PID)
  *   0x24  ClientId.UniqueThread   (TID)
  *   0x28  ActiveRpcHandle         (0)
- *   0x2C  ThreadLocalStoragePointer (-> TLS array)
+ *   0x2C  ThreadLocalStoragePointer (-> loader implicit-TLS vector)
  *   0x30  ProcessEnvironmentBlock (-> PEB)
  *   0x34  LastErrorValue
+ *   0xE10 TlsSlots[64]
+ *   0xF94 TlsExpansionSlots       (-> 1024 lazy dynamic slots)
+ *   0xFB4 FlsData                 (-> RTL_FLS_DATA, allocated on the first FlsSetValue)
  */
 
 import { Logger, LogCategory } from './logger';
@@ -39,25 +43,34 @@ const TEB_CLIENT_ID_THREAD  = 0x24;
 const TEB_TLS_POINTER       = 0x2C;
 const TEB_PEB               = 0x30;
 const TEB_LAST_ERROR        = 0x34;
+const TEB_FLS_DATA          = 0xFB4;
 
-/** NT keeps TLS_MINIMUM_AVAILABLE slots inline at TEB+0xE10 (TlsSlots), and code that inlines
- *  TlsGetValue reads them there: Mono's JIT emits `mov eax, fs:[0x18]; mov eax, [eax+0xE10+4*i]`
- *  for its thread/domain slots. The TLS array therefore starts at that offset of the TEB block,
- *  so slots 0..63 are the TlsSlots; the expansion slots follow it inside the same block. */
+/** Native NT32 dynamic TLS: 64 inline slots and 1024 lazy expansion slots. */
 const TEB_TLS_SLOTS = 0xE10;
-// A 32-bit NT 5.x PEB is 0x210 bytes. Anything we place at PEB+offset below that lands inside a
-// real field (0x100 is in the middle of GdiHandleBuffer), so the header proper is reserved whole.
+const TEB_TLS_EXPANSION = 0xF94;
+const TLS_INLINE_COUNT = 64;
+const TLS_EXPANSION_BYTES = 1024 * 4;
 const PEB_SIZE = 0x230;
-/** Every index TlsAlloc can hand out: TLS_MINIMUM_AVAILABLE (64) + TLS_EXPANSION_SLOTS (1024),
- *  as on NT. The per-thread array TEB+0x2C points at holds ALL of them, so it is the one
- *  storage for every slot: the JS TlsGetValue/TlsSetValue, the WASM fast paths (which serve
- *  0..63 and decline the rest to JS) and guest code that indexes fs:[2Ch] directly (implicit
- *  TLS, the libgcc SjLj splice in hle-lib/native-leaves.ts) all read and write it, and no
- *  index that exists can land past its end. */
-export const TLS_INDEX_LIMIT = 64 + 1024;
-const TLS_ARRAY_SIZE = TLS_INDEX_LIMIT * 4;
-/** The allocation behind one TEB: the TEB page plus the TLS array that starts inside it. */
-export const TEB_BLOCK_SIZE = TEB_TLS_SLOTS + TLS_ARRAY_SIZE;
+export const TLS_INDEX_LIMIT = TLS_INLINE_COUNT + 1024;
+/** Loader TLS has its own vector at FS:[2Ch], independent of TlsAlloc indices. */
+export const IMPLICIT_TLS_FIRST = 0;
+// Preserve the loader's historical1088-module admission independently of dynamic TLS.
+export const IMPLICIT_TLS_LIMIT = 1088;
+const TLS_ARRAY_SIZE = IMPLICIT_TLS_LIMIT * 4;
+export const FLS_INDEX_LIMIT = 128;
+export const FLS_DATA_SLOTS_OFFSET = 8;
+const FLS_DATA_SIZE = FLS_DATA_SLOTS_OFFSET + FLS_INDEX_LIMIT * 4;
+export const TEB_OFFSETS = {
+    self: TEB_SELF,
+    clientIdProcess: TEB_CLIENT_ID_PROCESS,
+    clientIdThread: TEB_CLIENT_ID_THREAD,
+    tlsPointer: TEB_TLS_POINTER,
+    tlsSlots: TEB_TLS_SLOTS,
+    tlsExpansion: TEB_TLS_EXPANSION,
+    lastError: TEB_LAST_ERROR,
+    flsData: TEB_FLS_DATA,
+} as const;
+export const TEB_BLOCK_SIZE = 0x1000;
 
 import { currentProcessId } from './process-identity';
 
@@ -103,6 +116,7 @@ export interface PebLoaderModule {
 
 interface MemoryManager {
     alloc(size: number, kind?: string, perms?: string): number;
+    free?(ptr: number): void;
 }
 
 interface MemoryReleaser {
@@ -113,8 +127,12 @@ export class TebManager {
     private pebAddress: number = 0;
     private processParametersAddress: number = 0;           // RTL_USER_PROCESS_PARAMETERS
     private tebMap: Map<number, number> = new Map();        // threadId -> TEB guest address
-    private tlsArrayMap: Map<number, number> = new Map();   // threadId -> TLS array guest address
+    private tlsArrayMap: Map<number, number> = new Map();   // threadId -> owned loader TLS vector
     private getMemory: (() => Uint8Array) | null = null;
+    private memoryManager: MemoryManager | null = null;
+    // Allocator ownership is independent of guest-writable TEB pointers.
+    private expansionMap = new Map<number, number>();
+    private flsMap = new Map<number, number>();
 
     /** Get a fresh DataView over the current (non-detached) memory buffer. */
     private getView(): DataView | null {
@@ -129,8 +147,11 @@ export class TebManager {
      */
     initProcess(getMemory: () => Uint8Array, memoryManager: MemoryManager, imageBase: number = 0x00400000): void {
         this.getMemory = getMemory;
+        this.memoryManager = memoryManager;
         this.tebMap.clear();
         this.tlsArrayMap.clear();
+        this.expansionMap.clear();
+        this.flsMap.clear();
 
         // Allocate PEB + its embedded ProcessParameters as one block.
         this.pebAddress = memoryManager.alloc(PEB_ALLOC_SIZE);
@@ -291,11 +312,20 @@ export class TebManager {
             return 0;
         }
 
-        // One block: the TEB page with the TLS array starting at its TlsSlots offset.
+        // The TEB inline slots and the loader TLS vector are separate native stores.
         const tebAddress = memoryManager.alloc(TEB_BLOCK_SIZE);
+        let tlsArrayAddress: number;
+        try {
+            tlsArrayAddress = memoryManager.alloc(TLS_ARRAY_SIZE);
+            if (!tlsArrayAddress) throw new MemoryAllocationError('TEB loader TLS vector allocation failed');
+        } catch (error) {
+            memoryManager.free?.(tebAddress);
+            throw error;
+        }
+        // Reacquire after both allocations: a memory provider may replace its buffer.
         const mem = this.getMemory();
         mem.fill(0, tebAddress, tebAddress + TEB_BLOCK_SIZE);
-        const tlsArrayAddress = tebAddress + TEB_TLS_SLOTS;
+        mem.fill(0, tlsArrayAddress, tlsArrayAddress + TLS_ARRAY_SIZE);
 
         const view = this.getView()!;
 
@@ -306,7 +336,7 @@ export class TebManager {
         view.setUint32(tebAddress + TEB_SELF, tebAddress, true);            // Self pointer
         view.setUint32(tebAddress + TEB_CLIENT_ID_PROCESS, currentProcessId, true); // PID
         view.setUint32(tebAddress + TEB_CLIENT_ID_THREAD, threadId, true);  // TID
-        view.setUint32(tebAddress + TEB_TLS_POINTER, tlsArrayAddress, true);// TLS array
+        view.setUint32(tebAddress + TEB_TLS_POINTER, tlsArrayAddress, true);// loader TLS vector
         view.setUint32(tebAddress + TEB_PEB, this.pebAddress, true);        // PEB
         view.setUint32(tebAddress + TEB_LAST_ERROR, 0, true);               // LastError
 
@@ -321,15 +351,19 @@ export class TebManager {
         return tebAddress;
     }
 
-    captureState(): { peb: number; params: number; tebs: number[][]; tls: number[][] } {
-        return { peb: this.pebAddress, params: this.processParametersAddress, tebs: [...this.tebMap], tls: [...this.tlsArrayMap] };
+    captureState(): { peb: number; params: number; tebs: number[][]; tls: number[][]; expansion: number[][]; fls: number[][] } {
+        return { peb: this.pebAddress, params: this.processParametersAddress,
+            tebs: [...this.tebMap], tls: [...this.tlsArrayMap],
+            expansion: [...this.expansionMap], fls: [...this.flsMap] };
     }
 
-    restoreState(state: { peb: number; params: number; tebs: number[][]; tls: number[][] }): void {
+    restoreState(state: ReturnType<TebManager['captureState']>): void {
         this.pebAddress = state.peb;
         this.processParametersAddress = state.params;
-        this.tebMap = new Map(state.tebs.map(([t, a]) => [t, a]));
-        this.tlsArrayMap = new Map(state.tls.map(([t, a]) => [t, a]));
+        this.tebMap = new Map(state.tebs.map(([t, a]) => [t!, a!]));
+        this.tlsArrayMap = new Map(state.tls.map(([t, a]) => [t!, a!]));
+        this.expansionMap = new Map(state.expansion.map(([t, a]) => [t!, a!]));
+        this.flsMap = new Map(state.fls.map(([t, a]) => [t!, a!]));
     }
 
     /**
@@ -350,7 +384,7 @@ export class TebManager {
     }
 
     /**
-     * Get TLS array address for a thread.
+     * Get the loader implicit-TLS vector address for a thread.
      */
     getTlsArrayAddress(threadId: number): number | undefined {
         return this.tlsArrayMap.get(threadId);
@@ -378,29 +412,116 @@ export class TebManager {
         return view.getUint32(tebAddr + TEB_LAST_ERROR, true);
     }
 
-    /**
-     * Store a TLS slot value in the thread's guest TLS array — the storage for every index,
-     * shared with the WASM TlsGetValue/TlsSetValue hypercalls (0..63). Returns false when
-     * the slot is not array-backed (index out of range, or no array for the thread).
-     */
+    /** Lazy guest allocations fail as Win32 OOM; programming errors are not swallowed. */
+    private optionalAllocation(memory: MemoryManager, size: number): number {
+        try { return memory.alloc(size); }
+        catch (error) { if (error instanceof MemoryAllocationError) return 0; throw error; }
+    }
+
+    /** Dynamic TLS is addressed exactly as native code: inline or expansion. */
+    private tlsSlotAddress(threadId: number, index: number, allocate: boolean): number | undefined {
+        if (!Number.isInteger(index) || index < 0 || index >= TLS_INDEX_LIMIT) return undefined;
+        const teb = this.tebMap.get(threadId);
+        let view = this.getView();
+        if (teb === undefined || !view) return undefined;
+        if (index < TLS_INLINE_COUNT) return teb + TEB_TLS_SLOTS + index * 4;
+        let expansion = view.getUint32(teb + TEB_TLS_EXPANSION, true) >>> 0;
+        if (!expansion && allocate) {
+            if (!this.memoryManager || !this.getMemory) return undefined;
+            expansion = this.optionalAllocation(this.memoryManager, TLS_EXPANSION_BYTES);
+            if (!expansion) return undefined;
+            this.getMemory().fill(0, expansion, expansion + TLS_EXPANSION_BYTES);
+            view = this.getView()!;
+            view.setUint32(teb + TEB_TLS_EXPANSION, expansion, true);
+            this.expansionMap.set(threadId, expansion);
+        }
+        return expansion ? expansion + (index - TLS_INLINE_COUNT) * 4 : 0;
+    }
+
     syncTlsSlot(threadId: number, index: number, value: number): boolean {
-        if (index < 0 || index >= TLS_INDEX_LIMIT) return false;
-        const tlsAddr = this.tlsArrayMap.get(threadId);
-        if (tlsAddr === undefined) return false;
+        const slot = this.tlsSlotAddress(threadId, index, true);
         const view = this.getView();
-        if (!view) return false;
+        if (!slot || !view) return false;
+        view.setUint32(slot, value >>> 0, true);
+        return true;
+    }
+
+    /** A module's implicit-TLS block pointer (ThreadLocalStoragePointer[index]). */
+    syncImplicitTlsSlot(threadId: number, index: number, value: number): boolean {
+        if (index < IMPLICIT_TLS_FIRST || index >= IMPLICIT_TLS_LIMIT) return false;
+        const tlsAddr = this.tlsArrayMap.get(threadId);
+        const view = this.getView();
+        if (tlsAddr === undefined || !view) return false;
         view.setUint32(tlsAddr + index * 4, value >>> 0, true);
         return true;
     }
 
-    /** A TLS slot value from the thread's guest TLS array; undefined when not array-backed. */
-    readTlsSlot(threadId: number, index: number): number | undefined {
-        if (index < 0 || index >= TLS_INDEX_LIMIT) return undefined;
+    readImplicitTlsSlot(threadId: number, index: number): number | undefined {
+        if (index < IMPLICIT_TLS_FIRST || index >= IMPLICIT_TLS_LIMIT) return undefined;
         const tlsAddr = this.tlsArrayMap.get(threadId);
-        if (tlsAddr === undefined) return undefined;
         const view = this.getView();
-        if (!view) return undefined;
-        return view.getUint32(tlsAddr + index * 4, true);
+        if (tlsAddr === undefined || !view) return undefined;
+        return view.getUint32(tlsAddr + index * 4, true) >>> 0;
+    }
+
+    /** Missing expansion is a successful NULL read, without allocating. */
+    readTlsSlot(threadId: number, index: number): number | undefined {
+        const slot = this.tlsSlotAddress(threadId, index, false);
+        const view = this.getView();
+        if (slot === undefined || !view) return undefined;
+        return slot === 0 ? 0 : view.getUint32(slot, true) >>> 0;
+    }
+
+    /** The thread's RTL_FLS_DATA block, or 0 before its first FlsSetValue (as on NT, whose
+     *  FlsGetValue then fails with ERROR_INVALID_PARAMETER). */
+    getFlsDataAddress(threadId: number): number {
+        const teb = this.tebMap.get(threadId);
+        if (teb === undefined) return 0;
+        const view = this.getView();
+        return view ? view.getUint32(teb + TEB_FLS_DATA, true) >>> 0 : 0;
+    }
+
+    /** Allocate the thread's FLS block on first use and publish it at TEB+0xFB4. */
+    ensureFlsData(threadId: number, memoryManager: MemoryManager): number {
+        const existing = this.getFlsDataAddress(threadId);
+        if (existing !== 0) return existing;
+        const teb = this.tebMap.get(threadId);
+        if (teb === undefined || !this.getView() || !this.getMemory) return 0;
+        const block = this.optionalAllocation(memoryManager, FLS_DATA_SIZE);
+        if (!block) return 0;
+        this.getMemory().fill(0, block, block + FLS_DATA_SIZE);
+        this.getView()!.setUint32(teb + TEB_FLS_DATA, block >>> 0, true);
+        this.flsMap.set(threadId, block >>> 0);
+        return block >>> 0;
+    }
+
+    /** An FLS slot of the thread; undefined when the index is invalid or the thread has no block. */
+    readFlsSlot(threadId: number, index: number): number | undefined {
+        if (index <= 0 || index >= FLS_INDEX_LIMIT) return undefined;
+        const block = this.getFlsDataAddress(threadId);
+        const view = this.getView();
+        if (block === 0 || !view) return undefined;
+        return view.getUint32(block + FLS_DATA_SLOTS_OFFSET + index * 4, true) >>> 0;
+    }
+
+    writeFlsSlot(threadId: number, index: number, value: number, memoryManager: MemoryManager): boolean {
+        if (index <= 0 || index >= FLS_INDEX_LIMIT) return false;
+        const block = this.ensureFlsData(threadId, memoryManager);
+        const view = this.getView();
+        if (block === 0 || !view) return false;
+        view.setUint32(block + FLS_DATA_SLOTS_OFFSET + index * 4, value >>> 0, true);
+        return true;
+    }
+
+    /** FlsFree: the slot reads as 0 in every thread when the index is handed out again. */
+    clearFlsSlotAllThreads(index: number): void {
+        if (index <= 0 || index >= FLS_INDEX_LIMIT) return;
+        const view = this.getView();
+        if (!view) return;
+        for (const threadId of this.tebMap.keys()) {
+            const block = this.getFlsDataAddress(threadId);
+            if (block !== 0) view.setUint32(block + FLS_DATA_SLOTS_OFFSET + index * 4, 0, true);
+        }
     }
 
     /** TlsFree: the slot reads as 0 in every thread when the index is handed out again. */
@@ -408,7 +529,10 @@ export class TebManager {
         if (index < 0 || index >= TLS_INDEX_LIMIT) return;
         const view = this.getView();
         if (!view) return;
-        for (const tlsAddr of this.tlsArrayMap.values()) view.setUint32(tlsAddr + index * 4, 0, true);
+        for (const threadId of this.tebMap.keys()) {
+            const slot = this.tlsSlotAddress(threadId, index, false);
+            if (slot) view.setUint32(slot, 0, true);
+        }
     }
 
     /**
@@ -420,11 +544,15 @@ export class TebManager {
     releaseTeb(threadId: number, memory: MemoryReleaser): boolean {
         const teb = this.tebMap.get(threadId);
         const tls = this.tlsArrayMap.get(threadId);
+        const fls = this.flsMap.get(threadId);
+        const expansion = this.expansionMap.get(threadId);
         this.tebMap.delete(threadId);
         this.tlsArrayMap.delete(threadId);
-        // A TLS array inside the TEB block goes with it; only one restored from an older
-        // savestate, where it was a block of its own, is freed separately.
-        if (tls !== undefined && (teb === undefined || tls !== teb + TEB_TLS_SLOTS)) memory.free(tls);
+        this.expansionMap.delete(threadId);
+        this.flsMap.delete(threadId);
+        if (fls !== undefined) memory.free(fls);
+        if (expansion !== undefined) memory.free(expansion);
+        if (tls !== undefined) memory.free(tls);
         if (teb !== undefined) memory.free(teb);
         return teb !== undefined || tls !== undefined;
     }
