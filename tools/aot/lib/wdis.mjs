@@ -166,10 +166,14 @@ export function* walkBody(bytes, from, to) {
         else if (op === 0x3f || op === 0x40) p++;
         else if (op === 0xfd) {
             const [subop,n]=uleb(bytes,p);p+=n;
-            if(subop!==0&&subop!==11) throw new Error(`unsupported SIMD opcode ${subop} at ${off}`);
-            const [align,a]=uleb(bytes,p);p+=a;
-            const offsetAt=p,[offset,k]=uleb(bytes,p);p+=k;
-            imm={subop,align,offset,offsetAt};
+            // v128.and, v128.or and i64x2.shr_u have no immediates.
+            if (subop === 78 || subop === 80 || subop === 205) imm = { subop };
+            else {
+                if(subop!==0&&subop!==11) throw new Error(`unsupported SIMD opcode ${subop} at ${off}`);
+                const [align,a]=uleb(bytes,p);p+=a;
+                const offsetAt=p,[offset,k]=uleb(bytes,p);p+=k;
+                imm={subop,align,offset,offsetAt};
+            }
         }
         yield { offset: off, op, depth, imm };
     }
