@@ -533,6 +533,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
     /** No device: every entry point below bails instead of dispatching onto dead handles. */
     private deviceLost = false;
 
+    private readonly megaBatchVertexRangeOff = (globalThis as { __ddrawMegaBatchVertexRangeOff?: unknown }).__ddrawMegaBatchVertexRangeOff === true;
+
     constructor(private backend: WebGPUBackend) {
         this.buildDeviceResources(backend.getDevice()!, backend.getQueue()!);
         // Debug handle: pure-D3D8 games have no ddraw module context to hang the
@@ -5561,7 +5563,7 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                 // every draw to read only its own allocation; otherwise each draw binds its own
                 // range as before.
                 const stride = batch.vertexSize;
-                let rangeStart = -1, rangeEnd = 0, oneRange = !skipMinIdx && stride > 0;
+                let rangeStart = -1, rangeEnd = 0, oneRange = !skipMinIdx && !this.megaBatchVertexRangeOff && stride > 0;
                 let anchor = 0;
                 if (oneRange) {
                     for (const draw of batch.draws) {

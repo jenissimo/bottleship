@@ -35,7 +35,7 @@ function vertices(count: number, tag: number): Uint8Array {
 interface Draw { firstVertex: number; vertexCount: number; drawIndex: number; vertexBufferOffset?: number; vertexBufferSize?: number }
 type Call = ["setVertexBuffer", FakeBuffer, number, number] | ["draw", number, number, number, number] | ["setBindGroup" | "setPipeline" | "setStencilReference", unknown];
 
-function rig(skipMinIdx = 0) {
+function rig(skipMinIdx = 0, rangeOff = false) {
     const calls: Call[] = [];
     const stats = { batches: 0, batchedDraws: 0, megaDrawsEncoded: 0, vertexRangeBinds: 0 };
     let passes = 0;
@@ -49,7 +49,7 @@ function rig(skipMinIdx = 0) {
         const ex = Object.create(DDrawWebGPUExecutor.prototype) as Record<string, unknown>;
         const fields: Record<string, unknown> = {
             debugFlags: skipMinIdx ? { skipMegaBatchDrawsRender: true, skipMegaBatchMinIdx: skipMinIdx } : {},
-            opLogArmed: 0, renderStats: stats,
+            opLogArmed: 0, renderStats: stats, megaBatchVertexRangeOff: rangeOff,
             opLog: () => {},
             ringBufferManager: { flushStorageBuffer: () => {} },
             ensureRenderPass: () => {
@@ -243,6 +243,22 @@ describe("non-indexed MegaBatch binds one vertex range for all its draws", () =>
         expect(r.passes()).toBe(2);
         expect(vbBinds(r.calls).map(c => c[1])).toEqual([a, b]);
         expect(execute(r.calls)).toEqual([...expected(a, d(0)), ...expected(b, d(1))]);
+    });
+
+    test("with the vertex-range switch on, every draw binds its own range as before", async () => {
+        const { newBuffer } = fakeGpu();
+        const buffer = newBuffer(64 * 16);
+        const draws: Draw[] = [
+            { firstVertex: 0, vertexCount: 3, drawIndex: 0, vertexBufferOffset: 0, vertexBufferSize: 3 * STRIDE },
+            { firstVertex: 3, vertexCount: 6, drawIndex: 1, vertexBufferOffset: 3 * STRIDE, vertexBufferSize: 6 * STRIDE },
+        ];
+        const r = await rig(0, true);
+        r.flush(buffer, draws);
+        expect(vbBinds(r.calls).map(c => [c[2], c[3]])).toEqual([[0, 3 * STRIDE], [3 * STRIDE, 6 * STRIDE]]);
+        expect(drawsOf(r.calls).map(c => c[3])).toEqual([0, 0]);
+        expect(r.stats.vertexRangeBinds).toBe(0);
+        expect(r.stats.megaDrawsEncoded).toBe(2);
+        expect(execute(r.calls)).toEqual(expected(buffer, draws));
     });
 
     test("the skip-draw diagnostic keeps the per-draw path", async () => {
