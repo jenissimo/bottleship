@@ -176,10 +176,10 @@ test('a window rebuilt after destroying the active one: one FALSE then one TRUE 
     // The rebuilt window is announced as a real application activation, then activated.
     const last = trace(mark).filter(([, hwnd]) => hwnd === win);
     expect(last).toEqual([
-        ['posted', win, WM_ACTIVATEAPP, 1, 0],
-        ['posted', win, WM_NCACTIVATE, 1, 0],
-        ['posted', win, WM_ACTIVATE, 1, 0],
-        ['posted', win, WM_SETFOCUS, 0, 0],
+        ['sent', win, WM_ACTIVATEAPP, 1, 0],
+        ['sent', win, WM_NCACTIVATE, 1, 0],
+        ['sent', win, WM_ACTIVATE, 1, 0],
+        ['sent', win, WM_SETFOCUS, 0, 0],
     ]);
 });
 
@@ -199,10 +199,10 @@ test('splash destroyed, then the main window of the same thread is shown: main i
     show(main, SW_SHOWNORMAL);
     expect(wm.getActiveHwnd()).toBe(main);
     expect(trace(shown)).toEqual([
-        ['posted', main, WM_ACTIVATEAPP, 1, 0],
-        ['posted', main, WM_NCACTIVATE, 1, 0],
-        ['posted', main, WM_ACTIVATE, 1, 0],
-        ['posted', main, WM_SETFOCUS, 0, 0],
+        ['sent', main, WM_ACTIVATEAPP, 1, 0],
+        ['sent', main, WM_NCACTIVATE, 1, 0],
+        ['sent', main, WM_ACTIVATE, 1, 0],
+        ['sent', main, WM_SETFOCUS, 0, 0],
     ]);
 });
 
@@ -223,10 +223,10 @@ test('hiding the only active window deactivates the app; showing it again reacti
     show(main, SW_HIDE);
     expect(wm.getActiveHwnd()).toBe(0);
     expect(trace(mark)).toEqual([
-        ['posted', main, WM_NCACTIVATE, 0, 0],
-        ['posted', main, WM_ACTIVATE, 0, 0],
-        ['posted', main, WM_ACTIVATEAPP, 0, 0],
-        ['posted', main, WM_KILLFOCUS, 0, 0],
+        ['sent', main, WM_NCACTIVATE, 0, 0],
+        ['sent', main, WM_ACTIVATE, 0, 0],
+        ['sent', main, WM_ACTIVATEAPP, 0, 0],
+        ['sent', main, WM_KILLFOCUS, 0, 0],
     ]);
     show(main, SW_SHOWNORMAL);
     expect(wm.getActiveHwnd()).toBe(main);

@@ -1,5 +1,6 @@
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { OpenGLContext } from "./context";
+import { immediateMaterialIndex } from "./lighting";
 import {
     emitDrawCommandFlat, arenaReserve, emitArenaDraw, immediateReserveVertex,
 } from "./immediate";
@@ -164,6 +165,7 @@ export function createArrayExports(ctx: OpenGLContext): Record<string, ThunkImpl
         const base = immediateReserveVertex(ctx);
         // The immediate buffer is transformed at glEnd, so object space is mandatory here.
         gatherVertices(ctx, idx, 1, ctx.immediateFlatBuf, base, false);
+        ctx.immediateFlatBuf[base+15] = immediateMaterialIndex(ctx);
         return 0;
     };
 

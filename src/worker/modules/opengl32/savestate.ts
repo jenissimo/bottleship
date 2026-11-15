@@ -10,6 +10,7 @@ import {
     type GLTexGenState, type GLTextureObject, type GLTextureUnit, type OpenGLContext,
 } from "./context";
 import type { GLCvaAttrib, GLCvaState } from "./client-arrays";
+import { captureImmediateMaterials, restoreImmediateMaterials, resetImmediateMaterials, type ImmediateMaterialSnapshot } from "./lighting";
 import { resetWglState, type WGLContextBinding, type WglContextEntry, type WglState } from "./wgl";
 import { captureGluState, restoreGluState, type GluQuadric, type GluState } from "../glu32";
 
@@ -63,6 +64,11 @@ export const OPENGL_CONTEXT_FIELDS = {
     materialFrontSpecular: "save",
     materialFrontEmission: "save",
     materialFrontShininess: "save",
+    materialBackAmbient: "save",
+    materialBackDiffuse: "save",
+    materialBackSpecular: "save",
+    materialBackEmission: "save",
+    materialBackShininess: "save",
     lightModelAmbient: "save",
     colorMaterialFace: "save",
     colorMaterialParam: "save",
@@ -268,6 +274,7 @@ export interface OpenGLSavedState {
     glu: GluState;
     presenterActive: boolean;
     color: OpenGLColorTarget | null;
+    immediateMaterials: ImmediateMaterialSnapshot | null;
 }
 
 export const OPENGL32_SCHEMA = {
@@ -287,7 +294,8 @@ export const OPENGL32_SCHEMA = {
     quadric: stateKeys<GluQuadric>({ normals: true, texture: true, orientation: true, drawStyle: true }),
     glu: stateKeys<GluState>({ nextQuadricId: true, quadrics: true }),
     color: stateKeys<OpenGLColorTarget>({ width: true, height: true, pixels: true }),
-    state: stateKeys<OpenGLSavedState>({ context: true, wgl: true, glu: true, presenterActive: true, color: true }),
+    immediateMaterials: stateKeys<ImmediateMaterialSnapshot>({ index: true, materials: true }),
+    state: stateKeys<OpenGLSavedState>({ context: true, wgl: true, glu: true, presenterActive: true, color: true, immediateMaterials: true }),
 };
 
 export interface OpenGLRestoreDebt {
@@ -505,6 +513,7 @@ export function captureOpenGL(ctx: OpenGLContext, wgl: WglState, io: Io): OpenGL
         wgl: wglSaved,
         glu: captureGluState(),
         presenterActive,
+        immediateMaterials: captureImmediateMaterials(ctx),
         color: readback ? { width: readback.width, height: readback.height, pixels: io.blob(readback.rgba) } : null,
     };
 }
@@ -580,6 +589,7 @@ export function restoreOpenGL(
     ctx: OpenGLContext, wgl: WglState, state: OpenGLSavedState, blob: RestoreContext["blob"], debt: OpenGLRestoreDebt,
 ): void {
     resetOpenGLContext(ctx);
+    resetImmediateMaterials(ctx);
     resetWglState(wgl);
     const target = ctx as unknown as Record<string, unknown>;
     for (const key of Object.keys(OPENGL_CONTEXT_FIELDS) as (keyof typeof OPENGL_CONTEXT_FIELDS)[]) {
@@ -630,6 +640,8 @@ export function restoreOpenGL(
         w[key] = key === "contexts" || key === "threadBindings" ? restoreMap(saved, v => decodePlain(v)) : decodePlain(saved);
     }
     restoreGluState(state.glu);
+    if (state.immediateMaterials === undefined) throw new Error("opengl32: the saved state has no immediateMaterials");
+    restoreImmediateMaterials(ctx, state.immediateMaterials);
 
     const render = System.getInstance().services.render;
     if (state.presenterActive && ctx.presenter) render.setActive(ctx.presenter);

@@ -232,7 +232,7 @@ export function postActivationTransition(newHwnd: number, prevHwnd: number): voi
  * slots and returns the steps in Win32 order, for the caller to send (destroy) or post
  * (hide) while hwnd still exists.
  */
-export function deactivateWithoutSuccessor(hwnd: number): ActivationStep[] {
+export function deactivateWithoutSuccessor(hwnd: number, deferStateChange = false): ActivationStep[] {
     const wm = System.getInstance().windowManager;
     if (!hwnd || wm.getActiveHwnd() !== hwnd) return [];
     const successor = wm.getZOrder().some(candidate => {
@@ -258,11 +258,14 @@ export function deactivateWithoutSuccessor(hwnd: number): ActivationStep[] {
     wm.forEachTopLevel((win) => {
         if (win.creatorThreadId === thread) step(win.hwnd, WM_ACTIVATEAPP, 0, 0);
     });
-    wm.clearActiveWindow(hwnd);
-    if (prevFocus && wm.getFocusHwnd() === 0 && wm.getWindow(prevFocus)) {
+    if (!deferStateChange) wm.clearActiveWindow(hwnd);
+    const losingFocus = deferStateChange
+        ? prevFocus === hwnd || wm.getTopLevelAncestor(prevFocus) === hwnd
+        : wm.getFocusHwnd() === 0;
+    if (prevFocus && losingFocus && wm.getWindow(prevFocus)) {
         step(prevFocus, WM_KILLFOCUS, 0, 0);
     }
-    markPendingActivation(hwnd);
+    if (!deferStateChange) markPendingActivation(hwnd);
     Logger.verbose(LogCategory.USER32,
         `deactivateWithoutSuccessor: 0x${hwnd.toString(16)} leaves, nothing takes activation`);
     return steps;

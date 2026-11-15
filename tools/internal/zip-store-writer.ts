@@ -109,12 +109,21 @@ export class ZipStoreWriter {
     private readonly fd: number;
     private readonly cd: OutEntry[] = [];
     private offset = 0;
+    private closed = false;
 
     constructor(outPath: string) {
         this.fd = openSync(outPath, "w");
     }
 
+    /** Close an unfinished archive after a caller failure; safe after finish(). */
+    abort(): void {
+        if (this.closed) return;
+        this.closed = true;
+        closeSync(this.fd);
+    }
+
     private raw(b: Buffer): void {
+        if (this.closed) throw new Error('ZIP writer is closed');
         writeSync(this.fd, b, 0, b.length);
         this.offset += b.length;
     }
@@ -228,7 +237,7 @@ export class ZipStoreWriter {
 
             return { bytes: this.offset, entries: this.cd.length };
         } finally {
-            closeSync(this.fd);
+            this.abort();
         }
     }
 }

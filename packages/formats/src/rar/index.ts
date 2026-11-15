@@ -16,8 +16,8 @@
  */
 
 import type { RandomAccessSource } from "../unpack/source";
-export { findRar4, parseRar4, extractRar4 } from './rar4';
-export type { Rar4Entry, Rar4Archive, Rar4Options } from './rar4';
+export { findRar4, parseRar4, extractRar4, extractRar4ToSink, assertRar4Extractable } from './rar4';
+export type { Rar4Entry, Rar4Archive, Rar4Options, Rar4Sink } from './rar4';
 
 export const RAR5_SIGNATURE = Uint8Array.from([0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00]);
 const RAR4_SIGNATURE = Uint8Array.from([0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00]);

@@ -5,7 +5,7 @@
 
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import {
-    OpenGLContext, GLDrawCommandType, GLTexGenState, mat4Multiply, VERT_FLOATS,
+    OpenGLContext, GLDrawCommandType, GLTexGenState, mat4Multiply, VERT_FLOATS, applyColorMaterial,
     CMD_I32, CMD_F32, CI_TYPE,
     CI_MODE, CI_VERT_OFFSET, CI_VERT_COUNT, CI_FLAGS, CI_DEPTH_FUNC, CI_BLEND_SRC, CI_BLEND_DST,
     CI_ALPHA_FUNC, CI_CULL_FACE, CI_FRONT_FACE, CI_TEX_ID0, CI_TEX_ID1, CI_TEXENV0, CI_TEXENV1,
@@ -32,7 +32,7 @@ import {
     GL_TEXTURE0,
     GL_FOG_MODE, GL_FOG_DENSITY, GL_FOG_START, GL_FOG_END, GL_FOG_COLOR,
     GL_LIGHT_MODEL_AMBIENT, GL_LIGHT_MODEL_TWO_SIDE,
-    GL_LIGHT_MODEL_LOCAL_VIEWER, GL_LIGHT_MODEL_COLOR_CONTROL,
+    GL_LIGHT_MODEL_LOCAL_VIEWER, GL_LIGHT_MODEL_COLOR_CONTROL, GL_SINGLE_COLOR, GL_SEPARATE_SPECULAR_COLOR,
     GL_AMBIENT, GL_DIFFUSE, GL_SPECULAR, GL_POSITION,
     GL_SPOT_DIRECTION, GL_SPOT_EXPONENT, GL_SPOT_CUTOFF,
     GL_CONSTANT_ATTENUATION, GL_LINEAR_ATTENUATION, GL_QUADRATIC_ATTENUATION,
@@ -62,6 +62,7 @@ import { Mem } from "../../core/memory/mem-accessor";
 import { isValidAddress } from "../../core/memory/address-guard";
 import { convertPixelsToRGBA8 } from "./texture";
 import { arenaReserve } from "./immediate";
+import { beforeImmediateMaterialChange, afterImmediateMaterialChange } from "./lighting";
 
 // ---- Helpers ----
 
@@ -203,6 +204,7 @@ function emitScissorColorClear(ctx: OpenGLContext): void {
         d[o + 4] = r; d[o + 5] = g; d[o + 6] = b; d[o + 7] = a;
         d[o + 8] = 0; d[o + 9] = 0; d[o + 10] = 1;
         d[o + 11] = 0; d[o + 12] = 0; d[o + 13] = 0; d[o + 14] = 0;
+        d[o + 15] = 0; d[o + 16] = 0; d[o + 17] = 0;
     }
     arena.used = base + 6 * VERT_FLOATS;
 
@@ -285,10 +287,149 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
     }
     const getMem = () => ctx.process.getCurrentMemory();
 
+    function outsidePrimitive(): boolean {
+        if (!ctx.immediateMode) return true;
+        ctx.error = GL_INVALID_OPERATION;
+        return false;
+    }
+
+    // Integer colour components use the signed normalized range; positions and
+    // directions are ordinary integers and must not undergo this conversion.
+    function lightingValues(ptr: number, count: number, integer: boolean, color: boolean): number[] {
+        const mem = getMem();
+        const out: number[] = [];
+        for (let i = 0; i < count; i++) {
+            const value = integer ? readU32(mem, ptr + i * 4) | 0 : readF32(mem, ptr + i * 4);
+            out.push(integer && color ? Math.max(-1, value / 2147483647) : value);
+        }
+        return out;
+    }
+
+    function lightCall(args: number[], integer: boolean, vector: boolean): number {
+        if (!outsidePrimitive()) return 0;
+        const index = (args[0] >>> 0) - GL_LIGHT0;
+        const pname = args[1] >>> 0;
+        if (index < 0 || index >= ctx.lights.length) { ctx.error = GL_INVALID_ENUM; return 0; }
+        const color = pname === GL_AMBIENT || pname === GL_DIFFUSE || pname === GL_SPECULAR;
+        const count = color || pname === GL_POSITION ? 4 : pname === GL_SPOT_DIRECTION ? 3
+            : pname === GL_SPOT_EXPONENT || pname === GL_SPOT_CUTOFF
+                || pname === GL_CONSTANT_ATTENUATION || pname === GL_LINEAR_ATTENUATION
+                || pname === GL_QUADRATIC_ATTENUATION ? 1 : 0;
+        if (!count || (!vector && count !== 1)) { ctx.error = GL_INVALID_ENUM; return 0; }
+        const values = vector ? lightingValues(args[2] >>> 0, count, integer, color)
+            : [integer ? args[2] | 0 : bitsToF32(args[2])];
+        const value = values[0];
+        if ((pname === GL_SPOT_EXPONENT && !(value >= 0 && value <= 128))
+            || (pname === GL_SPOT_CUTOFF && !(value === 180 || (value >= 0 && value <= 90)))
+            || ((pname === GL_CONSTANT_ATTENUATION || pname === GL_LINEAR_ATTENUATION
+                || pname === GL_QUADRATIC_ATTENUATION) && !(value >= 0))) {
+            ctx.error = GL_INVALID_VALUE;
+            return 0;
+        }
+        const light = ctx.lights[index];
+        switch (pname) {
+            case GL_AMBIENT: light.ambient.set(values); break;
+            case GL_DIFFUSE: light.diffuse.set(values); break;
+            case GL_SPECULAR: light.specular.set(values); break;
+            case GL_POSITION:
+            case GL_SPOT_DIRECTION: {
+                // GL 1.5 §2.14.2: both are captured in eye coordinates at set time.
+                // A spot direction uses Mu (upper-left 3x3), not the normal matrix.
+                const m = ctx.modelviewStack.stack[ctx.modelviewStack.top];
+                const w = pname === GL_POSITION ? values[3] : 0;
+                const target = pname === GL_POSITION ? light.position : light.spotDirection;
+                for (let row = 0; row < count; row++) {
+                    target[row] = m[row] * values[0] + m[4 + row] * values[1]
+                        + m[8 + row] * values[2] + m[12 + row] * w;
+                }
+                break;
+            }
+            case GL_SPOT_EXPONENT: light.spotExponent = value; break;
+            case GL_SPOT_CUTOFF: light.spotCutoff = value; break;
+            case GL_CONSTANT_ATTENUATION: light.constantAttenuation = value; break;
+            case GL_LINEAR_ATTENUATION: light.linearAttenuation = value; break;
+            case GL_QUADRATIC_ATTENUATION: light.quadraticAttenuation = value; break;
+        }
+        return 0;
+    }
+
+    function lightModelCall(args: number[], integer: boolean, vector: boolean): number {
+        if (!outsidePrimitive()) return 0;
+        const pname = args[0] >>> 0;
+        if (pname !== GL_LIGHT_MODEL_AMBIENT && pname !== GL_LIGHT_MODEL_TWO_SIDE
+            && pname !== GL_LIGHT_MODEL_LOCAL_VIEWER && pname !== GL_LIGHT_MODEL_COLOR_CONTROL) {
+            ctx.error = GL_INVALID_ENUM;
+            return 0;
+        }
+        if (!vector && pname === GL_LIGHT_MODEL_AMBIENT) { ctx.error = GL_INVALID_ENUM; return 0; }
+        const values = vector ? lightingValues(args[1] >>> 0,
+            pname === GL_LIGHT_MODEL_AMBIENT ? 4 : 1, integer, pname === GL_LIGHT_MODEL_AMBIENT)
+            : [integer ? args[1] | 0 : bitsToF32(args[1])];
+        if (pname === GL_LIGHT_MODEL_AMBIENT) ctx.lightModelAmbient.set(values);
+        else if (pname === GL_LIGHT_MODEL_COLOR_CONTROL) {
+            if (values[0] !== GL_SINGLE_COLOR && values[0] !== GL_SEPARATE_SPECULAR_COLOR) {
+                ctx.error = GL_INVALID_ENUM;
+                return 0;
+            }
+            ctx.hints.set(pname, values[0]);
+        } else ctx.hints.set(pname, values[0] !== 0 ? 1 : 0);
+        return 0;
+    }
+
+    function materialCall(args: number[], integer: boolean, vector: boolean): number {
+        const face = args[0] >>> 0;
+        const pname = args[1] >>> 0;
+        const color = pname === GL_AMBIENT || pname === GL_DIFFUSE || pname === GL_SPECULAR
+            || pname === GL_EMISSION || pname === GL_AMBIENT_AND_DIFFUSE;
+        if ((face !== GL_FRONT && face !== GL_BACK && face !== GL_FRONT_AND_BACK)
+            || (!color && pname !== GL_SHININESS) || (!vector && pname !== GL_SHININESS)) {
+            ctx.error = GL_INVALID_ENUM;
+            return 0;
+        }
+        const values = vector ? lightingValues(args[2] >>> 0, color ? 4 : 1, integer, color)
+            : [integer ? args[2] | 0 : bitsToF32(args[2])];
+        if (pname === GL_SHININESS && !(values[0] >= 0 && values[0] <= 128)) {
+            ctx.error = GL_INVALID_VALUE;
+            return 0;
+        }
+        // glMaterial is legal between vertices; preserve the material each earlier
+        // vertex used before changing the context's current material.
+        if (ctx.immediateMode) beforeImmediateMaterialChange(ctx);
+        for (const front of [true, false]) {
+            if ((front && face === GL_BACK) || (!front && face === GL_FRONT)) continue;
+            switch (pname) {
+                case GL_AMBIENT:
+                    (front ? ctx.materialFrontAmbient : ctx.materialBackAmbient).set(values); break;
+                case GL_DIFFUSE:
+                    (front ? ctx.materialFrontDiffuse : ctx.materialBackDiffuse).set(values); break;
+                case GL_SPECULAR:
+                    (front ? ctx.materialFrontSpecular : ctx.materialBackSpecular).set(values); break;
+                case GL_EMISSION:
+                    (front ? ctx.materialFrontEmission : ctx.materialBackEmission).set(values); break;
+                case GL_AMBIENT_AND_DIFFUSE:
+                    (front ? ctx.materialFrontAmbient : ctx.materialBackAmbient).set(values);
+                    (front ? ctx.materialFrontDiffuse : ctx.materialBackDiffuse).set(values);
+                    break;
+                case GL_SHININESS:
+                    if (front) ctx.materialFrontShininess = values[0];
+                    else ctx.materialBackShininess = values[0];
+                    break;
+            }
+        }
+        // Tracked parameters cannot be changed by glMaterial while color material
+        // is enabled (GL 1.5 §2.14.3); untracked channels retain the explicit value.
+        applyColorMaterial(ctx);
+        if (ctx.immediateMode) afterImmediateMaterialChange(ctx);
+        return 0;
+    }
+
+
     return {
         glEnable: (_c, _m, args) => {
             const cap = args[0] >>> 0;
+            if (!outsidePrimitive()) return 0;
             ctx.enableFlags.add(cap);
+            if (cap === GL_COLOR_MATERIAL) applyColorMaterial(ctx);
             if (cap === GL_TEXTURE_2D) {
                 ctx.textureUnits[ctx.activeTextureUnit].enabled2d = true;
             }
@@ -305,6 +446,7 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
 
         glDisable: (_c, _m, args) => {
             const cap = args[0] >>> 0;
+            if (!outsidePrimitive()) return 0;
             ctx.enableFlags.delete(cap);
             if (cap === GL_TEXTURE_2D) {
                 ctx.textureUnits[ctx.activeTextureUnit].enabled2d = false;
@@ -499,218 +641,34 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
         },
 
         // Lighting
-        glLightf: (_c, _m, args) => {
-            const lightIdx = (args[0] >>> 0) - GL_LIGHT0;
-            if (lightIdx < 0 || lightIdx >= 8) return 0;
-            const light = ctx.lights[lightIdx];
-            const pname = args[1] >>> 0;
-            const param = bitsToF32(args[2]);
-            switch (pname) {
-                case GL_SPOT_EXPONENT: light.spotExponent = param; break;
-                case GL_SPOT_CUTOFF: light.spotCutoff = param; break;
-                case GL_CONSTANT_ATTENUATION: light.constantAttenuation = param; break;
-                case GL_LINEAR_ATTENUATION: light.linearAttenuation = param; break;
-                case GL_QUADRATIC_ATTENUATION: light.quadraticAttenuation = param; break;
-            }
-            return 0;
-        },
+        glLightf: (_c, _m, args) => lightCall(args, false, false),
+        glLightfv: (_c, _m, args) => lightCall(args, false, true),
+        glLighti: (_c, _m, args) => lightCall(args, true, false),
+        glLightiv: (_c, _m, args) => lightCall(args, true, true),
 
-        glLightfv: (_c, _m, args) => {
-            const lightIdx = (args[0] >>> 0) - GL_LIGHT0;
-            if (lightIdx < 0 || lightIdx >= 8) return 0;
-            const light = ctx.lights[lightIdx];
-            const pname = args[1] >>> 0;
-            const ptr = args[2] >>> 0;
-            const mem = getMem();
-            switch (pname) {
-                case GL_AMBIENT: readF32x4(mem, ptr, light.ambient); break;
-                case GL_DIFFUSE: readF32x4(mem, ptr, light.diffuse); break;
-                case GL_SPECULAR: readF32x4(mem, ptr, light.specular); break;
-                case GL_POSITION: readF32x4(mem, ptr, light.position); break;
-                case GL_SPOT_DIRECTION: readF32x3(mem, ptr, light.spotDirection); break;
-                case GL_SPOT_EXPONENT: light.spotExponent = readF32(mem, ptr); break;
-                case GL_SPOT_CUTOFF: light.spotCutoff = readF32(mem, ptr); break;
-                case GL_CONSTANT_ATTENUATION: light.constantAttenuation = readF32(mem, ptr); break;
-                case GL_LINEAR_ATTENUATION: light.linearAttenuation = readF32(mem, ptr); break;
-                case GL_QUADRATIC_ATTENUATION: light.quadraticAttenuation = readF32(mem, ptr); break;
-            }
-            return 0;
-        },
+        glLightModelf: (_c, _m, args) => lightModelCall(args, false, false),
+        glLightModelfv: (_c, _m, args) => lightModelCall(args, false, true),
+        glLightModeli: (_c, _m, args) => lightModelCall(args, true, false),
+        glLightModeliv: (_c, _m, args) => lightModelCall(args, true, true),
 
-        glLighti: (_c, _m, args) => {
-            const lightIdx = (args[0] >>> 0) - GL_LIGHT0;
-            if (lightIdx < 0 || lightIdx >= 8) return 0;
-            const light = ctx.lights[lightIdx];
-            const pname = args[1] >>> 0;
-            const param = args[2] | 0;
-            switch (pname) {
-                case GL_SPOT_EXPONENT: light.spotExponent = param; break;
-                case GL_SPOT_CUTOFF: light.spotCutoff = param; break;
-                case GL_CONSTANT_ATTENUATION: light.constantAttenuation = param; break;
-                case GL_LINEAR_ATTENUATION: light.linearAttenuation = param; break;
-                case GL_QUADRATIC_ATTENUATION: light.quadraticAttenuation = param; break;
-            }
-            return 0;
-        },
+        glMaterialf: (_c, _m, args) => materialCall(args, false, false),
+        glMaterialfv: (_c, _m, args) => materialCall(args, false, true),
+        glMateriali: (_c, _m, args) => materialCall(args, true, false),
+        glMaterialiv: (_c, _m, args) => materialCall(args, true, true),
 
-        glLightiv: (_c, _m, args) => {
-            const lightIdx = (args[0] >>> 0) - GL_LIGHT0;
-            if (lightIdx < 0 || lightIdx >= 8) return 0;
-            const light = ctx.lights[lightIdx];
-            const pname = args[1] >>> 0;
-            const ptr = args[2] >>> 0;
-            const mem = getMem();
-            switch (pname) {
-                case GL_AMBIENT:
-                case GL_DIFFUSE:
-                case GL_SPECULAR:
-                case GL_POSITION: {
-                    const target = pname === GL_AMBIENT ? light.ambient
-                        : pname === GL_DIFFUSE ? light.diffuse
-                        : pname === GL_SPECULAR ? light.specular
-                        : light.position;
-                    for (let i = 0; i < 4; i++) {
-                        target[i] = (readU32(mem, ptr + i * 4) | 0) / 2147483647;
-                    }
-                    break;
-                }
-                case GL_SPOT_DIRECTION: {
-                    for (let i = 0; i < 3; i++) {
-                        light.spotDirection[i] = (readU32(mem, ptr + i * 4) | 0) / 2147483647;
-                    }
-                    break;
-                }
-                case GL_SPOT_EXPONENT: light.spotExponent = readU32(mem, ptr) | 0; break;
-                case GL_SPOT_CUTOFF: light.spotCutoff = readU32(mem, ptr) | 0; break;
-                case GL_CONSTANT_ATTENUATION: light.constantAttenuation = readU32(mem, ptr) | 0; break;
-                case GL_LINEAR_ATTENUATION: light.linearAttenuation = readU32(mem, ptr) | 0; break;
-                case GL_QUADRATIC_ATTENUATION: light.quadraticAttenuation = readU32(mem, ptr) | 0; break;
-            }
-            return 0;
-        },
-
-        // Light model
-        glLightModelf: (_c, _m, args) => {
-            const pname = args[0] >>> 0;
-            const param = bitsToF32(args[1]);
-            if (pname === GL_LIGHT_MODEL_TWO_SIDE || pname === GL_LIGHT_MODEL_LOCAL_VIEWER || pname === GL_LIGHT_MODEL_COLOR_CONTROL) {
-                ctx.hints.set(pname, param | 0);
-            }
-            return 0;
-        },
-
-        glLightModelfv: (_c, _m, args) => {
-            const pname = args[0] >>> 0;
-            const ptr = args[1] >>> 0;
-            const mem = getMem();
-            switch (pname) {
-                case GL_LIGHT_MODEL_AMBIENT: readF32x4(mem, ptr, ctx.lightModelAmbient); break;
-                case GL_LIGHT_MODEL_TWO_SIDE:
-                case GL_LIGHT_MODEL_LOCAL_VIEWER:
-                case GL_LIGHT_MODEL_COLOR_CONTROL:
-                    ctx.hints.set(pname, readF32(mem, ptr) | 0);
-                    break;
-            }
-            return 0;
-        },
-
-        glLightModeli: (_c, _m, args) => {
-            const pname = args[0] >>> 0;
-            const param = args[1] | 0;
-            if (pname === GL_LIGHT_MODEL_TWO_SIDE || pname === GL_LIGHT_MODEL_LOCAL_VIEWER || pname === GL_LIGHT_MODEL_COLOR_CONTROL) {
-                ctx.hints.set(pname, param);
-            }
-            return 0;
-        },
-
-        glLightModeliv: (_c, _m, args) => {
-            const pname = args[0] >>> 0;
-            const ptr = args[1] >>> 0;
-            const mem = getMem();
-            switch (pname) {
-                case GL_LIGHT_MODEL_AMBIENT: {
-                    for (let i = 0; i < 4; i++) {
-                        ctx.lightModelAmbient[i] = (readU32(mem, ptr + i * 4) | 0) / 2147483647;
-                    }
-                    break;
-                }
-                case GL_LIGHT_MODEL_TWO_SIDE:
-                case GL_LIGHT_MODEL_LOCAL_VIEWER:
-                case GL_LIGHT_MODEL_COLOR_CONTROL:
-                    ctx.hints.set(pname, readU32(mem, ptr) | 0);
-                    break;
-            }
-            return 0;
-        },
-
-        // Material
-        glMaterialf: (_c, _m, args) => {
-            const pname = args[1] >>> 0;
-            if (pname === GL_SHININESS) ctx.materialFrontShininess = bitsToF32(args[2]);
-            return 0;
-        },
-
-        glMaterialfv: (_c, _m, args) => {
-            const pname = args[1] >>> 0;
-            const ptr = args[2] >>> 0;
-            const mem = getMem();
-            switch (pname) {
-                case GL_AMBIENT: readF32x4(mem, ptr, ctx.materialFrontAmbient); break;
-                case GL_DIFFUSE: readF32x4(mem, ptr, ctx.materialFrontDiffuse); break;
-                case GL_SPECULAR: readF32x4(mem, ptr, ctx.materialFrontSpecular); break;
-                case GL_EMISSION: readF32x4(mem, ptr, ctx.materialFrontEmission); break;
-                case GL_SHININESS: ctx.materialFrontShininess = readF32(mem, ptr); break;
-                case GL_AMBIENT_AND_DIFFUSE:
-                    readF32x4(mem, ptr, ctx.materialFrontAmbient);
-                    ctx.materialFrontDiffuse.set(ctx.materialFrontAmbient);
-                    break;
-            }
-            return 0;
-        },
-
-        glMateriali: (_c, _m, args) => {
-            const pname = args[1] >>> 0;
-            if (pname === GL_SHININESS) ctx.materialFrontShininess = args[2] | 0;
-            return 0;
-        },
-
-        glMaterialiv: (_c, _m, args) => {
-            const pname = args[1] >>> 0;
-            const ptr = args[2] >>> 0;
-            const mem = getMem();
-            switch (pname) {
-                case GL_AMBIENT:
-                case GL_DIFFUSE:
-                case GL_SPECULAR:
-                case GL_EMISSION: {
-                    const target = pname === GL_AMBIENT ? ctx.materialFrontAmbient
-                        : pname === GL_DIFFUSE ? ctx.materialFrontDiffuse
-                        : pname === GL_SPECULAR ? ctx.materialFrontSpecular
-                        : ctx.materialFrontEmission;
-                    for (let i = 0; i < 4; i++) {
-                        target[i] = (readU32(mem, ptr + i * 4) | 0) / 2147483647;
-                    }
-                    break;
-                }
-                case GL_SHININESS:
-                    ctx.materialFrontShininess = readU32(mem, ptr) | 0;
-                    break;
-                case GL_AMBIENT_AND_DIFFUSE: {
-                    for (let i = 0; i < 4; i++) {
-                        const v = (readU32(mem, ptr + i * 4) | 0) / 2147483647;
-                        ctx.materialFrontAmbient[i] = v;
-                        ctx.materialFrontDiffuse[i] = v;
-                    }
-                    break;
-                }
-            }
-            return 0;
-        },
-
-        // Color material
         glColorMaterial: (_c, _m, args) => {
-            ctx.colorMaterialFace = args[0] >>> 0;
-            ctx.colorMaterialParam = args[1] >>> 0;
+            if (!outsidePrimitive()) return 0;
+            const face = args[0] >>> 0;
+            const param = args[1] >>> 0;
+            if ((face !== GL_FRONT && face !== GL_BACK && face !== GL_FRONT_AND_BACK)
+                || (param !== GL_AMBIENT && param !== GL_DIFFUSE && param !== GL_SPECULAR
+                    && param !== GL_EMISSION && param !== GL_AMBIENT_AND_DIFFUSE)) {
+                ctx.error = GL_INVALID_ENUM;
+                return 0;
+            }
+            ctx.colorMaterialFace = face;
+            ctx.colorMaterialParam = param;
+            applyColorMaterial(ctx);
             return 0;
         },
 
@@ -1024,6 +982,7 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
                 vertData[b+4]  = 1;     vertData[b+5]  = 1;     vertData[b+6]  = 1;  vertData[b+7]  = 1;
                 vertData[b+8]  = 0;     vertData[b+9]  = 0;     vertData[b+10] = 1;
                 vertData[b+11] = qv[2]; vertData[b+12] = qv[3]; vertData[b+13] = 0;  vertData[b+14] = 0;
+                vertData[b+15] = 0; vertData[b+16] = 0; vertData[b+17] = 0;
             }
 
             // Depth/alpha/stencil test and culling stay OFF for the raster quad, so

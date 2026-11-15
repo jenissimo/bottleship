@@ -248,6 +248,7 @@ describe("flat gather", () => {
             0.25, 0.5, 0.75, 1,
             0, 0, 1,
             0, 0, 0, 0,
+            0, 0, 0, // secondary color is neutral before lighting
         ]);
     });
 

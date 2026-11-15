@@ -24,12 +24,12 @@
  * to unsigned integer" — a >2GB Buffer length overflow).
  */
 
-import { openSync, readSync, writeSync, closeSync, fstatSync, renameSync, unlinkSync, readdirSync, mkdirSync } from "fs";
+import { openSync, readSync, writeSync, closeSync, fstatSync, statSync, renameSync, unlinkSync, readdirSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { inflateRawSync } from "zlib";
 import { tryResolveArchiveExtractPath } from "./internal/archive-extract-path";
 import {
-    crc32, lfhFor, cdhFor, type OutEntry,
+    crc32, crc32Update, crc32Final, lfhFor, cdhFor, type OutEntry,
     LFH_SIG, CDH_SIG, EOCD_SIG, EOCD64_SIG, EOCD64_LOC_SIG, U32_MAX, U16_MAX, COPY_CHUNK,
 } from "./internal/zip-store-writer";
 
@@ -176,9 +176,27 @@ function streamStoreData(fd: number, e: ZipEntry, sink: (chunk: Buffer) => void)
     }
 }
 
+type OverrideData = Buffer | { path: string };
+
+/** Read a local file with bounded memory; two passes permit a Store header without a descriptor. */
+function streamLocalFile(fd: number, size: number, path: string, sink: (chunk: Buffer) => void): number {
+    const buf = Buffer.allocUnsafe(Math.min(COPY_CHUNK, Math.max(size, 1)));
+    let crc = 0xffffffff;
+    for (let at = 0; at < size;) {
+        const n = readSync(fd, buf, 0, Math.min(buf.length, size - at), at);
+        if (n <= 0) throw new Error(`${path}: short read at ${at}/${size}`);
+        const chunk = buf.subarray(0, n);
+        crc = crc32Update(chunk, crc);
+        sink(chunk);
+        at += n;
+    }
+    if (fstatSync(fd).size !== size) throw new Error(`${path}: size changed while reading`);
+    return crc32Final(crc);
+}
+
 /**
  * Rebuild the archive as Store-only, streaming to a temp file then renaming over the source.
- * `dataFor(name)` returns an override Buffer for an entry, or null to copy the existing data.
+ * `dataFor(name)` returns override bytes/a local path, or null to copy the existing data.
  * Entries are taken from `srcEntries` (order preserved); any extra entries in `extraEntries`
  * (name → data) are appended.
  */
@@ -186,24 +204,39 @@ function rebuildStreaming(
     srcFd: number,
     srcEntries: ZipEntry[],
     outPath: string,
-    dataFor: (name: string) => Buffer | null,
-    extraEntries: { name: string; data: Buffer }[] = [],
+    dataFor: (name: string) => OverrideData | null,
+    extraEntries: { name: string; data: OverrideData }[] = [],
 ): { bytes: number; entries: number } {
-    const outFd = openSync(outPath, "w");
+    // Never truncate a pre-existing temp: it may itself be a local replacement input.
+    const outFd = openSync(outPath, "wx");
+    let completed = false;
     try {
         const cd: OutEntry[] = [];
         let offset = 0;
         const writeAt = (b: Buffer) => { writeSync(outFd, b, 0, b.length); offset += b.length; };
 
-        const emit = (name: string, getData: () => Buffer | null, copyFrom: ZipEntry | null) => {
+        const emit = (name: string, getData: () => OverrideData | null, copyFrom: ZipEntry | null) => {
             const nameBuf = Buffer.from(name, "utf8");
             const override = getData();
             const entryOffset = offset;
-            if (override) {
+            if (Buffer.isBuffer(override)) {
                 const crc = crc32(override);
                 writeAt(lfhFor(nameBuf, override.length, crc));
                 writeSync(outFd, override, 0, override.length); offset += override.length;
                 cd.push({ nameBuf, size: override.length, crc, offset: entryOffset });
+            } else if (override) {
+                const fd = openSync(override.path, "r");
+                try {
+                    const size = fstatSync(fd).size;
+                    const crc = streamLocalFile(fd, size, override.path, () => {});
+                    writeAt(lfhFor(nameBuf, size, crc));
+                    const copiedCrc = streamLocalFile(fd, size, override.path, chunk => {
+                        writeSync(outFd, chunk, 0, chunk.length);
+                        offset += chunk.length;
+                    });
+                    if (copiedCrc !== crc) throw new Error(`${override.path}: content changed while packing`);
+                    cd.push({ nameBuf, size, crc, offset: entryOffset });
+                } finally { closeSync(fd); }
             } else if (copyFrom) {
                 // Copy the existing Store entry verbatim (reuse its CRC; stream the data).
                 writeAt(lfhFor(nameBuf, copyFrom.size, copyFrom.crc, copyFrom.dosStamp));
@@ -251,9 +284,11 @@ function rebuildStreaming(
         eocd.writeUInt32LE(cdOffset > U32_MAX ? U32_MAX : cdOffset, 16);
         writeAt(eocd);
 
+        completed = true;
         return { bytes: offset, entries: cd.length };
     } finally {
         closeSync(outFd);
+        if (!completed) { try { unlinkSync(outPath); } catch { /* original archive remains untouched */ } }
     }
 }
 
@@ -354,8 +389,9 @@ function cmdExtractDir(wgbPath: string, prefix: string, outDir: string) {
 }
 
 /** Rebuild `wgbPath` with `entryName` replaced/added by `newData`, streaming via a temp file. */
-function writeOverride(wgbPath: string, entryName: string, newData: Buffer, outputPath?: string, label = "Replaced") {
+function writeOverride(wgbPath: string, entryName: string, newData: OverrideData, outputPath?: string, label = "Replaced") {
     const dest = outputPath ?? wgbPath;
+    const bytes = Buffer.isBuffer(newData) ? newData.length : statSync(newData.path).size;
     const tmp = `${dest}.wgbtmp`;
     const result = withArchive(wgbPath, (fd, _size, entries) => {
         const target = findEntry(entries, entryName);
@@ -363,14 +399,11 @@ function writeOverride(wgbPath: string, entryName: string, newData: Buffer, outp
         return rebuildStreaming(fd, entries, tmp, (n) => (target && n === target.name ? newData : null), extra);
     });
     renameSync(tmp, dest);
-    console.log(`${label} ${entryName} (${newData.length} bytes) -> ${dest} [${result.entries} entries, ${result.bytes} bytes]`);
+    console.log(`${label} ${entryName} (${bytes} bytes) -> ${dest} [${result.entries} entries, ${result.bytes} bytes]`);
 }
 
 function cmdReplace(wgbPath: string, entryName: string, inputPath: string, outputPath?: string) {
-    const ifd = openSync(inputPath, "r");
-    let newData: Buffer;
-    try { newData = readRange(ifd, 0, fstatSync(ifd).size); } finally { closeSync(ifd); }
-    writeOverride(wgbPath, entryName, newData, outputPath);
+    writeOverride(wgbPath, entryName, { path: inputPath }, outputPath);
 }
 
 /**
@@ -381,15 +414,13 @@ function cmdReplace(wgbPath: string, entryName: string, inputPath: string, outpu
  */
 function cmdAddDir(wgbPath: string, entryPrefix: string, localDir: string) {
     const prefix = entryPrefix.replace(/[/]+$/, "");
-    const files: { name: string; data: Buffer }[] = [];
+    const files: { name: string; path: string; size: number }[] = [];
     const walk = (dir: string, rel: string) => {
         for (const de of readdirSync(dir, { withFileTypes: true })) {
             const child = `${dir}/${de.name}`;
             const childRel = rel ? `${rel}/${de.name}` : de.name;
             if (de.isDirectory()) { walk(child, childRel); continue; }
-            const fd = openSync(child, "r");
-            try { files.push({ name: `${prefix}/${childRel}`, data: readRange(fd, 0, fstatSync(fd).size) }); }
-            finally { closeSync(fd); }
+            files.push({ name: `${prefix}/${childRel}`, path: child, size: statSync(child).size });
         }
     };
     walk(localDir, "");
@@ -398,13 +429,13 @@ function cmdAddDir(wgbPath: string, entryPrefix: string, localDir: string) {
     const tmp = `${wgbPath}.wgbtmp`;
     const result = withArchive(wgbPath, (fd, _size, entries) => {
         const key = (name: string) => name.replace(/\\/g, "/").toLowerCase();
-        const byName = new Map(files.map(f => [key(f.name), f.data]));
+        const byName = new Map(files.map(f => [key(f.name), { path: f.path }]));
         const existing = new Set(entries.map(e => key(e.name)));
-        const extra = files.filter(f => !existing.has(key(f.name)));
+        const extra = files.filter(f => !existing.has(key(f.name))).map(f => ({ name: f.name, data: { path: f.path } }));
         return rebuildStreaming(fd, entries, tmp, (n) => byName.get(key(n)) ?? null, extra);
     });
     renameSync(tmp, wgbPath);
-    const bytes = files.reduce((n, f) => n + f.data.length, 0);
+    const bytes = files.reduce((n, f) => n + f.size, 0);
     console.log(`Added ${files.length} file(s) under ${prefix}/ (${bytes} bytes) -> ${wgbPath} [${result.entries} entries, ${result.bytes} bytes]`);
 }
 
@@ -449,7 +480,7 @@ function cmdRepack(wgbPath: string) {
         return;
     } catch (e) {
         closeSync(fd);
-        try { unlinkSync(tmp); } catch { /* ignore */ }
+        // rebuildStreaming removes only the temp it created; an existing temp belongs to its owner.
         throw e;
     }
 }

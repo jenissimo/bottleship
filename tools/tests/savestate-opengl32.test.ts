@@ -7,7 +7,7 @@ import { Glu32 } from "../../src/worker/modules/glu32";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { System } from "../../src/worker/core/system";
 import { OpenGLBackendExecutor } from "../../src/worker/backends/webgpu/opengl/opengl-backend-executor";
-import { createOpenGLContext, type OpenGLContext } from "../../src/worker/modules/opengl32/context";
+import { createOpenGLContext, VERT_FLOATS, type OpenGLContext } from "../../src/worker/modules/opengl32/context";
 import { createCvaState } from "../../src/worker/modules/opengl32/client-arrays";
 import { createWglState } from "../../src/worker/modules/opengl32/wgl";
 import {
@@ -423,9 +423,88 @@ describe("opengl32 savestate participant", () => {
         expect(b.ctx.executor).toBeNull();
     });
 
-    test("the schema is version 1 with a pinned hash", () => {
+    test("eye-space lights, back materials and color-material tracking survive restore", () => {
+        const a = makeRig();
+        const put = (values: number[]) => {
+            const dv = new DataView(a.mem.buffer);
+            values.forEach((v, i) => dv.setFloat32(0x500 + i * 4, v, true));
+            return 0x500;
+        };
+        a.call("glTranslatef", bits(10), bits(20), bits(30));
+        a.call("glLightfv", GL_LIGHT0, 0x1203, put([1,2,3,1]));
+        a.call("glLoadIdentity");
+        a.call("glMaterialfv", 0x0405, 0x1200, put([0.25,0.5,0.75,1]));
+        a.call("glMaterialfv", 0x0405, 0x1201, put([0.5,0.25,0.75,0.5]));
+        a.call("glMaterialfv", 0x0405, 0x1202, put([1,0.5,0.25,1]));
+        a.call("glMaterialf", 0x0405, 0x1601, bits(42));
+        a.call("glLightModeli", 0x0B51, 1);
+        a.call("glLightModeli", 0x0B52, 1);
+        a.call("glLightModeli", 0x81F8, 0x81FA);
+        a.call("glColorMaterial", 0x0405, 0x1600);
+        a.call("glColor4f", bits(0.5), bits(0.25), bits(1), bits(0.75));
+        a.call("glEnable", 0x0B57);
+        const { saved, graph } = capture(a);
+        const b = makeRig(a.mem);
+        restoreInto(b, saved, graph);
+        expect([...b.ctx.lights[0]!.position]).toEqual([11,22,33,1]);
+        for (const key of ["materialBackAmbient","materialBackDiffuse","materialBackSpecular","materialBackEmission"] as const) {
+            expect([...b.ctx[key]]).toEqual([...a.ctx[key]]);
+            expect(b.ctx[key]).not.toBe(a.ctx[key]);
+        }
+        expect(b.ctx.materialBackShininess).toBe(42);
+        expect(b.ctx.hints.get(0x0B51)).toBe(1);
+        expect(b.ctx.hints.get(0x0B52)).toBe(1);
+        expect(b.ctx.hints.get(0x81F8)).toBe(0x81FA);
+        b.call("glColor4f", bits(0.25), bits(0.75), bits(0.5), bits(1));
+        expect([...b.ctx.materialBackEmission]).toEqual([0.25,0.75,0.5,1]);
+        expect([...a.ctx.materialBackEmission]).toEqual([0.5,0.25,1,0.75]);
+    });
+
+    test("a mid-primitive restore retains the material used by every earlier vertex", () => {
+        const a = makeRig();
+        const put = (values: number[]) => {
+            const dv = new DataView(a.mem.buffer);
+            values.forEach((v, i) => dv.setFloat32(0x500 + i * 4, v, true));
+            return 0x500;
+        };
+        a.call("glEnable", 0x0B50);
+        a.call("glLightModelfv", 0x0B53, put([0,0,0,1]));
+        a.call("glMaterialfv", 0x0404, 0x1600, put([1,0,0,1]));
+        a.call("glBegin", 0); // points always use front material
+        a.call("glVertex3f", bits(0), bits(0), bits(0));
+        a.call("glMaterialfv", 0x0404, 0x1600, put([0,1,0,1]));
+        a.call("glVertex3f", bits(0.25), bits(0), bits(0));
+        const { saved, graph } = capture(a);
+        const b = makeRig(a.mem);
+        restoreInto(b, saved, graph);
+        for (const r of [a,b]) {
+            const dv = new DataView(r.mem.buffer);
+            [0,0,1,1].forEach((v,i) => dv.setFloat32(0x500+i*4,v,true));
+            r.call("glMaterialfv", 0x0404, 0x1600, 0x500);
+            r.call("glVertex3f", bits(0.5), bits(0), bits(0));
+            r.call("glEnd");
+            const colors = [0,1,2].map(i => [...r.ctx.vertArena.data.subarray(i*VERT_FLOATS+4,i*VERT_FLOATS+8)]);
+            expect(colors).toEqual([[1,0,0,1],[0,1,0,1],[0,0,1,1]]);
+        }
+        expect([...b.ctx.vertArena.data.subarray(0,b.ctx.vertArena.used)])
+            .toEqual([...a.ctx.vertArena.data.subarray(0,a.ctx.vertArena.used)]);
+    });
+
+    test("module reset clears the saved immediate material history", () => {
         const r = makeRig();
-        expect(r.participant.version).toBe(1);
-        expect(savestateParticipants.schemas().opengl32).toEqual({ version: 1, schemaHash: "3e23da0754ccd8ed" });
+        r.call("glEnable", 0x0B50);
+        r.call("glBegin", 0);
+        r.call("glVertex3f", bits(0), bits(0), bits(0));
+        r.call("glMaterialf", 0x0404, 0x1601, bits(16));
+        expect(capture(r).saved).toHaveProperty("immediateMaterials.index", 1);
+        r.gl.reset();
+        expect(r.ctx.immediateMode).toBe(false);
+        expect(capture(r).saved).toHaveProperty("immediateMaterials", null);
+    });
+
+    test("the schema is version 2 with a pinned hash", () => {
+        const r = makeRig();
+        expect(r.participant.version).toBe(2);
+        expect(savestateParticipants.schemas().opengl32).toEqual({ version: 2, schemaHash: "54a63b7e2eef5cb6" });
     });
 });

@@ -16,13 +16,52 @@ import { createListExports } from "./lists";
 import { createArrayExports } from "./arrays";
 import { createMultitextureExports } from "./multitexture";
 import { registerWriteBufferGLStateFunctions } from "./wbuf-state";
-import { GL_COMPILE } from "./constants";
+import { GL_COMPILE, GL_TEXTURE0 } from "./constants";
+import { resetImmediateMaterials } from "./lighting";
 import { savestateParticipants, savestatesEnabled } from "../../savestate/participant";
 import type { SaveValue } from "../../savestate/value-codec";
 import {
     OPENGL32_SCHEMA, captureOpenGL, createRestoreDebt, prepareOpenGL, restoreOpenGL, settleRestoreDebt,
     type OpenGLSavedState,
 } from "./savestate";
+
+/**
+ * A display list owns vector attribute values from the compilation call, not
+ * the guest address. Canonical scalar commands retain that ownership on raw
+ * replay as well as on the prebaked path.
+ */
+function snapshotAttributeVector(name: string, args: number[], ctx: OpenGLContext): { fn: string; args: number[] } | null {
+    const match = /^gl(Vertex|Normal|Color|TexCoord|MultiTexCoord)([1-4])(ub|ui|us|b|s|i|f|d)v(ARB)?$/.exec(name);
+    if (!match) return null;
+    const family = match[1], count = Number(match[2]), type = match[3];
+    const multi = family === "MultiTexCoord";
+    // Other MultiTexCoord vector exports are stubs; do not turn them into
+    // working scalar calls or read an address the original stub never used.
+    if (multi && (type !== "f" || (count !== 2 && count !== 4))) return null;
+    const unit = (args[0] >>> 0) - GL_TEXTURE0;
+    if (multi && (unit < 0 || unit >= ctx.currentTexCoord.length)) return null;
+    const memory = ctx.process.getCurrentMemory();
+    const ptr = args[multi ? 1 : 0] >>> 0;
+    const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
+    const values: number[] = multi ? [args[0]] : [];
+    const size = type === "d" ? 8 : type === "f" || type === "i" || type === "ui" ? 4
+        : type === "s" || type === "us" ? 2 : 1;
+    for (let i = 0; i < count; i++) {
+        const offset = ptr + i * size;
+        switch (type) {
+            // Scalar float thunks consume IEEE bits; doubles consume JS numbers.
+            case "f": values.push(view.getUint32(offset, true)); break;
+            case "d": values.push(view.getFloat64(offset, true)); break;
+            case "i": values.push(view.getInt32(offset, true)); break;
+            case "ui": values.push(view.getUint32(offset, true)); break;
+            case "s": values.push(view.getInt16(offset, true)); break;
+            case "us": values.push(view.getUint16(offset, true)); break;
+            case "b": values.push(view.getInt8(offset)); break;
+            case "ub": values.push(view.getUint8(offset)); break;
+        }
+    }
+    return { fn: name.replace(/v(ARB)?$/, "$1"), args: values };
+}
 
 export class OpenGL32 implements IModule {
     name = "opengl32";
@@ -33,7 +72,7 @@ export class OpenGL32 implements IModule {
 
     registerSavestate(): () => void {
         return savestateParticipants.add({
-            id: 'opengl32', version: 1, order: 59, covers: ['opengl32', 'glu32'], schema: OPENGL32_SCHEMA as unknown as SaveValue,
+            id: 'opengl32', version: 2, order: 59, covers: ['opengl32', 'glu32'], schema: OPENGL32_SCHEMA as unknown as SaveValue,
             prepare: () => prepareOpenGL(this.context),
             capture: (io) => {
                 if (!this.context) throw new Error("opengl32: the module is not initialized");
@@ -87,8 +126,8 @@ export class OpenGL32 implements IModule {
                 }
 
                 if (ctx.compilingList !== null) {
-                    const recordedArgs = Array.isArray(args) ? [...args] : [];
-                    ctx.compilingCommands.push({ fn: name, args: recordedArgs });
+                    const snapshot = snapshotAttributeVector(name, args, ctx);
+                    ctx.compilingCommands.push(snapshot ?? { fn: name, args: [...args] });
 
                     // GL_COMPILE: record only, no execution side effects.
                     if (ctx.compilingListMode === GL_COMPILE) {
@@ -135,7 +174,10 @@ export class OpenGL32 implements IModule {
     }
 
     reset(): void {
-        if (this.context) resetOpenGLContext(this.context);
+        if (this.context) {
+            resetOpenGLContext(this.context);
+            resetImmediateMaterials(this.context);
+        }
         this.restoreDebt = createRestoreDebt();
     }
 }
