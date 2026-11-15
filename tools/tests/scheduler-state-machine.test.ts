@@ -32,6 +32,7 @@ import {
     type V86Cpu,
 } from "../../src/worker/core/scheduler/types";
 import { TimerWheel } from "../../src/worker/core/scheduler/timer-wheel";
+import { TimeService } from "../../src/worker/runtime/time";
 import {
     saveCpuContext,
     createInitialContext,
@@ -2176,12 +2177,44 @@ describe("scheduler/waitForSingleObjectWithContext — blocked with runnable pee
         const wheel = (s as any).timerWheel as TimerWheel;
         const now = (s as any).timeService.nowMs();
         expect(wheel.nextFireIn(now)).toBeGreaterThan(95);
-        expect(wheel.nextFireIn(now)).toBeLessThanOrEqual(100);
+        // (t0 + 100) - now rounds a few ULPs above 100 for some t0 when the clock has not
+        // moved; Number.EPSILON would round back to 100, so the tolerance is 1e-9 ms.
+        expect(wheel.nextFireIn(now)).toBeLessThanOrEqual(100 + 1e-9);
 
         // Parked with nobody READY/RUNNING ⇒ pollTimeouts' idle pump owns the clock and
         // paces the wait in wall time. Without this the park would freeze virtual time
         // and the deadline could never come due.
         expect((s as any).shouldPumpIdleVirtualTime()).toBe(true);
+    });
+
+    test("on a clock that does not move, a t0 where (t0 + 100) - t0 rounds above 100 still parks for the whole timeout", () => {
+        const T0 = 928.4724737459227;
+        expect((T0 + 100) - T0).toBeGreaterThan(100);
+        const ts = TimeService.getInstance();
+        const mode = ts.getMode();
+        ts.setMode("manual", T0);
+        try {
+            const s = new Scheduler();
+            const t1 = mkBlockableCurrent(s, 1);
+            const sem = s.createSemaphore(0, 1);
+            const ret = s.waitForSingleObjectWithContext(
+                sem,
+                100,
+                0x401000,
+                0x10ffa00,
+                { ecx: 0, edx: 0, ebx: 0, ebp: 0, esi: 0, edi: 0, eflags: 0x202 },
+            );
+            expect(ret).toBe(WAIT_BLOCKED_NO_SWITCH);
+            expect(t1.state).toBe(ThreadState.WAITING);
+            const wheel = (s as any).timerWheel as TimerWheel;
+            const now = (s as any).timeService.nowMs();
+            expect(now).toBe(T0);
+            const fireIn = wheel.nextFireIn(now);
+            expect(fireIn).toBeGreaterThan(100);
+            expect(fireIn).toBeLessThanOrEqual(100 + 1e-9);
+        } finally {
+            ts.setMode(mode);
+        }
     });
 });
 
