@@ -70,10 +70,22 @@ The CLI uses the project's built-in parser by default:
 
 ```sh
 bun tools/gog-to-wgb.ts setup_game.exe game.wgb
-bun tools/gog-to-wgb.ts --extract-only setup_game.exe ./out-dir
+bun tools/gog-to-wgb.ts setup_game.exe unused.wgb --extract-only --extract-dir ./out-dir
 ```
 
-Place matching `.bin` files alongside the EXE for multipart CLI inputs. The CLI has its own
-packing path; the browser's OPFS memory guarantees do not describe CLI heap usage.
+Place matching `.bin` files alongside the EXE for multipart CLI inputs. In addition to
+standard Inno slices, the CLI recognizes older GOG installers whose numbered BIN files
+are independent RAR4 archives containing `game/` and `support/app/` trees. It merges the
+install staging files into the game directory, preserves empty directories, and uses the
+installer metadata for the entrypoint and registry. It does not execute installer code.
+True split RAR volumes, encryption, missing numbered parts and ambiguous destinations
+are rejected. This RAR path is a CLI capability; it does not add browser importer support.
+
+The CLI reads installer payloads by range, extracts to a disk workspace, and writes a
+store-only ZIP64 WGB in chunks. Use `--extract-dir <new-directory>` to keep that workspace
+on a drive with enough space. The RAR path verifies CRC before publishing each group and
+retains at most one decoded solid group, with a 1 GiB output limit; it does not yet stream
+inside that group. Decoder dictionaries and small metadata still occupy memory.
+
 Curated emulator settings live in `public/gog-overrides.json`, keyed by the product ID from
 `goggame-*.info`.

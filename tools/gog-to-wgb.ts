@@ -1,41 +1,31 @@
 #!/usr/bin/env bun
 /**
- * gog-to-wgb: Extract a GOG Inno Setup installer and pack it as a .wgb bundle.
+ * gog-to-wgb: Extract GOG Inno installers or old Inno + numbered independent RAR payloads.
  *
  * Usage:
  *   bun tools/gog-to-wgb.ts <gog-installer.exe> <output.wgb> [options]
  *
- * Options:
- *   --native              Deprecated no-op alias (native WASM is now the default)
- *   --extract-only        Extract + filter only, don't pack
- *   ... see --help
+ * --extract-dir <new-dir> stages files on the selected disk (kept when explicitly set).
+ * --extract-only writes files and lists paths without packing or reloading payload bytes.
+ * --keep-gog retains GOG support metadata in the final bundle.
+ * --name/--exe/--args/--width/--height/--bpp/--ram/--os override synthesized settings.
+ * --reg-path/--reg-hive/--reg-install override the installer registry seed.
+ * --language selects an installer locale; --skip-video is opt-in.
+ * --native is a deprecated no-op: the project's WASM parser is always used.
+ * EXE/BIN reads are ranged; extraction and ZIP packing are disk-backed.
+ * RAR decoding still buffers one verified member/solid group (GOG limit: 1 GiB).
  */
-
-import {
-    writeFileSync, readdirSync, statSync, readFileSync, existsSync,
-    mkdirSync, rmSync, openSync, writeSync, closeSync,
-} from "fs";
-import { join, basename, extname, dirname } from "path";
-import { tmpdir } from "os";
+import { readdirSync, statSync, readFileSync, existsSync, mkdirSync, rmSync, openSync, writeSync, closeSync } from "fs";
+import { join, basename, extname, dirname, resolve } from "path";
 import { randomBytes } from "crypto";
-import {
-    BufferSource,
-    extractInno,
-    parseInnoHeader,
-    parseSliceSource,
-    MultiSliceReader,
-    type SliceData,
-    type SliceSource,
-    type InnoParseResult,
-} from "@bottleship/formats/inno";
+import { extractInno, parseInnoHeader, parseSliceSource, MultiSliceReader, detectInstallerLanguages, defaultLanguage,
+    type SliceData, type SliceSource, type InnoParseResult } from "@bottleship/formats/inno";
 import { UnpackDecoder } from "@bottleship/formats/unpack";
 import { FileSource } from "./internal/file-source";
+import { createInnoAssemblyStore } from "./internal/inno-assembly-store";
 import { resolveArchiveExtractPath } from "./internal/archive-extract-path";
-import { isGogJunk, SKIP_DIRS, detectExeFromPaths } from "@bottleship/repack/gog-filter";
-import { buildZip } from "@bottleship/formats/wgb/zip-build";
-import { OS_PRESETS } from "@bottleship/repack/manifest-synth";
-import { installerBytesToWgb } from "@bottleship/repack/installer-to-wgb";
-import { isValidGameId, deriveGameId, KNOWN_GAME_ID_SCHEMES } from "@bottleship/formats/wgb/container-id";
+import { collectGamePaths, discoverGogRarParts, planGogRarLayout, installGogRar, synthesizeInstalledGog, packInstalledGog } from "./internal/gog-rar";
+import { isGogJunk, detectExeFromPaths } from "@bottleship/repack/gog-filter";
 
 const isTTY = process.stdout.isTTY;
 
@@ -109,7 +99,9 @@ function readGogMetadataFromDir(appDir: string) {
     try {
         for (const entry of readdirSync(appDir)) {
             if (/^goggame-.*\.(info|script)$/i.test(entry)) {
-                const raw = readFileSync(join(appDir, entry), "utf8");
+                const metadataPath = join(appDir, entry);
+                if (statSync(metadataPath).size > 1024 * 1024) throw new Error("Oversized GOG installer metadata");
+                const raw = readFileSync(metadataPath, "utf8");
                 const parsed = JSON.parse(raw);
                 if (parsed && typeof parsed === "object") {
                     return { name: parsed.name ?? parsed.gameTitle, gameId: parsed.gameId };
@@ -120,34 +112,6 @@ function readGogMetadataFromDir(appDir: string) {
     return {};
 }
 
-function collectGameFiles(
-    dir: string,
-    prefix: string,
-    out: Map<string, Buffer>,
-    filterGog: boolean,
-    onFile?: (count: number, bytes: number, name: string) => void,
-) {
-    for (const entry of readdirSync(dir)) {
-        const full = join(dir, entry);
-        const relName = prefix + entry;
-        if (statSync(full).isDirectory()) {
-            if (filterGog && SKIP_DIRS.has(entry.toLowerCase())) continue;
-            collectGameFiles(full, relName + "/", out, filterGog, onFile);
-        } else {
-            if (filterGog && isGogJunk(relName)) continue;
-            const data = readFileSync(full);
-            out.set(relName, data);
-            let totalBytes = 0;
-            for (const b of out.values()) totalBytes += b.length;
-            onFile?.(out.size, totalBytes, relName);
-        }
-    }
-}
-
-/**
- * A multi-part installer keeps its payload in sibling `setup-*.bin` slices (header dataOffset === 0).
- * Both extraction paths need the same ordering, so gather them once.
- */
 function gatherSlices(installerPath: string, parsed: InnoParseResult): SliceSource | undefined {
     if (parsed.offsets.dataOffset) return undefined;
     const dir = dirname(installerPath);
@@ -172,233 +136,100 @@ function gatherSlices(installerPath: string, parsed: InnoParseResult): SliceSour
     return new MultiSliceReader(slices);
 }
 
-async function extractNative(
-    installerPath: string, outDir: string, keepGog: boolean, language?: string,
-): Promise<string> {
-    const data = new Uint8Array(readFileSync(installerPath));
-    const wasmPath = join(import.meta.dir, "../public/unpack-streaming.wasm");
-    const wasmBytes = readFileSync(wasmPath);
-    const lzma = new UnpackDecoder();
-    await lzma.init(wasmBytes.buffer.slice(wasmBytes.byteOffset, wasmBytes.byteOffset + wasmBytes.byteLength));
 
-    const source = new BufferSource(data);
-    const parsed = await parseInnoHeader(source, lzma);
-    const sliceSource = gatherSlices(installerPath, parsed);
-
+async function extractNative(source: FileSource, parsed: InnoParseResult, codec: UnpackDecoder,
+    sliceSource: SliceSource | undefined, outDir: string, keepGog: boolean, language?: string): Promise<string> {
     const appDir = join(outDir, "app");
     mkdirSync(appDir, { recursive: true });
-
-    // Stream each file straight to disk — a modern GOG payload is several GB, far past what a
-    // Map of Uint8Arrays can hold.
-    const filterGog = !keepGog;
     let count = 0;
-    // The descriptor lives in the per-file sink, not in a shared variable: an exception mid
-    // file would otherwise leave it open and a truncated file on disk that packs looking whole.
-    let open: { fd: number; dest: string } | null = null;
+    const open = new Set<number>();
     try {
         await extractInno(source, {
-            wantFile: (rel) => !filterGog || !isGogJunk(rel),
-            onProgress: (done, total) => { progress(`  ${progressBar(done, total)} extracting`); },
+            // Keep only the tiny metadata needed for manifest/registry synthesis, even
+            // when it is filtered from the final WGB. Never reload other payload files.
+            wantFile: rel => /^goggame-.*\.(info|script)$/i.test(basename(rel)) || keepGog || !isGogJunk(rel),
+            onProgress: (done, total) => progress(`  ${progressBar(done, total)} extracting`),
             language,
-        }, (relPath) => {
+            createAssemblyStore: size => createInnoAssemblyStore(outDir, size),
+        }, relPath => {
             const dest = resolveArchiveExtractPath(appDir, relPath);
+            let fd: number | undefined; // Per sink: deduplicated files can be open together.
             return {
-                begin() {
-                    mkdirSync(dirname(dest), { recursive: true });
-                    open = { fd: openSync(dest, "w"), dest };
+                begin() { mkdirSync(dirname(dest), { recursive: true }); fd = openSync(dest, "wx"); open.add(fd); },
+                data(bytes) {
+                    if (fd === undefined) throw new Error("Inno output sink is not open");
+                    for (let at = 0; at < bytes.length;) {
+                        const written = writeSync(fd, bytes, at, bytes.length - at);
+                        if (written <= 0) throw new Error("Inno output write made no progress");
+                        at += written;
+                    }
                 },
-                data(bytes) { if (open) writeSync(open.fd, bytes); },
-                end() {
-                    if (open) { closeSync(open.fd); open = null; }
+                end(ok) {
+                    if (fd !== undefined) { closeSync(fd); open.delete(fd); fd = undefined; }
+                    if (!ok) throw new Error("Inno output checksum mismatch");
                     count++;
                 },
             };
-        }, lzma, parsed, sliceSource);
+        }, codec, parsed, sliceSource);
     } finally {
-        if (open) {
-            const stray = open as { fd: number; dest: string };
-            try { closeSync(stray.fd); } catch { /* already gone */ }
-            console.error(`  extraction stopped inside ${stray.dest} — that file is TRUNCATED`);
-        }
+        for (const fd of open) { try { closeSync(fd); } catch { /* retain original error */ } }
     }
     progressDone(`  extracted ${count} files`);
-
     return appDir;
 }
 
-const { installer, output, get, has } = parseArgs(process.argv);
+async function run() {
+    const { installer, output, get, has } = parseArgs(process.argv);
+    if (!existsSync(installer)) throw new Error("Installer not found");
+    const extractOnly = has("--extract-only"), keepGog = has("--keep-gog");
+    if (!extractOnly && existsSync(output)) throw new Error("Output already exists; choose a new path");
+    const explicitDir = get("--extract-dir");
+    const destination = explicitDir ?? join(dirname(resolve(output)), `.gog-stage-${randomBytes(6).toString("hex")}`);
+    if (existsSync(destination)) throw new Error("Extraction destination already exists; inspect it before continuing");
 
-if (!existsSync(installer)) {
-    console.error(`Error: installer not found: ${installer}`);
-    process.exit(1);
-}
-
-const extractOnly = has("--extract-only");
-const keepGog = has("--keep-gog");
-// Default path: run the exact shared pipeline the browser UI uses (installerBytesToWgb) with no
-// 1.5 GB on-disk roundtrip. `--extract-only` writes the unpacked files to disk.
-if (!extractOnly) {
-    step(1, 1, `Extract + pack (native WASM) → ${output}`);
-    const data = new Uint8Array(readFileSync(installer));
-    const wasmPath = join(import.meta.dir, "../public/unpack-streaming.wasm");
-    const wasmBytes = readFileSync(wasmPath);
-    const wasmArrayBuf = wasmBytes.buffer.slice(
-        wasmBytes.byteOffset, wasmBytes.byteOffset + wasmBytes.byteLength,
-    );
-
-    // Multi-part installers keep their payload in sibling setup-*.bin slices (header dataOffset === 0).
-    // Gather + order them exactly like the browser worker so headless builds match the UI.
-    const lzma = new UnpackDecoder();
-    await lzma.init(wasmArrayBuf);
-    const parsed = await parseInnoHeader(new BufferSource(data), lzma);
-    let sliceSource: SliceSource | undefined;
-    try {
-        sliceSource = gatherSlices(installer, parsed);
-    } catch (err: unknown) {
-        console.error(`Error: ${err instanceof Error ? err.message : err}`);
-        process.exit(1);
+    const wasm = readFileSync(join(import.meta.dir, "../public/unpack-streaming.wasm"));
+    const codec = new UnpackDecoder();
+    await codec.init(wasm.buffer.slice(wasm.byteOffset, wasm.byteOffset + wasm.byteLength));
+    const source = new FileSource(installer); // Never read a multi-GB EXE into one Buffer.
+    const parsed = await parseInnoHeader(source, codec);
+    const languages = detectInstallerLanguages(parsed.files);
+    const language = get("--language") ?? defaultLanguage(languages);
+    const rarParts = parsed.offsets.dataOffset ? discoverGogRarParts(installer) : null;
+    let appDir: string;
+    step(1, 2, `Extracting ${rarParts ? "GOG RAR payloads" : "Inno payload"} to ${destination}`);
+    if (rarParts) {
+        const layout = planGogRarLayout(rarParts); // Preflight every part before mkdir/write.
+        appDir = await installGogRar(rarParts, layout, destination, codec);
+    } else {
+        appDir = await extractNative(source, parsed, codec, gatherSlices(installer, parsed), destination, keepGog, language);
     }
-
-    const num = (flag: string) => { const v = get(flag); return v !== undefined ? parseInt(v, 10) : undefined; };
-    const result = await installerBytesToWgb(data, wasmArrayBuf, {
-        parsed,
-        sliceSource,
-        keepGog,
-        language: get("--language"),
-        onProgress: (p) => progress(`  ${progressBar(p.doneBytes, p.totalBytes)} ${p.phase}`),
-        synth: {
-            name: get("--name"),
-            exe: get("--exe"),
-            args: get("--args"),
-            width: num("--width"),
-            height: num("--height"),
-            bpp: num("--bpp"),
-            ramMB: num("--ram"),
-            os: get("--os"),
-            regPath: get("--reg-path"),
-            regHive: get("--reg-hive"),
-            regInstall: get("--reg-install"),
-            skipVideo: has("--skip-video"),
-        },
-    });
-    const outDirPath = dirname(output);
-    if (outDirPath && outDirPath !== ".") mkdirSync(outDirPath, { recursive: true });
-    writeFileSync(output, result.wgb);
-    progressDone(`\nCreated ${output}`);
-    console.log(`  name:   ${result.name}`);
-    console.log(`  gameId: ${result.gameId ? `gog:${result.gameId}` : "(derived)"}`);
-    if (result.availableLanguages.length) {
-        const others = result.availableLanguages.filter((l) => l !== result.language);
-        console.log(`  language: ${result.language ?? "(none)"}${others.length ? `  (installer also offers: ${others.join(", ")} — pass --language to pick)` : ""}`);
+    const gogMeta = readGogMetadataFromDir(appDir);
+    if (gogMeta.name) console.log(`  game name: ${gogMeta.name}`);
+    if (extractOnly) {
+        const paths: string[] = [];
+        collectGamePaths(appDir, "", paths, !keepGog);
+        const exe = get("--exe") ?? detectExeFromPaths(paths);
+        if (exe) console.log(`  exe:       ${exe}`);
+        console.log("\n--- Extracted files (after GOG filter) ---");
+        for (const path of paths) console.log(`  ${path}`);
+        console.log(`\nExtracted to: ${appDir}`);
+        return;
     }
-    process.exit(0);
+    const num = (flag: string) => { const value = get(flag); return value === undefined ? undefined : parseInt(value, 10); };
+    const overridesPath = join(import.meta.dir, "../public/gog-overrides.json");
+    const overrides = existsSync(overridesPath) ? JSON.parse(readFileSync(overridesPath, "utf8")) : undefined;
+    const synth = await synthesizeInstalledGog(appDir, parsed, {
+        name: get("--name"), exe: get("--exe"), args: get("--args"),
+        width: num("--width"), height: num("--height"), bpp: num("--bpp"), ramMB: num("--ram"),
+        os: get("--os"), regPath: get("--reg-path"), regHive: get("--reg-hive"), regInstall: get("--reg-install"),
+        skipVideo: has("--skip-video"),
+    }, overrides);
+    step(2, 2, "Packing disk-backed WGB");
+    const packed = await packInstalledGog(appDir, output, synth, keepGog);
+    console.log(`Created ${output} (${packed.entries} files, ${(packed.bytes / 1024 / 1024).toFixed(1)} MB)`);
+    console.log(`  name: ${String(synth.manifest.name)}\n  gameId: ${String(synth.manifest.gameId)}\n  entrypoint: ${String(synth.manifest.entrypoint)}`);
+    if (languages.length) console.log(`  language: ${language ?? "(none)"} (available: ${languages.join(", ")})`);
+    if (!explicitDir) rmSync(destination, { recursive: true }); // Only our random staging dir, after final publication.
 }
 
-let extractDir = get("--extract-dir");
-let createdTmpDir = false;
-if (!extractDir) {
-    extractDir = join(tmpdir(), `gog-to-wgb-${randomBytes(6).toString("hex")}`);
-    mkdirSync(extractDir, { recursive: true });
-    createdTmpDir = true;
-}
-
-const TOTAL_STEPS = extractOnly ? 2 : 4;
-
-step(1, TOTAL_STEPS, "Extracting installer (native WASM)...");
-
-let appDir: string;
-
-try {
-    appDir = await extractNative(installer, extractDir, keepGog, get("--language"));
-} catch (err: unknown) {
-    console.error(`\nExtraction failed: ${err instanceof Error ? err.message : err}`);
-    if (createdTmpDir) rmSync(extractDir, { recursive: true, force: true });
-    process.exit(1);
-}
-
-step(2, TOTAL_STEPS, "Reading metadata...");
-
-const gogMeta = readGogMetadataFromDir(appDir);
-if (gogMeta.name) console.log(`  game name: ${gogMeta.name}`);
-
-const paths = new Map<string, Buffer>();
-collectGameFiles(appDir, "", paths, !keepGog);
-const exeName = get("--exe") ?? detectExeFromPaths(paths.keys());
-if (!exeName && !extractOnly) {
-    console.error("Error: no .exe found; use --exe <name>");
-    if (createdTmpDir) rmSync(extractDir, { recursive: true, force: true });
-    process.exit(1);
-}
-if (exeName) console.log(`  exe:       ${exeName}`);
-
-if (extractOnly) {
-    console.log("\n--- Extracted files (after GOG filter) ---");
-    for (const name of paths.keys()) console.log(`  ${name}`);
-    console.log(`\nExtracted to: ${appDir}`);
-    process.exit(0);
-}
-
-// Pack the extracted directory.
-const name = get("--name") ?? gogMeta.name ?? basename(installer, extname(installer));
-const osKey = get("--os") ?? "win98";
-const osVer = OS_PRESETS[osKey];
-if (!osVer) {
-    console.error(`Error: unknown --os "${osKey}"`);
-    process.exit(1);
-}
-
-// Container key (WGB v2): explicit --game-id wins; else GOG product id → gog:<id>; else derive.
-const entrypoint = `rom/${exeName}`;
-let gameId = get("--game-id");
-if (gameId && !isValidGameId(gameId)) {
-    console.error(`Error: invalid --game-id "${gameId}". Use "<scheme>:<id>" with scheme in {${KNOWN_GAME_ID_SCHEMES.join(", ")}}.`);
-    process.exit(1);
-}
-if (!gameId) gameId = gogMeta.gameId ? `gog:${gogMeta.gameId}` : deriveGameId({ name, entrypoint });
-
-const manifest: Record<string, unknown> = {
-    formatVersion: 2,
-    gameId,
-    name,
-    entrypoint,
-    rom: "rom",
-    registry: "registry.json",
-    emulator: {
-        osVersion: osVer,
-        screenResolution: {
-            width: parseInt(get("--width") ?? "640", 10),
-            height: parseInt(get("--height") ?? "480", 10),
-            bpp: parseInt(get("--bpp") ?? "16", 10),
-        },
-        memory: { ram: parseInt(get("--ram") ?? "64", 10) * 1024 * 1024 },
-        ...(has("--skip-video") ? { skipVideo: true } : {}),
-    },
-};
-const gameArgs = get("--args");
-if (gameArgs) manifest.args = gameArgs;
-
-const regPath = get("--reg-path");
-const registry = regPath
-    ? {
-        root: get("--reg-hive") ?? "HKLM",
-        path: regPath,
-        values: [{ name: "InstallPath", type: "REG_SZ", data: get("--reg-install") ?? "C:\\" }],
-    }
-    : { root: "HKLM", path: "Software", values: [] };
-
-step(3, TOTAL_STEPS, "Collecting game files...");
-const files = new Map<string, Buffer>();
-files.set("manifest.json", Buffer.from(JSON.stringify(manifest, null, 2), "utf8"));
-files.set("registry.json", Buffer.from(JSON.stringify(registry, null, 2), "utf8"));
-collectGameFiles(appDir, "rom/", files, !keepGog, (count, bytes, lastName) => {
-    progress(`  ${count} files  ${(bytes / 1024 / 1024).toFixed(1)} MB  ${basename(lastName)}`);
-});
-progressDone(`  ${files.size} files collected`);
-
-step(4, TOTAL_STEPS, `Packing → ${output}`);
-const zipEntries = new Map<string, Uint8Array>();
-for (const [k, v] of files) zipEntries.set(k, new Uint8Array(v));
-const zip = buildZip(zipEntries);
-writeFileSync(output, zip);
-console.log(`\nCreated ${output}`);
-if (createdTmpDir) rmSync(extractDir, { recursive: true, force: true });
+run().catch(error => { console.error(`GOG import failed: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; });

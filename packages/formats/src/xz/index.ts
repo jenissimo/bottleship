@@ -194,13 +194,21 @@ export function decodeXz(
         const block = stream.blocks[i]!;
         opts.onBlock?.(i, block);
         new DataView(props.buffer).setUint32(0, block.dictSize, true);
-        const compressed = src.readRangeSync(block.dataOffset, block.dataOffset + block.compressedSize);
-        if (compressed.length !== block.compressedSize) throw new XzError(`truncated block ${i}`);
+        // A single XZ block can contain the whole archive. Let the codec pull bounded
+        // input ranges rather than materializing the complete compressed block.
+        const compressed: RandomAccessSource = {
+            size: block.compressedSize,
+            readRangeSync(start, end) {
+                const bytes = src.readRangeSync(block.dataOffset + start, block.dataOffset + end);
+                if (bytes.length !== end - start) throw new XzError(`truncated block ${i}`);
+                return bytes;
+            },
+        };
 
         let produced = 0;
         const crc32 = verify && stream.checkSize === 4 ? new Crc32() : null;
         const crc64 = verify && stream.checkSize === 8 ? new Crc64() : null;
-        decoder.decodeToCallback(
+        decoder.decodeSourceToCallback(
             UNPACK_LZMA2,
             compressed,
             (bytes) => {

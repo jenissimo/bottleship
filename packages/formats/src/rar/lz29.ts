@@ -10,7 +10,7 @@ class Bits {
         let value = 0, pos = this.pos;
         for (let left = n; left > 0;) {
             const take = Math.min(left, 8 - (pos & 7));
-            const byte = pos < this.limit ? this.bytes[pos >>> 3] ?? 0 : 0;
+            const byte = pos < this.limit ? this.bytes[Math.floor(pos / 8)] ?? 0 : 0;
             value = value * 2 ** take + ((byte >>> (8 - (pos & 7) - take)) & ((1 << take) - 1));
             pos += take; left -= take;
         }
@@ -138,20 +138,31 @@ export interface RarPpmSession {
     close(): void;
 }
 
-export function decodeRar29(input: Uint8Array, expectedSize: number, createPpm?: (input: Uint8Array) => RarPpmSession): Uint8Array {
-    return decodeRar29Solid([{ input, expectedSize }], createPpm)[0];
+export interface Rar29Options { maxOutputBytes?: number; }
+
+/** The limit covers one decoded solid group, whose unfiltered history must stay resident. */
+export function rar29OutputLimit(options: Rar29Options = {}): number {
+    const limit = options.maxOutputBytes ?? 512 * 1024 * 1024;
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 0x7fffffff) throw new Error('RAR29: invalid maxOutputBytes');
+    return limit;
+}
+
+export function decodeRar29(input: Uint8Array, expectedSize: number, createPpm?: (input: Uint8Array) => RarPpmSession, options: Rar29Options = {}): Uint8Array {
+    return decodeRar29Solid([{ input, expectedSize }], createPpm, options)[0];
 }
 
 export interface Rar29File { input: Uint8Array; expectedSize: number; }
 
 /** A solid group shares unfiltered history, coding tables and the PPM model across file boundaries. */
-export function decodeRar29Solid(files: Rar29File[], createPpm?: (input: Uint8Array) => RarPpmSession): Uint8Array[] {
+export function decodeRar29Solid(files: Rar29File[], createPpm?: (input: Uint8Array) => RarPpmSession, options: Rar29Options = {}): Uint8Array[] {
+    const limit = rar29OutputLimit(options);
     let expectedSize = 0, packedSize = 0;
     for (const file of files) {
         if (!Number.isSafeInteger(file.expectedSize) || file.expectedSize < 0) throw new Error('RAR29: invalid output size');
         expectedSize += file.expectedSize; packedSize += file.input.length;
     }
-    if (!Number.isSafeInteger(expectedSize) || expectedSize > 512 * 1024 * 1024) throw new Error('RAR29: invalid output size');
+    if (!Number.isSafeInteger(expectedSize) || expectedSize > limit) throw new Error('RAR29: invalid output size');
+    if (!Number.isSafeInteger(packedSize) || packedSize > 0x7fffffff) throw new Error('RAR29: invalid packed size');
     if (!files.length) return [];
     const input = files.length === 1 ? files[0].input : new Uint8Array(packedSize);
     if (files.length > 1) {
