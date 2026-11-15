@@ -21,6 +21,7 @@ import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy }
 import { CaptureRefusal } from "../savestate/object-codecs";
 import type { SaveValue } from "../savestate/value-codec";
 import { comApartments, ComApartments, type ApartmentRow } from "../core/com/apartment";
+import { coCreateWebBrowser } from "./ole32-webbrowser";
 
 // COM error codes
 const REGDB_E_CLASSNOTREG = 0x80040154;
@@ -1035,6 +1036,8 @@ export class Ole32 implements IModule {
         context: X86Context,
         iidAddress: number,
     ): number {
+        const webBrowser = coCreateWebBrowser(this.process, clsidNormalized, iidNormalized, ppv);
+        if (webBrowser !== null) return webBrowser;
         const registered = lookupHleComClass(this.process, clsidNormalized);
         if (registered) {
             if (!registered.server.acquireLoaderReference()) {
