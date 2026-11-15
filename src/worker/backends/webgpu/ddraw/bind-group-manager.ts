@@ -120,6 +120,7 @@ export class BindGroupManager {
     private megaBatchCache = new Map<number, MegaBatchCacheNode>();
     private megaBatchCached = 0;
     readonly megaBatchCacheStats = { hits: 0, misses: 0, uncached: 0, resets: 0 };
+    private readonly megaBatchCacheOff: boolean;
 
     private readonly maxCacheSize: number;
 
@@ -130,6 +131,7 @@ export class BindGroupManager {
         this.device = device;
         this.maxCacheSize = maxCacheSize;
         this.samplers = new DxSamplerCache(device);
+        this.megaBatchCacheOff = (globalThis as { __ddrawMegaBatchCacheOff?: unknown }).__ddrawMegaBatchCacheOff === true;
     }
 
     /**
@@ -416,7 +418,7 @@ export class BindGroupManager {
         storageOffset: number = 0,
         storageSize?: number
     ): GPUBindGroup {
-        if (storageOffset !== 0 || storageSize !== undefined) {
+        if (this.megaBatchCacheOff || storageOffset !== 0 || storageSize !== undefined) {
             this.megaBatchCacheStats.uncached++;
             return this.buildMegaBatchBindGroup(storageBuffer, sampledMask, views, samplers, dummyTextureView, storageOffset, storageSize);
         }

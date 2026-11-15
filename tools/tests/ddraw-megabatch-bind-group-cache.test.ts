@@ -126,6 +126,22 @@ describe("MegaBatch bind groups are keyed by resource identity", () => {
         expect(st.misses + st.uncached).toBe(made.length);
     });
 
+    test("with the cache switched off when the manager is created, every group is built (the pre-cache path)", () => {
+        const g = globalThis as { __ddrawMegaBatchCacheOff?: unknown };
+        g.__ddrawMegaBatchCacheOff = true;
+        let off: ReturnType<typeof rig>;
+        try { off = rig(); } finally { delete g.__ddrawMegaBatchCacheOff; }
+        const buf = buffer("ring"), a = view("a");
+        const first = off.m.createMegaBatchBindGroup(buf, 1, [a], [sampler()], DUMMY);
+        expect(off.m.createMegaBatchBindGroup(buf, 1, [a], [sampler()], DUMMY)).not.toBe(first);
+        expect(off.made).toHaveLength(2);
+        expect(off.m.megaBatchCacheStats).toEqual({ hits: 0, misses: 0, uncached: 2, resets: 0 });
+        const on = rig();
+        on.m.createMegaBatchBindGroup(buf, 1, [a], [sampler()], DUMMY);
+        on.m.createMegaBatchBindGroup(buf, 1, [a], [sampler()], DUMMY);
+        expect(on.made).toHaveLength(1);
+    });
+
     test("clearCache, and a manager for a new device, share nothing", () => {
         const { m, made } = rig();
         const buf = buffer("ring"), a = view("a");
