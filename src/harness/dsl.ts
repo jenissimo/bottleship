@@ -401,7 +401,8 @@ export class HarnessChain {
      *  (drawable x internalScale), the viewport/scissor that were active, and each draw's
      *  NDC + resulting screen box. Separates "wrong quad" from "wrong viewport/render
      *  target" — and a guest-space quantity from a render-space one — without guessing. */
-    glFrame(opts?: { timeoutMs?: number }): this { return this.push("glFrame", [opts]); }
+    /** drawState opts into bounded per-emission lighting/material + pre-fog normals. */
+    glFrame(opts?: { timeoutMs?: number; drawState?: boolean; maxDrawStates?: number }): this { return this.push("glFrame", [opts]); }
     glTextures(): this { return this.push("glTextures", []); }
     glDumpTexture(id: number): this { return this.push("glDumpTexture", [id]); }
 

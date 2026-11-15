@@ -25,8 +25,13 @@ import {
     CI_VP_X, CI_VP_Y, CI_VP_W, CI_VP_H, CI_CLEAR_MASK,
     CI_TEXENV0, CI_TEXENV1, CI_COMBINE0_RGB, CI_COMBINE0_ALPHA, CI_COMBINE1_RGB, CI_COMBINE1_ALPHA,
     CF_ENV_COLOR0, CF_ENV_COLOR1,
+    CI_BLEND_SRC, CI_BLEND_DST, CI_ALPHA_FUNC, CI_DEPTH_FUNC,
+    CI_STENCIL_FUNC, CI_STENCIL_REF, CI_STENCIL_MASK, CI_STENCIL_FAIL,
+    CI_STENCIL_ZFAIL, CI_STENCIL_ZPASS, CI_STENCIL_WRITE_MASK, CF_ALPHA_REF,
+    DF_BLEND, DF_ALPHA_TEST, DF_STENCIL_TEST, DF_DEPTH_TEST, DF_DEPTH_MASK, DF_FOG,
+    DF_COLOR_MASK_R, DF_COLOR_MASK_G, DF_COLOR_MASK_B, DF_COLOR_MASK_A,
 } from "../../modules/opengl32/context";
-import { armGLFrameCapture, takeGLFrameCapture } from "../../modules/opengl32/frame-capture";
+import { armGLFrameCapture, cancelGLFrameCapture, takeGLFrameCapture, summarizeGLComponents, type GLFrameCaptureOptions } from "../../modules/opengl32/frame-capture";
 import type { OpenGLContext, GLTextureObject } from "../../modules/opengl32/context";
 
 function glCtx(): OpenGLContext {
@@ -82,18 +87,37 @@ function decodeTexEnv(
     };
 }
 
+/** Decode completed per-draw packet state; never consult the current UI context. */
+export function describeGLDrawPacket(I: Int32Array, F: Float32Array, i: number, f: number) {
+    const flags = I[i + CI_FLAGS]!;
+    return {
+        blend: { enabled: !!(flags & DF_BLEND), src: I[i + CI_BLEND_SRC], dst: I[i + CI_BLEND_DST] },
+        alphaTest: { enabled: !!(flags & DF_ALPHA_TEST), func: I[i + CI_ALPHA_FUNC], ref: F[f + CF_ALPHA_REF] },
+        depthFunc: I[i + CI_DEPTH_FUNC],
+        depthTest: !!(flags & DF_DEPTH_TEST), depthWrite: !!(flags & DF_DEPTH_MASK),
+        stencil: {
+            enabled: !!(flags & DF_STENCIL_TEST), func: I[i + CI_STENCIL_FUNC], ref: I[i + CI_STENCIL_REF],
+            mask: I[i + CI_STENCIL_MASK] >>> 0, fail: I[i + CI_STENCIL_FAIL],
+            zfail: I[i + CI_STENCIL_ZFAIL], zpass: I[i + CI_STENCIL_ZPASS],
+            writeMask: I[i + CI_STENCIL_WRITE_MASK] >>> 0,
+        },
+        colorMask: { r: !!(flags & DF_COLOR_MASK_R), g: !!(flags & DF_COLOR_MASK_G),
+            b: !!(flags & DF_COLOR_MASK_B), a: !!(flags & DF_COLOR_MASK_A) },
+    };
+}
+
 export function registerGlCommands(svc: HarnessService): void {
     svc.register("glFrame", async (args) => {
-        const opts = (args[0] ?? {}) as { timeoutMs?: number };
+        const opts = (args[0] ?? {}) as GLFrameCaptureOptions & { timeoutMs?: number };
         const ctx = glCtx(); // fail fast when the title is not GL
-        armGLFrameCapture();
+        armGLFrameCapture(opts, ctx);
         const deadline = Date.now() + (opts.timeoutMs ?? 3000);
         let cap = takeGLFrameCapture();
         while (!cap && Date.now() < deadline) {
             await new Promise((r) => setTimeout(r, 16));
             cap = takeGLFrameCapture();
         }
-        if (!cap) throw new HarnessError("no present within timeout (frame loop stalled?)", HarnessErrorCode.TIMEOUT);
+        if (!cap) { cancelGLFrameCapture(); throw new HarnessError("no present within timeout (frame loop stalled?)", HarnessErrorCode.TIMEOUT); }
 
         const { i32: I, f32: F, verts } = cap;
         const commands: unknown[] = [];
@@ -138,6 +162,11 @@ export function registerGlCommands(svc: HarnessService): void {
                 env0: decodeTexEnv(I[i + CI_TEXENV0], I[i + CI_COMBINE0_RGB], I[i + CI_COMBINE0_ALPHA], F, f + CF_ENV_COLOR0),
                 env1: decodeTexEnv(I[i + CI_TEXENV1], I[i + CI_COMBINE1_RGB], I[i + CI_COMBINE1_ALPHA], F, f + CF_ENV_COLOR1),
                 flags: "0x" + (I[i + CI_FLAGS] >>> 0).toString(16),
+                ...describeGLDrawPacket(I, F, i, f),
+                vertexColor: summarizeGLComponents(verts, off, n, 4, 4),
+                normalRange: (I[i + CI_FLAGS] & DF_FOG) ? null : summarizeGLComponents(verts, off, n, 8, 3),
+                normalRangeNote: (I[i + CI_FLAGS] & DF_FOG) ? "Fog reuses nx in the completed arena; use drawEmissions[].normal captured before transform" : "Object-space input normals; no lighting is inferred from this range",
+                emissions: cap.drawEmissions.map((emission, index) => emission.commandIndex === k ? index : -1).filter(index => index >= 0),
                 vp, scissor: [I[i + CI_SCISSOR_X], I[i + CI_SCISSOR_Y], I[i + CI_SCISSOR_W], I[i + CI_SCISSOR_H]],
                 ndc: n ? [round(x0), round(x1), round(y0), round(y1)] : null,
                 screen: n ? [px(x0), px(x1), py(y1), py(y0)] : null,
@@ -153,6 +182,8 @@ export function registerGlCommands(svc: HarnessService): void {
             render: space ? [space.renderW, space.renderH] : null,
             internalScale: space ? Math.round(space.scale * 1000) / 1000 : null,
             count: cap.count, commands,
+            drawEmissions: cap.drawEmissions,
+            emissionCoverage: cap.emissionCoverage,
         };
     });
 

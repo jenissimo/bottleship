@@ -22,6 +22,7 @@ import {
 } from "./constants";
 import { Logger, LogCategory } from "../../core/logger";
 import { guestViews } from "./client-arrays";
+import { captureGLDrawEmissionIfArmed, type GLDrawEmissionCapture } from "./frame-capture";
 
 /** @transient(float bit-conversion scratch, written before every read) */
 const _f32ab = new ArrayBuffer(4);
@@ -296,7 +297,7 @@ function drawStateEqual(i32: Int32Array, f32: Float32Array, a: number, b: number
     return true;
 }
 
-function pushGLDrawCommand(ctx: OpenGLContext, mode: number, vertOffset: number, vertCount: number): void {
+function pushGLDrawCommand(ctx: OpenGLContext, mode: number, vertOffset: number, vertCount: number, capture?: GLDrawEmissionCapture): void {
     // GL_SELECT and GL_FEEDBACK do not touch the framebuffer (GL 1.3 §5.2). A picking
     // pass re-renders the whole scene, so rasterizing it would overwrite the frame the
     // guest just presented.
@@ -383,10 +384,12 @@ function pushGLDrawCommand(ctx: OpenGLContext, mode: number, vertOffset: number,
             drawStateEqual(I, F, idx - 1, idx)) {
             I[p + CI_VERT_COUNT] += vertCount;
             stream.pop();
+            if (capture) capture.commandIndex = idx - 1;
             return;
         }
     }
 
+    if (capture) capture.commandIndex = idx;
     ctx.frameSnapshot.drawCalls++;
 }
 
@@ -421,6 +424,7 @@ export function emitArenaDraw(
     if (count === 0) return;
     const arena = ctx.vertArena;
     arena.used = base + count * VERT_FLOATS;
+    const capture = captureGLDrawEmissionIfArmed(ctx, base, count);
 
     if (!preTransformed) {
         if (ctx.enableFlags.has(GL_TEXTURE_GEN_S) || ctx.enableFlags.has(GL_TEXTURE_GEN_T)) {
@@ -429,7 +433,7 @@ export function emitArenaDraw(
         transformFlatVerts(ctx, arena.data, base, count);
     }
 
-    pushGLDrawCommand(ctx, mode, base, count);
+    pushGLDrawCommand(ctx, mode, base, count, capture);
 }
 
 /** For pre-baked display list items — data is already triangle-assembled, apply texgen + transform now */
@@ -443,13 +447,14 @@ export function emitDrawCommandFromPrebaked(ctx: OpenGLContext, mode: number, fl
     if (flatVerts.length === floats) arena.data.set(flatVerts, base);
     else arena.data.set(flatVerts.subarray(0, floats), base);
     arena.used = base + floats;
+    const capture = captureGLDrawEmissionIfArmed(ctx, base, count);
 
     if (ctx.enableFlags.has(GL_TEXTURE_GEN_S) || ctx.enableFlags.has(GL_TEXTURE_GEN_T)) {
         applyTexGenFlat(ctx, arena.data, base, count);
     }
     transformFlatVerts(ctx, arena.data, base, count);
 
-    pushGLDrawCommand(ctx, mode, base, count);
+    pushGLDrawCommand(ctx, mode, base, count, capture);
 }
 
 export function createImmediateExports(ctx: OpenGLContext): Record<string, ThunkImplementation> {
