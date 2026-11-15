@@ -175,12 +175,30 @@ describe("VirtualQuery fast path == full body", () => {
         expect(r.slow[1]).toBe(MEM_HEAP_BASE + 0x00200000); // AllocationBase = image base
     });
 
-    test("a thread-stack page defers (the stack branch reports the whole reservation)", () => {
+    test("a thread-stack page defers (AllocationBase is the reservation, the region runs from the page to the top)", () => {
         stacks.push({ base: MEM_HEAP_BASE + 0x00300000, top: MEM_HEAP_BASE + 0x00340000 });
-        const r = differential(MEM_HEAP_BASE + 0x00320000);
+        const r = differential(MEM_HEAP_BASE + 0x00320abc);
         expect(r.served).toBe(false);
+        expect(r.slow[0]).toBe(MEM_HEAP_BASE + 0x00320000);
         expect(r.slow[1]).toBe(MEM_HEAP_BASE + 0x00300000);
-        expect(r.slow[3]).toBe(0x40000);
+        expect(r.slow[3]).toBe(0x20000);
+    });
+
+    test("repeated stack queries from the base, an unaligned interior address and the last byte end at the stack top", () => {
+        const base = MEM_HEAP_BASE + 0x00300000, top = base + 0x40000;
+        stacks.push({ base, top });
+        for (let repeat = 0; repeat < 50; repeat++) {
+            for (const addr of [base, base + 0x12345, top - 1]) {
+                expect(callSlow(addr, SLOW_BUF)).toBe(28);
+                const info = mbi(SLOW_BUF), page = addr & ~0xfff;
+                expect(info[0]).toBe(page);
+                expect(info[1]).toBe(base);
+                expect(info[0]! + info[3]!).toBe(top);
+                expect(info[4]).toBe(MEM_COMMIT);
+                expect(info[5]).toBe(PAGE_READWRITE);
+            }
+        }
+        expect(allocations.size).toBe(0);
     });
 
     test("a VirtualAlloc'd page defers (AllocationBase is the reservation base)", () => {

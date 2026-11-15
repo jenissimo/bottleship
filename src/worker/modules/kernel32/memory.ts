@@ -1563,17 +1563,20 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             const stack = system.scheduler?.findStackReservation(pageBase) ?? null;
             const mod = stack ? null : (moduleRegistry?.getModuleContainingAddress(lpAddress) ?? null);
             if (stack) {
-                // 0) Thread stack. Windows describes a stack by its RESERVATION, and every
-                //    stack-bounds helper reads it that way: bottom = AllocationBase, top from
-                //    TEB StackBase. Answering page-granular (AllocationBase = the queried page,
-                //    RegionSize = 0x1000) hands them inverted or 4KB-wide bounds. We commit the
-                //    whole stack up front, so the committed run IS the reservation — no guard
-                //    page, no reserved tail to describe. This precedes the generic
-                //    backed-interval branch, whose page-granular answer stays load-bearing for
-                //    SmartHeap-style pointer validation of HEAP pointers.
-                baseAddress = stack.base;
+                // 0) Thread stack. AllocationBase is the reservation, the bottom every
+                //    stack-bounds helper reads; the REGION starts at the queried page and runs
+                //    to the top of the committed stack, as for any other run of like pages.
+                //    Helpers that take the top as BaseAddress + RegionSize get the same answer
+                //    either way. One that rounds its own stack pointer down to a page and adds
+                //    RegionSize (the Boehm GC's stack-base probe) needs the region to start
+                //    there: measured from the reservation instead, the top it computes lies a
+                //    whole stack too high, inside the next thread's stack. We commit the whole
+                //    stack up front, so there is no guard page or reserved tail to describe.
+                //    This precedes the generic backed-interval branch, whose page-granular
+                //    answer stays load-bearing for SmartHeap-style validation of HEAP pointers.
+                baseAddress = pageBase;
                 allocationBase = stack.base;
-                regionSize = stack.top - stack.base;
+                regionSize = ((((stack.top >>> 0) + 0xFFF) & ~0xFFF) >>> 0) - pageBase;
                 memType = MEM_PRIVATE;
                 protect = PAGE_READWRITE;
                 state = MEM_COMMIT;
