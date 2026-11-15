@@ -119,6 +119,7 @@ export class BindGroupManager {
     // holds resources, not contents.
     private megaBatchCache = new Map<number, MegaBatchCacheNode>();
     private megaBatchCached = 0;
+    readonly megaBatchCacheStats = { hits: 0, misses: 0, uncached: 0, resets: 0 };
 
     private readonly maxCacheSize: number;
 
@@ -416,6 +417,7 @@ export class BindGroupManager {
         storageSize?: number
     ): GPUBindGroup {
         if (storageOffset !== 0 || storageSize !== undefined) {
+            this.megaBatchCacheStats.uncached++;
             return this.buildMegaBatchBindGroup(storageBuffer, sampledMask, views, samplers, dummyTextureView, storageOffset, storageSize);
         }
         let node: MegaBatchCacheNode | undefined = this.megaBatchCache.get(sampledMask);
@@ -424,6 +426,7 @@ export class BindGroupManager {
             if ((sampledMask & (1 << s)) === 0) continue;
             const view = s === 0 ? (views[0] || dummyTextureView) : views[s];
             if (!view) {
+                this.megaBatchCacheStats.uncached++;
                 return this.buildMegaBatchBindGroup(storageBuffer, sampledMask, views, samplers, dummyTextureView, 0, undefined);
             }
             const sampler = this.getOrCreateStageSampler(samplers[s]);
@@ -438,12 +441,16 @@ export class BindGroupManager {
         if (!bg) {
             if (this.megaBatchCached >= MEGA_BATCH_CACHE_LIMIT) {
                 this.resetMegaBatchCache();
+                this.megaBatchCacheStats.resets++;
                 return this.createMegaBatchBindGroup(storageBuffer, sampledMask, views, samplers, dummyTextureView);
             }
             bg = this.buildMegaBatchBindGroup(storageBuffer, sampledMask, views, samplers, dummyTextureView, 0, undefined);
             node.byBuffer.set(storageBuffer, bg);
             this.megaBatchCached++;
+            this.megaBatchCacheStats.misses++;
+            return bg;
         }
+        this.megaBatchCacheStats.hits++;
         return bg;
     }
 

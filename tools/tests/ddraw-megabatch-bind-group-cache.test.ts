@@ -109,6 +109,23 @@ describe("MegaBatch bind groups are keyed by resource identity", () => {
         expect(made).toHaveLength(MEGA_BATCH_CACHE_LIMIT + 2);
     });
 
+    test("hits, misses, uncached builds and resets are counted, and every built group is one of them", () => {
+        const { m, made } = rig();
+        const buf = buffer("ring"), a = view("a");
+        m.createMegaBatchBindGroup(buf, 1, [a], [sampler()], DUMMY);
+        m.createMegaBatchBindGroup(buf, 1, [a], [sampler()], DUMMY);
+        m.createMegaBatchBindGroup(buf, 1, [a], [sampler()], DUMMY);
+        m.createMegaBatchBindGroup(buf, 2, [a, null], [sampler(), sampler()], DUMMY);
+        m.createMegaBatchBindGroup(buf, 1, [a], [sampler()], DUMMY, 0, 512);
+        expect(m.megaBatchCacheStats).toEqual({ hits: 2, misses: 1, uncached: 2, resets: 0 });
+        for (let i = 1; i < MEGA_BATCH_CACHE_LIMIT; i++) m.createMegaBatchBindGroup(buf, 1, [view(`v${i}`)], [sampler()], DUMMY);
+        m.createMegaBatchBindGroup(buf, 1, [view("past the limit")], [sampler()], DUMMY);
+        const st = m.megaBatchCacheStats;
+        expect(st.resets).toBe(1);
+        expect(st.misses).toBe(MEGA_BATCH_CACHE_LIMIT + 1);
+        expect(st.misses + st.uncached).toBe(made.length);
+    });
+
     test("clearCache, and a manager for a new device, share nothing", () => {
         const { m, made } = rig();
         const buf = buffer("ring"), a = view("a");
