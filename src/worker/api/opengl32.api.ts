@@ -459,5 +459,8 @@ export const opengl32Module: ModuleDescriptor = {
         gl("wglSetDeviceGammaRamp", [u("hdc"), p("ramp")], "u32"),
         gl("wglGetDeviceGammaRamp", [u("hdc"), p("ramp")], "u32"),
         gl("wglGetExtensionsStringARB", [u("hdc")], "u32"),
+        gl("wglGetExtensionsStringEXT", [], "u32"),
+        gl("wglSwapIntervalEXT", [i("interval")], "u32"),
+        gl("wglGetSwapIntervalEXT", [], "u32"),
     ]
 };

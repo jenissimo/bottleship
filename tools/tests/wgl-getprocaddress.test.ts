@@ -197,3 +197,57 @@ describe("resolveHleExportAddress", () => {
         expect(resolveHleExportAddress(dispatcher, "msvcrt", "_acmdln")).toBe(0x00401234);
     });
 });
+
+describe("WGL extensions string", () => {
+    function harness() {
+        const mem = new Uint8Array(0x8000);
+        const allocs: number[] = [];
+        let next = 0x4000;
+        const ctx: any = {
+            process: {
+                getCurrentMemory: () => mem,
+                dispatcher: makeDispatcher({}),
+                memory: { alloc: (n: number) => { const a = next; next += (n + 7) & ~7; allocs.push(a); return a; } },
+            },
+            stringCache: new Map(),
+            commands: new GLCommandStream(),
+        };
+        const api = createWglExports(ctx, () => ({ width: 640, height: 480 }));
+        const call = (name: string, ...args: number[]) => (api[name]!({ esp: 0 } as any, mem, args as any) as number) >>> 0;
+        const read = (p: number) => { let e = p; while (mem[e]) e++; return new TextDecoder().decode(mem.subarray(p, e)); };
+        return { call, read, allocs };
+    }
+
+    test("wglGetExtensionsStringEXT exists and names what has entry points behind it; ARB returns the same string", () => {
+        const h = harness();
+        const ext = h.call("wglGetExtensionsStringEXT");
+        expect(ext).not.toBe(0);
+        expect(h.read(ext).split(" ").sort()).toEqual(["WGL_ARB_extensions_string", "WGL_EXT_extensions_string", "WGL_EXT_swap_control"]);
+        expect(h.call("wglGetExtensionsStringARB", 0xdc)).toBe(ext);
+    });
+
+    test("the string is written once per process, however often it is queried", () => {
+        const h = harness();
+        const first = h.call("wglGetExtensionsStringEXT");
+        for (let i = 0; i < 50; i++) {
+            expect(h.call("wglGetExtensionsStringARB", 0xdc)).toBe(first);
+            expect(h.call("wglGetExtensionsStringEXT")).toBe(first);
+        }
+        expect(h.allocs.length).toBe(1);
+    });
+
+    test("wglGetProcAddress hands out the EXT entry point once it is registered", () => {
+        const h = makeHarness({ "opengl32:wglgetextensionsstringext": 0x21000060 });
+        h.makeCurrent();
+        expect(h.gpa("wglGetExtensionsStringEXT")).toBe(0x21000060);
+    });
+
+    test("WGL_EXT_swap_control: the interval is remembered and reported", () => {
+        const h = harness();
+        expect(h.call("wglGetSwapIntervalEXT")).toBe(1);
+        expect(h.call("wglSwapIntervalEXT", 0)).toBe(1);
+        expect(h.call("wglGetSwapIntervalEXT")).toBe(0);
+        expect(h.call("wglSwapIntervalEXT", 2)).toBe(1);
+        expect(h.call("wglGetSwapIntervalEXT")).toBe(2);
+    });
+});
