@@ -2,6 +2,7 @@
  * kernel32 directory-enumeration handlers (FindFirstFile/FindNextFile/FindClose
  * families) plus their pattern-matching and WIN32_FIND_DATA fill helpers.
  */
+import { ERROR_NO_SYSTEM_RESOURCES } from '../../core/thunking/thunk-errors';
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
@@ -146,6 +147,12 @@ objectCodecs.add<FindHandle>({
     }),
 });
 
+
+function findTableFull(): number {
+    System.getInstance().scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+    return 0xFFFFFFFF;
+}
+
 export function registerFileIoFindExports(exports: Record<string, ThunkImplementation>): void {
     exports['FindFirstFileA'] = (ctx, mem, args) => {
         const lpFileName = args[0];
@@ -182,6 +189,7 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
                 entries: [entry],
                 index: 1,
             });
+            if (!handleId) return findTableFull();
             Logger.log(LogCategory.KERNEL32, `FindFirstFileA("${pattern}") -> handle=0x${handleId.toString(16)} first="${entry.name}" (exact)`);
             return handleId;
         }
@@ -207,6 +215,7 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
         };
 
         const handleId = System.getInstance().resourceProvider.registerKernelObject(findHandle);
+        if (!handleId) return findTableFull();
         Logger.log(LogCategory.KERNEL32, `FindFirstFileA("${pattern}") -> handle=0x${handleId.toString(16)} first="${matches[0].name}" (${matches.length} match${matches.length === 1 ? '' : 'es'})`);
         return handleId;
     };
@@ -239,11 +248,12 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
                 return INVALID_HANDLE_VALUE;
             }
             fillFindDataW(mem, lpFindFileData, entry);
-            return System.getInstance().resourceProvider.registerKernelObject({
+            const exactId = System.getInstance().resourceProvider.registerKernelObject({
                 kind: 'find' as const,
                 entries: [entry],
                 index: 1,
             });
+            return exactId || findTableFull();
         }
 
         const { searchPath, searchMask } = splitFindPattern(pattern);
@@ -266,6 +276,7 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
         };
 
         const handleId = System.getInstance().resourceProvider.registerKernelObject(findHandle);
+        if (!handleId) return findTableFull();
         return handleId;
     };
 

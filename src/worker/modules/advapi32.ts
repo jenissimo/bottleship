@@ -1,3 +1,4 @@
+import { ERROR_NO_SYSTEM_RESOURCES } from '../core/thunking/thunk-errors';
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
@@ -10,6 +11,7 @@ import { Logger, LogCategory } from "../core/logger";
 import { encodeAnsi } from "./codepage-utils";
 import { tokenInformationLayout } from "./advapi32-token";
 import { Md5, Sha1 } from "@bottleship/formats/unpack";
+
 
 const HKEY_CLASSES_ROOT = 0x80000000;
 const HKEY_CURRENT_USER = 0x80000001;
@@ -243,6 +245,7 @@ export class Advapi32 implements IModule {
                 return { value: 87, stackCleanup: 20 }; // ERROR_INVALID_PARAMETER (e.g. thunk region)
             }
             const handle = process.resourceProvider.registerKernelObject({ kind: "reg", key: fullKey });
+            if (!handle) return { value: ERROR_NO_SYSTEM_RESOURCES, stackCleanup: 20 };
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             if (phkResult && phkResult + 4 <= mem.length) view.setUint32(phkResult, handle >>> 0, true);
             return { value: 0, stackCleanup: 20 };
@@ -265,6 +268,7 @@ export class Advapi32 implements IModule {
                 return { value: 87, stackCleanup: 20 }; // ERROR_INVALID_PARAMETER
             }
             const handle = process.resourceProvider.registerKernelObject({ kind: "reg", key: fullKey });
+            if (!handle) return { value: ERROR_NO_SYSTEM_RESOURCES, stackCleanup: 20 };
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             if (phkResult && phkResult + 4 <= mem.length) view.setUint32(phkResult, handle >>> 0, true);
             return { value: 0, stackCleanup: 20 };
@@ -290,6 +294,7 @@ export class Advapi32 implements IModule {
                 return { value: 87, stackCleanup: 12 };
             }
             const handle = process.resourceProvider.registerKernelObject({ kind: "reg", key: fullKey });
+            if (!handle) return { value: ERROR_NO_SYSTEM_RESOURCES, stackCleanup: 12 };
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             if (phkResult && phkResult + 4 <= mem.length) view.setUint32(phkResult, handle >>> 0, true);
             return { value: 0, stackCleanup: 12 };
@@ -737,6 +742,7 @@ export class Advapi32 implements IModule {
             const subKey = lpSubKey ? Marshaler.readString(mem, lpSubKey) : "";
             const { key: fullKey } = system.registry.createKey(root, subKey);
             const handle = process.resourceProvider.registerKernelObject({ kind: "reg", key: fullKey });
+            if (!handle) return { value: ERROR_NO_SYSTEM_RESOURCES, stackCleanup: 12 };
             if (phkResult && phkResult + 4 <= mem.length) {
                 const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                 view.setUint32(phkResult, handle >>> 0, true);
@@ -753,6 +759,7 @@ export class Advapi32 implements IModule {
             const subKey = lpSubKey ? Marshaler.readWideString(mem, lpSubKey) : "";
             const { key: fullKey } = system.registry.createKey(root, subKey);
             const handle = process.resourceProvider.registerKernelObject({ kind: "reg", key: fullKey });
+            if (!handle) return { value: ERROR_NO_SYSTEM_RESOURCES, stackCleanup: 12 };
             if (phkResult && phkResult + 4 <= mem.length) {
                 const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                 view.setUint32(phkResult, handle >>> 0, true);
@@ -784,6 +791,7 @@ export class Advapi32 implements IModule {
 
             const { key: fullKey, isNew } = system.registry.createKey(root, subKey);
             const handle = process.resourceProvider.registerKernelObject({ kind: "reg", key: fullKey });
+            if (!handle) return { value: ERROR_NO_SYSTEM_RESOURCES, stackCleanup: 36 };
 
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             if (phkResult) {
@@ -825,6 +833,7 @@ export class Advapi32 implements IModule {
             const subKey = lpSubKey ? Marshaler.readWideString(mem, lpSubKey) : "";
             const { key: fullKey, isNew } = system.registry.createKey(root, subKey);
             const handle = process.resourceProvider.registerKernelObject({ kind: "reg", key: fullKey });
+            if (!handle) return { value: ERROR_NO_SYSTEM_RESOURCES, stackCleanup: 36 };
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
             if (phkResult) {
@@ -1358,6 +1367,10 @@ export class Advapi32 implements IModule {
                 database,
                 desiredAccess: dwDesiredAccess,
             });
+            if (!handle) {
+                system.scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+                return { value: 0, stackCleanup: 12 };
+            }
 
             return { value: handle >>> 0, stackCleanup: 12 };
         };
@@ -1410,6 +1423,10 @@ export class Advapi32 implements IModule {
                 startName,
                 password,
             });
+            if (!handle) {
+                system.scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+                return { value: 0, stackCleanup: 52 };
+            }
 
             if (lpdwTagId && lpdwTagId + 4 <= mem.length) {
                 const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -1443,6 +1460,10 @@ export class Advapi32 implements IModule {
                 name,
                 desiredAccess: dwDesiredAccess,
             });
+            if (!handle) {
+                system.scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+                return { value: 0, stackCleanup: 12 };
+            }
 
             system.scheduler.setLastError(0);
             return { value: handle >>> 0, stackCleanup: 12 };
@@ -1617,6 +1638,10 @@ export class Advapi32 implements IModule {
                 return { value: 0, stackCleanup: 4 };
             }
             const handle = process.resourceProvider.registerKernelObject({ kind: "sc_lock" });
+            if (!handle) {
+                system.scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+                return { value: 0, stackCleanup: 4 };
+            }
             system.scheduler.setLastError(0);
             return { value: handle >>> 0, stackCleanup: 4 };
         };
@@ -1667,6 +1692,10 @@ export class Advapi32 implements IModule {
                 serviceName,
                 handler: lpHandlerProc,
             });
+            if (!handle) {
+                system.scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+                return { value: 0, stackCleanup: 8 };
+            }
 
             system.scheduler.setLastError(0);
             return { value: handle >>> 0, stackCleanup: 8 };
@@ -2037,6 +2066,10 @@ export class Advapi32 implements IModule {
                 provType: dwProvType,
                 flags: dwFlags,
             });
+            if (!handle) {
+                system.scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+                return { value: 0, stackCleanup: 20 };
+            }
 
             if (!Mem.writeUint32(phProv, handle >>> 0)) {
                 process.resourceProvider.unregisterKernelObject(handle);
@@ -2122,6 +2155,10 @@ export class Advapi32 implements IModule {
                 hasher: makeCryptHasher(algId),
                 finalDigest: null as Uint8Array | null,
             });
+            if (!handle) {
+                system.scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+                return { value: 0, stackCleanup: 20 };
+            }
 
             if (!Mem.writeUint32(phHash, handle >>> 0)) {
                 process.resourceProvider.unregisterKernelObject(handle);
@@ -2204,6 +2241,10 @@ export class Advapi32 implements IModule {
                 flags: dwFlags,
                 dataLen: dwDataLen,
             });
+            if (!handle) {
+                system.scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+                return { value: 0, stackCleanup: 24 };
+            }
 
             if (!Mem.writeUint32(phKey, handle >>> 0)) {
                 process.resourceProvider.unregisterKernelObject(handle);

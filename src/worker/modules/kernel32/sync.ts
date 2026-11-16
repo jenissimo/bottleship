@@ -4,6 +4,7 @@
  * Atomic implementation for critical sections and debugging
  */
 
+import { ERROR_NO_SYSTEM_RESOURCES } from '../../core/thunking/thunk-errors';
 import { type HleDispatcher, ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
 import type { DeferredWrite, FastPathImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
@@ -1024,6 +1025,10 @@ const syncModule = (() => {
                 concurrentThreads,
             };
             portHandle = resourceProvider.registerKernelObject(port);
+            if (!portHandle) {
+                scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+                return 0;
+            }
         } else {
             const existing = resourceProvider.getKernelObject(portHandle) as any;
             if (!existing || existing.kind !== 'iocp') {
