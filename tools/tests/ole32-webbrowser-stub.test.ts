@@ -91,13 +91,119 @@ test('WebBrowser stand-in serves the interfaces a hosting control asks for, invi
     expect(call(faces.browser2, 'get_ReadyState', [2504])).toBe(0);
     expect(view().getUint32(2504, true)).toBe(4);
     memory.fill(0xcc, 2600, 2616);
-    expect(call(faces.browser2, 'Invoke', [0x100, 0, 0, 1, 0, 2600, 0, 0])).toBe(0);
-    expect([...memory.slice(2600, 2616)].every(b => b === 0)).toBe(true);
+    expect(call(faces.browser2, 'Invoke', [0x7ffffffe, 2700, 0, 1, 2720, 2600, 0, 0])).toBe(0x80020003);
+    expect(call(faces.browser2, 'Invoke', [0, 2700, 0, 1, 2720, 2600, 0, 0])).toBe(0x80020003);
+    expect(call(faces.browser2, 'Invoke', [0x7ffffffe, iidAt('unknown'), 0, 1, 2720, 2600, 0, 0])).toBe(0x80020001);
+    expect([...memory.slice(2600, 2616)].every(b => b === 0xcc)).toBe(true);
     let refs = call(obj, 'AddRef');
     expect(refs).toBe(8);
     for (let i = 0; i < 7; i++) refs = call(obj, 'Release');
     expect(refs).toBe(1);
     expect(call(obj, 'Release')).toBe(0);
+});
+
+function browser() {
+    expect(coCreateWebBrowser(process, CLSID_WEBBROWSER, IOLEOBJECT, 2048)).toBe(0);
+    const obj = view().getUint32(2048, true);
+    expect(call(obj, 'QueryInterface', [iidAt('browser2'), 2300])).toBe(0);
+    return { obj, b2: view().getUint32(2300, true) };
+}
+
+test('VARIANT_BOOL getters write two bytes, accepted puts are kept, VARIANT_TRUE reads back as -1', () => {
+    const { b2 } = browser();
+    const bools = ['Visible', 'StatusBar', 'MenuBar', 'FullScreen', 'Offline', 'Silent', 'RegisterAsBrowser',
+        'RegisterAsDropTarget', 'TheaterMode', 'AddressBar', 'Resizable', 'Busy', 'TopLevelContainer'];
+    for (const name of bools) {
+        memory.fill(0xcc, 2800, 2808);
+        expect(call(b2, 'get_' + name, [2800])).toBe(0);
+        expect([...memory.slice(2800, 2808)]).toEqual([0, 0, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc]);
+    }
+    expect(call(b2, 'put_Silent', [0xffff])).toBe(0);
+    memory.fill(0xcc, 2800, 2804);
+    expect(call(b2, 'get_Silent', [2800])).toBe(0);
+    expect(view().getInt16(2800, true)).toBe(-1);
+    expect(memory[2802]).toBe(0xcc);
+    expect(call(b2, 'put_Visible', [1])).toBe(0);
+    expect(call(b2, 'get_Visible', [2800])).toBe(0);
+    expect(view().getInt16(2800, true)).toBe(-1);
+    expect(call(b2, 'put_Visible', [0])).toBe(0);
+    expect(call(b2, 'get_Visible', [2800])).toBe(0);
+    expect(view().getInt16(2800, true)).toBe(0);
+    expect(call(b2, 'get_Silent', [2800])).toBe(0);
+    expect(view().getInt16(2800, true)).toBe(-1);
+    expect(call(b2, 'put_ToolBar', [2])).toBe(0);
+    memory.fill(0xcc, 2800, 2808);
+    expect(call(b2, 'get_ToolBar', [2800])).toBe(0);
+    expect(view().getInt32(2800, true)).toBe(2);
+    expect(memory[2804]).toBe(0xcc);
+    for (const name of ['get_Document', 'get_LocationURL', 'get_HWND', 'get_ReadyState', 'get_Width']) {
+        memory.fill(0xcc, 2800, 2808);
+        expect(call(b2, name.slice(0), [2800])).toBe(0);
+        expect(memory[2804]).toBe(0xcc);
+    }
+});
+
+test('the client site is kept with a reference, handed out with one, and released on replace, clear and final release', () => {
+    const queue: Array<{ fn: number; args: number[]; done: () => number | null }> = [];
+    const log: string[] = [];
+    (process as unknown as { dispatcher: Record<string, unknown> }).dispatcher.callbackManager = {
+        saveSuspendedThunkContext: () => 1,
+        invokeCallback: (fn: number, args: number[], _cleanup: number, done: () => number | null) => {
+            queue.push({ fn, args, done });
+            return { callbackId: queue.length };
+        },
+    };
+    const site = (at: number, table: number) => {
+        view().setUint32(at, table, true);
+        view().setUint32(table + 4, 0x30004 + at, true);
+        view().setUint32(table + 8, 0x30008 + at, true);
+        return at;
+    };
+    const A = site(0x3800, 0x3900), B = site(0x3a00, 0x3b00);
+    const name = (fn: number) => (fn === 0x30004 + A ? 'AddRef A' : fn === 0x30008 + A ? 'Release A'
+        : fn === 0x30004 + B ? 'AddRef B' : fn === 0x30008 + B ? 'Release B' : 'fn ' + fn.toString(16));
+    const run = (ptr: number, method: string, args: number[]) => {
+        const table = view().getUint32(ptr, true);
+        for (let slot = 0; slot < 80; slot++) {
+            const n = namesByStub.get(view().getUint32(table + slot * 4, true));
+            if (n?.endsWith('_' + method)) {
+                const r = handlers.get(n)!(null as never, memory, [ptr, ...args]) as number | { value: number; suspendedForCallback?: boolean; stackCleanup?: number };
+                let value = typeof r === 'number' ? r : r.value;
+                while (queue.length) {
+                    const c = queue.shift()!;
+                    log.push(name(c.fn) + '(' + c.args.map(x => x.toString(16)).join(',') + ')');
+                    const v = c.done();
+                    if (v !== null) value = v;
+                }
+                return { value: value >>> 0, cleanup: typeof r === 'number' ? null : r.stackCleanup };
+            }
+        }
+        throw new Error('no method ' + method);
+    };
+    const { obj } = browser();
+    expect(run(obj, 'SetClientSite', [A])).toEqual({ value: 0, cleanup: 8 });
+    expect(log.splice(0)).toEqual(['AddRef A(3800)']);
+    view().setUint32(2900, 0x1234, true);
+    expect(run(obj, 'GetClientSite', [2900])).toEqual({ value: 0, cleanup: 8 });
+    expect(view().getUint32(2900, true)).toBe(A);
+    expect(log.splice(0)).toEqual(['AddRef A(3800)']);
+    expect(run(obj, 'SetClientSite', [A]).value).toBe(0);
+    expect(log.splice(0)).toEqual([]);
+    expect(run(obj, 'SetClientSite', [B])).toEqual({ value: 0, cleanup: 8 });
+    expect(log.splice(0)).toEqual(['AddRef B(3a00)', 'Release A(3800)']);
+    expect(run(obj, 'SetClientSite', [0])).toEqual({ value: 0, cleanup: 8 });
+    expect(log.splice(0)).toEqual(['Release B(3a00)']);
+    expect(run(obj, 'GetClientSite', [2900]).value).toBe(0);
+    expect(view().getUint32(2900, true)).toBe(0);
+    expect(log.splice(0)).toEqual([]);
+    expect(run(obj, 'SetClientSite', [A]).value).toBe(0);
+    expect(log.splice(0)).toEqual(['AddRef A(3800)']);
+    expect(run(obj, 'AddRef', []).value).toBe(3);
+    expect(run(obj, 'Release', []).value).toBe(2);
+    expect(run(obj, 'Release', []).value).toBe(1);
+    expect(log.splice(0)).toEqual([]);
+    expect(run(obj, 'Release', [])).toEqual({ value: 0, cleanup: 4 });
+    expect(log.splice(0)).toEqual(['Release A(3800)']);
 });
 
 test('other classes and unknown first interfaces are left to the generic path', () => {

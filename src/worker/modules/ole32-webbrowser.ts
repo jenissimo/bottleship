@@ -1,5 +1,6 @@
 import type { Process } from '../core/process';
-import type { ThunkImplementation } from '../core/thunking/thunk-dispatcher';
+import type { ThunkImplementation, ThunkResult } from '../core/thunking/thunk-dispatcher';
+import { SystemResourceProvider } from '../core/resources/system-resource-provider';
 import { installComVtable } from '../core/com/install-com-vtable';
 import { allocateComObject, freeComObject } from '../core/com/com-memory';
 import { readGuidFromMem } from '../core/com/typelib/typelib-types';
@@ -8,6 +9,7 @@ import { Mem } from '../core/memory/mem-accessor';
 export const CLSID_WEBBROWSER = '8856f961-340a-11d0-a96b-00c04fd705a2';
 const CLSID_BYTES = [0x61, 0xf9, 0x56, 0x88, 0x0a, 0x34, 0xd0, 0x11, 0xa9, 0x6b, 0x00, 0xc0, 0x4f, 0xd7, 0x05, 0xa2];
 
+const IID_NULL = '00000000-0000-0000-0000-000000000000';
 const IID_IUNKNOWN = '00000000-0000-0000-c000-000000000046';
 const IID_IOLEOBJECT = '00000112-0000-0000-c000-000000000046';
 const IID_IOLEINPLACEOBJECT = '00000113-0000-0000-c000-000000000046';
@@ -22,7 +24,7 @@ const IID_IWEBBROWSER2 = 'd30c1661-cdaf-11d0-8a3e-00c04fc9e26e';
 
 const S_OK = 0, S_FALSE = 1;
 const E_NOTIMPL = 0x80004001, E_NOINTERFACE = 0x80004002, E_POINTER = 0x80004003, E_FAIL = 0x80004005;
-const DISP_E_UNKNOWNNAME = 0x80020006;
+const DISP_E_UNKNOWNNAME = 0x80020006, DISP_E_MEMBERNOTFOUND = 0x80020003, DISP_E_UNKNOWNINTERFACE = 0x80020001;
 const OLEOBJ_E_NOVERBS = 0x80040180;
 const OLEMISC_INVISIBLEATRUNTIME = 0x400;
 const READYSTATE_COMPLETE = 4;
@@ -68,9 +70,18 @@ export const WEBBROWSER_LAYOUTS: Record<Face, [string, number][]> = {
         ['get_Resizable', 2], ['put_Resizable', 2]],
 };
 
-interface Instance { faces: Record<Face, number>; refs: number; site: number; left: number; top: number; width: number; height: number }
+const BOOL_PROPS = ['Visible', 'StatusBar', 'MenuBar', 'FullScreen', 'Offline', 'Silent', 'RegisterAsBrowser',
+    'RegisterAsDropTarget', 'TheaterMode', 'AddressBar', 'Resizable'] as const;
+type BoolProp = typeof BOOL_PROPS[number];
+const FIXED_BOOL_GETTERS = ['get_Busy', 'get_TopLevelContainer'];
+const NULL_POINTER_GETTERS = ['get_Application', 'get_Parent', 'get_Container', 'get_Document', 'get_Type',
+    'get_LocationName', 'get_LocationURL', 'get_Name', 'get_FullName', 'get_Path', 'get_StatusText'];
+interface Instance {
+    faces: Record<Face, number>; refs: number; site: number;
+    left: number; top: number; width: number; height: number; toolBar: number; bools: Record<BoolProp, number>;
+}
 interface Runtime { generation: number; vtables: Record<Face, number>; instances: Map<number, Instance> }
-// @transient(the WebBrowser stand-in has no state worth restoring: a reloaded game re-creates its control, and a resetGeneration change discards the tables)
+// @transient(a capture is refused while a stand-in instance is live, see liveWebBrowserInstances; a resetGeneration change discards the tables)
 const runtimes = new WeakMap<Process, Runtime>();
 
 const FACES: Face[] = ['object', 'inplace', 'control', 'persist', 'browser'];
@@ -80,6 +91,42 @@ const PREFIX: Record<Face, string> = {
 };
 
 function out32(p: number, v: number): boolean { return p !== 0 && Mem.writeUint32(p, v >>> 0); }
+function out16(p: number, v: number): boolean { return p !== 0 && Mem.writeUint16(p, v & 0xffff); }
+function variantBool(v: number): number { return (v & 0xffff) ? -1 : 0; }
+
+export function liveWebBrowserInstances(process: Process): number {
+    const r = runtimes.get(process);
+    if (!r || r.generation !== process.resetGeneration) return 0;
+    return new Set(r.instances.values()).size;
+}
+
+function guestUnknownCalls(
+    process: Process, ctx: unknown, calls: Array<{ ptr: number; slot: 1 | 2 }>, stackCleanup: number, label: string, value: number,
+): number | ThunkResult {
+    const pending: Array<{ ptr: number; fn: number }> = [];
+    const provider = SystemResourceProvider.getInstance();
+    for (const { ptr, slot } of calls) {
+        if (!ptr) continue;
+        const host = provider.getComObjectByAddress(ptr);
+        if (host) { if (slot === 1) host.addRef(ptr); else host.release(ptr); continue; }
+        const vtable = Mem.readUint32(ptr) ?? 0;
+        const fn = vtable ? Mem.readUint32(vtable + slot * 4) ?? 0 : 0;
+        if (fn >= 0x10000) pending.push({ ptr, fn });
+    }
+    const callbacks = process.dispatcher?.callbackManager;
+    if (!pending.length || !callbacks) return value;
+    const frameId = callbacks.saveSuspendedThunkContext(ctx as Parameters<typeof callbacks.saveSuspendedThunkContext>[0], stackCleanup, label);
+    if (!frameId) return value;
+    let index = 0;
+    const next = (): number | null => {
+        index++;
+        if (index >= pending.length) return value;
+        callbacks.invokeCallback(pending[index]!.fn, [pending[index]!.ptr], 4, next, false, label, frameId);
+        return null;
+    };
+    const { callbackId } = callbacks.invokeCallback(pending[0]!.fn, [pending[0]!.ptr], 4, next, false, label, frameId);
+    return { value, suspendedForCallback: true, callbackId, stackCleanup };
+}
 function zero(p: number, n: number): boolean {
     if (!p) return false;
     for (let i = 0; i < n; i += 4) if (!Mem.writeUint32(p + i, 0)) return false;
@@ -96,6 +143,15 @@ function runtime(process: Process): Runtime | null {
         for (const face of FACES) { r.instances.delete(o.faces[face]); freeComObject(process.memory, o.faces[face]); }
         o.refs = 0;
         return 0;
+    };
+    const releaseFace = (ctx: unknown, self: number): number | ThunkResult => {
+        const o = r.instances.get(self);
+        if (!o) return 0;
+        const site = o.site;
+        const left = release(o);
+        if (left || !site) return left;
+        o.site = 0;
+        return guestUnknownCalls(process, ctx, [{ ptr: site, slot: 2 }], 4, 'WebBrowser_Release', 0);
     };
     const getter = (value: (o: Instance) => number): ThunkImplementation => (_c, _m, a) => {
         const o = r.instances.get(a[0] >>> 0);
@@ -119,12 +175,24 @@ function runtime(process: Process): Runtime | null {
             return S_OK;
         };
         handlers[`${p}_AddRef`] = (_c, _m, a) => { const o = r.instances.get(a[0] >>> 0); return o ? ++o.refs : 0; };
-        handlers[`${p}_Release`] = (_c, _m, a) => { const o = r.instances.get(a[0] >>> 0); return o ? release(o) : 0; };
+        handlers[`${p}_Release`] = (c, _m, a) => releaseFace(c, a[0] >>> 0);
     }
     const O = PREFIX.object;
     Object.assign(handlers, {
-        [`${O}_SetClientSite`]: ((_c, _m, a) => { const o = r.instances.get(a[0] >>> 0); if (o) o.site = a[1] >>> 0; return S_OK; }) as ThunkImplementation,
-        [`${O}_GetClientSite`]: ((_c, _m, a) => out32(a[1] >>> 0, 0) ? E_FAIL : E_POINTER) as ThunkImplementation,
+        [`${O}_SetClientSite`]: ((c, _m, a) => {
+            const o = r.instances.get(a[0] >>> 0);
+            if (!o) return E_POINTER;
+            const next = a[1] >>> 0, previous = o.site;
+            if (next === previous) return S_OK;
+            o.site = next;
+            return guestUnknownCalls(process, c, [{ ptr: next, slot: 1 }, { ptr: previous, slot: 2 }], 8, 'WebBrowser_SetClientSite', S_OK);
+        }) as ThunkImplementation,
+        [`${O}_GetClientSite`]: ((c, _m, a) => {
+            const o = r.instances.get(a[0] >>> 0);
+            if (!o) return E_POINTER;
+            if (!out32(a[1] >>> 0, o.site)) return E_POINTER;
+            return guestUnknownCalls(process, c, [{ ptr: o.site, slot: 1 }], 8, 'WebBrowser_GetClientSite', S_OK);
+        }) as ThunkImplementation,
         [`${O}_SetHostNames`]: ok, [`${O}_Close`]: ok, [`${O}_SetMoniker`]: ok,
         [`${O}_GetMoniker`]: ((_c, _m, a) => { out32(a[3] >>> 0, 0); return E_NOTIMPL; }) as ThunkImplementation,
         [`${O}_InitFromData`]: (() => E_NOTIMPL) as ThunkImplementation,
@@ -165,11 +233,29 @@ function runtime(process: Process): Runtime | null {
         [`${P}_InitNew`]: ok,
     });
     const B = PREFIX.browser;
-    const zeroGetters = ['get_Application', 'get_Parent', 'get_Container', 'get_Document', 'get_TopLevelContainer', 'get_Type',
-        'get_LocationName', 'get_LocationURL', 'get_Busy', 'get_Name', 'get_HWND', 'get_FullName', 'get_Path', 'get_Visible',
-        'get_StatusBar', 'get_StatusText', 'get_ToolBar', 'get_MenuBar', 'get_FullScreen', 'get_Offline', 'get_Silent',
-        'get_RegisterAsBrowser', 'get_RegisterAsDropTarget', 'get_TheaterMode', 'get_AddressBar', 'get_Resizable'];
-    for (const name of zeroGetters) handlers[`${B}_${name}`] = getter(() => 0);
+    for (const name of [...NULL_POINTER_GETTERS, 'get_HWND']) handlers[`${B}_${name}`] = getter(() => 0);
+    const boolGetter = (value: (o: Instance) => number): ThunkImplementation => (_c, _m, a) => {
+        const o = r.instances.get(a[0] >>> 0);
+        if (!o) return E_POINTER;
+        return out16(a[1] >>> 0, value(o)) ? S_OK : E_POINTER;
+    };
+    for (const name of FIXED_BOOL_GETTERS) handlers[`${B}_${name}`] = boolGetter(() => 0);
+    for (const prop of BOOL_PROPS) {
+        handlers[`${B}_get_${prop}`] = boolGetter(o => o.bools[prop]);
+        handlers[`${B}_put_${prop}`] = (_c, _m, a) => {
+            const o = r.instances.get(a[0] >>> 0);
+            if (!o) return E_POINTER;
+            o.bools[prop] = variantBool(a[1] >>> 0);
+            return S_OK;
+        };
+    }
+    handlers[`${B}_get_ToolBar`] = getter(o => o.toolBar);
+    handlers[`${B}_put_ToolBar`] = (_c, _m, a) => {
+        const o = r.instances.get(a[0] >>> 0);
+        if (!o) return E_POINTER;
+        o.toolBar = a[1] | 0;
+        return S_OK;
+    };
     handlers[`${B}_get_ReadyState`] = getter(() => READYSTATE_COMPLETE);
     handlers[`${B}_get_Left`] = getter(o => o.left);
     handlers[`${B}_get_Top`] = getter(o => o.top);
@@ -183,9 +269,7 @@ function runtime(process: Process): Runtime | null {
     handlers[`${B}_put_Left`] = setter('left'); handlers[`${B}_put_Top`] = setter('top');
     handlers[`${B}_put_Width`] = setter('width'); handlers[`${B}_put_Height`] = setter('height');
     for (const name of ['GoBack', 'GoForward', 'GoHome', 'GoSearch', 'Navigate', 'Refresh', 'Refresh2', 'Stop', 'Quit',
-        'PutProperty', 'put_Visible', 'put_StatusBar', 'put_StatusText', 'put_ToolBar', 'put_MenuBar', 'put_FullScreen',
-        'Navigate2', 'ExecWB', 'ShowBrowserBar', 'put_Offline', 'put_Silent', 'put_RegisterAsBrowser',
-        'put_RegisterAsDropTarget', 'put_TheaterMode', 'put_AddressBar', 'put_Resizable', 'ClientToWindow'])
+        'PutProperty', 'put_StatusText', 'Navigate2', 'ExecWB', 'ShowBrowserBar', 'ClientToWindow'])
         handlers[`${B}_${name}`] = ok;
     handlers[`${B}_GetProperty`] = (_c, _m, a) => zero(a[2] >>> 0, 16) ? S_OK : E_POINTER;
     handlers[`${B}_QueryStatusWB`] = (_c, _m, a) => out32(a[2] >>> 0, 0) ? S_OK : E_POINTER;
@@ -196,10 +280,11 @@ function runtime(process: Process): Runtime | null {
         for (let i = 0; i < count && ids; i++) Mem.writeUint32(ids + i * 4, 0xffffffff);
         return DISP_E_UNKNOWNNAME;
     };
-    handlers[`${B}_Invoke`] = (_c, _m, a) => {
-        const result = a[6] >>> 0;
-        if (result) zero(result, 16);
-        return S_OK;
+    handlers[`${B}_Invoke`] = (_c, mem, a) => {
+        const riid = a[2] >>> 0;
+        if (!riid || riid + 16 > mem.length) return E_POINTER;
+        if (readGuidFromMem(mem, riid).toLowerCase() !== IID_NULL) return DISP_E_UNKNOWNINTERFACE;
+        return DISP_E_MEMBERNOTFOUND;
     };
     for (const face of FACES) {
         const prefix = PREFIX[face];
@@ -232,7 +317,9 @@ export function coCreateWebBrowser(process: Process, clsid: string, iid: string,
     if (!r) return E_FAIL;
     const faces = {} as Record<Face, number>;
     for (const f of FACES) faces[f] = allocateComObject(process.memory, process.getCurrentMemory(), r.vtables[f]);
-    const object: Instance = { faces, refs: 1, site: 0, left: 0, top: 0, width: 0, height: 0 };
+    const bools = {} as Record<BoolProp, number>;
+    for (const prop of BOOL_PROPS) bools[prop] = 0;
+    const object: Instance = { faces, refs: 1, site: 0, left: 0, top: 0, width: 0, height: 0, toolBar: 0, bools };
     for (const f of FACES) r.instances.set(faces[f], object);
     if (!Mem.writeUint32(out, faces[face])) {
         for (const f of FACES) { r.instances.delete(faces[f]); freeComObject(process.memory, faces[f]); }

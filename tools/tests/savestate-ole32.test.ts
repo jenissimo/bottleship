@@ -9,6 +9,8 @@ import { System } from "../../src/worker/core/system";
 import { comVtableOwner, registerComVtableOwner } from "../../src/worker/core/com/com-memory";
 import { registerHleComServer } from "../../src/worker/core/com/hle-com-registry";
 import { preserveComVtableOwners, preserveMemBinding } from "./helpers/scoped-process-state";
+import { coCreateWebBrowser, CLSID_WEBBROWSER, liveWebBrowserInstances } from "../../src/worker/modules/ole32-webbrowser";
+import { CaptureRefusal } from "../../src/worker/savestate/object-codecs";
 
 preserveMemBinding();
 preserveComVtableOwners();
@@ -216,6 +218,31 @@ describe("ole32 participant", () => {
         const saved = used().ole.captureSavestate();
         saved.blowfishInstances = [[0x700000, 1, new Uint32Array(4)]];
         expect(() => boot().ole.restoreSavestate(saved)).toThrow("Blowfish state of 4 words");
+    });
+
+    test("a live WebBrowser stand-in refuses the capture by name, and the capture works again once it is released", () => {
+        const { ole, handlers } = used();
+        const process = ole.process as never as Parameters<typeof coCreateWebBrowser>[0];
+        const fake = ole.process as unknown as Record<string, unknown>;
+        const realGenerator = fake.thunkGenerator;
+        fake.resetGeneration = 0;
+        let code = 0x380000;
+        fake.thunkGenerator = { generateStubDll: (_n: string, methods: Array<{ name: string }>) => {
+            const baseAddress = code; code += methods.length * 16;
+            return { baseAddress, stubCode: new Uint8Array(methods.length * 16).fill(0xb8),
+                exportTable: new Map(methods.map((m, i) => [m.name.toLowerCase(), baseAddress + i * 16])) };
+        } };
+        try {
+            expect(coCreateWebBrowser(process, CLSID_WEBBROWSER, "00000112-0000-0000-c000-000000000046", 0x300000)).toBe(0);
+        } finally { fake.thunkGenerator = realGenerator; }
+        const obj = new DataView(memory.buffer).getUint32(0x300000, true);
+        expect(liveWebBrowserInstances(process)).toBe(1);
+        expect(() => ole.captureSavestate()).toThrow(CaptureRefusal);
+        expect(() => ole.captureSavestate()).toThrow(/WebBrowser/);
+        const release = handlers.get("webbrowser")!["WebBrowser_IOleObject_Release"]!;
+        expect(release(null, memory, [obj])).toBe(0);
+        expect(liveWebBrowserInstances(process)).toBe(0);
+        expect(() => ole.captureSavestate()).not.toThrow();
     });
 
     test("the registered participant covers ole32 and has a pinned schema", () => {
