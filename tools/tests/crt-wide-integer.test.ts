@@ -1,4 +1,5 @@
-import { beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { Logger } from "../../src/worker/core/logger";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { msvcrtModule } from "../../src/worker/api/msvcrt.api";
 import { registerCrtWideIntegerExports } from "../../src/worker/modules/crt-wide-integer";
@@ -19,7 +20,11 @@ const read = (): string => {
     return value;
 };
 const call = (name: string, ...args: number[]): number => exports[name]!(null as never, mem, args) as number;
+let quietLog: ReturnType<typeof spyOn>, quietError: ReturnType<typeof spyOn>;
+afterEach(() => { quietLog.mockRestore(); quietError.mockRestore(); });
 beforeEach(() => {
+    quietLog = spyOn(Logger, "log").mockImplementation(() => {});
+    quietError = spyOn(Logger, "error").mockImplementation(() => {});
     mem = new Uint8Array(0x10000).fill(0x55);
     Mem.bind(() => mem);
     errno = 123;
@@ -71,4 +76,88 @@ test("large capacity does not cause a capacity-sized scan or write", () => {
     expect(call("_ltow_s", 1, OUT, 0xffffffff, 10)).toBe(0);
     expect(read()).toBe("1");
     expect(Mem.readUint16(OUT + 4)).toBe(0x5555);
+});
+
+test("_ltow propagates a refused character store", () => {
+
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== OUT;
+    });
+    expect(() => call("_ltow", 12, OUT, 10)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(OUT);
+    expect(Mem.readUint16(OUT)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("_ltow propagates a refused terminator store", () => {
+
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== OUT + 4;
+    });
+    expect(() => call("_ltow", 12, OUT, 10)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(OUT + 4);
+    expect(Mem.readUint16(OUT + 4)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("_ltow propagates a refused clearing store", () => {
+
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== OUT;
+    });
+    expect(() => call("_ltow", 12, OUT, 1)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(OUT);
+    expect(Mem.readUint16(OUT)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("_ltow_s propagates a refused character store", () => {
+
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== OUT;
+    });
+    expect(() => call("_ltow_s", 12, OUT, 3, 10)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(OUT);
+    expect(Mem.readUint16(OUT)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("_ltow_s propagates a refused terminator store", () => {
+
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== OUT + 4;
+    });
+    expect(() => call("_ltow_s", 12, OUT, 3, 10)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(OUT + 4);
+    expect(Mem.readUint16(OUT + 4)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("_ltow_s propagates a refused clearing store", () => {
+
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== OUT;
+    });
+    expect(() => call("_ltow_s", 12, OUT, 1, 10)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(OUT);
+    expect(Mem.readUint16(OUT)).toBe(0x5555);
+    expect(errno).toBe(123);
 });
