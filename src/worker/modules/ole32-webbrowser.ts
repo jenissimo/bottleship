@@ -77,7 +77,7 @@ const FIXED_BOOL_GETTERS = ['get_Busy', 'get_TopLevelContainer'];
 const NULL_POINTER_GETTERS = ['get_Application', 'get_Parent', 'get_Container', 'get_Document', 'get_Type',
     'get_LocationName', 'get_LocationURL', 'get_Name', 'get_FullName', 'get_Path', 'get_StatusText'];
 interface Instance {
-    faces: Record<Face, number>; refs: number; site: number;
+    faces: Record<Face, number>; refs: number; site: number; unreleased: number[];
     left: number; top: number; width: number; height: number; toolBar: number; bools: Record<BoolProp, number>;
 }
 interface Runtime { generation: number; vtables: Record<Face, number>; instances: Map<number, Instance> }
@@ -100,31 +100,65 @@ export function liveWebBrowserInstances(process: Process): number {
     return new Set(r.instances.values()).size;
 }
 
+const REFUSED = Symbol('refused');
+const E_OUTOFMEMORY = 0x8007000E;
+
+/**
+ * AddRef/Release the given guest interface pointers in order, through suspended callbacks
+ * when the object lives in guest code. `onAccepted` runs once the whole chain is admitted
+ * (synchronously or with the first callback accepted), `onStopped(done)` when a later call of
+ * an admitted chain is refused with `done` calls already made. A chain that cannot start
+ * releases its frame and returns REFUSED with nothing changed; a throwing dispatch releases the
+ * frame and rethrows the original error.
+ */
 function guestUnknownCalls(
     process: Process, ctx: unknown, calls: Array<{ ptr: number; slot: 1 | 2 }>, stackCleanup: number, label: string, value: number,
-): number | ThunkResult {
+    hooks: { onAccepted?: () => void; onStopped?: (done: number) => void } = {},
+): number | ThunkResult | typeof REFUSED {
     const pending: Array<{ ptr: number; fn: number }> = [];
     const provider = SystemResourceProvider.getInstance();
     for (const { ptr, slot } of calls) {
         if (!ptr) continue;
-        const host = provider.getComObjectByAddress(ptr);
-        if (host) { if (slot === 1) host.addRef(ptr); else host.release(ptr); continue; }
+        if (provider.getComObjectByAddress(ptr)) continue;
         const vtable = Mem.readUint32(ptr) ?? 0;
         const fn = vtable ? Mem.readUint32(vtable + slot * 4) ?? 0 : 0;
         if (fn >= 0x10000) pending.push({ ptr, fn });
     }
     const callbacks = process.dispatcher?.callbackManager;
-    if (!pending.length || !callbacks) return value;
-    const frameId = callbacks.saveSuspendedThunkContext(ctx as Parameters<typeof callbacks.saveSuspendedThunkContext>[0], stackCleanup, label);
-    if (!frameId) return value;
+    if (pending.length && !callbacks) return REFUSED;
+    const hostCalls = () => {
+        for (const { ptr, slot } of calls) {
+            const host = ptr ? provider.getComObjectByAddress(ptr) : null;
+            if (host) { if (slot === 1) host.addRef(ptr); else host.release(ptr); }
+        }
+    };
+    if (!pending.length) { hostCalls(); hooks.onAccepted?.(); return value; }
+    const frameId = callbacks!.saveSuspendedThunkContext(ctx as Parameters<typeof callbacks.saveSuspendedThunkContext>[0], stackCleanup, label);
+    if (!frameId) return REFUSED;
     let index = 0;
     const next = (): number | null => {
         index++;
         if (index >= pending.length) return value;
-        callbacks.invokeCallback(pending[index]!.fn, [pending[index]!.ptr], 4, next, false, label, frameId);
+        let callbackId = 0;
+        try {
+            callbackId = callbacks!.invokeCallback(pending[index]!.fn, [pending[index]!.ptr], 4, next, false, label, frameId).callbackId;
+        } catch (error) {
+            hooks.onStopped?.(index);
+            throw error;
+        }
+        if (!callbackId) { hooks.onStopped?.(index); return E_OUTOFMEMORY; }
         return null;
     };
-    const { callbackId } = callbacks.invokeCallback(pending[0]!.fn, [pending[0]!.ptr], 4, next, false, label, frameId);
+    let callbackId = 0;
+    try {
+        callbackId = callbacks!.invokeCallback(pending[0]!.fn, [pending[0]!.ptr], 4, next, false, label, frameId).callbackId;
+    } catch (error) {
+        callbacks!.abandonSuspendedFrame(frameId);
+        throw error;
+    }
+    if (!callbackId) { callbacks!.abandonSuspendedFrame(frameId); return REFUSED; }
+    hostCalls();
+    hooks.onAccepted?.();
     return { value, suspendedForCallback: true, callbackId, stackCleanup };
 }
 function zero(p: number, n: number): boolean {
@@ -149,9 +183,12 @@ function runtime(process: Process): Runtime | null {
         if (!o) return 0;
         const site = o.site;
         const left = release(o);
-        if (left || !site) return left;
+        const owed = [...(site ? [site] : []), ...o.unreleased];
+        if (left || !owed.length) return left;
         o.site = 0;
-        return guestUnknownCalls(process, ctx, [{ ptr: site, slot: 2 }], 4, 'WebBrowser_Release', 0);
+        o.unreleased = [];
+        const res = guestUnknownCalls(process, ctx, owed.map(ptr => ({ ptr, slot: 2 as const })), 4, 'WebBrowser_Release', 0);
+        return res === REFUSED ? 0 : res;
     };
     const getter = (value: (o: Instance) => number): ThunkImplementation => (_c, _m, a) => {
         const o = r.instances.get(a[0] >>> 0);
@@ -184,14 +221,20 @@ function runtime(process: Process): Runtime | null {
             if (!o) return E_POINTER;
             const next = a[1] >>> 0, previous = o.site;
             if (next === previous) return S_OK;
-            o.site = next;
-            return guestUnknownCalls(process, c, [{ ptr: next, slot: 1 }, { ptr: previous, slot: 2 }], 8, 'WebBrowser_SetClientSite', S_OK);
+            const res = guestUnknownCalls(process, c, [{ ptr: next, slot: 1 }, { ptr: previous, slot: 2 }], 8, 'WebBrowser_SetClientSite', S_OK, {
+                onAccepted: () => { o.site = next; },
+                onStopped: () => { if (previous) o.unreleased.push(previous); },
+            });
+            return res === REFUSED ? E_OUTOFMEMORY : res;
         }) as ThunkImplementation,
         [`${O}_GetClientSite`]: ((c, _m, a) => {
             const o = r.instances.get(a[0] >>> 0);
             if (!o) return E_POINTER;
             if (!out32(a[1] >>> 0, o.site)) return E_POINTER;
-            return guestUnknownCalls(process, c, [{ ptr: o.site, slot: 1 }], 8, 'WebBrowser_GetClientSite', S_OK);
+            const res = guestUnknownCalls(process, c, [{ ptr: o.site, slot: 1 }], 8, 'WebBrowser_GetClientSite', S_OK);
+            if (res !== REFUSED) return res;
+            out32(a[1] >>> 0, 0);
+            return E_OUTOFMEMORY;
         }) as ThunkImplementation,
         [`${O}_SetHostNames`]: ok, [`${O}_Close`]: ok, [`${O}_SetMoniker`]: ok,
         [`${O}_GetMoniker`]: ((_c, _m, a) => { out32(a[3] >>> 0, 0); return E_NOTIMPL; }) as ThunkImplementation,
@@ -319,7 +362,7 @@ export function coCreateWebBrowser(process: Process, clsid: string, iid: string,
     for (const f of FACES) faces[f] = allocateComObject(process.memory, process.getCurrentMemory(), r.vtables[f]);
     const bools = {} as Record<BoolProp, number>;
     for (const prop of BOOL_PROPS) bools[prop] = 0;
-    const object: Instance = { faces, refs: 1, site: 0, left: 0, top: 0, width: 0, height: 0, toolBar: 0, bools };
+    const object: Instance = { faces, refs: 1, site: 0, unreleased: [], left: 0, top: 0, width: 0, height: 0, toolBar: 0, bools };
     for (const f of FACES) r.instances.set(faces[f], object);
     if (!Mem.writeUint32(out, faces[face])) {
         for (const f of FACES) { r.instances.delete(faces[f]); freeComObject(process.memory, faces[f]); }

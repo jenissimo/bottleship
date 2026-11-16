@@ -212,3 +212,89 @@ test('other classes and unknown first interfaces are left to the generic path', 
     expect(coCreateWebBrowser(process, CLSID_WEBBROWSER, '11111111-2222-3333-4444-555555555555', 2048)).toBe(0x80004002);
     expect(view().getUint32(2048, true)).toBe(0);
 });
+
+test('a refused or throwing site callback leaves the site, the references and no suspended frame behind', () => {
+    const E_OUTOFMEMORY = 0x8007000e;
+    type Mode = 'accept' | 'refuse' | 'throw';
+    let modes: Mode[] = [], frames = 0;
+    const abandoned: number[] = [], queue: Array<{ fn: number; done: () => number | null }> = [], log: string[] = [];
+    (process as unknown as { dispatcher: Record<string, unknown> }).dispatcher.callbackManager = {
+        saveSuspendedThunkContext: () => (frames < 32 ? ++frames : 0),
+        abandonSuspendedFrame: (id: number) => { abandoned.push(id); frames--; return true; },
+        invokeCallback: (fn: number, _args: number[], _c: number, done: () => number | null) => {
+            const mode = modes.shift() ?? 'accept';
+            if (mode === 'throw') throw new Error('CallbackError: return-stub pool exhausted');
+            if (mode === 'refuse') return { callbackId: 0 };
+            queue.push({ fn, done });
+            return { callbackId: queue.length };
+        },
+    };
+    const site = (at: number, table: number) => {
+        view().setUint32(at, table, true);
+        view().setUint32(table + 4, 0x30004 + at, true);
+        view().setUint32(table + 8, 0x30008 + at, true);
+        return at;
+    };
+    const A = site(0x3800, 0x3900), B = site(0x3a00, 0x3b00);
+    const name = (fn: number) => (fn === 0x30004 + A ? 'AddRef A' : fn === 0x30008 + A ? 'Release A'
+        : fn === 0x30004 + B ? 'AddRef B' : fn === 0x30008 + B ? 'Release B' : '?');
+    const run = (ptr: number, method: string, args: number[]) => {
+        const table = view().getUint32(ptr, true);
+        for (let slot = 0; slot < 80; slot++) {
+            const n = namesByStub.get(view().getUint32(table + slot * 4, true));
+            if (!n?.endsWith('_' + method)) continue;
+            const r = handlers.get(n)!(null as never, memory, [ptr, ...args]) as number | { value: number };
+            let value = typeof r === 'number' ? r : r.value;
+            while (queue.length) {
+                const c = queue.shift()!;
+                log.push(name(c.fn));
+                const v = c.done();
+                if (v !== null) { value = v; frames--; }
+            }
+            return value >>> 0;
+        }
+        throw new Error('no method ' + method);
+    };
+    const siteNow = (obj: number) => { modes = ['accept']; run(obj, 'GetClientSite', [2900]); log.splice(0); return view().getUint32(2900, true); };
+    const { obj } = browser();
+
+    frames = 31;
+    expect(run(obj, 'SetClientSite', [A])).toBe(0);
+    expect(log.splice(0)).toEqual(['AddRef A']);
+    frames = 32;
+    expect(run(obj, 'SetClientSite', [B])).toBe(E_OUTOFMEMORY);
+    expect(log.splice(0)).toEqual([]);
+    expect(frames).toBe(32);
+    frames = 0;
+    log.splice(0);
+    expect(siteNow(obj)).toBe(A);
+
+    modes = ['refuse'];
+    expect(run(obj, 'SetClientSite', [B])).toBe(E_OUTOFMEMORY);
+    expect(abandoned.length).toBe(1);
+    expect(frames).toBe(0);
+    expect(log.splice(0)).toEqual([]);
+    expect(siteNow(obj)).toBe(A);
+
+    modes = ['throw'];
+    expect(() => run(obj, 'SetClientSite', [B])).toThrow('return-stub pool exhausted');
+    expect(abandoned.length).toBe(2);
+    expect(frames).toBe(0);
+    expect(siteNow(obj)).toBe(A);
+
+    modes = ['accept', 'refuse'];
+    expect(run(obj, 'SetClientSite', [B])).toBe(E_OUTOFMEMORY);
+    expect(log.splice(0)).toEqual(['AddRef B']);
+    expect(frames).toBe(0);
+    expect(siteNow(obj)).toBe(B);
+    log.splice(0);
+
+    modes = ['refuse'];
+    view().setUint32(2900, 0x1234, true);
+    expect(run(obj, 'GetClientSite', [2900])).toBe(E_OUTOFMEMORY);
+    expect(view().getUint32(2900, true)).toBe(0);
+
+    modes = [];
+    while (run(obj, 'Release', []) !== 0) { /* drop the extra references GetClientSite left */ }
+    expect(log.filter(l => l.startsWith('Release'))).toEqual(['Release B', 'Release A']);
+});
