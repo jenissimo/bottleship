@@ -39,3 +39,43 @@ test("guest ContinueExecution retries the failed cdecl call with its caller fram
     f.deny(0x1000); f.call([12, 0x1000, 8, 10]);
     f.expectFault(0x1000); f.expectRetry();
 });
+
+// Permissions below come from AddressSpace; accessors are not mocked.
+
+test("_ltow reports the first inaccessible byte of a crossing WCHAR store (r)", () => {
+    f = crtDispatchFixture("_ltow"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "r");
+    f.call([12, dst, 10]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("_ltow reports the first inaccessible byte of a crossing WCHAR store (noaccess)", () => {
+    f = crtDispatchFixture("_ltow"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "noaccess");
+    f.call([12, dst, 10]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("_ltow reports the first byte when the first page is read-only", () => {
+    f = crtDispatchFixture("_ltow"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x1000, 0x1000, "r"); f.call([12, dst, 10]); f.expectFault(dst);
+});
+
+test("_ltow_s reports the first inaccessible byte of a crossing WCHAR store (r)", () => {
+    f = crtDispatchFixture("_ltow_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "r");
+    f.call([12, dst, 8, 10]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("_ltow_s reports the first inaccessible byte of a crossing WCHAR store (noaccess)", () => {
+    f = crtDispatchFixture("_ltow_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "noaccess");
+    f.call([12, dst, 8, 10]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("_ltow_s reports the first byte when the first page is read-only", () => {
+    f = crtDispatchFixture("_ltow_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x1000, 0x1000, "r"); f.call([12, dst, 8, 10]); f.expectFault(dst);
+});
