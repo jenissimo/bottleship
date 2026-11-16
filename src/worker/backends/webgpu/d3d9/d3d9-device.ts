@@ -43,6 +43,7 @@ import {
     type SamplerSpec,
 } from "../shared/dx-sampler";
 import { isDxDepthStencilFormat } from "../shared/dx-format-support";
+import { D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE } from "../shared/msaa-policy";
 import {
     makeD3D9FloatUpload,
     resolveD3D9FloatRenderTargetPolicy,
@@ -2100,7 +2101,10 @@ export class D3D9Device {
     /** Capability gate used by D3D9 module entry points before creating MSAA surfaces. */
     supportsD3D9MultisampleType(multiSampleType: number): boolean {
         const type = multiSampleType >>> 0;
-        if (type === 0) return true;
+        // NONMASKABLE is the single-sample answer the capability query already gives
+        // (resolveDxMsaaPolicy): CheckDeviceMultiSampleType reports it with one quality
+        // level, so CreateDevice/Reset/CreateRenderTarget must accept what it promised.
+        if (type === D3DMULTISAMPLE_NONE || type === D3DMULTISAMPLE_NONMASKABLE) return true;
         const sampleCount = d3d9MsaaSampleCount(type);
         return sampleCount !== null && this.d3d9MsaaProbe?.supportsSampleCount(sampleCount) === true;
     }
