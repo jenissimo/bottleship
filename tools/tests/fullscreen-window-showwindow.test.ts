@@ -65,3 +65,39 @@ test('a mode-set on an already-visible window posts no WM_SHOWWINDOW', () => {
 
     expect(posted.filter((m) => m.msg === WM_SHOWWINDOW)).toHaveLength(0);
 });
+
+const WM_SIZE = 0x0005;
+
+// Reset at the size the window already has changes no client rect, so it owes no WM_SIZE.
+// An engine that answers WM_SIZE with a device Reset (Unity's fullscreen path) would
+// otherwise Reset, hear WM_SIZE, and Reset again forever without presenting a frame.
+test('a mode-set at the current client size of a visible window posts no WM_SIZE', () => {
+    sharedWindows.set(HWND, { ...makeWindow(true), width: 800, height: 600 });
+    const posted = withRecordedMessages(() => {
+        resizeFullscreenWindowToMode(HWND, 800, 600, 'test');
+        resizeFullscreenWindowToMode(HWND, 800, 600, 'test');
+    });
+
+    expect(posted.filter((m) => m.msg === WM_SIZE)).toHaveLength(0);
+});
+
+test('a mode-set that changes the client size posts WM_SIZE once per change', () => {
+    sharedWindows.set(HWND, makeWindow(true));
+    const posted = withRecordedMessages(() => {
+        resizeFullscreenWindowToMode(HWND, 800, 600, 'test');
+        resizeFullscreenWindowToMode(HWND, 800, 600, 'test');
+        resizeFullscreenWindowToMode(HWND, 1024, 768, 'test');
+    });
+
+    const sizes = posted.filter((m) => m.msg === WM_SIZE);
+    expect(sizes).toHaveLength(2);
+    expect(sharedWindows.get(HWND)!.width).toBe(1024);
+    expect(sharedWindows.get(HWND)!.height).toBe(768);
+});
+
+test('a mode-set that shows a hidden window at its current size still posts WM_SIZE', () => {
+    sharedWindows.set(HWND, makeWindow(false));
+    const posted = withRecordedMessages(() => resizeFullscreenWindowToMode(HWND, 320, 200, 'test'));
+
+    expect(posted.filter((m) => m.msg === WM_SIZE)).toHaveLength(1);
+});

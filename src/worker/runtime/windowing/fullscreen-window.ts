@@ -42,6 +42,12 @@ export function resizeFullscreenWindowToMode(
     const system = System.getInstance();
 
     const winObj = system.windowManager?.getWindow(hwnd);
+    const sharedWin = sharedWindows.get(hwnd);
+    const sizeChanged = sharedWin
+        ? sharedWin.width !== width || sharedWin.height !== height
+        : !!winObj && (winObj.rect.w !== width || winObj.rect.h !== height);
+    const wasVisible = sharedWin ? sharedWin.visible : winObj?.visible;
+
     if (winObj) {
         winObj.rect.x = 0;
         winObj.rect.y = 0;
@@ -49,7 +55,6 @@ export function resizeFullscreenWindowToMode(
         winObj.rect.h = height;
     }
 
-    const sharedWin = sharedWindows.get(hwnd);
     if (sharedWin) {
         sharedWin.x = 0;
         sharedWin.y = 0;
@@ -62,9 +67,14 @@ export function resizeFullscreenWindowToMode(
     showFullscreenWindow(hwnd, source);
 
     // The app updates its viewport/projection from this, exactly as it does for a real
-    // fullscreen switch.
-    system.windowManager?.postMessage(hwnd, WM_SIZE, SIZE_RESTORED,
-        ((width & 0xFFFF) | ((height & 0xFFFF) << 16)) >>> 0);
+    // fullscreen switch. A mode-set that leaves the client area at the size it already
+    // had sends none: SetWindowPos to an unchanged client rect carries SWP_NOCLIENTSIZE
+    // and DefWindowProc then has no WM_SIZE to send. Engines that answer WM_SIZE with a
+    // device Reset would otherwise Reset, hear WM_SIZE, and Reset again without end.
+    if (sizeChanged || !wasVisible) {
+        system.windowManager?.postMessage(hwnd, WM_SIZE, SIZE_RESTORED,
+            ((width & 0xFFFF) | ((height & 0xFFFF) << 16)) >>> 0);
+    }
     Logger.log(LogCategory.SYSTEM,
         `${source}: fullscreen window resize hwnd=0x${hwnd.toString(16)} -> ${width}x${height}`);
 }
