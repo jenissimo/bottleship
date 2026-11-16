@@ -2,8 +2,9 @@ import { Mem } from "../core/memory/mem-accessor";
 import { raiseGuestAccessViolation } from "../core/thunking/guest-fault";
 import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 
+import {EmulatorConfig, getCodePageDecoder} from "../core/emulator-config-manager";
 import {ArrayVaListReader, formatCLazy} from "./crt-format";
-import {readCrtWString, readCrtCString, readCrtFormatString, withCrtReadFault} from "./crt-checked-strings";
+import {CrtReadFault, readCrtWString, withCrtReadFault} from "./crt-checked-strings";
 
 interface WideFormatHost {
     setErrno(code: number): void;
@@ -62,4 +63,38 @@ export function registerCrtWideFormatExports(exports: Record<string, ThunkImplem
     };
     exports["swprintf_s"] = withCrtReadFault(format(false));
     exports["_snwprintf_s"] = withCrtReadFault(format(true));
+}
+
+function readCrtCString(ptr: number, maxBytes: number): string {
+    if (!ptr) return "";
+    const limit = Math.max(1, maxBytes >>> 0), bytes: number[] = [];
+    for (let i = 0; i < limit; i++) {
+        const address = ptr + i, byte = Mem.readUint8(address);
+        if (byte === null) throw new CrtReadFault(address);
+        if (byte === 0) break;
+        bytes.push(byte);
+    }
+    return getCodePageDecoder(EmulatorConfig.getInstance().ansiCodePage).decode(new Uint8Array(bytes));
+}
+
+/** A precision-limited string need not have a readable terminator past its output. */
+function readCrtFormatString(ptr: number, wide: boolean, precision: number | null): string {
+    if (precision === 0) return "";
+    if (wide) return readCrtWString(ptr, precision === null ? 0x10000 : precision);
+    if (precision === null) return readCrtCString(ptr, 0x100000);
+    // Decode complete multibyte characters, stopping at the wide-output limit.
+    // A private streaming decoder keeps an access fault from retaining decoder state.
+    const codepage = getCodePageDecoder(EmulatorConfig.getInstance().ansiCodePage);
+    const decoder = codepage instanceof TextDecoder ? new TextDecoder(codepage.encoding) : null;
+    const byte = new Uint8Array(1);
+    let text = "";
+    for (let i = 0; i < 0x100000; i++) {
+        const address = ptr + i, value = Mem.readUint8(address);
+        if (value === null) throw new CrtReadFault(address);
+        if (value === 0) return (text + (decoder?.decode() ?? "")).slice(0, precision);
+        byte[0] = value;
+        text += decoder ? decoder.decode(byte, {stream: true}) : codepage.decode(byte);
+        if (text.length >= precision) return text.slice(0, precision);
+    }
+    return (text + (decoder?.decode() ?? "")).slice(0, precision);
 }
