@@ -134,6 +134,8 @@ const ucrtFunctions: FunctionDescriptor[] = [
     makeFunc("_utime64", 2),
     makeFunc("_utime", 2),
     makeFunc("_utime32", 2),
+    makeFunc("_ltow", 3),
+    makeFunc("_ltow_s", 4),
     makeFunc("_ultow", 3),
     makeFunc("wcsncat", 3),
     makeFunc("_getw", 1),

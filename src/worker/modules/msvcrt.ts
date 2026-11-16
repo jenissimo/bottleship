@@ -48,6 +48,7 @@ import { registerMsvcrtTimeLocaleExports } from "./msvcrt-time-locale";
 import { MsvcrtTimezoneState } from "./msvcrt-timezone";
 import { readWindowsTimezoneSnapshot } from "../runtime/windows-timezone";
 import { crtFileCharBytes, decodeCrtFileChar, encodeCrtFileChar } from "./crt-file-codec";
+import { registerCrtWideIntegerExports } from "./crt-wide-integer";
 import { captureCrtConvStatics, registerCrtConvExports, resetCrtConvStatics, restoreCrtConvStatics } from "./crt-conv";
 import { registerCrtPathExports } from "./crt-path";
 import { registerCrtSeh3Exports } from "./crt-seh3";
@@ -621,6 +622,7 @@ export class Msvcrt implements IModule {
         });
 
         // --- Conversion functions — see crt-conv.ts ---
+        registerCrtWideIntegerExports(exports, { setErrno: e => { this.setErrno(e); } });
         registerCrtConvExports(exports, {
             process: this.process,
             readCString: (p, max) => this.readCString(p, max),
