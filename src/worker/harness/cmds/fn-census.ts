@@ -17,7 +17,7 @@
 
 import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
-import { startRetiredAccumulator, peekRetiredTotal, stopRetiredAccumulator, type RetiredAccumulator } from "./perf";
+import { startRetiredAccumulator, peekRetiredTotal, stopRetiredAccumulator, countedWindowActive, type RetiredAccumulator } from "./perf";
 import { cpu, symbolize } from "../serialize";
 import { dbg } from "../../core/debug/dbg-commands";
 
@@ -133,12 +133,17 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
     }
 
     type Row = { r: Uint32Array; entries: number; admitted: number; refused: number; executed: number };
+    const changedVersion = (r: Uint32Array) => {
+        const b = before.rows.get(r[ROW.entryVirt]!);
+        return !!b && b[ROW.flags] !== 0 && (b[ROW.analyses] !== r[ROW.analyses] || b[ROW.smcEvents] !== r[ROW.smcEvents]);
+    };
     const window: Row[] = [];
+    const versionChanged: Row[] = [];
     for (const [virt, r] of after.rows) {
         const b = before.rows.get(virt);
         const entries = r[ROW.entries]! - (b?.[ROW.entries] ?? 0);
         if (entries <= 0) continue;
-        window.push({
+        (changedVersion(r) ? versionChanged : window).push({
             r, entries, executed: 0,
             admitted: r[ROW.windowAdmitted]! - (b?.[ROW.windowAdmitted] ?? 0),
             refused: r[ROW.windowRefused]! - (b?.[ROW.windowRefused] ?? 0),
@@ -146,7 +151,7 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
     }
 
     const counted = after.counted;
-    let countedTotal = 0, ownedAdmitted = 0, ownedRefused = 0, unattributed = 0, saturated = 0;
+    let countedTotal = 0, ownedAdmitted = 0, ownedRefused = 0, unattributed = 0, saturated = 0, ownedChanged = 0;
     const byEntry = new Map(window.map(w => [w.r[ROW.entryVirt]!, w]));
     const rowsByIndex = [...after.rows.values()];
     if (counted) {
@@ -157,6 +162,7 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
             const owner = b.owner > 0 ? rowsByIndex[b.owner - 1] : undefined;
             const row = owner ? byEntry.get(owner[ROW.entryVirt]!) : undefined;
             if (!owner) { unattributed += w; continue; }
+            if (changedVersion(owner)) { ownedChanged += w; continue; }
             if (row) row.executed += w;
             if (owner[ROW.unit] === 0) ownedAdmitted += w; else ownedRefused += w;
         }
@@ -224,7 +230,16 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
                 admittedPct: pct(probesAdmitted, probesAdmitted + probesRefused),
                 refusedBy: probeReasons,
             },
-            executed: counted
+            executed: counted && executedProblems(counted, countedTotal, retired, saturated, before).length
+                ? {
+                    available: false,
+                    note: "executed coverage is unavailable for this window; the raw counts are kept as evidence",
+                    problems: executedProblems(counted, countedTotal, retired, saturated, before),
+                    raw: { retiredIns: retired, countedIns: countedTotal, admittedIns: ownedAdmitted, refusedIns: ownedRefused,
+                        unattributedIns: unattributed, changedVersionIns: ownedChanged, saturatedBlocks: saturated,
+                        recording: counted.recording, watchedPages: counted.watchedPages, armedPages: counted.armedPages },
+                }
+                : counted
                 ? {
                     note: "trace2 counted channel on the candidates' code pages: exec x instructions per block, a block "
                         + "attributed by its entry address to the function whose decoded range holds it",
@@ -233,7 +248,8 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
                     admittedIns: ownedAdmitted,
                     refusedIns: ownedRefused,
                     unattributedIns: unattributed,
-                    unknownIns: Math.max(0, retired - countedTotal),
+                    changedVersionIns: ownedChanged,
+                    unknownIns: retired - countedTotal,
                     admittedPctOfRetired: pct(ownedAdmitted, retired),
                     admittedPctOfCounted: pct(ownedAdmitted, countedTotal),
                     windowEligiblePctOfRetired: pct(sumExec(windowEligible), retired),
@@ -241,6 +257,12 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
                     recording: counted.recording,
                 }
                 : { available: false, note: "the counted channel was not armed at fnCensusMark(); executed coverage is unknown, not zero" },
+            versionChanged: {
+                note: "functions re-analysed after a code write inside the window: which body ran is not known, so their "
+                    + "entries and counted instructions are left out of every share above",
+                functions: versionChanged.length,
+                entries: versionChanged.reduce((s, w) => s + w.entries, 0),
+            },
             dropped: {
                 rowTableFull: stat(1),
                 rangePoolOverflow: stat(8),
@@ -274,6 +296,20 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
             }),
         },
     };
+}
+
+/** Reasons a counted window cannot give exact shares; empty when it can. */
+export function executedProblems(counted: NonNullable<FnCensusSnapshot["counted"]>, countedTotal: number, retired: number,
+    saturated: number, before: FnCensusSnapshot): string[] {
+    const out: string[] = [];
+    if (!counted.recording) out.push("the counted recorder was disarmed during the window");
+    if (counted.watchedPages !== counted.armedPages) {
+        out.push(`the recorder watches ${counted.watchedPages} pages but this window armed ${counted.armedPages}: another observer changed it`);
+    }
+    if (!before.counted) out.push("the counted channel was not armed at fnCensusMark()");
+    if (countedTotal > retired) out.push(`counted ${countedTotal} instructions exceed the ${retired} retired: inconsistent denominators`);
+    if (saturated > 0) out.push(`${saturated} block counter(s) saturated: their weight is a lower bound of unknown size`);
+    return out;
 }
 
 // @transient(harness census window; a reset or restore moves the kernel generation, which refuses the report)
@@ -363,6 +399,13 @@ export function candidatePages(rows: Iterable<Uint32Array>, maxPages: number): {
     return { pages: all.slice(0, maxPages), wanted: all.length };
 }
 
+/** Stop what this verb armed (retired ticker, counted recorder) without touching a recorder guestBlocks owns. */
+function releaseOwnedObserver(w: Exports): void {
+    if (retiredAcc) { stopRetiredAccumulator(retiredAcc); retiredAcc = null; }
+    if (countedArmed && !countedWindowActive()) w.trace2_unwatch_all?.();
+    countedArmed = null;
+}
+
 export function registerFnCensusCommands(svc: HarnessService): void {
     /**
      * fnCensusArm({on?, caps?}) — switch the census on (kernel reset + JIT cache clear through
@@ -376,11 +419,11 @@ export function registerFnCensusCommands(svc: HarnessService): void {
             const c = opts.caps;
             w.fn_census_set_caps?.(c.codePages ?? cur[0]!, c.instructions ?? cur[1]!, c.blocks ?? cur[2]!, c.bytes ?? cur[3]!, c.windowPages ?? cur[4]!);
         }
+        releaseOwnedObserver(w);
         dbg.fnCensusEnable(opts.on ?? true);
         armEpoch++;
         armedAtMs = performance.now();
         mark = null;
-        countedArmed = null;
         return {
             armed: opts.on ?? true, armEpoch, schema: FN_CENSUS_SCHEMA,
             caps: [0, 1, 2, 3, 4].map(i => w.fn_census_get_cap!(i) >>> 0),
@@ -396,11 +439,13 @@ export function registerFnCensusCommands(svc: HarnessService): void {
     svc.register("fnCensusMark", (args) => {
         const opts = (args[0] ?? {}) as { maxPages?: number; counted?: boolean };
         const { w } = liveExports();
-        if (retiredAcc) stopRetiredAccumulator(retiredAcc);
-        countedArmed = null;
+        releaseOwnedObserver(w);
         let counted: Record<string, unknown> = { armed: false };
         if (opts.counted ?? true) {
-            if (typeof w.trace2_reset !== "function" || typeof w.trace2_watch_page !== "function") {
+            if (countedWindowActive()) {
+                counted = { armed: false, note: "guestBlocks owns an armed counted window; executed coverage will be unavailable" };
+            }
+            else if (typeof w.trace2_reset !== "function" || typeof w.trace2_watch_page !== "function") {
                 counted = { armed: false, note: "trace2 exports missing: executed coverage will be reported unavailable" };
             }
             else {

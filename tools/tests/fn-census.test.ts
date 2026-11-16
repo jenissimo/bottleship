@@ -5,8 +5,9 @@
  */
 
 import { describe, test, expect } from "bun:test";
+import { System } from "../../src/worker/core/system";
 import {
-    summarizeFnCensus, candidatePages, ROW, FN_CENSUS_ROW_WORDS, STAT_NAMES,
+    summarizeFnCensus, candidatePages, registerFnCensusCommands, ROW, FN_CENSUS_ROW_WORDS, STAT_NAMES, FN_CENSUS_SCHEMA,
     type FnCensusSnapshot, type CountedSample,
 } from "../../src/worker/harness/cmds/fn-census";
 
@@ -102,7 +103,7 @@ describe("readout", () => {
             { addr: 0x500000, exec: 10, ins: 7, owner: 0 },
         ];
         const counted = { recording: true, watchedPages: 2, armedPages: 2, pagesNotArmed: 1, slotOverflow: 0, blocks };
-        const before = snap({ atMs: 1, retiredTotal: 0 }, [leaf(0), caller(0)], { calls: 0 });
+        const before = snap({ atMs: 1, retiredTotal: 0, counted: { ...counted, blocks: [] } }, [leaf(0), caller(0)], { calls: 0 });
         const after = snap({ atMs: 2, retiredTotal: 20000, counted }, [leaf(100), caller(10)], { calls: 110 });
         const r = summarizeFnCensus(before, after);
         expect(r.ok).toBe(true);
@@ -121,11 +122,53 @@ describe("readout", () => {
         expect(top[0].frame).toEqual([-12, 8]);
     });
 
-    test("a saturated counted block is named as dropped precision", () => {
-        const counted = { recording: true, watchedPages: 1, armedPages: 1, pagesNotArmed: 0, slotOverflow: 0,
-            blocks: [{ addr: LEAF, exec: 0xffffffff, ins: 1, owner: 1 }] };
-        const r = summarizeFnCensus(snap({ atMs: 1 }, [leaf(0)]), snap({ atMs: 2, counted }, [leaf(5)], { calls: 5 }));
-        expect(r.ok && (r.report.dropped as any).countedSaturatedBlocks).toBe(1);
+    const ch = (blocks: CountedSample[], o: Partial<NonNullable<FnCensusSnapshot["counted"]>> = {}) =>
+        ({ recording: true, watchedPages: 1, armedPages: 1, pagesNotArmed: 0, slotOverflow: 0, blocks, ...o });
+    const exec = (before: FnCensusSnapshot, after: FnCensusSnapshot) => {
+        const r = summarizeFnCensus(before, after);
+        if (!r.ok) throw new Error(r.refuse);
+        return r.report.executed as any;
+    };
+
+    test("a saturated counted block makes executed shares unavailable, raw evidence kept", () => {
+        const x = exec(snap({ atMs: 1, counted: ch([]) }, [leaf(0)]),
+            snap({ atMs: 2, retiredTotal: 1e12, counted: ch([{ addr: LEAF, exec: 0xffffffff, ins: 1, owner: 1 }]) }, [leaf(5)], { calls: 5 }));
+        expect(x.available).toBe(false);
+        expect(x.problems.join(" ")).toContain("saturated");
+        expect(x.raw.saturatedBlocks).toBe(1);
+        expect(x.admittedPctOfRetired).toBeUndefined();
+    });
+
+    test("counted above retired is inconsistent, not 200 %", () => {
+        const x = exec(snap({ atMs: 1, counted: ch([]) }, [leaf(0)]),
+            snap({ atMs: 2, retiredTotal: 100, counted: ch([{ addr: LEAF, exec: 100, ins: 2, owner: 1 }]) }, [leaf(5)], { calls: 5 }));
+        expect(x.available).toBe(false);
+        expect(x.raw.countedIns).toBe(200);
+        expect(x.problems.join(" ")).toContain("exceed");
+    });
+
+    test("a recorder disarmed or changed during the window gives no shares", () => {
+        const blocks = [{ addr: LEAF, exec: 10, ins: 2, owner: 1 }];
+        const before = snap({ atMs: 1, counted: ch([]) }, [leaf(0)]);
+        expect(exec(before, snap({ atMs: 2, retiredTotal: 1000, counted: ch(blocks, { recording: false }) }, [leaf(5)], { calls: 5 })).available).toBe(false);
+        expect(exec(before, snap({ atMs: 2, retiredTotal: 1000, counted: ch(blocks, { watchedPages: 3 }) }, [leaf(5)], { calls: 5 })).available).toBe(false);
+        expect(exec(before, snap({ atMs: 2, retiredTotal: 1000, counted: ch(blocks) }, [leaf(5)], { calls: 5 })).admittedIns).toBe(20);
+    });
+
+    test("a function re-analysed after SMC inside the window is attributed to neither version", () => {
+        const before = snap({ atMs: 1, counted: ch([]) }, [caller(0) as Uint32Array]);
+        before.rows.get(CALLER)![ROW.flags] = 2;
+        before.rows.get(CALLER)![ROW.analyses] = 1;
+        const now = leaf(50, { entryVirt: CALLER, entryPhys: CALLER, analyses: 2, flags: 2, smcEvents: 1 });
+        const r = summarizeFnCensus(before, snap({ atMs: 2, retiredTotal: 10000, counted: ch([{ addr: CALLER, exec: 1000, ins: 9, owner: 1 }]) }, [now], { calls: 50 }));
+        expect(r.ok).toBe(true);
+        if (!r.ok) return;
+        const x = r.report.executed as any;
+        expect(x.admittedIns).toBe(0);
+        expect(x.refusedIns).toBe(0);
+        expect(x.changedVersionIns).toBe(9000);
+        expect((r.report.versionChanged as any).functions).toBe(1);
+        expect((r.report.population as any).unitAdmitted).toBe(0);
     });
 });
 
@@ -138,5 +181,56 @@ describe("candidate pages for the counted channel", () => {
         const out = candidatePages([a, b, c], 2);
         expect(out.pages).toEqual([0x402, 0x403]);
         expect(out.wanted).toBe(3);
+    });
+});
+
+describe("command lifecycle", () => {
+    test("off stops the ticker and unwatches the recorder this verb armed, and leaves guestBlocks' alone", () => {
+        const rows = new Uint32Array(FN_CENSUS_ROW_WORDS);
+        rows[ROW.entryVirt] = LEAF; rows[ROW.entries] = 10; rows[ROW.codePage0] = LEAF >>> 12; rows[ROW.flags] = 2;
+        const log: string[] = [];
+        let enabled = 0, watched = 0;
+        const exp: Record<string, (...a: number[]) => number> = {
+            fn_census_version: () => FN_CENSUS_SCHEMA, fn_census_row_words: () => FN_CENSUS_ROW_WORDS,
+            fn_census_set_enabled: (on) => { enabled = on; return 0; }, fn_census_enabled: () => enabled,
+            fn_census_generation: () => 1, fn_census_reset: () => 0, fn_census_row_count: () => 1, fn_census_rows_ptr: () => 0,
+            fn_census_stat: () => 0, fn_census_stat_count: () => STAT_NAMES.length, fn_census_owner_of: () => 0,
+            fn_census_get_cap: () => 1, jit_codegen_fingerprint_lo: () => 1, jit_codegen_fingerprint_hi: () => 2,
+            trace2_reset: () => { watched = 0; log.push("reset"); return 0; },
+            trace2_watch_page: () => { watched++; return 1; },
+            trace2_unwatch_all: () => { watched = 0; log.push("unwatch"); return 0; },
+            trace2_enabled: () => (watched ? 1 : 0), trace2_watched_page_count: () => watched,
+            trace2_block_snapshot: () => 0, jit_clear_cache_js: () => 0,
+        };
+        const cpuObj = { wm: { exports: exp }, wasm_memory: { buffer: rows.buffer }, instruction_counter: new Int32Array(1) };
+        const system = System.getInstance() as any;
+        const saved = system.process;
+        const g = globalThis as any;
+        const savedPre = g.preemption;
+        const timers: unknown[] = [];
+        const realSet = globalThis.setInterval, realClear = globalThis.clearInterval;
+        (globalThis as any).setInterval = (f: () => void, ms: number) => { const t = realSet(f, ms); timers.push(t); return t; };
+        let cleared = 0;
+        (globalThis as any).clearInterval = (t: any) => { cleared++; realClear(t); };
+        try {
+            system.process = { v86: { cpu: cpuObj } };
+            g.preemption = { getWasmExports: () => ({ ...exp, dbg_enable: () => 0 }) };
+            const handlers = new Map<string, (a: unknown[]) => unknown>();
+            registerFnCensusCommands({ register: (n: string, f: (a: unknown[]) => unknown) => handlers.set(n, f) } as never);
+            handlers.get("fnCensusArm")!([{}]);
+            handlers.get("fnCensusMark")!([{}]);
+            expect(watched).toBe(1);
+            expect(timers.length).toBe(1);
+            handlers.get("fnCensusArm")!([{ on: false }]);
+            expect(enabled).toBe(0);
+            expect(watched).toBe(0);
+            expect(log).toContain("unwatch");
+            expect(cleared).toBe(1);
+        } finally {
+            system.process = saved;
+            g.preemption = savedPre;
+            (globalThis as any).setInterval = realSet;
+            (globalThis as any).clearInterval = realClear;
+        }
     });
 });
