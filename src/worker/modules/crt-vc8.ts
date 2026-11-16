@@ -31,16 +31,10 @@ export interface CrtVc8Host {
     setErrno(code: number): void;
     /** vsnprintf into a caller buffer: at most `count` bytes, -1 when it did not fit. */
     vsnprintf(dest: number, count: number, format: number, vaList: number): number;
-    /** Format a wide format string whose variadic arguments start at args[first]. */
-    formatWide(format: number, args: number[], first: number): string;
 }
 
 const EINVAL = 22;
 const ERANGE = 34;
-/** STRUNCATE: a *_s copy given _TRUNCATE that had to cut the source short. */
-const STRUNCATE = 80;
-/** _TRUNCATE ((size_t)-1): copy what fits instead of failing. */
-const TRUNCATE = 0xffffffff;
 const MAX_STR = 0x100000;
 
 /** The two dwords of bookkeeping that sit below an _aligned_malloc pointer. */
@@ -176,98 +170,6 @@ export function registerCrtVc8Exports(exports: Record<string, ThunkImplementatio
         if (s.length + 1 > size) { Mem.writeUint8(dst, 0); host.setErrno(ERANGE); return ERANGE; }
         host.writeCString(dst, s);
         return 0;
-    };
-
-    // The wide secure copies. Sizes count wchar_t, not bytes, and on overflow the destination
-    // is left empty, as with the narrow forms above.
-    exports["wcscpy_s"] = (_c, _m, a) => {
-        const dst = (a[0] ?? 0) >>> 0;
-        const size = (a[1] ?? 0) >>> 0;
-        const src = (a[2] ?? 0) >>> 0;
-        if (!dst || size === 0) { host.setErrno(EINVAL); return EINVAL; }
-        if (!src) { host.writeWString(dst, ""); host.setErrno(EINVAL); return EINVAL; }
-        const s = host.readWString(src, MAX_STR);
-        if (s.length + 1 > size) { host.writeWString(dst, ""); host.setErrno(ERANGE); return ERANGE; }
-        host.writeWString(dst, s);
-        return 0;
-    };
-
-    exports["wcscat_s"] = (_c, _m, a) => {
-        const dst = (a[0] ?? 0) >>> 0;
-        const size = (a[1] ?? 0) >>> 0;
-        const src = (a[2] ?? 0) >>> 0;
-        if (!dst || size === 0) { host.setErrno(EINVAL); return EINVAL; }
-        if (!src) { host.writeWString(dst, ""); host.setErrno(EINVAL); return EINVAL; }
-        const head = host.readWString(dst, size);
-        // An unterminated destination is EINVAL: there is nowhere to append to.
-        if (head.length >= size) { host.writeWString(dst, ""); host.setErrno(EINVAL); return EINVAL; }
-        const tail = host.readWString(src, MAX_STR);
-        if (head.length + tail.length + 1 > size) { host.writeWString(dst, ""); host.setErrno(ERANGE); return ERANGE; }
-        host.writeWString(dst, head + tail);
-        return 0;
-    };
-
-    /**
-     * wcsncpy_s/wcsncat_s copy at most `count` characters of the source. With
-     * count == _TRUNCATE they copy what fits and return STRUNCATE; otherwise a source
-     * that does not fit is ERANGE and leaves the destination empty.
-     */
-    const wcsnSecure = (append: boolean): ThunkImplementation => (_c, _m, a) => {
-        const dst = (a[0] ?? 0) >>> 0;
-        const size = (a[1] ?? 0) >>> 0;
-        const src = (a[2] ?? 0) >>> 0;
-        const count = (a[3] ?? 0) >>> 0;
-        if (!append && count === 0 && dst === 0 && size === 0) return 0;
-        if (!dst || size === 0) { host.setErrno(EINVAL); return EINVAL; }
-        const head = append ? host.readWString(dst, size) : "";
-        if (append && head.length >= size) { host.writeWString(dst, ""); host.setErrno(EINVAL); return EINVAL; }
-        if (count === 0) { host.writeWString(dst, head); return 0; }
-        if (!src) { host.writeWString(dst, ""); host.setErrno(EINVAL); return EINVAL; }
-        const room = size - 1 - head.length;
-        const source = host.readWString(src, count === TRUNCATE ? MAX_STR : Math.min(count, MAX_STR));
-        if (source.length > room) {
-            if (count !== TRUNCATE) { host.writeWString(dst, ""); host.setErrno(ERANGE); return ERANGE; }
-            host.writeWString(dst, head + source.slice(0, room));
-            return STRUNCATE;
-        }
-        host.writeWString(dst, head + source);
-        return 0;
-    };
-    exports["wcsncpy_s"] = wcsnSecure(false);
-    exports["wcsncat_s"] = wcsnSecure(true);
-
-    /** int swprintf_s(wchar_t* buffer, size_t sizeOfBuffer, const wchar_t* format, ...) */
-    exports["swprintf_s"] = (_c, _m, a) => {
-        const dst = (a[0] ?? 0) >>> 0;
-        const size = (a[1] ?? 0) >>> 0;
-        const fmt = (a[2] ?? 0) >>> 0;
-        if (!dst || size === 0 || !fmt) { host.setErrno(EINVAL); return -1; }
-        const out = host.formatWide(fmt, a, 3);
-        if (out.length + 1 > size) { host.writeWString(dst, ""); host.setErrno(ERANGE); return -1; }
-        host.writeWString(dst, out);
-        return out.length;
-    };
-
-    /**
-     * int _snwprintf_s(wchar_t* buffer, size_t sizeOfBuffer, size_t count, const wchar_t* format, ...)
-     * Writes at most `count` characters. Output longer than `count` is cut to it and returns -1;
-     * output that does not fit the buffer is ERANGE (empty buffer) unless count is _TRUNCATE,
-     * which keeps what fits.
-     */
-    exports["_snwprintf_s"] = (_c, _m, a) => {
-        const dst = (a[0] ?? 0) >>> 0;
-        const size = (a[1] ?? 0) >>> 0;
-        const count = (a[2] ?? 0) >>> 0;
-        const fmt = (a[3] ?? 0) >>> 0;
-        if (count === 0 && dst === 0 && size === 0) return 0;
-        if (!dst || size === 0 || !fmt) { host.setErrno(EINVAL); return -1; }
-        const out = host.formatWide(fmt, a, 4);
-        const limit = count === TRUNCATE ? size - 1 : count;
-        if (out.length <= limit && out.length + 1 <= size) { host.writeWString(dst, out); return out.length; }
-        if (limit + 1 <= size) { host.writeWString(dst, out.slice(0, limit)); return -1; }
-        host.writeWString(dst, "");
-        host.setErrno(ERANGE);
-        return -1;
     };
 
     exports["strcat_s"] = (_c, _m, a) => {

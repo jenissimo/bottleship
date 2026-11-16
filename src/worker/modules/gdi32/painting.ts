@@ -17,10 +17,9 @@ import { LOGPEN_OFFSETS, LOGPEN_SIZE, STOCK_NULL_BRUSH, colorToCss } from './gdi
 import { writeBackDibSectionRect, readDibSectionRgbaGeneric } from './bitmap-resolve';
 import { patBlt } from './gdi-blit';
 import { extTextOut } from './ext-text-out';
-import { fontCellHeight, measureTextMetricsCached, prefixWidths } from './text-extent-cache';
+import { fontCellHeight, measureTextMetricsCached, measureWholeTextCached, prefixWidths } from './text-extent-cache';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
-import { getFontSetEpoch } from './font-resource';
 import { measureVerticalMetrics } from './text-metrics';
 // Track GetPixel HDC usage for profiling
 // @transient(diagnostics)
@@ -615,53 +614,12 @@ function dibToCanvas(
 /**
  * Measure text extent using the DC's current font, writing SIZE struct (cx, cy)
  */
-const EXTENT_CACHE_MAX_PER_FONT = 4096;
-// @transient(derived text measurements keyed by font and host-font generation)
-const extentCache = new Map<string, Map<string, readonly [number, number]>>();
-// @transient(derived host-font cache generation)
-let extentCacheEpoch = -1;
-
 function measureTextExtent(hdc: number, text: string, lpSize: number, mem: Uint8Array): void {
     const gdi = System.getInstance().gdiContext;
-    const dcCtx = gdi.getMeasureContext(hdc);
-
-    // The measurement is a pure function of (selected font, text) and the installed font set.
-    const epoch = getFontSetEpoch();
-    if (epoch !== extentCacheEpoch) {
-        extentCache.clear();
-        extentCacheEpoch = epoch;
-    }
-    const font = dcCtx ? gdi.hdcStates.get(hdc)?.font : undefined;
-    let perFont = font !== undefined ? extentCache.get(font) : undefined;
-    let hit = perFont?.get(text);
-
-    if (hit === undefined) {
-        let cx = text.length * 8; // fallback: 8px per char
-        let cy = 16;              // fallback: 16px height
-        if (dcCtx) {
-            try {
-                cx = Math.round(dcCtx.measureText(text).width);
-                cy = measureVerticalMetrics(dcCtx).height;
-            } catch (_) {
-                // keep defaults
-            }
-            if (font !== undefined) {
-                if (!perFont) {
-                    perFont = new Map();
-                    extentCache.set(font, perFont);
-                }
-                if (perFont.size >= EXTENT_CACHE_MAX_PER_FONT) perFont.clear();
-                hit = [cx, cy];
-                perFont.set(text, hit);
-            }
-        }
-        if (hit === undefined) hit = [cx, cy];
-    }
-
-    const plain = toPlainGuestMemory(mem);
-    const cx = hit[0], cy = hit[1];
-    plain[lpSize] = cx; plain[lpSize + 1] = cx >>> 8; plain[lpSize + 2] = cx >>> 16; plain[lpSize + 3] = cx >>> 24;
-    plain[lpSize + 4] = cy; plain[lpSize + 5] = cy >>> 8; plain[lpSize + 6] = cy >>> 16; plain[lpSize + 7] = cy >>> 24;
+    const ctx = gdi.getMeasureContext(hdc);
+    const extent = ctx ? measureWholeTextCached(ctx, text) : null;
+    Mem.writeUint32(lpSize, extent?.width ?? text.length * 8);
+    Mem.writeUint32(lpSize + 4, extent?.height ?? 16);
 }
 
 function writeTextMetrics(hdc: number, lptm: number, mem: Uint8Array): void {
@@ -846,28 +804,16 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         return System.getInstance().gdiContext.createSolidBrush(color);
     };
 
-    // HBRUSH CreateBrushIndirect(const LOGBRUSH *lplb)
     // LOGBRUSH is { UINT lbStyle; COLORREF lbColor; ULONG_PTR lbHatch } on Win32.
-    // BS_HOLLOW is the stock NULL_BRUSH; BS_HATCHED is approximated by its foreground colour.
-    exports['CreateBrushIndirect'] = (ctx, mem, args): number => {
-        const lplb = args[0] >>> 0;
-        if (!lplb || lplb + 12 > mem.byteLength) return 0;
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const style = view.getUint32(lplb, true);
-        const color = view.getUint32(lplb + 4, true);
+    exports['CreateBrushIndirect'] = (_ctx, mem, args): number => {
+        const ptr = args[0] >>> 0;
+        if (!ptr || ptr + 12 > mem.length || !isValidAddress(mem, ptr, 12, 'r')) return 0;
+        const style = Mem.readUint32(ptr);
         const gdi = System.getInstance().gdiContext;
-        switch (style) {
-            case 0: // BS_SOLID
-            case 2: // BS_HATCHED
-                return gdi.createSolidBrush(color);
-            case 1: // BS_NULL / BS_HOLLOW
-                return (0x80000000 | STOCK_NULL_BRUSH) >>> 0;
-            case 3: // BS_PATTERN
-                return gdi.createPatternBrush(view.getUint32(lplb + 8, true));
-            default:
-                Logger.verbose(LogCategory.GDI32, `CreateBrushIndirect style=${style} unsupported`);
-                return 0;
-        }
+        if (style === 0) return gdi.createSolidBrush(Mem.readUint32(ptr + 4) ?? 0);
+        if (style === 1) return (0x80000000 | STOCK_NULL_BRUSH) >>> 0;
+        if (style === 3) return gdi.createPatternBrush(Mem.readUint32(ptr + 8) ?? 0);
+        return 0;
     };
 
     exports['CreatePatternBrush'] = (ctx, mem, args): number => {

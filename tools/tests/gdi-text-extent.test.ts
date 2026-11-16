@@ -1,3 +1,4 @@
+import { invalidateTextExtentCache } from "../../src/worker/modules/gdi32/text-extent-cache";
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { System } from '../../src/worker/core/system';
 import { Mem } from '../../src/worker/core/memory/mem-accessor';
@@ -13,6 +14,7 @@ let measured: string[] = [];
 let font = '12px A';
 
 const dc = {
+    get font() { return font; },
     measureText: (text: string) => {
         if (text !== 'ABCgjpqy') measured.push(text); // 'ABCgjpqy' is the font-bounds probe
         return { width: text.length * 6 + (font === '12px B' ? 1 : 0), fontBoundingBoxAscent: 10, fontBoundingBoxDescent: 3 };
@@ -20,6 +22,7 @@ const dc = {
 };
 
 beforeEach(() => {
+    invalidateTextExtentCache();
     memory.fill(0);
     measured = [];
     font = '12px A';

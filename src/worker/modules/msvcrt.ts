@@ -49,9 +49,12 @@ import { registerMsvcrtTimeLocaleExports } from "./msvcrt-time-locale";
 import { MsvcrtTimezoneState } from "./msvcrt-timezone";
 import { readWindowsTimezoneSnapshot } from "../runtime/windows-timezone";
 import { crtFileCharBytes, decodeCrtFileChar, encodeCrtFileChar } from "./crt-file-codec";
+import { registerCrtWideFormatExports } from "./crt-wide-format";
 import { captureCrtConvStatics, registerCrtConvExports, resetCrtConvStatics, restoreCrtConvStatics } from "./crt-conv";
+import { registerCrtWidePathExports } from "./crt-wide-path";
 import { registerCrtPathExports } from "./crt-path";
 import { registerCrtSeh3Exports } from "./crt-seh3";
+import { registerCrtWideCopyExports } from "./crt-wide-copy";
 import { registerCrtVc8Exports } from "./crt-vc8";
 import { ensureNativeEHProlog } from "./crt-eh-prolog";
 import { registerRttiExports, demangleTypeInfoName } from "./crt-rtti";
@@ -635,9 +638,9 @@ export class Msvcrt implements IModule {
             free: (p) => this.free(p),
             setErrno: (e) => { this.setErrno(e); },
             vsnprintf: (dest, count, fmt, va) => this.vsnprintf(dest, count, fmt, va),
-            formatWide: (fmt, args, first) =>
-                this.formatWide(this.readWString(fmt, Msvcrt.MAX_WIDE_SCAN_CHARS), new ArrayVaListReader(args, first)),
         });
+
+        registerCrtWideCopyExports(exports, { setErrno: (e) => { this.setErrno(e); } });
 
         // --- String functions (see crt-string.ts) ---
         this.stringState = registerCrtStringExports(exports, {
@@ -668,6 +671,11 @@ export class Msvcrt implements IModule {
         exports["setlocale"] = (ctx, mem, args) => this.setlocale(args[0] ?? 0, args[1] ?? 0);
         exports["localeconv"] = () => this.localeconv();
 
+        registerCrtWideFormatExports(exports, {
+            format: (fmt, args, first) => this.formatWide(this.readWString(fmt, Msvcrt.MAX_WIDE_SCAN_CHARS), new ArrayVaListReader(args, first)),
+            setErrno: (e) => { this.setErrno(e); },
+        });
+
         // --- Formatted output ---
         exports["_vsnprintf"] = (ctx, mem, args) => this.vsnprintf(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0, args[3] ?? 0);
         exports["vsprintf"] = (ctx, mem, args) => this.vsprintf(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
@@ -678,11 +686,15 @@ export class Msvcrt implements IModule {
         const pathFns = registerCrtPathExports(exports, {
             readCString: (p, max) => this.readCString(p, max),
             writeCString: (p, v) => this.writeCString(p, v),
-            readWString: (p, max) => this.readWString(p, max),
-            writeWString: (p, v) => this.writeWString(p, v),
             malloc: (n) => this.malloc(n),
             setErrno: (e) => this.setErrno(e),
             nextTempnamSeq: () => (this.tempnamCounter++ & 0xffff),
+        });
+        registerCrtWidePathExports(exports, {
+            readWString: (p, max) => this.readWString(p, max),
+            writeWString: (p, text) => this.writeWString(p, text),
+            malloc: (n) => this.malloc(n),
+            setErrno: (e) => { this.setErrno(e); },
         });
         exports["_setmode"] = () => 0;
         exports["_fileno"] = (ctx, mem, args) => this.fileno(args[0] ?? 0);

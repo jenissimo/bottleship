@@ -1,7 +1,7 @@
 /**
  * CRT path/directory functions (_getcwd, _fullpath, _makepath, _splitpath,
- * _chdir, _mkdir, _access, _tempnam, _mktemp, _getdiskfree, remove/_unlink/rename, and the EACCES
- * stubs _chmod/_rmdir), plus the wide _wfullpath, _wmakepath_s and _wsplitpath_s.
+ * _chdir, _mkdir, _access, _tempnam, _mktemp, _getdiskfree, remove/_unlink/rename,
+ * and the EACCES stubs _chmod/_rmdir).
  *
  * Host supplies codepage-aware string readers/writers, CRT malloc
  * (getcwd(NULL)/_tempnam return heap blocks the guest free()s), errno, and the
@@ -21,8 +21,6 @@ import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 export interface CrtPathHost {
     readCString(ptr: number, maxLen: number): string;
     writeCString(ptr: number, value: string): void;
-    readWString(ptr: number, maxChars: number): string;
-    writeWString(ptr: number, value: string): void;
     malloc(size: number): number;
     setErrno(value: number): boolean;
     /** Next _tempnam sequence value ((counter++ & 0xffff) — counter lives in Msvcrt so reset() clears it). */
@@ -35,85 +33,6 @@ export interface CrtPathFns {
 
 /** _MAX_PATH — the block size _fullpath(NULL, …) grants (it ignores maxLength there). */
 const MAX_PATH_BYTES = 260;
-
-const EINVAL = 22;
-const ERANGE = 34;
-
-/** Make a path absolute against the current directory and resolve `.` and `..`. */
-function resolveFullPath(rel: string): string {
-    let full = rel.replace(/\//g, "\\");
-
-    if (!full.match(/^[A-Za-z]:/)) {
-        const cwd = currentDirectory();
-        if (full.startsWith("\\")) {
-            full = cwd.slice(0, 2) + full; // drive letter from CWD
-        } else {
-            full = cwd.endsWith("\\") ? cwd + full : cwd + "\\" + full;
-        }
-    }
-
-    // Normalize path: resolve . and ..
-    const parts = full.split("\\");
-    const result: string[] = [];
-    for (const part of parts) {
-        if (part === "." || part === "") continue;
-        if (part === "..") {
-            if (result.length > 1) result.pop();
-        } else {
-            result.push(part);
-        }
-    }
-    full = result.join("\\");
-    if (/^[A-Za-z]:$/.test(full)) full += "\\";
-    return full;
-}
-
-/** Join the four _makepath components, adding the separators a component leaves out. */
-function composePath(drive: string, dir: string, fname: string, ext: string): string {
-    let path = "";
-    if (drive) {
-        path += drive;
-        if (!drive.endsWith(":")) path += ":";
-    }
-    if (dir) {
-        path += dir;
-        if (!dir.endsWith("\\") && !dir.endsWith("/")) path += "\\";
-    }
-    path += fname;
-    if (ext) {
-        if (!ext.startsWith(".")) path += ".";
-        path += ext;
-    }
-    return path;
-}
-
-/** The _splitpath components: drive with its colon, dir with its trailing separator, ext with its dot. */
-function splitPathParts(path: string): { drive: string; dir: string; fname: string; ext: string } {
-    const normalized = path.replace(/\//g, "\\");
-    let drive = "";
-    let dir = "";
-    let fname = normalized;
-    let ext = "";
-
-    const driveMatch = normalized.match(/^[A-Za-z]:/);
-    if (driveMatch) {
-        drive = driveMatch[0];
-        fname = normalized.slice(2);
-    }
-
-    const lastSlash = fname.lastIndexOf("\\");
-    if (lastSlash >= 0) {
-        dir = fname.slice(0, lastSlash + 1);
-        fname = fname.slice(lastSlash + 1);
-    }
-
-    const lastDot = fname.lastIndexOf(".");
-    if (lastDot > 0) {
-        ext = fname.slice(lastDot);
-        fname = fname.slice(0, lastDot);
-    }
-    return { drive, dir, fname, ext };
-}
 
 /** Ensure a path carries a drive letter — _getcwd/_getdcwd never return a bare path. */
 function qualifyDrive(path: string): string {
@@ -165,7 +84,31 @@ export function registerCrtPathExports(exports: Record<string, ThunkImplementati
 
     function fullpath(absPath: number, relPath: number, maxLen: number): number {
         if (!relPath) return 0;
-        const full = resolveFullPath(host.readCString(relPath, 512));
+        const rel = host.readCString(relPath, 512);
+        let full = rel.replace(/\//g, "\\");
+
+        if (!full.match(/^[A-Za-z]:/)) {
+            const cwd = currentDirectory();
+            if (full.startsWith("\\")) {
+                full = cwd.slice(0, 2) + full; // drive letter from CWD
+            } else {
+                full = cwd.endsWith("\\") ? cwd + full : cwd + "\\" + full;
+            }
+        }
+
+        // Normalize path: resolve . and ..
+        const parts = full.split("\\");
+        const result: string[] = [];
+        for (const part of parts) {
+            if (part === "." || part === "") continue;
+            if (part === "..") {
+                if (result.length > 1) result.pop();
+            } else {
+                result.push(part);
+            }
+        }
+        full = result.join("\\");
+        if (/^[A-Za-z]:$/.test(full)) full += "\\";
 
         if (!absPath) {
             // Same ownership contract as getcwd(NULL): malloc the buffer and return it.
@@ -192,61 +135,22 @@ export function registerCrtPathExports(exports: Record<string, ThunkImplementati
         const dir = dirPtr ? host.readCString(dirPtr, 512) : "";
         const fname = fnamePtr ? host.readCString(fnamePtr, 256) : "";
         const ext = extPtr ? host.readCString(extPtr, 64) : "";
-        host.writeCString(pathPtr, composePath(drive, dir, fname, ext));
-        return 0;
-    }
 
-    /** _wfullpath: _fullpath in UTF-16; maxLength counts wide characters. */
-    function wfullpath(absPath: number, relPath: number, maxLen: number): number {
-        if (!relPath) return 0;
-        const full = resolveFullPath(host.readWString(relPath, 1024));
-        if (!absPath) {
-            const ptr = host.malloc(Math.max(MAX_PATH_BYTES, full.length + 1) * 2);
-            if (ptr) host.writeWString(ptr, full);
-            return ptr;
+        let path = "";
+        if (drive) {
+            path += drive;
+            if (!drive.endsWith(":")) path += ":";
         }
-        if (full.length >= maxLen >>> 0) {
-            host.setErrno(ERANGE);
-            return 0;
+        if (dir) {
+            path += dir;
+            if (!dir.endsWith("\\") && !dir.endsWith("/")) path += "\\";
         }
-        host.writeWString(absPath, full);
-        return absPath >>> 0;
-    }
-
-    /** errno_t _wmakepath_s(wchar_t* path, size_t sizeInWords, drive, dir, fname, ext). */
-    function wmakepathS(pathPtr: number, size: number, drivePtr: number, dirPtr: number, fnamePtr: number, extPtr: number): number {
-        if (!pathPtr || size === 0) { host.setErrno(EINVAL); return EINVAL; }
-        const path = composePath(
-            drivePtr ? host.readWString(drivePtr, 8) : "",
-            dirPtr ? host.readWString(dirPtr, 1024) : "",
-            fnamePtr ? host.readWString(fnamePtr, 1024) : "",
-            extPtr ? host.readWString(extPtr, 1024) : "");
-        // Like every *_s form, a result that does not fit leaves the buffer empty, not truncated.
-        if (path.length + 1 > size) { host.writeWString(pathPtr, ""); host.setErrno(ERANGE); return ERANGE; }
-        host.writeWString(pathPtr, path);
-        return 0;
-    }
-
-    /**
-     * errno_t _wsplitpath_s(path, drive, driveSize, dir, dirSize, fname, fnameSize, ext, extSize).
-     * Each component buffer may be NULL only with a size of 0; a component that does not fit
-     * empties every buffer and fails the whole call with ERANGE.
-     */
-    function wsplitpathS(pathPtr: number, out: Array<[number, number]>): number {
-        const clearAll = (): void => { for (const [p, n] of out) if (p && n) host.writeWString(p, ""); };
-        if (!pathPtr || out.some(([p, n]) => (p === 0) !== (n === 0))) {
-            clearAll();
-            host.setErrno(EINVAL);
-            return EINVAL;
+        path += fname;
+        if (ext) {
+            if (!ext.startsWith(".")) path += ".";
+            path += ext;
         }
-        const { drive, dir, fname, ext } = splitPathParts(host.readWString(pathPtr, 1024));
-        const parts = [drive, dir, fname, ext];
-        if (parts.some((part, i) => out[i]![0] && part.length + 1 > out[i]![1])) {
-            clearAll();
-            host.setErrno(ERANGE);
-            return ERANGE;
-        }
-        parts.forEach((part, i) => { if (out[i]![0]) host.writeWString(out[i]![0], part); });
+        host.writeCString(pathPtr, path);
         return 0;
     }
 
@@ -262,7 +166,31 @@ export function registerCrtPathExports(exports: Record<string, ThunkImplementati
     }
 
     function splitpath(pathPtr: number, drivePtr: number, dirPtr: number, fnamePtr: number, extPtr: number): number {
-        const { drive, dir, fname, ext } = splitPathParts(host.readCString(pathPtr, 1024));
+        const path = host.readCString(pathPtr, 1024);
+        const normalized = path.replace(/\//g, "\\");
+        let drive = "";
+        let dir = "";
+        let fname = normalized;
+        let ext = "";
+
+        const driveMatch = normalized.match(/^[A-Za-z]:/);
+        if (driveMatch) {
+            drive = driveMatch[0];
+            fname = normalized.slice(2);
+        }
+
+        const lastSlash = fname.lastIndexOf("\\");
+        if (lastSlash >= 0) {
+            dir = fname.slice(0, lastSlash + 1);
+            fname = fname.slice(lastSlash + 1);
+        }
+
+        const lastDot = fname.lastIndexOf(".");
+        if (lastDot > 0) {
+            ext = fname.slice(lastDot);
+            fname = fname.slice(0, lastDot);
+        }
+
         if (drivePtr) host.writeCString(drivePtr, drive);
         if (dirPtr) host.writeCString(dirPtr, dir);
         if (fnamePtr) host.writeCString(fnamePtr, fname);
@@ -303,6 +231,8 @@ export function registerCrtPathExports(exports: Record<string, ThunkImplementati
             return -1;
         }
         const vfs = System.getInstance().fileSystem;
+        // _access asks about the path's attributes, so a directory answers like a file.
+        if (vfs.directoryExists(path)) return 0;
         if (vfs.hasRomFile(path)) return 0;
         const handle = vfs.openSync(path, 0x80000000, 3);
         if (handle) return 0;
@@ -449,12 +379,6 @@ export function registerCrtPathExports(exports: Record<string, ThunkImplementati
     exports["_getcwd"] = (ctx, mem, args) => getcwd(args[0] ?? 0, args[1] ?? 0);
     exports["_fullpath"] = (ctx, mem, args) => fullpath(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
     exports["_makepath"] = (ctx, mem, args) => makepath(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0, args[3] ?? 0, args[4] ?? 0);
-    exports["_wfullpath"] = (ctx, mem, args) => wfullpath(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
-    exports["_wmakepath_s"] = (ctx, mem, args) =>
-        wmakepathS(args[0] ?? 0, (args[1] ?? 0) >>> 0, args[2] ?? 0, args[3] ?? 0, args[4] ?? 0, args[5] ?? 0);
-    exports["_wsplitpath_s"] = (ctx, mem, args) => wsplitpathS(args[0] ?? 0, [
-        [(args[1] ?? 0) >>> 0, (args[2] ?? 0) >>> 0], [(args[3] ?? 0) >>> 0, (args[4] ?? 0) >>> 0],
-        [(args[5] ?? 0) >>> 0, (args[6] ?? 0) >>> 0], [(args[7] ?? 0) >>> 0, (args[8] ?? 0) >>> 0]]);
     exports["_chdir"] = (ctx, mem, args) => chdir(args[0] ?? 0);
     exports["remove"] = (ctx, mem, args) => unlinkImpl(args[0] ?? 0);
     exports["rename"] = (ctx, mem, args) => renameImpl(args[0] ?? 0, args[1] ?? 0);

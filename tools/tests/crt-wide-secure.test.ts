@@ -1,3 +1,6 @@
+import { registerCrtWidePathExports } from "../../src/worker/modules/crt-wide-path";
+import { registerCrtWideFormatExports } from "../../src/worker/modules/crt-wide-format";
+import { registerCrtWideCopyExports } from "../../src/worker/modules/crt-wide-copy";
 /**
  * The wide-character and secure CRT entry points d3dcompiler_46.dll imports: the *_s string
  * copies and formatters, wcstol, and the wide path helpers.
@@ -74,18 +77,21 @@ describe("wide and secure CRT functions", () => {
             free: () => 0,
             setErrno: (e) => { errno = e; },
             vsnprintf: () => -1,
-            formatWide: (fmt, args, first) =>
-                formatCLazy(readW(fmt), new ArrayVaListReader(args, first), readC, { wide: true, readWString: readW }),
         });
         registerCrtPathExports(exports, {
             readCString: readC,
             writeCString: () => { throw new Error("narrow write in a wide test"); },
-            readWString: readW,
-            writeWString: writeW,
             malloc: alloc,
             setErrno: (e) => { errno = e; return true; },
             nextTempnamSeq: () => 1,
         });
+        registerCrtWideCopyExports(exports, { setErrno: e => { errno = e; } });
+        registerCrtWideFormatExports(exports, {
+            setErrno: e => { errno = e; },
+            format: (fmt, args, first) => formatCLazy(readW(fmt), new ArrayVaListReader(args, first), readC, { wide: true, readWString: readW }),
+        });
+        registerCrtWidePathExports(exports, { readWString: readW, writeWString: writeW,
+            malloc: alloc, setErrno: e => { errno = e; } });
         registerCrtConvExports(exports, {
             process: {} as any,
             readCString: readC,
