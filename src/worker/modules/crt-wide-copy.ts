@@ -1,9 +1,6 @@
 import { Mem } from "../core/memory/mem-accessor";
-import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
-
-function putUnit(address: number, value: number): void {
-    if (!Mem.writeUint16(address, value)) throw new Error("CRT wide copies: invalid guest write");
-}
+import { raiseGuestAccessViolation } from "../core/thunking/guest-fault";
+import type { ThunkResult, ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 
 const EINVAL = 22;
 const ERANGE = 34;
@@ -14,12 +11,12 @@ export function registerCrtWideCopyExports(
     exports: Record<string, ThunkImplementation>,
     host: { setErrno(code: number): void },
 ): void {
-    const fail = (dst: number, size: number, code: number): number => {
-        if (dst && size) putUnit(dst, 0);
+    const fail = (ctx: {esp: number}, mem: Uint8Array, dst: number, size: number, code: number): number | ThunkResult => {
+        if (dst && size && !Mem.writeUint16(dst, 0)) return raiseGuestAccessViolation(ctx, mem, dst, "w", 0);
         host.setErrno(code);
         return code;
     };
-    const copy = (append: boolean, counted: boolean): ThunkImplementation => (_c, _m, a) => {
+    const copy = (append: boolean, counted: boolean): ThunkImplementation => (ctx, mem, a) => {
         const dst = (a[0] ?? 0) >>> 0;
         const size = (a[1] ?? 0) >>> 0;
         const src = (a[2] ?? 0) >>> 0;
@@ -30,30 +27,33 @@ export function registerCrtWideCopyExports(
         if (append) {
             while (used < size) {
                 const ch = Mem.readUint16(dst + used * 2);
-                if (ch === null) return fail(dst, size, EINVAL);
+                if (ch === null) return fail(ctx, mem, dst, size, EINVAL);
                 if (ch === 0) break;
                 used++;
             }
-            if (used === size) return fail(dst, size, EINVAL);
+            if (used === size) return fail(ctx, mem, dst, size, EINVAL);
         }
-        if (counted && count === 0) { putUnit(dst + used * 2, 0); return 0; }
-        if (!src) return fail(dst, size, EINVAL);
+        if (counted && count === 0) {
+            if (!Mem.writeUint16(dst + used * 2, 0)) return raiseGuestAccessViolation(ctx, mem, dst + used * 2, "w", 0);
+            return 0;
+        }
+        if (!src) return fail(ctx, mem, dst, size, EINVAL);
         const room = size - used - 1;
         let n = 0;
         // Read only the source prefix needed to decide whether it fits; no arbitrary string cap.
         while (n < count) {
             const ch = Mem.readUint16(src + n * 2);
-            if (ch === null) return fail(dst, size, EINVAL);
+            if (ch === null) return fail(ctx, mem, dst, size, EINVAL);
             if (ch === 0) break;
             if (n === room) {
-                if (!counted || count !== TRUNCATE) return fail(dst, size, ERANGE);
-                putUnit(dst + (used + n) * 2, 0);
+                if (!counted || count !== TRUNCATE) return fail(ctx, mem, dst, size, ERANGE);
+                if (!Mem.writeUint16(dst + (used + n) * 2, 0)) return raiseGuestAccessViolation(ctx, mem, dst + (used + n) * 2, "w", 0);
                 return STRUNCATE;
             }
-            putUnit(dst + (used + n) * 2, ch);
+            if (!Mem.writeUint16(dst + (used + n) * 2, ch)) return raiseGuestAccessViolation(ctx, mem, dst + (used + n) * 2, "w", 0);
             n++;
         }
-        putUnit(dst + (used + n) * 2, 0);
+        if (!Mem.writeUint16(dst + (used + n) * 2, 0)) return raiseGuestAccessViolation(ctx, mem, dst + (used + n) * 2, "w", 0);
         return 0;
     };
     exports["wcscpy_s"] = copy(false, false);
