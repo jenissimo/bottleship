@@ -301,7 +301,7 @@ export function synthesizeManifest(opts: SynthOptions): SynthResult {
     // of FILE_NOT_FOUND) vs a real install.
     const createDirs = [...new Set(
         (opts.parsed.directories ?? [])
-            .map((d) => normalizeInnoDestination(d.name))
+            .map((d) => normalizeInnoDestination(d.name.replace(/[\\/]+$/, "")))
             .filter((rel): rel is string => !!rel)
             .map((rel) => rel.replace(/\//g, "\\")),
     )].sort();
