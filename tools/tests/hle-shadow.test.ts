@@ -42,6 +42,16 @@ describe('validatePrologueBytes', () => {
         const bytes = new Uint8Array([0x55, 0xB9, 0x00, 0x01, 0x00, 0x00]);
         expect(validatePrologueBytes(bytes)).toBeNull();
     });
+    test('accepts the Delphi RTL record-helper prologue', () => {
+        // xor ecx,ecx (31 C9); push ebx; mov cl,[edx+1]; push esi; push edi
+        const bytes = new Uint8Array([0x31, 0xC9, 0x53, 0x8A, 0x4A, 0x01, 0x56, 0x57]);
+        expect(validatePrologueBytes(bytes)).toBeNull();
+    });
+    test('rejects mov r8 with a SIB byte or a disp32 form it does not size', () => {
+        // mov cl,[esp+eax+1] (8A 4C 04 01) and mov cl,[edx+disp32] (8A 8A ..)
+        expect(validatePrologueBytes(new Uint8Array([0x8A, 0x4C, 0x04, 0x01, 0x90]))).toContain('unsupported');
+        expect(validatePrologueBytes(new Uint8Array([0x8A, 0x8A, 0x00, 0x01, 0x00, 0x00]))).toContain('unsupported');
+    });
     test('rejects relative call (E8) — position-dependent', () => {
         const bytes = new Uint8Array([0x55, 0x8B, 0xEC, 0xE8, 0x00, 0x00, 0x00, 0x00]);
         expect(validatePrologueBytes(bytes)).toContain('unsupported');
