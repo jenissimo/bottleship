@@ -2,8 +2,10 @@ import { Mem } from "../core/memory/mem-accessor";
 import { raiseGuestAccessViolation } from "../core/thunking/guest-fault";
 import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 
+import {ArrayVaListReader, formatCLazy} from "./crt-format";
+import {readCrtWString, readCrtCString, readCrtFormatString, withCrtReadFault} from "./crt-checked-strings";
+
 interface WideFormatHost {
-    format(format: number, args: number[], first: number): string;
     setErrno(code: number): void;
 }
 
@@ -12,7 +14,7 @@ function validSecureFormat(ptr: number): boolean | number {
     let format = "";
     for (let i = 0; ; i++) {
         const unit = Mem.readUint16(ptr + i * 2);
-        if (unit === null) return ptr + i * 2;
+        if (unit === null) return Mem.firstInaccessibleByte(ptr + i * 2, 2, "r");
         if (unit === 0) break;
         format += String.fromCharCode(unit);
     }
@@ -38,25 +40,26 @@ export function registerCrtWideFormatExports(exports: Record<string, ThunkImplem
         const validation = validSecureFormat(fmt);
         if (typeof validation === "number") return raiseGuestAccessViolation(ctx, mem, validation, "r", 0);
         if (!validation) {
-            if (!Mem.writeUint16(dst, 0)) return raiseGuestAccessViolation(ctx, mem, dst, "w", 0);
+            if (!Mem.writeUint16(dst, 0)) return raiseGuestAccessViolation(ctx, mem, Mem.firstInaccessibleByte(dst, 2, "w"), "w", 0);
             host.setErrno(22);
             return -1;
         }
-        const text = host.format(fmt, a, counted ? 4 : 3);
+        const text = formatCLazy(readCrtWString(fmt, 0x10000), new ArrayVaListReader(a, counted ? 4 : 3),
+            readCrtCString, {wide: true, readWString: readCrtWString, readString: readCrtFormatString});
         const limit = counted && count < size ? count : size - 1;
         if (text.length > limit && (!counted || (count !== 0xffffffff && count >= size))) {
-            if (!Mem.writeUint16(dst, 0)) return raiseGuestAccessViolation(ctx, mem, dst, "w", 0);
+            if (!Mem.writeUint16(dst, 0)) return raiseGuestAccessViolation(ctx, mem, Mem.firstInaccessibleByte(dst, 2, "w"), "w", 0);
             host.setErrno(34);
             return -1;
         }
         const length = Math.min(text.length, limit);
         for (let i = 0; i < length; i++) {
             const address = dst + i * 2;
-            if (!Mem.writeUint16(address, text.charCodeAt(i))) return raiseGuestAccessViolation(ctx, mem, address, "w", 0);
+            if (!Mem.writeUint16(address, text.charCodeAt(i))) return raiseGuestAccessViolation(ctx, mem, Mem.firstInaccessibleByte(address, 2, "w"), "w", 0);
         }
-        if (!Mem.writeUint16(dst + length * 2, 0)) return raiseGuestAccessViolation(ctx, mem, dst + length * 2, "w", 0);
+        if (!Mem.writeUint16(dst + length * 2, 0)) return raiseGuestAccessViolation(ctx, mem, Mem.firstInaccessibleByte(dst + length * 2, 2, "w"), "w", 0);
         return text.length > limit ? -1 : length;
     };
-    exports["swprintf_s"] = format(false);
-    exports["_snwprintf_s"] = format(true);
+    exports["swprintf_s"] = withCrtReadFault(format(false));
+    exports["_snwprintf_s"] = withCrtReadFault(format(true));
 }

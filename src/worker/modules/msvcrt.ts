@@ -635,7 +635,6 @@ export class Msvcrt implements IModule {
         exports["localeconv"] = () => this.localeconv();
 
         registerCrtWideFormatExports(exports, {
-            format: (fmt, args, first) => this.formatWide(this.readWString(fmt, Msvcrt.MAX_WIDE_SCAN_CHARS), new ArrayVaListReader(args, first)),
             setErrno: (e) => { this.setErrno(e); },
         });
 

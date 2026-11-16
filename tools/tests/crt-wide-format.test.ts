@@ -33,9 +33,6 @@ beforeEach(() => {
     errno = 123; next = 0x2000; exports = {};
     registerCrtWideFormatExports(exports, {
         setErrno: e => { errno = e; },
-        format: (fmt, args, first) => formatCLazy(read(fmt), new ArrayVaListReader(args, first),
-            ptr => { let s = ""; while (mem[ptr]) s += String.fromCharCode(mem[ptr++]!); return s; },
-            { wide: true, readWString: read }),
     });
 });
 for (const name of ["swprintf_s", "_snwprintf_s"]) {
