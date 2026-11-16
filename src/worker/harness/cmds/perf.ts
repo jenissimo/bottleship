@@ -420,6 +420,9 @@ export function stopRetiredAccumulator(acc: RetiredAccumulator): number {
 }
 
 let countedWindow: CountedWindow | null = null;
+
+/** Whether guestBlocks owns an armed counted window, so another verb must not re-arm trace2 under it. */
+export function countedWindowActive(): boolean { return countedWindow !== null; }
 /** Ranges the ARMED window covers, so `phase:'read'` rolls up against exactly the spans
  *  whose pages `phase:'arm'` guaranteed a slot to. */
 let countedRanges: { resolved: ResolvedRange[]; unresolved: string[] } = { resolved: [], unresolved: [] };

@@ -1582,6 +1582,21 @@ export const dbg = {
         delete g.__jitOpStatsPrevious;
         console.log(`[dbg] opStatsEnable=${on ? 1 : 0} (census zeroed + JIT cache cleared). Warm the workload up, then dbg.opStatsSnapshot().`);
     },
+    /** Turn the function census (v86 fn_census_*) on or off: kernel rows and stats reset, JIT
+     *  cache cleared so compiled direct calls carry the census hook. The hook changes the
+     *  generated code (and the codegen fingerprint), so its window measures shares, not FPS. */
+    fnCensusEnable(on = true): void {
+        const w = wasm(); if (!w) return;
+        const setter = w["fn_census_set_enabled"];
+        if (typeof setter !== "function") {
+            console.warn("[dbg] fn_census_set_enabled missing — rebuild vendor/v86 (build-wasm.sh)");
+            return;
+        }
+        setter(on ? 1 : 0);
+        if (w["fn_census_reset"]) w["fn_census_reset"]();
+        if (w.jit_clear_cache_js) w.jit_clear_cache_js();
+        console.log(`[dbg] fnCensusEnable=${on ? 1 : 0} (census reset + JIT cache cleared). Warm the workload up, then fnCensusMark().`);
+    },
     dispatchStatsEnable(on = true): void {
         const w = wasm(); if (!w) return;
         const setter = w["set_dispatch_stats"];
