@@ -1,4 +1,5 @@
-import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { Logger } from "../../src/worker/core/logger";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { msvcrtModule } from "../../src/worker/api/msvcrt.api";
 import type { ThunkImplementation } from "../../src/worker/core/thunking/thunk-dispatcher";
@@ -22,7 +23,11 @@ function read(ptr: number, max = 32768): string {
 const str = (value: string): number => { const ptr = next; next += value.length * 2 + 16; return put(ptr, value); };
 const call = (name: string, ...args: number[]): number => exports[name]!(null as never, mem, args) as number;
 import { registerCrtWideCopyExports } from "../../src/worker/modules/crt-wide-copy";
+let quietLog: ReturnType<typeof spyOn>, quietError: ReturnType<typeof spyOn>;
+afterEach(() => { quietLog.mockRestore(); quietError.mockRestore(); });
 beforeEach(() => {
+    quietLog = spyOn(Logger, "log").mockImplementation(() => {});
+    quietError = spyOn(Logger, "error").mockImplementation(() => {});
     mem = new Uint8Array(0x10000).fill(0x55); Mem.bind(() => mem);
     errno = 123; next = 0x2000; exports = {};
     registerCrtWideCopyExports(exports, { setErrno: e => { errno = e; } });
@@ -91,3 +96,178 @@ test("append rejects an unterminated destination within its capacity", () => {
 
 const savedMemBinding = ["memoryGetter", "validateRange", "getRegion", "dataRoutes"].map(k => [k, Object.getOwnPropertyDescriptor(Mem, k)] as const);
 afterAll(() => { for (const [k, d] of savedMemBinding) if (d) Object.defineProperty(Mem, k, d); });
+
+for (const name of ["wcsncpy_s", "wcsncat_s"]) {
+    test(name + " accepts the null destination zero-count no-op without changing errno", () => {
+        expect(call(name, 0, 0, 0, 0)).toBe(0);
+        expect(errno).toBe(123);
+    });
+}
+
+test("wcscpy_s propagates a refused character store", () => {
+    put(0x1000, ""); const src = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000;
+    });
+    expect(() => call("wcscpy_s", 0x1000, 8, src)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000);
+    expect(Mem.readUint16(0x1000)).toBe(0);
+    expect(errno).toBe(123);
+});
+
+test("wcscpy_s propagates a refused terminator store", () => {
+    put(0x1000, ""); const src = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000 + 4;
+    });
+    expect(() => call("wcscpy_s", 0x1000, 8, src)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000 + 4);
+    expect(Mem.readUint16(0x1000 + 4)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("wcscpy_s propagates a refused clearing store", () => {
+    put(0x1000, ""); const src = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000;
+    });
+    expect(() => call("wcscpy_s", 0x1000, 8, 0)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000);
+    expect(Mem.readUint16(0x1000)).toBe(0);
+    expect(errno).toBe(123);
+});
+
+test("wcscat_s propagates a refused character store", () => {
+    put(0x1000, ""); const src = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000;
+    });
+    expect(() => call("wcscat_s", 0x1000, 8, src)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000);
+    expect(Mem.readUint16(0x1000)).toBe(0);
+    expect(errno).toBe(123);
+});
+
+test("wcscat_s propagates a refused terminator store", () => {
+    put(0x1000, ""); const src = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000 + 4;
+    });
+    expect(() => call("wcscat_s", 0x1000, 8, src)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000 + 4);
+    expect(Mem.readUint16(0x1000 + 4)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("wcscat_s propagates a refused clearing store", () => {
+    put(0x1000, ""); const src = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000;
+    });
+    expect(() => call("wcscat_s", 0x1000, 8, 0)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000);
+    expect(Mem.readUint16(0x1000)).toBe(0);
+    expect(errno).toBe(123);
+});
+
+test("wcsncpy_s propagates a refused character store", () => {
+    put(0x1000, ""); const src = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000;
+    });
+    expect(() => call("wcsncpy_s", 0x1000, 8, src, 2)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000);
+    expect(Mem.readUint16(0x1000)).toBe(0);
+    expect(errno).toBe(123);
+});
+
+test("wcsncpy_s propagates a refused terminator store", () => {
+    put(0x1000, ""); const src = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000 + 4;
+    });
+    expect(() => call("wcsncpy_s", 0x1000, 8, src, 2)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000 + 4);
+    expect(Mem.readUint16(0x1000 + 4)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("wcsncpy_s propagates a refused clearing store", () => {
+    put(0x1000, ""); const src = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000;
+    });
+    expect(() => call("wcsncpy_s", 0x1000, 8, 0, 2)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000);
+    expect(Mem.readUint16(0x1000)).toBe(0);
+    expect(errno).toBe(123);
+});
+
+test("wcsncat_s propagates a refused character store", () => {
+    put(0x1000, ""); const src = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000;
+    });
+    expect(() => call("wcsncat_s", 0x1000, 8, src, 2)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000);
+    expect(Mem.readUint16(0x1000)).toBe(0);
+    expect(errno).toBe(123);
+});
+
+test("wcsncat_s propagates a refused terminator store", () => {
+    put(0x1000, ""); const src = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000 + 4;
+    });
+    expect(() => call("wcsncat_s", 0x1000, 8, src, 2)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000 + 4);
+    expect(Mem.readUint16(0x1000 + 4)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("wcsncat_s propagates a refused clearing store", () => {
+    put(0x1000, ""); const src = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000;
+    });
+    expect(() => call("wcsncat_s", 0x1000, 8, 0, 2)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000);
+    expect(Mem.readUint16(0x1000)).toBe(0);
+    expect(errno).toBe(123);
+});
