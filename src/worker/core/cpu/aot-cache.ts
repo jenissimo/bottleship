@@ -66,6 +66,80 @@ export interface AotUnit {
      *  page would leave the rest for the JIT to compile again, so two modules would end up
      *  covering overlapping code. */
     pages: AotPage[];
+    /**
+     * Every guest page the module holds code from, as the JIT compiled it (block map, read
+     * at codegen_finalize). A module keeps code from a page it does not own: once another
+     * module becomes that page's owner, this one is only a hidden holder of it and the
+     * engine no longer lists it among the module's pages — but this module's own blocks
+     * still run that page's old translation. A unit whose `pages` miss one of these would be
+     * published without that page being content-checked, so such a unit is never recorded,
+     * and never replayed.
+     */
+    codePages?: number[];
+}
+
+/** Physical pages the blocks of the module the engine generated LAST came from. Valid only
+ *  synchronously inside codegen_finalize (the block map is overwritten by the next compile). */
+function lastModuleCodePages(w: any, buffer: ArrayBufferLike | undefined): number[] | null {
+    if (!buffer || typeof w?.jit_block_map_count !== "function" || typeof w?.jit_block_map_ptr !== "function") return null;
+    const n = w.jit_block_map_count() >>> 0;
+    if (!n) return null;
+    const words = new Uint32Array(buffer, w.jit_block_map_ptr() >>> 0, n * 8);
+    const pages = new Set<number>();
+    for (let i = 0; i < n; i++) {
+        const start = words[i * 8] >>> 0, end = words[i * 8 + 2] >>> 0;
+        pages.add(start >>> 12);
+        if (end > start) pages.add(((end - 1) >>> 0) >>> 12);
+    }
+    return [...pages].sort((a, b) => a - b);
+}
+
+/** Lowest entry block of a module from its `g<addr>@t<index>` function name (v86
+ *  JIT_FUNCTION_NAMES), or null when the module carries no such name. */
+export function moduleNamePrimaryEntry(bytes: Uint8Array): number | null {
+    let p = 8;
+    const leb = (): number => { let v = 0, sh = 0, b: number; do { b = bytes[p++]!; v |= (b & 0x7f) << sh; sh += 7; } while (b & 0x80 && p < bytes.length); return v >>> 0; };
+    while (p < bytes.length) {
+        const id = bytes[p++]!, size = leb(), end = p + size;
+        if (id === 0) {
+            const nameLen = leb();
+            const name = new TextDecoder().decode(bytes.subarray(p, p + nameLen));
+            p += nameLen;
+            if (name === "name") {
+                while (p < end) {
+                    const sub = bytes[p++]!, subSize = leb(), subEnd = p + subSize;
+                    if (sub === 1) {
+                        const count = leb();
+                        for (let i = 0; i < count && p < subEnd; i++) {
+                            leb();
+                            const len = leb();
+                            const fn = new TextDecoder().decode(bytes.subarray(p, p + len));
+                            p += len;
+                            const m = /^g([0-9a-f]{8})@t\d+$/.exec(fn);
+                            if (m) return parseInt(m[1]!, 16) >>> 0;
+                        }
+                    }
+                    p = subEnd;
+                }
+            }
+        }
+        p = end;
+    }
+    return null;
+}
+
+/** The first code page of `unit` that its `pages` do not content-check, or null. */
+export function unlistedCodePage(unit: { pages: Array<{ physPage: number }>; codePages?: number[]; bytes: Uint8Array }): number | null {
+    const listed = new Set(unit.pages.map((p) => p.physPage));
+    if (unit.codePages) {
+        for (const page of unit.codePages) if (!listed.has(page)) return page;
+        return null;
+    }
+    // Units recorded before codePages existed: the module's name still names its lowest
+    // entry block, which is enough to catch a module whose primary page went unlisted.
+    const primary = moduleNamePrimaryEntry(unit.bytes);
+    if (primary !== null && !listed.has(primary >>> 12)) return primary >>> 12;
+    return null;
 }
 
 /** What replay() actually published. Kept so "was this unit entered?" can be answered
@@ -73,7 +147,7 @@ export interface AotUnit {
  *  having entries proves nothing without checking WHOSE function still sits in it. */
 interface LiveUnit { unit: AotUnit; idx: number; fn: unknown; }
 
-interface WasmDumpRecord { start: number; table_index: number; len: number; bytes: Uint8Array }
+interface WasmDumpRecord { start: number; table_index: number; len: number; bytes: Uint8Array; codePages?: number[] | null }
 
 function hex(buf: ArrayBuffer): string {
     const b = new Uint8Array(buf);
@@ -197,6 +271,7 @@ export class AotCache {
         // keepLatestPerPage: a capture over a long session sees each hot page recompiled on
         // every tier-2 promotion, and only the newest module describes the live page anyway.
         (globalThis as any).__wasmDump = { pages: new Set(list), out: [], keepLatestPerPage: true };
+        (globalThis as any).__wasmDump.codePagesRequired = this.tapCodePages();
         return { armed: list.length, pages: list };
     }
 
@@ -215,6 +290,7 @@ export class AotCache {
         (globalThis as any).__wasmDump = {
             out: [], keepLatestPerPage: true, maxPages, dropped: 0,
         };
+        (globalThis as any).__wasmDump.codePagesRequired = this.tapCodePages();
         return { armed: "all", maxPages };
     }
 
@@ -235,7 +311,51 @@ export class AotCache {
         };
     }
 
-    disarm(): void { (globalThis as any).__wasmDump = undefined; }
+    disarm(): void {
+        (globalThis as any).__wasmDump = undefined;
+        this.untapCodePages();
+    }
+
+    private tappedFinalize: { cpu: any; original: (...a: unknown[]) => unknown; wasBlockMap: number } | null = null;
+
+    /** Record each captured module's code pages (see AotUnit.codePages) as it is generated. */
+    private tapCodePages(): boolean {
+        if (this.tappedFinalize) return true;
+        const cpu = this.cpu();
+        const w = this.wasm();
+        if (!cpu || typeof cpu.codegen_finalize !== "function" || typeof w?.jit_block_map_set_enabled !== "function") return false;
+        const wasBlockMap = typeof w.jit_block_map_enabled === "function" ? w.jit_block_map_enabled() >>> 0 : 0;
+        w.jit_block_map_set_enabled(1);
+        const original = cpu.codegen_finalize;
+        const self = this;
+        cpu.codegen_finalize = function (this: unknown, ...args: unknown[]) {
+            const result = original.apply(this, args);
+            const dump = (globalThis as any).__wasmDump;
+            const index = (args[0] as number) >>> 0, start = (args[1] as number) >>> 0;
+            const out: WasmDumpRecord[] = dump?.out ?? [];
+            for (let i = out.length - 1; i >= 0; i--) {
+                const rec = out[i]!;
+                if ((rec.table_index >>> 0) !== index || (rec.start >>> 0) !== start) continue;
+                if (rec.codePages === undefined) {
+                    const ex = self.wasm();
+                    rec.codePages = lastModuleCodePages(ex, self.cpu()?.wasm_memory?.buffer ?? ex?.memory?.buffer);
+                }
+                break;
+            }
+            return result;
+        };
+        this.tappedFinalize = { cpu, original, wasBlockMap };
+        return true;
+    }
+
+    private untapCodePages(): void {
+        const t = this.tappedFinalize;
+        if (!t) return;
+        t.cpu.codegen_finalize = t.original;
+        const w = this.wasm();
+        if (typeof w?.jit_block_map_set_enabled === "function") w.jit_block_map_set_enabled(t.wasBlockMap);
+        this.tappedFinalize = null;
+    }
 
     /**
      * Pair captured bytes with the engine's publication record for the same page.
@@ -261,7 +381,7 @@ export class AotCache {
 
         let skipped = 0;
         const seen = new Set<number>();
-        const captured: Array<{ entryPage: number; bytes: Uint8Array<ArrayBuffer>; tableIndex: number;
+        const captured: Array<{ entryPage: number; bytes: Uint8Array<ArrayBuffer>; tableIndex: number; codePages?: number[];
             pages: Array<{ physPage: number; stateFlags: number; entries: Array<[number, number]>; bytes: Uint8Array<ArrayBuffer> }> }> = [];
         // Later captures supersede earlier ones for the same page.
         for (let i = out.length - 1; i >= 0; i--) {
@@ -299,12 +419,21 @@ export class AotCache {
                 seen.add(pAddr >>> 12);
             }
             if (!pages.length) { skipped++; continue; }
+            const codePages: number[] | undefined = Array.isArray(rec.codePages) ? rec.codePages.slice() : undefined;
+            if (dump?.codePagesRequired && !codePages) {
+                skipped++;
+                continue;
+            }
+            if (codePages && unlistedCodePage({ pages, codePages, bytes: rec.bytes })) {
+                skipped++;
+                continue;
+            }
 
             // Copy off the capture buffer: it lives on the wasm (shared) heap, and
             // WebAssembly.Module rejects a shared backing store at replay time.
             const bytes = new Uint8Array(rec.bytes.length);
             bytes.set(rec.bytes);
-            captured.push({ entryPage: physPage, bytes, tableIndex: idx, pages });
+            captured.push({ entryPage: physPage, bytes, tableIndex: idx, pages, ...(codePages ? { codePages } : {}) });
         }
         let sourceVersion: AotVersion;
         try {
@@ -320,6 +449,7 @@ export class AotCache {
                         physPage: page.physPage, stateFlags: page.stateFlags, entries: page.entries,
                         sha: await sha256Page(page.bytes, 0),
                     }))),
+                    ...(unit.codePages ? { codePages: unit.codePages } : {}),
                 });
             }
             if (!this.sameVersion(sourceVersion, await this.version())) {
@@ -508,6 +638,7 @@ export class AotCache {
             version,
             units: this.units.map((u) => ({
                 entryPage: u.entryPage, tableIndex: u.tableIndex, pages: u.pages,
+                ...(u.codePages ? { codePages: u.codePages } : {}),
                 file: `${u.entryPage.toString(16)}.wasm`, bytes: u.bytes.length,
             })),
         };
@@ -537,7 +668,8 @@ export class AotCache {
             for (const u of index.units) {
                 const f = await (await dir.getFileHandle(u.file)).getFile();
                 const bytes = new Uint8Array(await f.arrayBuffer());
-                loaded.push({ entryPage: u.entryPage, tableIndex: u.tableIndex, pages: u.pages, bytes });
+                loaded.push({ entryPage: u.entryPage, tableIndex: u.tableIndex, pages: u.pages, bytes,
+                    ...(Array.isArray(u.codePages) ? { codePages: u.codePages.map((x: number) => x >>> 0) } : {}) });
             }
             this.units = loaded;
             this.loadedVersion = index.version;
@@ -656,6 +788,9 @@ export class AotCache {
             // success. snapshot() never produces that; a truncated index.json could.
             if (!u.pages?.length) { no("no-pages"); continue; }
             if (!(u.tableIndex > 0 && u.tableIndex < WASM_TABLE_SIZE)) { no("no-table-index"); continue; }
+            // A page the module runs code from but the unit does not content-check: published,
+            // its old translation would run whatever that page holds now. Never retried.
+            if (unlistedCodePage(u) !== null) { no("unlisted-code-page"); continue; }
             let contentOk = true;
             for (const p of u.pages) {
                 if (!Number.isInteger(p.physPage) || p.physPage < 0 || p.physPage > 0xFFFFF) {
