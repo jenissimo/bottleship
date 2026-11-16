@@ -25,7 +25,7 @@ const LIB = fileURLToPath(new URL('../../vendor/v86/build/libv86.mjs', import.me
 const WASM = fileURLToPath(new URL('../../vendor/v86/build/v86.wasm', import.meta.url));
 const HAVE_V86 = existsSync(LIB) && existsSync(WASM);
 
-const BASE = 0x400000, IMG = 0xc000, ENTRY = BASE + 0x40;
+const BASE = 0x400000, IMG = 0xc000, ENTRY = BASE + 0x40, RESUME = BASE + 0x1000;
 // A Delphi 7 runner's layout: the bodies keep their distances, so every rel32 resolves the way
 // the linker resolved it.
 const LSTRCLR = 0x404fa8, IREC = 0x405988, IARR = 0x4059b8, FREC = 0x405a58, FARR = 0x405aa4;
@@ -46,7 +46,7 @@ const SITES: Partial<Record<keyof typeof BODIES, Record<number, number>>> = {
     },
     LStrClr: { 0x1c: FREEMEM },
 };
-const CTL_PORT = 0xb0a0, CTL_SNAP = 1, CTL_FREE = 2, CTL_TRAP = 3, CTL_FAULT = 4;
+const CTL_PORT = 0xb0a0, CTL_SNAP = 1, CTL_FREE = 2, CTL_TRAP = 3, CTL_FAULT = 4, CTL_SPLIT = 5;
 const FILTERS = 0x409000, PF_HANDLER = 0x409c00, DATA = 0x40a000, NP_PAGE = 0x40b000, STACK = 0x200000;
 // Paging for the fault arms: page 0x40a000 (type info and records) read-only, 0x40b000 not present.
 const PD = 0x100000, PT = 0x101000, IDT = 0x102000, IDTR = 0x102800, GDT = 0x102900, GDTR = 0x102980;
@@ -55,6 +55,8 @@ const PD = 0x100000, PT = 0x101000, IDT = 0x102000, IDTR = 0x102800, GDT = 0x102
 // then (PPTypeInfo, offset) per managed field.
 const TI_LSTR = DATA, TI_WSTR = DATA + 0x20, TI_VAR = DATA + 0x40, P_LSTR = DATA + 0x60, P_WSTR = DATA + 0x64, P_VAR = DATA + 0x68;
 const TI_REC1 = DATA + 0x80, TI_REC2 = DATA + 0xc0, TI_RECW = DATA + 0x100, TI_RECV = DATA + 0x140, TI_RECNP = DATA + 0x180;
+// A long-string type info whose kind byte is the last byte before the absent page.
+const TI_EDGE = NP_PAGE - 1, P_EDGE = DATA + 0x6c, TI_RECEDGE = DATA + 0x1c0;
 const RECS = DATA + 0x400, STRS = DATA + 0x800;
 const rec = (i: number) => RECS + i * 0x40;
 const str = (i: number) => STRS + i * 0x20 + 8;
@@ -77,11 +79,11 @@ const sentinel = (r: number, i: number) => (0x10000000 * (r + 1) + 0x100 + i) >>
 
 /** machine: DF, x87 control word, status word and stack top after the call. */
 interface Snap { regs: number[]; eax: number; recs: number[]; machine: number[] }
-type FaultCase = 'typeInfoName' | 'fieldTypeInfo' | 'readOnlyStore' | 'absentString';
+type FaultCase = 'typeInfoName' | 'fieldTypeInfo' | 'readOnlyStore' | 'absentString' | 'kindAtPageEndInit' | 'kindAtPageEndFinal';
 interface Fault { cr2: number; err: number; eip: number; esp: number }
 interface Patched { entry: number; filter: number; trampoline: number }
-interface Arm { snaps: Snap[]; data: number[]; frees: number[]; traps: number[]; halted: boolean; found: ReturnType<typeof findRecordHelpers>; fault?: Fault; patched: Patched[]; generator?: ThunkGenerator }
-interface ArmOptions { filter: boolean; trapTrampolines?: boolean; onlyFast?: boolean; mutate?: (fin: boolean, code: Uint8Array) => void; fault?: FaultCase }
+interface Arm { snaps: Snap[]; data: number[]; frees: number[]; traps: number[]; halted: boolean; entryOps: number[]; found: ReturnType<typeof findRecordHelpers>; fault?: Fault; patched: Patched[]; generator?: ThunkGenerator }
+interface ArmOptions { filter: boolean; trapTrampolines?: boolean; onlyFast?: boolean; mutate?: (fin: boolean, code: Uint8Array) => void; fault?: FaultCase; splitAt?: number }
 
 /** One call that faults in both arms, with the address the fault must name. */
 const FAULTS: Record<FaultCase, { step: Step; cr2: number; write: boolean }> = {
@@ -89,6 +91,8 @@ const FAULTS: Record<FaultCase, { step: Step; cr2: number; write: boolean }> = {
     fieldTypeInfo: { step: { fn: 'IR', p: rec(0), ti: TI_RECNP, fast: false }, cr2: NP_PAGE, write: false },
     readOnlyStore: { step: { fn: 'IR', p: rec(0), ti: TI_REC1, fast: true }, cr2: rec(0) + 8, write: true },
     absentString: { step: { fn: 'FR', p: NP_PAGE - 8, ti: TI_REC1, fast: true }, cr2: NP_PAGE, write: false },
+    kindAtPageEndInit: { step: { fn: 'IR', p: rec(0), ti: TI_RECEDGE, fast: false }, cr2: NP_PAGE, write: false },
+    kindAtPageEndFinal: { step: { fn: 'FR', p: rec(10), ti: TI_RECEDGE, fast: false }, cr2: NP_PAGE, write: false },
 };
 
 function writeTypeInfo(dv: DataView, mem: Uint8Array): void {
@@ -111,6 +115,9 @@ function writeTypeInfo(dv: DataView, mem: Uint8Array): void {
     recTi(TI_RECW, 'TWide', 8, [[P_WSTR, 4]]);
     recTi(TI_RECV, 'TVar', 24, [[P_VAR, 8]]);
     recTi(TI_RECNP, 'TLost', 16, [[NP_PAGE, 8]]);
+    mem[TI_EDGE] = TK_LSTRING;
+    dv.setUint32(P_EDGE, TI_EDGE, true);
+    recTi(TI_RECEDGE, 'TEdge', 16, [[P_EDGE, 8]]);
 }
 
 /** Long strings: refcount at -8, length at -4. */
@@ -143,6 +150,7 @@ function buildImage(opts: ArmOptions): { bytes: Uint8Array; found: Arm['found'];
         dv.setUint32(rec(i) + 8, s, true);
     }
     dv.setUint32(rec(0) + 8, 0x5eed0000, true);
+    dv.setUint32(rec(10) + 8, 0, true);
     for (let k = 0; k < 3; k++) dv.setUint32(rec(8) + k * 16 + 8, 0x5eed0100 + k, true);
 
     const found = findRecordHelpers(mem);
@@ -199,6 +207,14 @@ function buildImage(opts: ArmOptions): { bytes: Uint8Array; found: Arm['found'];
     const steps = opts.fault ? [FAULTS[opts.fault].step] : SCENARIO;
     steps.forEach((s, i) => {
         if (opts.onlyFast && !s.fast) return;
+        if (opts.splitAt === i) {
+            // The first machine stops here; the restored one enters at RESUME with the same
+            // DF and x87 setup and runs the remaining calls.
+            e(0xb8); u(CTL_SPLIT); e(0xba); u(CTL_PORT); e(OUT_DX_EAX, 0xf4);
+            p = RESUME;
+            e(0xbc); u(STACK);
+            e(0xfc, 0xdb, 0xe3, 0xd9, 0xe8, 0xd9, 0xeb);
+        }
         e(0xbb); u(sentinel(0, i)); e(0xbe); u(sentinel(1, i)); e(0xbf); u(sentinel(2, i)); e(0xbd); u(sentinel(3, i));
         e(0xb8); u(s.p); e(0xba); u(s.ti);
         if (s.n !== undefined) { e(0xb9); u(s.n); }
@@ -209,12 +225,29 @@ function buildImage(opts: ArmOptions): { bytes: Uint8Array; found: Arm['found'];
     return { bytes: mem.slice(BASE), found, patched, generator };
 }
 
-async function runArm(opts: ArmOptions): Promise<Arm> {
+/** v86 binds its browser adapters to a global `window` when one exists; another test file may
+ *  leave a partial mock behind, so the machine is built without one. */
+async function withoutWindow<T>(fn: () => Promise<T>): Promise<T> {
+    const g = globalThis as { window?: unknown };
+    const had = 'window' in g, saved = g.window;
+    if (had) delete g.window;
+    try { return await fn(); } finally { if (had) g.window = saved; }
+}
+
+function runArm(opts: ArmOptions): Promise<Arm> {
+    return withoutWindow(() => runArmIsolated(opts));
+}
+
+async function runArmIsolated(opts: ArmOptions): Promise<Arm> {
     const { V86 } = await import(LIB);
-    const em = new V86({ autostart: false, memory_size: 32 << 20, wasm_path: WASM, log_level: 0, disable_jit: 1 });
-    try {
+    const boot = async () => {
+        const em = new V86({ autostart: false, memory_size: 32 << 20, wasm_path: WASM, log_level: 0, disable_jit: 1 });
         await new Promise<void>(resolve => em.add_listener('emulator-loaded', resolve));
-        const cpu = em.v86.cpu;
+        return em;
+    };
+    let em = await boot();
+    try {
+        let cpu = em.v86.cpu;
         cpu.reboot_internal(); cpu.reset_memory();
         const { bytes, found, patched, generator } = buildImage(opts);
         cpu.load_multiboot(bytes.buffer);
@@ -235,7 +268,8 @@ async function runArm(opts: ArmOptions): Promise<Arm> {
         }
         let fault: Fault | undefined;
         const snaps: Snap[] = [], frees: number[] = [], traps: number[] = [];
-        cpu.io.register_write(CTL_PORT, null, undefined, undefined, (cmd: number) => {
+        let split: (() => void) | null = null;
+        const listen = () => cpu.io.register_write(CTL_PORT, null, undefined, undefined, (cmd: number) => {
             const r = cpu.reg32;
             const esp = r[4] >>> 0;
             if (cmd === CTL_SNAP) {
@@ -247,17 +281,42 @@ async function runArm(opts: ArmOptions): Promise<Arm> {
             } else if (cmd === CTL_FAULT) {
                 fault = { cr2: r[1] >>> 0, err: cpu.read32s(esp) >>> 0, eip: cpu.read32s(esp + 4) >>> 0, esp: (esp + 16) >>> 0 };
             } else if (cmd === CTL_FREE) frees.push(cpu.read32s(esp + 4) >>> 0);
+            else if (cmd === CTL_SPLIT) split?.();
             else traps.push(cpu.read32s(esp + 8) >>> 0);
         });
-        const halted = await new Promise<boolean>(resolve => {
-            const timer = setTimeout(() => { em.stop(); resolve(false); }, 10000);
-            em.bus.register('cpu-event-halt', () => { clearTimeout(timer); em.stop(); resolve(true); });
-            cpu.reg32[4] = STACK; cpu.instruction_pointer[0] = ENTRY; cpu.flags[0] = 2;
+        const go = (start: boolean) => new Promise<'halt' | 'split' | 'timeout'>(resolve => {
+            const timer = setTimeout(() => { em.stop(); resolve('timeout'); }, 10000);
+            em.bus.register('cpu-event-halt', () => { clearTimeout(timer); em.stop(); resolve('halt'); });
+            split = () => { clearTimeout(timer); em.stop(); resolve('split'); };
+            if (start) { cpu.reg32[4] = STACK; cpu.instruction_pointer[0] = ENTRY; cpu.flags[0] = 2; }
             em.run();
         });
+        listen();
+        let end = await go(true);
+        let restored: ThunkGenerator | undefined;
+        if (end === 'split') {
+            // The machine is saved between two calls and resumed in a fresh emulator: guest RAM
+            // with the patched entries, filters, trampolines and records as the first machine
+            // left them, and the thunk allocator through its captured state. The restored machine
+            // enters at RESUME, so the CPU registers it does not carry are set as at boot.
+            const image = cpu.mem8.slice(BASE, BASE + IMG);
+            const allocator = structuredClone(generator!.captureState());
+            await em.stop();
+            await em.destroy();
+            em = await boot();
+            cpu = em.v86.cpu;
+            cpu.reboot_internal(); cpu.reset_memory();
+            cpu.load_multiboot(buildImage({ filter: false }).bytes.buffer);
+            cpu.mem8.set(image, BASE);
+            restored = new ThunkGenerator();
+            restored.restoreState(allocator);
+            listen();
+            cpu.reg32[4] = STACK; cpu.instruction_pointer[0] = RESUME; cpu.flags[0] = 2;
+            end = await go(false);
+        }
         const data = Array.from({ length: 0x1000 / 4 }, (_, i) => cpu.mem8[RECS + i * 4]! | (cpu.mem8[RECS + i * 4 + 1]! << 8) | (cpu.mem8[RECS + i * 4 + 2]! << 16) | (cpu.mem8[RECS + i * 4 + 3]! << 24))
             .map(v => v >>> 0);
-        return { snaps, data, frees, traps, halted, found, fault, patched, generator };
+        return { snaps, data, frees, traps, halted: end === 'halt', entryOps: [cpu.mem8[IREC]!, cpu.mem8[FREC]!], found, fault, patched, generator: restored ?? generator };
     } finally {
         await em.destroy();
     }
@@ -397,6 +456,38 @@ describe.skipIf(!HAVE_V86)('delphi-rtl record helpers, executed in v86', () => {
         expect(restored.allocateRawCodeArea(16)).toBeGreaterThanOrEqual(end);
     }, 30000);
 
+    test('a machine saved between calls and resumed in a fresh emulator keeps the filters: the rest of the scenario, claims and declines, matches the original', async () => {
+        const orig = await runArm({ filter: false });
+        for (const splitAt of [3, 6, 9]) {
+            const resumed = await runArm({ filter: true, splitAt });
+            expect(resumed.entryOps).toEqual([0xe9, 0xe9]);
+            expect(modelProblems(resumed)).toEqual([]);
+            expect(contract(resumed)).toEqual(contract(orig));
+            expect(resumed.data).toEqual(orig.data);
+            expect(resumed.frees).toEqual(orig.frees);
+            const size = (x: Patched) => assembleRecordFilter(0, 0, x.entry === FREC).length;
+            const end = Math.max(...resumed.patched.flatMap(x => [x.filter + size(x), x.trampoline + PROLOGUE_LEN + 5]));
+            const next = resumed.generator!.allocateRawCodeArea(16);
+            expect(next).toBeGreaterThanOrEqual(end);
+            expect(next).toBeLessThan(PF_HANDLER);
+        }
+        const trapped = await runArm({ filter: true, trapTrampolines: true, onlyFast: true, splitAt: 4 });
+        expect(modelProblems(trapped, true)).toEqual([]);
+    }, 120000);
+
+    test('a partial window left behind by another test does not reach the machine', async () => {
+        const g = globalThis as { window?: unknown };
+        const had = 'window' in g, saved = g.window;
+        g.window = { addEventListener() { /* partial mock */ } };
+        try {
+            const arm = await runArm({ filter: true });
+            expect(modelProblems(arm)).toEqual([]);
+            expect((g.window as object)).toHaveProperty('addEventListener');
+        } finally {
+            if (had) g.window = saved; else delete g.window;
+        }
+    }, 30000);
+
     test('DF and the x87 control word, status word and stack top are what the scenario set before every call', async () => {
         const filt = await runArm({ filter: true });
         const first = filt.snaps.find(Boolean)!.machine;
@@ -434,8 +525,8 @@ describe.skipIf(!HAVE_V86)('delphi-rtl record helpers, executed in v86', () => {
     const MUTANTS: Array<{ name: string; mutate: (fin: boolean, code: Uint8Array) => void }> = [
         { name: 'the field-count test is dropped', mutate: (_f, c) => { c[9] = 0x90; c[10] = 0x90; } },
         { name: 'the long-string kind test is dropped', mutate: (_f, c) => { c[20] = 0x90; c[21] = 0x90; } },
-        { name: 'finalize skips its nil test', mutate: (f, c) => { if (f) { c[34] = 0x90; c[35] = 0x90; } } },
-        { name: 'initialize stores 1 instead of 0', mutate: (f, c) => { if (!f) c[33] = 1; } },
+        { name: 'finalize skips its nil test', mutate: (f, c) => { if (f) { c[38] = 0x90; c[39] = 0x90; } } },
+        { name: 'initialize stores 1 instead of 0', mutate: (f, c) => { if (!f) c[37] = 1; } },
     ];
     for (const m of MUTANTS) {
         test(`negative control: a broken filter is caught — ${m.name}`, async () => {

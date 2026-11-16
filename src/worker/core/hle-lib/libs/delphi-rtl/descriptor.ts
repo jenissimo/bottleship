@@ -34,8 +34,10 @@
  *     is reported at an EIP inside the filter instead of inside the RTL body, and with ESP one
  *     return address deep instead of below the original's pushes and nested calls. The filter
  *     reads the record's type info in a different order than the original before the store
- *     (name length, field count, field type, offset), all of which the original also reads
- *     before its store.
+ *     (name length, field count, field type, its kind and name length, offset), all of which
+ *     the original also reads before its store: _InitializeArray and _FinalizeArray load the
+ *     field type's kind AND its name length before they dispatch, so a field type whose kind
+ *     byte ends a mapped page faults there in both arms, before anything is written.
  * On decline the filter has changed only ECX and the flags, neither of which is an input; EAX and
  * EDX reach the trampoline as the caller passed them. The filter writes no stack and touches no
  * shared state, so a quantum ending inside it is harmless.
@@ -170,6 +172,7 @@ export const PROLOGUE_LEN = 8;
  *   mov   ecx, [ecx]
  *   cmp   byte [ecx], tkLString
  *   jne   .orig
+ *   cmp   byte [ecx+1], 0            ; the field type's name length, which the original reads too
  *   movzx ecx, byte [edx+1]
  *   mov   ecx, [edx+ecx+0Eh]         ; field 0: offset
  *   init:     mov dword [eax+ecx], 0 ; ret
@@ -186,6 +189,7 @@ export function assembleRecordFilter(at: number, trampoline: number, finalize: b
         0x8b, 0x09,
         0x80, 0x39, TK_LSTRING,
         0x75, 0x00,
+        0x80, 0x79, 0x01, 0x00,
         0x0f, 0xb6, 0x4a, 0x01,
         0x8b, 0x4c, 0x0a, 0x0e,
     ];
