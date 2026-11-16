@@ -271,7 +271,7 @@ export class AotCache {
         // keepLatestPerPage: a capture over a long session sees each hot page recompiled on
         // every tier-2 promotion, and only the newest module describes the live page anyway.
         (globalThis as any).__wasmDump = { pages: new Set(list), out: [], keepLatestPerPage: true };
-        this.tapCodePages();
+        (globalThis as any).__wasmDump.codePagesRequired = this.tapCodePages();
         return { armed: list.length, pages: list };
     }
 
@@ -290,7 +290,7 @@ export class AotCache {
         (globalThis as any).__wasmDump = {
             out: [], keepLatestPerPage: true, maxPages, dropped: 0,
         };
-        this.tapCodePages();
+        (globalThis as any).__wasmDump.codePagesRequired = this.tapCodePages();
         return { armed: "all", maxPages };
     }
 
@@ -319,11 +319,11 @@ export class AotCache {
     private tappedFinalize: { cpu: any; original: (...a: unknown[]) => unknown; wasBlockMap: number } | null = null;
 
     /** Record each captured module's code pages (see AotUnit.codePages) as it is generated. */
-    private tapCodePages(): void {
-        if (this.tappedFinalize) return;
+    private tapCodePages(): boolean {
+        if (this.tappedFinalize) return true;
         const cpu = this.cpu();
         const w = this.wasm();
-        if (!cpu || typeof cpu.codegen_finalize !== "function" || typeof w?.jit_block_map_set_enabled !== "function") return;
+        if (!cpu || typeof cpu.codegen_finalize !== "function" || typeof w?.jit_block_map_set_enabled !== "function") return false;
         const wasBlockMap = typeof w.jit_block_map_enabled === "function" ? w.jit_block_map_enabled() >>> 0 : 0;
         w.jit_block_map_set_enabled(1);
         const original = cpu.codegen_finalize;
@@ -331,14 +331,21 @@ export class AotCache {
         cpu.codegen_finalize = function (this: unknown, ...args: unknown[]) {
             const result = original.apply(this, args);
             const dump = (globalThis as any).__wasmDump;
-            const rec = dump?.out?.[dump.out.length - 1];
-            if (rec && (rec.table_index >>> 0) === ((args[0] as number) >>> 0) && rec.start === ((args[1] as number) >>> 0) && !rec.codePages) {
-                const ex = self.wasm();
-                rec.codePages = lastModuleCodePages(ex, self.cpu()?.wasm_memory?.buffer ?? ex?.memory?.buffer);
+            const index = (args[0] as number) >>> 0, start = (args[1] as number) >>> 0;
+            const out: WasmDumpRecord[] = dump?.out ?? [];
+            for (let i = out.length - 1; i >= 0; i--) {
+                const rec = out[i]!;
+                if ((rec.table_index >>> 0) !== index || (rec.start >>> 0) !== start) continue;
+                if (rec.codePages === undefined) {
+                    const ex = self.wasm();
+                    rec.codePages = lastModuleCodePages(ex, self.cpu()?.wasm_memory?.buffer ?? ex?.memory?.buffer);
+                }
+                break;
             }
             return result;
         };
         this.tappedFinalize = { cpu, original, wasBlockMap };
+        return true;
     }
 
     private untapCodePages(): void {
@@ -413,6 +420,10 @@ export class AotCache {
             }
             if (!pages.length) { skipped++; continue; }
             const codePages: number[] | undefined = Array.isArray(rec.codePages) ? rec.codePages.slice() : undefined;
+            if (dump?.codePagesRequired && !codePages) {
+                skipped++;
+                continue;
+            }
             if (codePages && unlistedCodePage({ pages, codePages, bytes: rec.bytes })) {
                 skipped++;
                 continue;

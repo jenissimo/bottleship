@@ -113,6 +113,73 @@ describe("AOT units cover every page their module runs code from", () => {
         expect(blockMapOn).toBe(0);                                 // disarm restores the switch
     });
 
+    test("a recompiled earlier page gets its own map, and a capture without one is not published", async () => {
+        const memory = new Uint8Array(PAGE * 8);
+        const wasmMemory = new ArrayBuffer(4096);
+        const blockWords = new Uint32Array(wasmMemory, 1024, 16);
+        let blockMapOn = 0, mapAvailable = true;
+        const tableOf = new Map<number, number>();
+        const wasm: any = {
+            jit_block_map_set_enabled: (v: number) => { blockMapOn = v; },
+            jit_block_map_enabled: () => blockMapOn,
+            jit_block_map_count: () => (mapAvailable ? 2 : 0),
+            jit_block_map_ptr: () => 1024,
+            jit_aot_page_table_index: (addr: number) => tableOf.get(addr >>> 12) ?? 0,
+            jit_aot_module_page_count: () => 1,
+            jit_aot_module_page_at: (idx: number) => [...tableOf.entries()].find(([, t]) => t === idx)![0] * PAGE,
+            jit_aot_page_entry_count: () => 1,
+            jit_aot_page_entry_at: () => 0,
+            jit_aot_page_state_flags: () => 0,
+            jit_config_abi_version: () => 1,
+            jit_config_supported_mask: () => 1,
+            jit_codegen_fingerprint_lo: () => 1,
+            jit_codegen_fingerprint_hi: () => 0,
+        };
+        const cpu: any = {
+            mem8: memory, memory_size: new Uint32Array([memory.length]), wm: { exports: wasm }, wasm_memory: { buffer: wasmMemory },
+            codegen_finalize(index: number, start: number) {
+                const out = (globalThis as any).__wasmDump.out;
+                const rec = { start, table_index: index, len: 4, bytes: new Uint8Array([1, 2, 3, index]) };
+                const i = out.findIndex((r: any) => (r.start >>> 12) === (start >>> 12));
+                if (i >= 0) out[i] = rec; else out.push(rec);
+                tableOf.set(start >>> 12, index);
+            },
+        };
+        const blocks = (pages: number[]) => pages.forEach((page, i) => {
+            blockWords[i * 8] = page * PAGE + 0x20;
+            blockWords[i * 8 + 2] = page * PAGE + 0x40;
+        });
+        (globalThis as any).System = { getInstance: () => ({ process: { v86: { cpu } } }) };
+        (globalThis as any).preemption = { getWasmExports: () => wasm };
+        (aotCache as any).engineFingerprint = async () => "engine";
+        (aotCache as any).hostFingerprint = async () => "host";
+        aotCache.clear();
+
+        aotCache.armAll();
+        blocks([0, 0]); cpu.codegen_finalize(7, 0);
+        blocks([1, 1]); cpu.codegen_finalize(8, PAGE);
+        blocks([0, 5]); cpu.codegen_finalize(9, 0);                 // replaces record 0 in place
+        const out = (globalThis as any).__wasmDump.out;
+        expect(out.length).toBe(2);
+        expect(out[0].table_index).toBe(9);
+        expect(out[0].codePages).toEqual([0, 5]);
+        expect(out[1].codePages).toEqual([1]);
+        const snap = await aotCache.snapshot();
+        expect(snap.units).toBe(1);
+        expect(snap.skipped).toBe(1);
+        expect(aotCache.getUnits().map(u => u.pages[0]!.physPage)).toEqual([1]);
+        aotCache.disarm();
+
+        aotCache.clear();
+        aotCache.armAll();
+        mapAvailable = false;
+        blocks([2, 2]); cpu.codegen_finalize(10, 2 * PAGE);
+        expect((globalThis as any).__wasmDump.out.at(-1).codePages).toBeNull();
+        const none = await aotCache.snapshot();
+        expect(none.units).toBe(0);
+        aotCache.disarm();
+    });
+
     test("replay refuses a unit with an unlisted code page before instantiating it", async () => {
         const memory = new Uint8Array(PAGE * 8);
         const tx = () => 0;
