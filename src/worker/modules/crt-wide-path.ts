@@ -1,12 +1,21 @@
 import { Mem } from "../core/memory/mem-accessor";
 import { System } from "../core/system";
-import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
+import { raiseGuestAccessViolation } from "../core/thunking/guest-fault";
+import type { ThunkResult, ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 
 interface WidePathHost {
     readWString(ptr: number, maxChars: number): string;
-    writeWString(ptr: number, value: string): void;
     malloc(bytes: number): number;
     setErrno(code: number): void;
+}
+
+function writePath(ctx: {esp: number}, mem: Uint8Array, dst: number, text: string): ThunkResult | undefined {
+    for (let i = 0; i <= text.length; i++) {
+        const address = dst + i * 2;
+        if (!Mem.writeUint16(address, i === text.length ? 0 : text.charCodeAt(i))) {
+            return raiseGuestAccessViolation(ctx, mem, address, "w", 0);
+        }
+    }
 }
 
 function fullPath(path: string, cwd: string): string {
@@ -55,35 +64,56 @@ function fullPath(path: string, cwd: string): string {
 export function registerCrtWidePathExports(exports: Record<string, ThunkImplementation>, host: WidePathHost): void {
     const read = (ptr: number): string => ptr ? host.readWString(ptr, 32768) : "";
     const error = (code: number): number => { host.setErrno(code); return code; };
-    exports["_wfullpath"] = (_c, _m, a) => {
+    exports["_wfullpath"] = (ctx, mem, a) => {
         const dst = (a[0] ?? 0) >>> 0, size = (a[2] ?? 0) >>> 0;
         if (dst && size === 0) { error(22); return 0; }
         const result = fullPath(read((a[1] ?? 0) >>> 0), System.getInstance().fileSystem.currentDir || "C:\\");
-        if (dst && result.length >= size) { Mem.writeUint16(dst, 0); error(34); return 0; }
+        if (dst && result.length >= size) {
+            const fault = writePath(ctx, mem, dst, "");
+            if (fault) return fault;
+            error(34); return 0;
+        }
         const out = dst || host.malloc((result.length + 1) * 2);
         if (!out) { error(12); return 0; }
-        host.writeWString(out, result);
+        const fault = writePath(ctx, mem, out, result);
+        if (fault) return fault;
         return out >>> 0;
     };
-    exports["_wmakepath_s"] = (_c, _m, a) => {
+    exports["_wmakepath_s"] = (ctx, mem, a) => {
         const dst = (a[0] ?? 0) >>> 0, size = (a[1] ?? 0) >>> 0;
         if (!dst || !size) return error(22);
         const drive = read((a[2] ?? 0) >>> 0), dir = read((a[3] ?? 0) >>> 0);
         const name = read((a[4] ?? 0) >>> 0), ext = read((a[5] ?? 0) >>> 0);
         const result = (drive ? drive[0] + ":" : "") + dir +
             (dir && !/[\\/]$/.test(dir) ? "\\" : "") + name + (ext && ext[0] !== "." ? "." : "") + ext;
-        if (result.length >= size) { Mem.writeUint16(dst, 0); return error(34); }
-        host.writeWString(dst, result);
+        if (result.length >= size) {
+            const fault = writePath(ctx, mem, dst, "");
+            if (fault) return fault;
+            return error(34);
+        }
+        const fault = writePath(ctx, mem, dst, result);
+        if (fault) return fault;
         return 0;
     };
-    exports["_wsplitpath_s"] = (_c, _m, a) => {
-        const clear = (): void => {
-            for (let i = 1; i < 9; i += 2) if (a[i] && a[i + 1]) Mem.writeUint16(a[i]! >>> 0, 0);
+    exports["_wsplitpath_s"] = (ctx, mem, a) => {
+        const clear = (): ThunkResult | undefined => {
+            for (let i = 1; i < 9; i += 2) if (a[i] && a[i + 1]) {
+                const fault = writePath(ctx, mem, a[i]! >>> 0, "");
+                if (fault) return fault;
+            }
         };
         for (let i = 1; i < 9; i += 2) {
-            if (!(a[i] ?? 0) !== !(a[i + 1] ?? 0)) { clear(); return error(22); }
+            if (!(a[i] ?? 0) !== !(a[i + 1] ?? 0)) {
+                const fault = clear();
+                if (fault) return fault;
+                return error(22);
+            }
         }
-        if (!a[0]) { clear(); return error(22); }
+        if (!a[0]) {
+            const fault = clear();
+            if (fault) return fault;
+            return error(22);
+        }
         let path = read(a[0] >>> 0);
         const drive = path.length >= 2 && path[1] === ":" ? path.slice(0, 2) : "";
         path = path.slice(drive.length);
@@ -92,9 +122,16 @@ export function registerCrtWidePathExports(exports: Record<string, ThunkImplemen
         const dot = file.lastIndexOf(".");
         const parts = [drive, dir, dot < 0 ? file : file.slice(0, dot), dot < 0 ? "" : file.slice(dot)];
         for (let i = 0; i < 4; i++) {
-            if (a[1 + i * 2] && parts[i]!.length >= (a[2 + i * 2]! >>> 0)) { clear(); return error(34); }
+            if (a[1 + i * 2] && parts[i]!.length >= (a[2 + i * 2]! >>> 0)) {
+                const fault = clear();
+                if (fault) return fault;
+                return error(34);
+            }
         }
-        for (let i = 0; i < 4; i++) if (a[1 + i * 2]) host.writeWString(a[1 + i * 2]! >>> 0, parts[i]!);
+        for (let i = 0; i < 4; i++) if (a[1 + i * 2]) {
+            const fault = writePath(ctx, mem, a[1 + i * 2]! >>> 0, parts[i]!);
+            if (fault) return fault;
+        }
         return 0;
     };
 }

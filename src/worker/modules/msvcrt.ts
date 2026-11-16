@@ -650,7 +650,6 @@ export class Msvcrt implements IModule {
         });
         registerCrtWidePathExports(exports, {
             readWString: (p, max) => this.readWString(p, max),
-            writeWString: (p, text) => this.writeWString(p, text),
             malloc: (n) => this.malloc(n),
             setErrno: (e) => { this.setErrno(e); },
         });

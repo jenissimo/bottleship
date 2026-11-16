@@ -29,7 +29,7 @@ beforeEach(() => {
     errno = 123; next = 0x2000; exports = {}; allocated = []; failAllocation = false;
     cwd = System.getInstance().fileSystem.currentDir;
     System.getInstance().fileSystem.currentDir = "C:\\Game\\data\\";
-    registerCrtWidePathExports(exports, { readWString: read, writeWString: put,
+    registerCrtWidePathExports(exports, { readWString: read,
         malloc: bytes => { allocated.push(bytes); return failAllocation ? 0 : 0x8000; },
         setErrno: e => { errno = e; } });
 });
