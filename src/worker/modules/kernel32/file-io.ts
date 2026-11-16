@@ -2114,6 +2114,8 @@ const fileIoModule = (() => {
                         hypercallDataManager.unregisterEventMirror(hObject);
                     } else if (kernelObj?.kind === 'mutex') {
                         hypercallDataManager.unregisterMutexMirror(hObject);
+                    } else if (kernelObj?.kind === 'thread') {
+                        hypercallDataManager.forgetThreadSuspendCount(hObject);
                     }
                     resourceProvider.unregisterKernelObject(hObject);
                     break;

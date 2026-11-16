@@ -143,6 +143,7 @@ export class SyncObjectManager {
         const handle = this.resourceProvider.registerKernelObject({
             kind: 'event', manualReset, signaled: initialState,
         } as KernelEventObject);
+        if (!handle) return 0;
         this.eventHandles.add(handle);
         hypercallDataManager.registerEventMirror(handle, manualReset, initialState);
         return handle;
@@ -163,6 +164,7 @@ export class SyncObjectManager {
         const aliases = this.eventAliasGroups.get(event) ?? new Set([handle]);
         for (const alias of aliases) hypercallDataManager.unregisterEventMirror(alias);
         const duplicate = this.resourceProvider.registerKernelObject(event);
+        if (!duplicate) return null;
         this.eventHandles.add(duplicate); aliases.add(duplicate); this.eventAliasGroups.set(event, aliases);
         hypercallDataManager.unregisterEventMirror(duplicate);
         return duplicate;
@@ -259,6 +261,7 @@ export class SyncObjectManager {
         const handle = this.resourceProvider.registerKernelObject({
             kind: 'semaphore', count: Math.min(count, max), max,
         } as KernelSemaphoreObject);
+        if (!handle) return 0;
         this.semaphoreHandles.add(handle);
         return handle;
     }
@@ -283,6 +286,7 @@ export class SyncObjectManager {
             recursion: initialOwner ? 1 : 0,
             abandoned: false,
         } as KernelMutexObject);
+        if (!handle) return 0;
         this.mutexHandles.add(handle);
         hypercallDataManager.registerMutexMirror(
             handle,

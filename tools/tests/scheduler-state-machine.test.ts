@@ -13,6 +13,7 @@
  * isolation (verified): its only construction-time deps are benign singletons.
  */
 
+import { SystemResourceProvider } from "../../src/worker/core/resources/system-resource-provider";
 import { describe, expect, test } from "bun:test";
 import { Scheduler } from "../../src/worker/core/scheduler/scheduler";
 import { CallbackManager } from "../../src/worker/core/thunking/callback-manager";
@@ -83,7 +84,7 @@ function fakeCpu(init: { eax?: number; esp?: number; ebp?: number; eip?: number;
 function mkThread(id: number, state: ThreadState): Thread {
     return {
         id,
-        handle: 0x1000 + id,
+        handle: SystemResourceProvider.getInstance().registerKernelObject({ kind: "thread", threadId: id }),
         state,
         context: null,
         stackBase: 0x00200000,

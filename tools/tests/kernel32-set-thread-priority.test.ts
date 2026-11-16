@@ -10,6 +10,7 @@
  * Runs against the real scheduler with one injected thread, so what is asserted is what
  * GetThreadPriority reads back, not what a mock was handed.
  */
+import { SystemResourceProvider } from "../../src/worker/core/resources/system-resource-provider";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { System } from "../../src/worker/core/system";
 import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
@@ -57,6 +58,7 @@ describe("SetThreadPriority", () => {
         lastError = 0;
         scheduler.setLastError = (code: number) => { lastError = code; };
         scheduler.threads.set(THREAD_ID, { id: THREAD_ID, handle: HTHREAD, priority: 0 });
+        SystemResourceProvider.getInstance().registerKernelObjectAt(HTHREAD, { kind: "thread", threadId: THREAD_ID });
         resetProcessApiState();
     });
     afterEach(() => {
@@ -64,6 +66,8 @@ describe("SetThreadPriority", () => {
         scheduler.currentThreadId = savedCurrent;
         scheduler.threads.delete(THREAD_ID);
         scheduler.threads.delete(OTHER_ID);
+        SystemResourceProvider.getInstance().unregisterKernelObject(HTHREAD);
+        SystemResourceProvider.getInstance().unregisterKernelObject(HOTHER);
         config.osVersion = savedOs;
         resetProcessApiState();
     });
@@ -158,6 +162,7 @@ describe("SetThreadPriority", () => {
             config.osVersion = { ...VISTA };
             scheduler.currentThreadId = THREAD_ID;
             scheduler.threads.set(OTHER_ID, { id: OTHER_ID, handle: HOTHER, priority: 0 });
+            SystemResourceProvider.getInstance().registerKernelObjectAt(HOTHER, { kind: "thread", threadId: OTHER_ID });
         });
 
         test("BEGIN then END on the current thread succeed, by pseudo or real handle", () => {
