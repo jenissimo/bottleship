@@ -36,3 +36,87 @@ test("guest ContinueExecution retries the failed cdecl call with its caller fram
     f.deny(0x1000); f.call([0x1000, 8, src]);
     f.expectFault(0x1000); f.expectRetry();
 });
+
+// Permissions below come from AddressSpace; accessors are not mocked.
+for (const name of ["wcscpy_s", "wcscat_s", "wcsncpy_s", "wcsncat_s"]) {
+    test(name + " preserves output and errno when a later source WCHAR is NOACCESS", () => {
+        f = crtDispatchFixture(name); const src = f.put(0x3000, "xy"), dst = f.put(0x1000, name.includes("cat") ? "a" : "keep");
+        f.protect(src + 2, 2, "noaccess"); f.call([dst, 8, src, 2]); f.expectFault(src + 2, "r");
+        expect(f.reads).toContain(src + 2);
+        const offset = name.includes("cat") ? 2 : 0;
+        expect(f.dv.getUint16(dst + offset, true)).toBe(120);
+        expect(f.dv.getUint16(dst + offset + 2, true)).toBe(name.includes("cat") ? 0 : 101);
+    });
+    test(name + " attributes a crossing source read to the protected second byte", () => {
+        f = crtDispatchFixture(name); const src = f.put(0x1fff, "x"), dst = f.put(0x4000, "");
+        f.protect(0x2000, 0x1000, "noaccess"); f.call([dst, 8, src, 2]); f.expectFault(0x2000, "r");
+        expect(f.writes).toEqual([]);
+    });
+}
+for (const name of ["wcscat_s", "wcsncat_s"]) test(name + " faults while scanning a protected destination", () => {
+    f = crtDispatchFixture(name); const dst = f.put(0x1000, "ab"), src = f.put(0x3000, "x");
+    f.protect(dst + 2, 2, "noaccess"); f.call([dst, 8, src, 2]); f.expectFault(dst + 2, "r");
+    expect(f.writes).toEqual([]); expect(f.dv.getUint16(dst, true)).toBe(97);
+});
+
+test("wcscpy_s reports the first inaccessible byte of a crossing WCHAR store (r)", () => {
+    f = crtDispatchFixture("wcscpy_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "r");
+    f.call([dst, 8, input, 2]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("wcscpy_s reports the first inaccessible byte of a crossing WCHAR store (noaccess)", () => {
+    f = crtDispatchFixture("wcscpy_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "noaccess");
+    f.call([dst, 8, input, 2]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("wcscpy_s reports the first byte when the first page is read-only", () => {
+    f = crtDispatchFixture("wcscpy_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x1000, 0x1000, "r"); f.call([dst, 8, input, 2]); f.expectFault(dst);
+});
+
+test("wcscat_s reports the first inaccessible byte of a crossing WCHAR store (r)", () => {
+    f = crtDispatchFixture("wcscat_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "r");
+    f.call([dst, 8, input, 2]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("wcscat_s reports the first byte when the first page is read-only", () => {
+    f = crtDispatchFixture("wcscat_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x1000, 0x1000, "r"); f.call([dst, 8, input, 2]); f.expectFault(dst);
+});
+
+test("wcsncpy_s reports the first inaccessible byte of a crossing WCHAR store (r)", () => {
+    f = crtDispatchFixture("wcsncpy_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "r");
+    f.call([dst, 8, input, 2]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("wcsncpy_s reports the first inaccessible byte of a crossing WCHAR store (noaccess)", () => {
+    f = crtDispatchFixture("wcsncpy_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "noaccess");
+    f.call([dst, 8, input, 2]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("wcsncpy_s reports the first byte when the first page is read-only", () => {
+    f = crtDispatchFixture("wcsncpy_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x1000, 0x1000, "r"); f.call([dst, 8, input, 2]); f.expectFault(dst);
+});
+
+test("wcsncat_s reports the first inaccessible byte of a crossing WCHAR store (r)", () => {
+    f = crtDispatchFixture("wcsncat_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "r");
+    f.call([dst, 8, input, 2]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("wcsncat_s reports the first byte when the first page is read-only", () => {
+    f = crtDispatchFixture("wcsncat_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x1000, 0x1000, "r"); f.call([dst, 8, input, 2]); f.expectFault(dst);
+});
