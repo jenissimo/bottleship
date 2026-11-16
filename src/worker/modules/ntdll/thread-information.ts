@@ -31,6 +31,14 @@ function writable(system: System, memoryLength: number, ptr: number, size: numbe
         && (!system.process?.addressSpace || system.process.addressSpace.validateRange(ptr, size, 'w'));
 }
 
+/** The proof the guest stub relies on: every byte of the thread's [StackLimit, StackBase)
+ *  is writable now. Withdrawn by Scheduler.forgetPriorityMirrorsOverlapping on change. */
+function stackWritable(system: System, memoryLength: number, teb: number): boolean {
+    const stackBase = (Mem.readUint32(teb + TEB_OFFSETS.stackBase) ?? 0) >>> 0;
+    const stackLimit = (Mem.readUint32(teb + TEB_OFFSETS.stackLimit) ?? 0) >>> 0;
+    return stackLimit < stackBase && writable(system, memoryLength, stackLimit, stackBase - stackLimit);
+}
+
 export const queryThreadBasicInformation: ThunkImplementation = (_ctx, mem, args): number => {
     const handle = args[0] >>> 0, infoClass = args[1] >>> 0;
     const out = args[2] >>> 0, length = args[3] >>> 0, returnLength = args[4] >>> 0;
@@ -62,7 +70,7 @@ export const queryThreadBasicInformation: ThunkImplementation = (_ctx, mem, args
     if (returnLength && !Mem.writeUint32(returnLength, SIZE)) return STATUS_ACCESS_VIOLATION;
     // The guest stub answers the next calls on this thread from these two TEB words until a
     // priority input changes (Scheduler.forgetPriorityMirror clears the first one).
-    if (thread.tebAddress) {
+    if (thread.tebAddress && stackWritable(system, mem.length, thread.tebAddress)) {
         Mem.writeUint32(thread.tebAddress + TEB_OFFSETS.priorityRelative, thread.relativePriority);
         Mem.writeUint32(thread.tebAddress + TEB_OFFSETS.priorityEffective, priority);
     }
@@ -80,9 +88,11 @@ const STUB_REGION = 256;
  * calling thread's TEB — Self, ClientId and the priority pair the JS handler mirrors there.
  * Any other handle, class, length, an unaligned or off-stack buffer, or a thread whose mirror
  * is not published yet takes the export's own OUT trap, so the JS handler stays the single
- * definition of every other case (status codes, probing, other threads). A buffer inside
- * [StackLimit, StackBase) is committed and writable, which is what lets the stub skip the
- * probe the handler performs. stdcall(5); touches EAX/ECX/EDX and EFLAGS only.
+ * definition of every other case (status codes, probing, other threads). The stub skips the
+ * probe only under a maintained proof: the handler publishes the mirror only while the whole
+ * [StackLimit, StackBase) is writable, and any protect, release or decommit that touches the
+ * stack withdraws it (Scheduler.forgetPriorityMirrorsOverlapping). stdcall(5); touches
+ * EAX/ECX/EDX and EFLAGS only.
  */
 export function writeThreadInformationStub(
     allocator: StubAllocator, getMemory: () => Uint8Array, trapFunctionId: number,

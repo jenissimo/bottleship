@@ -15,6 +15,7 @@ import { queryThreadBasicInformation, writeThreadInformationStub } from '../../s
 import { exports as processApi } from '../../src/worker/modules/kernel32/process/process';
 import type { StubAllocator } from '../../src/worker/core/thunking/thunk-memory-manager';
 import { Mem } from '../../src/worker/core/memory/mem-accessor';
+import { AddressSpace } from '../../src/worker/core/memory/address-space';
 
 const lib = fileURLToPath(new URL('../../vendor/v86/build/libv86.mjs', import.meta.url));
 const wasm = fileURLToPath(new URL('../../public/v86.wasm', import.meta.url));
@@ -55,7 +56,20 @@ const SCRIPT: Step[] = [
     js('SetPriorityClass(NORMAL)', () => processApi.SetPriorityClass!(null as never, new Uint8Array(0), [0xFFFFFFFF, NORMAL_PRIORITY_CLASS])),
     call({}, true),
     call({}, false),
+    js('protect the stack page read-only', () => space().protect(STACK - 0x1000, 0x1000, 'r')),
+    call({}, true),                                   // proof withdrawn: JS probes, refuses, publishes nothing
+    call({}, true),
+    call({ retLen: 'none' }, true),
+    js('protect the stack page read-write again', () => space().protect(STACK - 0x1000, 0x1000, 'rw')),
+    call({}, true),                                   // JS re-establishes the whole-stack proof
+    call({}, false),
+    js('protect another stack page read-only', () => space().protect(STACK - 0x8000, 0x1000, 'r')),
+    call({}, true),                                   // this buffer is writable, but the stack is not: no proof
+    call({}, true),
 ];
+
+let liveSpace: AddressSpace | null = null;
+const space = () => liveSpace!;
 
 const calls = SCRIPT.flatMap((s, k) => 'call' in s ? [k] : []);
 const SLOT = 64;                                      // per call: status + 7 dwords + retLen + esp
@@ -144,7 +158,11 @@ async function runArm(viaStub: boolean): Promise<Arm> {
         s.tebManager.initProcess(mem, memory);
         (s as any).process = { memory };
         system.scheduler = s;
-        system.process = { resetGeneration: 0, memory, getCurrentMemory: mem } as never;
+        const addressSpace = new AddressSpace(mem);
+        addressSpace.mapRegion(0x100000, (32 << 20) - 0x100000, 'rwx', 'HEAP', 'test', 'all');
+        addressSpace.onAccessChange = (b, size) => s.forgetPriorityMirrorsOverlapping(b, size);
+        liveSpace = addressSpace;
+        system.process = { resetGeneration: 0, memory, getCurrentMemory: mem, addressSpace } as never;
         const rp = (s as any).resourceProvider;
         const t = thread(1);
         const realHandle = rp.registerKernelObject({ kind: 'thread', threadId: 1 }) >>> 0;
@@ -206,6 +224,9 @@ describe.skipIf(!existsSync(lib) || !existsSync(wasm))('NtQueryInformationThread
         expect(viaStub.rows[calls.indexOf(13)]![0]).toBe(0xc0000002);  // other class
         expect(viaStub.rows[calls.indexOf(14)]![0]).toBe(0xc0000004);  // other length
         for (const row of viaStub.rows) expect(row[10]).toBe(STACK - 0x40);  // RET 20 popped the args
+        const roAt = SCRIPT.findIndex(s => 'js' in s && s.js.startsWith('protect the stack page read-only'));
+        expect(viaStub.rows[calls.indexOf(roAt + 1)]![0]).toBe(0xc0000005);  // STATUS_ACCESS_VIOLATION, not a write
+        expect(viaStub.rows[calls.indexOf(roAt + 3)]![0]).toBe(0xc0000005);
         // Crossings: the trap arm crosses on every call; the stub arm exactly where the script says.
         expect(calls.map(k => viaTrap.crossings[k])).toEqual(calls.map(() => true));
         expect(calls.map(k => viaStub.crossings[k])).toEqual(calls.map(k => (SCRIPT[k] as { call: Call }).call.cross));
