@@ -29,6 +29,7 @@ import { serializeLocaleStubTable, writeLocaleStubDestLimit } from '../modules/k
 import { writeMbwcStubs, resetMbwcInlineStubs, type MbwcInlineStubs } from '../modules/kernel32/mbwc-stubs';
 import { serializeMbwcStubTable, writeMbwcStubDestLimit } from '../modules/kernel32/codepage-lut';
 import { writeTebStubs, TEB_STUB_EXPORTS, type TebInlineStubs } from '../modules/kernel32/teb-stubs';
+import { writeThreadInformationStub } from '../modules/ntdll/thread-information';
 import { loadDiagnostics } from './diagnostics/load-diagnostics';
 import { writeGuestCode, invalidateGuestCode } from './memory/guest-code';
 import { markGuestPagesDirty, zeroGuestRange } from './memory/guest-page-dirty';
@@ -276,6 +277,13 @@ export class PELoader {
     /** Trap-free kernel32 LastError/TLS/FLS accessors over the TEB. Emitted on the first
      *  kernel32 import; see kernel32/teb-stubs writeTebStubs. */
     private tebInlineStubs: TebInlineStubs | null = null;
+    /** Guest NtQueryInformationThread stub (ntdll/thread-information); 0 until emitted.
+     *  Not part of InlineStubState: after a restore the redirect and the stub are both in
+     *  guest memory already, and a later emission would only point the export at a copy. */
+    // @transient(rebuilt from guest memory state)
+    private threadInfoStub = 0;
+    // @transient(rebuilt from guest memory state)
+    private threadInfoStubBound = false;
 
     /** Dynamically-linked C runtime modules that export the cdecl malloc/free pair
      *  and the MSVC operator new/delete aliases — all share one slab fast path. */
@@ -383,6 +391,26 @@ export class PELoader {
         this.mathInlineStubs = null;
         this.tebInlineStubs = null;
         hypercallDataManager.setTebStubsBound(false);
+        this.threadInfoStub = 0;
+        this.threadInfoStubBound = false;
+    }
+
+    /** Bind NtQueryInformationThread/ZwQueryInformationThread to the guest stub once ntdll's
+     *  image exports exist (an importer of ntdll or of kernel32 brings them); retried on the
+     *  next such import until both routes point at it. */
+    private bindThreadInformationStub(): void {
+        const tmm = System.getInstance().process?.thunkMemoryManager;
+        const allowImage = !(globalThis as { __noImageIatBinding?: boolean }).__noImageIatBinding;
+        const trap = this.thunkGenerator.findStubsByName('ntdll', 'NtQueryInformationThread')[0]?.functionId;
+        if (!tmm || !trap) return;
+        let bound = false;
+        for (const name of ['ntqueryinformationthread', 'zwqueryinformationthread']) {
+            const at = hleExportBindingAddress(this.thunkGenerator, 'ntdll', name, allowImage);
+            if (at === undefined) continue;
+            if (!this.threadInfoStub) this.threadInfoStub = writeThreadInformationStub(tmm.stubAllocator, this.getMemory, trap);
+            if (redirectHleImageExport(this.thunkGenerator, 'ntdll', name, this.threadInfoStub, at) !== undefined) bound = true;
+        }
+        this.threadInfoStubBound = bound;
     }
 
     /**
@@ -1802,6 +1830,18 @@ export class PELoader {
                         this.tebInlineStubs = this.emitTebStubs(stubDll.exportTable);
                     } catch (e) {
                         Logger.warn(LogCategory.SYSTEM, `[PE] TEB stubs unavailable: ${e}`);
+                    }
+                }
+
+                // NtQueryInformationThread(GetCurrentThread(), ThreadBasicInformation) answered
+                // in guest code (ntdll/thread-information). DEFAULT-ON; window.__noNtQitStub=true
+                // before loading a game for the A/B.
+                if ((dllName === 'kernel32' || dllName === 'ntdll') && !this.threadInfoStubBound
+                    && !(globalThis as { __noNtQitStub?: boolean }).__noNtQitStub) {
+                    try {
+                        this.bindThreadInformationStub();
+                    } catch (e) {
+                        Logger.warn(LogCategory.SYSTEM, `[PE] NtQueryInformationThread stub unavailable: ${e}`);
                     }
                 }
 

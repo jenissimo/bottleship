@@ -27,6 +27,8 @@ import { MemoryAllocationError } from './memory/allocation-error';
  *   0xE10 TlsSlots[64]
  *   0xF94 TlsExpansionSlots       (-> 1024 lazy dynamic slots)
  *   0xFB4 FlsData                 (-> RTL_FLS_DATA, allocated on the first FlsSetValue)
+ *   0xFF8 (private) effective priority mirror for the NtQueryInformationThread stub, 0 = unknown
+ *   0xFFC (private) relative priority mirror, valid only while 0xFF8 is non-zero
  */
 
 import { Logger, LogCategory } from './logger';
@@ -44,6 +46,10 @@ const TEB_TLS_POINTER       = 0x2C;
 const TEB_PEB               = 0x30;
 const TEB_LAST_ERROR        = 0x34;
 const TEB_FLS_DATA          = 0xFB4;
+/** Past every field NT's 32-bit TEB defines at these offsets; zero-filled, so a new TEB
+ *  starts "unknown" and the stub defers to the JS handler, which publishes the pair. */
+const TEB_PRIORITY_EFFECTIVE = 0xFF8;
+const TEB_PRIORITY_RELATIVE  = 0xFFC;
 
 /** Native NT32 dynamic TLS: 64 inline slots and 1024 lazy expansion slots. */
 const TEB_TLS_SLOTS = 0xE10;
@@ -62,6 +68,8 @@ export const FLS_DATA_SLOTS_OFFSET = 8;
 const FLS_DATA_SIZE = FLS_DATA_SLOTS_OFFSET + FLS_INDEX_LIMIT * 4;
 export const TEB_OFFSETS = {
     self: TEB_SELF,
+    stackBase: TEB_STACK_BASE,
+    stackLimit: TEB_STACK_LIMIT,
     clientIdProcess: TEB_CLIENT_ID_PROCESS,
     clientIdThread: TEB_CLIENT_ID_THREAD,
     tlsPointer: TEB_TLS_POINTER,
@@ -69,6 +77,8 @@ export const TEB_OFFSETS = {
     tlsExpansion: TEB_TLS_EXPANSION,
     lastError: TEB_LAST_ERROR,
     flsData: TEB_FLS_DATA,
+    priorityEffective: TEB_PRIORITY_EFFECTIVE,
+    priorityRelative: TEB_PRIORITY_RELATIVE,
 } as const;
 export const TEB_BLOCK_SIZE = 0x1000;
 
