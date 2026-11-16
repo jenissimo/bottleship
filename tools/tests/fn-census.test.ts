@@ -7,7 +7,7 @@
 import { describe, test, expect } from "bun:test";
 import { System } from "../../src/worker/core/system";
 import {
-    summarizeFnCensus, candidatePages, registerFnCensusCommands, ROW, FN_CENSUS_ROW_WORDS, STAT_NAMES, FN_CENSUS_SCHEMA,
+    summarizeFnCensus, candidatePages, callContinuation, registerFnCensusCommands, ROW, FN_CENSUS_ROW_WORDS, STAT_NAMES, FN_CENSUS_SCHEMA,
     type FnCensusSnapshot, type CountedSample,
 } from "../../src/worker/harness/cmds/fn-census";
 
@@ -20,7 +20,7 @@ function row(fields: Partial<Record<keyof typeof ROW, number>>): Uint32Array {
 function snap(over: Partial<FnCensusSnapshot> = {}, rows: Uint32Array[] = [], stats: Partial<Record<(typeof STAT_NAMES)[number], number>> = {}): FnCensusSnapshot {
     return {
         atMs: 0, armEpoch: 1, kernelGeneration: 7, exportsId: 1, enabled: 1,
-        rows: new Map(rows.map(r => [r[ROW.entryVirt]!, r])),
+        rows: new Map(rows.map(r => [r[ROW.entryVirt]!, r])), calls: new Uint32Array(0),
         stats: STAT_NAMES.map(n => stats[n] ?? 0),
         retiredTotal: 0, fingerprint: "0x1:0x2", caps: [3, 2048, 512, 12288, 3], counted: null,
         ...over,
@@ -196,6 +196,7 @@ describe("command lifecycle", () => {
             fn_census_generation: () => 1, fn_census_reset: () => 0, fn_census_row_count: () => 1, fn_census_rows_ptr: () => 0,
             fn_census_stat: () => 0, fn_census_stat_count: () => STAT_NAMES.length, fn_census_owner_of: () => 0,
             fn_census_get_cap: () => 1, jit_codegen_fingerprint_lo: () => 1, jit_codegen_fingerprint_hi: () => 2,
+            fn_census_call_count: () => 0, fn_census_calls_ptr: () => 0,
             trace2_reset: () => { watched = 0; log.push("reset"); return 0; },
             trace2_watch_page: () => { watched++; return 1; },
             trace2_unwatch_all: () => { watched = 0; log.push("unwatch"); return 0; },
@@ -232,5 +233,38 @@ describe("command lifecycle", () => {
             (globalThis as any).setInterval = realSet;
             (globalThis as any).clearInterval = realClear;
         }
+    });
+});
+
+describe("call continuation estimate (schema 2)", () => {
+    const LEAF2 = 0x404000, BIGLEAF = 0x405000, ALIGNED = 0x406000, ICALLER = 0x407000, C1 = 0x408000, C2 = 0x409000;
+    const calls = new Uint32Array([
+        C1 + 5, LEAF2, 2, 4,
+        C2 + 5, BIGLEAF, 2, 0,
+        ALIGNED + 9, LEAF2, 2, 4,
+        ICALLER + 3, 0, 1, 0,
+    ]);
+    const rows = [
+        row({ entryVirt: LEAF2, entries: 1, instructions: 20, retSummary: 0x10004 }),
+        row({ entryVirt: BIGLEAF, entries: 1, instructions: 300 }),
+        row({ entryVirt: C1, entries: 1, unit: 1, windowStatic: 16, outCalls: 1, callStart: 0, callCount: 1 }),
+        row({ entryVirt: C2, entries: 1, unit: 1, windowStatic: 16, outCalls: 1, callStart: 1, callCount: 1 }),
+        row({ entryVirt: ALIGNED, entries: 1, unit: 1, windowStatic: 16 | 2, outCalls: 1, callStart: 2, callCount: 1 }),
+        row({ entryVirt: ICALLER, entries: 1, unit: 2, windowStatic: 64, callStart: 3, callCount: 1 }),
+        row({ entryVirt: 0x40a000, entries: 1, unit: 1, windowStatic: 16 | 1, outCalls: 0 }),
+    ];
+    const after = snap({ calls }, rows);
+    const exec = [10, 10, 100, 200, 400, 800, 1600];
+    const window = rows.map((r, i) => ({ r, entries: 1, executed: exec[i]! }));
+    const out = callContinuation(window, after, 4000, 3120) as any;
+    test("each option removes exactly its own refusals", () => {
+        expect(out.variants.m1.executedPctOfRetired).toBe(0.5);
+        expect(out.variants.inlineLeaves.executedPctOfRetired).toBe(3);
+        expect(out.variants.callChain.executedPctOfRetired).toBe(8);
+        expect(out.variants.callChainAlignedFrames.executedPctOfRetired).toBe(18);
+        expect(out.variants.callChainIndirectGuarded.executedPctOfRetired).toBe(28);
+    });
+    test("call sites are joined to callee rows", () => {
+        expect(out.sites).toEqual({ direct: 3, indirect: 1, calleeWithRow: 3, calleeAdmitted: 3, calleeRetKnown: 3, calleeInlinable: 2 });
     });
 });

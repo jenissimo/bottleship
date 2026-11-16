@@ -21,7 +21,8 @@ import { startRetiredAccumulator, peekRetiredTotal, stopRetiredAccumulator, coun
 import { cpu, symbolize } from "../serialize";
 import { dbg } from "../../core/debug/dbg-commands";
 
-export const FN_CENSUS_SCHEMA = 1;
+export const FN_CENSUS_SCHEMA = 2;
+export const FN_CENSUS_CALL_WORDS = 4;
 export const FN_CENSUS_ROW_WORDS = 40;
 
 export const ROW = {
@@ -30,14 +31,14 @@ export const ROW = {
     windowAdmitted: 14, windowRefused: 15, windowRefusedSeen: 16, windowMaxPages: 17, smcEvents: 18,
     frameAccesses: 19, otherAccesses: 20, x87Ops: 21, firstRefuseEip: 22, firstRefuseOp: 23,
     rangeStart: 24, rangeCount: 25, flags: 26, outCalls: 27, analyses: 28, codePage0: 29,
-    firstWindowEip: 32, firstWindowOp: 33,
+    firstWindowEip: 32, firstWindowOp: 33, callStart: 34, callCount: 35, retSummary: 36,
 } as const;
 
 export const UNIT_REASONS = [
     "guestCall", "guestCallIndirect", "indirectJump", "stateInstruction", "helperReentry",
     "codePageBudget", "instructionCap", "blockCap", "byteCap", "codeNotMapped", "pageCrossSplit", "addr16",
 ] as const;
-export const WINDOW_STATIC_REASONS = ["espUntracked", "espAlign", "espMerge", "espUnbalanced", "outCall", "extentPages"] as const;
+export const WINDOW_STATIC_REASONS = ["espUntracked", "espAlign", "espMerge", "espUnbalanced", "outCall", "extentPages", "calleeEspUnknown"] as const;
 export const PROMOTION_REASONS = ["slotEscapes", "unknownAlias", "noWindow"] as const;
 export const P4_REASONS = ["fldcw", "x87DepthMerge", "x87DepthUnknown", "strictFpu", "fpuEnv", "noX87"] as const;
 export const PROBE_REASONS = [
@@ -46,7 +47,7 @@ export const PROBE_REASONS = [
 ] as const;
 export const STAT_NAMES = [
     "calls", "callsTableFull", "analyses", "reanalyses", "tlbRevocations", "revocationsOnWindowPages",
-    "smcDirties", "smcOnCandidates", "rangeOverflow", "callsNotFlat32", "exceptions", "windowProbes", "windowAdmitted",
+    "smcDirties", "smcOnCandidates", "rangeOverflow", "callsNotFlat32", "exceptions", "windowProbes", "windowAdmitted", "callOverflow",
 ] as const;
 
 const P4_BLOCKING = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5);
@@ -57,7 +58,7 @@ type Exports = Record<string, ((...a: number[]) => number) | undefined>;
 const REQUIRED = [
     "fn_census_version", "fn_census_set_enabled", "fn_census_enabled", "fn_census_generation", "fn_census_reset",
     "fn_census_row_count", "fn_census_row_words", "fn_census_rows_ptr", "fn_census_stat", "fn_census_stat_count",
-    "fn_census_owner_of", "fn_census_get_cap", "jit_codegen_fingerprint_lo", "jit_codegen_fingerprint_hi",
+    "fn_census_owner_of", "fn_census_get_cap", "fn_census_call_count", "fn_census_calls_ptr", "jit_codegen_fingerprint_lo", "jit_codegen_fingerprint_hi",
 ] as const;
 
 export interface CountedSample { addr: number; exec: number; ins: number; owner: number }
@@ -69,6 +70,8 @@ export interface FnCensusSnapshot {
     exportsId: number;
     enabled: number;
     rows: Map<number, Uint32Array>;
+    /** Call-site pool, FN_CENSUS_CALL_WORDS per site: site EIP, direct target (0 = indirect), flags, callee ret imm16. */
+    calls: Uint32Array;
     stats: number[];
     retiredTotal: number;
     fingerprint: string;
@@ -263,9 +266,11 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
                 functions: versionChanged.length,
                 entries: versionChanged.reduce((s, w) => s + w.entries, 0),
             },
+            callContinuation: callContinuation(window, after, retired, countedTotal),
             dropped: {
                 rowTableFull: stat(1),
                 rangePoolOverflow: stat(8),
+                callSitePoolOverflow: stat(13),
                 callsNotFlat32: stat(9),
                 countedSlotOverflow: counted?.slotOverflow ?? null,
                 countedPagesNotArmed: counted?.pagesNotArmed ?? null,
@@ -310,6 +315,80 @@ export function executedProblems(counted: NonNullable<FnCensusSnapshot["counted"
     if (countedTotal > retired) out.push(`counted ${countedTotal} instructions exceed the ${retired} retired: inconsistent denominators`);
     if (saturated > 0) out.push(`${saturated} block counter(s) saturated: their weight is a lower bound of unknown size`);
     return out;
+}
+
+// @transient(harness census window; a reset or restore moves the kernel generation, which refuses the report)
+const W_OUT_CALL = 1 << 4, W_ALIGN = 1 << 1, W_CALLEE_ESP = 1 << 6;
+const U_CALL = 1 << 0, U_ICALL = 1 << 1;
+const CALL_INDIRECT = 1, CALL_RET_KNOWN = 2;
+export const INLINE_MAX_INSTRUCTIONS = 64;
+
+type Weighted = { r: Uint32Array; entries: number; executed: number };
+
+/**
+ * What each continuation option would add, from the same rows: a function qualifies when the
+ * option removes every reason it is refused for. Shares are cumulative (they include functions
+ * M1 already admits) and executed shares are of the window's counted owners, so they are lower
+ * bounds wherever the counted channel missed pages.
+ */
+export function callContinuation(window: Weighted[], after: FnCensusSnapshot, retired: number, counted: number) {
+    const byEntry = new Map<number, Uint32Array>();
+    for (const r of after.rows.values()) byEntry.set(r[ROW.entryVirt]!, r);
+    const sites = (r: Uint32Array) => {
+        const out: Array<{ target: number; flags: number; imm: number }> = [];
+        for (let i = 0; i < r[ROW.callCount]!; i++) {
+            const o = (r[ROW.callStart]! + i) * FN_CENSUS_CALL_WORDS;
+            if (o + FN_CENSUS_CALL_WORDS > after.calls.length) break;
+            out.push({ target: after.calls[o + 1]!, flags: after.calls[o + 2]!, imm: after.calls[o + 3]! });
+        }
+        return out;
+    };
+    const inlinable = (t: number) => {
+        const c = byEntry.get(t);
+        return !!c && c[ROW.unit] === 0 && c[ROW.windowStatic] === 0 && c[ROW.outCalls] === 0
+            && c[ROW.instructions]! <= INLINE_MAX_INSTRUCTIONS;
+    };
+    const variants: Record<string, (r: Uint32Array) => boolean> = {
+        m1: r => r[ROW.unit] === 0 && r[ROW.windowStatic] === 0,
+        inlineLeaves: r => (r[ROW.unit]! & ~U_CALL) === 0 && (r[ROW.windowStatic]! & ~W_OUT_CALL) === 0
+            && sites(r).every(s => !(s.flags & CALL_INDIRECT) && inlinable(s.target)),
+        callChain: r => (r[ROW.unit]! & ~U_CALL) === 0 && (r[ROW.windowStatic]! & ~W_OUT_CALL) === 0,
+        callChainAlignedFrames: r => (r[ROW.unit]! & ~U_CALL) === 0 && (r[ROW.windowStatic]! & ~(W_OUT_CALL | W_ALIGN)) === 0,
+        callChainIndirectGuarded: r => (r[ROW.unit]! & ~(U_CALL | U_ICALL)) === 0
+            && (r[ROW.windowStatic]! & ~(W_OUT_CALL | W_CALLEE_ESP)) === 0,
+    };
+    const entriesTotal = window.reduce((s, w) => s + w.entries, 0);
+    const out: Record<string, unknown> = {};
+    for (const [name, ok] of Object.entries(variants)) {
+        const q = window.filter(w => ok(w.r));
+        const ex = q.reduce((s, w) => s + w.executed, 0);
+        out[name] = {
+            functions: q.length,
+            entriesPct: pct(q.reduce((s, w) => s + w.entries, 0), entriesTotal),
+            executedPctOfRetired: pct(ex, retired),
+            executedPctOfCounted: pct(ex, counted),
+        };
+    }
+    let direct = 0, indirect = 0, calleeRow = 0, calleeAdmitted = 0, calleeRetKnown = 0, calleeInlinable = 0;
+    for (const w of window) {
+        for (const s of sites(w.r)) {
+            if (s.flags & CALL_INDIRECT) { indirect++; continue; }
+            direct++;
+            if (s.flags & CALL_RET_KNOWN) calleeRetKnown++;
+            const c = byEntry.get(s.target);
+            if (!c) continue;
+            calleeRow++;
+            if (c[ROW.unit] === 0) calleeAdmitted++;
+            if (inlinable(s.target)) calleeInlinable++;
+        }
+    }
+    return {
+        note: "cumulative shares: each option includes what M1 admits. inlineLeaves = callChain restricted to callers whose "
+            + `every call is direct to an admitted, call-free, window-clean callee of at most ${INLINE_MAX_INSTRUCTIONS} `
+            + "instructions. callChainIndirectGuarded assumes a guarded target supplies the callee's ESP effect.",
+        variants: out,
+        sites: { direct, indirect, calleeWithRow: calleeRow, calleeAdmitted, calleeRetKnown, calleeInlinable },
+    };
 }
 
 // @transient(harness census window; a reset or restore moves the kernel generation, which refuses the report)
@@ -358,6 +437,8 @@ function readSnapshot(withCounted: boolean): FnCensusSnapshot {
         rows.set(r[ROW.entryVirt]!, r);
     }
     const stats = Array.from({ length: STAT_NAMES.length }, (_, i) => Number(w.fn_census_stat!(i)));
+    const nc = w.fn_census_call_count!() >>> 0;
+    const calls = nc ? new Uint32Array(buffer, w.fn_census_calls_ptr!() >>> 0, nc * FN_CENSUS_CALL_WORDS).slice() : new Uint32Array(0);
     let counted: FnCensusSnapshot["counted"] = null;
     if (withCounted && countedArmed && typeof w.trace2_block_snapshot === "function") {
         const blocks: CountedSample[] = [];
@@ -377,7 +458,7 @@ function readSnapshot(withCounted: boolean): FnCensusSnapshot {
     }
     return {
         atMs: performance.now(), armEpoch, kernelGeneration: w.fn_census_generation!() >>> 0, exportsId: id,
-        enabled: w.fn_census_enabled!() >>> 0, rows, stats,
+        enabled: w.fn_census_enabled!() >>> 0, rows, calls, stats,
         retiredTotal: retiredAcc ? peekRetiredTotal(retiredAcc) : 0,
         fingerprint: hex(w.jit_codegen_fingerprint_hi!()) + ":" + hex(w.jit_codegen_fingerprint_lo!()),
         caps: [0, 1, 2, 3, 4].map(i => w.fn_census_get_cap!(i) >>> 0),
