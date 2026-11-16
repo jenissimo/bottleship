@@ -59,12 +59,15 @@ export function parseGogGameInfo(files: Map<string, Uint8Array>): GogGameInfo {
 }
 
 function resolveAppPath(value: string, installRoot = "C:\\"): string {
-    const normalized = value.replace(/\//g, "\\");
-    if (/^\{app\}$/i.test(normalized)) {
+    return expandAppConstant(value.replace(/\//g, "\\"), installRoot);
+}
+
+function expandAppConstant(value: string, installRoot: string): string {
+    if (/^\{app\}$/i.test(value)) {
         return installRoot.endsWith("\\") ? installRoot : `${installRoot}\\`;
     }
     const root = installRoot.replace(/\\$/, "");
-    return normalized.replace(/\{app\}/gi, root);
+    return value.replace(/\{app\}/gi, root);
 }
 
 /** Find UTF-16LE null wchar offset (byte index of 0x0000), not the first zero byte. */
@@ -105,7 +108,7 @@ function decodeRegistryValue(entry: RegistryEntry, unicode: boolean, installRoot
 
     let text = decodeRegistryText(v, unicode);
     if (entry.type === 5) text = text.replace(/\{break\}/gi, "\0");
-    text = resolveAppPath(text, installRoot);
+    text = expandAppConstant(text, installRoot);
     if (text.includes("{")) return null;
     if (entry.type === 3) {
         const number = text.trim();

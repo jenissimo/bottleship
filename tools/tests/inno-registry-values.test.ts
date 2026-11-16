@@ -57,3 +57,16 @@ test("malformed Unicode binary values are rejected", () => {
     expect(() => seed(4, new Uint8Array([1]), true)).toThrow(/binary/i);
     expect(() => seed(4, new Uint8Array([0, 1]), true)).toThrow(/binary/i);
 });
+
+for (const unicode of [false, true]) {
+    test(`multi-string members preserve literal slashes (${unicode ? "Unicode" : "ANSI"})`, () => {
+        const value = "https://host/a{break}plain/path";
+        expect(seed(5, text(value, unicode), unicode)[0]!.values[0]!.data).toBe(Buffer.from("https://host/a\0plain/path\0\0", "utf16le").toString("hex"));
+    });
+    test(`multi-string expansion preserves text beside app paths (${unicode ? "Unicode" : "ANSI"})`, () => {
+        expect(seed(5, text("{app}\\folder{break}a/b", unicode), unicode)[0]!.values[0]!.data).toBe(Buffer.from("C:\\folder\0a/b\0\0", "utf16le").toString("hex"));
+    });
+    test(`ordinary registry strings also preserve literal slashes (${unicode ? "Unicode" : "ANSI"})`, () => {
+        expect(seed(1, text("https://host/a", unicode), unicode)[0]!.values[0]!.data).toBe("https://host/a");
+    });
+}
