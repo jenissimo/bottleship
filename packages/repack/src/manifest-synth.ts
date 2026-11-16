@@ -59,12 +59,15 @@ export function parseGogGameInfo(files: Map<string, Uint8Array>): GogGameInfo {
 }
 
 function resolveAppPath(value: string, installRoot = "C:\\"): string {
-    const normalized = value.replace(/\//g, "\\");
-    if (/^\{app\}$/i.test(normalized)) {
+    return expandAppConstant(value.replace(/\//g, "\\"), installRoot);
+}
+
+function expandAppConstant(value: string, installRoot: string): string {
+    if (/^\{app\}$/i.test(value)) {
         return installRoot.endsWith("\\") ? installRoot : `${installRoot}\\`;
     }
     const root = installRoot.replace(/\\$/, "");
-    return normalized.replace(/\{app\}/gi, root);
+    return value.replace(/\{app\}/gi, root);
 }
 
 /** Find UTF-16LE null wchar offset (byte index of 0x0000), not the first zero byte. */
@@ -75,61 +78,54 @@ function utf16NullByteOffset(v: Uint8Array): number {
     return -1;
 }
 
-function decodeRegistryValue(entry: RegistryEntry, unicode: boolean): unknown {
+function decodeRegistryText(v: Uint8Array, unicode: boolean): string {
+    const end = unicode ? utf16NullByteOffset(v) : v.indexOf(0);
+    return new TextDecoder(unicode ? "utf-16le" : "windows-1252").decode(end >= 0 ? v.subarray(0, end) : v);
+}
+
+function hexBytes(v: Uint8Array): string {
+    return Array.from(v, b => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Inno's rt* ordinals are not Win32 REG_* constants (Shared.Struct.pas). */
+function decodeRegistryValue(entry: RegistryEntry, unicode: boolean, installRoot: string): RegistrySeed["values"][number] | null {
+    const name = entry.name || "(Default)";
     const v = entry.value;
-    switch (entry.type) {
-        case 0: // REG_NONE
-            return "";
-        case 1: { // REG_SZ
-            if (unicode) {
-                const nullOff = utf16NullByteOffset(v);
-                const bytes = nullOff >= 0 ? v.subarray(0, nullOff) : v;
-                return new TextDecoder("utf-16le").decode(bytes);
-            }
-            const end = v.indexOf(0);
-            return new TextDecoder("windows-1252").decode(end >= 0 ? v.subarray(0, end) : v);
+    if (entry.type === 0) return null; // rtNone creates the key only.
+    if (entry.type === 4) {
+        // Unicode installers store each binary byte as one UTF-16 code unit.
+        if (!unicode) return { name, type: "REG_BINARY", data: hexBytes(v) };
+        if (v.length % 2) throw new Error("Invalid Inno registry binary payload");
+        const bytes = new Uint8Array(v.length / 2);
+        for (let i = 0; i < bytes.length; i++) {
+            if (v[i * 2 + 1] !== 0) throw new Error("Invalid Inno registry binary payload");
+            bytes[i] = v[i * 2]!;
         }
-        case 2: { // REG_EXPAND_SZ
-            if (unicode) {
-                const nullOff = utf16NullByteOffset(v);
-                const bytes = nullOff >= 0 ? v.subarray(0, nullOff) : v;
-                return new TextDecoder("utf-16le").decode(bytes);
-            }
-            const end = v.indexOf(0);
-            return new TextDecoder("windows-1252").decode(end >= 0 ? v.subarray(0, end) : v);
-        }
-        case 3: { // REG_BINARY
-            return Array.from(v);
-        }
-        case 4: { // REG_DWORD
-            if (v.byteLength >= 4) return new DataView(v.buffer, v.byteOffset, 4).getUint32(0, true);
-            return 0;
-        }
-        case 7: { // REG_MULTI_SZ
-            const parts: string[] = [];
-            const dec = new TextDecoder(unicode ? "utf-16le" : "windows-1252");
-            if (unicode) {
-                let start = 0;
-                for (let i = 0; i + 1 < v.byteLength; i += 2) {
-                    if (v[i] === 0 && v[i + 1] === 0) {
-                        parts.push(dec.decode(v.subarray(start, i)));
-                        start = i + 2;
-                    }
-                }
-            } else {
-                let start = 0;
-                for (let i = 0; i < v.byteLength; i++) {
-                    if (v[i] === 0) {
-                        parts.push(dec.decode(v.subarray(start, i)));
-                        start = i + 1;
-                    }
-                }
-            }
-            return parts;
-        }
-        default:
-            return Array.from(v);
+        return { name, type: "REG_BINARY", data: hexBytes(bytes) };
     }
+    if (entry.type === 6) throw new Error("Inno registry QWORD values are not supported by registry seeds");
+    if (![1, 2, 3, 5].includes(entry.type)) throw new Error(`Unsupported Inno registry value type ${entry.type}`);
+
+    let text = decodeRegistryText(v, unicode);
+    if (entry.type === 5) text = text.replace(/\{break\}/gi, "\0");
+    text = expandAppConstant(text, installRoot);
+    if (text.includes("{")) return null;
+    if (entry.type === 3) {
+        const number = text.trim();
+        if (!/^(?:\d+|\$[\da-f]+)$/i.test(number)) throw new Error(`Invalid Inno registry DWORD: ${text}`);
+        const data = number.startsWith("$") ? Number.parseInt(number.slice(1), 16) : Number(number);
+        if (data > 0xffffffff) throw new Error(`Inno registry DWORD out of range: ${text}`);
+        return { name, type: "REG_DWORD", data };
+    }
+    if (entry.type === 5) {
+        // Registry seeds represent REG_MULTI_SZ as UTF-16LE bytes in hex, not an array.
+        const terminated = text.replace(/\0+$/, "") + "\0\0";
+        const bytes = new Uint8Array(terminated.length * 2);
+        const view = new DataView(bytes.buffer);
+        for (let i = 0; i < terminated.length; i++) view.setUint16(i * 2, terminated.charCodeAt(i), true);
+        return { name, type: "REG_MULTI_SZ", data: hexBytes(bytes) };
+    }
+    return { name, type: "REG_SZ", data: text };
 }
 
 const HIVE_NAMES = ["HKCR", "HKCU", "HKLM", "HKU"] as const;
@@ -153,16 +149,8 @@ export function synthesizeRegistry(
         let keyPath = resolveAppPath(entry.key, installRoot);
         if (keyPath.includes("{")) continue;
 
-        let data = decodeRegistryValue(entry, unicode);
-        if (typeof data === "string") {
-            data = resolveAppPath(data, installRoot);
-            if ((data as string).includes("{")) continue;
-        }
-
-        const regType = entry.type === 4 ? "REG_DWORD"
-            : entry.type === 3 ? "REG_BINARY"
-            : entry.type === 7 ? "REG_MULTI_SZ"
-            : "REG_SZ";
+        const value = decodeRegistryValue(entry, unicode, installRoot);
+        if (!value && entry.type !== 0) continue;
 
         const seedKey = `${hive}\\${keyPath}`;
         let seed = byHive.get(seedKey);
@@ -170,7 +158,7 @@ export function synthesizeRegistry(
             seed = { root: hive, path: keyPath, values: [] };
             byHive.set(seedKey, seed);
         }
-        seed.values.push({ name: entry.name || "(Default)", type: regType, data });
+        if (value) seed.values.push(value);
     }
 
     return [...byHive.values()];
