@@ -47,6 +47,33 @@ function image(): Uint8Array {
     return bytes;
 }
 
+async function waitForJitEntry(api: any, finalized: () => number, failuresBefore: number, timeoutMs = 5000): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let poll: ReturnType<typeof setInterval> | undefined;
+    const entries = () => Array.from({ length: api.jit_aot_page_entry_count(STUB) }, (_, i) =>
+        api.jit_aot_page_entry_at(STUB, i) >>> 16);
+    try {
+        await new Promise<void>((resolve, reject) => {
+            const check = () => {
+                if (api.codegen_get_finalize_failure_count() !== failuresBefore) {
+                    reject(new Error('JIT publication failed'));
+                } else if (api.codegen_is_compiling() === 0 && finalized() > 0 &&
+                    entries().includes((STUB + 11) & 0xfff)) {
+                    resolve();
+                }
+            };
+            timer = setTimeout(() => reject(new Error(
+                `JIT entry publication timed out: pending=${api.codegen_is_compiling()} finalized=${finalized()} entries=${entries()}`,
+            )), timeoutMs);
+            poll = setInterval(check, 1);
+            check();
+        });
+    } finally {
+        clearTimeout(timer);
+        clearInterval(poll);
+    }
+}
+
 // Execute caller code in v86 so bookkeeping alone cannot conceal a suspended
 // thread continuing past the OUT trap.
 describe.skipIf(!existsSync(lib) || !existsSync(wasm))('scheduler self-suspend, executed', () => {
@@ -64,6 +91,7 @@ describe.skipIf(!existsSync(lib) || !existsSync(wasm))('scheduler self-suspend, 
                 cpu.reboot_internal(); cpu.reset_memory(); cpu.load_multiboot(image().buffer);
                 for (const [index, value] of SHIPPING_JIT) api.set_jit_config(index, value);
                 applyCodegenSwitches(api);
+                const failuresBefore = api.codegen_get_finalize_failure_count();
                 let finalized = 0;
                 cpu.test_hook_did_finalize_wasm = () => finalized++;
                 const mem = () => new Uint8Array(cpu.mem8.buffer, cpu.mem8.byteOffset, cpu.mem8.length);
@@ -90,8 +118,12 @@ describe.skipIf(!existsSync(lib) || !existsSync(wasm))('scheduler self-suspend, 
                 });
                 cpu.reg32[4] = OUT_STACK; cpu.reg32[7] = jit ? 50000 : 1;
                 cpu.instruction_pointer[0] = ENTRY; cpu.flags[0] = 2;
-                await run(); await Bun.sleep(0);
+                await run();
                 if (jit) {
+                    // HLT stops guest execution, not the asynchronous Wasm publication.
+                    await waitForJitEntry(api, () => finalized, failuresBefore);
+                    expect(api.codegen_get_finalize_failure_count()).toBe(failuresBefore);
+                    expect(api.codegen_is_compiling()).toBe(0);
                     expect(finalized).toBeGreaterThan(0);
                     const entries = Array.from({ length: api.jit_aot_page_entry_count(STUB) }, (_, i) =>
                         api.jit_aot_page_entry_at(STUB, i) >>> 16);
