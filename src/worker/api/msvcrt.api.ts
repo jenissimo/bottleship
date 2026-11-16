@@ -528,6 +528,8 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("strftime", 4),
         makeFunc("_snwprintf", 16),
         makeFunc("swprintf", 16),
+        makeFunc("swprintf_s", 16),
+        makeFunc("_snwprintf_s", 16),
 
         // Console
         makeFunc("_kbhit", 0),
