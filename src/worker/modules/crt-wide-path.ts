@@ -3,8 +3,9 @@ import { System } from "../core/system";
 import { raiseGuestAccessViolation } from "../core/thunking/guest-fault";
 import type { ThunkResult, ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 
+import {readCrtWString, withCrtReadFault} from "./crt-checked-strings";
+
 interface WidePathHost {
-    readWString(ptr: number, maxChars: number): string;
     malloc(bytes: number): number;
     setErrno(code: number): void;
 }
@@ -13,7 +14,7 @@ function writePath(ctx: {esp: number}, mem: Uint8Array, dst: number, text: strin
     for (let i = 0; i <= text.length; i++) {
         const address = dst + i * 2;
         if (!Mem.writeUint16(address, i === text.length ? 0 : text.charCodeAt(i))) {
-            return raiseGuestAccessViolation(ctx, mem, address, "w", 0);
+            return raiseGuestAccessViolation(ctx, mem, Mem.firstInaccessibleByte(address, 2, "w"), "w", 0);
         }
     }
 }
@@ -62,9 +63,9 @@ function fullPath(path: string, cwd: string): string {
 }
 
 export function registerCrtWidePathExports(exports: Record<string, ThunkImplementation>, host: WidePathHost): void {
-    const read = (ptr: number): string => ptr ? host.readWString(ptr, 32768) : "";
+    const read = (ptr: number): string => ptr ? readCrtWString(ptr, 32768) : "";
     const error = (code: number): number => { host.setErrno(code); return code; };
-    exports["_wfullpath"] = (ctx, mem, a) => {
+    exports["_wfullpath"] = withCrtReadFault((ctx, mem, a) => {
         const dst = (a[0] ?? 0) >>> 0, size = (a[2] ?? 0) >>> 0;
         if (dst && size === 0) { error(22); return 0; }
         const result = fullPath(read((a[1] ?? 0) >>> 0), System.getInstance().fileSystem.currentDir || "C:\\");
@@ -78,8 +79,8 @@ export function registerCrtWidePathExports(exports: Record<string, ThunkImplemen
         const fault = writePath(ctx, mem, out, result);
         if (fault) return fault;
         return out >>> 0;
-    };
-    exports["_wmakepath_s"] = (ctx, mem, a) => {
+    });
+    exports["_wmakepath_s"] = withCrtReadFault((ctx, mem, a) => {
         const dst = (a[0] ?? 0) >>> 0, size = (a[1] ?? 0) >>> 0;
         if (!dst || !size) return error(22);
         const drive = read((a[2] ?? 0) >>> 0), dir = read((a[3] ?? 0) >>> 0);
@@ -94,8 +95,8 @@ export function registerCrtWidePathExports(exports: Record<string, ThunkImplemen
         const fault = writePath(ctx, mem, dst, result);
         if (fault) return fault;
         return 0;
-    };
-    exports["_wsplitpath_s"] = (ctx, mem, a) => {
+    });
+    exports["_wsplitpath_s"] = withCrtReadFault((ctx, mem, a) => {
         const clear = (): ThunkResult | undefined => {
             for (let i = 1; i < 9; i += 2) if (a[i] && a[i + 1]) {
                 const fault = writePath(ctx, mem, a[i]! >>> 0, "");
@@ -133,5 +134,5 @@ export function registerCrtWidePathExports(exports: Record<string, ThunkImplemen
             if (fault) return fault;
         }
         return 0;
-    };
+    });
 }

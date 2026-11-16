@@ -649,7 +649,6 @@ export class Msvcrt implements IModule {
             nextTempnamSeq: () => (this.tempnamCounter++ & 0xffff),
         });
         registerCrtWidePathExports(exports, {
-            readWString: (p, max) => this.readWString(p, max),
             malloc: (n) => this.malloc(n),
             setErrno: (e) => { this.setErrno(e); },
         });

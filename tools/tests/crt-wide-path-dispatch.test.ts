@@ -56,3 +56,78 @@ test("_wsplitpath_s stops clearing at a refused component on invalid input", () 
     expect(f.dv.getUint16(drive, true)).toBe(0);
     expect(f.dv.getUint16(dir, true)).toBe(107); expect(f.dv.getUint16(file, true)).toBe(107);
 });
+
+// Permissions below come from AddressSpace; accessors are not mocked.
+for (const [name, component] of [["_wfullpath", "path"], ["_wsplitpath_s", "path"],
+    ["_wmakepath_s", "drive"], ["_wmakepath_s", "directory"], ["_wmakepath_s", "filename"], ["_wmakepath_s", "extension"]]) {
+    test(name + " faults on a protected " + component + " input", () => {
+        f = crtDispatchFixture(name!); const dst = f.put(0x1000, "keep"), input = f.put(0x3000, "xy");
+        f.protect(input + 2, 2, "noaccess");
+        const args = name === "_wfullpath" ? [dst, input, 32] : name === "_wsplitpath_s" ?
+            [input, 0, 0, 0, 0, dst, 32, 0, 0] : [dst, 32, ...["drive", "directory", "filename", "extension"].map(k => k === component ? input : 0)];
+        f.call(args); f.expectFault(input + 2, "r");
+        expect(f.writes).toEqual([]); expect(f.dv.getUint16(dst, true)).toBe(107);
+    });
+}
+for (const name of ["_wfullpath", "_wmakepath_s", "_wsplitpath_s"]) test(name + " attributes a crossing input read to the protected byte", () => {
+    f = crtDispatchFixture(name); const input = f.put(0x1fff, "x"); f.protect(0x2000, 0x1000, "noaccess");
+    f.call(name === "_wfullpath" ? [0x5000, input, 32] : name === "_wmakepath_s" ? [0x5000, 32, 0, 0, input, 0] :
+        [input, 0, 0, 0, 0, 0x5000, 32, 0, 0]); f.expectFault(0x2000, "r"); expect(f.writes).toEqual([]);
+});
+
+test("_wfullpath reports the first inaccessible byte of a crossing WCHAR store (r)", () => {
+    f = crtDispatchFixture("_wfullpath"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "r");
+    f.call([dst, input, 32]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("_wfullpath reports the first inaccessible byte of a crossing WCHAR store (noaccess)", () => {
+    f = crtDispatchFixture("_wfullpath"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "noaccess");
+    f.call([dst, input, 32]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("_wfullpath reports the first byte when the first page is read-only", () => {
+    f = crtDispatchFixture("_wfullpath"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x1000, 0x1000, "r"); f.call([dst, input, 32]); f.expectFault(dst);
+});
+
+test("_wmakepath_s reports the first inaccessible byte of a crossing WCHAR store (r)", () => {
+    f = crtDispatchFixture("_wmakepath_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "r");
+    f.call([dst, 32, 0, 0, input, 0]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("_wmakepath_s reports the first inaccessible byte of a crossing WCHAR store (noaccess)", () => {
+    f = crtDispatchFixture("_wmakepath_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "noaccess");
+    f.call([dst, 32, 0, 0, input, 0]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("_wmakepath_s reports the first byte when the first page is read-only", () => {
+    f = crtDispatchFixture("_wmakepath_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x1000, 0x1000, "r"); f.call([dst, 32, 0, 0, input, 0]); f.expectFault(dst);
+});
+
+test("_wsplitpath_s reports the first inaccessible byte of a crossing WCHAR store (r)", () => {
+    f = crtDispatchFixture("_wsplitpath_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "r");
+    f.call([input, 0, 0, 0, 0, dst, 32, 0, 0]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("_wsplitpath_s reports the first inaccessible byte of a crossing WCHAR store (noaccess)", () => {
+    f = crtDispatchFixture("_wsplitpath_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x2000, 0x1000, "noaccess");
+    f.call([input, 0, 0, 0, 0, dst, 32, 0, 0]); f.expectFault(0x2000);
+    expect(f.dv.getUint8(dst)).toBe(0); expect(f.dv.getUint8(dst + 1)).toBe(0);
+});
+
+test("_wsplitpath_s reports the first byte when the first page is read-only", () => {
+    f = crtDispatchFixture("_wsplitpath_s"); const dst = f.put(0x1fff, ""), input = f.put(0x4000, "xy");
+    f.protect(0x1000, 0x1000, "r"); f.call([input, 0, 0, 0, 0, dst, 32, 0, 0]); f.expectFault(dst);
+});

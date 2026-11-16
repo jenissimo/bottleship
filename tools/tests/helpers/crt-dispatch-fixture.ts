@@ -1,5 +1,6 @@
 import {expect} from "bun:test";
 import {Mem} from "../../../src/worker/core/memory/mem-accessor";
+import {AddressSpace} from "../../../src/worker/core/memory/address-space";
 import {System} from "../../../src/worker/core/system";
 import {ThunkDispatcher} from "../../../src/worker/core/thunking/thunk-dispatcher";
 import {ThunkBoundaryKind} from "../../../src/worker/core/scheduler/types";
@@ -21,7 +22,8 @@ export function crtDispatchFixture(name: string) {
         flags: new Int32Array(mem.buffer, 120, 1), flags_changed: new Int32Array(1),
         segment_offsets: new Int32Array(mem.buffer, 736, 8), get_eflags: () => 0x202};
     v86.cpu = cpu; v86.mem8 = mem;
-    const process: any = {v86, dispatcher: d};
+    const space = new AddressSpace(() => mem);
+    const process: any = {v86, dispatcher: d, addressSpace: space};
     system.process = process;
     d.cachedCpu = cpu; d.cachedMem8 = mem; d.cachedDataView = dv; d.memLength = mem.length;
     d.cachedWasmBuffer = mem.buffer; d.cachedReg32Raw = cpu.reg32; d.cachedFlagsRaw = cpu.flags;
@@ -47,17 +49,23 @@ export function crtDispatchFixture(name: string) {
     expect(typeof d.dispatchTable[id]).toBe("function");
     let denied = -1, deniedRead = -1;
     let callArgs: number[] = [];
-    const writes: number[] = [];
+    const writes: number[] = [], reads: number[] = [];
     Mem.bind(() => mem, (address, size, perms) => {
-        if (!perms.includes("w")) return !(address <= deniedRead && deniedRead < address + size);
+        if (!perms.includes("w")) {
+            reads.push(address);
+            return address >= 0 && address + size <= mem.length && space.validateRange(address, size, perms) &&
+                !(address <= deniedRead && deniedRead < address + size);
+        }
         writes.push(address);
-        return !(address <= denied && denied < address + size);
+        return address >= 0 && address + size <= mem.length && space.validateRange(address, size, perms) &&
+            !(address <= denied && denied < address + size);
     });
     function put(address: number, text: string): number {
         for (let i = 0; i <= text.length; i++) dv.setUint16(address + i * 2, i === text.length ? 0 : text.charCodeAt(i), true);
         return address;
     }
-    return {mem, dv, cpu, d, esp, ret, retry, writes, put,
+    return {mem, dv, cpu, d, esp, ret, retry, writes, reads, put,
+        protect(address: number, size: number, perms: "r" | "noaccess") { expect(space.protect(address, size, perms)).toBe(true); },
         deny(address: number) { denied = address; },
         denyRead(address: number) { deniedRead = address; },
         call(args: number[]) {
