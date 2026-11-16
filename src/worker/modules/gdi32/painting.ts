@@ -15,7 +15,7 @@ import { profiler } from '../../core/profiler';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { SystemResourceProvider } from '../../core/resources/system-resource-provider';
 import { toPlainGuestMemory } from '../../core/memory/guest-memory';
-import { LOGPEN_OFFSETS, LOGPEN_SIZE, colorToCss } from './gdi-objects';
+import { LOGPEN_OFFSETS, LOGPEN_SIZE, STOCK_NULL_BRUSH, colorToCss } from './gdi-objects';
 import { writeBackDibSectionRect, readDibSectionRgbaGeneric } from './bitmap-resolve';
 import { patBlt } from './gdi-blit';
 import { extTextOut } from './ext-text-out';
@@ -826,22 +826,16 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         return System.getInstance().gdiContext.createSolidBrush(color);
     };
 
-    // HBRUSH CreateBrushIndirect(const LOGBRUSH *lplb)
     // LOGBRUSH is { UINT lbStyle; COLORREF lbColor; ULONG_PTR lbHatch } on Win32.
-    // The renderer supports solid brushes; return failure for patterns/hatches rather
-    // than pretending an unsupported brush can draw correctly.
-    exports['CreateBrushIndirect'] = (ctx, mem, args): number => {
-        const lplb = args[0] >>> 0;
-        if (!lplb || lplb + 12 > mem.byteLength) return 0;
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const style = view.getUint32(lplb, true);
-        const color = view.getUint32(lplb + 4, true);
-        if (style !== 0 /* BS_SOLID */) {
-            Logger.verbose(LogCategory.GDI32, `CreateBrushIndirect style=${style} unsupported`);
-            return 0;
-        }
-        Logger.verbose(LogCategory.GDI32, `CreateBrushIndirect solid color=0x${color.toString(16)}`);
-        return System.getInstance().gdiContext.createSolidBrush(color);
+    exports['CreateBrushIndirect'] = (_ctx, mem, args): number => {
+        const ptr = args[0] >>> 0;
+        if (!ptr || ptr + 12 > mem.length || !isValidAddress(mem, ptr, 12, 'r')) return 0;
+        const style = Mem.readUint32(ptr);
+        const gdi = System.getInstance().gdiContext;
+        if (style === 0) return gdi.createSolidBrush(Mem.readUint32(ptr + 4) ?? 0);
+        if (style === 1) return (0x80000000 | STOCK_NULL_BRUSH) >>> 0;
+        if (style === 3) return gdi.createPatternBrush(Mem.readUint32(ptr + 8) ?? 0);
+        return 0;
     };
 
     exports['CreatePatternBrush'] = (ctx, mem, args): number => {
