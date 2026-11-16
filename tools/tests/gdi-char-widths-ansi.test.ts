@@ -54,7 +54,7 @@ const call = (name: string, first: number, last: number): number =>
     (exports[name] as any)(null, mem, [HDC, first, last, OUT]) as number;
 const untouched = (): boolean => mem.subarray(OUT, OUT + 64).every(b => b === 0xcc);
 
-for (const name of ["GetCharWidthA", "GetCharABCWidthsA"]) {
+for (const name of ["GetCharWidthA", "GetCharWidth32A", "GetCharABCWidthsA"]) {
     describe(`${name} decodes through the selected font's code page`, () => {
         test("0x80 under an ANSI_CHARSET font is the euro sign", () => {
             expect(call(name, 0x80, 0x80)).toBe(1);
