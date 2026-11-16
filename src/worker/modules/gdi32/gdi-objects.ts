@@ -5,6 +5,8 @@
  * object/handle tables. DC/bitmap state relationships (SelectObject, memory-DC
  * canvas linking) stay in context.ts — this module is only the object registry.
  */
+import { Mem } from "../../core/memory/mem-accessor";
+import { isValidAddress } from "../../core/memory/address-guard";
 import { Logger, LogCategory } from "../../core/logger";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { System } from "../../core/system";
@@ -205,10 +207,22 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
             return (obj.data?.dibBits || (obj.data?.bitsPtr && obj.data?.dibStride)) ? 0x54 : 24;
         } else if (obj.type === 'FONT') {
             return isUnicode ? 92 : 60; // sizeof(LOGFONTW) vs sizeof(LOGFONTA)
+        } else if (obj.type === 'BRUSH') {
+            return 12;
         } else if (obj.type === 'PEN') {
             return LOGPEN_SIZE;
         }
         return 0;
+    }
+
+    if (obj.type === 'BRUSH') {
+        if (cbBuffer < 12 || !isValidAddress(mem, lpvObject, 12, 'rw') || lpvObject + 12 > mem.length) return 0;
+        const pattern = typeof obj.data !== 'string' && obj.data?.kind === 'pattern';
+        const hollow = obj.data === 'transparent';
+        Mem.writeUint32(lpvObject, pattern ? 3 : hollow ? 1 : 0);
+        Mem.writeUint32(lpvObject + 4, pattern || hollow ? 0 : cssToColor(obj.data));
+        Mem.writeUint32(lpvObject + 8, pattern ? obj.data.sourceBitmap : 0);
+        return 12;
     }
 
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
