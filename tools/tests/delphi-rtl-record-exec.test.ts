@@ -20,6 +20,12 @@ import { OUT_DX_EAX } from '../../src/worker/core/thunking/thunk-constants';
 import { applyPatch, validatePrologueBytes, type PatchContext } from '../../src/worker/core/hle-lib/lib-patcher';
 import { ThunkGenerator } from '../../src/worker/core/thunking/thunk-generator';
 import { delphiRtlDescriptor } from '../../src/worker/core/hle-lib/libs/delphi-rtl/descriptor';
+import { System } from '../../src/worker/core/system';
+import { savestateParticipants } from '../../src/worker/savestate/participant';
+import { registerCoreParticipants } from '../../src/worker/savestate/core-participants';
+import { encodeValue, decodeValue } from '../../src/worker/savestate/value-codec';
+import { newCaptureRun } from '../../src/worker/savestate/session';
+
 
 const LIB = fileURLToPath(new URL('../../vendor/v86/build/libv86.mjs', import.meta.url));
 const WASM = fileURLToPath(new URL('../../vendor/v86/build/v86.wasm', import.meta.url));
@@ -57,6 +63,9 @@ const TI_LSTR = DATA, TI_WSTR = DATA + 0x20, TI_VAR = DATA + 0x40, P_LSTR = DATA
 const TI_REC1 = DATA + 0x80, TI_REC2 = DATA + 0xc0, TI_RECW = DATA + 0x100, TI_RECV = DATA + 0x140, TI_RECNP = DATA + 0x180;
 // A long-string type info whose kind byte is the last byte before the absent page.
 const TI_EDGE = NP_PAGE - 1, P_EDGE = DATA + 0x6c, TI_RECEDGE = DATA + 0x1c0;
+// Field offset word straddling into NP_PAGE (its low bytes share the page end with TI_EDGE, read only) and a field
+// type pointer that resolves into NP_PAGE too: the original reads the offset first.
+const TI_RECOFS = NP_PAGE - 0x10, P_OFS = DATA + 0x70;
 const RECS = DATA + 0x400, STRS = DATA + 0x800;
 const rec = (i: number) => RECS + i * 0x40;
 const str = (i: number) => STRS + i * 0x20 + 8;
@@ -79,7 +88,7 @@ const sentinel = (r: number, i: number) => (0x10000000 * (r + 1) + 0x100 + i) >>
 
 /** machine: DF, x87 control word, status word and stack top after the call. */
 interface Snap { regs: number[]; eax: number; recs: number[]; machine: number[] }
-type FaultCase = 'typeInfoName' | 'fieldTypeInfo' | 'readOnlyStore' | 'absentString' | 'kindAtPageEndInit' | 'kindAtPageEndFinal';
+type FaultCase = 'typeInfoName' | 'fieldTypeInfo' | 'readOnlyStore' | 'absentString' | 'kindAtPageEndInit' | 'kindAtPageEndFinal' | 'offsetBeforeType';
 interface Fault { cr2: number; err: number; eip: number; esp: number }
 interface Patched { entry: number; filter: number; trampoline: number }
 interface Arm { snaps: Snap[]; data: number[]; frees: number[]; traps: number[]; halted: boolean; entryOps: number[]; found: ReturnType<typeof findRecordHelpers>; fault?: Fault; patched: Patched[]; generator?: ThunkGenerator }
@@ -93,6 +102,7 @@ const FAULTS: Record<FaultCase, { step: Step; cr2: number; write: boolean }> = {
     absentString: { step: { fn: 'FR', p: NP_PAGE - 8, ti: TI_REC1, fast: true }, cr2: NP_PAGE, write: false },
     kindAtPageEndInit: { step: { fn: 'IR', p: rec(0), ti: TI_RECEDGE, fast: false }, cr2: NP_PAGE, write: false },
     kindAtPageEndFinal: { step: { fn: 'FR', p: rec(10), ti: TI_RECEDGE, fast: false }, cr2: NP_PAGE, write: false },
+    offsetBeforeType: { step: { fn: 'IR', p: rec(0), ti: TI_RECOFS, fast: false }, cr2: NP_PAGE, write: false },
 };
 
 function writeTypeInfo(dv: DataView, mem: Uint8Array): void {
@@ -118,6 +128,10 @@ function writeTypeInfo(dv: DataView, mem: Uint8Array): void {
     mem[TI_EDGE] = TK_LSTRING;
     dv.setUint32(P_EDGE, TI_EDGE, true);
     recTi(TI_RECEDGE, 'TEdge', 16, [[P_EDGE, 8]]);
+    mem[TI_RECOFS] = 0x0e; mem[TI_RECOFS + 1] = 0;
+    dv.setUint32(TI_RECOFS + 2, 16, true); dv.setUint32(TI_RECOFS + 6, 1, true);
+    dv.setUint32(TI_RECOFS + 0x0a, P_OFS, true);
+    dv.setUint32(P_OFS, NP_PAGE + 1, true);
 }
 
 /** Long strings: refcount at -8, length at -4. */
@@ -234,6 +248,18 @@ async function withoutWindow<T>(fn: () => Promise<T>): Promise<T> {
     try { return await fn(); } finally { if (had) g.window = saved; }
 }
 
+function thunkParticipant() {
+    if (!savestateParticipants.all().some(p => p.id === 'thunk-generator')) registerCoreParticipants();
+    return savestateParticipants.all().find(p => p.id === 'thunk-generator')!;
+}
+
+function withProcess<T>(process: object, run: () => T): T {
+    const system = System.getInstance() as unknown as { process: unknown };
+    const saved = system.process;
+    system.process = process;
+    try { return run(); } finally { system.process = saved; }
+}
+
 function runArm(opts: ArmOptions): Promise<Arm> {
     return withoutWindow(() => runArmIsolated(opts));
 }
@@ -297,10 +323,11 @@ async function runArmIsolated(opts: ArmOptions): Promise<Arm> {
         if (end === 'split') {
             // The machine is saved between two calls and resumed in a fresh emulator: guest RAM
             // with the patched entries, filters, trampolines and records as the first machine
-            // left them, and the thunk allocator through its captured state. The restored machine
-            // enters at RESUME, so the CPU registers it does not carry are set as at boot.
+            // left them, and the thunk allocator through the shipping 'thunk-generator' savestate
+            // participant and value codec. The restored machine enters at RESUME, so the CPU
+            // registers it does not carry are set as at boot.
             const image = cpu.mem8.slice(BASE, BASE + IMG);
-            const allocator = structuredClone(generator!.captureState());
+            const encoded = withProcess({ thunkGenerator: generator }, () => encodeValue(thunkParticipant().capture(newCaptureRun())));
             await em.stop();
             await em.destroy();
             em = await boot();
@@ -309,7 +336,8 @@ async function runArmIsolated(opts: ArmOptions): Promise<Arm> {
             cpu.load_multiboot(buildImage({ filter: false }).bytes.buffer);
             cpu.mem8.set(image, BASE);
             restored = new ThunkGenerator();
-            restored.restoreState(allocator);
+            const target = restored;
+            withProcess({ thunkGenerator: target }, () => thunkParticipant().restore(decodeValue(encoded), undefined as never));
             listen();
             cpu.reg32[4] = STACK; cpu.instruction_pointer[0] = RESUME; cpu.flags[0] = 2;
             end = await go(false);
@@ -524,9 +552,9 @@ describe.skipIf(!HAVE_V86)('delphi-rtl record helpers, executed in v86', () => {
 
     const MUTANTS: Array<{ name: string; mutate: (fin: boolean, code: Uint8Array) => void }> = [
         { name: 'the field-count test is dropped', mutate: (_f, c) => { c[9] = 0x90; c[10] = 0x90; } },
-        { name: 'the long-string kind test is dropped', mutate: (_f, c) => { c[20] = 0x90; c[21] = 0x90; } },
-        { name: 'finalize skips its nil test', mutate: (f, c) => { if (f) { c[38] = 0x90; c[39] = 0x90; } } },
-        { name: 'initialize stores 1 instead of 0', mutate: (f, c) => { if (!f) c[37] = 1; } },
+        { name: 'the long-string kind test is dropped', mutate: (_f, c) => { c[30] = 0x90; c[31] = 0x90; } },
+        { name: 'finalize skips its nil test', mutate: (f, c) => { if (f) { c[48] = 0x90; c[49] = 0x90; } } },
+        { name: 'initialize stores 1 instead of 0', mutate: (f, c) => { if (!f) c[47] = 1; } },
     ];
     for (const m of MUTANTS) {
         test(`negative control: a broken filter is caught — ${m.name}`, async () => {

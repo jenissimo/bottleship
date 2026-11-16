@@ -163,12 +163,17 @@ export function findRecordHelpers(mem: Uint8Array, start = 0, end = mem.length):
 export const PROLOGUE_LEN = 8;
 
 /**
- * The filter body. `finalize` adds the nil test and keeps EAX = p.
+ * The filter body. `finalize` adds the nil test and keeps EAX = p. Its first accesses come in
+ * the original helpers' order (name length, field count, PPTypeInfo, offset, PPTypeInfo^, kind,
+ * the type's name length), so the first fault is the original's first fault; the two values it
+ * needs again are re-read from addresses that have already been read successfully.
  *
  *   movzx ecx, byte [edx+1]          ; type name length
  *   cmp   dword [edx+ecx+6], 1       ; managed field count
  *   jne   .orig
- *   mov   ecx, [edx+ecx+0Ah]         ; field 0: PPTypeInfo
+ *   cmp   dword [edx+ecx+0Ah], 0     ; field 0: PPTypeInfo (read, as the original reads it first)
+ *   cmp   dword [edx+ecx+0Eh], 0     ; field 0: offset     (read, before the dereference)
+ *   mov   ecx, [edx+ecx+0Ah]
  *   mov   ecx, [ecx]
  *   cmp   byte [ecx], tkLString
  *   jne   .orig
@@ -185,6 +190,8 @@ export function assembleRecordFilter(at: number, trampoline: number, finalize: b
         0x0f, 0xb6, 0x4a, 0x01,
         0x83, 0x7c, 0x0a, 0x06, 0x01,
         0x75, 0x00,
+        0x83, 0x7c, 0x0a, 0x0a, 0x00,
+        0x83, 0x7c, 0x0a, 0x0e, 0x00,
         0x8b, 0x4c, 0x0a, 0x0a,
         0x8b, 0x09,
         0x80, 0x39, TK_LSTRING,
@@ -200,7 +207,7 @@ export function assembleRecordFilter(at: number, trampoline: number, finalize: b
     const orig = code.length;
     const patchJcc = (pos: number) => { code[pos + 1] = orig - (pos + 2); };
     patchJcc(9);
-    patchJcc(20);
+    patchJcc(30);
     if (finalize) patchJcc(head.length + 4);
     const rel = (trampoline - (at + orig + 5)) | 0;
     code.push(0xe9, rel & 0xff, (rel >>> 8) & 0xff, (rel >>> 16) & 0xff, (rel >>> 24) & 0xff);
