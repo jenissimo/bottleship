@@ -51,6 +51,7 @@ import { crtFileCharBytes, decodeCrtFileChar, encodeCrtFileChar } from "./crt-fi
 import { captureCrtConvStatics, registerCrtConvExports, resetCrtConvStatics, restoreCrtConvStatics } from "./crt-conv";
 import { registerCrtPathExports } from "./crt-path";
 import { registerCrtSeh3Exports } from "./crt-seh3";
+import { registerCrtWideCopyExports } from "./crt-wide-copy";
 import { registerCrtVc8Exports } from "./crt-vc8";
 import { ensureNativeEHProlog } from "./crt-eh-prolog";
 import { registerRttiExports, demangleTypeInfoName } from "./crt-rtti";
@@ -605,6 +606,8 @@ export class Msvcrt implements IModule {
             setErrno: (e) => { this.setErrno(e); },
             vsnprintf: (dest, count, fmt, va) => this.vsnprintf(dest, count, fmt, va),
         });
+
+        registerCrtWideCopyExports(exports, { setErrno: (e) => { this.setErrno(e); } });
 
         // --- String functions (see crt-string.ts) ---
         this.stringState = registerCrtStringExports(exports, {
