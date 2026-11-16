@@ -87,3 +87,96 @@ test("a short split component clears all outputs, while invalid pairs return EIN
 
 const savedMemBinding = ["memoryGetter", "validateRange", "getRegion", "dataRoutes"].map(k => [k, Object.getOwnPropertyDescriptor(Mem, k)] as const);
 afterAll(() => { for (const [k, d] of savedMemBinding) if (d) Object.defineProperty(Mem, k, d); });
+
+for (const [input, expected] of [
+    ["C:\\folder\\", "C:\\folder\\"],
+    ["\\\\server\\share\\folder\\", "\\\\server\\share\\folder\\"],
+    ["C:\\folder\\file.  ", "C:\\folder\\file"],
+    ["C:\\foo   ", "C:\\foo"],
+    ["\\\\?\\C:\\folder\\file.  ", "\\\\?\\C:\\folder\\file"],
+]) test("_wfullpath preserves the native normalization of " + input, () => {
+    expect(call("_wfullpath", 0x1000, str(input), 100)).toBe(0x1000);
+    expect(read(0x1000)).toBe(expected);
+    expect(errno).toBe(123);
+});
+test("_wfullpath includes a retained trailing separator in its capacity check", () => {
+    put(0x1000, "old");
+    const input = str("C:\\folder\\");
+    expect(call("_wfullpath", 0x1000, input, 10)).toBe(0);
+    expect(errno).toBe(34);
+    expect(read(0x1000)).toBe("");
+    expect(Mem.readUint16(0x1002)).toBe('l'.charCodeAt(0));
+    expect(call("_wfullpath", 0x1000, input, 11)).toBe(0x1000);
+    expect(read(0x1000)).toBe("C:\\folder\\");
+});
+
+// Observed with the Windows UCRT _wfullpath entry point, including namespace prefixes.
+for (const [input, expected] of [
+    [
+        "C:\\folder\\",
+        "C:\\folder\\"
+    ],
+    [
+        "\\\\server\\share\\folder\\",
+        "\\\\server\\share\\folder\\"
+    ],
+    [
+        "C:\\folder\\file.  ",
+        "C:\\folder\\file"
+    ],
+    [
+        "C:\\foo   ",
+        "C:\\foo"
+    ],
+    [
+        "C:\\foo.\\bar",
+        "C:\\foo\\bar"
+    ],
+    [
+        "C:\\foo \\bar",
+        "C:\\foo \\bar"
+    ],
+    [
+        "C:\\foo.\\",
+        "C:\\foo\\"
+    ],
+    [
+        "C:\\foo \\",
+        "C:\\foo \\"
+    ],
+    [
+        "C:\\foo\\..",
+        "C:\\"
+    ],
+    [
+        "C:\\foo\\.",
+        "C:\\foo"
+    ],
+    [
+        "C:\\foo\\..\\",
+        "C:\\"
+    ],
+    [
+        "\\\\?\\C:\\folder\\file.  ",
+        "\\\\?\\C:\\folder\\file"
+    ],
+    [
+        "\\\\?\\C:\\folder\\..\\x",
+        "\\\\?\\C:\\x"
+    ],
+    [
+        "\\\\?\\UNC\\server\\share\\folder\\..\\x",
+        "\\\\?\\UNC\\server\\share\\x"
+    ],
+    [
+        "\\\\.\\C:\\folder\\file.  ",
+        "\\\\.\\C:\\folder\\file"
+    ],
+    [
+        "\\\\?\\C:/folder/file.  ",
+        "\\\\?\\C:\\folder\\file"
+    ]
+]) test("_wfullpath matches native UCRT for " + input, () => {
+    expect(call("_wfullpath", 0x1000, str(input!), 100)).toBe(0x1000);
+    expect(read(0x1000)).toBe(expected!);
+});

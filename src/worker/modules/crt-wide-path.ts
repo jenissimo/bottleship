@@ -11,9 +11,15 @@ interface WidePathHost {
 
 function fullPath(path: string, cwd: string): string {
     let value = path.replace(/\//g, "\\");
+    const trailingSeparator = /[\\/]$/.test(path);
+    // Keep device namespace roots separate from ordinary UNC server/share roots.
+    let prefix = /^\\\\[?.]\\/.exec(value)?.[0] ?? "";
+    if (prefix) value = value.slice(prefix.length);
+    const namespaceUnc = !!prefix && /^UNC\\/i.test(value);
+    if (namespaceUnc) { prefix += value.slice(0, 4); value = "\\\\" + value.slice(4); }
     cwd = cwd.replace(/\//g, "\\");
     if (!value) value = cwd;
-    else if (!value.startsWith("\\\\")) {
+    else if (!prefix && !value.startsWith("\\\\")) {
         const drive = /^([a-z]):/i.exec(value);
         if (drive) {
             if (value[2] !== "\\") {
@@ -24,18 +30,25 @@ function fullPath(path: string, cwd: string): string {
             value = cwd.slice(0, 2) + value;
         } else value = cwd.replace(/\\*$/, "\\") + value;
     }
-    // A UNC server/share is the root, not two ordinary directories that '..' can pop.
     const unc = value.startsWith("\\\\");
     const parts = value.split("\\").filter(Boolean);
     const floor = unc ? 2 : 1;
     const normalized: string[] = [];
-    for (const part of parts) {
+    for (let i = 0; i < parts.length; i++) {
+        let part = parts[i]!;
         if (part === ".") continue;
         if (part === "..") { if (normalized.length > floor) normalized.pop(); }
-        else normalized.push(part);
+        else {
+            // Intermediate components lose a single final dot, but keep final spaces.
+            if ((i < parts.length - 1 || trailingSeparator) && /[^.]\.$/.test(part)) part = part.slice(0, -1);
+            normalized.push(part);
+        }
     }
-    let result = (unc ? "\\\\" : "") + normalized.join("\\");
-    if (/^[a-z]:$/i.test(result)) result += "\\";
+    if (!trailingSeparator && normalized.length > floor) {
+        normalized[normalized.length - 1] = normalized[normalized.length - 1]!.replace(/[. ]+$/, "");
+    }
+    let result = prefix + (unc && !namespaceUnc ? "\\\\" : "") + normalized.join("\\");
+    if (/^[a-z]:$/i.test(result.slice(prefix.length)) || (trailingSeparator && !result.endsWith("\\"))) result += "\\";
     return result;
 }
 
