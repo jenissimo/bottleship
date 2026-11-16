@@ -69,6 +69,10 @@ export function describeComObject(obj: unknown): string {
     return vtable ? `[${comVtableLabel(vtable)} of ${comVtableOwner(vtable)}, iid ${iid}]` : `[iid ${iid}]`;
 }
 
+const KERNEL_HANDLE_BASE = 0x30000;
+const KERNEL_HANDLE_END = 0x40000;
+const KERNEL_HANDLE_SLOTS = (KERNEL_HANDLE_END - KERNEL_HANDLE_BASE) >> 2;
+
 export class SystemResourceProvider {
     private static instance: SystemResourceProvider;
 
@@ -381,12 +385,15 @@ export class SystemResourceProvider {
      * Register a kernel object (file handles, etc.)
      */
     registerKernelObject(obj: any, attributes?: HandleAttributes): number {
-        // Values a process inherited at creation are already taken in its table (see
-        // registerKernelObjectAt); a fresh object gets the next value nobody holds.
-        while (this.kernelObjects.getByHandle(this.nextKernelHandle) !== null) this.nextKernelHandle += 4;
-        const handle = this.nextKernelHandle;
-        if (handle >= 0x40000) {
-            Logger.error(LogCategory.RESOURCE, `Kernel handle range exhausted! handle=0x${handle.toString(16)}`);
+        // A fresh object gets the next value nobody holds (values a process inherited at
+        // creation are already taken, see registerKernelObjectAt). Values of closed handles
+        // come back round, as on NT: the range holds 16384 live handles, and a title that
+        // opens and closes one per frame or per file walks past its end in minutes. Past
+        // 0x3FFFF a value lands in the USER range and every later lookup of it fails.
+        const handle = this.nextFreeKernelHandle();
+        if (handle === 0) {
+            Logger.error(LogCategory.RESOURCE, `Kernel handle table full: ${KERNEL_HANDLE_SLOTS} handles open`);
+            return 0;
         }
         this.kernelObjects.create(handle, obj);
         this.handleAttributes.set(handle, attributes ?? {
@@ -395,10 +402,20 @@ export class SystemResourceProvider {
         if (obj !== null && (typeof obj === 'object' || typeof obj === 'function')) {
             this.kernelObjectReferences.set(obj, (this.kernelObjectReferences.get(obj) ?? 0) + 1);
         }
-        this.nextKernelHandle += 4;
+        this.nextKernelHandle = handle + 4;
 
         Logger.verbose(LogCategory.RESOURCE, `Registered kernel object handle=0x${handle.toString(16)}`);
         return handle;
+    }
+
+    /** The next unused kernel handle value at or after the cursor, wrapping once; 0 = all in use. */
+    private nextFreeKernelHandle(): number {
+        let h = this.nextKernelHandle >>> 0;
+        for (let n = 0; n < KERNEL_HANDLE_SLOTS; n++, h += 4) {
+            if (h < KERNEL_HANDLE_BASE || h >= KERNEL_HANDLE_END) h = KERNEL_HANDLE_BASE;
+            if (this.kernelObjects.getByHandle(h) === null) return h;
+        }
+        return 0;
     }
 
     /**

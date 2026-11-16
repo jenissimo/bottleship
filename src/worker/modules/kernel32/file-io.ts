@@ -4,6 +4,7 @@
  * Atomic implementation for file operations
  */
 
+import { ERROR_NO_SYSTEM_RESOURCES } from '../../core/thunking/thunk-errors';
 import { type HleDispatcher, ThunkImplementation, ThunkResult, DeferredWrite } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory, LogLevel } from '../../core/logger';
 import { registerFileIoCommExports } from './file-io-comm';
@@ -1031,6 +1032,10 @@ const fileIoModule = (() => {
         };
 
         const handle = System.getInstance().resourceProvider.registerKernelObject(mapping);
+        if (!handle) {
+            System.getInstance().scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+            return 0;
+        }
         if (name) {
             namedFileMappings.set(name, handle);
         }
@@ -1083,6 +1088,10 @@ const fileIoModule = (() => {
         };
 
         const handle = System.getInstance().resourceProvider.registerKernelObject(mapping);
+        if (!handle) {
+            System.getInstance().scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+            return 0;
+        }
         if (name) {
             namedFileMappings.set(name, handle);
         }
@@ -2114,6 +2123,8 @@ const fileIoModule = (() => {
                         hypercallDataManager.unregisterEventMirror(hObject);
                     } else if (kernelObj?.kind === 'mutex') {
                         hypercallDataManager.unregisterMutexMirror(hObject);
+                    } else if (kernelObj?.kind === 'thread') {
+                        hypercallDataManager.forgetThreadSuspendCount(hObject);
                     }
                     resourceProvider.unregisterKernelObject(hObject);
                     break;

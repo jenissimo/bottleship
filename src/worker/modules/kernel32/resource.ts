@@ -4,6 +4,7 @@
  * PE resource loading and access - parses actual PE resource directory
  */
 
+import { ERROR_NO_SYSTEM_RESOURCES } from '../../core/thunking/thunk-errors';
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
@@ -837,6 +838,10 @@ export const exports: Record<string, ThunkImplementation> = {
             vfsHandle,
             deleteExisting: bDeleteExistingResources,
         });
+        if (!handle) {
+            System.getInstance().scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+            return 0;
+        }
 
         Logger.verbose(
             LogCategory.KERNEL32,

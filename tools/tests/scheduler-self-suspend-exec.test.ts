@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { SystemResourceProvider } from "../../src/worker/core/resources/system-resource-provider";
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { Scheduler } from '../../src/worker/core/scheduler/scheduler';
@@ -15,7 +16,7 @@ const OUT_STACK = 0x200000;
 
 function thread(id: number, state: ThreadState): Thread {
     return {
-        id, handle: id, state, context: null, stackBase: id * 0x100000,
+        id, handle: SystemResourceProvider.getInstance().registerKernelObject({ kind: "thread", threadId: id }), state, context: null, stackBase: id * 0x100000,
         stackSize: 0x100000, stackTop: (id + 1) * 0x100000,
         startAddress: ENTRY, parameter: 0, waitInfo: null, exitCode: null,
         tlsValues: new Map(), lastError: 0, suspendCount: 0, priority: 0,

@@ -8,6 +8,7 @@ export const ERROR_NOT_SUPPORTED = 50;
 export const ERROR_INVALID_FUNCTION = 1;
 export const ERROR_INVALID_HANDLE = 6;
 export const ERROR_INSUFFICIENT_BUFFER = 122;
+export const ERROR_NO_SYSTEM_RESOURCES = 1450;
 
 /**
  * Base error class for thunk system errors

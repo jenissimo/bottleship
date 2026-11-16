@@ -1,6 +1,7 @@
 // Process-related functions for kernel32
 // GetCurrentProcessId, GetCurrentThreadId, ExitProcess, GetStartupInfo*, IsProcessorFeaturePresent
 
+import { ERROR_NO_SYSTEM_RESOURCES } from '../../../core/thunking/thunk-errors';
 import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
 import {
     promoteChildSession, hasChildSession, pendingChildHandoff, win32ErrorOf,
@@ -1959,8 +1960,13 @@ export const exports: Record<string, ThunkImplementation> = {
             } else {
                 const virtual = getVirtualProcessManager().duplicateHandle(hSourceHandle >>> 0);
                 target = virtual ?? (sourceObject.kind === 'event'
-                    ? System.getInstance().scheduler.syncObjects.duplicateEvent(hSourceHandle)!
+                    ? (System.getInstance().scheduler.syncObjects.duplicateEvent(hSourceHandle) ?? 0)
                     : resourceProvider.registerKernelObject(sourceObject));
+                if (!target) {
+                    if (closeSource) fileIo.CloseHandle!(ctx, mem, [hSourceHandle]);
+                    System.getInstance().scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+                    return { value: 0, stackCleanup: 28 };
+                }
                 resourceProvider.setHandleAttributes(target, attributes);
             }
             if (lpTargetHandle) Mem.writeUint32(lpTargetHandle, target);
@@ -1978,13 +1984,11 @@ export const exports: Record<string, ThunkImplementation> = {
             const sched = System.getInstance().scheduler;
             const currentThread = sched.getCurrentThread();
             if (currentThread) {
-                const resourceProvider = System.getInstance().resourceProvider;
-                const threadResource = resourceProvider.getResource(currentThread.handle >>> 0);
-                if (threadResource?.type === 'kernel_object') {
-                    targetHandle = resourceProvider.registerKernelObject(threadResource.resource) >>> 0;
-                } else {
-                    targetHandle = currentThread.handle >>> 0;
-                }
+                // The pseudo handle names the running thread itself, never whatever object now
+                // holds the value of its (possibly closed and reused) creation handle.
+                targetHandle = System.getInstance().resourceProvider.registerKernelObject(
+                    currentThread.kernelObject ?? { kind: 'thread', threadId: currentThread.id },
+                ) >>> 0;
             } else {
                 targetHandle = CURRENT_THREAD;
             }
@@ -2000,13 +2004,19 @@ export const exports: Record<string, ThunkImplementation> = {
                 if (resource?.type === 'kernel_object') {
                     // Event aliases must share signal consumption and all wait lists.
                     targetHandle = resource.resource?.kind === "event"
-                        ? System.getInstance().scheduler.syncObjects.duplicateEvent(hSourceHandle)!
+                        ? (System.getInstance().scheduler.syncObjects.duplicateEvent(hSourceHandle) ?? 0)
                         : resourceProvider.registerKernelObject(resource.resource) >>> 0;
                 } else {
                     // Fallback for non-virtual handles: preserve legacy behavior.
                     targetHandle = hSourceHandle;
                 }
             }
+        }
+
+        if (!targetHandle && hSourceHandle) {
+            if (dwOptions & DUPLICATE_CLOSE_SOURCE) fileIo.CloseHandle!(ctx, mem, [hSourceHandle]);
+            System.getInstance().scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+            return { value: 0, stackCleanup: 28 };
         }
 
         // A handle this call created carries the caller's bInheritHandle — the usual way a
@@ -2411,6 +2421,10 @@ export const exports: Record<string, ThunkImplementation> = {
 
         const resourceProvider = SystemResourceProvider.getInstance();
         const handle = resourceProvider.registerKernelObject({ kind: 'toolhelp_snapshot' });
+        if (!handle) {
+            System.getInstance().scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+            return 0xFFFFFFFF;
+        }
         toolhelpSnapshots.set(handle, snap);
 
         Logger.log(LogCategory.KERNEL32,

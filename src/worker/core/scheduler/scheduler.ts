@@ -24,7 +24,7 @@ import { TimeService } from '../../runtime/time';
 import { clearAllActiveExceptions } from '../seh-dispatch';
 import { cpuViews, readEip, readEsp, readRetiredInsns, PROXY_BASELINE } from '../cpu/cpu-views';
 import { Mem } from '../memory/mem-accessor';
-import { ERROR_INVALID_HANDLE } from '../thunking/thunk-errors';
+import { ERROR_INVALID_HANDLE, ERROR_NO_SYSTEM_RESOURCES } from '../thunking/thunk-errors';
 import { setParkedStackProvider, guardStackWrite } from '../memory/stack-write-guard';
 import { TebManager, TLS_INDEX_LIMIT, IMPLICIT_TLS_FIRST, IMPLICIT_TLS_LIMIT } from '../teb-manager';
 import {
@@ -2284,16 +2284,24 @@ export class Scheduler {
         }
         const stackTop = stackBase + size;
 
+        const threadId = this.nextThreadId;
+        const handle = this.resourceProvider.registerKernelObject({
+            kind: 'thread', threadId,
+        } as KernelThreadObject);
+        if (!handle) {
+            // Nothing of the thread may outlive a refused handle: no record, no TEB, no stack.
+            this.releaseStackBlock(stackBase, size);
+            this.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+            Logger.error(LogCategory.THREAD, `CreateThread failed: kernel handle table full`);
+            return 0;
+        }
+        this.nextThreadId++;
+
         // Set up stack: [parameter, exitStubAddr]
         const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
         let esp = stackTop;
         esp -= 4; view.setUint32(esp, parameter >>> 0, true);
         esp -= 4; view.setUint32(esp, this.threadExitStubAddr >>> 0, true);
-
-        const threadId = this.nextThreadId++;
-        const handle = this.resourceProvider.registerKernelObject({
-            kind: 'thread', threadId,
-        } as KernelThreadObject);
 
         const isSuspended = (creationFlags & CREATE_SUSPENDED) !== 0;
         // A guest-created thread enters through the start stub, which runs its DLL_THREAD_ATTACH
@@ -2422,7 +2430,7 @@ export class Scheduler {
         const safeExitCode = exitCode >>> 0;
         // A terminated thread leaves the shared table: its handle can be handed to a new
         // thread, and the WASM handler must not answer for the dead one.
-        hypercallDataManager.forgetThreadSuspendCount(thread.handle >>> 0);
+        if (this.creationHandleNamesThread(thread)) hypercallDataManager.forgetThreadSuspendCount(thread.handle >>> 0);
         if ((thread.dllNotify ?? 0) & DLL_NOTIFY_WAITING) this.loaderWaiters--;
         thread.dllNotify = DllNotifyPhase.NONE;
         this.setThreadState(thread, ThreadState.TERMINATED);
@@ -2557,7 +2565,7 @@ export class Scheduler {
     }
 
     terminateThreadByHandle(handle: number, exitCode: number): boolean {
-        const thread = this.getThreadByHandle(this.resolveHandle(handle));
+        const thread = this.threadFromHandle(handle);
         if (!thread) return false;
         this.terminateThread(thread.id, exitCode);
         if (this.currentThreadId === thread.id) this.requestSwitch();
@@ -3553,7 +3561,7 @@ export class Scheduler {
     // ═══════════════════════════════════════════════════════════════════════
 
     resumeThread(handle: number): number {
-        const thread = this.getThreadByHandle(this.resolveHandle(handle));
+        const thread = this.threadFromHandle(handle);
         if (!thread) return 0xFFFFFFFF;
 
         const prev = thread.suspendCount;
@@ -3616,13 +3624,22 @@ export class Scheduler {
      * machine.
      */
     private publishSuspendCount(thread: Thread): void {
+        if (!this.creationHandleNamesThread(thread)) return;
         hypercallDataManager.setThreadSuspendCount(thread.handle >>> 0, thread.suspendCount);
+    }
+
+    /** The suspend table is keyed by the creation handle's VALUE, which stays meaningful only
+     *  while that handle is open and still names this thread; once closed the value can be
+     *  handed to any new object, and the table must not answer for it. */
+    private creationHandleNamesThread(thread: Thread): boolean {
+        const kobj = this.resourceProvider.getKernelObject(thread.handle >>> 0) as KernelThreadObject | null;
+        return kobj?.kind === 'thread' && kobj.threadId === thread.id;
     }
 
     /** Win32 SuspendThread: previous suspend count, or 0xFFFFFFFF on failure (last error set
      *  here, since the caller cannot tell an invalid handle from a refused signal). */
     suspendThread(handle: number): number {
-        const thread = this.getThreadByHandle(this.resolveHandle(handle));
+        const thread = this.threadFromHandle(handle);
         if (!thread || thread.state === ThreadState.TERMINATED) {
             this.setLastError(ERROR_INVALID_HANDLE);
             return 0xFFFFFFFF;
@@ -3681,7 +3698,7 @@ export class Scheduler {
      * last error). See registerFastPathProcessFunctions.
      */
     suspendThreadFast(handle: number): number | null {
-        const thread = this.getThreadByHandle(this.resolveHandle(handle));
+        const thread = this.threadFromHandle(handle);
         if (!thread || thread.state === ThreadState.TERMINATED) return null;
         // A refusal at MAXIMUM_SUSPEND_COUNT is answered HERE, not deferred: suspendThread
         // sets the last error itself and setLastError syncs the hypercall page GetLastError
@@ -3703,26 +3720,26 @@ export class Scheduler {
     /** Fast-path ResumeThread companion to suspendThreadFast. NULL → defer to slow path
      *  (non-scheduler handle / terminated). Resuming another thread needs no context switch. */
     resumeThreadFast(handle: number): number | null {
-        const thread = this.getThreadByHandle(this.resolveHandle(handle));
+        const thread = this.threadFromHandle(handle);
         if (!thread || thread.state === ThreadState.TERMINATED) return null;
         return this.resumeThread(handle);
     }
 
     setThreadPriority(handle: number, priority: number): boolean {
-        const thread = this.getThreadByHandle(this.resolveHandle(handle));
+        const thread = this.threadFromHandle(handle);
         if (!thread) return false;
         thread.priority = priority;
         return true;
     }
 
     getThreadPriority(handle: number): number | null {
-        const thread = this.getThreadByHandle(this.resolveHandle(handle));
+        const thread = this.threadFromHandle(handle);
         if (!thread) return null;
         return thread.priority;
     }
 
     getThreadContext(handle: number): CpuContext | null {
-        const thread = this.getThreadByHandle(this.resolveHandle(handle));
+        const thread = this.threadFromHandle(handle);
         if (!thread) return null;
 
         // If this is the currently running thread, read live CPU registers
@@ -3737,7 +3754,7 @@ export class Scheduler {
     }
 
     setThreadContext(handle: number, ctx: Partial<CpuContext>, flags: number): boolean {
-        const thread = this.getThreadByHandle(this.resolveHandle(handle));
+        const thread = this.threadFromHandle(handle);
         if (!thread) return false;
 
         // Can only set context on suspended/waiting threads (not running)
@@ -3767,7 +3784,7 @@ export class Scheduler {
 
     getThreadInfoByHandle(handle: number): { state: ThreadState; exitCode: number | null } | null {
         const resolved = this.resolveHandle(handle);
-        const thread = this.getThreadByHandle(resolved);
+        const thread = this.threadFromHandle(handle);
         if (thread) return { state: thread.state, exitCode: thread.exitCode };
 
         // Thread already reaped from scheduler — check kernel object for exit metadata
@@ -3837,7 +3854,7 @@ export class Scheduler {
 
     /** Id of the live thread a handle (or the GetCurrentThread pseudo-handle) names; null if none. */
     getThreadIdByHandle(handle: number): number | null {
-        const t = this.getThreadByHandle(this.resolveHandle(handle >>> 0));
+        const t = this.threadFromHandle(handle >>> 0);
         return t ? t.id : null;
     }
 
@@ -4242,7 +4259,7 @@ export class Scheduler {
     }
 
     queueUserApcByHandle(threadHandle: number, routine: number, arg0: number): boolean {
-        const thread = this.getThreadByHandle(this.resolveHandle(threadHandle >>> 0));
+        const thread = this.threadFromHandle(threadHandle >>> 0);
         if (!thread || thread.state === ThreadState.TERMINATED || !routine) return false;
         thread.apcQueue.push({ routine: routine >>> 0, arg0: arg0 >>> 0, arg1: 0, arg2: 0, kind: ApcKind.USER32_QUEUE_USER_APC });
         this.wakeAlertableThreadForApc(thread);
@@ -4293,7 +4310,7 @@ export class Scheduler {
     }
 
     queueNtApcByHandle(threadHandle: number, routine: number, arg0: number, arg1: number, arg2: number): number {
-        const thread = this.getThreadByHandle(this.resolveHandle(threadHandle >>> 0));
+        const thread = this.threadFromHandle(threadHandle >>> 0);
         if (!thread || thread.state === ThreadState.TERMINATED) return 0xC0000008; // STATUS_INVALID_HANDLE
         if (!routine) return 0xC0000001; // STATUS_UNSUCCESSFUL
         thread.apcQueue.push({ routine: routine >>> 0, arg0: arg0 >>> 0, arg1: arg1 >>> 0, arg2: arg2 >>> 0, kind: ApcKind.NTDLL_NT_QUEUE_APC });
@@ -5535,13 +5552,13 @@ export class Scheduler {
         return handle;
     }
 
-    private getThreadByHandle(handle: number): Thread | null {
-        for (const t of this.threads.values()) {
-            if (t.handle === handle) return t;
-        }
-        // Any other handle to the thread object (DuplicateHandle of GetCurrentThread(), a
-        // duplicate of the creation handle) names the same thread.
-        const kobj = this.resourceProvider.getKernelObject(handle >>> 0) as KernelThreadObject | null;
+    /** A thread is named by what the handle refers to NOW, never by the value its creation
+     *  handle once had: a closed handle's value can come back for any other object. The
+     *  current-thread pseudo handle needs no handle table entry at all. */
+    private threadFromHandle(handle: number): Thread | null {
+        const h = handle >>> 0;
+        if (h === 0xFFFFFFFE) return this.getCurrentThread();
+        const kobj = this.resourceProvider.getKernelObject(h) as KernelThreadObject | null;
         return kobj?.kind === 'thread' ? this.threads.get(kobj.threadId) ?? null : null;
     }
 

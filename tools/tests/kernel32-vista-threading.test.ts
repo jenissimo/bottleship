@@ -6,6 +6,7 @@
  * WaitOnAddress that returns at once whatever the value. The tests pin the Windows
  * contract, including the parts only a second thread can observe.
  */
+import { SystemResourceProvider } from "../../src/worker/core/resources/system-resource-provider";
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { Scheduler } from "../../src/worker/core/scheduler/scheduler";
 import { ThreadState, WAIT_TIMEOUT, type Thread } from "../../src/worker/core/scheduler/types";
@@ -40,7 +41,7 @@ let reg32: Int32Array;
 
 function thread(id: number, state: ThreadState): Thread {
     return {
-        id, handle: 0x1000 + id, state, context: null,
+        id, handle: SystemResourceProvider.getInstance().registerKernelObject({ kind: "thread", threadId: id }), state, context: null,
         stackBase: 0x00200000, stackSize: 0x00100000, stackTop: 0x00300000,
         startAddress: 0x00401000, parameter: 0, waitInfo: null, exitCode: null,
         tlsValues: new Map(), lastError: 0, suspendCount: 0, priority: 0,
@@ -235,7 +236,7 @@ describe("thread description", () => {
 
         expect(call(vistaSystem, "SetThreadDescription", CURRENT_THREAD, NAME)).toBe(0);
         view.setUint32(OUT, 0xDEADBEEF, true);
-        expect(call(vistaSystem, "GetThreadDescription", 0x1001 /* thread 1's handle */, OUT)).toBe(0);
+        expect(call(vistaSystem, "GetThreadDescription", (sched as any).threads.get(1).handle, OUT)).toBe(0);
         const p = view.getUint32(OUT, true);
         expect(p).toBeGreaterThanOrEqual(HEAP);
         let got = "";
@@ -244,7 +245,7 @@ describe("thread description", () => {
     });
 
     test("an unnamed thread describes itself as the empty string; a bad handle is an NT HRESULT", () => {
-        expect(call(vistaSystem, "GetThreadDescription", 0x1002, OUT)).toBe(0);
+        expect(call(vistaSystem, "GetThreadDescription", (sched as any).threads.get(2).handle, OUT)).toBe(0);
         expect(view.getUint16(view.getUint32(OUT, true), true)).toBe(0);
         expect(call(vistaSystem, "GetThreadDescription", 0x7777, OUT)).toBe(0xD0000008);
         expect(view.getUint32(OUT, true)).toBe(0);
