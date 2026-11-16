@@ -31,8 +31,19 @@ interface FontCache {
 // @transient(text metrics measured again on demand)
 const caches = new Map<string, FontCache>();
 
+const MAX_EXTENT_ENTRIES = 1024;
+const MAX_EXTENT_FONTS = 64;
+const MAX_EXTENT_TEXT = 256;
+interface TextExtent { width: number; height: number }
+// @transient(host text measurements, bounded and rebuilt after font changes)
+const extents = new Map<string, Map<string, TextExtent>>();
+// @transient(host text cache occupancy)
+let extentEntries = 0;
+
 export function invalidateTextExtentCache(): void {
     caches.clear();
+    extents.clear();
+    extentEntries = 0;
 }
 
 function cacheFor(font: string): FontCache {
@@ -148,4 +159,38 @@ export function measureTextMetricsCached(ctx: TextMeasurer, defaults: MeasuredTe
     }
     c.metrics = { ascent, descent, aveWidth, maxWidth };
     return c.metrics;
+}
+/** Whole-string measurements preserve shaping and ligatures that a sum of advances cannot. */
+export function measureWholeTextCached(ctx: TextMeasurer, text: string): TextExtent | null {
+    const canvas = ctx as TextMeasurer & Partial<Pick<CanvasRenderingContext2D,
+        'letterSpacing' | 'wordSpacing' | 'fontKerning' | 'fontStretch' | 'fontVariantCaps' | 'textRendering'>>;
+    const cacheable = text.length <= MAX_EXTENT_TEXT
+        && (!canvas.letterSpacing || canvas.letterSpacing === '0px')
+        && (!canvas.wordSpacing || canvas.wordSpacing === '0px')
+        && (!canvas.fontKerning || canvas.fontKerning === 'auto')
+        && (!canvas.fontStretch || canvas.fontStretch === 'normal')
+        && (!canvas.fontVariantCaps || canvas.fontVariantCaps === 'normal')
+        && (!canvas.textRendering || canvas.textRendering === 'auto');
+    let byText = cacheable ? extents.get(ctx.font) : undefined;
+    const cached = byText?.get(text);
+    if (cached) return cached;
+    let width: number, height = 16;
+    try {
+        const metrics = ctx.measureText(text);
+        width = Math.round(metrics.width);
+        if (metrics.fontBoundingBoxAscent !== undefined) {
+            height = Math.ceil(metrics.fontBoundingBoxAscent + metrics.fontBoundingBoxDescent!);
+        }
+    } catch { return null; }
+    const result = { width, height };
+    if (!cacheable) return result;
+    if (extentEntries >= MAX_EXTENT_ENTRIES || (!byText && extents.size >= MAX_EXTENT_FONTS)) {
+        extents.clear();
+        extentEntries = 0;
+        byText = undefined;
+    }
+    if (!byText) { byText = new Map(); extents.set(ctx.font, byText); }
+    byText.set(text, result);
+    extentEntries++;
+    return result;
 }

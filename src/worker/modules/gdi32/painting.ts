@@ -19,7 +19,7 @@ import { LOGPEN_OFFSETS, LOGPEN_SIZE, colorToCss } from './gdi-objects';
 import { writeBackDibSectionRect, readDibSectionRgbaGeneric } from './bitmap-resolve';
 import { patBlt } from './gdi-blit';
 import { extTextOut } from './ext-text-out';
-import { fontCellHeight, measureTextMetricsCached, prefixWidths } from './text-extent-cache';
+import { fontCellHeight, measureTextMetricsCached, measureWholeTextCached, prefixWidths } from './text-extent-cache';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
 // Track GetPixel HDC usage for profiling
@@ -617,26 +617,10 @@ function dibToCanvas(
  */
 function measureTextExtent(hdc: number, text: string, lpSize: number, mem: Uint8Array): void {
     const gdi = System.getInstance().gdiContext;
-    const dcCtx = gdi.getMeasureContext(hdc);
-    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-
-    let cx = text.length * 8; // fallback: 8px per char
-    let cy = 16;              // fallback: 16px height
-
-    if (dcCtx) {
-        try {
-            const metrics = dcCtx.measureText(text);
-            cx = Math.round(metrics.width);
-            if (metrics.fontBoundingBoxAscent !== undefined) {
-                cy = Math.ceil(metrics.fontBoundingBoxAscent + metrics.fontBoundingBoxDescent);
-            }
-        } catch (_) {
-            // keep defaults
-        }
-    }
-
-    view.setInt32(lpSize, cx, true);     // SIZE.cx
-    view.setInt32(lpSize + 4, cy, true); // SIZE.cy
+    const ctx = gdi.getMeasureContext(hdc);
+    const extent = ctx ? measureWholeTextCached(ctx, text) : null;
+    Mem.writeUint32(lpSize, extent?.width ?? text.length * 8);
+    Mem.writeUint32(lpSize + 4, extent?.height ?? 16);
 }
 
 function writeTextMetrics(hdc: number, lptm: number, mem: Uint8Array): void {
