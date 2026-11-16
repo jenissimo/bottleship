@@ -1,4 +1,5 @@
-import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { Logger } from "../../src/worker/core/logger";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { msvcrtModule } from "../../src/worker/api/msvcrt.api";
 import type { ThunkImplementation } from "../../src/worker/core/thunking/thunk-dispatcher";
@@ -23,7 +24,11 @@ const str = (value: string): number => { const ptr = next; next += value.length 
 const call = (name: string, ...args: number[]): number => exports[name]!(null as never, mem, args) as number;
 import { registerCrtWideFormatExports } from "../../src/worker/modules/crt-wide-format";
 import { ArrayVaListReader, formatCLazy } from "../../src/worker/modules/crt-format";
+let quietLog: ReturnType<typeof spyOn>, quietError: ReturnType<typeof spyOn>;
+afterEach(() => { quietLog.mockRestore(); quietError.mockRestore(); });
 beforeEach(() => {
+    quietLog = spyOn(Logger, "log").mockImplementation(() => {});
+    quietError = spyOn(Logger, "error").mockImplementation(() => {});
     mem = new Uint8Array(0x10000).fill(0x55); Mem.bind(() => mem);
     errno = 123; next = 0x2000; exports = {};
     registerCrtWideFormatExports(exports, {
@@ -80,3 +85,109 @@ test("zero count terminates output and distinguishes an empty result", () => {
 
 const savedMemBinding = ["memoryGetter", "validateRange", "getRegion", "dataRoutes"].map(k => [k, Object.getOwnPropertyDescriptor(Mem, k)] as const);
 afterAll(() => { for (const [k, d] of savedMemBinding) if (d) Object.defineProperty(Mem, k, d); });
+
+test("swprintf_s propagates a refused character store", () => {
+    const fmt = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000;
+    });
+    expect(() => call("swprintf_s", 0x1000, 8, fmt)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000);
+    expect(Mem.readUint16(0x1000)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("swprintf_s propagates a refused terminator store", () => {
+    const fmt = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000 + 4;
+    });
+    expect(() => call("swprintf_s", 0x1000, 8, fmt)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000 + 4);
+    expect(Mem.readUint16(0x1000 + 4)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("swprintf_s propagates a refused clearing store", () => {
+    const fmt = str("%q");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000;
+    });
+    expect(() => call("swprintf_s", 0x1000, 8, fmt)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000);
+    expect(Mem.readUint16(0x1000)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("_snwprintf_s propagates a refused character store", () => {
+    const fmt = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000;
+    });
+    expect(() => call("_snwprintf_s", 0x1000, 8, 7, fmt)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000);
+    expect(Mem.readUint16(0x1000)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("_snwprintf_s propagates a refused terminator store", () => {
+    const fmt = str("xy");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000 + 4;
+    });
+    expect(() => call("_snwprintf_s", 0x1000, 8, 7, fmt)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000 + 4);
+    expect(Mem.readUint16(0x1000 + 4)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+test("_snwprintf_s propagates a refused clearing store", () => {
+    const fmt = str("%q");
+    const writes: number[] = [];
+    Mem.bind(() => mem, (address, _size, perms) => {
+        if (!perms.includes("w")) return true;
+        writes.push(address);
+        return address !== 0x1000;
+    });
+    expect(() => call("_snwprintf_s", 0x1000, 8, 7, fmt)).toThrow(/invalid guest write/);
+    expect(writes.at(-1)).toBe(0x1000);
+    expect(Mem.readUint16(0x1000)).toBe(0x5555);
+    expect(errno).toBe(123);
+});
+
+for (const name of ["swprintf_s", "_snwprintf_s"]) {
+    for (const value of ["%q", "%", "x%n", "%hn", "%I64n", "%s %q", "%3$u", "%I32"]) {
+        test(name + " refuses secure format " + value + " before formatting side effects", () => {
+            const canary = 0x1800;
+            const fmt = str(value);
+            expect(call(name, 0x1000, 32, ...(name.startsWith("_") ? [31] : []), fmt, canary)).toBe(-1);
+            expect(errno).toBe(22);
+            expect(read(0x1000)).toBe("");
+            expect(Mem.readUint32(canary)).toBe(0x55555555);
+            expect(Mem.readUint16(0x1002)).toBe(0x5555);
+        });
+    }
+    test(name + " permits literal percent signs and valid flags, width and precision", () => {
+        expect(call(name, 0x1000, 32, ...(name.startsWith("_") ? [31] : []), str("%% %#08x %*.*d"), 42, 4, 2, 7)).toBe(15);
+        expect(read(0x1000)).toBe("% 0x00002a   07");
+    });
+}
+test("legacy formatter retains its existing %n and unknown-format behavior", () => {
+    expect(formatCLazy("x%n %q", new ArrayVaListReader([0x1800], 0), () => "")).toBe("x %q");
+    expect(Mem.readUint32(0x1800)).toBe(1);
+});
