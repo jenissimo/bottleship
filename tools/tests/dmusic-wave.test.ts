@@ -1,11 +1,8 @@
-/**
- * Wave segments: a WAVE image decodes to PCM, the performance starts and ends the wave with
- * its segment state, and an audio path mixes the waves sounding on it.
- */
+/** WAVE decoding and mixing use the same renderer as DirectMusic playback. */
 import { describe, expect, test } from "bun:test";
-import { decodeWave, WaveMixer } from "../../src/worker/modules/dmusic-wave";
+import { decodeWave } from "../../src/worker/core/audio/directmusic/wave";
+import { DlsSynth } from "../../src/worker/core/audio/directmusic/synth";
 import { DMUS_SEGF_SECONDARY, PerfSegment, Performance } from "../../src/worker/core/audio/directmusic/performance";
-import type { DlsSynth } from "../../src/worker/core/audio/directmusic/synth";
 
 function wav(channels: number, rate: number, bits: number, samples: number[]): Uint8Array {
     const bytesPer = bits / 8, data = samples.length * bytesPer;
@@ -21,16 +18,19 @@ function wav(channels: number, rate: number, bits: number, samples: number[]): U
 
 describe("decodeWave", () => {
     test("16-bit PCM keeps its samples; 8-bit PCM is recentred and widened", () => {
-        expect(decodeWave(wav(2, 22050, 16, [100, -100, 200, -200]))).toMatchObject({ channels: 2, sampleRate: 22050, frames: 2 });
-        expect([...decodeWave(wav(2, 22050, 16, [100, -100, 200, -200]))!.pcm]).toEqual([100, -100, 200, -200]);
-        expect([...decodeWave(wav(1, 11025, 8, [128, 255, 0]))!.pcm]).toEqual([0, 127 << 8, -128 << 8]);
+        expect(decodeWave(wav(2, 22050, 16, [100, -100, 200, -200]))).toMatchObject({ rate: 22050, frames: 2 });
+        const stereo = decodeWave(wav(2, 22050, 16, [100, -100, 200, -200]))!;
+        expect(Array.from(stereo.left, x => x * 32768)).toEqual([100, 200]);
+        expect(Array.from(stereo.right, x => x * 32768)).toEqual([-100, -200]);
+        expect(Array.from(decodeWave(wav(1, 11025, 8, [128, 255, 0]))!.left, x => x * 32768))
+            .toEqual([0, 127 << 8, -128 << 8]);
     });
 
     test("MS ADPCM decodes block by block with the predictor its header names", () => {
         // Mono, one 10-byte block: predictor 1 (512, -256: a straight line), delta 16,
         // sample1 30, sample2 20, then nibbles 0 (no correction) and 1 (+delta).
         const block = [1, 16, 0, 30, 0, 20, 0, 0x01, 0x00, 0x00];
-        const fmt = 20 + 4 * 7 * 2 / 2; // WAVEFORMATEX + cbSize, samplesPerBlock, numCoef, 7 pairs
+        const fmt = 22 + 7 * 4; // WAVEFORMATEX, samplesPerBlock, numCoef, seven coefficient pairs
         const b = new Uint8Array(12 + 8 + fmt + 8 + block.length), v = new DataView(b.buffer);
         b.set(new TextEncoder().encode("RIFF"), 0); v.setUint32(4, b.length - 8, true);
         b.set(new TextEncoder().encode("WAVEfmt "), 8); v.setUint32(16, fmt, true);
@@ -42,7 +42,7 @@ describe("decodeWave", () => {
         b.set(block, 28 + fmt);
         const w = decodeWave(b)!;
         // Header samples oldest first, then each nibble high half first: 0, 1, 0, 0, 0, 0.
-        expect([...w.pcm]).toEqual([20, 30, 40, 66, 92, 118, 144, 170]);
+        expect(Array.from(w.left, x => x * 32768)).toEqual([20, 30, 40, 66, 92, 118, 144, 170]);
     });
 
     test("anything that is not a decodable WAVE is refused", () => {
@@ -50,48 +50,37 @@ describe("decodeWave", () => {
     });
 });
 
-describe("WaveMixer", () => {
-    test("mixes voices, resamples to the path rate, and drops a voice once it has played out", () => {
-        const mixer = new WaveMixer();
-        const loud = decodeWave(wav(1, 22050, 16, [1000, 1000, 1000, 1000]))!;
-        const half = decodeWave(wav(1, 11025, 16, [500, 500]))!;
-        mixer.play("a", loud);
-        mixer.play("b", half);
-        const out = new Int16Array(12);
-        mixer.render(out, 6, 2, 22050);
-        // Four frames of both, then silence; the 11025 Hz voice lasts as long at twice the step.
-        expect([...out.subarray(0, 8)]).toEqual([1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500]);
-        expect([...out.subarray(8)]).toEqual([0, 0, 0, 0]);
-        expect(mixer.active).toBe(0);
+describe("performance wave mixing", () => {
+    const fromSamples = (channels: number, rate: number, samples: number[]) =>
+        PerfSegment.fromWave(decodeWave(wav(channels, rate, 16, samples))!);
+
+    test("mixes voices, resamples to the path rate, and ends voices after playback", () => {
+        const perf = new Performance(new DlsSynth(22050, 8));
+        const a = perf.playSegment(fromSamples(1, 22050, [1000, 1000, 1000, 1000]), DMUS_SEGF_SECONDARY);
+        const b = perf.playSegment(fromSamples(1, 11025, [500, 500]), DMUS_SEGF_SECONDARY);
+        const left = new Float32Array(6), right = new Float32Array(6);
+        perf.render(left, right, 6);
+        expect(Array.from(left, x => Math.round(x * 32768))).toEqual([1500, 1500, 1500, 1500, 0, 0]);
+        expect(Array.from(right, x => Math.round(x * 32768))).toEqual([1500, 1500, 1500, 1500, 0, 0]);
+        expect(perf.isPlaying(null, a)).toBe(false);
+        expect(perf.isPlaying(null, b)).toBe(false);
     });
 
-    test("stop silences one owner's voices only, and a mono path gets the average of both sides", () => {
-        const mixer = new WaveMixer();
-        mixer.play("a", decodeWave(wav(2, 22050, 16, [400, 0, 400, 0]))!);
-        mixer.play("b", decodeWave(wav(1, 22050, 16, [100, 100]))!);
-        mixer.stop("b");
-        const out = new Int16Array(2);
-        mixer.render(out, 2, 1, 22050);
-        expect([...out]).toEqual([200, 200]);
-    });
-});
-
-describe("WaveMixer volume", () => {
-    test("SetVolume's hundredths of a decibel scale the mix, ramping from the old level", () => {
-        const mixer = new WaveMixer();
-        const loud = decodeWave(wav(1, 22050, 16, new Array(8).fill(10000)))!;
-        mixer.play("a", loud);
-        mixer.setVolume(-600); // -6 dB: about half
-        const out = new Int16Array(8);
-        mixer.render(out, 4, 2, 22050);
-        expect(out[6]).toBe(5012); // the ramp lands on the new level by the end of the render
-        expect(out[0]).toBeGreaterThan(5012);
-        mixer.render(out, 4, 2, 22050);
-        expect([...out]).toEqual(new Array(8).fill(5012));
-        mixer.setVolume(-9600);
-        mixer.play("b", loud);
-        mixer.render(out, 4, 2, 22050);
-        expect(out[6]).toBe(0);
+    test("stopping one state preserves the other state's stereo samples", () => {
+        const perf = new Performance(new DlsSynth(22050, 8));
+        const a = perf.playSegment(fromSamples(2, 22050, [400, 0, 400, 0]), DMUS_SEGF_SECONDARY);
+        const b = perf.playSegment(fromSamples(1, 22050, [100, 100]), DMUS_SEGF_SECONDARY);
+        perf.stop(null, b, 0);
+        const left = new Float32Array(2), right = new Float32Array(2);
+        perf.render(left, right, 2);
+        expect(Array.from(left, x => Math.round(x * 32768))).toEqual([400, 400]);
+        expect(Array.from(right)).toEqual([0, 0]);
+        perf.stop(null, a, 0);
+        expect(perf.isPlaying(null, a)).toBe(false);
+        left.fill(0); right.fill(0);
+        perf.render(left, right, 2);
+        expect(Array.from(left)).toEqual([0, 0]);
+        expect(Array.from(right)).toEqual([0, 0]);
     });
 });
 

@@ -1124,9 +1124,6 @@ function runModalDialog(
         // claim; without it an Edit in a modal dialog never receives a character.
         translateKeyMessage(hwnd, message, wParam, lParam);
 
-        // The DialogBox loop is `if (!IsDialogMessage) { TranslateMessage; DispatchMessage }`.
-        translateKeyMessage(hwnd, message, wParam, lParam);
-
         // --- Modal dialog mouse re-routing ---
         // Real modal dialogs are active owned top-level windows. If an already queued
         // mouse message still targets the owner, translate the screen point into the

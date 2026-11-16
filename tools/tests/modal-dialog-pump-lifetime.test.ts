@@ -231,15 +231,26 @@ describe('a modal pump that cannot dispatch', () => {
         expect(removed).toContain(0x0113);
     });
 
-    test('a key the dialog manager does not claim is translated into WM_CHAR', async () => {
-        const { invocations, dialogHwnd } = runDialog(() => 0x2000, 0);
-        System.getInstance().windowManager.postMessage(dialogHwnd, 0x0100 /* WM_KEYDOWN */, 0x41, 0x1e0001);
+    for (const [keyMessage, charMessage] of [[0x0100, 0x0102], [0x0104, 0x0106]]) {
+        test(`one unclaimed 0x${keyMessage.toString(16)} posts exactly one character message`, async () => {
+            const { invocations, dialogHwnd } = runDialog(() => 0x2000, 0);
+            const wm = System.getInstance().windowManager;
+            const posted = spyOn(wm, 'postMessage');
+            try {
+                wm.postMessage(dialogHwnd, keyMessage, 0x41, 0x1e0001);
+                await completeUntil(invocations, charMessage);
 
-        await completeUntil(invocations, 0x0102);
-
-        const char = pumpDispatches(invocations).find(i => i.args[1] === 0x0102);
-        expect(char?.args.slice(0, 4)).toEqual([dialogHwnd, 0x0102, 0x61, 0x1e0001]);
-    });
+                const chars = posted.mock.calls.filter(args => args[1] === charMessage);
+                expect(chars).toHaveLength(1);
+                expect(chars[0]?.slice(0, 4)).toEqual([dialogHwnd, charMessage, 0x61, 0x1e0001]);
+                const delivered = pumpDispatches(invocations).find(i => i.args[1] === charMessage);
+                expect(delivered?.args.slice(0, 4)).toEqual([dialogHwnd, charMessage, 0x61, 0x1e0001]);
+            } finally {
+                resetDialogPumps();
+                posted.mockRestore();
+            }
+        });
+    }
 
     test('a WM_TIMER carrying a TIMERPROC calls the TIMERPROC, not the dialog procedure', async () => {
         const timerProc = 0x403000;
