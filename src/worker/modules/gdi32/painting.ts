@@ -2134,34 +2134,33 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         return 1;
     };
 
-    exports['GetCharWidthA'] = (ctx, mem, args): number => {
-        const hdc = args[0];
-        const iFirst = args[1];
-        const iLast = args[2];
-        const lpBuffer = args[3];
-        Logger.verbose(LogCategory.GDI32, `GetCharWidthA(hdc=0x${hdc.toString(16)}, ${iFirst}-${iLast})`);
-        if (lpBuffer) {
-            const gdi = System.getInstance().gdiContext;
-            const dcCtx = gdi.getMeasureContext(hdc);
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            // The codes are characters of the selected font's code page, not Unicode scalars.
-            const characters = decodeAnsiCharRange(iFirst >>> 0, iLast >>> 0,
-                fontCodePage(gdi.getSelectedFontCharset(hdc) ?? systemDefaultCharset()));
-            if (!characters) return 0;
-            for (let i = 0; i < characters.length; i++) {
-                const ch = characters[i]!;
-                let width = 8;
-                if (dcCtx) {
-                    try {
-                        width = Math.round(dcCtx.measureText(ch).width);
-                        if (width < 1) width = 1;
-                    } catch (_) { /* keep fallback */ }
-                }
-                view.setInt32(lpBuffer + i * 4, width, true);
-            }
+    const charWidths = (wide: boolean): ThunkImplementation => (_ctx, mem, args): number => {
+        const hdc = args[0] >>> 0;
+        const first = args[1] >>> 0;
+        const last = args[2] >>> 0;
+        const out = args[3] >>> 0;
+        if (!hdc || !out || last < first || last > 0xffff) return 0;
+        const count = last - first + 1;
+        if (out + count * 4 > mem.length || !isValidAddress(mem, out, count * 4, 'rw')) return 0;
+        const gdi = System.getInstance().gdiContext;
+        const dcCtx = gdi.getMeasureContext(hdc);
+        if (!dcCtx) return 0;
+        // ANSI codes name the selected font's code page; W codes are UTF-16 units.
+        const characters = wide ? null : decodeAnsiCharRange(first, last,
+            fontCodePage(gdi.getSelectedFontCharset(hdc) ?? systemDefaultCharset()));
+        if (!wide && !characters) return 0;
+        for (let i = 0; i < count; i++) {
+            const ch = wide ? String.fromCharCode(first + i) : characters![i]!;
+            let width = 8;
+            try { width = Math.round(dcCtx.measureText(ch).width); } catch (_) { /* keep fallback */ }
+            Mem.writeUint32(out + i * 4, width);
         }
-        return 1; // success
+        return 1;
     };
+    exports['GetCharWidthA'] = charWidths(false);
+    exports['GetCharWidth32A'] = exports['GetCharWidthA'];
+    exports['GetCharWidthW'] = charWidths(true);
+    exports['GetCharWidth32W'] = exports['GetCharWidthW'];
 
     exports['ExtTextOutA'] = (_ctx, _mem, args) => extTextOut(args, false);
     exports['ExtTextOutW'] = (_ctx, _mem, args) => extTextOut(args, true);
