@@ -27,6 +27,8 @@ import { MemoryAllocationError } from './memory/allocation-error';
  *   0xE10 TlsSlots[64]
  *   0xF94 TlsExpansionSlots       (-> 1024 lazy dynamic slots)
  *   0xFB4 FlsData                 (-> RTL_FLS_DATA, allocated on the first FlsSetValue)
+ *   0xFF0 (private) StackBase the stub's writable-stack proof was established for
+ *   0xFF4 (private) StackLimit of that proof; the stub declines when fs:[4]/fs:[8] differ
  *   0xFF8 (private) effective priority mirror for the NtQueryInformationThread stub, 0 = unknown
  *   0xFFC (private) relative priority mirror, valid only while 0xFF8 is non-zero
  */
@@ -48,6 +50,8 @@ const TEB_LAST_ERROR        = 0x34;
 const TEB_FLS_DATA          = 0xFB4;
 /** Past every field NT's 32-bit TEB defines at these offsets; zero-filled, so a new TEB
  *  starts "unknown" and the stub defers to the JS handler, which publishes the pair. */
+const TEB_PROVEN_STACK_BASE  = 0xFF0;
+const TEB_PROVEN_STACK_LIMIT = 0xFF4;
 const TEB_PRIORITY_EFFECTIVE = 0xFF8;
 const TEB_PRIORITY_RELATIVE  = 0xFFC;
 
@@ -77,6 +81,8 @@ export const TEB_OFFSETS = {
     tlsExpansion: TEB_TLS_EXPANSION,
     lastError: TEB_LAST_ERROR,
     flsData: TEB_FLS_DATA,
+    provenStackBase: TEB_PROVEN_STACK_BASE,
+    provenStackLimit: TEB_PROVEN_STACK_LIMIT,
     priorityEffective: TEB_PRIORITY_EFFECTIVE,
     priorityRelative: TEB_PRIORITY_RELATIVE,
 } as const;

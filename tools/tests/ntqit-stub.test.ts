@@ -66,7 +66,19 @@ const SCRIPT: Step[] = [
     js('protect another stack page read-only', () => space().protect(STACK - 0x8000, 0x1000, 'r')),
     call({}, true),                                   // this buffer is writable, but the stack is not: no proof
     call({}, true),
+    js('protect that stack page read-write again', () => space().protect(STACK - 0x8000, 0x1000, 'rw')),
+    call({}, true),
+    call({}, false),
+    js('protect an off-stack page read-only', () => space().protect(OFFSTACK, 0x1000, 'r')),
+    call({}, false),                                  // outside the proven span: the proof stands
+    js('move StackBase above that page', s => Mem.writeUint32(teb(s) + 4, MOVED_BASE)),
+    call({ buf: 'offstack' }, true),                  // in the new bounds, not proven writable: JS refuses
+    call({}, true),                                   // the proof was for the old bounds
+    js('restore StackBase', s => Mem.writeUint32(teb(s) + 4, STACK)),
+    call({}, false),                                  // the proven span again: no withdrawal was needed
 ];
+const MOVED_BASE = 0x500000;
+const teb = (s: Scheduler) => (s as any).threads.get(1).tebAddress as number;
 
 let liveSpace: AddressSpace | null = null;
 const space = () => liveSpace!;
@@ -227,6 +239,9 @@ describe.skipIf(!existsSync(lib) || !existsSync(wasm))('NtQueryInformationThread
         const roAt = SCRIPT.findIndex(s => 'js' in s && s.js.startsWith('protect the stack page read-only'));
         expect(viaStub.rows[calls.indexOf(roAt + 1)]![0]).toBe(0xc0000005);  // STATUS_ACCESS_VIOLATION, not a write
         expect(viaStub.rows[calls.indexOf(roAt + 3)]![0]).toBe(0xc0000005);
+        const movedAt = SCRIPT.findIndex(s => 'js' in s && s.js.startsWith('move StackBase'));
+        expect(viaStub.rows[calls.indexOf(movedAt + 1)]![0]).toBe(0xc0000005);  // read-only page inside the moved bounds
+        expect(viaStub.rows[calls.indexOf(movedAt + 1)]!.slice(1, 9)).toEqual(Array(8).fill(0xcccccccc));
         // Crossings: the trap arm crosses on every call; the stub arm exactly where the script says.
         expect(calls.map(k => viaTrap.crossings[k])).toEqual(calls.map(() => true));
         expect(calls.map(k => viaStub.crossings[k])).toEqual(calls.map(k => (SCRIPT[k] as { call: Call }).call.cross));

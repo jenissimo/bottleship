@@ -3722,15 +3722,15 @@ export class Scheduler {
         if (thread.tebAddress) Mem.writeUint32(thread.tebAddress + TEB_OFFSETS.priorityEffective, 0);
     }
 
-    /** The stub writes into [StackLimit, StackBase) without probing; any protection,
-     *  release or decommit touching a thread's stack withdraws that proof until the JS
-     *  handler re-establishes it for the whole stack. */
+    /** The stub writes into the stack span its proof was established for without probing;
+     *  any protection, release or decommit touching that span withdraws the proof until the
+     *  JS handler re-establishes it for the whole stack. */
     forgetPriorityMirrorsOverlapping(base: number, size: number): void {
         const end = base + size;
         for (const t of this.threads.values()) {
             if (!t.tebAddress) continue;
-            const stackBase = (Mem.readUint32(t.tebAddress + TEB_OFFSETS.stackBase) ?? 0) >>> 0;
-            const stackLimit = (Mem.readUint32(t.tebAddress + TEB_OFFSETS.stackLimit) ?? 0) >>> 0;
+            const stackBase = (Mem.readUint32(t.tebAddress + TEB_OFFSETS.provenStackBase) ?? 0) >>> 0;
+            const stackLimit = (Mem.readUint32(t.tebAddress + TEB_OFFSETS.provenStackLimit) ?? 0) >>> 0;
             if (base < stackBase && stackLimit < end) this.forgetPriorityMirror(t);
         }
     }
