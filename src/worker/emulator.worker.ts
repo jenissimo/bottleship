@@ -1431,6 +1431,7 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false): Promi
     const win9x = EmulatorConfig.getInstance().osVersion.platformId === VER_PLATFORM_WIN32_WINDOWS;
     ptm.initialize(mem8.length, win9x);
     system.process!.pageTableManager = ptm;
+    system.process!.addressSpace.onAccessChange = (base, size) => system.scheduler.forgetPriorityMirrorsOverlapping(base, size);
 
     // Provide stack bounds to scheduler for main thread TEB allocation
     system.scheduler.setMainStackInfo(stackPointer, mainStackSize);

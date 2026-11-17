@@ -1717,6 +1717,7 @@ export const exports: Record<string, ThunkImplementation> = {
         }
 
         currentPriorityClass = priorityClass;
+        System.getInstance().scheduler.forgetAllPriorityMirrors();
         Logger.verbose(LogCategory.KERNEL32, `SetPriorityClass(hProcess=CURRENT_PROCESS, class=0x${priorityClass.toString(16)})`);
         return { value: 1, stackCleanup: 8 };
     },

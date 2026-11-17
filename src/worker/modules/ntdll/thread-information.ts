@@ -3,6 +3,8 @@ import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
 import { getCurrentProcessPriorityClass } from '../kernel32/process/process';
 import { VIRTUAL_CURRENT_PROCESS_ID } from '../kernel32/process/virtual-process-manager';
+import { TEB_OFFSETS } from '../../core/teb-manager';
+import type { StubAllocator } from '../../core/thunking/thunk-memory-manager';
 
 const SIZE = 28;
 const STATUS_NOT_IMPLEMENTED = 0xc0000002, STATUS_INFO_LENGTH_MISMATCH = 0xc0000004;
@@ -27,6 +29,17 @@ export function effectiveThreadPriority(priorityClass: number, relative: number)
 function writable(system: System, memoryLength: number, ptr: number, size: number): boolean {
     return ptr > 0 && ptr + size <= memoryLength
         && (!system.process?.addressSpace || system.process.addressSpace.validateRange(ptr, size, 'w'));
+}
+
+/** The proof the guest stub relies on: every byte of the thread's [StackLimit, StackBase)
+ *  is writable now. Returns that span, or null. Withdrawn by
+ *  Scheduler.forgetPriorityMirrorsOverlapping on an access change inside it; the stub also
+ *  declines once StackBase/StackLimit no longer equal the span it was proven for. */
+function provenStack(system: System, memoryLength: number, teb: number): [number, number] | null {
+    const stackBase = (Mem.readUint32(teb + TEB_OFFSETS.stackBase) ?? 0) >>> 0;
+    const stackLimit = (Mem.readUint32(teb + TEB_OFFSETS.stackLimit) ?? 0) >>> 0;
+    return stackLimit < stackBase && writable(system, memoryLength, stackLimit, stackBase - stackLimit)
+        ? [stackBase, stackLimit] : null;
 }
 
 export const queryThreadBasicInformation: ThunkImplementation = (_ctx, mem, args): number => {
@@ -58,8 +71,87 @@ export const queryThreadBasicInformation: ThunkImplementation = (_ctx, mem, args
         || !Mem.writeUint32(out + 24, thread.relativePriority)) return STATUS_ACCESS_VIOLATION;
     // Deliberately last: ReturnLength may alias any DWORD in the struct.
     if (returnLength && !Mem.writeUint32(returnLength, SIZE)) return STATUS_ACCESS_VIOLATION;
+    // The guest stub answers the next calls on this thread from these two TEB words until a
+    // priority input changes (Scheduler.forgetPriorityMirror clears the first one).
+    const proven = thread.tebAddress ? provenStack(system, mem.length, thread.tebAddress) : null;
+    if (proven) {
+        Mem.writeUint32(thread.tebAddress + TEB_OFFSETS.provenStackBase, proven[0]);
+        Mem.writeUint32(thread.tebAddress + TEB_OFFSETS.provenStackLimit, proven[1]);
+        Mem.writeUint32(thread.tebAddress + TEB_OFFSETS.priorityRelative, thread.relativePriority);
+        Mem.writeUint32(thread.tebAddress + TEB_OFFSETS.priorityEffective, priority);
+    }
     return 0;
 };
+
+const CURRENT_THREAD = 0xFFFFFFFE;
+const STATUS_PENDING = 0x103;
+const STUB_REGION = 320;
+
+/**
+ * Trap-free guest x86 for the one shape engines issue thousands of times a second:
+ * NtQueryInformationThread(GetCurrentThread(), ThreadBasicInformation, &tbi, 28, &len?)
+ * with &tbi (and &len) on the caller's own stack. Everything it writes is already in the
+ * calling thread's TEB — Self, ClientId and the priority pair the JS handler mirrors there.
+ * Any other handle, class, length, an unaligned or off-stack buffer, or a thread whose mirror
+ * is not published yet takes the export's own OUT trap, so the JS handler stays the single
+ * definition of every other case (status codes, probing, other threads). The stub skips the
+ * probe only under a maintained proof: the handler publishes the mirror only while the whole
+ * [StackLimit, StackBase) is writable, and any protect, release or decommit that touches the
+ * stack withdraws it (Scheduler.forgetPriorityMirrorsOverlapping). The proven span is kept
+ * beside the mirror, and the stub declines whenever the current StackBase/StackLimit differ
+ * from it, so a moved stack never inherits the old proof. stdcall(5); touches
+ * EAX/ECX/EDX and EFLAGS only.
+ */
+export function writeThreadInformationStub(
+    allocator: StubAllocator, getMemory: () => Uint8Array, trapFunctionId: number,
+): number {
+    const base = allocator.alloc(STUB_REGION, 'THUNK_CODE', 'rx');
+    const mem = getMemory();
+    const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    let off = base;
+    const limit = base + STUB_REGION;
+    const room = (n: number) => { if (off + n > limit) throw new Error(`[ntqit-stub] emit past ${STUB_REGION}B`); };
+    const w = (...b: number[]) => { room(b.length); for (const x of b) mem[off++] = x & 0xFF; };
+    const u32 = (v: number) => { room(4); dv.setUint32(off, v >>> 0, true); off += 4; };
+    const traps: number[] = [];
+    const toTrap = (cc: number) => { w(0x0F, cc); traps.push(off); u32(0); };       // jcc rel32 -> trap
+    const fs = (op: number[], field: number) => { w(0x64, ...op); u32(field); };    // fs: moffs/modrm disp32
+
+    w(0x81, 0x7C, 0x24, 0x04); u32(CURRENT_THREAD); toTrap(0x85);                  // cmp [esp+4],-2 ; jne
+    w(0x83, 0x7C, 0x24, 0x08, 0x00); toTrap(0x85);                                   // cmp [esp+8],0  ; jne
+    w(0x83, 0x7C, 0x24, 0x10, SIZE); toTrap(0x85);                                   // cmp [esp+16],28; jne
+    w(0x8B, 0x54, 0x24, 0x0C);                                                       // mov edx,[esp+12]
+    w(0xF6, 0xC2, 0x03); toTrap(0x85);                                               // test dl,3 ; jnz
+    fs([0xA1], TEB_OFFSETS.stackBase);                                               // mov eax,fs:[4]
+    fs([0x3B, 0x05], TEB_OFFSETS.provenStackBase); toTrap(0x85);                     // cmp eax,fs:[FF0] ; jne
+    fs([0xA1], TEB_OFFSETS.stackLimit);                                              // mov eax,fs:[8]
+    fs([0x3B, 0x05], TEB_OFFSETS.provenStackLimit); toTrap(0x85);                    // cmp eax,fs:[FF4] ; jne
+    fs([0x3B, 0x15], TEB_OFFSETS.stackLimit); toTrap(0x82);                          // cmp edx,fs:[8] ; jb
+    w(0x8B, 0xC2, 0x83, 0xC0, SIZE); toTrap(0x82);                                   // mov eax,edx ; add eax,28 ; jc
+    fs([0x3B, 0x05], TEB_OFFSETS.stackBase); toTrap(0x87);                           // cmp eax,fs:[4] ; ja
+    w(0x8B, 0x4C, 0x24, 0x14);                                                       // mov ecx,[esp+20]
+    w(0x85, 0xC9); w(0x74, 0); const noLen = off;                                    // test ecx,ecx ; jz noLen
+    w(0xF6, 0xC1, 0x03); toTrap(0x85);                                               // test cl,3 ; jnz
+    fs([0x3B, 0x0D], TEB_OFFSETS.stackLimit); toTrap(0x82);                          // cmp ecx,fs:[8] ; jb
+    w(0x8B, 0xC1, 0x83, 0xC0, 0x04); toTrap(0x82);                                   // mov eax,ecx ; add eax,4 ; jc
+    fs([0x3B, 0x05], TEB_OFFSETS.stackBase); toTrap(0x87);                           // cmp eax,fs:[4] ; ja
+    mem[noLen - 1] = (off - noLen) & 0xFF;
+    fs([0xA1], TEB_OFFSETS.priorityEffective);                                       // mov eax,fs:[FF8]
+    w(0x85, 0xC0); toTrap(0x84);                                                     // test eax,eax ; jz
+    w(0xC7, 0x02); u32(STATUS_PENDING);                                              // ExitStatus
+    w(0x89, 0x42, 0x14);                                                             // Priority
+    fs([0xA1], TEB_OFFSETS.priorityRelative); w(0x89, 0x42, 0x18);                   // BasePriority
+    fs([0xA1], TEB_OFFSETS.self); w(0x89, 0x42, 0x04);                               // TebBaseAddress
+    fs([0xA1], TEB_OFFSETS.clientIdProcess); w(0x89, 0x42, 0x08);                    // ClientId.UniqueProcess
+    fs([0xA1], TEB_OFFSETS.clientIdThread); w(0x89, 0x42, 0x0C);                     // ClientId.UniqueThread
+    w(0xC7, 0x42, 0x10); u32(1);                                                     // AffinityMask
+    w(0x85, 0xC9); w(0x74, 6); w(0xC7, 0x01); u32(SIZE);                             // ReturnLength last
+    w(0x31, 0xC0); w(0xC2, 20, 0);                                                   // STATUS_SUCCESS
+    const trap = off;
+    w(0xB8); u32(trapFunctionId); w(0xBA, 0x77, 0xB0, 0x00, 0x00); w(0xEF); w(0xC2, 20, 0);
+    for (const at of traps) dv.setInt32(at, trap - (at + 4), true);
+    return base;
+}
 
 const THREAD_BASIC_INFORMATION_CLASS = 0;
 const fastArgs = [0, 0, 0, 0, 0];

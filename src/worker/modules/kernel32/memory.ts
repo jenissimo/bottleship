@@ -998,6 +998,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         }
 
         decommittedPages.addRange(alignedAddress, alignedSize);
+        proc.addressSpace.onAccessChange?.(alignedAddress, alignedSize);
     }
 
     /**
