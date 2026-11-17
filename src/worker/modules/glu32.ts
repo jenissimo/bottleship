@@ -167,13 +167,29 @@ export class Glu32 implements IModule {
             if (width <= 0 || height <= 0) return 0;
             const gl = process.getModule("opengl32") as OpenGL32 | undefined;
             const ctx = gl?.getContext();
-            if (!ctx) return 0;
+            if (!gl || !ctx) return 0;
             if (ctx.immediateMode) { ctx.error = 0x0502 /* GL_INVALID_OPERATION */; return 0; }
             const ptr = args[8] >>> 0, mem = process.getCurrentMemory();
             if (!ptr || ptr + 16 > mem.byteLength) return 0;
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             const vx = view.getInt32(ptr, true), vy = view.getInt32(ptr + 4, true);
             const vw = view.getInt32(ptr + 8, true), vh = view.getInt32(ptr + 12, true);
+            if (ctx.compilingList !== null && !ctx.replayingList) {
+                // GLU expands into GL matrix operations. Let the existing wrappers
+                // own scalar arguments and honor COMPILE / COMPILE_AND_EXECUTE;
+                // never retain the caller's viewport pointer in the display list.
+                const words = (x: number, y: number, z: number): number[] => {
+                    const out: number[] = [];
+                    for (const value of [x, y, z]) {
+                        _dv.setFloat64(0, value, true);
+                        out.push(_dv.getUint32(0, true), _dv.getUint32(4, true));
+                    }
+                    return out;
+                };
+                gl.exports["glTranslated"]!(_ctx, mem, words((vw + 2 * (vx - x)) / width, (vh + 2 * (vy - y)) / height, 0));
+                gl.exports["glScaled"]!(_ctx, mem, words(vw / width, vh / height, 1));
+                return 0;
+            }
             _tempMat.fill(0);
             _tempMat[0] = vw / width;
             _tempMat[5] = vh / height;

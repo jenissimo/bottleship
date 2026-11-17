@@ -1,4 +1,5 @@
 import {expect,test} from "bun:test";
+import {OpenGL32} from "../../src/worker/modules/opengl32";
 import {Glu32} from "../../src/worker/modules/glu32";
 import {createOpenGLContext} from "../../src/worker/modules/opengl32/context";
 import {createStateExports} from "../../src/worker/modules/opengl32/state";
@@ -37,3 +38,23 @@ test("selection sees only the requested window region",()=>{
  expect(call('glRenderMode',G.GL_RENDER)).toBe(1);
  expect(Array.from(new Uint32Array(mem.buffer,256,4))).toEqual([1,2147483648,2147483648,11]);
 });
+
+for (const mode of [G.GL_COMPILE, G.GL_COMPILE_AND_EXECUTE]) {
+ test(`gluPickMatrix compiles owned matrix operations in list mode ${mode}`,()=>{
+  const mem=new Uint8Array(4096),gl=new OpenGL32(),glu=new Glu32();
+  const process={getCurrentMemory:()=>mem,dispatcher:{},getModule:()=>gl};
+  gl.initialize(process as never);glu.initialize(process as never);
+  const ctx=gl.getContext()!,call=(n:string,...a:number[])=>gl.exports[n]!(null as never,mem,a);
+  new Int32Array(mem.buffer,128,4).set([100,50,800,600]);
+  const values=new Float64Array([300,350,10,20]),args=[...new Uint32Array(values.buffer),128];
+  call('glMatrixMode',G.GL_PROJECTION);call('glNewList',17,mode);
+  glu.exports.gluPickMatrix!(null as never,mem,args);call('glEndList');
+  const expected=[80,0,0,0,0,30,0,0,0,0,1,0,40,0,0,1];
+  expect(Array.from(ctx.currentMatrix())).toEqual(mode===G.GL_COMPILE? [1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]:expected);
+  // The caller can overwrite both argument and viewport memory after compilation.
+  values.fill(999);args.fill(0);mem.fill(0xff,128,144);
+  call('glLoadIdentity');call('glCallList',17);
+  expect(Array.from(ctx.currentMatrix())).toEqual(expected);
+  call('glDeleteLists',17,1);expect(ctx.displayLists.size).toBe(0);
+ });
+}
