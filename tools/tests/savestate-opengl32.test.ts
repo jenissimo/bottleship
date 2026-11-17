@@ -156,6 +156,30 @@ function readFloats(r: Rig, pname: number, n: number): number[] {
 }
 
 describe("opengl32 savestate participant", () => {
+    test("selection resumes with an already written record and a pending depth interval", () => {
+        const a = makeRig();
+        a.call("glSelectBuffer", 16, OUT); a.call("glRenderMode", 0x1c02);
+        a.call("glPushName", 5); a.call("glRasterPos3f", bits(0), bits(0), bits(-.5));
+        a.call("glLoadName", 6); a.call("glRasterPos3f", bits(0), bits(0), bits(.5));
+        const {saved, graph} = capture(a);
+        const b = makeRig(a.mem.slice()); restoreInto(b, saved, graph);
+        expect(b.call("glRenderMode", 0x1c00)).toBe(2);
+        expect(a.call("glRenderMode", 0x1c00)).toBe(2);
+        expect(b.mem.slice(OUT, OUT + 32)).toEqual(a.mem.slice(OUT, OUT + 32));
+        expect(Array.from(new Uint32Array(b.mem.buffer, OUT, 8))).toEqual([1,1073741824,1073741824,5,1,3221225471,3221225471,6]);
+    });
+    test("selection client commands execute while compiling a display list", () => {
+        const r = makeRig();
+        r.call("glNewList", 1, GL_COMPILE);
+        r.call("glSelectBuffer", 16, OUT); r.call("glRenderMode", 0x1c02);
+        expect(r.ctx.renderMode).toBe(0x1c02);
+        r.call("glPushName", 7); r.call("glRasterPos3f", bits(0), bits(0), bits(0));
+        r.call("glEndList");
+        expect(r.ctx.nameStackTop).toBe(-1);
+        r.call("glCallList", 1);
+        expect(r.call("glRenderMode", 0x1c00)).toBe(1);
+        expect(new Uint32Array(r.mem.buffer, OUT, 4)[3]).toBe(7);
+    });
     test("capture, restore into a fresh module and capture again is byte-identical", () => {
         const a = makeRig();
         buildScene(a);
@@ -502,9 +526,9 @@ describe("opengl32 savestate participant", () => {
         expect(capture(r).saved).toHaveProperty("immediateMaterials", null);
     });
 
-    test("the schema is version 3 with a pinned hash", () => {
+    test("the schema is version 4 with a pinned hash", () => {
         const r = makeRig();
-        expect(r.participant.version).toBe(3);
-        expect(savestateParticipants.schemas().opengl32).toEqual({ version: 3, schemaHash: "60414f0006c57b78" });
+        expect(r.participant.version).toBe(4);
+        expect(savestateParticipants.schemas().opengl32).toEqual({ version: 4, schemaHash: "ca0bccc7148e42a1" });
     });
 });

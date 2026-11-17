@@ -129,7 +129,7 @@ export function createListExports(ctx: OpenGLContext): Record<string, ThunkImple
 
         // Lighting needs vertex-time materials and inherited current color. Raw replay
         // preserves those semantics; baked object geometry remains the unlit fast path.
-        if (dl.prebaked && !ctx.enableFlags.has(0x0b50 /* GL_LIGHTING */) &&
+        if (dl.prebaked && ctx.renderMode !== 0x1c02 /* GL_SELECT: retain original polygons */ && !ctx.enableFlags.has(0x0b50 /* GL_LIGHTING */) &&
             !dl.commands.some(cmd => cmd.fn === 'glCallList' || cmd.fn === 'glCallLists' ||
                 (cmd.fn === 'glEnable' && cmd.args[0] === 0x0b50))) {
             // Fast path: use pre-baked vertex data

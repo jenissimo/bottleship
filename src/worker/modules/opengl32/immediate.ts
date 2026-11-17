@@ -18,8 +18,9 @@ import {
     GL_POLYGON, GL_POINTS, GL_LINES, GL_LINE_STRIP, GL_LINE_LOOP,
     GL_INVALID_OPERATION,
     GL_TEXTURE_GEN_S, GL_TEXTURE_GEN_T,
-    GL_OBJECT_LINEAR, GL_EYE_LINEAR, GL_SPHERE_MAP, GL_STENCIL_TEST, GL_RENDER, GL_FOG,
+    GL_OBJECT_LINEAR, GL_EYE_LINEAR, GL_SPHERE_MAP, GL_STENCIL_TEST, GL_RENDER, GL_SELECT, GL_FOG,
 } from "./constants";
+import { selectDraw } from "./selection";
 import { Logger, LogCategory } from "../../core/logger";
 import { guestViews } from "./client-arrays";
 import { captureGLDrawEmissionIfArmed, type GLDrawEmissionCapture } from "./frame-capture";
@@ -399,6 +400,7 @@ function pushGLDrawCommand(ctx: OpenGLContext, mode: number, vertOffset: number,
 export function emitDrawCommandFlat(
     ctx: OpenGLContext, mode: number, src: Float32Array, srcCount: number, preTransformed = false,
 ): void {
+    if (ctx.renderMode === GL_SELECT) { selectDraw(ctx, mode, src, 0, srcCount); return; }
     const expected = assembledVertCount(mode, srcCount);
     if (expected === 0) return;
 
@@ -425,6 +427,7 @@ export function emitArenaDraw(
     ctx: OpenGLContext, mode: number, base: number, count: number, preTransformed = false,
 ): void {
     if (count === 0) return;
+    if (ctx.renderMode === GL_SELECT) { selectDraw(ctx, mode, ctx.vertArena.data, base, count); return; }
     const arena = ctx.vertArena;
     arena.used = base + count * VERT_FLOATS;
     const capture = captureGLDrawEmissionIfArmed(ctx, base, count);

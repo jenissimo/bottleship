@@ -48,7 +48,6 @@ import {
     GL_TEXTURE_GEN_S, GL_TEXTURE_GEN_T, GL_TEXTURE_GEN_R, GL_TEXTURE_GEN_Q,
     GL_SAMPLE_ALPHA_TO_COVERAGE, GL_SAMPLE_COVERAGE,
     GL_RENDER, GL_SELECT, GL_FEEDBACK, GL_INVALID_OPERATION,
-    GL_STACK_OVERFLOW, GL_STACK_UNDERFLOW, NAME_STACK_MAX_DEPTH,
     GL_CLIP_PLANE0, GL_CLIP_PLANE5,
     GL_UNPACK_ALIGNMENT, GL_UNPACK_ROW_LENGTH, GL_UNPACK_SKIP_PIXELS,
     GL_UNPACK_SKIP_ROWS, GL_PACK_ALIGNMENT,
@@ -61,6 +60,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { Mem } from "../../core/memory/mem-accessor";
 import { isValidAddress } from "../../core/memory/address-guard";
 import { convertPixelsToRGBA8 } from "./texture";
+import { createSelectionExports, setClipPlane, insideUserClipPlanes, selectionDepth } from "./selection";
 import { arenaReserve } from "./immediate";
 import { beforeImmediateMaterialChange, afterImmediateMaterialChange } from "./lighting";
 
@@ -433,13 +433,9 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
             if (cap === GL_TEXTURE_2D) {
                 ctx.textureUnits[ctx.activeTextureUnit].enabled2d = true;
             }
-            // We publish GL_MAX_CLIP_PLANES = 6 because GL 1.3 forbids anything less,
-            // but nothing clips. The error is toward drawing MORE (a mirror/water pass
-            // shows geometry it should have cut), which is visible but not corrupting —
-            // still, say so the first time one is actually turned on rather than let the
-            // gap stay silent.
+            // Selection implements user planes; the GPU render path still does not.
             if (cap >= GL_CLIP_PLANE0 && cap <= GL_CLIP_PLANE5) {
-                stubWarn(`glEnable(GL_CLIP_PLANE${cap - GL_CLIP_PLANE0}): user clip planes are not applied`);
+                stubWarn(`glEnable(GL_CLIP_PLANE${cap - GL_CLIP_PLANE0}): user clip planes are not applied in GL_RENDER`);
             }
             return 0;
         },
@@ -810,65 +806,11 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
         glAccum: () => stubWarn("glAccum"),
         glClearAccum: () => stubWarn("glClearAccum"),
 
-        // ---- Render mode / selection ----
-        //
-        // The return value is the number of records the mode being LEFT produced, and a
-        // picking caller walks exactly that many records out of its own buffer. Answering
-        // with the GL_RENDER enum (7680) told every caller "7680 hits" over a buffer
-        // nothing had written — it then parses uninitialized memory as hit records and
-        // either picks a wrong object or walks off the end of its array.
-        //
-        // We record no hits, so selection fails CLOSED (0 hits = nothing under the
-        // cursor) instead of failing wild.
-        glRenderMode: (_c, _m, args) => {
-            const mode = args[0] >>> 0;
-            const previous = ctx.renderMode;
-            if (mode !== GL_RENDER && mode !== GL_SELECT && mode !== GL_FEEDBACK) {
-                ctx.error = GL_INVALID_ENUM;
-                return 0;
-            }
-            ctx.renderMode = mode;
-            if (previous === GL_SELECT) {
-                stubWarn("glRenderMode: leaving GL_SELECT with 0 hits (selection not implemented)");
-                return 0;
-            }
-            if (previous === GL_FEEDBACK) {
-                stubWarn("glRenderMode: leaving GL_FEEDBACK with 0 values (feedback not implemented)");
-                return 0;
-            }
-            return 0;
-        },
-
-        // Remembered so the buffers can be filled if selection is ever implemented, and
-        // so nothing else pretends they were consumed.
-        glSelectBuffer: (_c, _m, args) => {
-            ctx.selectBufferSize = args[0] | 0;
-            ctx.selectBufferPtr = args[1] >>> 0;
-            return 0;
-        },
+        ...createSelectionExports(ctx),
         glFeedbackBuffer: (_c, _m, args) => {
             ctx.feedbackBufferSize = args[0] | 0;
             ctx.feedbackBufferType = args[1] >>> 0;
             ctx.feedbackBufferPtr = args[2] >>> 0;
-            return 0;
-        },
-
-        // The name stack is real state independent of whether hits are recorded, and
-        // GL_MAX_NAME_STACK_DEPTH is published from the same constant.
-        glInitNames: () => { ctx.nameStackTop = -1; return 0; },
-        glPushName: (_c, _m, args) => {
-            if (ctx.nameStackTop + 1 >= NAME_STACK_MAX_DEPTH) { ctx.error = GL_STACK_OVERFLOW; return 0; }
-            ctx.nameStack[++ctx.nameStackTop] = args[0] | 0;
-            return 0;
-        },
-        glPopName: () => {
-            if (ctx.nameStackTop < 0) { ctx.error = GL_STACK_UNDERFLOW; return 0; }
-            ctx.nameStackTop--;
-            return 0;
-        },
-        glLoadName: (_c, _m, args) => {
-            if (ctx.nameStackTop < 0) { ctx.error = GL_INVALID_OPERATION; return 0; }
-            ctx.nameStack[ctx.nameStackTop] = args[0] | 0;
             return 0;
         },
 
@@ -878,15 +820,15 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
         glPushClientAttrib: () => stubWarn("glPushClientAttrib"),
         glPopClientAttrib: () => stubWarn("glPopClientAttrib"),
 
-        // Clip planes: the plane equations are real state even though nothing clips yet,
-        // so a caller that reads one back gets what it set instead of its own stack.
+        // Clip planes are captured in eye coordinates at definition time.
         glClipPlane: (_c, _m, args) => {
+            if (!outsidePrimitive()) return 0;
             const index = (args[0] >>> 0) - GL_CLIP_PLANE0;
             const ptr = args[1] >>> 0;
             if (index < 0 || index >= 6) { ctx.error = GL_INVALID_ENUM; return 0; }
             if (!ptr) return 0;
             const view = new DataView(getMem().buffer, getMem().byteOffset);
-            for (let i = 0; i < 4; i++) ctx.clipPlanes[index * 4 + i] = view.getFloat64(ptr + i * 8, true);
+            setClipPlane(ctx, index, view, ptr);
             return 0;
         },
         glGetClipPlane: (_c, _m, args) => {
@@ -903,6 +845,7 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
         glCopyPixels: () => stubWarn("glCopyPixels"),
 
         glDrawPixels: (_c: any, _m: any, args: number[]) => {
+            if (ctx.renderMode !== GL_RENDER) return 0;
             const width = args[0] | 0;
             const height = args[1] | 0;
             const format = args[2] >>> 0;
@@ -1181,7 +1124,7 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
                 const cz = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14] * w;
                 const cw = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15] * w;
 
-                if (cw === 0) { ctx.rasterPosValid = false; return; }
+                if (cw <= 0) { ctx.rasterPosValid = false; return; }
                 const invW = 1 / cw;
                 const ndcX = cx * invW;
                 const ndcY = cy * invW;
@@ -1193,11 +1136,19 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
                     return;
                 }
 
+                if (!insideUserClipPlanes(ctx,
+                    mv[0]*x + mv[4]*y + mv[8]*z + mv[12]*w,
+                    mv[1]*x + mv[5]*y + mv[9]*z + mv[13]*w,
+                    mv[2]*x + mv[6]*y + mv[10]*z + mv[14]*w,
+                    mv[3]*x + mv[7]*y + mv[11]*z + mv[15]*w)) {
+                    ctx.rasterPosValid = false; return;
+                }
                 ctx.rasterPosX = ctx.viewportX + (ndcX + 1) * 0.5 * ctx.viewportW;
                 ctx.rasterPosY = ctx.viewportY + (ndcY + 1) * 0.5 * ctx.viewportH;
                 ctx.rasterPosZ = ctx.depthRangeNear + (ndcZ + 1) * 0.5 * (ctx.depthRangeFar - ctx.depthRangeNear);
                 ctx.rasterPosW = cw;
                 ctx.rasterPosValid = true;
+                if (ctx.renderMode === GL_SELECT) selectionDepth(ctx, ctx.rasterPosZ);
             }
 
             const readF32 = (ptr: number, n: number): number[] => {
