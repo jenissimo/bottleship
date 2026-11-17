@@ -16,6 +16,8 @@ import {
 } from "./audio-decode";
 import { playSample, updateSamplePlayback, stopRingBuffer, resumeRingBuffer, seekRingBuffer, applySample3D } from "./playback-engine";
 import { System } from "../../core/system";
+import { armStreamingRing, releaseRingBuffer } from "./playback-engine";
+import { restartSampleBufferPlayback, updateSampleBufferPlayback } from "./sample-buffer-playback";
 import { i32ToFloat } from "../../../audio/audio-ring-buffer";
 import { ensureListener3D, writeListener3D } from "./spatial";
 import { decodeRawSampleImage } from "./raw-sample-cache";
@@ -158,8 +160,9 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         const handle = args[0];
         const sample = ctx.samples.get(handle);
         if (sample) {
-            // Stop playback
-            if (sample.isPlaying || sample.isStopped) {
+            // Stop playback and drop buffered PCM ownership before handle reuse.
+            if (sample.bufferPlayback) releaseRingBuffer(sample.id);
+            else if (sample.isPlaying || sample.isStopped) {
                 if (!stopRingBuffer(sample.id)) {
                     self.postMessage({ type: "audio_stop", payload: { id: sample.id } });
                 }
@@ -187,8 +190,9 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
             return 1;
         }
 
-        // Stop current playback if active
-        if (sampleObj.isPlaying || sampleObj.isStopped) {
+        // A later ordinary sample must not inherit the old circular streaming ring.
+        if (sampleObj.bufferPlayback) releaseRingBuffer(sampleObj.id);
+        else if (sampleObj.isPlaying || sampleObj.isStopped) {
             if (!stopRingBuffer(sampleObj.id)) {
                 self.postMessage({ type: "audio_stop", payload: { id: sampleObj.id } });
             }
@@ -232,6 +236,8 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
             Logger.warn(LogCategory.SYSTEM, `MSS32: _AIL_start_sample@4: Invalid sample`);
             return 0;
         }
+
+        if (sampleObj.bufferPlayback) return restartSampleBufferPlayback(ctx, sampleObj);
 
         if (sampleObj.isStopped) {
             if (!resumeRingBuffer(sampleObj.id)) {
@@ -298,7 +304,10 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
 
         const sampleObj = ctx.samples.get(handle);
         if (sampleObj?.isPlaying) {
-            if (!stopRingBuffer(sampleObj.id)) {
+            if (sampleObj.bufferPlayback) {
+                updateSampleBufferPlayback(ctx, sampleObj);
+                armStreamingRing(ctx, sampleObj, false);
+            } else if (!stopRingBuffer(sampleObj.id)) {
                 self.postMessage({ type: "audio_pause", payload: { id: sampleObj.id } });
             }
             sampleObj.isPlaying = false;

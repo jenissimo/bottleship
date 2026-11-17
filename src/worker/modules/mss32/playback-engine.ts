@@ -81,7 +81,7 @@ function ensureRingBuffer(id: number, channels: number, sampleRate: number, bits
     return sab;
 }
 
-function releaseRingBuffer(id: number): void {
+export function releaseRingBuffer(id: number): void {
     const entry = ringBuffers.get(id);
     if (entry) {
         if (entry.registered) {

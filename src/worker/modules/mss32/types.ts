@@ -9,7 +9,7 @@ export interface MSSSample {
     streamBuffers?: { ptr: number; size: number; inUse: boolean; endFrame?: number }[];
     eobCallback?: number;
     /** Live double-buffered input; capture refuses this pending host PCM state. */
-    bufferPlayback?: { submittedFrames: number; writtenFrames: number; pending: Array<{ data: Float32Array; at: number }>; ending: boolean };
+    bufferPlayback?: { submittedFrames: number; writtenFrames: number; pending: Array<{ data: Float32Array; at: number }>; chunks: Array<{ slot: number; data: Float32Array; endFrame: number }>; ending: boolean };
     userData?: number[];
     totalBytes?: number;
     fileFormat?: "wav" | "mp3" | "ogg" | "raw" | "unknown";

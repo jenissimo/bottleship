@@ -7,7 +7,8 @@ import { updateEmulatorState, resetMssRingBuffers } from "../../src/worker/modul
 import { captureMssSavestate, restoreMssSavestate } from "../../src/worker/modules/mss32/savestate";
 import { mss32Module } from "../../src/worker/api/mss32.api";
 import type { MSSSample } from "../../src/worker/modules/mss32/types";
-import { CTRL_PLAY_CURSOR, CTRL_WRITE_CURSOR, CTRL_DATA_LENGTH, getCtrl, setCtrl } from "../../src/audio/audio-ring-buffer";
+import { CTRL_PLAY_CURSOR, CTRL_WRITE_CURSOR, CTRL_DATA_LENGTH, CTRL_STATE, CTRL_STOP_REQUESTED, CTRL_FLAGS,
+    FLAG_STREAMING, STATE_PLAYING, STATE_STOPPED, getCtrl, setCtrl } from "../../src/audio/audio-ring-buffer";
 
 const HANDLE = 0x400, DATA = 0x2000, CALLBACK = 0x401000;
 let memory: Uint8Array, ctx: MSSContext, sample: MSSSample, module: MSS32;
@@ -198,6 +199,65 @@ describe("Miles end-of-buffer callbacks", () => {
         updateEmulatorState(ctx);
         expect(sample.streamBuffers![1]!.inUse).toBe(false);
         expect(sample.position).toBe(20004 * 2);
+    });
+
+    test("start rewinds only still-owned buffers and keeps a circular ring with rebased boundaries", () => {
+        load(0, 8); load(1, 9);
+        cursor(3); updateEmulatorState(ctx);
+        const capacity = getCtrl(rings.get(1)!, CTRL_DATA_LENGTH);
+        expect(invoke("_AIL_start_sample@4", [HANDLE])).toBe(1);
+        expect(getCtrl(rings.get(1)!, CTRL_FLAGS) & FLAG_STREAMING).toBe(FLAG_STREAMING);
+        expect(getCtrl(rings.get(1)!, CTRL_DATA_LENGTH)).toBe(capacity);
+        expect(getCtrl(rings.get(1)!, CTRL_PLAY_CURSOR)).toBe(0);
+        expect(sample.position).toBe(0);
+        cursor(10); updateEmulatorState(ctx);
+        expect(sample.streamBuffers![0]!.inUse).toBe(false);
+        expect(sample.streamBuffers![1]!.inUse).toBe(true);
+        expect(invoke("_AIL_start_sample@4", [HANDLE])).toBe(1);
+        expect(sample.bufferPlayback!.submittedFrames).toBe(9);
+        expect(sample.streamBuffers![0]!.inUse).toBe(false);
+        expect(sample.streamBuffers![1]!.endFrame).toBe(9);
+        cursor(8); updateEmulatorState(ctx);
+        expect(sample.streamBuffers![1]!.inUse).toBe(true);
+        cursor(9); updateEmulatorState(ctx);
+        expect(sample.streamBuffers![1]!.inUse).toBe(false);
+    });
+
+    test("stop/resume preserves the mixer cursor and source ownership; start after stop rewinds", () => {
+        load(0, 8); load(1, 9);
+        cursor(3); updateEmulatorState(ctx);
+        const ring = rings.get(1)!;
+        expect(invoke("_AIL_stop_sample@4", [HANDLE])).toBe(0);
+        expect(getCtrl(ring, CTRL_STATE)).toBe(STATE_STOPPED);
+        expect(getCtrl(ring, CTRL_STOP_REQUESTED)).toBe(0);
+        expect(getCtrl(ring, CTRL_PLAY_CURSOR)).toBe(12);
+        updateEmulatorState(ctx);
+        expect(sample.streamBuffers![0]!.inUse).toBe(true);
+        expect(invoke("_AIL_resume_sample@4", [HANDLE])).toBe(1);
+        expect(rings.get(1)).toBe(ring);
+        expect(getCtrl(ring, CTRL_STATE)).toBe(STATE_PLAYING);
+        expect(getCtrl(ring, CTRL_PLAY_CURSOR)).toBe(12);
+        invoke("_AIL_stop_sample@4", [HANDLE]);
+        expect(invoke("_AIL_start_sample@4", [HANDLE])).toBe(1);
+        expect(getCtrl(rings.get(1)!, CTRL_PLAY_CURSOR)).toBe(0);
+        expect(sample.position).toBe(0);
+    });
+
+    test("reinit and release dispose the buffered ring before an ordinary sample or handle reuse", () => {
+        invoke("_AIL_register_EOB_callback@8", [HANDLE, CALLBACK]);
+        load(0, 4);
+        invoke("_AIL_init_sample@4", [HANDLE]);
+        expect(rings.has(1)).toBe(false);
+        expect(sample.bufferPlayback).toBeUndefined();
+        expect(sample.streamBuffers).toBeUndefined();
+        expect(sample.eobCallback).toBeUndefined();
+        expect(invoke("_AIL_start_sample@4", [HANDLE])).toBe(1);
+        expect(getCtrl(rings.get(1)!, CTRL_FLAGS) & FLAG_STREAMING).toBe(0);
+        load(0, 4);
+        expect(getCtrl(rings.get(1)!, CTRL_FLAGS) & FLAG_STREAMING).toBe(FLAG_STREAMING);
+        invoke("_AIL_release_sample_handle@4", [HANDLE]);
+        expect(rings.has(1)).toBe(false);
+        expect(ctx.samples.has(HANDLE)).toBe(false);
     });
 
     test("savestate preserves an idle EOB callback and refuses live buffered input", async () => {

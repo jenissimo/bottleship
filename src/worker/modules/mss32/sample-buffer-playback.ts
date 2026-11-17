@@ -35,7 +35,7 @@ export function loadSampleBuffer(ctx: MSSContext, sample: MSSSample, mem: Uint8A
         // buffer is held as a pending chunk and fed as the mixer makes room.
         const frameBytes = Math.max(1, sample.channels) * 4;
         ensureStreamingRing(sample, Math.max(64 * 1024, chunk.byteLength * 2 + frameBytes));
-        sample.bufferPlayback = { submittedFrames: 0, writtenFrames: 0, pending: [], ending: false };
+        sample.bufferPlayback = { submittedFrames: 0, writtenFrames: 0, pending: [], chunks: [], ending: false };
         sample.fileData = mem.slice(address, address + length);
         sample.decodedData = chunk;
         sample.fileDataAllocated = false;
@@ -47,6 +47,7 @@ export function loadSampleBuffer(ctx: MSSContext, sample: MSSSample, mem: Uint8A
     const frames = chunk.length / Math.max(1, sample.channels);
     state.submittedFrames += frames;
     state.pending.push({ data: chunk, at: 0 });
+    state.chunks.push({ slot, data: chunk, endFrame: state.submittedFrames });
     sample.streamBuffers ??= [];
     sample.streamBuffers[slot] = { ptr: address, size: length, inUse: true, endFrame: state.submittedFrames };
     sample.totalBytes = (sample.totalBytes ?? 0) + length;
@@ -76,6 +77,7 @@ export function updateSampleBufferPlayback(ctx: MSSContext, sample: MSSSample): 
             callback: sample.eobCallback, handle: sample.handle, id: sample.id,
         });
     }
+    state.chunks = state.chunks.filter(chunk => chunk.endFrame > played);
     sample.position = played * Math.max(1, sample.blockAlign);
     writeSamplePosition(ctx, sample, sample.position);
     while (state.pending.length) {
@@ -92,4 +94,33 @@ export function updateSampleBufferPlayback(ctx: MSSContext, sample: MSSSample): 
         return;
     }
     setSampleStatus(ctx, sample, SMP_PLAYING);
+}
+
+/** AIL_start_sample rewinds the CURRENT source buffer; resume does not.
+ * Retain only still-owned chunks, never replay data whose EOB already released it. */
+export function restartSampleBufferPlayback(ctx: MSSContext, sample: MSSSample): number {
+    updateSampleBufferPlayback(ctx, sample);
+    const state = sample.bufferPlayback;
+    if (!state?.chunks.length) return 0;
+    const chunks = state.chunks.slice();
+    const capacity = streamingRingBytes(sample);
+    ensureStreamingRing(sample, capacity);
+    state.pending = [];
+    state.chunks = [];
+    state.submittedFrames = 0;
+    state.writtenFrames = 0;
+    for (const chunk of chunks) {
+        state.submittedFrames += chunk.data.length / Math.max(1, sample.channels);
+        state.chunks.push({ ...chunk, endFrame: state.submittedFrames });
+        state.pending.push({ data: chunk.data, at: 0 });
+        sample.streamBuffers![chunk.slot]!.endFrame = state.submittedFrames;
+    }
+    sample.position = 0;
+    sample.startTime = performance.now();
+    sample.isPlaying = true;
+    sample.isStopped = false;
+    sample.pendingStart = false;
+    updateSampleBufferPlayback(ctx, sample);
+    armStreamingRing(ctx, sample, true);
+    return 1;
 }
