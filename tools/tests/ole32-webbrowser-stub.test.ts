@@ -5,6 +5,7 @@ import { coCreateWebBrowser, CLSID_WEBBROWSER } from '../../src/worker/modules/o
 import { checkComGuard, resetComMemory, snapshotComVtableOwners } from '../../src/worker/core/com/com-memory';
 import type { Process } from '../../src/worker/core/process';
 import type { ThunkImplementation } from '../../src/worker/core/thunking/thunk-dispatcher';
+import { CallbackManager } from '../../src/worker/core/thunking/callback-manager';
 
 const IOLEOBJECT = '00000112-0000-0000-c000-000000000046';
 const IIDS: Record<string, string> = {
@@ -297,4 +298,88 @@ test('a refused or throwing site callback leaves the site, the references and no
     modes = [];
     while (run(obj, 'Release', []) !== 0) { /* drop the extra references GetClientSite left */ }
     expect(log.filter(l => l.startsWith('Release'))).toEqual(['Release B', 'Release A']);
+});
+
+test('a later site callback that throws in the real return handler completes the frame and keeps the owed release', () => {
+    const E_OUTOFMEMORY = 0x8007000e, ENTRY = 0xc000, RETURN = 0x1000;
+    const scheduler = system.scheduler;
+    let pins = 0;
+    system.scheduler = {
+        getCurrentThreadId: () => 1,
+        getThreadStackBounds: () => ({ base: 0xa000, top: 0xd000 }),
+        wakeCurrentThreadForCallbackDispatch: () => true,
+        pinCurrentThread: () => { pins++; },
+        unpinThread: () => { pins--; },
+        reportCallbackFrameFatal: () => { throw new Error('fatal'); },
+    } as never;
+    const cpu = { reg32: new Int32Array(8), instruction_pointer: new Int32Array(1), is_jumping: false };
+    const manager = new CallbackManager({ cpu }, {} as never, () => memory);
+    manager.initialize({ getRegions: () => ({ callbackStubPoolBase: 0x38000, callbackStubPoolSize: 0x4000 }) } as never);
+    (process as unknown as { dispatcher: Record<string, unknown> }).dispatcher.callbackManager = manager;
+    (process as unknown as Record<string, unknown>).addressSpace = { validateRange: (p: number, n: number) => p > 0 && p + n <= memory.length };
+    const stubs4 = (manager as unknown as { stubsByCleanup: Map<number, Array<{ inUse: boolean }>> }).stubsByCleanup.get(4)!;
+    const site = (at: number, table: number) => {
+        view().setUint32(at, table, true);
+        view().setUint32(table + 4, 0x30004 + at, true);
+        view().setUint32(table + 8, 0x30008 + at, true);
+        return at;
+    };
+    const A = site(0x3800, 0x3900), B = site(0x3a00, 0x3b00);
+    const name = (fn: number) => (fn === 0x30004 + A ? 'AddRef A' : fn === 0x30008 + A ? 'Release A'
+        : fn === 0x30004 + B ? 'AddRef B' : fn === 0x30008 + B ? 'Release B' : '?');
+    const log: string[] = [];
+    const returnOne = (before?: () => void) => {
+        const id = [...(manager as unknown as { pendingCallbacks: Map<number, unknown> }).pendingCallbacks.keys()][0]!;
+        log.push(name(cpu.instruction_pointer[0]! >>> 0));
+        before?.();
+        cpu.reg32[4] = manager.getPendingCallback(id)!.espBeforeInvoke! - 4;
+        view().setUint32(cpu.reg32[4]! >>> 0, 1, true);
+        manager.handleCallbackReturn(id);
+    };
+    const invoke = (ptr: number, method: string, args: number[]) => {
+        cpu.reg32[4] = ENTRY;
+        cpu.instruction_pointer[0] = 0x2222;
+        view().setUint32(ENTRY, RETURN, true);
+        const table = view().getUint32(ptr, true);
+        for (let slot = 0; slot < 80; slot++) {
+            const n = namesByStub.get(view().getUint32(table + slot * 4, true));
+            if (n?.endsWith('_' + method)) return handlers.get(n)!({ esp: ENTRY, returnAddr: RETURN } as never, memory, [ptr, ...args]);
+        }
+        throw new Error('no method ' + method);
+    };
+    const settled = () => {
+        expect(manager.getActiveSuspendedFrameId()).toBe(0);
+        expect(manager.getPendingCount()).toBe(0);
+        expect(pins).toBe(0);
+        expect(cpu.instruction_pointer[0]).toBe(RETURN);
+    };
+    try {
+        const { obj } = browser();
+        expect(typeof invoke(obj, 'SetClientSite', [A])).toBe('object');
+        returnOne();
+        settled();
+        expect(cpu.reg32[0]).toBe(0);
+
+        expect(typeof invoke(obj, 'SetClientSite', [B])).toBe('object');
+        returnOne(() => { for (const s of stubs4) s.inUse = true; });
+        for (const s of stubs4) s.inUse = false;
+        settled();
+        expect(cpu.reg32[0]! >>> 0).toBe(E_OUTOFMEMORY);
+        expect(log.splice(0)).toEqual(['AddRef A', 'AddRef B']);
+
+        expect(typeof invoke(obj, 'GetClientSite', [2900])).toBe('object');
+        expect(view().getUint32(2900, true)).toBe(B);
+        returnOne();
+        settled();
+        expect(log.splice(0)).toEqual(['AddRef B']);
+
+        expect(invoke(obj, 'Release', [])).toBe(1);
+        expect(typeof invoke(obj, 'Release', [])).toBe('object');
+        while (manager.getPendingCount()) returnOne();
+        settled();
+        expect(log.splice(0)).toEqual(['Release B', 'Release A']);
+    } finally {
+        manager.reset();
+        system.scheduler = scheduler;
+    }
 });

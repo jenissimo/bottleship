@@ -5,6 +5,7 @@ import { installComVtable } from '../core/com/install-com-vtable';
 import { allocateComObject, freeComObject } from '../core/com/com-memory';
 import { readGuidFromMem } from '../core/com/typelib/typelib-types';
 import { Mem } from '../core/memory/mem-accessor';
+import { Logger, LogCategory } from '../core/logger';
 
 export const CLSID_WEBBROWSER = '8856f961-340a-11d0-a96b-00c04fd705a2';
 const CLSID_BYTES = [0x61, 0xf9, 0x56, 0x88, 0x0a, 0x34, 0xd0, 0x11, 0xa9, 0x6b, 0x00, 0xc0, 0x4f, 0xd7, 0x05, 0xa2];
@@ -107,9 +108,11 @@ const E_OUTOFMEMORY = 0x8007000E;
  * AddRef/Release the given guest interface pointers in order, through suspended callbacks
  * when the object lives in guest code. `onAccepted` runs once the whole chain is admitted
  * (synchronously or with the first callback accepted), `onStopped(done)` when a later call of
- * an admitted chain is refused with `done` calls already made. A chain that cannot start
- * releases its frame and returns REFUSED with nothing changed; a throwing dispatch releases the
- * frame and rethrows the original error.
+ * an admitted chain is refused or its dispatch throws, with `done` calls already made. A chain
+ * that cannot start releases its frame and returns REFUSED with nothing changed; a throwing
+ * first dispatch releases the frame and rethrows the original error. A later call runs inside
+ * the callback return handler, which completes the frame only when the completion returns, so
+ * there a throw ends the chain with E_OUTOFMEMORY like a refusal.
  */
 function guestUnknownCalls(
     process: Process, ctx: unknown, calls: Array<{ ptr: number; slot: 1 | 2 }>, stackCleanup: number, label: string, value: number,
@@ -143,8 +146,9 @@ function guestUnknownCalls(
         try {
             callbackId = callbacks!.invokeCallback(pending[index]!.fn, [pending[index]!.ptr], 4, next, false, label, frameId).callbackId;
         } catch (error) {
+            Logger.warn(LogCategory.COM, `${label}: call ${index + 1} of ${pending.length} not dispatched (${(error as Error)?.message ?? error})`);
             hooks.onStopped?.(index);
-            throw error;
+            return E_OUTOFMEMORY;
         }
         if (!callbackId) { hooks.onStopped?.(index); return E_OUTOFMEMORY; }
         return null;
