@@ -101,6 +101,11 @@ export class AddressSpace {
     private mem8: Uint8Array | null = null;
     private layoutBucketMap: Map<RegionKind, RegionEntry> = new Map();
 
+    /** Called after protect(), releaseRegion() and decommit with the affected range. The
+     *  NtQueryInformationThread stub's writable-stack proof is dropped here (Scheduler). */
+    // @transient(wired by the worker for the live process; a restore keeps the same instance)
+    onAccessChange: ((base: number, size: number) => void) | null = null;
+
     constructor(private readonly memoryGetter: () => Uint8Array) {
         this.syncMemoryView();
         this.ensureLowMemRegion(0x00100000);
@@ -211,6 +216,7 @@ export class AddressSpace {
         for (const region of removed) {
             this.noteRegionRemoved(region);
             setWriteMapBase(region.base, region.size, false);
+            this.onAccessChange?.(region.base, region.size);
         }
         return true;
     }
@@ -301,6 +307,7 @@ export class AddressSpace {
         // Membership and lengths changed together; rebuild lazily on the next query.
         this.invalidateRegionIndex();
         setWriteMapBase(base, size, isWriteMapFastRegion(first.kind, perms));
+        this.onAccessChange?.(base, size);
         return true;
     }
 

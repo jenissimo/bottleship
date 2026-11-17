@@ -26,7 +26,7 @@ import { cpuViews, readEip, readEsp, readRetiredInsns, PROXY_BASELINE } from '..
 import { Mem } from '../memory/mem-accessor';
 import { ERROR_INVALID_HANDLE, ERROR_NO_SYSTEM_RESOURCES } from '../thunking/thunk-errors';
 import { setParkedStackProvider, guardStackWrite } from '../memory/stack-write-guard';
-import { TebManager, TLS_INDEX_LIMIT, IMPLICIT_TLS_FIRST, IMPLICIT_TLS_LIMIT } from '../teb-manager';
+import { TebManager, TLS_INDEX_LIMIT, IMPLICIT_TLS_FIRST, IMPLICIT_TLS_LIMIT, TEB_OFFSETS } from '../teb-manager';
 import {
     clearFpuSimdDirty,
     createDefaultFpuSnapshot,
@@ -3729,7 +3729,32 @@ export class Scheduler {
         const thread = this.threadFromHandle(handle);
         if (!thread) return false;
         thread.priority = priority;
+        this.forgetPriorityMirror(thread);
         return true;
+    }
+
+    /** The NtQueryInformationThread stub answers priorities from a per-TEB mirror that the JS
+     *  handler publishes; any change to its inputs returns the thread to the JS handler. */
+    forgetPriorityMirror(thread: Thread): void {
+        if (thread.tebAddress) Mem.writeUint32(thread.tebAddress + TEB_OFFSETS.priorityEffective, 0);
+    }
+
+    /** The stub writes into the stack span its proof was established for without probing;
+     *  any protection, release or decommit touching that span withdraws the proof until the
+     *  JS handler re-establishes it for the whole stack. */
+    forgetPriorityMirrorsOverlapping(base: number, size: number): void {
+        const end = base + size;
+        for (const t of this.threads.values()) {
+            if (!t.tebAddress) continue;
+            const stackBase = (Mem.readUint32(t.tebAddress + TEB_OFFSETS.provenStackBase) ?? 0) >>> 0;
+            const stackLimit = (Mem.readUint32(t.tebAddress + TEB_OFFSETS.provenStackLimit) ?? 0) >>> 0;
+            if (base < stackBase && stackLimit < end) this.forgetPriorityMirror(t);
+        }
+    }
+
+    /** SetPriorityClass changes every thread's effective priority. */
+    forgetAllPriorityMirrors(): void {
+        for (const t of this.threads.values()) this.forgetPriorityMirror(t);
     }
 
     getThreadPriority(handle: number): number | null {
