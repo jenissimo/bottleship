@@ -378,11 +378,6 @@ export function emitTexOp(
         }
         case Op.TEXLDD: {
             if (!d) return true;
-            if (options.uniformity?.isDerivativeRefused(ins)) {
-                throw new Error(
-                    `D3D9 ${opName(ins.opcode)} in dynamic control flow cannot be lowered to WGSL; refusing link`,
-                );
-            }
             const coordinateSource = ins.src[0] ?? defaultSrc(d.reg);
             const samplerSource = ins.src[1];
             const stage = samplerSource?.reg.num ?? d.reg.num;

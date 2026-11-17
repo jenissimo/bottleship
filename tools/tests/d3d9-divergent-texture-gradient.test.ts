@@ -2,8 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { analyzePs, emitPsMain } from "../../src/worker/backends/webgpu/d3d9/shader/emit/ps";
 import { Census } from "../../src/worker/backends/webgpu/d3d9/shader/census";
 import { planUniformity } from "../../src/worker/backends/webgpu/d3d9/shader/passes/uniformity";
-import { Op, RegType } from "../../src/worker/backends/webgpu/d3d9/shader/sm-enums";
+import { Op, RegType, TexType, Usage } from "../../src/worker/backends/webgpu/d3d9/shader/sm-enums";
 import type { SmInstruction, SmProgram, SmSource } from "../../src/worker/backends/webgpu/d3d9/shader/sm-parser";
+
+import { compilePixelShader, compileVertexShader, linkProgram } from "../../src/worker/backends/webgpu/d3d9/shader";
+import { probeOfflineWgslValidator, validateWgslOffline } from "../d3d9-parity/wgsl-validator";
 
 const IDENTITY = 0xe4;
 
@@ -87,7 +90,7 @@ describe("D3D9 divergent texture gradients", () => {
         expect(wgsl).toContain("exp2((_tc");
     });
 
-    test("refuses texldd in dynamic control flow instead of emitting textureSampleGrad", () => {
+    test("preserves explicit texldd gradients inside dynamic control flow", () => {
         const coordinate = source(RegType.INPUT, 0);
         const gradientSample = instruction(
             Op.TEXLDD,
@@ -100,12 +103,14 @@ describe("D3D9 divergent texture gradients", () => {
             instruction(Op.ENDIF),
         ]);
 
-        expect(() => emitPsMain(program, analyzePs(program))).toThrow(
-            "D3D9 texldd in dynamic control flow cannot be lowered to WGSL; refusing link",
-        );
+        const wgsl = emitPsMain(program, analyzePs(program));
+        expect(wgsl).toContain("textureSampleGrad(tex0, samp");
+        expect(wgsl.indexOf("textureSampleGrad(")).toBeGreaterThan(wgsl.indexOf("if ("));
+        expect(wgsl).not.toContain("dpdx(");
+        expect(wgsl).not.toContain("dpdy(");
     });
 
-    test("uniformity pass refuses every explicit derivative below divergent flow", () => {
+    test("uniformity pass refuses derivative computation, not sampling with explicit gradients", () => {
         const coordinate = source(RegType.INPUT, 0);
         const dsx = instruction(Op.DSX, [coordinate], destination(0));
         const dsy = instruction(Op.DSY, [coordinate], destination(1));
@@ -126,10 +131,10 @@ describe("D3D9 divergent texture gradients", () => {
 
         expect(plan.isDerivativeRefused(dsx)).toBe(true);
         expect(plan.isDerivativeRefused(dsy)).toBe(true);
-        expect(plan.isDerivativeRefused(texldd)).toBe(true);
+        expect(plan.isDerivativeRefused(texldd)).toBe(false);
         expect(census.summary()).toMatchObject({
-            unsupported: 3,
-            unsupportedOps: ["dsx", "dsy", "texldd"],
+            unsupported: 2,
+            unsupportedOps: ["dsx", "dsy"],
         });
     });
 
@@ -179,7 +184,7 @@ describe("D3D9 divergent texture gradients", () => {
         expect(emitPsMain(program, analyzePs(program))).toContain("textureSampleGrad(tex0, samp");
     });
 
-    test("a per-lane break makes the same rep divergent again", () => {
+    test("explicit gradients remain usable after a per-lane break", () => {
         const coordinate = source(RegType.INPUT, 0);
         const gradient = source(RegType.INPUT, 1);
         const texldd = instruction(
@@ -196,7 +201,8 @@ describe("D3D9 divergent texture gradients", () => {
             instruction(Op.ENDREP),
         ]);
 
-        expect(planUniformity(program).isDerivativeRefused(texldd)).toBe(true);
+        expect(planUniformity(program).isDerivativeRefused(texldd)).toBe(false);
+        expect(emitPsMain(program, analyzePs(program))).toContain("textureSampleGrad(tex0, samp");
     });
 
     test("nested uniform reps sample loop-carried coordinates without hoisting derivatives", () => {
@@ -231,4 +237,52 @@ describe("D3D9 divergent texture gradients", () => {
         expect(planUniformity(program).get(sample)).toMatchObject({ mode: "refuse", divergent: true });
         expect(() => emitPsMain(program, analyzePs(program))).toThrow("refusing link");
     });
+});
+
+// Validate complete linked modules, including branch-local gradients and a loop
+// whose lanes leave on different iterations. No derivative may be hoisted.
+const validator = probeOfflineWgslValidator();
+const reg = (type: number, num: number) => (((type & 7) << 28) | (((type >>> 3) & 3) << 11) | num) >>> 0;
+const token = (op: number, operands: number) => (op | (operands << 24)) >>> 0;
+const dst = (type: number, num: number) => (reg(type, num) | (0xf << 16)) >>> 0;
+const src = (type: number, num: number) => (reg(type, num) | (IDENTITY << 16)) >>> 0;
+const dcl = (usage: number, index: number, type: number, num: number, texType = 0) => [
+    token(Op.DCL, 2), (usage | (index << 16) | (texType << 27)) >>> 0, reg(type, num),
+];
+const vs = compileVertexShader(new Uint32Array([
+    0xfffe0300,
+    ...dcl(Usage.POSITION, 0, RegType.INPUT, 0),
+    ...dcl(Usage.POSITION, 0, RegType.OUTPUT, 0),
+    ...dcl(Usage.TEXCOORD, 0, RegType.OUTPUT, 1),
+    token(Op.MOV, 2), dst(RegType.OUTPUT, 0), src(RegType.INPUT, 0),
+    token(Op.MOV, 2), dst(RegType.OUTPUT, 1), src(RegType.INPUT, 0), 0xffff,
+]));
+
+describe.skipIf(!validator.available)("divergent TEXLDD complete WGSL validation", () => {
+    for (const texture of [TexType.D2, TexType.CUBE, TexType.VOLUME]) {
+        for (const loop of [false, true]) {
+            test(`texture ${texture}, divergent ${loop ? "loop" : "branch"}`, () => {
+                const ps = compilePixelShader(new Uint32Array([
+                    0xffff0300,
+                    ...dcl(Usage.TEXCOORD, 0, RegType.INPUT, 0),
+                    ...dcl(0, 0, RegType.SAMPLER, 0, texture),
+                    ...(loop ? [token(Op.REP, 1), src(RegType.CONSTINT, 0)] : []),
+                    token(Op.IF, 1), src(RegType.INPUT, 0),
+                    ...(loop ? [token(Op.BREAK, 0), token(Op.ENDIF, 0)] : []),
+                    token(Op.MUL, 3), dst(RegType.TEMP, 1), src(RegType.INPUT, 0), src(RegType.INPUT, 0),
+                    token(Op.ADD, 3), dst(RegType.TEMP, 2), src(RegType.INPUT, 0), src(RegType.TEMP, 1),
+                    token(Op.TEXLDD, 5), dst(RegType.TEMP, 0), src(RegType.INPUT, 0), src(RegType.SAMPLER, 0), src(RegType.TEMP, 1), src(RegType.TEMP, 2),
+                    token(loop ? Op.ENDREP : Op.ENDIF, 0),
+                    token(Op.MOV, 2), dst(RegType.COLOROUT, 0), src(RegType.TEMP, 0), 0xffff,
+                ]));
+                const linked = linkProgram({ vs, ps, declElements: null, streamStride: 16 });
+                expect(linked.wgsl).toContain("textureSampleGrad(tex0, samp");
+                expect(linked.wgsl).not.toContain("dpdx(");
+                expect(linked.wgsl).not.toContain("dpdy(");
+                expect(linked.census.ps.unsupportedOps).toEqual([]);
+                const result = validateWgslOffline(linked.wgsl, validator);
+                expect(result.status, result.diagnostics ?? result.reason).toBe("passed");
+            });
+        }
+    }
 });
