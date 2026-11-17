@@ -5,7 +5,7 @@ BottleShip targets native Win32 games of roughly **1997–2004** — the DirectD
 not exhaustive, and "runs" means different things at different stages (boots to menu vs. fully
 playable). Your mileage will vary with the exact build/version you own.
 
-Updated **2026-11-07** for the `develop` branch after **BottleShip 0.7** (titles added since
+Updated **2026-11-17** for the `develop` branch after **BottleShip 0.7** (titles added since
 2026-10-26 come from merged pull requests; see [Added since 0.7](#added-since-07)). Working
 statuses include maintainer and contributor reports; every title has not been retested for this
 release. Observed demo stages are listed separately below. Successful
@@ -69,6 +69,7 @@ GOG extraction does not establish gameplay coverage for that installer edition.
 | Tony Hawk's Pro Skater 2 (demo) | playable | |
 | Tomb Raider II | playable | ✓ |
 | The Elder Scrolls III: Morrowind | playable | ✓ |
+| Arcanum: Of Steamworks and Magick Obscura (English GOG 1.0.7.4 hotfix) | playable; opening verified | ✓ |
 | Nuclear Titbit (Ядерный Титбит) | playable | |
 | Neighbours from Hell (2003, Buka/Russian) | boots; tutorial movement verified | |
 | Airfix Dogfighter (demo) | playable | |
@@ -181,6 +182,15 @@ character movement and room transition were checked. Russian speech and music pl
 MPEG assets with leading padding are recognized. The original disc's three stale MSI
 hash records require explicit acceptance during import. Later episodes and campaign
 completion have not been tested.
+
+Arcanum: Of Steamworks and Magick Obscura (English GOG 1.0.7.4 hotfix, checked
+2026-11-17): the Crash Site opening reaches gameplay, with movement, inventory,
+Virgil dialogue and combat verified. An existing save loads, and a new F7 quicksave
+survives page reload; F8 restores the saved position. The four save files were
+checked against committed OPFS bytes. Reopening the repacked bundle from its final
+location retains the same saves. The bundle uses DirectDraw, Bink and Miles HLE;
+the maintainer separately confirmed music. Later locations and a full playthrough
+have not been tested.
 
 ## Added since 0.7
 
