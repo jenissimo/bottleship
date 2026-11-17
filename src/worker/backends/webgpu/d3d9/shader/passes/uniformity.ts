@@ -20,7 +20,8 @@ const IMPLICIT_SAMPLE_OPS = new Set<number>([
 ]);
 
 /** WGSL derivative operations are also forbidden in non-uniform control flow. */
-const EXPLICIT_DERIVATIVE_OPS = new Set<number>([Op.DSX, Op.DSY, Op.TEXLDD]);
+// TEXLDD consumes supplied gradients; textureSampleGrad is valid in divergent flow.
+const EXPLICIT_DERIVATIVE_OPS = new Set<number>([Op.DSX, Op.DSY]);
 
 export type SampleMode = "implicit" | "grad" | "level" | "refuse";
 export type CoordinateSafety = "stable" | "branch-local" | "unsafe";
@@ -79,7 +80,7 @@ export interface UniformityPlan {
     readonly derivatives: readonly DerivativePlan[];
     get(instruction: SmInstruction): SamplePlan | undefined;
     sampleFor(instruction: SmInstruction): SamplePlan | undefined;
-    /** True when DSX/DSY/TEXLDD was found below dynamic control flow. */
+    /** True when DSX/DSY was found below dynamic control flow. */
     isDerivativeRefused(instruction: SmInstruction): boolean;
     derivativesAt(path: readonly number[]): readonly DerivativePlan[];
 }
@@ -507,8 +508,8 @@ function walkInstructions(
     for (let index = 0; index < instructions.length; index++) {
         const instruction = instructions[index];
         if (EXPLICIT_DERIVATIVE_OPS.has(instruction.opcode) && ancestors.nonUniform.length > 0) {
-            // Keep this conservative: hoisting an explicit derivative or a
-            // texldd gradient would either read a branch-local register before
+            // Keep this conservative: hoisting a derivative computation
+            // would either read a branch-local register before
             // its defining lane executes or change the D3D instruction's
             // derivative semantics. The emitter turns this marker into a link
             // refusal instead of emitting WGSL that the uniformity validator
