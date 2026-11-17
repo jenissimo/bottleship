@@ -1,6 +1,6 @@
 import {expect} from "bun:test";
 import {Mem} from "../../../src/worker/core/memory/mem-accessor";
-import {AddressSpace} from "../../../src/worker/core/memory/address-space";
+import {AddressSpace, type RegionPerms} from "../../../src/worker/core/memory/address-space";
 import {System} from "../../../src/worker/core/system";
 import {ThunkDispatcher} from "../../../src/worker/core/thunking/thunk-dispatcher";
 import {ThunkBoundaryKind} from "../../../src/worker/core/scheduler/types";
@@ -23,6 +23,8 @@ export function crtDispatchFixture(name: string) {
         segment_offsets: new Int32Array(mem.buffer, 736, 8), get_eflags: () => 0x202};
     v86.cpu = cpu; v86.mem8 = mem;
     const space = new AddressSpace(() => mem);
+    // Application data is non-executable unless a test explicitly protects it RWX.
+    space.registerRegion({base: 0x10000, size: 0x20000, kind: "HEAP", perms: "rw", allowOverlap: true});
     const process: any = {v86, dispatcher: d, addressSpace: space};
     system.process = process;
     d.cachedCpu = cpu; d.cachedMem8 = mem; d.cachedDataView = dv; d.memLength = mem.length;
@@ -65,7 +67,7 @@ export function crtDispatchFixture(name: string) {
         return address;
     }
     return {mem, dv, cpu, d, esp, ret, retry, writes, reads, put,
-        protect(address: number, size: number, perms: "r" | "noaccess") { expect(space.protect(address, size, perms)).toBe(true); },
+        protect(address: number, size: number, perms: RegionPerms) { expect(space.protect(address, size, perms)).toBe(true); },
         useProductionBinding() { Mem.bind(() => mem); },
         deny(address: number) { denied = address; },
         denyRead(address: number) { deniedRead = address; },
