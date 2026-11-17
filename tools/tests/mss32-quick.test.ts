@@ -15,6 +15,7 @@ const saved = new Map<string, PropertyDescriptor | undefined>();
 const rings = new Map<number, SharedArrayBuffer>();
 let Processor: any, processor: any, module: MSS32, ctx: MSSContext, memory: Uint8Array;
 let next: number, allocations: Set<number>, freed: number[];
+let moduleReady = false;
 function global(key: string, value: unknown): void {
     saved.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
@@ -58,9 +59,13 @@ beforeAll(async () => {
             processor?.port.onmessage({ data: { type: "unregister", id: m.payload.id } });
         }
     } });
-    await import("../../src/audio/bottleship-audio-worklet");
+    // Private module instance: earlier worklet tests have already cached the plain import.
+    await import("../../src/audio/bottleship-audio-worklet.ts?mss32-quick");
+    if (!Processor) throw new Error("worklet processor was not registered");
 });
 beforeEach(() => {
+    moduleReady = false;
+    processor = undefined;
     resetMssRingBuffers(); rings.clear(); processor = new Processor();
     memory = new Uint8Array(0x40000); next = 0x8000; allocations = new Set(); freed = [];
     ctx = createMSSContext({
@@ -76,10 +81,19 @@ beforeEach(() => {
     view.setUint32(ctx.digitalDriverHandle + 0x10, 127, true); // real driver default master volume
     for (let i = 0; i < 2; i++) view.setUint32(SAMPLE_ARRAY + i * 0x284 + 8, SMP_FREE, true);
     module = new MSS32(); (module as any).ctx = ctx;
+    moduleReady = true;
     Object.assign(module.exports, createCoreExports(ctx), createQuickExports(ctx));
     (module as any).installStreamServicePoints();
 });
-afterEach(() => { module.reset(); resetMssRingBuffers(); });
+afterEach(() => {
+    try { if (moduleReady) module.reset(); }
+    finally {
+        moduleReady = false;
+        resetMssRingBuffers();
+        rings.clear();
+        processor = undefined;
+    }
+});
 afterAll(() => {
     for (const [key, descriptor] of saved) {
         if (descriptor) Object.defineProperty(globalThis, key, descriptor);
