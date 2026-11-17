@@ -138,7 +138,10 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
     type Row = { r: Uint32Array; entries: number; admitted: number; refused: number; executed: number };
     const changedVersion = (r: Uint32Array) => {
         const b = before.rows.get(r[ROW.entryVirt]!);
-        return !!b && b[ROW.flags] !== 0 && (b[ROW.analyses] !== r[ROW.analyses] || b[ROW.smcEvents] !== r[ROW.smcEvents]);
+        if (b && b[ROW.flags] !== 0) return b[ROW.analyses] !== r[ROW.analyses] || b[ROW.smcEvents] !== r[ROW.smcEvents];
+        // First analysed inside the window: its counts are cumulative over every body it had
+        // since then, so any reanalysis or code write after that first analysis mixes versions.
+        return r[ROW.analyses]! - (b?.[ROW.analyses] ?? 0) > 1 || r[ROW.smcEvents]! - (b?.[ROW.smcEvents] ?? 0) > 0;
     };
     const window: Row[] = [];
     const versionChanged: Row[] = [];
@@ -263,7 +266,7 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
                 }
                 : { available: false, note: "the counted channel was not armed at fnCensusMark(); executed coverage is unknown, not zero" },
             versionChanged: {
-                note: "functions re-analysed after a code write inside the window: which body ran is not known, so their "
+                note: "functions re-analysed after a code write inside the window (including rows first seen after MARK): which body ran is not known, so their "
                     + "entries and counted instructions are left out of every share above",
                 functions: versionChanged.length,
                 entries: versionChanged.reduce((s, w) => s + w.entries, 0),

@@ -299,6 +299,27 @@ describe("call continuation estimate (schema 2)", () => {
         expect(o.sites.incompleteCallers).toBe(2);
         expect(o.variants.callChain.functions).toBe(3);
     });
+    test("rows first seen after MARK count as changed only when they were reanalysed or dirtied", () => {
+        const cs = new Uint32Array([C1 + 5, LEAF2, 2, 4]);
+        const ch = (blocks: CountedSample[]) => ({ recording: true, watchedPages: 1, armedPages: 1, pagesNotArmed: 0, slotOverflow: 0, blocks });
+        const before = snap({ atMs: 1, calls: cs, counted: ch([]) }, []);
+        const run = (a: number, smc: number) => {
+            const L = row({ entryVirt: LEAF2, entries: 10, instructions: 20, flags: 2, analyses: a, smcEvents: smc });
+            const C = row({ entryVirt: C1, entries: 10, unit: 1, windowStatic: 16, outCalls: 1, callStart: 0, callCount: 1, flags: 2, analyses: a, smcEvents: smc });
+            const r = summarizeFnCensus(before, snap({ atMs: 2, retiredTotal: 1000, calls: cs, counted: ch([{ addr: LEAF2, exec: 10, ins: 20, owner: 1 }, { addr: C1, exec: 10, ins: 50, owner: 2 }]) }, [L, C], { calls: 20 }));
+            if (!r.ok) throw new Error(r.refuse);
+            return r.report as any;
+        };
+        const clean = run(1, 0);
+        expect(clean.versionChanged.functions).toBe(0);
+        expect(clean.callContinuation.variants.inlineLeaves.functions).toBe(2);
+        const mixed = run(2, 1);
+        expect(mixed.versionChanged.functions).toBe(2);
+        expect(mixed.callContinuation.variants.inlineLeaves.functions).toBe(0);
+        expect(mixed.executed.admittedIns).toBe(0);
+        expect(mixed.executed.changedVersionIns).toBe(700);
+        expect(run(1, 1).versionChanged.functions).toBe(2);
+    });
     test("summarize carries refused executed coverage and callee versions into the continuation", () => {
         const L = row({ entryVirt: LEAF2, entries: 0, instructions: 20, flags: 2, analyses: 1 });
         const C = row({ entryVirt: C1, entries: 0, unit: 1, windowStatic: 16, outCalls: 1, callStart: 0, callCount: 1, flags: 2, analyses: 1 });
