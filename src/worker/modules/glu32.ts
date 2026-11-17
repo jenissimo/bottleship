@@ -159,6 +159,33 @@ export class Glu32 implements IModule {
     private gluStringPtr = 0;
 
     initialize(process: Process): void {
+        // GLU picking post-multiplies the current matrix by translation * scale.
+        // Arguments remain raw stdcall words, as for the other GLU double APIs.
+        this.exports["gluPickMatrix"] = (_ctx, _mem, args) => {
+            const x = readF64(args, 0), y = readF64(args, 2);
+            const width = readF64(args, 4), height = readF64(args, 6);
+            if (width <= 0 || height <= 0) return 0;
+            const gl = process.getModule("opengl32") as OpenGL32 | undefined;
+            const ctx = gl?.getContext();
+            if (!ctx) return 0;
+            if (ctx.immediateMode) { ctx.error = 0x0502 /* GL_INVALID_OPERATION */; return 0; }
+            const ptr = args[8] >>> 0, mem = process.getCurrentMemory();
+            if (!ptr || ptr + 16 > mem.byteLength) return 0;
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            const vx = view.getInt32(ptr, true), vy = view.getInt32(ptr + 4, true);
+            const vw = view.getInt32(ptr + 8, true), vh = view.getInt32(ptr + 12, true);
+            _tempMat.fill(0);
+            _tempMat[0] = vw / width;
+            _tempMat[5] = vh / height;
+            _tempMat[10] = _tempMat[15] = 1;
+            _tempMat[12] = (vw + 2 * (vx - x)) / width;
+            _tempMat[13] = (vh + 2 * (vy - y)) / height;
+            const cur = ctx.currentMatrix();
+            // mat4Multiply caches the left operand, so in-place output is safe.
+            mat4Multiply(cur, cur, _tempMat);
+            return 0;
+        };
+
 
         // ==================== gluPerspective ====================
         // void gluPerspective(GLdouble fovy, GLdouble aspect, GLdouble zNear, GLdouble zFar)
