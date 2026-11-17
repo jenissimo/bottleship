@@ -134,6 +134,8 @@ const ucrtFunctions: FunctionDescriptor[] = [
     makeFunc("_utime64", 2),
     makeFunc("_utime", 2),
     makeFunc("_utime32", 2),
+    makeFunc("_ltow", 3),
+    makeFunc("_ltow_s", 4),
     makeFunc("_ultow", 3),
     makeFunc("wcsncat", 3),
     makeFunc("_getw", 1),
@@ -273,6 +275,10 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_wstrtime", 1),
         makeFunc("wcslen", 1),
         makeFunc("wcscpy", 2),
+        makeFunc("wcscpy_s", 3),
+        makeFunc("wcscat_s", 3),
+        makeFunc("wcsncpy_s", 4),
+        makeFunc("wcsncat_s", 4),
         makeFunc("wcscat", 2),
         makeFunc("wcscmp", 2),
         makeFunc("wcsncmp", 3),
@@ -397,6 +403,9 @@ export const msvcrtModule: ModuleDescriptor = {
         // Path/directory
         makeFunc("_getcwd", 2),
         makeFunc("_fullpath", 3),
+        makeFunc("_wfullpath", 3),
+        makeFunc("_wmakepath_s", 6),
+        makeFunc("_wsplitpath_s", 9),
         makeFunc("_makepath", 5),
         makeFunc("_chdir", 1),
         makeFunc("_setmode", 2),
@@ -528,6 +537,8 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("strftime", 4),
         makeFunc("_snwprintf", 16),
         makeFunc("swprintf", 16),
+        makeFunc("swprintf_s", 16),
+        makeFunc("_snwprintf_s", 16),
 
         // Console
         makeFunc("_kbhit", 0),
