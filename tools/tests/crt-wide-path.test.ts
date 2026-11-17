@@ -3,6 +3,7 @@ import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { msvcrtModule } from "../../src/worker/api/msvcrt.api";
 import type { ThunkImplementation } from "../../src/worker/core/thunking/thunk-dispatcher";
 
+let originalProcess: ReturnType<typeof System.getInstance>["process"];
 let mem: Uint8Array, errno: number, next: number;
 let exports: Record<string, ThunkImplementation>;
 function put(ptr: number, value: string): number {
@@ -25,6 +26,8 @@ import { registerCrtWidePathExports } from "../../src/worker/modules/crt-wide-pa
 import { System } from "../../src/worker/core/system";
 let cwd: string, allocated: number[], failAllocation: boolean;
 beforeEach(() => {
+    originalProcess = System.getInstance().process;
+    System.getInstance().process = null;
     mem = new Uint8Array(0x10000).fill(0x55); Mem.bind(() => mem);
     errno = 123; next = 0x2000; exports = {}; allocated = []; failAllocation = false;
     cwd = System.getInstance().fileSystem.currentDir;
@@ -180,3 +183,5 @@ for (const [input, expected] of [
     expect(call("_wfullpath", 0x1000, str(input!), 100)).toBe(0x1000);
     expect(read(0x1000)).toBe(expected!);
 });
+
+afterEach(() => { System.getInstance().process = originalProcess; });

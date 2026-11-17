@@ -1,4 +1,4 @@
-import { Mem } from "../core/memory/mem-accessor";
+import {writeCrtUint16, crtFaultAddress} from "./crt-guest-access";
 import { System } from "../core/system";
 import { raiseGuestAccessViolation } from "../core/thunking/guest-fault";
 import type { ThunkResult, ThunkImplementation } from "../core/thunking/thunk-dispatcher";
@@ -13,8 +13,8 @@ interface WidePathHost {
 function writePath(ctx: {esp: number}, mem: Uint8Array, dst: number, text: string): ThunkResult | undefined {
     for (let i = 0; i <= text.length; i++) {
         const address = dst + i * 2;
-        if (!Mem.writeUint16(address, i === text.length ? 0 : text.charCodeAt(i))) {
-            return raiseGuestAccessViolation(ctx, mem, Mem.firstInaccessibleByte(address, 2, "w"), "w", 0);
+        if (!writeCrtUint16(address, i === text.length ? 0 : text.charCodeAt(i))) {
+            return raiseGuestAccessViolation(ctx, mem, crtFaultAddress(address, 2, "w"), "w", 0);
         }
     }
 }
