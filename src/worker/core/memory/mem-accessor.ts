@@ -164,6 +164,19 @@ export class Mem {
         return mem;
     }
 
+    /** Attribute a refused extent without performing another read or write. Failure path only. */
+    static firstInaccessibleByte(address: number, size: number, perms: string): number {
+        const mem = this.getMemory();
+        if (!mem) return address;
+        for (let i = 0; i < size; i++) {
+            const byte = address + i;
+            if (byte < 0 || byte >= mem.length || byte > 0xffffffff ||
+                (this.validateRange && !this.validateRange(byte, 1, perms)) ||
+                (this.dataRoutes && !this.dataRoutes.isAccessible(byte, 1, perms.includes("w")))) return byte;
+        }
+        return address;
+    }
+
     static readUint32(address: number): number | null {
         const mem = this.ensure(address, 4, "r", "Mem.readUint32", "read");
         if (!mem) return null;
