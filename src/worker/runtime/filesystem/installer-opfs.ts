@@ -6,7 +6,8 @@ import {
 import { UnpackDecoder } from "@bottleship/formats/unpack";
 import { BlobSource, BufferSource, type ZipSource } from "@bottleship/formats/zip";
 import { writeZipStream } from "@bottleship/formats/wgb/zip-stream";
-import { synthesizeManifest, parseGogGameInfo } from "@bottleship/repack/manifest-synth";
+import { synthesizeInstallerManifest } from "@bottleship/repack/installer-layout";
+import { parseGogGameInfo } from "@bottleship/repack/manifest-synth";
 import { isGogJunk } from "@bottleship/repack/gog-filter";
 import { getOverride, type GogOverridesDb } from "@bottleship/repack/overrides";
 import type { BuildSource, ProgressFn } from "./wgb-build";
@@ -129,12 +130,12 @@ export async function buildInstallerOnDisk(source: BuildSource, db: GogOverrides
             metadata.set(name, meta ? await file.readRange(0, file.size) : new Uint8Array(0));
         }
         const gog = parseGogGameInfo(metadata);
-        const synth = synthesizeManifest({ parsed, gameFiles: metadata, override: getOverride(db, gog.gameId), cli: source.cli });
+        const synth = synthesizeInstallerManifest({ parsed, gameFiles: metadata, override: getOverride(db, gog.gameId), cli: source.cli });
         output = await openSyncFile(dir, "game.wgb");
         const entries = [
             { name: "manifest.json", source: new BufferSource(new TextEncoder().encode(JSON.stringify(synth.manifest, null, 2))) },
             { name: "registry.json", source: new BufferSource(new TextEncoder().encode(JSON.stringify(synth.registry, null, 2))) },
-            ...[...files.values()].filter((f) => !isGogJunk(f.name)).map((f) => ({ name: `rom/${f.name}`, source: f.source })),
+            ...[...files.values()].filter((f) => !isGogJunk(f.name)).map((f) => ({ name: synth.romPrefix + f.name, source: f.source })),
         ];
         const total = entries.reduce((n, e) => n + e.source.size, 0);
         onProgress?.("packing", 0, "Building WGB on disk");

@@ -10,6 +10,9 @@
  * --keep-gog retains GOG support metadata in the final bundle.
  * --name/--exe/--args/--width/--height/--bpp/--ram/--os override synthesized settings.
  * --reg-path/--reg-hive/--reg-install override the installer registry seed.
+ * --install-dir C:\\Games\\MyGame sets the guest install directory (payload + registry default).
+ * --app-dir-dlls ddraw.dll selects explicit game-directory DLLs (no automatic native policy).
+ * --reg-install alone retains the legacy root payload, changing registry only.
  * --language selects an installer locale; --skip-video is opt-in.
  * --native is a deprecated no-op: the project's WASM parser is always used.
  * EXE/BIN reads are ranged; extraction and ZIP packing are disk-backed.
@@ -68,7 +71,7 @@ function parseArgs(argv: string[]) {
 
     const flagsWithValue = new Set([
         "--name", "--exe", "--args", "--width", "--height", "--bpp", "--ram", "--os",
-        "--reg-hive", "--reg-path", "--reg-install", "--extract-dir",
+        "--reg-hive", "--reg-path", "--reg-install", "--install-dir", "--app-dir-dlls", "--extract-dir",
         "--language",
     ]);
     const positionals: string[] = [];
@@ -130,7 +133,7 @@ function gatherSlices(installerPath: string, parsed: InnoParseResult): SliceSour
         slices.push(parseSliceSource(new FileSource(p)));
     }
     if (slices.length === 0) {
-        throw new Error(`multi-part installer — no slices found next to ${basename(installerPath)} (expected ${sliceName(0)})`);
+        throw new Error(`multi-part installer Р Р†Р вЂљРІР‚Сњ no slices found next to ${basename(installerPath)} (expected ${sliceName(0)})`);
     }
     console.log(`  slices: ${slices.length}`);
     return new MultiSliceReader(slices);
@@ -222,6 +225,8 @@ async function run() {
         name: get("--name"), exe: get("--exe"), args: get("--args"),
         width: num("--width"), height: num("--height"), bpp: num("--bpp"), ramMB: num("--ram"),
         os: get("--os"), regPath: get("--reg-path"), regHive: get("--reg-hive"), regInstall: get("--reg-install"),
+        installDir: get("--install-dir"),
+        appDirDlls: get("--app-dir-dlls")?.split(/[,;]/).map(p => p.trim()).filter(Boolean),
         skipVideo: has("--skip-video"),
     }, overrides);
     step(2, 2, "Packing disk-backed WGB");

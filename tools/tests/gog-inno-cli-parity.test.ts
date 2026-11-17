@@ -79,14 +79,16 @@ async function members(input: Uint8Array) {
     for (const entry of zip.listEntries()) out[entry.name] = await zip.readEntry(entry);
     return out;
 }
-async function compare(external: boolean, german: boolean, galaxy: boolean) {
+async function compare(external: boolean, german: boolean, galaxy: boolean, layout: "default" | "legacy" | "explicit" = "default") {
     const dir = mkdtempSync(join(tmpdir(), 'gog-inno-parity-'));
     try {
         const f = fixture(external, galaxy), installer = join(dir, 'setup.exe'), output = join(dir, 'game.wgb'), stage = join(dir, 'stage');
         writeFileSync(installer, external ? bytes('header fixture') : f.input);
         if (external) f.slices.forEach((part, i) => writeFileSync(join(dir, 'setup-1' + String.fromCharCode(97 + i) + '.bin'), part));
         const wasm = readFileSync('public/unpack-streaming.wasm');
-        const synth = german ? { args: '--cli', os: 'winxp', ramMB: 256 } : {};
+        const synth = { ...(german ? { args: '--cli', os: 'winxp', ramMB: 256 } : {}),
+            ...(layout === 'legacy' ? { regInstall: 'C:\\' } : layout === 'explicit' ? { installDir: 'C:\\Chosen', appDirDlls: ['ddraw.dll'] } : {}) };
+        const layoutArgs = layout === 'legacy' ? ['--reg-install', 'C:\\'] : layout === 'explicit' ? ['--install-dir', 'C:\\Chosen', '--app-dir-dlls', 'ddraw.dll'] : [];
         const expected = await installerToWgb({ source: new BufferSource(f.input),
             wasmBytes: wasm.buffer.slice(wasm.byteOffset, wasm.byteOffset + wasm.byteLength),
             parsed: f.parsed, sliceSource: external ? new MultiSliceReader(f.slices.map(p => parseSliceSource(new BufferSource(p)))) : undefined,
@@ -116,7 +118,7 @@ async function compare(external: boolean, german: boolean, galaxy: boolean) {
                 return parsed;
             } }));
             process.argv = ['bun', ${JSON.stringify(cli)}, ${JSON.stringify(installer)}, ${JSON.stringify(output)},
-                '--extract-dir', ${JSON.stringify(stage)}, ...${JSON.stringify(german ? ['--keep-gog', '--language', 'de-DE', '--args', '--cli', '--os', 'winxp', '--ram', '256'] : [])}];
+                '--extract-dir', ${JSON.stringify(stage)}, ...${JSON.stringify(german ? ['--keep-gog', '--language', 'de-DE', '--args', '--cli', '--os', 'winxp', '--ram', '256'] : [])}, ...${JSON.stringify(layoutArgs)}];
             await import(${JSON.stringify(cli)});
         `;
         const child = Bun.spawnSync([process.execPath, '--eval', runner], { stdout: 'pipe', stderr: 'pipe', timeout: 20_000 });
@@ -130,7 +132,7 @@ async function compare(external: boolean, german: boolean, galaxy: boolean) {
         const manifest = JSON.parse(new TextDecoder().decode(actual['manifest.json']));
         expect(Object.hasOwn(manifest.emulator, 'createDirs')).toBe(false);
         expect(manifest.emulator.screenResolution).toEqual({ width: 640, height: 480, bpp: 16 });
-        expect(new TextDecoder().decode(actual['rom/strings.ini'])).toBe(german ? 'Deutsch' : 'English');
+        expect(new TextDecoder().decode(actual[layout === 'legacy' ? 'rom/strings.ini' : layout === 'explicit' ? 'rom/Chosen/strings.ini' : 'rom/Games/gog-1207659963/strings.ini'])).toBe(german ? 'Deutsch' : 'English');
         expect(readFileSync(join(stage, 'app', 'alias', 'game.exe'))).toEqual(bytes('executable'));
         expect(readdirSync(stage)).toEqual(['app']); // Assembly scratch must be closed/unlinked.
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -138,3 +140,6 @@ async function compare(external: boolean, german: boolean, galaxy: boolean) {
 test('single-file Inno disk CLI preserves existing manifest/registry/content and auto-English selection', () => compare(false, false, false));
 test('lettered standard Inno slices preserve language, keep-GOG, CLI args and curation', () => compare(true, true, false));
 test('Galaxy assembly stays disk-backed and preserves the existing WGB bytes', () => compare(false, false, true));
+
+test('explicit legacy reg-install remains registry-only and flat in both CLI and buffered import', () => compare(false, false, false, 'legacy'));
+test('explicit install-dir and local-DLL policy agree across CLI and buffered import', () => compare(false, false, false, 'explicit'));

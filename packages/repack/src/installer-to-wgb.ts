@@ -15,7 +15,8 @@ import {
 import { UnpackDecoder } from "@bottleship/formats/unpack";
 import { isGogJunk } from "./gog-filter";
 import { loadOverrides, getOverride } from "./overrides";
-import { guessCacheKey, parseGogGameInfo, synthesizeManifest, type SynthOptions } from "./manifest-synth";
+import { guessCacheKey, parseGogGameInfo, type SynthOptions } from "./manifest-synth";
+import { synthesizeInstallerManifest } from "./installer-layout";
 import { buildZip } from "@bottleship/formats/wgb/zip-build";
 
 export interface InstallProgress {
@@ -83,7 +84,7 @@ export async function installerToWgb(opts: InstallerToWgbOptions): Promise<Insta
     const db = await loadOverrides(opts.overrides);
     const gogMeta = parseGogGameInfo(extracted);
     const override = getOverride(db, gogMeta.gameId);
-    const synth = synthesizeManifest({
+    const synth = synthesizeInstallerManifest({
         parsed,
         gameFiles: extracted,
         override,
@@ -98,7 +99,7 @@ export async function installerToWgb(opts: InstallerToWgbOptions): Promise<Insta
 
     for (const [rel, data] of extracted) {
         if (filterGog && isGogJunk(rel)) continue;
-        files.set(`rom/${rel}`, data);
+        files.set(synth.romPrefix + rel, data);
     }
 
     const wgb = buildZip(files);
