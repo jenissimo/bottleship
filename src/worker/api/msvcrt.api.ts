@@ -401,6 +401,9 @@ export const msvcrtModule: ModuleDescriptor = {
         // Path/directory
         makeFunc("_getcwd", 2),
         makeFunc("_fullpath", 3),
+        makeFunc("_wfullpath", 3),
+        makeFunc("_wmakepath_s", 6),
+        makeFunc("_wsplitpath_s", 9),
         makeFunc("_makepath", 5),
         makeFunc("_chdir", 1),
         makeFunc("_setmode", 2),
