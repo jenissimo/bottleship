@@ -507,6 +507,10 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
 
         // Clear
         glClear: (_c, _m, args) => {
+            // Selection/feedback passes must not modify the framebuffer. Picking
+            // code may clear after the visible scene; emitting that clear here
+            // would erase it even though its non-rendering draws are suppressed.
+            if (ctx.renderMode !== GL_RENDER) return 0;
             // GL clears only the SCISSOR BOX when GL_SCISSOR_TEST is on; WebGPU's loadOp
             // clears the whole attachment. A mid-frame panel clear then wipes everything
             // drawn before it — Serious Sam's NETRICSA briefing came out as one flat green
