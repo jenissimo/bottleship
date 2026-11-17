@@ -1,4 +1,4 @@
-import { Mem } from "../core/memory/mem-accessor";
+import {readCrtUint8, readCrtUint16, writeCrtUint16, crtFaultAddress} from "./crt-guest-access";
 import { raiseGuestAccessViolation } from "../core/thunking/guest-fault";
 import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 
@@ -14,8 +14,8 @@ interface WideFormatHost {
 function validSecureFormat(ptr: number): boolean | number {
     let format = "";
     for (let i = 0; ; i++) {
-        const unit = Mem.readUint16(ptr + i * 2);
-        if (unit === null) return Mem.firstInaccessibleByte(ptr + i * 2, 2, "r");
+        const unit = readCrtUint16(ptr + i * 2);
+        if (unit === null) return crtFaultAddress(ptr + i * 2, 2, "r");
         if (unit === 0) break;
         format += String.fromCharCode(unit);
     }
@@ -41,7 +41,7 @@ export function registerCrtWideFormatExports(exports: Record<string, ThunkImplem
         const validation = validSecureFormat(fmt);
         if (typeof validation === "number") return raiseGuestAccessViolation(ctx, mem, validation, "r", 0);
         if (!validation) {
-            if (!Mem.writeUint16(dst, 0)) return raiseGuestAccessViolation(ctx, mem, Mem.firstInaccessibleByte(dst, 2, "w"), "w", 0);
+            if (!writeCrtUint16(dst, 0)) return raiseGuestAccessViolation(ctx, mem, crtFaultAddress(dst, 2, "w"), "w", 0);
             host.setErrno(22);
             return -1;
         }
@@ -49,16 +49,16 @@ export function registerCrtWideFormatExports(exports: Record<string, ThunkImplem
             readCrtCString, {wide: true, readWString: readCrtWString, readString: readCrtFormatString});
         const limit = counted && count < size ? count : size - 1;
         if (text.length > limit && (!counted || (count !== 0xffffffff && count >= size))) {
-            if (!Mem.writeUint16(dst, 0)) return raiseGuestAccessViolation(ctx, mem, Mem.firstInaccessibleByte(dst, 2, "w"), "w", 0);
+            if (!writeCrtUint16(dst, 0)) return raiseGuestAccessViolation(ctx, mem, crtFaultAddress(dst, 2, "w"), "w", 0);
             host.setErrno(34);
             return -1;
         }
         const length = Math.min(text.length, limit);
         for (let i = 0; i < length; i++) {
             const address = dst + i * 2;
-            if (!Mem.writeUint16(address, text.charCodeAt(i))) return raiseGuestAccessViolation(ctx, mem, Mem.firstInaccessibleByte(address, 2, "w"), "w", 0);
+            if (!writeCrtUint16(address, text.charCodeAt(i))) return raiseGuestAccessViolation(ctx, mem, crtFaultAddress(address, 2, "w"), "w", 0);
         }
-        if (!Mem.writeUint16(dst + length * 2, 0)) return raiseGuestAccessViolation(ctx, mem, Mem.firstInaccessibleByte(dst + length * 2, 2, "w"), "w", 0);
+        if (!writeCrtUint16(dst + length * 2, 0)) return raiseGuestAccessViolation(ctx, mem, crtFaultAddress(dst + length * 2, 2, "w"), "w", 0);
         return text.length > limit ? -1 : length;
     };
     exports["swprintf_s"] = withCrtReadFault(format(false));
@@ -69,7 +69,7 @@ function readCrtCString(ptr: number, maxBytes: number): string {
     if (!ptr) return "";
     const limit = Math.max(1, maxBytes >>> 0), bytes: number[] = [];
     for (let i = 0; i < limit; i++) {
-        const address = ptr + i, byte = Mem.readUint8(address);
+        const address = ptr + i, byte = readCrtUint8(address);
         if (byte === null) throw new CrtReadFault(address);
         if (byte === 0) break;
         bytes.push(byte);
@@ -89,7 +89,7 @@ function readCrtFormatString(ptr: number, wide: boolean, precision: number | nul
     const byte = new Uint8Array(1);
     let text = "";
     for (let i = 0; i < 0x100000; i++) {
-        const address = ptr + i, value = Mem.readUint8(address);
+        const address = ptr + i, value = readCrtUint8(address);
         if (value === null) throw new CrtReadFault(address);
         if (value === 0) return (text + (decoder?.decode() ?? "")).slice(0, precision);
         byte[0] = value;

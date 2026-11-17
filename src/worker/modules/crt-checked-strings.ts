@@ -1,4 +1,4 @@
-import {Mem} from "../core/memory/mem-accessor";
+import {readCrtUint16, crtFaultAddress} from "./crt-guest-access";
 import {raiseGuestAccessViolation} from "../core/thunking/guest-fault";
 import type {ThunkImplementation} from "../core/thunking/thunk-dispatcher";
 
@@ -22,8 +22,8 @@ export function readCrtWString(ptr: number, maxChars: number): string {
     const limit = Math.max(1, Math.min(maxChars >>> 0, 0x10000));
     let text = "";
     for (let i = 0; i < limit; i++) {
-        const address = ptr + i * 2, unit = Mem.readUint16(address);
-        if (unit === null) throw new CrtReadFault(Mem.firstInaccessibleByte(address, 2, "r"));
+        const address = ptr + i * 2, unit = readCrtUint16(address);
+        if (unit === null) throw new CrtReadFault(crtFaultAddress(address, 2, "r"));
         if (unit === 0) break;
         text += String.fromCharCode(unit);
     }
