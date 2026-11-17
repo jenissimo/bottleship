@@ -177,8 +177,13 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
         // Fast path: an explicit path with no wildcard is an existence check, not an
         // enumeration. Stat it directly (O(1)) instead of scanning the whole ROM index.
         const exactPath = pattern.replace(/\//g, '\\');
-        if (exactPath.includes('\\') && !/[*?]/.test(exactPath)) {
-            const entry = vfs.statEntry(exactPath) ?? vfs.statVirtualSystemFile(exactPath);
+        const isDotPath = /(?:^|[\\:])\.{1,2}$/.test(exactPath);
+        if ((exactPath.includes('\\') || isDotPath) && !/[*?]/.test(exactPath)) {
+            // Exact . / .. name the resolved directory, not a literal child entry.
+            // A drive root has no directory entry, including in a writable overlay.
+            const resolved = isDotPath ? vfs.resolvePath(exactPath) : exactPath;
+            const entry = isDotPath && /^[A-Za-z]:\\?$/.test(resolved)
+                ? null : (vfs.statEntry(exactPath) ?? vfs.statVirtualSystemFile(exactPath));
             if (!entry) {
                 System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
                 return INVALID_HANDLE_VALUE;
@@ -241,8 +246,13 @@ export function registerFileIoFindExports(exports: Record<string, ThunkImplement
 
         // Fast path: explicit path, no wildcard → direct stat (see FindFirstFileA).
         const exactPath = pattern.replace(/\//g, '\\');
-        if (exactPath.includes('\\') && !/[*?]/.test(exactPath)) {
-            const entry = vfs.statEntry(exactPath) ?? vfs.statVirtualSystemFile(exactPath);
+        const isDotPath = /(?:^|[\\:])\.{1,2}$/.test(exactPath);
+        if ((exactPath.includes('\\') || isDotPath) && !/[*?]/.test(exactPath)) {
+            // Exact . / .. name the resolved directory, not a literal child entry.
+            // A drive root has no directory entry, including in a writable overlay.
+            const resolved = isDotPath ? vfs.resolvePath(exactPath) : exactPath;
+            const entry = isDotPath && /^[A-Za-z]:\\?$/.test(resolved)
+                ? null : (vfs.statEntry(exactPath) ?? vfs.statVirtualSystemFile(exactPath));
             if (!entry) {
                 System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
                 return INVALID_HANDLE_VALUE;
