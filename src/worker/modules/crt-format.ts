@@ -66,6 +66,8 @@ export interface FormatCLazyOptions {
      * When set, `readWString` SHOULD be provided so wide %s can be resolved.
      */
     wide?: boolean;
+    /** Secure callers can bound checked string reads by the output precision. */
+    readString?: (addr: number, wide: boolean, precision: number | null) => string;
     /** Reader for wide (UTF-16) guest strings; required for wide %s/%S resolution. */
     readWString?: (addr: number, maxChars: number) => string;
 }
@@ -247,6 +249,8 @@ export function formatCLazy(
                 let str: string;
                 if (!strAddr) {
                     str = "(null)";
+                } else if (opts?.readString) {
+                    str = opts.readString(strAddr, useWide, precision);
                 } else if (useWide && readWString) {
                     str = readWString(strAddr, 0x100000);
                 } else {
@@ -263,6 +267,8 @@ export function formatCLazy(
                 let str: string;
                 if (!strAddr) {
                     str = "(null)";
+                } else if (opts?.readString) {
+                    str = opts.readString(strAddr, useWide, precision);
                 } else if (useWide && readWString) {
                     str = readWString(strAddr, 0x100000);
                 } else {
