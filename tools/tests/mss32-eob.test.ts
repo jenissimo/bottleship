@@ -148,6 +148,53 @@ describe("Miles end-of-buffer callbacks", () => {
         expect(ctx.pendingEOBCallbacks).toEqual([]);
     });
 
+    for (const revoke of ["reinit", "unregister", "replace"] as const) {
+        test(`${revoke} cannot resurrect a deferred EOB by registering the same callback again`, () => {
+            invoke("_AIL_register_EOB_callback@8", [HANDLE, CALLBACK]);
+            load(0, 4); load(1, 5);
+            cursor(9); updateEmulatorState(ctx);
+            expect((invoke("_AIL_sample_buffer_ready@4", [HANDLE]) as any).suspendedForCallback).toBe(true);
+            expect(calls.length).toBe(1);
+            expect(ctx.pendingEOBCallbacks.length).toBe(1);
+            // The first EOB is active; its sibling must not outlive this registration.
+            if (revoke === "reinit") invoke("_AIL_init_sample@4", [HANDLE]);
+            else invoke("_AIL_register_EOB_callback@8", [HANDLE, revoke === "unregister" ? 0 : CALLBACK + 16]);
+            invoke("_AIL_register_EOB_callback@8", [HANDLE, CALLBACK]);
+            expect(sample.id).toBe(1);
+            expect(complete()).toBe(0);
+            invoke("_AIL_sample_buffer_ready@4", [HANDLE]);
+            expect(calls.length).toBe(1);
+
+            // New consumption with the same handle/function is still a valid EOB.
+            expect(load(0, 4)).toBe(1);
+            cursor(sample.bufferPlayback!.submittedFrames);
+            updateEmulatorState(ctx);
+            expect((invoke("_AIL_sample_buffer_ready@4", [HANDLE]) as any).suspendedForCallback).toBe(true);
+            expect(calls).toEqual([
+                { fn: CALLBACK, args: [HANDLE], cleanup: 0 },
+                { fn: CALLBACK, args: [HANDLE], cleanup: 0 },
+            ]);
+            expect(savedCleanup).toBe(4);
+            expect(complete()).toBe(0);
+            expect(ctx.pendingEOBCallbacks).toEqual([]);
+        });
+    }
+
+    test("revocation preserves unrelated EOBs and repeated identical nonzero registration", () => {
+        invoke("_AIL_register_EOB_callback@8", [HANDLE, CALLBACK]);
+        load(0, 4); cursor(4); updateEmulatorState(ctx);
+        const other = { callback: CALLBACK + 32, handle: HANDLE + 0x400, id: 2 };
+        ctx.pendingEOBCallbacks.push(other);
+        frame = 1;
+        expect(invoke("_AIL_register_EOB_callback@8", [HANDLE, CALLBACK])).toBe(CALLBACK);
+        expect(ctx.pendingEOBCallbacks).toEqual([{ callback: CALLBACK, handle: HANDLE, id: 1 }, other]);
+        invoke("_AIL_init_sample@4", [HANDLE]);
+        expect(ctx.pendingEOBCallbacks).toEqual([other]);
+        ctx.pendingEOBCallbacks.unshift({ callback: CALLBACK, handle: HANDLE, id: 1 });
+        invoke("_AIL_register_EOB_callback@8", [HANDLE, 0]);
+        expect(ctx.pendingEOBCallbacks).toEqual([other]);
+    });
+
     test("a zero-length end marker fires EOS once after pending data, not when submitted", () => {
         invoke("_AIL_register_EOS_callback@8", [HANDLE, CALLBACK + 32]);
         load(0, 4);

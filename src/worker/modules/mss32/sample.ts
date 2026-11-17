@@ -23,6 +23,14 @@ import { ensureListener3D, writeListener3D } from "./spatial";
 import { decodeRawSampleImage } from "./raw-sample-cache";
 import { clampLevel, f32Arg, levelsToVolumePan, pan127ToPanLevel, panLevelToPan127, volumePanToLevels } from "./volume-levels";
 
+// Deferred notifications belong to the registration that observed consumption.
+// Reset/change must revoke them even if the guest later reuses the same function.
+function cancelPendingSampleEOB(ctx: MSSContext, handle: number): void {
+    for (let i = ctx.pendingEOBCallbacks.length - 1; i >= 0; i--) {
+        if (ctx.pendingEOBCallbacks[i]!.handle === handle) ctx.pendingEOBCallbacks.splice(i, 1);
+    }
+}
+
 const tagAt = (d: Uint8Array, o: number, tag: string): boolean => {
     if (d.length < o + tag.length) return false;
     for (let i = 0; i < tag.length; i++) if (d[o + i] !== tag.charCodeAt(i)) return false;
@@ -197,6 +205,8 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
                 self.postMessage({ type: "audio_stop", payload: { id: sampleObj.id } });
             }
         }
+
+        cancelPendingSampleEOB(ctx, handle);
 
         // Reset runtime state to defaults
         sampleObj.eobCallback = undefined;
@@ -927,7 +937,9 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         const sample = ctx.samples.get(args[0] >>> 0);
         if (!sample) return 0;
         const previous = sample.eobCallback ?? 0;
-        sample.eobCallback = args[1] >>> 0;
+        const callback = args[1] >>> 0;
+        if (callback === 0 || callback !== previous) cancelPendingSampleEOB(ctx, sample.handle);
+        sample.eobCallback = callback;
         return previous;
     };
 
