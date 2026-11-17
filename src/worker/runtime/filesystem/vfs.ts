@@ -2683,6 +2683,7 @@ class OpfsOverlay {
         this.contentCache.clear();
         this.ephemeralFiles.clear();
         this.entries.clear();
+        this.directoryNameIndexes.clear();
         this.pendingFlushes.clear();
         this.shadowed.clear();
         this.shadowDirty = false;
@@ -2691,10 +2692,12 @@ class OpfsOverlay {
     }
 
     async loadIndex(): Promise<void> {
-        await this.namespaceQueue;
-        if (!this.root) return;
-        this.entries.clear();
-        await this.scanDirectory(this.root, []);
+        await this.inNamespace(async () => {
+            this.directoryNameIndexes.clear();
+            if (!this.root) return;
+            this.entries.clear();
+            await this.scanDirectory(this.root, []);
+        });
     }
 
     hasFile(path: string): boolean {
@@ -2880,6 +2883,7 @@ class OpfsOverlay {
 
     async ensureDirectory(path: string): Promise<void> {
         await this.inNamespace(async () => {
+            this.invalidateNameLookups(path);
             if (!this.root) throw new Error("OPFS not initialized");
             let dir = this.root;
             for (const segment of toOpfsSegments(path)) {
@@ -2992,6 +2996,7 @@ class OpfsOverlay {
         const key = toKey(path);
 
         if (this.policy.isEphemeral(path)) return this.ephemeralRead(key, offset, length);
+        this.assertKnownIdentity(path);
 
         // Authoritative in-memory content (files written/truncated this session) — exact
         // read-after-write without touching OPFS handles.
@@ -3159,6 +3164,7 @@ class OpfsOverlay {
         const key = toKey(path);
 
         if (this.policy.isEphemeral(path)) return this.ephemeralRead(key, offset, length);
+        this.assertKnownIdentity(path);
 
         // Authoritative in-memory content (files written/truncated this session).
         const cached = this.cacheRead(key, offset, length);
@@ -3598,12 +3604,13 @@ class OpfsOverlay {
 
     /** Resolve identity without holding the lock while waiting for file commits. */
     private async deletionTarget(path: string): Promise<{ path: string }> {
-        return this.inNamespace(() => this.getDirectoryHandle(path, false));
+        return this.inNamespace(() => this.getDirectoryHandle(path, false, true));
     }
 
     private async removePhysicalEntry(path: string, kind: "file" | "directory"): Promise<void> {
         await this.inNamespace(async () => {
-            const { dirHandle, name } = await this.getDirectoryHandle(path, false);
+            this.invalidateNameLookups(path);
+            const { dirHandle, name } = await this.getDirectoryHandle(path, false, true);
             // An index entry may be stale; never remove a different physical type.
             if (kind === "file") await dirHandle.getFileHandle(name);
             else await dirHandle.getDirectoryHandle(name);
@@ -3717,9 +3724,48 @@ class OpfsOverlay {
 
     private async getFileHandle(path: string, create: boolean): Promise<FileSystemFileHandle> {
         return this.inNamespace(async () => {
-            const { dirHandle, name } = await this.getDirectoryHandle(path, create);
-            return dirHandle.getFileHandle(name, { create });
+            if (create) this.invalidateNameLookups(path);
+            try {
+                const { dirHandle, name } = await this.getDirectoryHandle(path, create);
+                return await dirHandle.getFileHandle(name, { create });
+            } catch (error) {
+                if (create || (error as { name?: string }).name !== "NotFoundError") throw error;
+                // An out-of-band deletion/rename can invalidate a read snapshot.
+                // Retry identity once from disk; never turn a create into a cached lookup.
+                this.invalidateNameLookups(path);
+                const { dirHandle, name } = await this.getDirectoryHandle(path, false, true);
+                return dirHandle.getFileHandle(name);
+            }
         });
+    }
+
+    // @transient(derived complete directory-name snapshots; namespace owner invalidates mutations)
+    private directoryNameIndexes = new Map<string, Map<string, string | null>>();
+
+    /** Reads share the existing session snapshot contract; refresh rebuilds collision state.
+     * Creates/removals always enumerate disk afresh, including external case twins. */
+    private invalidateNameLookups(path: string): void {
+        let key = "";
+        this.directoryNameIndexes.delete(key);
+        for (const segment of toOpfsSegments(path)) {
+            key = key ? key + "/" + segment.toLowerCase() : segment.toLowerCase();
+            this.directoryNameIndexes.delete(key);
+        }
+        for (const existing of this.directoryNameIndexes.keys()) {
+            if (existing.startsWith(key + "/")) this.directoryNameIndexes.delete(existing);
+        }
+    }
+
+    /** Known snapshot collisions must not be bypassed by content or sync-handle caches. */
+    private assertKnownIdentity(path: string): void {
+        let parent = "";
+        for (const segment of toOpfsSegments(path)) {
+            const folded = segment.toLowerCase();
+            if (this.directoryNameIndexes.get(parent)?.get(folded) === null) {
+                throw new Error(`OPFS case collision for "${segment}"`);
+            }
+            parent = parent ? parent + "/" + folded : folded;
+        }
     }
 
     // @transient(runtime infrastructure) Serializes metadata identity, not file I/O.
@@ -3738,27 +3784,34 @@ class OpfsOverlay {
     }
 
     /** Win32 has one name per case-insensitive component; OPFS itself does not. */
-    private async physicalName(dir: FileSystemDirectoryHandle, requested: string): Promise<string> {
-        const matches: string[] = [];
-        const children = dir as unknown as { entries(): AsyncIterableIterator<[string, FileSystemHandle]> };
-        for await (const [name] of children.entries()) {
-            if (name.toLowerCase() === requested.toLowerCase()) matches.push(name);
+    private async physicalName(dir: FileSystemDirectoryHandle, requested: string, indexKey?: string): Promise<string> {
+        let names = indexKey === undefined ? undefined : this.directoryNameIndexes.get(indexKey);
+        if (!names) {
+            names = new Map<string, string | null>();
+            const children = dir as unknown as { entries(): AsyncIterableIterator<[string, FileSystemHandle]> };
+            for await (const [name] of children.entries()) {
+                const folded = name.toLowerCase();
+                names.set(folded, names.has(folded) ? null : name);
+            }
+            // Publish only a COMPLETE enumeration. Null retains every ambiguous spelling.
+            if (indexKey !== undefined) this.directoryNameIndexes.set(indexKey, names);
         }
-        if (matches.length > 1) throw new Error(`OPFS case collision for "${requested}"`);
-        return matches[0] ?? requested;
+        const name = names.get(requested.toLowerCase());
+        if (name === null) throw new Error(`OPFS case collision for "${requested}"`);
+        return name ?? requested;
     }
 
     /** Called with the namespace held; lookup and creation are one atomic admission. */
-    private async physicalDirectory(dir: FileSystemDirectoryHandle, requested: string, create: boolean): Promise<{
+    private async physicalDirectory(dir: FileSystemDirectoryHandle, requested: string, create: boolean, indexKey?: string): Promise<{
         dir: FileSystemDirectoryHandle; name: string;
     }> {
-        const name = await this.physicalName(dir, requested);
+        const name = await this.physicalName(dir, requested, indexKey);
         // A file is not an absent directory. Preserve it and propagate TypeMismatch.
         return { dir: await dir.getDirectoryHandle(name, { create }), name };
     }
 
     /** Caller holds namespace until its final getFileHandle/removeEntry also completes. */
-    private async getDirectoryHandle(path: string, create: boolean): Promise<{
+    private async getDirectoryHandle(path: string, create: boolean, fresh = false): Promise<{
         dirHandle: FileSystemDirectoryHandle; name: string; path: string;
     }> {
         if (!this.root) throw new Error("OPFS not initialized");
@@ -3766,12 +3819,15 @@ class OpfsOverlay {
         if (!segments.length) throw new Error("Invalid path");
         let dir = this.root;
         const actual: string[] = [];
+        let parentKey = "";
+        const cachedRead = !create && !fresh;
         for (const segment of segments.slice(0, -1)) {
-            const resolved = await this.physicalDirectory(dir, segment, create);
+            const resolved = await this.physicalDirectory(dir, segment, create, cachedRead ? parentKey : undefined);
             dir = resolved.dir;
             actual.push(resolved.name);
+            parentKey = parentKey ? parentKey + "/" + resolved.name.toLowerCase() : resolved.name.toLowerCase();
         }
-        const name = await this.physicalName(dir, segments.at(-1)!);
+        const name = await this.physicalName(dir, segments.at(-1)!, cachedRead ? parentKey : undefined);
         actual.push(name);
         return { dirHandle: dir, name, path: `${actual[0]}:\\${actual.slice(1).join("\\")}` };
     }
@@ -3780,7 +3836,10 @@ class OpfsOverlay {
         // FileSystemDirectoryHandle.entries() exists but TypeScript types may not include it
         // Use type assertion to access the async iterator
         const dirEntries = (dir as any as { entries(): AsyncIterableIterator<[string, FileSystemHandle]> }).entries();
+        const names = new Map<string, string | null>();
         for await (const [name, handle] of dirEntries) {
+            const folded = name.toLowerCase();
+            names.set(folded, names.has(folded) ? null : name);
             const nextPrefix = prefix.concat(name);
             const vfsPath = fromOpfsSegments(nextPrefix);
             if (handle.kind === "file") {
@@ -3791,6 +3850,7 @@ class OpfsOverlay {
                 await this.scanDirectory(handle as FileSystemDirectoryHandle, nextPrefix);
             }
         }
+        this.directoryNameIndexes.set(prefix.map(part => part.toLowerCase()).join("/"), names);
     }
 }
 
