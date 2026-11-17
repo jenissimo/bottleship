@@ -2672,6 +2672,8 @@ class OpfsOverlay {
             clearTimeout(this.writerCleanupTimer);
             this.writerCleanupTimer = null;
         }
+        this.namespaceClosed = true;
+        await this.namespaceQueue;
         this.writerCache.clear();
         for (const sah of this.syncHandleCache.values()) {
             try { sah.close(); } catch { /* ignore */ }
@@ -2689,6 +2691,7 @@ class OpfsOverlay {
     }
 
     async loadIndex(): Promise<void> {
+        await this.namespaceQueue;
         if (!this.root) return;
         this.entries.clear();
         await this.scanDirectory(this.root, []);
@@ -2876,24 +2879,13 @@ class OpfsOverlay {
     }
 
     async ensureDirectory(path: string): Promise<void> {
-        if (!this.root) {
-            throw new Error("OPFS not initialized");
-        }
-        const segments = toOpfsSegments(path);
-        let dir = this.root;
-        for (const segment of segments) {
-            try {
-                dir = await dir.getDirectoryHandle(segment, { create: true });
-            } catch (e: any) {
-                if (e.name === 'TypeMismatchError') {
-                    Logger.warn(LogCategory.SYSTEM, `VFS: Replacing file with directory at segment "${segment}" while ensuring directory "${path}"`);
-                    await dir.removeEntry(segment);
-                    dir = await dir.getDirectoryHandle(segment, { create: true });
-                } else {
-                    throw e;
-                }
+        await this.inNamespace(async () => {
+            if (!this.root) throw new Error("OPFS not initialized");
+            let dir = this.root;
+            for (const segment of toOpfsSegments(path)) {
+                dir = (await this.physicalDirectory(dir, segment, true)).dir;
             }
-        }
+        });
     }
 
     async truncateFile(path: string): Promise<void> {
@@ -3596,6 +3588,46 @@ class OpfsOverlay {
         if (inFlight) { try { await inFlight; } catch { /* commit error already logged */ } }
     }
 
+    /** Resolve identity without holding the lock while waiting for file commits. */
+    private async deletionTarget(path: string): Promise<{ path: string }> {
+        return this.inNamespace(() => this.getDirectoryHandle(path, false));
+    }
+
+    private async removePhysicalEntry(path: string, kind: "file" | "directory"): Promise<void> {
+        await this.inNamespace(async () => {
+            const { dirHandle, name } = await this.getDirectoryHandle(path, false);
+            // An index entry may be stale; never remove a different physical type.
+            if (kind === "file") await dirHandle.getFileHandle(name);
+            else await dirHandle.getDirectoryHandle(name);
+            await dirHandle.removeEntry(name);
+        });
+    }
+
+    /** Drain admitted work before removal; a promise in this map is not cancellable. */
+    private async settleWritesBeforeDelete(path: string): Promise<void> {
+        const key = toKey(path);
+        for (;;) {
+            const pending = this.pendingFlushes.get(key);
+            if (pending) await pending; // propagate refusal; never erase it as cancellation
+            const writer = this.writerCache.get(key);
+            if (writer) {
+                let physicalPath = writer.path;
+                try {
+                    physicalPath = (await this.deletionTarget(writer.path)).path;
+                } catch (error) {
+                    // A newly created path may not be on disk yet. Its ordinary writer
+                    // creates the missing parents; collisions and I/O failures must escape.
+                    if ((error as { name?: string }).name !== "NotFoundError") throw error;
+                }
+                writer.path = physicalPath;
+                await this.flushFile(physicalPath);
+                continue; // a successor admitted during the await must also settle
+            }
+            const current = this.pendingFlushes.get(key);
+            if (!current || current === pending) return;
+        }
+    }
+
     async deleteFile(path: string): Promise<boolean> {
         const ephKey = toKey(path);
         if (this.ephemeralFiles.has(ephKey)) {
@@ -3604,36 +3636,15 @@ class OpfsOverlay {
             this.clearShadowed(ephKey);
             return true;
         }
-        this.closeSyncHandle(path);
         const key = toKey(path);
-        this.contentCache.delete(key);
-        this.pendingFlushes.delete(key);
-        this.clearShadowed(key);
         const existing = this.entries.get(key);
-        if (!existing || existing.kind !== "file") {
-            return false;
-        }
-
-        const cacheEntry = this.writerCache.get(key);
-        if (cacheEntry) {
-            this.writerCache.delete(key);
-            if (cacheEntry.flushTimer !== null) {
-                clearTimeout(cacheEntry.flushTimer);
-                cacheEntry.flushTimer = null;
-            }
-
-            await this.flushWriteBuffer(cacheEntry);
-            await cacheEntry.queue;
-            try {
-                await cacheEntry.writer?.close();
-            } catch (e) {
-                Logger.warn(LogCategory.SYSTEM, `OPFS: Error closing writer before delete for key "${key}": ${e}`);
-            }
-        }
-
+        if (!existing || existing.kind !== "file") return false;
+        await this.settleWritesBeforeDelete(path);
+        this.closeSyncHandle(path);
         try {
-            const { dirHandle, name } = await this.getDirectoryHandle(path, false);
-            await dirHandle.removeEntry(name);
+            await this.removePhysicalEntry(path, "file");
+            this.contentCache.delete(key);
+            this.clearShadowed(key);
             this.entries.delete(key);
             return true;
         } catch (e: any) {
@@ -3643,6 +3654,8 @@ class OpfsOverlay {
                 // from the index makes it invisible — that IS a successful delete;
                 // returning false here made DeleteFile/remove() fail on files the
                 // guest just created (Max Payne re-saving over a fresh slot).
+                this.contentCache.delete(key);
+                this.clearShadowed(key);
                 this.entries.delete(key);
                 return true;
             }
@@ -3659,8 +3672,7 @@ class OpfsOverlay {
             return false;
         }
         try {
-            const { dirHandle, name } = await this.getDirectoryHandle(path, false);
-            await dirHandle.removeEntry(name);
+            await this.removePhysicalEntry(path, "directory");
         } catch (e: any) {
             if (e?.name !== "NotFoundError") throw e; // never persisted → index-only dir
         }
@@ -3696,67 +3708,64 @@ class OpfsOverlay {
     }
 
     private async getFileHandle(path: string, create: boolean): Promise<FileSystemFileHandle> {
-        Logger.verbose(LogCategory.SYSTEM, `OPFS: getFileHandle("${path}", create=${create}) starting`);
-        try {
-            const dirStart = performance.now();
+        return this.inNamespace(async () => {
             const { dirHandle, name } = await this.getDirectoryHandle(path, create);
-            const dirTime = performance.now() - dirStart;
-            Logger.verbose(LogCategory.SYSTEM, `OPFS: getFileHandle got directory handle in ${dirTime.toFixed(2)}ms, filename="${name}"`);
-
-            const fileStart = performance.now();
-            const fileHandle = await dirHandle.getFileHandle(name, { create });
-            const fileTime = performance.now() - fileStart;
-            Logger.verbose(LogCategory.SYSTEM, `OPFS: getFileHandle got file handle in ${fileTime.toFixed(2)}ms`);
-            return fileHandle;
-        } catch (e) {
-            Logger.error(LogCategory.SYSTEM, `OPFS: getFileHandle("${path}", create=${create}) failed: ${e}`);
-            throw e;
-        }
+            return dirHandle.getFileHandle(name, { create });
+        });
     }
 
-    private async getDirectoryHandle(path: string, create: boolean): Promise<{ dirHandle: FileSystemDirectoryHandle; name: string }> {
-        Logger.verbose(LogCategory.SYSTEM, `OPFS: getDirectoryHandle("${path}", create=${create}) starting`);
-        if (!this.root) {
-            Logger.error(LogCategory.SYSTEM, `OPFS: getDirectoryHandle("${path}") failed: OPFS not initialized`);
-            throw new Error("OPFS not initialized");
-        }
-        const segments = toOpfsSegments(path);
-        if (segments.length === 0) {
-            Logger.error(LogCategory.SYSTEM, `OPFS: getDirectoryHandle("${path}") failed: Invalid path (empty segments)`);
-            throw new Error("Invalid path");
-        }
-        Logger.verbose(LogCategory.SYSTEM, `OPFS: getDirectoryHandle path segments: [${segments.join(", ")}]`);
+    // @transient(runtime infrastructure) Serializes metadata identity, not file I/O.
+    private namespaceQueue: Promise<void> = Promise.resolve();
+    // @transient(runtime infrastructure)
+    private namespaceClosed = false;
 
-        let dir = this.root;
-        for (let i = 0; i < segments.length - 1; i++) {
-            const segment = segments[i];
-            const segmentStart = performance.now();
-            try {
-                dir = await dir.getDirectoryHandle(segment, { create });
-                const segmentTime = performance.now() - segmentStart;
-                Logger.verbose(LogCategory.SYSTEM, `OPFS: getDirectoryHandle got segment "${segment}" (${i + 1}/${segments.length - 1}) in ${segmentTime.toFixed(2)}ms`);
-            } catch (e: any) {
-                if (e.name === 'TypeMismatchError') {
-                    // Path exists but is a file, replace it with a directory if creating
-                    if (create) {
-                        Logger.warn(LogCategory.SYSTEM, `OPFS: Replacing file with directory at segment "${segment}" for path "${path}"`);
-                        await dir.removeEntry(segment);
-                        dir = await dir.getDirectoryHandle(segment, { create: true });
-                        const segmentTime = performance.now() - segmentStart;
-                        Logger.verbose(LogCategory.SYSTEM, `OPFS: getDirectoryHandle replaced and got segment "${segment}" in ${segmentTime.toFixed(2)}ms`);
-                    } else {
-                        Logger.error(LogCategory.SYSTEM, `OPFS: getDirectoryHandle("${path}") failed at segment "${segment}": TypeMismatchError and create=false`);
-                        throw e;
-                    }
-                } else {
-                    Logger.error(LogCategory.SYSTEM, `OPFS: getDirectoryHandle("${path}") failed at segment "${segment}": ${e}`);
-                    throw e;
-                }
-            }
+    private async inNamespace<T>(work: () => Promise<T>): Promise<T> {
+        if (this.namespaceClosed) throw new Error("OPFS overlay is closed");
+        const previous = this.namespaceQueue;
+        let release!: () => void;
+        this.namespaceQueue = new Promise<void>(resolve => { release = resolve; });
+        await previous;
+        try { return await work(); }
+        finally { release(); }
+    }
+
+    /** Win32 has one name per case-insensitive component; OPFS itself does not. */
+    private async physicalName(dir: FileSystemDirectoryHandle, requested: string): Promise<string> {
+        const matches: string[] = [];
+        const children = dir as unknown as { entries(): AsyncIterableIterator<[string, FileSystemHandle]> };
+        for await (const [name] of children.entries()) {
+            if (name.toLowerCase() === requested.toLowerCase()) matches.push(name);
         }
-        const fileName = segments[segments.length - 1];
-        Logger.verbose(LogCategory.SYSTEM, `OPFS: getDirectoryHandle("${path}") completed, returning directory with filename="${fileName}"`);
-        return { dirHandle: dir, name: fileName };
+        if (matches.length > 1) throw new Error(`OPFS case collision for "${requested}"`);
+        return matches[0] ?? requested;
+    }
+
+    /** Called with the namespace held; lookup and creation are one atomic admission. */
+    private async physicalDirectory(dir: FileSystemDirectoryHandle, requested: string, create: boolean): Promise<{
+        dir: FileSystemDirectoryHandle; name: string;
+    }> {
+        const name = await this.physicalName(dir, requested);
+        // A file is not an absent directory. Preserve it and propagate TypeMismatch.
+        return { dir: await dir.getDirectoryHandle(name, { create }), name };
+    }
+
+    /** Caller holds namespace until its final getFileHandle/removeEntry also completes. */
+    private async getDirectoryHandle(path: string, create: boolean): Promise<{
+        dirHandle: FileSystemDirectoryHandle; name: string; path: string;
+    }> {
+        if (!this.root) throw new Error("OPFS not initialized");
+        const segments = toOpfsSegments(path);
+        if (!segments.length) throw new Error("Invalid path");
+        let dir = this.root;
+        const actual: string[] = [];
+        for (const segment of segments.slice(0, -1)) {
+            const resolved = await this.physicalDirectory(dir, segment, create);
+            dir = resolved.dir;
+            actual.push(resolved.name);
+        }
+        const name = await this.physicalName(dir, segments.at(-1)!);
+        actual.push(name);
+        return { dirHandle: dir, name, path: `${actual[0]}:\\${actual.slice(1).join("\\")}` };
     }
 
     private async scanDirectory(dir: FileSystemDirectoryHandle, prefix: string[]): Promise<void> {
