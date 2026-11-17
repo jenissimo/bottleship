@@ -10,6 +10,7 @@ import { isValidAddress } from '../../core/memory/address-guard';
 import { sanitizeViewport } from '../../backends/webgpu/ddraw/types';
 import { addComRef, createComObject, devices, deviceBoundDepthStencil, deviceClipStatus, deviceCreationParams, deviceRenderTargetOverride, deviceWindowed, getVTables, releaseComRef, resourceToDevice, surfaceInfo, textureD3DFormat, isComObjectLive } from './shared-state';
 import { bindAutoDepthStencil, invalidateDevicePresentationSurfaces, resizeFullscreenDeviceWindow } from './device-lifecycle';
+import { resolveWindowedBackBufferExtent } from '../../runtime/windowing/fullscreen-window';
 import { isBitmapTexture } from '../ddraw/com-objects';
 import { D3DMaterial7Data, D3DLight7Data } from '../ddraw/d3d/types';
 import { gammaService } from '../../core/gamma-service';
@@ -567,6 +568,16 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         // No GPU device yet: a Reset cannot succeed, and real D3D8 says so rather than
         // pretending — that answer is what keeps the app's poll loop honest.
         if (!acknowledgeDeviceReset(devicePtr)) return D3DERR_DEVICELOST;
+        // A zero dimension of a windowed back buffer is resolved before the backend, the
+        // presentation surfaces and the auto depth-stencil read the struct.
+        if (args[1] && isValidAddress(mem, args[1] >>> 0, 32)) {
+            const rv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            const pp = args[1] >>> 0;
+            resolveWindowedBackBufferExtent(
+                mem, pp,
+                (rv.getUint32(pp + 24, true) || deviceCreationParams.get(devicePtr)?.hFocusWindow || 0) >>> 0,
+                rv.getUint32(pp + 28, true) === 0, 'D3D8 Reset', LogCategory.SYSTEM);
+        }
         const hr = device.reset(args[1], mem);
         if (hr !== D3D_OK) return hr;
         invalidateDevicePresentationSurfaces(args[0]);

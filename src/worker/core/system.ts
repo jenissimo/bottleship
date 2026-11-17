@@ -876,11 +876,6 @@ export class System {
         return this.hostViewWindow;
     }
 
-    /** Show a rectangle that belongs to no single window's client area (a windowed device's back buffer). */
-    requestHostViewAt(x: number, y: number, width: number, height: number): void {
-        this.publishHostView(x, y, width, height, 0);
-    }
-
     /** Show a top-level window's client rectangle; a later move or resize of it follows. */
     requestHostViewOfWindow(hwnd: number, x: number, y: number, width: number, height: number): void {
         this.publishHostView(x, y, width, height, hwnd);
