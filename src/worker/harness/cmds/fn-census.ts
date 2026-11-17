@@ -21,7 +21,8 @@ import { startRetiredAccumulator, peekRetiredTotal, stopRetiredAccumulator, coun
 import { cpu, symbolize } from "../serialize";
 import { dbg } from "../../core/debug/dbg-commands";
 
-export const FN_CENSUS_SCHEMA = 1;
+export const FN_CENSUS_SCHEMA = 2;
+export const FN_CENSUS_CALL_WORDS = 4;
 export const FN_CENSUS_ROW_WORDS = 40;
 
 export const ROW = {
@@ -30,14 +31,14 @@ export const ROW = {
     windowAdmitted: 14, windowRefused: 15, windowRefusedSeen: 16, windowMaxPages: 17, smcEvents: 18,
     frameAccesses: 19, otherAccesses: 20, x87Ops: 21, firstRefuseEip: 22, firstRefuseOp: 23,
     rangeStart: 24, rangeCount: 25, flags: 26, outCalls: 27, analyses: 28, codePage0: 29,
-    firstWindowEip: 32, firstWindowOp: 33,
+    firstWindowEip: 32, firstWindowOp: 33, callStart: 34, callCount: 35, retSummary: 36,
 } as const;
 
 export const UNIT_REASONS = [
     "guestCall", "guestCallIndirect", "indirectJump", "stateInstruction", "helperReentry",
     "codePageBudget", "instructionCap", "blockCap", "byteCap", "codeNotMapped", "pageCrossSplit", "addr16",
 ] as const;
-export const WINDOW_STATIC_REASONS = ["espUntracked", "espAlign", "espMerge", "espUnbalanced", "outCall", "extentPages"] as const;
+export const WINDOW_STATIC_REASONS = ["espUntracked", "espAlign", "espMerge", "espUnbalanced", "outCall", "extentPages", "calleeEspUnknown"] as const;
 export const PROMOTION_REASONS = ["slotEscapes", "unknownAlias", "noWindow"] as const;
 export const P4_REASONS = ["fldcw", "x87DepthMerge", "x87DepthUnknown", "strictFpu", "fpuEnv", "noX87"] as const;
 export const PROBE_REASONS = [
@@ -46,7 +47,7 @@ export const PROBE_REASONS = [
 ] as const;
 export const STAT_NAMES = [
     "calls", "callsTableFull", "analyses", "reanalyses", "tlbRevocations", "revocationsOnWindowPages",
-    "smcDirties", "smcOnCandidates", "rangeOverflow", "callsNotFlat32", "exceptions", "windowProbes", "windowAdmitted",
+    "smcDirties", "smcOnCandidates", "rangeOverflow", "callsNotFlat32", "exceptions", "windowProbes", "windowAdmitted", "callOverflow",
 ] as const;
 
 const P4_BLOCKING = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5);
@@ -57,7 +58,7 @@ type Exports = Record<string, ((...a: number[]) => number) | undefined>;
 const REQUIRED = [
     "fn_census_version", "fn_census_set_enabled", "fn_census_enabled", "fn_census_generation", "fn_census_reset",
     "fn_census_row_count", "fn_census_row_words", "fn_census_rows_ptr", "fn_census_stat", "fn_census_stat_count",
-    "fn_census_owner_of", "fn_census_get_cap", "jit_codegen_fingerprint_lo", "jit_codegen_fingerprint_hi",
+    "fn_census_owner_of", "fn_census_get_cap", "fn_census_call_count", "fn_census_calls_ptr", "jit_codegen_fingerprint_lo", "jit_codegen_fingerprint_hi",
 ] as const;
 
 export interface CountedSample { addr: number; exec: number; ins: number; owner: number }
@@ -69,6 +70,8 @@ export interface FnCensusSnapshot {
     exportsId: number;
     enabled: number;
     rows: Map<number, Uint32Array>;
+    /** Call-site pool, FN_CENSUS_CALL_WORDS per site: site EIP, direct target (0 = indirect), flags, callee ret imm16. */
+    calls: Uint32Array;
     stats: number[];
     retiredTotal: number;
     fingerprint: string;
@@ -135,7 +138,10 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
     type Row = { r: Uint32Array; entries: number; admitted: number; refused: number; executed: number };
     const changedVersion = (r: Uint32Array) => {
         const b = before.rows.get(r[ROW.entryVirt]!);
-        return !!b && b[ROW.flags] !== 0 && (b[ROW.analyses] !== r[ROW.analyses] || b[ROW.smcEvents] !== r[ROW.smcEvents]);
+        if (b && b[ROW.flags] !== 0) return b[ROW.analyses] !== r[ROW.analyses] || b[ROW.smcEvents] !== r[ROW.smcEvents];
+        // First analysed inside the window: its counts are cumulative over every body it had
+        // since then, so any reanalysis or code write after that first analysis mixes versions.
+        return r[ROW.analyses]! - (b?.[ROW.analyses] ?? 0) > 1 || r[ROW.smcEvents]! - (b?.[ROW.smcEvents] ?? 0) > 0;
     };
     const window: Row[] = [];
     const versionChanged: Row[] = [];
@@ -194,6 +200,8 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
         }
     }
 
+    const execProblems = counted ? executedProblems(counted, countedTotal, retired, saturated, before)
+        : ["the counted channel was not armed at fnCensusMark(); executed coverage is unknown, not zero"];
     const ranked = [...window].sort((a, b) => (b.executed - a.executed) || (b.entries - a.entries)).slice(0, top);
     return {
         ok: true,
@@ -230,11 +238,11 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
                 admittedPct: pct(probesAdmitted, probesAdmitted + probesRefused),
                 refusedBy: probeReasons,
             },
-            executed: counted && executedProblems(counted, countedTotal, retired, saturated, before).length
+            executed: counted && execProblems.length
                 ? {
                     available: false,
                     note: "executed coverage is unavailable for this window; the raw counts are kept as evidence",
-                    problems: executedProblems(counted, countedTotal, retired, saturated, before),
+                    problems: execProblems,
                     raw: { retiredIns: retired, countedIns: countedTotal, admittedIns: ownedAdmitted, refusedIns: ownedRefused,
                         unattributedIns: unattributed, changedVersionIns: ownedChanged, saturatedBlocks: saturated,
                         recording: counted.recording, watchedPages: counted.watchedPages, armedPages: counted.armedPages },
@@ -258,14 +266,17 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
                 }
                 : { available: false, note: "the counted channel was not armed at fnCensusMark(); executed coverage is unknown, not zero" },
             versionChanged: {
-                note: "functions re-analysed after a code write inside the window: which body ran is not known, so their "
+                note: "functions re-analysed after a code write inside the window (including rows first seen after MARK): which body ran is not known, so their "
                     + "entries and counted instructions are left out of every share above",
                 functions: versionChanged.length,
                 entries: versionChanged.reduce((s, w) => s + w.entries, 0),
             },
+            callContinuation: callContinuation(window, after, retired, countedTotal,
+                { executedProblems: execProblems, unstable: changedVersion }),
             dropped: {
                 rowTableFull: stat(1),
                 rangePoolOverflow: stat(8),
+                callSitePoolOverflow: stat(13),
                 callsNotFlat32: stat(9),
                 countedSlotOverflow: counted?.slotOverflow ?? null,
                 countedPagesNotArmed: counted?.pagesNotArmed ?? null,
@@ -310,6 +321,108 @@ export function executedProblems(counted: NonNullable<FnCensusSnapshot["counted"
     if (countedTotal > retired) out.push(`counted ${countedTotal} instructions exceed the ${retired} retired: inconsistent denominators`);
     if (saturated > 0) out.push(`${saturated} block counter(s) saturated: their weight is a lower bound of unknown size`);
     return out;
+}
+
+// @transient(harness census window; a reset or restore moves the kernel generation, which refuses the report)
+const W_OUT_CALL = 1 << 4, W_ALIGN = 1 << 1, W_CALLEE_ESP = 1 << 6;
+const U_CALL = 1 << 0, U_ICALL = 1 << 1;
+const CALL_INDIRECT = 1, CALL_RET_KNOWN = 2;
+export const INLINE_MAX_INSTRUCTIONS = 64;
+
+type Weighted = { r: Uint32Array; entries: number; executed: number };
+
+/**
+ * What each continuation option would add, from the same rows: a function qualifies when the
+ * option removes every reason it is refused for. Shares are cumulative (they include functions
+ * M1 already admits) and executed shares are of the window's counted owners, so they are lower
+ * bounds wherever the counted channel missed pages.
+ */
+export function callContinuation(window: Weighted[], after: FnCensusSnapshot, retired: number, counted: number,
+    opts: { executedProblems?: string[]; unstable?: (r: Uint32Array) => boolean } = {}) {
+    const problems = opts.executedProblems ?? [];
+    const unstable = opts.unstable ?? (() => false);
+    const byEntry = new Map<number, Uint32Array>();
+    for (const r of after.rows.values()) byEntry.set(r[ROW.entryVirt]!, r);
+    const sites = (r: Uint32Array) => {
+        const out: Array<{ target: number; flags: number; imm: number }> = [];
+        for (let i = 0; i < r[ROW.callCount]!; i++) {
+            const o = (r[ROW.callStart]! + i) * FN_CENSUS_CALL_WORDS;
+            if (o + FN_CENSUS_CALL_WORDS > after.calls.length) break;
+            out.push({ target: after.calls[o + 1]!, flags: after.calls[o + 2]!, imm: after.calls[o + 3]! });
+        }
+        return out;
+    };
+    const sitesComplete = (r: Uint32Array) => {
+        const s = sites(r);
+        return s.length === r[ROW.callCount] && s.filter(x => !(x.flags & CALL_INDIRECT)).length === r[ROW.outCalls];
+    };
+    const calleeUnstable = (t: number) => {
+        const c = byEntry.get(t);
+        return !!c && unstable(c);
+    };
+    const inlinable = (t: number) => {
+        const c = byEntry.get(t);
+        return !!c && !unstable(c) && c[ROW.unit] === 0 && c[ROW.windowStatic] === 0 && c[ROW.outCalls] === 0
+            && c[ROW.instructions]! <= INLINE_MAX_INSTRUCTIONS;
+    };
+    const inlineShape = (r: Uint32Array) => (r[ROW.unit]! & ~U_CALL) === 0 && (r[ROW.windowStatic]! & ~W_OUT_CALL) === 0;
+    const inlineUnknown = (r: Uint32Array) => inlineShape(r)
+        && (!sitesComplete(r) || sites(r).some(s => !(s.flags & CALL_INDIRECT) && calleeUnstable(s.target)));
+    const variants: Record<string, (r: Uint32Array) => boolean> = {
+        m1: r => r[ROW.unit] === 0 && r[ROW.windowStatic] === 0,
+        inlineLeaves: r => inlineShape(r) && !inlineUnknown(r)
+            && sites(r).every(s => !(s.flags & CALL_INDIRECT) && inlinable(s.target)),
+        callChain: r => (r[ROW.unit]! & ~U_CALL) === 0 && (r[ROW.windowStatic]! & ~W_OUT_CALL) === 0,
+        callChainAlignedFrames: r => (r[ROW.unit]! & ~U_CALL) === 0 && (r[ROW.windowStatic]! & ~(W_OUT_CALL | W_ALIGN)) === 0,
+        callChainIndirectGuarded: r => (r[ROW.unit]! & ~(U_CALL | U_ICALL)) === 0
+            && (r[ROW.windowStatic]! & ~(W_OUT_CALL | W_CALLEE_ESP)) === 0,
+    };
+    const entriesTotal = window.reduce((s, w) => s + w.entries, 0);
+    const executedAvailable = problems.length === 0;
+    const out: Record<string, unknown> = {};
+    for (const [name, ok] of Object.entries(variants)) {
+        const q = window.filter(w => ok(w.r));
+        const ex = q.reduce((s, w) => s + w.executed, 0);
+        out[name] = {
+            functions: q.length,
+            entriesPct: pct(q.reduce((s, w) => s + w.entries, 0), entriesTotal),
+            executedPctOfRetired: executedAvailable ? pct(ex, retired) : null,
+            executedPctOfCounted: executedAvailable ? pct(ex, counted) : null,
+        };
+    }
+    const unknown = window.filter(w => inlineUnknown(w.r));
+    (out.inlineLeaves as Record<string, unknown>).unknown = {
+        note: "callers left out because a callee body changed inside the window or the call-site record is incomplete",
+        functions: unknown.length,
+        entriesPct: pct(unknown.reduce((s, w) => s + w.entries, 0), entriesTotal),
+    };
+    let direct = 0, indirect = 0, calleeRow = 0, calleeAdmitted = 0, calleeRetKnown = 0, calleeInlinable = 0;
+    let calleeVersionChanged = 0, incompleteCallers = 0;
+    for (const w of window) {
+        if (!sitesComplete(w.r)) incompleteCallers++;
+        for (const s of sites(w.r)) {
+            if (s.flags & CALL_INDIRECT) { indirect++; continue; }
+            direct++;
+            if (s.flags & CALL_RET_KNOWN) calleeRetKnown++;
+            const c = byEntry.get(s.target);
+            if (!c) continue;
+            calleeRow++;
+            if (unstable(c)) { calleeVersionChanged++; continue; }
+            if (c[ROW.unit] === 0) calleeAdmitted++;
+            if (inlinable(s.target)) calleeInlinable++;
+        }
+    }
+    return {
+        note: "cumulative shares: each option includes what M1 admits. inlineLeaves = callChain restricted to callers whose "
+            + `every call is direct to an admitted, call-free, window-clean callee of at most ${INLINE_MAX_INSTRUCTIONS} `
+            + "instructions, with a complete call-site record and callees whose body did not change inside the window. "
+            + "callChainIndirectGuarded assumes a guarded target supplies the callee's ESP effect. Entry shares are not "
+            + "CPU time or achieved tier coverage.",
+        executed: executedAvailable ? { available: true } : { available: false, problems },
+        variants: out,
+        sites: { direct, indirect, calleeWithRow: calleeRow, calleeAdmitted, calleeRetKnown, calleeInlinable,
+            calleeVersionChanged, incompleteCallers },
+    };
 }
 
 // @transient(harness census window; a reset or restore moves the kernel generation, which refuses the report)
@@ -358,6 +471,8 @@ function readSnapshot(withCounted: boolean): FnCensusSnapshot {
         rows.set(r[ROW.entryVirt]!, r);
     }
     const stats = Array.from({ length: STAT_NAMES.length }, (_, i) => Number(w.fn_census_stat!(i)));
+    const nc = w.fn_census_call_count!() >>> 0;
+    const calls = nc ? new Uint32Array(buffer, w.fn_census_calls_ptr!() >>> 0, nc * FN_CENSUS_CALL_WORDS).slice() : new Uint32Array(0);
     let counted: FnCensusSnapshot["counted"] = null;
     if (withCounted && countedArmed && typeof w.trace2_block_snapshot === "function") {
         const blocks: CountedSample[] = [];
@@ -377,7 +492,7 @@ function readSnapshot(withCounted: boolean): FnCensusSnapshot {
     }
     return {
         atMs: performance.now(), armEpoch, kernelGeneration: w.fn_census_generation!() >>> 0, exportsId: id,
-        enabled: w.fn_census_enabled!() >>> 0, rows, stats,
+        enabled: w.fn_census_enabled!() >>> 0, rows, calls, stats,
         retiredTotal: retiredAcc ? peekRetiredTotal(retiredAcc) : 0,
         fingerprint: hex(w.jit_codegen_fingerprint_hi!()) + ":" + hex(w.jit_codegen_fingerprint_lo!()),
         caps: [0, 1, 2, 3, 4].map(i => w.fn_census_get_cap!(i) >>> 0),
