@@ -168,7 +168,7 @@ export function synthesizeRegistry(
 
 /**
  * The first `{app}` shortcut: its target AND its command line. Pre-Galaxy GOG installers
- * carry no goggame-*.info, so the shortcut is the only record of how the game is started вЂ”
+ * carry no goggame-*.info, so the shortcut is the only record of how the game is started —
  * and some start it with arguments it cannot run without (Cossacks: European Wars runs
  * `Cossacks.exe .\videos\cdv.avi .\videos\kz.avi .\videos\Logo.avi dmln.exe`, a GOG
  * playlist player that terminates at once when ParamStr(1) is empty).
@@ -180,7 +180,7 @@ export function iconEntrypoint(icons: IconEntry[], installRoot = "C:\\"): { exe:
             const rel = target.replace(/^\{app\}[\\/]/i, "");
             if (rel && !rel.includes("{")) {
                 const params = resolveAppPath(icon.parameters ?? "", installRoot).trim();
-                // A parameter that still names an unresolved Inno constant ({src}, {code:вЂ¦})
+                // A parameter that still names an unresolved Inno constant ({src}, {code:…})
                 // cannot be reproduced here; launching without it beats a bogus argument.
                 return params && !params.includes("{") ? { exe: rel, args: params } : { exe: rel };
             }
@@ -234,7 +234,7 @@ function deepMerge(base: Record<string, unknown>, patch: Record<string, unknown>
 
 /**
  * Best-effort release year from an Inno AppCopyright string.
- * Copyright lines usually carry a year or range ("(C) 1997-2002 вЂ¦") вЂ” the
+ * Copyright lines usually carry a year or range ("(C) 1997-2002 …") — the
  * latest year in range is the closest to the actual release.
  */
 export function copyrightYear(copyright: string | undefined): number | undefined {
@@ -286,7 +286,7 @@ export function synthesizeManifest(opts: SynthOptions): SynthResult {
     const regPath = cli.regPath;
 
     const entrypoint = `rom/${exeName.replace(/\\/g, "/")}`;
-    // Container key (WGB v2): a GOG product id в†’ gog:<id>; else derive app:<slug>/byo.
+    // Container key (WGB v2): a GOG product id → gog:<id>; else derive app:<slug>/byo.
     const manifestGameId = gogInfo.gameId ? `gog:${gogInfo.gameId}` : deriveGameId({ name, entrypoint });
 
     // Installer [Dirs] entries: a store-only ZIP has no entry for an empty directory,
@@ -317,7 +317,7 @@ export function synthesizeManifest(opts: SynthOptions): SynthResult {
     };
     if (gameArgs) manifest.args = gameArgs;
 
-    // manifest.meta (WgbMeta): developer/year from the Inno header вЂ” feeds the
+    // manifest.meta (WgbMeta): developer/year from the Inno header — feeds the
     // library card without any external metadata lookup.
     const developer = opts.parsed.header.appPublisher?.trim();
     const year = copyrightYear(opts.parsed.header.appCopyright);
@@ -337,7 +337,7 @@ export function synthesizeManifest(opts: SynthOptions): SynthResult {
         : synthesizeRegistry(opts.parsed, regInstall);
 
     // goggame-*.script carries game-specific setRegistry actions (LucasArts keys, etc.)
-    // that Inno's [Registry] block does not include вЂ” only GOG.com metadata lives there.
+    // that Inno's [Registry] block does not include — only GOG.com metadata lives there.
     const scriptRegistry = synthesizeRegistryFromGogScripts(opts.gameFiles, regInstall);
     if (scriptRegistry.length > 0) {
         registry = mergeRegistrySeeds(registry, scriptRegistry);

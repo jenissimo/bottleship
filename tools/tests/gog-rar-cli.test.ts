@@ -129,7 +129,7 @@ test('installation folds parent directory casing and omits absent createDirs', a
 test('native exclusive publication supports Unicode and refuses a concurrent stale output unchanged', async () => {
     const f = fixture();
     try {
-        const pending = join(f.dir, 'С‡РµСЂРЅРѕРІРёРє-жёёж€Џ.partial'), output = join(f.dir, 'РіРѕС‚РѕРІРѕ-жёёж€Џ.wgb');
+        const pending = join(f.dir, 'черновик-游戏.partial'), output = join(f.dir, 'готово-游戏.wgb');
         writeFileSync(pending, 'complete fixture bytes');
         await publishGogBundle(pending, output);
         expect(readFileSync(output, 'utf8')).toBe('complete fixture bytes');

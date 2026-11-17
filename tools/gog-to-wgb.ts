@@ -133,7 +133,7 @@ function gatherSlices(installerPath: string, parsed: InnoParseResult): SliceSour
         slices.push(parseSliceSource(new FileSource(p)));
     }
     if (slices.length === 0) {
-        throw new Error(`multi-part installer Р Р†Р вЂљРІР‚Сњ no slices found next to ${basename(installerPath)} (expected ${sliceName(0)})`);
+        throw new Error(`multi-part installer — no slices found next to ${basename(installerPath)} (expected ${sliceName(0)})`);
     }
     console.log(`  slices: ${slices.length}`);
     return new MultiSliceReader(slices);

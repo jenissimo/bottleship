@@ -12,15 +12,15 @@ select `setup_*.exe` **and every matching `.bin` file together**, with their ori
 The loading overlay shows extraction and packing progress, then launches your copy.
 Files stay on your device.
 
-In Google Chrome, **Add game** also offers **Installed game folderРІР‚В¦** and **GOG installer
-folderРІР‚В¦**. The first option takes the game's installed directory, including its subfolders;
+In Google Chrome, **Add game** also offers **Installed game folder…** and **GOG installer
+folder…**. The first option takes the game's installed directory, including its subfolders;
 the second takes a directory containing one offline setup EXE and its matching BIN parts.
 For a download directory holding several installers, use Choose files to select one game.
 The picker grants read access. The worker reads files in chunks to build an independent WGB,
 so launching the saved package later does not require renewed access to the original folder.
 The wizard still lets you choose among executable candidates and adjust settings before saving.
 
-New imports default to **1024Р“вЂ”768**, **32-bit color**, **128 MB RAM**, **Windows 98**,
+New imports default to **1024×768**, **32-bit color**, **128 MB RAM**, **Windows 98**,
 and **Skip video: no**. Explicit bundle settings and curated overrides take precedence.
 
 New **GOG installer** packages put the installed files below
@@ -33,7 +33,7 @@ are preserved. Installed-folder imports, existing WGBs and cached packages are u
 this is a layout policy for newly generated installer packages, not a migration.
 
 
-The same importer is available through **Add game** in the library and **Load FileРІР‚В¦**
+The same importer is available through **Add game** in the library and **Load File…**
 in the dev panel. The wizard lets you review the executable and settings before choosing
 **Play now**, **Save to library**, or **Download WGB**. Play now saves the configured
 bundle to the cache and launches that bundle without extracting the installer again.
@@ -48,7 +48,7 @@ in the JavaScript heap. Decoder dictionaries and archive metadata still use memo
 
 Allow enough browser storage for roughly **three times the unpacked game size**, plus any
 existing cached copy. Browser quota and available disk space still limit an import. An
-exhausted quota produces an error directing you to **Settings РІвЂ вЂ™ Storage**.
+exhausted quota produces an error directing you to **Settings → Storage**.
 
 Successful library/play finalization removes its import workspace. Cancelled imports,
 downloads and interrupted sessions can leave temporary files. After imports and downloads
@@ -65,7 +65,7 @@ and then packaged through Installed game folder.
 
 ## Supported inputs
 
-- Single-file and multipart Inno Setup installers in the parser's supported 5.2РІР‚вЂњ6.x families,
+- Single-file and multipart Inno Setup installers in the parser's supported 5.2–6.x families,
   including supported GOG Galaxy file assembly records.
 - Numeric and lettered slice names, validated before extraction. Missing, duplicate or
   unrelated parts fail with a message instead of silently importing a partial game.
