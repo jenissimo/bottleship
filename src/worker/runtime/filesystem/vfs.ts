@@ -3270,18 +3270,26 @@ class OpfsOverlay {
             // only point at which the anchor may be moved.
             const flush = this.flushWriteBuffer(cacheEntry);
             cacheEntry.bufferOffset = offset + data.length;
-            await flush;
+            const run = (async () => {
+                await flush;
+                await this.ensureWriter(cacheEntry);
+                const buffer = new Uint8Array(data).buffer;
+                const doWrite = async () => {
+                    await cacheEntry!.writer!.seek(offset);
+                    await cacheEntry!.writer!.write(buffer);
+                    cacheEntry!.lastUsed = performance.now();
+                };
+                cacheEntry.queue = cacheEntry.queue.then(doWrite, doWrite);
+                await cacheEntry.queue;
+            })();
 
-            await this.ensureWriter(cacheEntry);
-            const buffer = new Uint8Array(data).buffer;
-            const doWrite = async () => {
-                await cacheEntry!.writer!.seek(offset);
-                await cacheEntry!.writer!.write(buffer);
-                cacheEntry!.lastUsed = performance.now();
-            };
-
-            cacheEntry.queue = cacheEntry.queue.then(doWrite, doWrite);
-            await cacheEntry.queue;
+            // Close/idle cleanup must drain admission as well as the queued stream write.
+            cacheEntry.flushInFlight = run;
+            try {
+                await run;
+            } finally {
+                if (cacheEntry.flushInFlight === run) cacheEntry.flushInFlight = null;
+            }
 
             this.scheduleWriterCleanup();
 
