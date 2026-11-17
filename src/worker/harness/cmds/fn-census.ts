@@ -197,6 +197,8 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
         }
     }
 
+    const execProblems = counted ? executedProblems(counted, countedTotal, retired, saturated, before)
+        : ["the counted channel was not armed at fnCensusMark(); executed coverage is unknown, not zero"];
     const ranked = [...window].sort((a, b) => (b.executed - a.executed) || (b.entries - a.entries)).slice(0, top);
     return {
         ok: true,
@@ -233,11 +235,11 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
                 admittedPct: pct(probesAdmitted, probesAdmitted + probesRefused),
                 refusedBy: probeReasons,
             },
-            executed: counted && executedProblems(counted, countedTotal, retired, saturated, before).length
+            executed: counted && execProblems.length
                 ? {
                     available: false,
                     note: "executed coverage is unavailable for this window; the raw counts are kept as evidence",
-                    problems: executedProblems(counted, countedTotal, retired, saturated, before),
+                    problems: execProblems,
                     raw: { retiredIns: retired, countedIns: countedTotal, admittedIns: ownedAdmitted, refusedIns: ownedRefused,
                         unattributedIns: unattributed, changedVersionIns: ownedChanged, saturatedBlocks: saturated,
                         recording: counted.recording, watchedPages: counted.watchedPages, armedPages: counted.armedPages },
@@ -266,7 +268,8 @@ export function summarizeFnCensus(before: FnCensusSnapshot, after: FnCensusSnaps
                 functions: versionChanged.length,
                 entries: versionChanged.reduce((s, w) => s + w.entries, 0),
             },
-            callContinuation: callContinuation(window, after, retired, countedTotal),
+            callContinuation: callContinuation(window, after, retired, countedTotal,
+                { executedProblems: execProblems, unstable: changedVersion }),
             dropped: {
                 rowTableFull: stat(1),
                 rangePoolOverflow: stat(8),
@@ -331,7 +334,10 @@ type Weighted = { r: Uint32Array; entries: number; executed: number };
  * M1 already admits) and executed shares are of the window's counted owners, so they are lower
  * bounds wherever the counted channel missed pages.
  */
-export function callContinuation(window: Weighted[], after: FnCensusSnapshot, retired: number, counted: number) {
+export function callContinuation(window: Weighted[], after: FnCensusSnapshot, retired: number, counted: number,
+    opts: { executedProblems?: string[]; unstable?: (r: Uint32Array) => boolean } = {}) {
+    const problems = opts.executedProblems ?? [];
+    const unstable = opts.unstable ?? (() => false);
     const byEntry = new Map<number, Uint32Array>();
     for (const r of after.rows.values()) byEntry.set(r[ROW.entryVirt]!, r);
     const sites = (r: Uint32Array) => {
@@ -343,14 +349,25 @@ export function callContinuation(window: Weighted[], after: FnCensusSnapshot, re
         }
         return out;
     };
+    const sitesComplete = (r: Uint32Array) => {
+        const s = sites(r);
+        return s.length === r[ROW.callCount] && s.filter(x => !(x.flags & CALL_INDIRECT)).length === r[ROW.outCalls];
+    };
+    const calleeUnstable = (t: number) => {
+        const c = byEntry.get(t);
+        return !!c && unstable(c);
+    };
     const inlinable = (t: number) => {
         const c = byEntry.get(t);
-        return !!c && c[ROW.unit] === 0 && c[ROW.windowStatic] === 0 && c[ROW.outCalls] === 0
+        return !!c && !unstable(c) && c[ROW.unit] === 0 && c[ROW.windowStatic] === 0 && c[ROW.outCalls] === 0
             && c[ROW.instructions]! <= INLINE_MAX_INSTRUCTIONS;
     };
+    const inlineShape = (r: Uint32Array) => (r[ROW.unit]! & ~U_CALL) === 0 && (r[ROW.windowStatic]! & ~W_OUT_CALL) === 0;
+    const inlineUnknown = (r: Uint32Array) => inlineShape(r)
+        && (!sitesComplete(r) || sites(r).some(s => !(s.flags & CALL_INDIRECT) && calleeUnstable(s.target)));
     const variants: Record<string, (r: Uint32Array) => boolean> = {
         m1: r => r[ROW.unit] === 0 && r[ROW.windowStatic] === 0,
-        inlineLeaves: r => (r[ROW.unit]! & ~U_CALL) === 0 && (r[ROW.windowStatic]! & ~W_OUT_CALL) === 0
+        inlineLeaves: r => inlineShape(r) && !inlineUnknown(r)
             && sites(r).every(s => !(s.flags & CALL_INDIRECT) && inlinable(s.target)),
         callChain: r => (r[ROW.unit]! & ~U_CALL) === 0 && (r[ROW.windowStatic]! & ~W_OUT_CALL) === 0,
         callChainAlignedFrames: r => (r[ROW.unit]! & ~U_CALL) === 0 && (r[ROW.windowStatic]! & ~(W_OUT_CALL | W_ALIGN)) === 0,
@@ -358,6 +375,7 @@ export function callContinuation(window: Weighted[], after: FnCensusSnapshot, re
             && (r[ROW.windowStatic]! & ~(W_OUT_CALL | W_CALLEE_ESP)) === 0,
     };
     const entriesTotal = window.reduce((s, w) => s + w.entries, 0);
+    const executedAvailable = problems.length === 0;
     const out: Record<string, unknown> = {};
     for (const [name, ok] of Object.entries(variants)) {
         const q = window.filter(w => ok(w.r));
@@ -365,12 +383,20 @@ export function callContinuation(window: Weighted[], after: FnCensusSnapshot, re
         out[name] = {
             functions: q.length,
             entriesPct: pct(q.reduce((s, w) => s + w.entries, 0), entriesTotal),
-            executedPctOfRetired: pct(ex, retired),
-            executedPctOfCounted: pct(ex, counted),
+            executedPctOfRetired: executedAvailable ? pct(ex, retired) : null,
+            executedPctOfCounted: executedAvailable ? pct(ex, counted) : null,
         };
     }
+    const unknown = window.filter(w => inlineUnknown(w.r));
+    (out.inlineLeaves as Record<string, unknown>).unknown = {
+        note: "callers left out because a callee body changed inside the window or the call-site record is incomplete",
+        functions: unknown.length,
+        entriesPct: pct(unknown.reduce((s, w) => s + w.entries, 0), entriesTotal),
+    };
     let direct = 0, indirect = 0, calleeRow = 0, calleeAdmitted = 0, calleeRetKnown = 0, calleeInlinable = 0;
+    let calleeVersionChanged = 0, incompleteCallers = 0;
     for (const w of window) {
+        if (!sitesComplete(w.r)) incompleteCallers++;
         for (const s of sites(w.r)) {
             if (s.flags & CALL_INDIRECT) { indirect++; continue; }
             direct++;
@@ -378,6 +404,7 @@ export function callContinuation(window: Weighted[], after: FnCensusSnapshot, re
             const c = byEntry.get(s.target);
             if (!c) continue;
             calleeRow++;
+            if (unstable(c)) { calleeVersionChanged++; continue; }
             if (c[ROW.unit] === 0) calleeAdmitted++;
             if (inlinable(s.target)) calleeInlinable++;
         }
@@ -385,9 +412,13 @@ export function callContinuation(window: Weighted[], after: FnCensusSnapshot, re
     return {
         note: "cumulative shares: each option includes what M1 admits. inlineLeaves = callChain restricted to callers whose "
             + `every call is direct to an admitted, call-free, window-clean callee of at most ${INLINE_MAX_INSTRUCTIONS} `
-            + "instructions. callChainIndirectGuarded assumes a guarded target supplies the callee's ESP effect.",
+            + "instructions, with a complete call-site record and callees whose body did not change inside the window. "
+            + "callChainIndirectGuarded assumes a guarded target supplies the callee's ESP effect. Entry shares are not "
+            + "CPU time or achieved tier coverage.",
+        executed: executedAvailable ? { available: true } : { available: false, problems },
         variants: out,
-        sites: { direct, indirect, calleeWithRow: calleeRow, calleeAdmitted, calleeRetKnown, calleeInlinable },
+        sites: { direct, indirect, calleeWithRow: calleeRow, calleeAdmitted, calleeRetKnown, calleeInlinable,
+            calleeVersionChanged, incompleteCallers },
     };
 }
 

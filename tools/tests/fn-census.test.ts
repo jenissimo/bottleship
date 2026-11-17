@@ -265,6 +265,58 @@ describe("call continuation estimate (schema 2)", () => {
         expect(out.variants.callChainIndirectGuarded.executedPctOfRetired).toBe(28);
     });
     test("call sites are joined to callee rows", () => {
-        expect(out.sites).toEqual({ direct: 3, indirect: 1, calleeWithRow: 3, calleeAdmitted: 3, calleeRetKnown: 3, calleeInlinable: 2 });
+        expect(out.sites).toEqual({ direct: 3, indirect: 1, calleeWithRow: 3, calleeAdmitted: 3, calleeRetKnown: 3, calleeInlinable: 2,
+            calleeVersionChanged: 0, incompleteCallers: 0 });
+        expect(out.executed).toEqual({ available: true });
+    });
+    test("unavailable executed coverage leaves every continuation share null", () => {
+        const o = callContinuation(window, after, 100, 3120, { executedProblems: ["counted 3120 instructions exceed the 100 retired"] }) as any;
+        expect(o.executed.available).toBe(false);
+        for (const v of Object.values(o.variants) as any[]) {
+            expect(v.executedPctOfRetired).toBeNull();
+            expect(v.executedPctOfCounted).toBeNull();
+        }
+        expect(o.variants.callChain.entriesPct).toBe(out.variants.callChain.entriesPct);
+    });
+    test("a callee whose body changed in the window cannot admit its caller", () => {
+        const o = callContinuation(window, after, 4000, 3120, { unstable: r => r[ROW.entryVirt] === LEAF2 }) as any;
+        expect(out.variants.inlineLeaves.functions).toBe(3);
+        expect(o.variants.inlineLeaves.functions).toBe(2);
+        expect(o.variants.inlineLeaves.unknown.functions).toBe(1);
+        expect(o.sites.calleeVersionChanged).toBe(2);
+        expect(o.variants.callChain.executedPctOfRetired).toBe(8);
+    });
+    test("a truncated call-site record does not prove every call inlinable", () => {
+        const two = new Uint32Array([C1 + 5, LEAF2, 2, 4]);
+        const rs = [
+            row({ entryVirt: LEAF2, entries: 1, instructions: 20 }),
+            row({ entryVirt: C1, entries: 1, unit: 1, windowStatic: 16, outCalls: 2, callStart: 0, callCount: 1 }),
+            row({ entryVirt: C2, entries: 1, unit: 1, windowStatic: 16, outCalls: 1, callStart: 1, callCount: 0 }),
+        ];
+        const o = callContinuation(rs.map(r => ({ r, entries: 1, executed: 10 })), snap({ calls: two }, rs), 1000, 30) as any;
+        expect(o.variants.inlineLeaves.functions).toBe(1);
+        expect(o.variants.inlineLeaves.unknown.functions).toBe(2);
+        expect(o.sites.incompleteCallers).toBe(2);
+        expect(o.variants.callChain.functions).toBe(3);
+    });
+    test("summarize carries refused executed coverage and callee versions into the continuation", () => {
+        const L = row({ entryVirt: LEAF2, entries: 0, instructions: 20, flags: 2, analyses: 1 });
+        const C = row({ entryVirt: C1, entries: 0, unit: 1, windowStatic: 16, outCalls: 1, callStart: 0, callCount: 1, flags: 2, analyses: 1 });
+        const cs = new Uint32Array([C1 + 5, LEAF2, 2, 4]);
+        const ch = (blocks: CountedSample[]) => ({ recording: true, watchedPages: 1, armedPages: 1, pagesNotArmed: 0, slotOverflow: 0, blocks });
+        const before = snap({ atMs: 1, calls: cs, counted: ch([]) }, [L, C]);
+        const L2 = row({ entryVirt: LEAF2, entries: 10, instructions: 20, flags: 2, analyses: 2, smcEvents: 1 });
+        const C2r = row({ entryVirt: C1, entries: 10, unit: 1, windowStatic: 16, outCalls: 1, callStart: 0, callCount: 1, flags: 2, analyses: 1 });
+        const bad = summarizeFnCensus(before, snap({ atMs: 2, retiredTotal: 100, calls: cs, counted: ch([{ addr: C1, exec: 100, ins: 2, owner: 2 }]) }, [L2, C2r], { calls: 20 }));
+        expect(bad.ok).toBe(true);
+        if (!bad.ok) return;
+        const cc = bad.report.callContinuation as any;
+        expect(cc.executed.available).toBe(false);
+        expect(cc.variants.callChain.executedPctOfRetired).toBeNull();
+        expect(cc.variants.inlineLeaves.functions).toBe(0);
+        expect(cc.variants.inlineLeaves.unknown.functions).toBe(1);
+        const unarmed = summarizeFnCensus(snap({ atMs: 1, calls: cs }, [L, C]), snap({ atMs: 2, retiredTotal: 1000, calls: cs }, [L2, C2r], { calls: 20 }));
+        if (!unarmed.ok) throw new Error(unarmed.refuse);
+        expect((unarmed.report.callContinuation as any).variants.m1.executedPctOfRetired).toBeNull();
     });
 });
