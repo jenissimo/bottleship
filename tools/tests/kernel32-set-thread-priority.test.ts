@@ -28,9 +28,9 @@ const CURRENT_THREAD = 0xfffffffe;
 const NORMAL_PRIORITY_CLASS = 0x20;
 const REALTIME_PRIORITY_CLASS = 0x100;
 const THREAD_ID = 0x7ff1;
-const HTHREAD = 0x30044;
+let threadHandle = 0;
 const OTHER_ID = 0x7ff2;
-const HOTHER = 0x30048;
+let otherThreadHandle = 0;
 const XP = { major: 5, minor: 1, build: 2600, platformId: 2 };
 const VISTA = { major: 6, minor: 0, build: 6000, platformId: 2 };
 
@@ -57,8 +57,11 @@ describe("SetThreadPriority", () => {
         config.osVersion = { ...XP };
         lastError = 0;
         scheduler.setLastError = (code: number) => { lastError = code; };
-        scheduler.threads.set(THREAD_ID, { id: THREAD_ID, handle: HTHREAD, priority: 0 });
-        SystemResourceProvider.getInstance().registerKernelObjectAt(HTHREAD, { kind: "thread", threadId: THREAD_ID });
+        // Allocate owned handles; fixed values can belong to another suite's live objects.
+        threadHandle = SystemResourceProvider.getInstance().registerKernelObject({ kind: "thread", threadId: THREAD_ID });
+        expect(threadHandle).not.toBe(0);
+        otherThreadHandle = 0;
+        scheduler.threads.set(THREAD_ID, { id: THREAD_ID, handle: threadHandle, priority: 0 });
         resetProcessApiState();
     });
     afterEach(() => {
@@ -66,19 +69,19 @@ describe("SetThreadPriority", () => {
         scheduler.currentThreadId = savedCurrent;
         scheduler.threads.delete(THREAD_ID);
         scheduler.threads.delete(OTHER_ID);
-        SystemResourceProvider.getInstance().unregisterKernelObject(HTHREAD);
-        SystemResourceProvider.getInstance().unregisterKernelObject(HOTHER);
+        SystemResourceProvider.getInstance().unregisterKernelObject(threadHandle);
+        if (otherThreadHandle !== 0) SystemResourceProvider.getInstance().unregisterKernelObject(otherThreadHandle);
         config.osVersion = savedOs;
         resetProcessApiState();
     });
 
     /** stdcall: every outcome, success or failure, pops exactly the arguments it was given. */
-    const set = (priority: number, h = HTHREAD) => {
+    const set = (priority: number, h = threadHandle) => {
         const r = api("SetThreadPriority")(null as never, new Uint8Array(0), [h, priority >>> 0]);
         expect(r.stackCleanup).toBe(8);
         return r.value;
     };
-    const get = (h = HTHREAD) => {
+    const get = (h = threadHandle) => {
         const r = api("GetThreadPriority")(null as never, new Uint8Array(0), [h]);
         expect(r.stackCleanup).toBe(4);
         return r.value | 0;
@@ -152,7 +155,7 @@ describe("SetThreadPriority", () => {
     });
 
     test("the scheduler leaves validation to the API and rejects only an unknown thread", () => {
-        expect(scheduler.setThreadPriority(HTHREAD, 6)).toBe(true);
+        expect(scheduler.setThreadPriority(threadHandle, 6)).toBe(true);
         expect(get()).toBe(6);
         expect(scheduler.setThreadPriority(0x1234, 0)).toBe(false);
     });
@@ -161,8 +164,9 @@ describe("SetThreadPriority", () => {
         beforeEach(() => {
             config.osVersion = { ...VISTA };
             scheduler.currentThreadId = THREAD_ID;
-            scheduler.threads.set(OTHER_ID, { id: OTHER_ID, handle: HOTHER, priority: 0 });
-            SystemResourceProvider.getInstance().registerKernelObjectAt(HOTHER, { kind: "thread", threadId: OTHER_ID });
+            otherThreadHandle = SystemResourceProvider.getInstance().registerKernelObject({ kind: "thread", threadId: OTHER_ID });
+            expect(otherThreadHandle).not.toBe(0);
+            scheduler.threads.set(OTHER_ID, { id: OTHER_ID, handle: otherThreadHandle, priority: 0 });
         });
 
         test("BEGIN then END on the current thread succeed, by pseudo or real handle", () => {
@@ -184,7 +188,7 @@ describe("SetThreadPriority", () => {
         });
 
         test("another thread's handle is refused and its mode is untouched", () => {
-            expect(set(THREAD_MODE_BACKGROUND_BEGIN, HOTHER)).toBe(0);
+            expect(set(THREAD_MODE_BACKGROUND_BEGIN, otherThreadHandle)).toBe(0);
             expect(lastError).toBe(ERROR_INVALID_PARAMETER);
             scheduler.currentThreadId = OTHER_ID;
             expect(set(THREAD_MODE_BACKGROUND_END, CURRENT_THREAD)).toBe(0);
