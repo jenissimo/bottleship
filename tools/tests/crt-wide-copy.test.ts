@@ -1,9 +1,11 @@
+import { System } from "../../src/worker/core/system";
 import { afterAll, afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Logger } from "../../src/worker/core/logger";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { msvcrtModule } from "../../src/worker/api/msvcrt.api";
 import type { ThunkImplementation } from "../../src/worker/core/thunking/thunk-dispatcher";
 
+let originalProcess: ReturnType<typeof System.getInstance>["process"];
 let mem: Uint8Array, errno: number, next: number;
 let exports: Record<string, ThunkImplementation>;
 function put(ptr: number, value: string): number {
@@ -26,6 +28,8 @@ import { registerCrtWideCopyExports } from "../../src/worker/modules/crt-wide-co
 let quietLog: ReturnType<typeof spyOn>, quietError: ReturnType<typeof spyOn>;
 afterEach(() => { quietLog.mockRestore(); quietError.mockRestore(); });
 beforeEach(() => {
+    originalProcess = System.getInstance().process;
+    System.getInstance().process = null;
     quietLog = spyOn(Logger, "log").mockImplementation(() => {});
     quietError = spyOn(Logger, "error").mockImplementation(() => {});
     mem = new Uint8Array(0x10000).fill(0x55); Mem.bind(() => mem);
@@ -103,3 +107,5 @@ for (const name of ["wcsncpy_s", "wcsncat_s"]) {
         expect(errno).toBe(123);
     });
 }
+
+afterEach(() => { System.getInstance().process = originalProcess; });

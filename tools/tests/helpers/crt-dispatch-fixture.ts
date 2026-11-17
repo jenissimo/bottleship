@@ -43,7 +43,7 @@ export function crtDispatchFixture(name: string) {
     // Runtime allocation/data-export publication is unrelated to these calls. Keep the
     // production initialize/registration, formatter, readers and errno writer intact.
     crt.ensureRuntimeStorage = crt.registerDataExports = () => {};
-    crt.errnoAddr = 0x800;
+    crt.errnoAddr = 0x10800;
     crt.initialize(process);
     d.dispatchTable[id] = crt.exports[name];
     expect(typeof d.dispatchTable[id]).toBe("function");
@@ -66,6 +66,7 @@ export function crtDispatchFixture(name: string) {
     }
     return {mem, dv, cpu, d, esp, ret, retry, writes, reads, put,
         protect(address: number, size: number, perms: "r" | "noaccess") { expect(space.protect(address, size, perms)).toBe(true); },
+        useProductionBinding() { Mem.bind(() => mem); },
         deny(address: number) { denied = address; },
         denyRead(address: number) { deniedRead = address; },
         call(args: number[]) {
@@ -74,7 +75,7 @@ export function crtDispatchFixture(name: string) {
             cpu.segment_offsets[4] = teb; cpu.flags[0] = 0x202;
             dv.setUint32(teb, frame, true); dv.setUint32(frame, 0xffffffff, true); dv.setUint32(frame + 4, 0x12000, true);
             dv.setUint32(esp, ret, true); args.forEach((value, i) => dv.setUint32(esp + 4 + i * 4, value, true));
-            dv.setUint32(0x800, 123, true);
+            dv.setUint32(0x10800, 123, true);
             d._handlePortWriteSlow(id, true);
         },
         expectFault(address: number, access = "w") {
@@ -91,7 +92,7 @@ export function crtDispatchFixture(name: string) {
             expect(dv.getUint32(esp, true)).toBe(d.sehDispatchStubAddress);
             expect(boundaries).toEqual([[ThunkBoundaryKind.CALLBACK_STUB, 0]]);
             expect(d.lastExpectedEspAfterReturn).toBe(0);
-            expect(dv.getUint32(0x800, true)).toBe(123);
+            expect(dv.getUint32(0x10800, true)).toBe(123);
         },
         expectReturn(value: number, errno = 123) {
             expect(d.sehDispatchStack).toHaveLength(0);
@@ -99,7 +100,7 @@ export function crtDispatchFixture(name: string) {
             expect(boundaries).toEqual([[ThunkBoundaryKind.THUNK_STUB, 0]]);
             expect(d.lastExpectedEspAfterReturn).toBe(esp + 4);
             expect(dv.getUint32(esp, true)).toBe(ret);
-            expect(dv.getUint32(0x800, true)).toBe(errno);
+            expect(dv.getUint32(0x10800, true)).toBe(errno);
         },
         expectRetry() {
             const s = d.sehDispatchStack[0].scratchAddr;
