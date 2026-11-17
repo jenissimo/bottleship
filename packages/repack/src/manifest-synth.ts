@@ -26,6 +26,7 @@ export interface GogGameInfo {
     name?: string;
     exe?: string;
     args?: string;
+    workingDir?: string;
 }
 
 export function parseGogGameInfo(files: Map<string, Uint8Array>): GogGameInfo {
@@ -52,6 +53,7 @@ export function parseGogGameInfo(files: Map<string, Uint8Array>): GogGameInfo {
                 name: (parsed.name as string | undefined) ?? (parsed.gameTitle as string | undefined),
                 exe,
                 args,
+                workingDir: typeof primary?.workingDir === "string" ? primary.workingDir : undefined,
             };
         } catch { /* ignore */ }
     }
@@ -203,6 +205,10 @@ export interface SynthOptions {
         regPath?: string;
         regHive?: string;
         regInstall?: string;
+        /** Guest installation directory for new installer imports (files + registry default). */
+        installDir?: string;
+        /** Explicit local DLL policy; never inferred from filenames. */
+        appDirDlls?: string[];
         skipVideo?: boolean;
     };
 }

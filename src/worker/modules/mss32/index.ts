@@ -9,11 +9,12 @@ import { TimeService } from "../../runtime/time";
 import { MSSContext, createMSSContext, SMP_DONE, SMP_PLAYING } from "./context";
 import { finishSamplePlayback, getBytesPerSecond, getPlaybackLengthBytes, setSampleStatus, setStreamStatus, writeSamplePosition, writeStreamPosition, startHeartbeat, stopHeartbeat } from "./helpers";
 import { updateEmulatorState, playSample, appendDecodedChunk, resetMssRingBuffers } from "./playback-engine";
-import { invokeEOSCallback } from "./callbacks";
+import { invokeEOSCallback, servePendingEOBCallbacks } from "./callbacks";
 import { pumpVfsStreams, serveIncrementalStreams } from "./stream-engine";
 import { mss32Module } from "../../api/mss32.api";
 import { convertToFloat } from "./audio-decode";
 import { createCoreExports } from "./core";
+import { clearQuickAudio, createQuickExports, serviceQuickAudio } from "./quick";
 import { createDigitalDriverExports } from "./digital-driver";
 import { createSampleExports } from "./sample";
 import { createSampleBufferExports } from "./sample-buffers";
@@ -75,6 +76,7 @@ export class MSS32 implements IModule {
         Object.assign(this.exports, createCoreExports(this.ctx));
         Object.assign(this.exports, createDigitalDriverExports(this.ctx));
         Object.assign(this.exports, createSampleExports(this.ctx));
+        Object.assign(this.exports, createQuickExports(this.ctx));
         Object.assign(this.exports, createSampleBufferExports(this.ctx));
         Object.assign(this.exports, createStreamExports(this.ctx));
         Object.assign(this.exports, createRedbookExports(this.ctx));
@@ -123,8 +125,8 @@ export class MSS32 implements IModule {
             const serviced: ThunkImplementation = (thunkCtx, mem, args) => {
                 const result = impl(thunkCtx, mem, args);
                 if (typeof result !== "number") return result;
-                return serveIncrementalStreams(
-                    this.ctx, thunkCtx, stackCleanup, `mss32:${name}`, result) ?? result;
+                return servePendingEOBCallbacks(this.ctx, thunkCtx, stackCleanup, `mss32:${name}`, result)
+                    ?? serveIncrementalStreams(this.ctx, thunkCtx, stackCleanup, `mss32:${name}`, result) ?? result;
             };
             this.exports[name] = serviced;
         }
@@ -141,6 +143,7 @@ export class MSS32 implements IModule {
             if (!sample.isPlaying) return; // already handled by heartbeat
             finishSamplePlayback(ctx, sample, getPlaybackLengthBytes(sample));
             invokeEOSCallback(ctx, sample);
+            serviceQuickAudio(ctx);
             return;
         }
 
@@ -329,7 +332,9 @@ export class MSS32 implements IModule {
         ctx.timers.clear();
         ctx.pendingTimerCallbacks.length = 0;
         ctx.pendingEOSCallbacks.length = 0;
+        ctx.pendingEOBCallbacks.length = 0;
         ctx.insideAilServe = false;
+        clearQuickAudio(ctx);
         resetMssRingBuffers();
         ctx.samples.clear();
         ctx.samplesById.clear();

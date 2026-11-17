@@ -15,6 +15,18 @@ export const SMP_STOPPED = 8;
 /** Released while still audible — the mixer still owns the voice (AIL_active_sample_count counts it). */
 export const SMP_PLAYINGBUTRELEASED = 16;
 
+/** Opaque HAUDIO owner; load_mem borrows the image until unload. */
+export interface MSSQuickAudio {
+    handle: number;
+    imageAddress: number;
+    imageLength: number;
+    sampleHandle: number;
+    sampleId: number;
+    status: number;
+    volume: number;
+    pan: number;
+}
+
 export interface MSSContext {
     process: Process;
 
@@ -29,6 +41,7 @@ export interface MSSContext {
     sequences: Map<number, MSSSequence>;
     /** Opaque HPROVIDERs allocated for .m3d/.flt/.asi RIB_Main entry points. */
     ribProviders: Map<number, MSSRibProvider>;
+    quickAudio: Map<number, MSSQuickAudio>;
 
     nextSampleId: number;
     nextStreamId: number;
@@ -89,6 +102,8 @@ export interface MSSContext {
     pendingTimerCallbacks: Array<{ callback: number; user: number; handle?: number }>;
     /** Queue of pending EOS callbacks - processed during _AIL_serve to avoid corrupting CPU state */
     pendingEOSCallbacks: Array<{ callback: number; handle: number; user: number }>;
+    /** EOB events queued by mixer progress, drained only at a safe guest service point. */
+    pendingEOBCallbacks: Array<{ callback: number; handle: number; id: number }>;
     /** Stream callbacks (AIL_register_stream_callback) an incremental stream hit the end
      *  of source on. One arg, HSTREAM — drained in _AIL_serve like the EOS queue. */
     pendingStreamCallbacks: Array<{ callback: number; handle: number }>;
@@ -132,6 +147,7 @@ export function createMSSContext(process: Process): MSSContext {
         timers: new Map(),
         sequences: new Map(),
         ribProviders: new Map(),
+        quickAudio: new Map(),
 
         nextSampleId: 1,
         nextStreamId: 0x00010001,
@@ -190,6 +206,7 @@ export function createMSSContext(process: Process): MSSContext {
         memAllocatedByMss: new Set(),
         pendingTimerCallbacks: [],
         pendingEOSCallbacks: [],
+        pendingEOBCallbacks: [],
         pendingStreamCallbacks: [],
         insideAilServe: false,
         serveDepth: 0,

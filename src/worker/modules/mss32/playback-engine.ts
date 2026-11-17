@@ -9,6 +9,8 @@ import {
     getDigitalMasterVolume,
 } from "./helpers";
 import { invokeEOSCallback } from "./callbacks";
+import { updateSampleBufferPlayback } from "./sample-buffer-playback";
+import { serviceQuickAudio } from "./quick";
 import {
     createAudioRingBuffer,
     writeRingData,
@@ -80,7 +82,7 @@ function ensureRingBuffer(id: number, channels: number, sampleRate: number, bits
     return sab;
 }
 
-function releaseRingBuffer(id: number): void {
+export function releaseRingBuffer(id: number): void {
     const entry = ringBuffers.get(id);
     if (entry) {
         if (entry.registered) {
@@ -100,12 +102,12 @@ function releaseRingBuffer(id: number): void {
 // would read as a completely empty one.
 
 /** Float32 frames the worklet plays from; the guest's own block align is unrelated. */
-function ringFrameBytes(stream: MSSStream): number {
+function ringFrameBytes(stream: MSSStream | MSSSample): number {
     return Math.max(1, stream.channels) * 4;
 }
 
 /** (Re)create a stream's streaming ring. `ringBytes` is rounded down to whole frames. */
-export function ensureStreamingRing(stream: MSSStream, ringBytes: number): SharedArrayBuffer {
+export function ensureStreamingRing(stream: MSSStream | MSSSample, ringBytes: number): SharedArrayBuffer {
     releaseRingBuffer(stream.id);
 
     const frameBytes = ringFrameBytes(stream);
@@ -130,7 +132,7 @@ export function ensureStreamingRing(stream: MSSStream, ringBytes: number): Share
 }
 
 /** Bytes the producer may write right now (one frame of headroom is never offered). */
-export function streamingRingFreeBytes(stream: MSSStream): number {
+export function streamingRingFreeBytes(stream: MSSStream | MSSSample): number {
     const entry = ringBuffers.get(stream.id);
     if (!entry?.streaming) return 0;
     const ringBytes = getCtrl(entry.sab, CTRL_DATA_LENGTH);
@@ -143,7 +145,7 @@ export function streamingRingFreeBytes(stream: MSSStream): number {
 }
 
 /** Total ring capacity in bytes, or 0 when the stream has no streaming ring. */
-export function streamingRingBytes(stream: MSSStream): number {
+export function streamingRingBytes(stream: MSSStream | MSSSample): number {
     const entry = ringBuffers.get(stream.id);
     if (!entry?.streaming) return 0;
     return getCtrl(entry.sab, CTRL_DATA_LENGTH);
@@ -154,7 +156,7 @@ export function streamingRingBytes(stream: MSSStream): number {
  * FLOATS consumed, so the caller can keep the remainder for the next refill
  * rather than dropping it (a dropped tail is an inaudible click, not an error).
  */
-export function appendStreamingRing(stream: MSSStream, floats: Float32Array, fromFloat = 0): number {
+export function appendStreamingRing(stream: MSSStream | MSSSample, floats: Float32Array, fromFloat = 0): number {
     const entry = ringBuffers.get(stream.id);
     if (!entry?.streaming) return 0;
     const ringBytes = getCtrl(entry.sab, CTRL_DATA_LENGTH);
@@ -195,7 +197,7 @@ export function streamingRingPlayCursor(stream: MSSStream): number {
     return getCtrl(entry.sab, CTRL_PLAY_CURSOR);
 }
 
-export function armStreamingRing(ctx: MSSContext, stream: MSSStream, playing: boolean): void {
+export function armStreamingRing(ctx: MSSContext, stream: MSSStream | MSSSample, playing: boolean): void {
     const entry = ringBuffers.get(stream.id);
     if (!entry?.streaming) return;
     const sab = entry.sab;
@@ -867,6 +869,11 @@ export function updateEmulatorState(ctx: MSSContext): void {
     for (const sample of ctx.samples.values()) {
         if (!sample.fileData) continue;
 
+        if (sample.bufferPlayback) {
+            updateSampleBufferPlayback(ctx, sample);
+            continue;
+        }
+
         tryKickPendingSampleStart(ctx, sample);
 
         if (!sample.isPlaying || !sample.startTime) continue;
@@ -968,6 +975,8 @@ export function updateEmulatorState(ctx: MSSContext): void {
             }
         }
     }
+
+    serviceQuickAudio(ctx);
 
     // Update streams position tracking
     for (const stream of ctx.streams.values()) {

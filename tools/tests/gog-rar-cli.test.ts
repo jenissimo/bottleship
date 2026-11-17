@@ -61,19 +61,19 @@ test('old GOG independent RAR parts install game + support/app overlay, preserve
         const synth = await synthesizeInstalledGog(app, parsed, { os: 'winxp', ramMB: 256 }, {
             '123': { manifest: { emulator: { screenResolution: { width: 800, height: 600, bpp: 32 } } } },
         });
-        expect(synth.manifest.entrypoint).toBe('rom/game.exe');
+        expect(synth.manifest.entrypoint).toBe('rom/Games/gog-123/game.exe');
         expect(synth.manifest.args).toBe('--info-argument');
         expect(synth.manifest.gameId).toBe('gog:123');
         expect(synth.manifest.name).toBe('Metadata Name');
-        expect((synth.manifest.emulator as any).createDirs).toEqual(['emptyFromArchive', 'emptyFromInstaller']);
+        expect((synth.manifest.emulator as any).createDirs).toEqual(['C:\\Games\\gog-123\\emptyFromArchive', 'C:\\Games\\gog-123\\emptyFromInstaller']);
         expect((synth.manifest.emulator as any).screenResolution.width).toBe(800);
-        expect(synth.registry).toEqual([{ root: 'HKLM', path: 'Software\\Fixture', values: [{ name: 'Location', type: 'REG_SZ', data: 'C:\\' }] }]);
+        expect(synth.registry).toEqual([{ root: 'HKLM', path: 'Software\\Fixture', values: [{ name: 'Location', type: 'REG_SZ', data: 'C:\\Games\\gog-123\\' }] }]);
         const output = join(f.dir, 'game.wgb');
         await packInstalledGog(app, output, synth, false);
         const original = readFileSync(output);
         const zip = new ZipArchive(new BufferSource(original)); await zip.init();
-        expect(new TextDecoder().decode(await zip.readEntry(zip.getEntry('rom/options.ini')!))).toBe('installed bytes');
-        expect(zip.getEntry('rom/goggame-123.info')).toBeUndefined();
+        expect(new TextDecoder().decode(await zip.readEntry(zip.getEntry('rom/Games/gog-123/options.ini')!))).toBe('installed bytes');
+        expect(zip.getEntry('rom/Games/gog-123/goggame-123.info')).toBeUndefined();
         expect(JSON.parse(new TextDecoder().decode(await zip.readEntry(zip.getEntry('manifest.json')!)))).toEqual(synth.manifest);
         await expect(packInstalledGog(app, output, synth, false)).rejects.toThrow('already exists');
         expect(readFileSync(output)).toEqual(original);
@@ -105,7 +105,7 @@ test('standard Inno BIN siblings are left to the existing Inno path; icons remai
         const app = await installGogRar(parts, planGogRarLayout(parts), join(f.dir, 'extract'), codec);
         const synth = await synthesizeInstalledGog(app, parsed, {}, {});
         expect(synth.manifest.args).toBe('--icon-argument');
-        expect(synth.manifest.entrypoint).toBe('rom/game.exe');
+        expect(synth.manifest.entrypoint).toBe('rom/Games/app-installer-name/game.exe');
         const missing = { ...parsed, icons: [{ filename: '{app}\\missing.exe', parameters: '' }] } as unknown as InnoParseResult;
         await expect(synthesizeInstalledGog(app, missing, {}, {})).rejects.toThrow('entrypoint is absent');
     } finally { rmSync(f.dir, { recursive: true, force: true }); }

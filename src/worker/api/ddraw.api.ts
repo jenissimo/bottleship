@@ -852,6 +852,36 @@ export const ddrawModule: ModuleDescriptor = {
     version: "7.0",
     description: "DirectDraw graphics stubs",
     functions: [
+        // NT5 ddraw/main/ddsacc.c:196-215, ddcsurf.c:2348, ddcreate.c:7866.
+        // ABI declarations only: private DDRAWI surface helpers are not COM surface methods.
+        // Void locks have no failure result. Dynamic lookup refuses them; static imports
+        // retain the documented unresolvable-policy UNIMPLEMENTED stub, not a working lock.
+        {
+            name: "AcquireDDThreadLock", params: [], returnType: "void",
+            callingConvention: "stdcall", onUnimplemented: "unresolvable",
+        },
+        {
+            name: "ReleaseDDThreadLock", params: [], returnType: "void",
+            callingConvention: "stdcall", onUnimplemented: "unresolvable",
+        },
+        {
+            name: "DDInternalLock",
+            params: [{ name: "surfaceLocal", type: "ptr" }, { name: "bits", type: "ptr", direction: "out" }],
+            returnType: "i32", callingConvention: "stdcall", onUnimplemented: "hresult",
+        },
+        {
+            name: "DDInternalUnlock", params: [{ name: "surfaceLocal", type: "ptr" }],
+            returnType: "i32", callingConvention: "stdcall", onUnimplemented: "hresult",
+        },
+        {
+            name: "CompleteCreateSysmemSurface", params: [{ name: "surfaceLocal", type: "ptr" }],
+            returnType: "u32", callingConvention: "stdcall", onUnimplemented: "zero",
+        },
+        {
+            name: "D3DParseUnknownCommand",
+            params: [{ name: "commands", type: "ptr" }, { name: "returnedCommand", type: "ptr", direction: "out" }],
+            returnType: "i32", callingConvention: "stdcall", onUnimplemented: "hresult",
+        },
         {
             name: "DirectDrawEnumerateA",
             params: [

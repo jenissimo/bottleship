@@ -7,7 +7,8 @@ import { findRar4, parseRar4, assertRar4Extractable, extractRar4ToSink, type Rar
 import type { InnoParseResult } from '@bottleship/formats/inno';
 import type { UnpackDecoder } from '@bottleship/formats/unpack';
 import { isGogJunk, SKIP_DIRS, detectExeFromPaths } from '@bottleship/repack/gog-filter';
-import { synthesizeManifest, parseGogGameInfo, type SynthOptions } from '@bottleship/repack/manifest-synth';
+import { synthesizeInstallerManifest, installerGuestPath } from '@bottleship/repack/installer-layout';
+import { parseGogGameInfo, type SynthOptions } from '@bottleship/repack/manifest-synth';
 import { loadOverrides, getOverride, type GogOverridesDb } from '@bottleship/repack/overrides';
 import { FileSource } from './file-source';
 import { resolveArchiveExtractPath } from './archive-extract-path';
@@ -146,11 +147,11 @@ export async function synthesizeInstalledGog(app: string, parsed: InnoParseResul
         metadata.set(path, readFileSync(full));
     }
     const db = await loadOverrides(overrides);
-    const synth = synthesizeManifest({ parsed, gameFiles: metadata, cli, override: getOverride(db, parseGogGameInfo(metadata).gameId) });
-    const exe = String(synth.manifest.entrypoint).replace(/^rom\//, '').toLowerCase();
+    const synth = synthesizeInstallerManifest({ parsed, gameFiles: metadata, cli, override: getOverride(db, parseGogGameInfo(metadata).gameId) });
+    const exe = String(synth.manifest.entrypoint).slice(synth.romPrefix.length).toLowerCase();
     if (!paths.some(path => path.toLowerCase() === exe)) throw new Error('GOG RAR: installer entrypoint is absent from installed payload');
     const emulator = synth.manifest.emulator as Record<string, unknown>;
-    const createDirs = [...new Set([...(emulator.createDirs as string[] ?? []), ...emptyDirs])].sort();
+    const createDirs = [...new Set([...(emulator.createDirs as string[] ?? []), ...emptyDirs.map(p => synth.installDir.length > 3 ? installerGuestPath(synth.installDir, p) : p)])].sort();
     if (createDirs.length) emulator.createDirs = createDirs;
     return { ...synth, paths };
 }
@@ -193,7 +194,7 @@ export async function packInstalledGog(app: string, output: string, synth: Await
     try {
         writer.addBuffer('manifest.json', Buffer.from(JSON.stringify(synth.manifest, null, 2)));
         writer.addBuffer('registry.json', Buffer.from(JSON.stringify(synth.registry, null, 2)));
-        for (const path of synth.paths) if (keepGog || !isGogJunk(path)) writer.addFile(`rom/${path}`, resolveArchiveExtractPath(app, path));
+        for (const path of synth.paths) if (keepGog || !isGogJunk(path)) writer.addFile(`${synth.romPrefix}${path}`, resolveArchiveExtractPath(app, path));
         const result = writer.finish();
         await publishGogBundle(pending, output);
         return result;

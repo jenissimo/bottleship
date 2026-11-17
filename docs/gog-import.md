@@ -23,6 +23,16 @@ The wizard still lets you choose among executable candidates and adjust settings
 New imports default to **1024×768**, **32-bit color**, **128 MB RAM**, **Windows 98**,
 and **Skip video: no**. Explicit bundle settings and curated overrides take precedence.
 
+New **GOG installer** packages put the installed files below
+`C:\Games\gog-<product-id>`, rather than directly in the drive root. Without a numeric GOG
+product ID, a safe slug derived from the installer name is used. The entrypoint, installer
+`{app}` registry/shortcut paths and installer-created directories use the same location.
+A primary GOG task or installer shortcut can supply its working directory; otherwise the
+loader uses the executable's directory. Literal absolute DOS paths, including CD paths,
+are preserved. Installed-folder imports, existing WGBs and cached packages are unchanged;
+this is a layout policy for newly generated installer packages, not a migration.
+
+
 The same importer is available through **Add game** in the library and **Load File…**
 in the dev panel. The wizard lets you review the executable and settings before choosing
 **Play now**, **Save to library**, or **Download WGB**. Play now saves the configured
@@ -89,3 +99,26 @@ inside that group. Decoder dictionaries and small metadata still occupy memory.
 
 Curated emulator settings live in `public/gog-overrides.json`, keyed by the product ID from
 `goggame-*.info`.
+
+
+### Choosing a guest installation directory
+
+```sh
+bun tools/gog-to-wgb.ts setup_game.exe game.wgb --install-dir "C:\Games\MyGame"
+```
+
+`--install-dir` changes the payload layout and the default installer-registry root together.
+It accepts an absolute directory on C: (the WGB ROM drive); UNC paths, traversal and
+ambiguous/reserved Win32 components are rejected. `--install-dir "C:\"` explicitly selects
+the old flat layout. An extract-only workspace remains installation-relative on the host.
+
+The older `--reg-install` flag retains its **registry-only** meaning. When supplied without
+`--install-dir`, it also retains the legacy flat payload layout so existing packaging
+recipes do not silently move files. If both are supplied, `--install-dir` determines the
+payload and `--reg-install` is an intentional registry override; keep them consistent
+unless the installer requires otherwise. Registry seeds are still generated from Inno/GOG
+metadata; literal paths in that metadata are not guessed or rewritten.
+
+Local wrapper DLLs remain an explicit compatibility choice, never an automatic policy.
+For example, `--app-dir-dlls ddraw.dll` asks the loader to use that copy from
+the executable's directory. It does not alter their bytes or enable every native DLL.

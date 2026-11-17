@@ -1,13 +1,10 @@
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { MemoryGuard } from "../../core/memory/mem-guard";
-import { MSSContext, SMP_PLAYING } from "./context";
-import { defaultStreamBufferSize, setSampleStatus, refreshSampleLenDone, getMemory } from "./helpers";
+import { MSSContext } from "./context";
+import { defaultStreamBufferSize, refreshSampleLenDone, getMemory } from "./helpers";
 import { decodeRawSampleData } from "./sample";
-import { convertToFloat } from "./audio-decode";
-import { playSample, appendDecodedChunk } from "./playback-engine";
-
-const MAX_STREAM_BUFFER_BYTES = 2 * 1024 * 1024; // 2MB cap for streaming audio
+import { loadSampleBuffer, updateSampleBufferPlayback } from "./sample-buffer-playback";
 
 export function createSampleBufferExports(ctx: MSSContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
@@ -21,62 +18,8 @@ export function createSampleBufferExports(ctx: MSSContext): Record<string, Thunk
         Logger.verbose(LogCategory.SYSTEM, `MSS32: _AIL_load_sample_buffer@16 called: sample=0x${sample.toString(16)}, buf=${bufferNum}, len=${dataLen}`);
 
         const sampleObj = ctx.samples.get(sample);
-        if (!sampleObj || !dataPtr || dataLen <= 0) {
-            return 1;
-        }
-
-        if (!sampleObj.streamBuffers) sampleObj.streamBuffers = [];
-        const bufArr = sampleObj.streamBuffers;
-        const existing = bufArr[bufferNum];
-        const ptrCopy = dataPtr >>> 0;
-        const sizeCopy = dataLen >>> 0;
-        bufArr[bufferNum] = existing
-            ? { ...existing, ptr: ptrCopy, size: sizeCopy, inUse: true }
-            : { ptr: ptrCopy, size: sizeCopy, inUse: true };
-
-        if (!sampleObj.fileData) {
-            sampleObj.fileData = mem.slice(dataPtr, dataPtr + dataLen);
-        } else {
-            const prev = sampleObj.fileData;
-            const newTotal = prev.length + dataLen;
-            if (newTotal <= MAX_STREAM_BUFFER_BYTES) {
-                const grown = new Uint8Array(newTotal);
-                grown.set(prev, 0);
-                grown.set(mem.slice(dataPtr, dataPtr + dataLen), prev.length);
-                sampleObj.fileData = grown;
-            } else {
-                // Sliding window: keep recent data up to cap
-                const newChunk = mem.slice(dataPtr, dataPtr + dataLen);
-                const keepFromPrev = Math.max(0, MAX_STREAM_BUFFER_BYTES - dataLen);
-                const trimmed = new Uint8Array(keepFromPrev + dataLen);
-                if (keepFromPrev > 0) {
-                    trimmed.set(prev.subarray(prev.length - keepFromPrev), 0);
-                }
-                trimmed.set(newChunk, keepFromPrev);
-                sampleObj.fileData = trimmed;
-            }
-        }
-        sampleObj.fileDataAllocated = false;
-        sampleObj.fileDataAddress = sampleObj.fileDataAddress ?? dataPtr;
-        sampleObj.totalBytes = (sampleObj.totalBytes ?? 0) + dataLen;
-
-        const channels = sampleObj.channels || 1;
-        const bits = sampleObj.bitsPerSample || 16;
-        const blockAlign = sampleObj.blockAlign || Math.max(1, (bits >> 3) * channels);
-        const chunk = convertToFloat(mem.slice(dataPtr, dataPtr + dataLen), channels, bits, sampleObj.formatTag || 1, blockAlign);
-
-        if (!sampleObj.isPlaying) {
-            sampleObj.decodedData = chunk;
-            sampleObj.startTime = performance.now();
-            sampleObj.pendingStart = false;
-            playSample(ctx, sampleObj);
-        } else if (chunk.length > 0) {
-            appendDecodedChunk(ctx, sampleObj, chunk);
-        }
-
-        bufArr[bufferNum].inUse = false;
-        setSampleStatus(ctx, sampleObj, SMP_PLAYING);
-        return 1;
+        if (!sampleObj) return 0;
+        return loadSampleBuffer(ctx, sampleObj, mem, bufferNum, dataPtr, dataLen);
     };
 
     // _AIL_minimum_sample_buffer_size@12
@@ -130,9 +73,11 @@ export function createSampleBufferExports(ctx: MSSContext): Record<string, Thunk
     // _AIL_sample_buffer_ready@4
     exports["_AIL_sample_buffer_ready@4"] = (ctxThunk, mem, args) => {
         const sampleObj = ctx.samples.get(args[0]);
-        if (!sampleObj?.streamBuffers) return 1;
-        const ready = sampleObj.streamBuffers.some(b => !b.inUse);
-        return ready ? 1 : 0;
+        if (!sampleObj) return -1;
+        updateSampleBufferPlayback(ctx, sampleObj);
+        // Native Miles returns the available buffer number, or -1 if both are busy.
+        for (let slot = 0; slot < 2; slot++) if (!sampleObj.streamBuffers?.[slot]?.inUse) return slot;
+        return -1;
     };
 
     // _AIL_sample_buffer_info@20
@@ -144,6 +89,7 @@ export function createSampleBufferExports(ctx: MSSContext): Record<string, Thunk
         const statusPtrOut = args[4];
         const sampleObj = ctx.samples.get(sample);
         if (!sampleObj) return 0;
+        updateSampleBufferPlayback(ctx, sampleObj);
         if (!sampleObj.streamBuffers) sampleObj.streamBuffers = [];
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 

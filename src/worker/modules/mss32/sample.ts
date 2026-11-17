@@ -16,10 +16,20 @@ import {
 } from "./audio-decode";
 import { playSample, updateSamplePlayback, stopRingBuffer, resumeRingBuffer, seekRingBuffer, applySample3D } from "./playback-engine";
 import { System } from "../../core/system";
+import { armStreamingRing, releaseRingBuffer } from "./playback-engine";
+import { restartSampleBufferPlayback, updateSampleBufferPlayback } from "./sample-buffer-playback";
 import { i32ToFloat } from "../../../audio/audio-ring-buffer";
 import { ensureListener3D, writeListener3D } from "./spatial";
 import { decodeRawSampleImage } from "./raw-sample-cache";
 import { clampLevel, f32Arg, levelsToVolumePan, pan127ToPanLevel, panLevelToPan127, volumePanToLevels } from "./volume-levels";
+
+// Deferred notifications belong to the registration that observed consumption.
+// Reset/change must revoke them even if the guest later reuses the same function.
+function cancelPendingSampleEOB(ctx: MSSContext, handle: number): void {
+    for (let i = ctx.pendingEOBCallbacks.length - 1; i >= 0; i--) {
+        if (ctx.pendingEOBCallbacks[i]!.handle === handle) ctx.pendingEOBCallbacks.splice(i, 1);
+    }
+}
 
 const tagAt = (d: Uint8Array, o: number, tag: string): boolean => {
     if (d.length < o + tag.length) return false;
@@ -158,8 +168,9 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         const handle = args[0];
         const sample = ctx.samples.get(handle);
         if (sample) {
-            // Stop playback
-            if (sample.isPlaying || sample.isStopped) {
+            // Stop playback and drop buffered PCM ownership before handle reuse.
+            if (sample.bufferPlayback) releaseRingBuffer(sample.id);
+            else if (sample.isPlaying || sample.isStopped) {
                 if (!stopRingBuffer(sample.id)) {
                     self.postMessage({ type: "audio_stop", payload: { id: sample.id } });
                 }
@@ -187,14 +198,20 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
             return 1;
         }
 
-        // Stop current playback if active
-        if (sampleObj.isPlaying || sampleObj.isStopped) {
+        // A later ordinary sample must not inherit the old circular streaming ring.
+        if (sampleObj.bufferPlayback) releaseRingBuffer(sampleObj.id);
+        else if (sampleObj.isPlaying || sampleObj.isStopped) {
             if (!stopRingBuffer(sampleObj.id)) {
                 self.postMessage({ type: "audio_stop", payload: { id: sampleObj.id } });
             }
         }
 
+        cancelPendingSampleEOB(ctx, handle);
+
         // Reset runtime state to defaults
+        sampleObj.eobCallback = undefined;
+        sampleObj.bufferPlayback = undefined;
+        sampleObj.streamBuffers = undefined;
         sampleObj.volume = 127;
         sampleObj.pan = 64;
         sampleObj.playbackRate = 1.0;
@@ -229,6 +246,8 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
             Logger.warn(LogCategory.SYSTEM, `MSS32: _AIL_start_sample@4: Invalid sample`);
             return 0;
         }
+
+        if (sampleObj.bufferPlayback) return restartSampleBufferPlayback(ctx, sampleObj);
 
         if (sampleObj.isStopped) {
             if (!resumeRingBuffer(sampleObj.id)) {
@@ -295,7 +314,10 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
 
         const sampleObj = ctx.samples.get(handle);
         if (sampleObj?.isPlaying) {
-            if (!stopRingBuffer(sampleObj.id)) {
+            if (sampleObj.bufferPlayback) {
+                updateSampleBufferPlayback(ctx, sampleObj);
+                armStreamingRing(ctx, sampleObj, false);
+            } else if (!stopRingBuffer(sampleObj.id)) {
                 self.postMessage({ type: "audio_pause", payload: { id: sampleObj.id } });
             }
             sampleObj.isPlaying = false;
@@ -909,6 +931,16 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
             }
         }
         return count;
+    };
+
+    exports["_AIL_register_EOB_callback@8"] = (ctxThunk, _mem, args) => {
+        const sample = ctx.samples.get(args[0] >>> 0);
+        if (!sample) return 0;
+        const previous = sample.eobCallback ?? 0;
+        const callback = args[1] >>> 0;
+        if (callback === 0 || callback !== previous) cancelPendingSampleEOB(ctx, sample.handle);
+        sample.eobCallback = callback;
+        return previous;
     };
 
     // _AIL_register_EOS_callback@8(sample, EOS) -> previous callback.

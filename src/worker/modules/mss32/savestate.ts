@@ -6,7 +6,7 @@ import { pickDefined, savestateParticipants, stateKeys, type FieldPolicy } from 
 import { CaptureRefusal } from "../../savestate/object-codecs";
 import type { SaveValue } from "../../savestate/value-codec";
 import type { VfsFileHandle } from "../../runtime/filesystem/vfs";
-import type { MSSContext } from "./context";
+import type { MSSContext, MSSQuickAudio } from "./context";
 import type { MSSListener3D, MSSSample, MSSSequence, MSSStream, MSSStreamSource, MSSTimer, MSSWaveOut, RedbookHandle } from "./types";
 import { convertToFloat, decodeStreamFile, parseWav, DIG_F_ADPCM_MASK } from "./audio-decode";
 import { decodeRawSampleImage } from "./raw-sample-cache";
@@ -23,7 +23,7 @@ const DIG_PCM_SIGN = 0x0001;
 
 export const MSS_CONTEXT_FIELDS = {
     process: 'host',
-    samples: 'save', samplesById: 'derive', streams: 'save', streamsById: 'derive',
+    samples: 'save', samplesById: 'derive', streams: 'save', streamsById: 'derive', quickAudio: 'save',
     waveOuts: 'save', fileHandles: 'transient', redbookHandles: 'save', timers: 'save', sequences: 'save', ribProviders: 'save',
     nextSampleId: 'save', nextStreamId: 'save', nextWaveOutId: 'save', nextFileHandleId: 'save', nextTimerId: 'save',
     nextRedbookId: 'save', nextSequenceId: 'save',
@@ -34,7 +34,7 @@ export const MSS_CONTEXT_FIELDS = {
     listener3D: 'save', listenerSab: 'host', speakerType3D: 'save', roomType3D: 'save', preferences: 'save',
     midiDriverHandle: 'save', midiMasterVolume: 'save', updateInterval: 'save', heartbeatTick: 'host', startupTime: 'derive',
     lastErrorPtr: 'save', lastErrorStr: 'save', memAllocatedByMss: 'save',
-    pendingTimerCallbacks: 'transient', pendingEOSCallbacks: 'transient', pendingStreamCallbacks: 'transient',
+    pendingTimerCallbacks: 'transient', pendingEOSCallbacks: 'transient', pendingEOBCallbacks: 'transient', pendingStreamCallbacks: 'transient',
     insideAilServe: 'transient', serveDepth: 'transient',
     wavFormatByDataPtr: 'save', fileCallbacks: 'save', memCallbacks: 'save',
     streamUserData: 'save', streamCallbacks: 'save', sequenceUserData: 'save', sequenceCallbacks: 'save', distanceFactor3D: 'save',
@@ -42,6 +42,7 @@ export const MSS_CONTEXT_FIELDS = {
 
 export const MSS_SAMPLE_FIELDS = {
     id: 'save', handle: 'save', fileData: 'derive', decodedData: 'derive', streamBuffers: 'save', userData: 'save', totalBytes: 'save',
+    eobCallback: 'save', bufferPlayback: 'transient', // capture explicitly refuses live double-buffer state
     fileFormat: 'save', sampleTypeFormat: 'save', sampleTypeFlags: 'save', sampleRate: 'save', channels: 'save', bitsPerSample: 'save',
     formatTag: 'save', blockAlign: 'save', volume: 'save', pan: 'save', playbackRate: 'save', playbackRateHz: 'save', loopCount: 'save',
     loopStartBytes: 'save', loopEndBytes: 'save', pcmBytes: 'save', isPlaying: 'save', isStopped: 'save', position: 'save',
@@ -125,6 +126,7 @@ export interface MssState {
     provider3DNamePtrs: number[];
     listener3D: MSSListener3D | null;
     samples: MssSampleState[];
+    quickAudio: MSSQuickAudio[];
     streams: MssStreamState[];
     timers: TimerFields[];
     sequences: MSSSequence[];
@@ -146,9 +148,13 @@ export const MSS_SCHEMA = {
     timer: MSS_TIMER_FIELDS, sequence: MSS_SEQUENCE_FIELDS, redbook: MSS_REDBOOK_FIELDS, waveOut: MSS_WAVEOUT_FIELDS,
     state: stateKeys<MssState>({
         scalars: true, startupAgeMs: true, heartbeat: true, preferences: true, provider3DNamePtrs: true, listener3D: true,
-        samples: true, streams: true, timers: true, sequences: true, redbook: true, waveOuts: true, ribProviders: true,
+        samples: true, quickAudio: true, streams: true, timers: true, sequences: true, redbook: true, waveOuts: true, ribProviders: true,
         memAllocatedByMss: true, wavFormatByDataPtr: true, fileCallbacks: true, memCallbacks: true, streamUserData: true,
         streamCallbacks: true, sequenceUserData: true, sequenceCallbacks: true,
+    }),
+    quickState: stateKeys<MSSQuickAudio>({
+        handle: true, imageAddress: true, imageLength: true, sampleHandle: true,
+        sampleId: true, status: true, volume: true, pan: true,
     }),
     sampleState: stateKeys<MssSampleState>({ fields: true, image: true, decode: true, decoded: true, playFrame: true, ended: true }),
     streamState: stateKeys<MssStreamState>({ fields: true, loaded: true, source: true, playFrame: true, ended: true }),
@@ -199,6 +205,7 @@ function elapsedStart(item: MSSSample | MSSStream): number {
 }
 
 function captureSample(s: MSSSample, mem: Uint8Array): MssSampleState {
+    if (s.bufferPlayback) throw new Error(`mss32: sample ${s.id} has live double-buffered input; try saving after releasing or reinitializing it`);
     const active = s.isPlaying || s.isStopped;
     if (active && isEncodedFormat(s.fileFormat)) {
         throw new Error(`mss32: sample ${s.id} plays ${s.fileFormat} data through the host decoder, which is not part of a v1 savestate`);
@@ -322,7 +329,7 @@ async function restoreStream(ctx: MSSContext, st: MssStreamState): Promise<MSSSt
 
 export function captureMssSavestate(ctx: MSSContext): MssState {
     if (ctx.insideAilServe || ctx.serveDepth > 0) throw new Error('mss32: AIL_serve is running; try saving again');
-    const queued = ctx.pendingTimerCallbacks.length + ctx.pendingEOSCallbacks.length + ctx.pendingStreamCallbacks.length;
+    const queued = ctx.pendingTimerCallbacks.length + ctx.pendingEOSCallbacks.length + ctx.pendingEOBCallbacks.length + ctx.pendingStreamCallbacks.length;
     if (queued > 0) throw new Error(`mss32: ${queued} Miles callback(s) are queued for AIL_serve; try saving again`);
     if (refillChainRunning()) throw new Error('mss32: a stream refill is running through the title\'s file callbacks; try saving again');
     if (ctx.fileHandles.size > 0) {
@@ -346,6 +353,7 @@ export function captureMssSavestate(ctx: MSSContext): MssState {
         provider3DNamePtrs: [...ctx.provider3DNamePtrs],
         listener3D: ctx.listener3D ? { ...ctx.listener3D } : null,
         samples: [...ctx.samples.values()].map(s => captureSample(s, mem)),
+        quickAudio: [...ctx.quickAudio.values()].map(q => ({ ...q })),
         streams: [...ctx.streams.values()].map(s => captureStream(ctx, s)),
         timers: [...ctx.timers.values()].map(t => pickDefined(t, MSS_TIMER_FIELDS)),
         sequences: [...ctx.sequences.values()].map(q => ({ ...q })),
@@ -379,9 +387,11 @@ export async function restoreMssSavestate(ctx: MSSContext, s: MssState): Promise
         ensureListener3D(ctx);
         writeListener3D(ctx);
     }
+    ctx.quickAudio = new Map(s.quickAudio.map(q => [q.handle, { ...q }]));
     ctx.fileHandles.clear();
     ctx.pendingTimerCallbacks.length = 0;
     ctx.pendingEOSCallbacks.length = 0;
+    ctx.pendingEOBCallbacks.length = 0;
     ctx.pendingStreamCallbacks.length = 0;
     ctx.insideAilServe = false;
     ctx.serveDepth = 0;
@@ -424,7 +434,7 @@ export async function restoreMssSavestate(ctx: MSSContext, s: MssState): Promise
 
 export function registerMssSavestate(ctx: MSSContext): () => void {
     return savestateParticipants.add({
-        id: 'mss32', version: 1, order: 76, covers: ['mss32'], schema: MSS_SCHEMA as unknown as SaveValue,
+        id: 'mss32', version: 3, order: 76, covers: ['mss32'], schema: MSS_SCHEMA as unknown as SaveValue,
         capture: () => {
             try {
                 return captureMssSavestate(ctx) as unknown as SaveValue;
