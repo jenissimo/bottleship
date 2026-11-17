@@ -37,6 +37,7 @@ import { registerSavestateCommands } from "./cmds/savestate";
 import { registerDispatchCommands } from "./cmds/dispatch";
 import { registerCensusCommands } from "./cmds/census";
 import { registerFnCensusCommands } from "./cmds/fn-census";
+import { registerFnUnitCommands } from "./cmds/fn-unit";
 import { registerCrossingCommands } from "./cmds/crossings";
 import { registerHleCommands } from "./cmds/hle";
 import { registerPacingCommands } from "./cmds/pacing";
@@ -99,6 +100,7 @@ export function installHarnessCommands(): void {
     registerDispatchCommands(harnessService);
     registerCensusCommands(harnessService);
     registerFnCensusCommands(harnessService);
+    registerFnUnitCommands(harnessService);
     registerCrossingCommands(harnessService);
     registerHleCommands(harnessService);
     registerPacingCommands(harnessService);
