@@ -923,7 +923,7 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         return count;
     };
 
-    exports["_AIL_register_EOB_callback@8"] = (_thunk, _mem, args) => {
+    exports["_AIL_register_EOB_callback@8"] = (ctxThunk, _mem, args) => {
         const sample = ctx.samples.get(args[0] >>> 0);
         if (!sample) return 0;
         const previous = sample.eobCallback ?? 0;

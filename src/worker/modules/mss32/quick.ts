@@ -84,7 +84,7 @@ export function createQuickExports(ctx: MSSContext): Record<string, ThunkImpleme
     const exports: Record<string, ThunkImplementation> = {};
     const samples = createSampleExports(ctx);
 
-    exports["_AIL_quick_load_mem@8"] = (_thunk, mem, args) => {
+    exports["_AIL_quick_load_mem@8"] = (ctxThunk, mem, args) => {
         const imageAddress = args[0] >>> 0, imageLength = args[1] >>> 0;
         const image = imageAt(mem, imageAddress, imageLength);
         if (!ctx.digitalDriverHandle || !image || !supportedImage(image)) {
@@ -100,7 +100,7 @@ export function createQuickExports(ctx: MSSContext): Record<string, ThunkImpleme
         return handle;
     };
 
-    exports["_AIL_quick_play@8"] = (thunk, mem, args) => {
+    exports["_AIL_quick_play@8"] = (ctxThunk, mem, args) => {
         const audio = ctx.quickAudio.get(args[0] >>> 0);
         if (!audio) return 0;
         releaseVoice(ctx, audio, mem);
@@ -110,7 +110,7 @@ export function createQuickExports(ctx: MSSContext): Record<string, ThunkImpleme
             ctx.lastErrorStr = "Quick audio image is no longer available";
             return 0;
         }
-        const handle = samples["_AIL_allocate_sample_handle@4"]!(thunk, mem, [ctx.digitalDriverHandle]);
+        const handle = samples["_AIL_allocate_sample_handle@4"]!(ctxThunk, mem, [ctx.digitalDriverHandle]);
         if (typeof handle !== "number" || !handle) return 0;
         const sample = ctx.samples.get(handle)!;
         audio.sampleHandle = handle;
@@ -126,9 +126,9 @@ export function createQuickExports(ctx: MSSContext): Record<string, ThunkImpleme
         }
         sample.playbackRateHz = sample.sampleRate;
         sample.loopCount = args[1] >>> 0; // 0 repeats indefinitely; N plays N times.
-        if (audio.volume !== -1) samples["_AIL_set_sample_volume@8"]!(thunk, mem, [handle, audio.volume]);
-        if (audio.pan !== -1) samples["_AIL_set_sample_pan@8"]!(thunk, mem, [handle, audio.pan]);
-        samples["_AIL_start_sample@4"]!(thunk, mem, [handle]);
+        if (audio.volume !== -1) samples["_AIL_set_sample_volume@8"]!(ctxThunk, mem, [handle, audio.volume]);
+        if (audio.pan !== -1) samples["_AIL_set_sample_pan@8"]!(ctxThunk, mem, [handle, audio.pan]);
+        samples["_AIL_start_sample@4"]!(ctxThunk, mem, [handle]);
         if (!sample.isPlaying) {
             releaseVoice(ctx, audio, mem);
             return 0;
@@ -137,14 +137,14 @@ export function createQuickExports(ctx: MSSContext): Record<string, ThunkImpleme
         return 1;
     };
 
-    exports["_AIL_quick_status@4"] = (_thunk, mem, args) => {
+    exports["_AIL_quick_status@4"] = (ctxThunk, mem, args) => {
         const audio = ctx.quickAudio.get(args[0] >>> 0);
         if (!audio) return QSTAT_DONE;
         if (audio.status === QSTAT_PLAYING) updateEmulatorState(ctx);
         return audio.status;
     };
 
-    exports["_AIL_quick_set_volume@12"] = (thunk, mem, args) => {
+    exports["_AIL_quick_set_volume@12"] = (ctxThunk, mem, args) => {
         const audio = ctx.quickAudio.get(args[0] >>> 0);
         if (!audio) return 0;
         // Native retains both S32 arguments, including -1. That sentinel leaves
@@ -153,18 +153,18 @@ export function createQuickExports(ctx: MSSContext): Record<string, ThunkImpleme
         audio.pan = args[2] | 0;
         const sample = ctx.samples.get(audio.sampleHandle);
         if (sample && sample.id === audio.sampleId) {
-            if (audio.volume !== -1) samples["_AIL_set_sample_volume@8"]!(thunk, mem, [sample.handle, audio.volume]);
-            if (audio.pan !== -1) samples["_AIL_set_sample_pan@8"]!(thunk, mem, [sample.handle, audio.pan]);
+            if (audio.volume !== -1) samples["_AIL_set_sample_volume@8"]!(ctxThunk, mem, [sample.handle, audio.volume]);
+            if (audio.pan !== -1) samples["_AIL_set_sample_pan@8"]!(ctxThunk, mem, [sample.handle, audio.pan]);
         }
         return 0;
     };
 
-    exports["_AIL_quick_halt@4"] = (_thunk, mem, args) => {
+    exports["_AIL_quick_halt@4"] = (ctxThunk, mem, args) => {
         const audio = ctx.quickAudio.get(args[0] >>> 0);
         if (audio) { releaseVoice(ctx, audio, mem); audio.status = QSTAT_DONE; }
         return 0;
     };
-    exports["_AIL_quick_unload@4"] = (_thunk, mem, args) => {
+    exports["_AIL_quick_unload@4"] = (ctxThunk, mem, args) => {
         unloadQuickAudio(ctx, args[0] >>> 0, mem);
         return 0;
     };
