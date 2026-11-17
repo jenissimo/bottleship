@@ -7,7 +7,7 @@
 import { describe, test, expect } from "bun:test";
 import { System } from "../../src/worker/core/system";
 import {
-    summarizeFnCensus, candidatePages, registerFnCensusCommands, ROW, FN_CENSUS_ROW_WORDS, STAT_NAMES, FN_CENSUS_SCHEMA,
+    summarizeFnCensus, candidatePages, callContinuation, registerFnCensusCommands, ROW, FN_CENSUS_ROW_WORDS, STAT_NAMES, FN_CENSUS_SCHEMA,
     type FnCensusSnapshot, type CountedSample,
 } from "../../src/worker/harness/cmds/fn-census";
 
@@ -20,7 +20,7 @@ function row(fields: Partial<Record<keyof typeof ROW, number>>): Uint32Array {
 function snap(over: Partial<FnCensusSnapshot> = {}, rows: Uint32Array[] = [], stats: Partial<Record<(typeof STAT_NAMES)[number], number>> = {}): FnCensusSnapshot {
     return {
         atMs: 0, armEpoch: 1, kernelGeneration: 7, exportsId: 1, enabled: 1,
-        rows: new Map(rows.map(r => [r[ROW.entryVirt]!, r])),
+        rows: new Map(rows.map(r => [r[ROW.entryVirt]!, r])), calls: new Uint32Array(0),
         stats: STAT_NAMES.map(n => stats[n] ?? 0),
         retiredTotal: 0, fingerprint: "0x1:0x2", caps: [3, 2048, 512, 12288, 3], counted: null,
         ...over,
@@ -196,6 +196,7 @@ describe("command lifecycle", () => {
             fn_census_generation: () => 1, fn_census_reset: () => 0, fn_census_row_count: () => 1, fn_census_rows_ptr: () => 0,
             fn_census_stat: () => 0, fn_census_stat_count: () => STAT_NAMES.length, fn_census_owner_of: () => 0,
             fn_census_get_cap: () => 1, jit_codegen_fingerprint_lo: () => 1, jit_codegen_fingerprint_hi: () => 2,
+            fn_census_call_count: () => 0, fn_census_calls_ptr: () => 0,
             trace2_reset: () => { watched = 0; log.push("reset"); return 0; },
             trace2_watch_page: () => { watched++; return 1; },
             trace2_unwatch_all: () => { watched = 0; log.push("unwatch"); return 0; },
@@ -232,5 +233,111 @@ describe("command lifecycle", () => {
             (globalThis as any).setInterval = realSet;
             (globalThis as any).clearInterval = realClear;
         }
+    });
+});
+
+describe("call continuation estimate (schema 2)", () => {
+    const LEAF2 = 0x404000, BIGLEAF = 0x405000, ALIGNED = 0x406000, ICALLER = 0x407000, C1 = 0x408000, C2 = 0x409000;
+    const calls = new Uint32Array([
+        C1 + 5, LEAF2, 2, 4,
+        C2 + 5, BIGLEAF, 2, 0,
+        ALIGNED + 9, LEAF2, 2, 4,
+        ICALLER + 3, 0, 1, 0,
+    ]);
+    const rows = [
+        row({ entryVirt: LEAF2, entries: 1, instructions: 20, retSummary: 0x10004 }),
+        row({ entryVirt: BIGLEAF, entries: 1, instructions: 300 }),
+        row({ entryVirt: C1, entries: 1, unit: 1, windowStatic: 16, outCalls: 1, callStart: 0, callCount: 1 }),
+        row({ entryVirt: C2, entries: 1, unit: 1, windowStatic: 16, outCalls: 1, callStart: 1, callCount: 1 }),
+        row({ entryVirt: ALIGNED, entries: 1, unit: 1, windowStatic: 16 | 2, outCalls: 1, callStart: 2, callCount: 1 }),
+        row({ entryVirt: ICALLER, entries: 1, unit: 2, windowStatic: 64, callStart: 3, callCount: 1 }),
+        row({ entryVirt: 0x40a000, entries: 1, unit: 1, windowStatic: 16 | 1, outCalls: 0 }),
+    ];
+    const after = snap({ calls }, rows);
+    const exec = [10, 10, 100, 200, 400, 800, 1600];
+    const window = rows.map((r, i) => ({ r, entries: 1, executed: exec[i]! }));
+    const out = callContinuation(window, after, 4000, 3120) as any;
+    test("each option removes exactly its own refusals", () => {
+        expect(out.variants.m1.executedPctOfRetired).toBe(0.5);
+        expect(out.variants.inlineLeaves.executedPctOfRetired).toBe(3);
+        expect(out.variants.callChain.executedPctOfRetired).toBe(8);
+        expect(out.variants.callChainAlignedFrames.executedPctOfRetired).toBe(18);
+        expect(out.variants.callChainIndirectGuarded.executedPctOfRetired).toBe(28);
+    });
+    test("call sites are joined to callee rows", () => {
+        expect(out.sites).toEqual({ direct: 3, indirect: 1, calleeWithRow: 3, calleeAdmitted: 3, calleeRetKnown: 3, calleeInlinable: 2,
+            calleeVersionChanged: 0, incompleteCallers: 0 });
+        expect(out.executed).toEqual({ available: true });
+    });
+    test("unavailable executed coverage leaves every continuation share null", () => {
+        const o = callContinuation(window, after, 100, 3120, { executedProblems: ["counted 3120 instructions exceed the 100 retired"] }) as any;
+        expect(o.executed.available).toBe(false);
+        for (const v of Object.values(o.variants) as any[]) {
+            expect(v.executedPctOfRetired).toBeNull();
+            expect(v.executedPctOfCounted).toBeNull();
+        }
+        expect(o.variants.callChain.entriesPct).toBe(out.variants.callChain.entriesPct);
+    });
+    test("a callee whose body changed in the window cannot admit its caller", () => {
+        const o = callContinuation(window, after, 4000, 3120, { unstable: r => r[ROW.entryVirt] === LEAF2 }) as any;
+        expect(out.variants.inlineLeaves.functions).toBe(3);
+        expect(o.variants.inlineLeaves.functions).toBe(2);
+        expect(o.variants.inlineLeaves.unknown.functions).toBe(1);
+        expect(o.sites.calleeVersionChanged).toBe(2);
+        expect(o.variants.callChain.executedPctOfRetired).toBe(8);
+    });
+    test("a truncated call-site record does not prove every call inlinable", () => {
+        const two = new Uint32Array([C1 + 5, LEAF2, 2, 4]);
+        const rs = [
+            row({ entryVirt: LEAF2, entries: 1, instructions: 20 }),
+            row({ entryVirt: C1, entries: 1, unit: 1, windowStatic: 16, outCalls: 2, callStart: 0, callCount: 1 }),
+            row({ entryVirt: C2, entries: 1, unit: 1, windowStatic: 16, outCalls: 1, callStart: 1, callCount: 0 }),
+        ];
+        const o = callContinuation(rs.map(r => ({ r, entries: 1, executed: 10 })), snap({ calls: two }, rs), 1000, 30) as any;
+        expect(o.variants.inlineLeaves.functions).toBe(1);
+        expect(o.variants.inlineLeaves.unknown.functions).toBe(2);
+        expect(o.sites.incompleteCallers).toBe(2);
+        expect(o.variants.callChain.functions).toBe(3);
+    });
+    test("rows first seen after MARK count as changed only when they were reanalysed or dirtied", () => {
+        const cs = new Uint32Array([C1 + 5, LEAF2, 2, 4]);
+        const ch = (blocks: CountedSample[]) => ({ recording: true, watchedPages: 1, armedPages: 1, pagesNotArmed: 0, slotOverflow: 0, blocks });
+        const before = snap({ atMs: 1, calls: cs, counted: ch([]) }, []);
+        const run = (a: number, smc: number) => {
+            const L = row({ entryVirt: LEAF2, entries: 10, instructions: 20, flags: 2, analyses: a, smcEvents: smc });
+            const C = row({ entryVirt: C1, entries: 10, unit: 1, windowStatic: 16, outCalls: 1, callStart: 0, callCount: 1, flags: 2, analyses: a, smcEvents: smc });
+            const r = summarizeFnCensus(before, snap({ atMs: 2, retiredTotal: 1000, calls: cs, counted: ch([{ addr: LEAF2, exec: 10, ins: 20, owner: 1 }, { addr: C1, exec: 10, ins: 50, owner: 2 }]) }, [L, C], { calls: 20 }));
+            if (!r.ok) throw new Error(r.refuse);
+            return r.report as any;
+        };
+        const clean = run(1, 0);
+        expect(clean.versionChanged.functions).toBe(0);
+        expect(clean.callContinuation.variants.inlineLeaves.functions).toBe(2);
+        const mixed = run(2, 1);
+        expect(mixed.versionChanged.functions).toBe(2);
+        expect(mixed.callContinuation.variants.inlineLeaves.functions).toBe(0);
+        expect(mixed.executed.admittedIns).toBe(0);
+        expect(mixed.executed.changedVersionIns).toBe(700);
+        expect(run(1, 1).versionChanged.functions).toBe(2);
+    });
+    test("summarize carries refused executed coverage and callee versions into the continuation", () => {
+        const L = row({ entryVirt: LEAF2, entries: 0, instructions: 20, flags: 2, analyses: 1 });
+        const C = row({ entryVirt: C1, entries: 0, unit: 1, windowStatic: 16, outCalls: 1, callStart: 0, callCount: 1, flags: 2, analyses: 1 });
+        const cs = new Uint32Array([C1 + 5, LEAF2, 2, 4]);
+        const ch = (blocks: CountedSample[]) => ({ recording: true, watchedPages: 1, armedPages: 1, pagesNotArmed: 0, slotOverflow: 0, blocks });
+        const before = snap({ atMs: 1, calls: cs, counted: ch([]) }, [L, C]);
+        const L2 = row({ entryVirt: LEAF2, entries: 10, instructions: 20, flags: 2, analyses: 2, smcEvents: 1 });
+        const C2r = row({ entryVirt: C1, entries: 10, unit: 1, windowStatic: 16, outCalls: 1, callStart: 0, callCount: 1, flags: 2, analyses: 1 });
+        const bad = summarizeFnCensus(before, snap({ atMs: 2, retiredTotal: 100, calls: cs, counted: ch([{ addr: C1, exec: 100, ins: 2, owner: 2 }]) }, [L2, C2r], { calls: 20 }));
+        expect(bad.ok).toBe(true);
+        if (!bad.ok) return;
+        const cc = bad.report.callContinuation as any;
+        expect(cc.executed.available).toBe(false);
+        expect(cc.variants.callChain.executedPctOfRetired).toBeNull();
+        expect(cc.variants.inlineLeaves.functions).toBe(0);
+        expect(cc.variants.inlineLeaves.unknown.functions).toBe(1);
+        const unarmed = summarizeFnCensus(snap({ atMs: 1, calls: cs }, [L, C]), snap({ atMs: 2, retiredTotal: 1000, calls: cs }, [L2, C2r], { calls: 20 }));
+        if (!unarmed.ok) throw new Error(unarmed.refuse);
+        expect((unarmed.report.callContinuation as any).variants.m1.executedPctOfRetired).toBeNull();
     });
 });
