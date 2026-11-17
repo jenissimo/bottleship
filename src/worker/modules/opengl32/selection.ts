@@ -8,6 +8,8 @@ const clipA = new Float64Array(16 * 8);
 const clipB = new Float64Array(16 * 8);
 /** @transient(plane transform augmented matrix, overwritten per glClipPlane) */
 const planeSolve = new Float64Array(20);
+/** @transient(per-plane distances, overwritten before every clipping step) */
+const clipDistances = new Float64Array(16);
 
 export function selectionDepth(ctx: OpenGLContext, z: number): void {
     z = Math.max(0, Math.min(1, z));
@@ -89,7 +91,7 @@ function distance(ctx: OpenGLContext, v: Float64Array, b: number, plane: number)
     return q[p] * v[b + 4] + q[p + 1] * v[b + 5] + q[p + 2] * v[b + 6] + q[p + 3] * v[b + 7];
 }
 
-function primitive(ctx: OpenGLContext, src: Float32Array, base: number, i0: number, i1 = -1, i2 = -1, i3 = -1): void {
+function primitive(ctx: OpenGLContext, src: Float32Array, base: number, planes: number, i0: number, i1 = -1, i2 = -1, i3 = -1): void {
     let n = i1 < 0 ? 1 : i2 < 0 ? 2 : i3 < 0 ? 3 : 4;
     const polygon = n >= 3;
     const mv = ctx.modelviewStack.stack[ctx.modelviewStack.top];
@@ -103,7 +105,7 @@ function primitive(ctx: OpenGLContext, src: Float32Array, base: number, i0: numb
     }
     // Homogeneous clipping preserves both clip and eye coordinates for user planes.
     for (let p = 0; p < 12 && n; p++) {
-        if (p >= 6 && !ctx.enableFlags.has(GL.GL_CLIP_PLANE0 + p - 6)) continue;
+        if (!(planes & (1 << p))) continue;
         if (!polygon) {
             const a = distance(ctx, input, 0, p);
             if (n === 1) { if (!(a >= 0)) n = 0; continue; }
@@ -115,10 +117,20 @@ function primitive(ctx: OpenGLContext, src: Float32Array, base: number, i0: numb
             }
             continue;
         }
+        // Most picking primitives miss the tiny selection volume completely.
+        // Classify this plane before interpolating/copying any polygon vertices.
+        let inside = 0;
+        for (let i = 0; i < n; i++) {
+            const d = distance(ctx, input, i * 8, p);
+            clipDistances[i] = d;
+            if (d >= 0) inside++;
+        }
+        if (!inside) return;
+        if (inside === n) continue;
         let out = 0;
         for (let i = 0; i < n; i++) {
             const prev = ((i + n - 1) % n) * 8, cur = i * 8;
-            const a = distance(ctx, input, prev, p), b = distance(ctx, input, cur, p);
+            const a = clipDistances[(i + n - 1) % n], b = clipDistances[i];
             if ((a < 0) !== (b < 0)) {
                 const t = a / (a - b);
                 for (let k = 0; k < 8; k++) output[out * 8 + k] = input[prev + k] + t * (input[cur + k] - input[prev + k]);
@@ -151,22 +163,24 @@ function primitive(ctx: OpenGLContext, src: Float32Array, base: number, i0: numb
 
 /** Object-space vertices. Call before texgen, lighting, or primitive expansion. */
 export function selectDraw(ctx: OpenGLContext, mode: number, src: Float32Array, base: number, count: number): void {
+    let planes = 0x3f;
+    for (let p = 0; p < 6; p++) if (ctx.enableFlags.has(GL.GL_CLIP_PLANE0 + p)) planes |= 1 << (p + 6);
     switch (mode) {
-        case GL.GL_POINTS: for (let i = 0; i < count; i++) primitive(ctx, src, base, i); break;
-        case GL.GL_LINES: for (let i = 0; i + 1 < count; i += 2) primitive(ctx, src, base, i, i + 1); break;
+        case GL.GL_POINTS: for (let i = 0; i < count; i++) primitive(ctx, src, base, planes, i); break;
+        case GL.GL_LINES: for (let i = 0; i + 1 < count; i += 2) primitive(ctx, src, base, planes, i, i + 1); break;
         case GL.GL_LINE_LOOP:
         case GL.GL_LINE_STRIP:
-            for (let i = 0; i + 1 < count; i++) primitive(ctx, src, base, i, i + 1);
-            if (mode === GL.GL_LINE_LOOP && count > 1) primitive(ctx, src, base, count - 1, 0);
+            for (let i = 0; i + 1 < count; i++) primitive(ctx, src, base, planes, i, i + 1);
+            if (mode === GL.GL_LINE_LOOP && count > 1) primitive(ctx, src, base, planes, count - 1, 0);
             break;
-        case GL.GL_TRIANGLES: for (let i = 0; i + 2 < count; i += 3) primitive(ctx, src, base, i, i + 1, i + 2); break;
+        case GL.GL_TRIANGLES: for (let i = 0; i + 2 < count; i += 3) primitive(ctx, src, base, planes, i, i + 1, i + 2); break;
         case GL.GL_TRIANGLE_STRIP:
-            for (let i = 0; i + 2 < count; i++) primitive(ctx, src, base, i + (i & 1), i + 1 - (i & 1), i + 2);
+            for (let i = 0; i + 2 < count; i++) primitive(ctx, src, base, planes, i + (i & 1), i + 1 - (i & 1), i + 2);
             break;
         case GL.GL_TRIANGLE_FAN:
-        case GL.GL_POLYGON: for (let i = 1; i + 1 < count; i++) primitive(ctx, src, base, 0, i, i + 1); break;
-        case GL.GL_QUADS: for (let i = 0; i + 3 < count; i += 4) primitive(ctx, src, base, i, i + 1, i + 2, i + 3); break;
-        case GL.GL_QUAD_STRIP: for (let i = 0; i + 3 < count; i += 2) primitive(ctx, src, base, i, i + 1, i + 3, i + 2); break;
+        case GL.GL_POLYGON: for (let i = 1; i + 1 < count; i++) primitive(ctx, src, base, planes, 0, i, i + 1); break;
+        case GL.GL_QUADS: for (let i = 0; i + 3 < count; i += 4) primitive(ctx, src, base, planes, i, i + 1, i + 2, i + 3); break;
+        case GL.GL_QUAD_STRIP: for (let i = 0; i + 3 < count; i += 2) primitive(ctx, src, base, planes, i, i + 1, i + 3, i + 2); break;
     }
 }
 
