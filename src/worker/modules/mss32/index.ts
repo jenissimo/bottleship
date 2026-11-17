@@ -14,6 +14,7 @@ import { pumpVfsStreams, serveIncrementalStreams } from "./stream-engine";
 import { mss32Module } from "../../api/mss32.api";
 import { convertToFloat } from "./audio-decode";
 import { createCoreExports } from "./core";
+import { clearQuickAudio, createQuickExports, serviceQuickAudio } from "./quick";
 import { createDigitalDriverExports } from "./digital-driver";
 import { createSampleExports } from "./sample";
 import { createSampleBufferExports } from "./sample-buffers";
@@ -75,6 +76,7 @@ export class MSS32 implements IModule {
         Object.assign(this.exports, createCoreExports(this.ctx));
         Object.assign(this.exports, createDigitalDriverExports(this.ctx));
         Object.assign(this.exports, createSampleExports(this.ctx));
+        Object.assign(this.exports, createQuickExports(this.ctx));
         Object.assign(this.exports, createSampleBufferExports(this.ctx));
         Object.assign(this.exports, createStreamExports(this.ctx));
         Object.assign(this.exports, createRedbookExports(this.ctx));
@@ -141,6 +143,7 @@ export class MSS32 implements IModule {
             if (!sample.isPlaying) return; // already handled by heartbeat
             finishSamplePlayback(ctx, sample, getPlaybackLengthBytes(sample));
             invokeEOSCallback(ctx, sample);
+            serviceQuickAudio(ctx);
             return;
         }
 
@@ -331,6 +334,7 @@ export class MSS32 implements IModule {
         ctx.pendingEOSCallbacks.length = 0;
         ctx.pendingEOBCallbacks.length = 0;
         ctx.insideAilServe = false;
+        clearQuickAudio(ctx);
         resetMssRingBuffers();
         ctx.samples.clear();
         ctx.samplesById.clear();

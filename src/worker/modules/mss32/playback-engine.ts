@@ -10,6 +10,7 @@ import {
 } from "./helpers";
 import { invokeEOSCallback } from "./callbacks";
 import { updateSampleBufferPlayback } from "./sample-buffer-playback";
+import { serviceQuickAudio } from "./quick";
 import {
     createAudioRingBuffer,
     writeRingData,
@@ -974,6 +975,8 @@ export function updateEmulatorState(ctx: MSSContext): void {
             }
         }
     }
+
+    serviceQuickAudio(ctx);
 
     // Update streams position tracking
     for (const stream of ctx.streams.values()) {

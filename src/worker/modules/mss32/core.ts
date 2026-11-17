@@ -11,6 +11,7 @@ import { fpuPush } from "../../core/fpu-helper";
 import { processPendingTimerCallbacks, processPendingEOSCallbacks, processPendingStreamCallbacks } from "./callbacks";
 import { pumpVfsStreams, serveIncrementalStreams } from "./stream-engine";
 import { ensureListener3D } from "./spatial";
+import { clearQuickAudio } from "./quick";
 
 /** The software 3D providers we publish, in the order Miles lists its redist. */
 const PROVIDERS_3D: ReadonlyArray<{ name: string; handle: number }> = [
@@ -56,6 +57,7 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
     exports["_AIL_shutdown@0"] = (ctxThunk, mem, args) => {
         Logger.log(LogCategory.SYSTEM, 'MSS32: _AIL_shutdown@0 called');
         stopHeartbeat(ctx);
+        clearQuickAudio(ctx);
         freeDriverResources(ctx);
         ctx.initialized = false;
         for (const sample of ctx.samples.values()) {

@@ -475,7 +475,7 @@ describe("mss32 participant", () => {
             const p = savestateParticipants.all().find(x => x.id === "mss32")!;
             expect(p.covers).toEqual(["mss32"]);
             expect(savestateParticipants.coveredModules().has("mss32")).toBe(true);
-            expect(savestateParticipants.schemas().mss32).toEqual({ version: 2, schemaHash: "e39bd4aa60f1e2fa" });
+            expect(savestateParticipants.schemas().mss32).toEqual({ version: 3, schemaHash: "1ed07c699b5ae2a7" });
             ctx.insideAilServe = true;
             expect(() => p.capture({} as never)).toThrow(CaptureRefusal);
         } finally {

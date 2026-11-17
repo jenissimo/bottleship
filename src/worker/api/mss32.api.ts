@@ -80,6 +80,12 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_shutdown@0", 0),                  // @0 = 0 args
         makeFunc("_AIL_quick_startup@20", 5),
         makeFunc("_AIL_quick_shutdown@0", 0),
+        makeFunc("_AIL_quick_load_mem@8", 2),
+        makeFunc("_AIL_quick_play@8", 2),
+        makeFunc("_AIL_quick_status@4", 1),
+        makeFunc("_AIL_quick_set_volume@12", 3),
+        makeFunc("_AIL_quick_halt@4", 1),
+        makeFunc("_AIL_quick_unload@4", 1),
         makeFunc("_AIL_set_preference@8", 2),            // @8 = 2 args
         makeFunc("_AIL_MSS_version@8", 2),               // (C8 *buff, U32 buff_size)
         makeFunc("_MemSetPatching@4", 1),
@@ -398,6 +404,12 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("AIL_shutdown", 0),
         makeFunc("AIL_quick_startup", 5),
         makeFunc("AIL_quick_shutdown", 0),
+        makeFunc("AIL_quick_load_mem", 2),
+        makeFunc("AIL_quick_play", 2),
+        makeFunc("AIL_quick_status", 1),
+        makeFunc("AIL_quick_set_volume", 3),
+        makeFunc("AIL_quick_halt", 1),
+        makeFunc("AIL_quick_unload", 1),
         makeFunc("AIL_start_sample", 1),
         makeFunc("AIL_start_stream", 1),
         makeFunc("AIL_start_timer", 1),

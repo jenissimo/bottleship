@@ -6,7 +6,7 @@ import { pickDefined, savestateParticipants, stateKeys, type FieldPolicy } from 
 import { CaptureRefusal } from "../../savestate/object-codecs";
 import type { SaveValue } from "../../savestate/value-codec";
 import type { VfsFileHandle } from "../../runtime/filesystem/vfs";
-import type { MSSContext } from "./context";
+import type { MSSContext, MSSQuickAudio } from "./context";
 import type { MSSListener3D, MSSSample, MSSSequence, MSSStream, MSSStreamSource, MSSTimer, MSSWaveOut, RedbookHandle } from "./types";
 import { convertToFloat, decodeStreamFile, parseWav, DIG_F_ADPCM_MASK } from "./audio-decode";
 import { decodeRawSampleImage } from "./raw-sample-cache";
@@ -23,7 +23,7 @@ const DIG_PCM_SIGN = 0x0001;
 
 export const MSS_CONTEXT_FIELDS = {
     process: 'host',
-    samples: 'save', samplesById: 'derive', streams: 'save', streamsById: 'derive',
+    samples: 'save', samplesById: 'derive', streams: 'save', streamsById: 'derive', quickAudio: 'save',
     waveOuts: 'save', fileHandles: 'transient', redbookHandles: 'save', timers: 'save', sequences: 'save', ribProviders: 'save',
     nextSampleId: 'save', nextStreamId: 'save', nextWaveOutId: 'save', nextFileHandleId: 'save', nextTimerId: 'save',
     nextRedbookId: 'save', nextSequenceId: 'save',
@@ -126,6 +126,7 @@ export interface MssState {
     provider3DNamePtrs: number[];
     listener3D: MSSListener3D | null;
     samples: MssSampleState[];
+    quickAudio: MSSQuickAudio[];
     streams: MssStreamState[];
     timers: TimerFields[];
     sequences: MSSSequence[];
@@ -147,9 +148,13 @@ export const MSS_SCHEMA = {
     timer: MSS_TIMER_FIELDS, sequence: MSS_SEQUENCE_FIELDS, redbook: MSS_REDBOOK_FIELDS, waveOut: MSS_WAVEOUT_FIELDS,
     state: stateKeys<MssState>({
         scalars: true, startupAgeMs: true, heartbeat: true, preferences: true, provider3DNamePtrs: true, listener3D: true,
-        samples: true, streams: true, timers: true, sequences: true, redbook: true, waveOuts: true, ribProviders: true,
+        samples: true, quickAudio: true, streams: true, timers: true, sequences: true, redbook: true, waveOuts: true, ribProviders: true,
         memAllocatedByMss: true, wavFormatByDataPtr: true, fileCallbacks: true, memCallbacks: true, streamUserData: true,
         streamCallbacks: true, sequenceUserData: true, sequenceCallbacks: true,
+    }),
+    quickState: stateKeys<MSSQuickAudio>({
+        handle: true, imageAddress: true, imageLength: true, sampleHandle: true,
+        sampleId: true, status: true, volume: true, pan: true,
     }),
     sampleState: stateKeys<MssSampleState>({ fields: true, image: true, decode: true, decoded: true, playFrame: true, ended: true }),
     streamState: stateKeys<MssStreamState>({ fields: true, loaded: true, source: true, playFrame: true, ended: true }),
@@ -348,6 +353,7 @@ export function captureMssSavestate(ctx: MSSContext): MssState {
         provider3DNamePtrs: [...ctx.provider3DNamePtrs],
         listener3D: ctx.listener3D ? { ...ctx.listener3D } : null,
         samples: [...ctx.samples.values()].map(s => captureSample(s, mem)),
+        quickAudio: [...ctx.quickAudio.values()].map(q => ({ ...q })),
         streams: [...ctx.streams.values()].map(s => captureStream(ctx, s)),
         timers: [...ctx.timers.values()].map(t => pickDefined(t, MSS_TIMER_FIELDS)),
         sequences: [...ctx.sequences.values()].map(q => ({ ...q })),
@@ -381,6 +387,7 @@ export async function restoreMssSavestate(ctx: MSSContext, s: MssState): Promise
         ensureListener3D(ctx);
         writeListener3D(ctx);
     }
+    ctx.quickAudio = new Map(s.quickAudio.map(q => [q.handle, { ...q }]));
     ctx.fileHandles.clear();
     ctx.pendingTimerCallbacks.length = 0;
     ctx.pendingEOSCallbacks.length = 0;
@@ -427,7 +434,7 @@ export async function restoreMssSavestate(ctx: MSSContext, s: MssState): Promise
 
 export function registerMssSavestate(ctx: MSSContext): () => void {
     return savestateParticipants.add({
-        id: 'mss32', version: 2, order: 76, covers: ['mss32'], schema: MSS_SCHEMA as unknown as SaveValue,
+        id: 'mss32', version: 3, order: 76, covers: ['mss32'], schema: MSS_SCHEMA as unknown as SaveValue,
         capture: () => {
             try {
                 return captureMssSavestate(ctx) as unknown as SaveValue;
