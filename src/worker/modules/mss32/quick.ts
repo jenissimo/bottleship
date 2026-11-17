@@ -24,8 +24,19 @@ function supportedImage(image: Uint8Array): boolean {
     const info = probeAudioAt(image, 0, image.byteLength);
     if (info?.format === "mp3" || info?.format === "ogg") return info.sampleRate > 0 && info.channels > 0;
     const wav = parseWav(image);
-    return !!wav && wav.channels >= 1 && wav.channels <= 2 && wav.sampleRate > 0
-        && wav.data.byteLength > 0 && [1, 2, 3, 17].includes(wav.formatTag);
+    if (!wav || wav.channels < 1 || wav.channels > 2 || wav.sampleRate <= 0 || wav.data.byteLength === 0) return false;
+    // Admit layouts the shared decoder actually implements, rather than let its
+    // unknown-layout fallback manufacture silence for e.g. IEEE float64 WAV.
+    if (wav.formatTag === 1 || wav.formatTag === 3) {
+        const bits = wav.bitsPerSample;
+        return (wav.formatTag === 1 ? [8, 16, 24, 32].includes(bits) : bits === 32)
+            && wav.blockAlign >= wav.channels * (bits / 8) && wav.data.byteLength >= wav.blockAlign;
+    }
+    if (wav.formatTag === 2 || wav.formatTag === 17) {
+        const header = (wav.formatTag === 2 ? 7 : 4) * wav.channels;
+        return wav.bitsPerSample === 4 && wav.blockAlign >= header && wav.data.byteLength >= header;
+    }
+    return false;
 }
 
 function releaseVoice(ctx: MSSContext, audio: MSSQuickAudio, mem: Uint8Array): void {

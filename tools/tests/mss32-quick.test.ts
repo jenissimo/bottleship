@@ -198,6 +198,12 @@ describe("Miles quick audio", () => {
         expect(invoke("_AIL_quick_load_mem@8", [IMAGE, size])).toBe(0);
         memory.set(new TextEncoder().encode("MThd"), IMAGE);
         expect(invoke("_AIL_quick_load_mem@8", [IMAGE, size])).toBe(0); // no fake MIDI synthesis
+        wave();
+        const header = new DataView(memory.buffer, IMAGE);
+        header.setUint16(20, 3, true); header.setUint16(32, 8, true); header.setUint16(34, 64, true);
+        expect(invoke("_AIL_quick_load_mem@8", [IMAGE, size])).toBe(0); // unsupported IEEE float64 is not silent "playback"
+        wave(); header.setUint16(20, 99, true);
+        expect(invoke("_AIL_quick_load_mem@8", [IMAGE, size])).toBe(0);
         wave(); ctx.digitalDriverHandle = 0;
         expect(invoke("_AIL_quick_load_mem@8", [IMAGE, size])).toBe(0);
         expect(allocations.size).toBe(0); expect(ctx.samples.size).toBe(0); expect(rings.size).toBe(0);
