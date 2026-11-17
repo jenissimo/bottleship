@@ -6,7 +6,10 @@ export interface MSSSample {
     handle: number;
     fileData: Uint8Array | null;
     decodedData: Float32Array | null;
-    streamBuffers?: { ptr: number; size: number; inUse: boolean }[];
+    streamBuffers?: { ptr: number; size: number; inUse: boolean; endFrame?: number }[];
+    eobCallback?: number;
+    /** Live double-buffered input; capture refuses this pending host PCM state. */
+    bufferPlayback?: { submittedFrames: number; writtenFrames: number; pending: Array<{ data: Float32Array; at: number }>; ending: boolean };
     userData?: number[];
     totalBytes?: number;
     fileFormat?: "wav" | "mp3" | "ogg" | "raw" | "unknown";

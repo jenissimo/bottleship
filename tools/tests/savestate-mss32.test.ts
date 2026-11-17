@@ -213,7 +213,7 @@ describe("mss32 participant", () => {
         ctx.timers.set(5, { handle: 5, callback: 0x403000, user: 1, freq: 50, period: 0, active: false });
         const base = captureMssSavestate(ctx);
         const sampleValues: Partial<MSSSample> = {
-            id: 4, handle: 0x1234, streamBuffers: [{ ptr: 0x3000, size: 4096, inUse: false }], userData: [5, 6], totalBytes: 99,
+            id: 4, handle: 0x1234, eobCallback: 0x401000, streamBuffers: [{ ptr: 0x3000, size: 4096, inUse: false }], userData: [5, 6], totalBytes: 99,
             fileFormat: "wav", sampleTypeFormat: 3, sampleTypeFlags: 1, sampleRate: 11025, channels: 2, bitsPerSample: 8, formatTag: 17,
             blockAlign: 4, volume: 60, pan: 20, playbackRate: 1.5, playbackRateHz: 33075, loopCount: 4, loopStartBytes: 8, loopEndBytes: 64,
             pcmBytes: 4000, isPlaying: true, isStopped: true, position: 256, pendingStart: true, fileDataAllocated: true, fileDataAddress: 0x3000,
@@ -475,7 +475,7 @@ describe("mss32 participant", () => {
             const p = savestateParticipants.all().find(x => x.id === "mss32")!;
             expect(p.covers).toEqual(["mss32"]);
             expect(savestateParticipants.coveredModules().has("mss32")).toBe(true);
-            expect(savestateParticipants.schemas().mss32).toEqual({ version: 1, schemaHash: "567f198e080fc09e" });
+            expect(savestateParticipants.schemas().mss32).toEqual({ version: 2, schemaHash: "e39bd4aa60f1e2fa" });
             ctx.insideAilServe = true;
             expect(() => p.capture({} as never)).toThrow(CaptureRefusal);
         } finally {

@@ -2,6 +2,8 @@ import { Logger, LogCategory } from "../../core/logger";
 import { MSSContext } from "./context";
 import { MSSSample } from "./types";
 import { getMemory, makeView } from "./helpers";
+import { runGuestCallChain } from "./app-file-io";
+import type { ThunkResult } from "../../core/thunking/thunk-dispatcher";
 
 /** Invoke EOS_callback (0x4C) with [sample_handle, user_data]; stdcall 8 bytes. */
 export function invokeEOSCallback(ctx: MSSContext, sample: MSSSample): void {
@@ -108,4 +110,29 @@ export function processPendingEOSCallbacks(ctx: MSSContext): boolean {
         Logger.warn(LogCategory.SYSTEM, `MSS32: EOS callback invoke failed: ${e}`);
         return false;
     }
+}
+
+/** EOB is a one-argument AILSAMPLECB, unlike the legacy two-argument EOS path.
+ * Heartbeats only queue events. An ordinary export owns the suspended caller. */
+export function servePendingEOBCallbacks(
+    ctx: MSSContext, thunkCtx: unknown, cleanup: number, source: string, answer: number,
+): ThunkResult | null {
+    const cm = ctx.process?.dispatcher?.callbackManager;
+    if (!cm || cm.getActiveSuspendedFrameId?.()) return null;
+    while (ctx.pendingEOBCallbacks.length) {
+        const event = ctx.pendingEOBCallbacks[0]!;
+        const sample = ctx.samples.get(event.handle);
+        if (!sample || sample.id !== event.id || sample.eobCallback !== event.callback) {
+            ctx.pendingEOBCallbacks.shift();
+            continue;
+        }
+        const result = runGuestCallChain(ctx, thunkCtx, cleanup, source, (function* () {
+            yield { fn: event.callback, args: [event.handle], label: "EOB" };
+            return answer;
+        })());
+        if (typeof result === "number") return null; // caller could not be parked; retain the event
+        ctx.pendingEOBCallbacks.shift();
+        return result;
+    }
+    return null;
 }

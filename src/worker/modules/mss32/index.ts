@@ -9,7 +9,7 @@ import { TimeService } from "../../runtime/time";
 import { MSSContext, createMSSContext, SMP_DONE, SMP_PLAYING } from "./context";
 import { finishSamplePlayback, getBytesPerSecond, getPlaybackLengthBytes, setSampleStatus, setStreamStatus, writeSamplePosition, writeStreamPosition, startHeartbeat, stopHeartbeat } from "./helpers";
 import { updateEmulatorState, playSample, appendDecodedChunk, resetMssRingBuffers } from "./playback-engine";
-import { invokeEOSCallback } from "./callbacks";
+import { invokeEOSCallback, servePendingEOBCallbacks } from "./callbacks";
 import { pumpVfsStreams, serveIncrementalStreams } from "./stream-engine";
 import { mss32Module } from "../../api/mss32.api";
 import { convertToFloat } from "./audio-decode";
@@ -123,8 +123,8 @@ export class MSS32 implements IModule {
             const serviced: ThunkImplementation = (thunkCtx, mem, args) => {
                 const result = impl(thunkCtx, mem, args);
                 if (typeof result !== "number") return result;
-                return serveIncrementalStreams(
-                    this.ctx, thunkCtx, stackCleanup, `mss32:${name}`, result) ?? result;
+                return servePendingEOBCallbacks(this.ctx, thunkCtx, stackCleanup, `mss32:${name}`, result)
+                    ?? serveIncrementalStreams(this.ctx, thunkCtx, stackCleanup, `mss32:${name}`, result) ?? result;
             };
             this.exports[name] = serviced;
         }
@@ -329,6 +329,7 @@ export class MSS32 implements IModule {
         ctx.timers.clear();
         ctx.pendingTimerCallbacks.length = 0;
         ctx.pendingEOSCallbacks.length = 0;
+        ctx.pendingEOBCallbacks.length = 0;
         ctx.insideAilServe = false;
         resetMssRingBuffers();
         ctx.samples.clear();

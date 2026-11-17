@@ -89,6 +89,8 @@ export interface MSSContext {
     pendingTimerCallbacks: Array<{ callback: number; user: number; handle?: number }>;
     /** Queue of pending EOS callbacks - processed during _AIL_serve to avoid corrupting CPU state */
     pendingEOSCallbacks: Array<{ callback: number; handle: number; user: number }>;
+    /** EOB events queued by mixer progress, drained only at a safe guest service point. */
+    pendingEOBCallbacks: Array<{ callback: number; handle: number; id: number }>;
     /** Stream callbacks (AIL_register_stream_callback) an incremental stream hit the end
      *  of source on. One arg, HSTREAM — drained in _AIL_serve like the EOS queue. */
     pendingStreamCallbacks: Array<{ callback: number; handle: number }>;
@@ -190,6 +192,7 @@ export function createMSSContext(process: Process): MSSContext {
         memAllocatedByMss: new Set(),
         pendingTimerCallbacks: [],
         pendingEOSCallbacks: [],
+        pendingEOBCallbacks: [],
         pendingStreamCallbacks: [],
         insideAilServe: false,
         serveDepth: 0,
