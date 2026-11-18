@@ -3,3 +3,7 @@
 /tools/lan-conformance/winsock-udp-connreset.schema.json text eol=lf
 /tools/lan-conformance/winsock-udp-connreset-iocp-apc-effect.c text eol=lf
 /tools/lan-conformance/winsock-udp-connreset-iocp-apc-effect.schema.json text eol=lf
+
+# Linux TURN deployment files are also archived from Windows checkouts.
+/deploy/lan/start-turn.sh text eol=lf
+/deploy/lan/*.conf text eol=lf
