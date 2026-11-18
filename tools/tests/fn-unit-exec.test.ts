@@ -19,7 +19,7 @@ import { resetGuestCodeInvalidationState, writeGuestCode } from '../../src/worke
 import { exports as fiberApi, resetFiberState } from '../../src/worker/modules/kernel32/fiber';
 import { MOV_EAX_IMM32, MOV_EDX_IMM32, OUT_DX_EAX, THUNK_PORT } from '../../src/worker/core/thunking/thunk-constants';
 import { captureCpu, restoreCpu } from '../../src/worker/savestate/participants/cpu';
-import { registerFnUnitCommands, summarizeFnUnit, FN_UNIT_STAT_NAMES } from '../../src/worker/harness/cmds/fn-unit';
+import { registerFnUnitCommands, summarizeFnUnit, FN_UNIT_STAT_NAMES, FN_UNIT_CHAIN_COUNTER_NAMES } from '../../src/worker/harness/cmds/fn-unit';
 
 const LIB = fileURLToPath(new URL('../../vendor/v86/build/libv86.mjs', import.meta.url));
 const WASM = fileURLToPath(new URL('../../vendor/v86/build/v86.wasm', import.meta.url));
@@ -94,7 +94,7 @@ function expectedMain(get2: number, get1 = 0x11): number {
 
 interface Machine { em: any; cpu: any; w: any; mem: () => Uint8Array; u32: (a: number) => number; stats: () => Record<string, number> }
 
-async function machine(units: boolean): Promise<Machine> {
+async function machine(units: boolean, chain = 0): Promise<Machine> {
     const { V86 } = await import(LIB);
     const em = new V86({ autostart: false, memory_size: 32 << 20, wasm_path: WASM, log_level: 0, disable_jit: 0 });
     await new Promise<void>(resolve => em.add_listener('emulator-loaded', resolve));
@@ -106,7 +106,11 @@ async function machine(units: boolean): Promise<Machine> {
     w.fn_unit_set_threshold(4);
     w.fn_unit_set_mutation(+(process.env.FN_UNIT_MUTATION ?? 0));
     if (units) { w.fn_census_set_enabled(1); w.fn_unit_set_enabled(1); }
-    const stats = () => Object.fromEntries(FN_UNIT_STAT_NAMES.map((n, i) => [n, w.fn_unit_stat(i)]));
+    if (chain) { w.fn_unit_set_chain(chain); w.fn_unit_set_chain_counting(1); }
+    const stats = () => Object.fromEntries([
+        ...FN_UNIT_STAT_NAMES.map((n, i) => [n, w.fn_unit_stat(i)]),
+        ...FN_UNIT_CHAIN_COUNTER_NAMES.map((n, i) => [`chain.${n}`, w.fn_unit_chain_counter(i) >>> 0]),
+    ]);
     return { em, cpu, w, mem, u32, stats };
 }
 
@@ -146,6 +150,10 @@ describe('fnUnit verbs', () => {
         expect(s.problems).toContain('matched + exited != entries');
         expect(s.problems.some(p => p.includes('census is off'))).toBe(true);
         expect(s.matchedShare).toBeCloseTo(1 / 3);
+        expect(s.chain).toBe('off');
+        const c = summarizeFnUnit({ exportsId: 1, enabled: 1, censusEnabled: 1, threshold: 4, units: 0, stats: [], chain: 2, depth: 3 });
+        expect(c.chain).toBe('private');
+        expect(c.problems.some(p => p.includes('chain depth 3'))).toBe(true);
     });
 });
 
@@ -278,7 +286,7 @@ describe.skipIf(!HAVE_V86)('function units in v86 through the host', () => {
         await dst.em.destroy();
     }), 60000);
 
-    for (const units of [false, true]) test(`fiber switches through thunk stubs while units run on both stacks (units ${units ? 'on' : 'off'})`, async () => withoutWindow(async () => {
+    for (const [units, chain] of [[false, 0], [true, 0], [true, 2]] as const) test(`fiber switches through thunk stubs while units run on both stacks (units ${units ? 'on' : 'off'}, chain ${chain})`, async () => withoutWindow(async () => {
         const API = { ConvertThreadToFiber: 101, CreateFiber: 102, SwitchToFiber: 103 } as const;
         const ARGC = { ConvertThreadToFiber: 1, CreateFiber: 3, SwitchToFiber: 1 } as const;
         const names = Object.keys(API) as (keyof typeof API)[];
@@ -312,7 +320,7 @@ describe.skipIf(!HAVE_V86)('function units in v86 through the host', () => {
         b.e(0xff, 0x35).u(MAIN).call(stub('SwitchToFiber'));
         b.e(0xeb, (loop - (b.p + 2)) & 0xff);
 
-        const m = await machine(units);
+        const m = await machine(units, chain);
         const system = System.getInstance() as any;
         const saved = { process: system.process, scheduler: system.scheduler };
         try {
@@ -355,4 +363,119 @@ describe.skipIf(!HAVE_V86)('function units in v86 through the host', () => {
             await m.em.destroy();
         }
     }), 90000);
+
+    /** pair(n) = sum(n) + get(): a unit whose two direct calls go to units. */
+    const PAIR = BASE + 0x5000;
+    function chainImage(withHalt: boolean): Uint8Array {
+        const mem = new Uint8Array(BASE + IMG);
+        header(mem);
+        functions(mem);
+        const p = new Asm(mem, PAIR);
+        p.e(0x55, 0x8b, 0xec, 0x53, 0xff, 0x75, 0x08).call(FN).e(0x89, 0xc3).call(GET).e(0x01, 0xd8, 0x5b, 0x5d, 0xc2, 0x04, 0x00);
+        const a = new Asm(mem, ENTRY);
+        a.e(0xbc).u(STACK).e(0x31, 0xff);
+        const phase = () => {
+            a.e(0xb9).u(ITER);
+            const top = a.p;
+            a.e(0x51, 0x6a, SUM_N).call(PAIR).e(0x01, 0xc7, 0x59, 0x49).jnz(top);
+        };
+        phase();
+        a.ctl(1);
+        if (withHalt) a.e(0xf4);
+        phase();
+        a.e(0x68).u(LONG_N).call(PAIR).e(0x01, 0xc7);
+        a.e(0x89, 0x3d).u(RES);
+        a.ctl(2);
+        a.e(0xf4);
+        return mem.slice(BASE);
+    }
+    const expectedChain = (get2: number, get1 = 0x11) => (expectedMain(get2, get1) + get2) >>> 0;
+
+    test('chain verbs: modes, and-esp, counting, status; each switch frees the units', async () => withoutWindow(async () => {
+        const m = await machine(false);
+        const v = verbs(m.cpu);
+        try {
+            const st0 = v.call('fnUnitStatus');
+            expect([st0.chain, st0.andEsp, st0.chainDepth]).toEqual(['off', false, 0]);
+            m.w.fn_census_set_enabled(1);
+            expect(() => v.call('fnUnitEnable', { chain: 'fast' })).toThrow('chain must be');
+            const on = v.call('fnUnitEnable', { threshold: 4, chain: 'private', andEsp: true, counting: true });
+            expect([on.enabled, on.chain, on.andEsp]).toEqual([true, 'private', true]);
+            m.cpu.load_multiboot(chainImage(false).buffer);
+            expect(await runToHalt(m, () => { m.cpu.reg32[4] = STACK; m.cpu.instruction_pointer[0] = ENTRY; })).toBe(true);
+            expect(m.u32(RES)).toBe(expectedChain(0x11));
+            const st = v.call('fnUnitStatus');
+            expect(st.problems).toEqual([]);
+            expect(st.chainCounters.calls).toBeGreaterThan(ITER);
+            expect(st.chainCounters.retMatched).toBeGreaterThan(ITER);
+            expect(st.stats.chainSites).toBeGreaterThanOrEqual(2);
+            expect(st.units).toBeGreaterThan(0);
+            const canon = v.call('fnUnitEnable', { chain: 'canonical' });
+            expect([canon.chain, canon.units]).toEqual(['canonical', 0]);
+            const off = v.call('fnUnitEnable', { on: false, chain: 'off', andEsp: false, counting: false });
+            expect([off.enabled, off.chain, off.andEsp, off.units]).toEqual([false, 'off', false, 0]);
+        } finally { v.restore(); await m.em.destroy(); }
+    }), 60000);
+
+    for (const chain of [0, 1, 2]) test(`writeGuestCode patches a chained callee; its caller is dropped and chains again (chain ${chain})`, async () => withoutWindow(async () => {
+        const m = await machine(chain !== 0, chain);
+        const saved = (preemptionManager as unknown as { wasmExports: unknown }).wasmExports;
+        (preemptionManager as unknown as { wasmExports: unknown }).wasmExports = m.w;
+        resetGuestCodeInvalidationState();
+        let before: Record<string, number> = {};
+        try {
+            Mem.bind(m.mem);
+            m.cpu.load_multiboot(chainImage(false).buffer);
+            m.cpu.io.register_write(CTL_PORT, null, undefined, undefined, () => {
+                if ((m.cpu.reg32[1] >>> 0) !== 1) return;
+                before = m.stats();
+                expect(writeGuestCode(m.mem(), new Uint8Array([0x22]), GET + 1)).toBe(true);
+            });
+            expect(await runToHalt(m, () => { m.cpu.reg32[4] = STACK; m.cpu.instruction_pointer[0] = ENTRY; })).toBe(true);
+            expect(m.u32(RES)).toBe(expectedChain(0x22));
+            const after = m.stats();
+            expect(m.w.fn_unit_chain_depth() >>> 0).toBe(0);
+            if (chain) {
+                expect(after.chainDependantsDropped! - before.chainDependantsDropped!).toBeGreaterThanOrEqual(1);
+                expect(after['chain.calls']! - before['chain.calls']!).toBeGreaterThan(ITER);
+                expect(after['chain.fallbackToken']! - before['chain.fallbackToken']!).toBeLessThan(64);
+                expect(after.matched! + after.exited!).toBe(after.entries!);
+            }
+            else expect(after['chain.calls']).toBe(0);
+        } finally {
+            (preemptionManager as unknown as { wasmExports: unknown }).wasmExports = saved;
+            resetGuestCodeInvalidationState();
+            await m.em.destroy();
+        }
+    }), 60000);
+
+    test('a host savestate taken at a safe point restores over live chained units', async () => withoutWindow(async () => {
+        const src = await machine(true, 2);
+        src.cpu.load_multiboot(chainImage(true).buffer);
+        expect(await runToHalt(src, () => { src.cpu.reg32[4] = STACK; src.cpu.instruction_pointer[0] = ENTRY; })).toBe(true);
+        expect(src.w.fn_unit_count() >>> 0).toBeGreaterThan(0);
+        const cpuState = captureCpu(src.cpu);
+        const ram = src.mem().slice();
+        src.cpu.in_hlt[0] = 0;
+        expect(await runToHalt(src)).toBe(true);
+        const continued = src.u32(RES);
+        await src.em.destroy();
+
+        const dst = await machine(true, 2);
+        const other = chainImage(false);
+        new Asm(other, GET - BASE + 1).u(0x33);
+        dst.cpu.load_multiboot(other.buffer);
+        expect(await runToHalt(dst, () => { dst.cpu.reg32[4] = STACK; dst.cpu.instruction_pointer[0] = ENTRY; })).toBe(true);
+        expect(dst.u32(RES)).toBe(expectedChain(0x33, 0x33));
+        const callsBefore = dst.stats()['chain.calls']!;
+        dst.mem().set(ram);
+        restoreCpu(dst.cpu, cpuState);
+        expect(dst.w.fn_unit_count() >>> 0).toBe(0);
+        dst.cpu.in_hlt[0] = 0;
+        expect(await runToHalt(dst)).toBe(true);
+        expect([continued, dst.u32(RES)]).toEqual([expectedChain(0x11), expectedChain(0x11)]);
+        expect(dst.stats()['chain.calls']!).toBeGreaterThan(callsBefore);
+        expect(dst.w.fn_unit_chain_depth() >>> 0).toBe(0);
+        await dst.em.destroy();
+    }), 60000);
 });
