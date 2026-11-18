@@ -9,7 +9,8 @@ services:
       BS_LAN_TURN_ALLOW_PUBLIC: ${BS_LAN_TURN_ALLOW_PUBLIC:-false}
 
   coturn:
-    image: coturn/coturn:4.19.1-r0@sha256:81f69dc7cb672eb73ab3414afbb199637c37ab8069919d1c6caaed96ff16fb88
+    build: ./turn-image
+    image: bottleship-coturn:4.19.1-r0
     restart: unless-stopped
     network_mode: host
     user: "65534:65534"
