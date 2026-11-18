@@ -672,14 +672,19 @@ let cursorClipRect: CursorClipRect | null = null;
 /** Bounds the clip rect itself is confined to (wineserver set_clip_rectangle clamps
  *  the requested rect to the virtual screen). */
 export function getVirtualScreenRect(): CursorClipRect {
+    return { left: 0, top: 0, right: virtualScreenWidth(), bottom: virtualScreenHeight() };
+}
+
+/** The virtual screen's width; it starts at (0,0). Builds nothing, for per-frame checks. */
+export function virtualScreenWidth(): number {
     const sys = System.getInstance();
-    const cfg = EmulatorConfig.getInstance().screenResolution;
-    return {
-        left: 0,
-        top: 0,
-        right: sys.emulatedDisplayMode?.width || sys.ddrawContext?.display?.width || cfg.width,
-        bottom: sys.emulatedDisplayMode?.height || sys.ddrawContext?.display?.height || cfg.height,
-    };
+    return sys.emulatedDisplayMode?.width || sys.ddrawContext?.display?.width || EmulatorConfig.getInstance().screenResolution.width;
+}
+
+/** The virtual screen's height; it starts at (0,0). Builds nothing, for per-frame checks. */
+export function virtualScreenHeight(): number {
+    const sys = System.getInstance();
+    return sys.emulatedDisplayMode?.height || sys.ddrawContext?.display?.height || EmulatorConfig.getInstance().screenResolution.height;
 }
 
 export function setCursorClipRect(rect: CursorClipRect | null): void {

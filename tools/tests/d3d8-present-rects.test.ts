@@ -83,6 +83,7 @@ async function presentWith(regions: Array<PresentRegion | undefined>) {
         gpuTexture: {}, gpuTextureView: backView,
     } as unknown as RenderSurface;
     const shown: Array<{ name: string; srcW: number; srcH: number }> = [];
+    const clientPlanes: Array<boolean | undefined> = [];
     const destroyed: string[] = [];
     let made = 0;
     const encoder = { finish: () => ({}) };
@@ -92,9 +93,10 @@ async function presentWith(regions: Array<PresentRegion | undefined>) {
         getQueue: () => ({ submit: () => events.push('submit') }),
         getContext: () => ({ getCurrentTexture: () => ({ width: 1280, height: 960, createView: () => ({}) }) }),
         drawTexture: (source: { name: string }, _t: unknown, _e: unknown, _o: unknown, _w: unknown, _h: unknown, _c: unknown, _n: unknown,
-            present: { srcW: number; srcH: number }) => {
+            present: { srcW: number; srcH: number; clientPlane?: boolean }) => {
             events.push('display');
             shown.push({ name: source.name, srcW: present.srcW, srcH: present.srcH });
+            clientPlanes.push(present.clientPlane);
         },
     };
     const fakeSystem = {
@@ -143,7 +145,7 @@ async function presentWith(regions: Array<PresentRegion | undefined>) {
         } finally { system.mockRestore(); }
     };
     await run(regions);
-    return { events, shown, blits, destroyed, made: () => made, adapter, run };
+    return { events, shown, clientPlanes, blits, destroyed, made: () => made, adapter, run };
 }
 
 async function presentAgain(r: Awaited<ReturnType<typeof presentWith>>, regions: Array<PresentRegion | undefined>) {
@@ -156,6 +158,11 @@ describe('D3D8 Present with rectangles', () => {
         const r = await presentWith([undefined]);
         expect(r.events).toEqual(['display', 'submit']);
         expect(r.shown).toEqual([{ name: 'back', srcW: 640, srcH: 480 }]);
+    });
+
+    test('the canvas present marks its source as the device window\'s client area, with and without rectangles', async () => {
+        const r = await presentWith([undefined, region(rect(0, 0, 560, 400), rect(0, 0, 560, 400), 560, 400)]);
+        expect(r.clientPlanes).toEqual([true, true]);
     });
 
     test('rectangles that name the whole back buffer and client area change nothing either', async () => {

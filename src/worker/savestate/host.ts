@@ -222,6 +222,8 @@ async function runPendingLoadLocked(input: PendingLoadInput): Promise<PendingLoa
     if (!check.ok) throw new Error(`savestate ${name} does not fit this boot: ${check.reasons.join('; ')}`);
     if (check.overlayChanged) Logger.warn(LogCategory.SYSTEM, `[SAVESTATE] ${name}: the game's files changed since it was taken`);
     await restoreSession(input.target, check.state, store.chunkStore, input.participants);
+    // The host view is derived, not saved: the restored windows and mode give it again.
+    System.getInstance().refreshHostView();
     return { kind: 'restored', name, ms: Math.round(performance.now() - t0), overlayChanged: check.overlayChanged };
 }
 
