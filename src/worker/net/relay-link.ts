@@ -1,5 +1,6 @@
 import { io, type Socket } from "socket.io-client";
 import type { ClientEvents, ServerEvents, LanReady } from "./netplay-wire";
+import { readRoomCommsEvent, readRoomCommsRequest, type RoomCommsUpdate } from "../../../packages/lan/src/room-comms";
 import { PROTOCOL_VERSION, WIRE_DGRAM_MULTICAST4, PROTO_DIRECTPLAY, isTcpProtocol, asBytes, decodeDatagram, isLanNode, nodeToIpv4 } from "./netplay-wire";
 import { LanNetwork, type NetTransport } from "./lan-network";
 import { UdpHostLeaseRpc, type UdpHostLease } from "./udp-host-lease-rpc";
@@ -11,6 +12,7 @@ import type { UdpPeerLeaseRequest } from "./netplay-wire";
 import { NetResolveError, type ResolveRequest, type ResolveResult, type ResolveReply, parseIpv6, parseIpv4, isExternalIpv6Node, validBindingGeneration } from "./netplay-wire";
 
 export interface RelayLinkOptions {
+    onRoomComms?: (update: RoomCommsUpdate) => void;
     invite?: string;
     transports?: ("websocket" | "polling")[];
     timeoutMs?: number;
@@ -41,6 +43,9 @@ export class RelayLink implements NetTransport {
     readonly ready: Promise<void>;
     readonly socket: Socket<ServerEvents, ClientEvents>;
     private online = false;
+    private roomCommsEnabled = false;
+    private roomCommsRecovering = false;
+    private pendingVoice?: "join" | "leave" | "replace";
     private closed = false;
     private settled = false;
     private readonly reliableQueue:({kind:"frame";frame:Uint8Array<ArrayBuffer>;generation?:number}|{kind:"release";port:number;proto:number;generation:number}|{kind:"leaseRequest";id:number;request:UdpPeerLeaseRequest}|{kind:"leaseCancel";id:number}|{kind:"leaseRelease";id:number}|{kind:"hostRequest";id:number;request:UdpHostOpenRequest}|{kind:"hostCancel";id:number}|{kind:"hostRelease";id:number}|{kind:"tcpHostRequest";id:number;request:TcpHostOpenRequest}|{kind:"tcpHostCancel";id:number}|{kind:"tcpHostRelease";id:number})[] = [];
@@ -86,7 +91,7 @@ export class RelayLink implements NetTransport {
     get connected(): boolean { return this.online; }
     get connecting(): boolean { return !this.settled && !this.closed; }
 
-    constructor(url: string, room: string, private readonly net: LanNetwork, options: RelayLinkOptions = {}) {
+    constructor(url: string, room: string, private readonly net: LanNetwork, private readonly options: RelayLinkOptions = {}) {
         this.ready = new Promise<void>((resolve, reject) => { this.resolveReady = resolve; this.rejectReady = reject; });
         const timeout = options.timeoutMs ?? 10_000;
         const clientId = clientIds.get(net) ?? crypto.randomUUID();
@@ -101,18 +106,25 @@ export class RelayLink implements NetTransport {
             reconnection: true,
             reconnectionDelay: 500,
             reconnectionDelayMax: 10_000,
-            auth: { version: PROTOCOL_VERSION, room, clientId, node: Array.from(net.node), ...(options.invite ? {invite: options.invite} : {}) },
+            auth: { version: PROTOCOL_VERSION, room, clientId, node: Array.from(net.node), ...(options.invite ? {invite: options.invite} : {}),
+                ...(options.onRoomComms ? { roomCommsV1: true } : {}) },
             ...(options.extraHeaders ? { extraHeaders: options.extraHeaders } : {}),
         });
         const origin = options.origin ?? (globalThis as { location?: { origin?: string } }).location?.origin;
         this.deadline = setTimeout(() => this.failInitial(new Error("LAN server readiness timed out")), timeout);
         this.socket.on("connect", () => {
             this.socket.io.engine.on("drain", () => {
+                this.flushVoice();
                 this.flush();
                 if (this.online && !this.closed) this.net.notifyWritable();
             });
         });
         this.socket.on("ready", info => this.acceptReady(info));
+        this.socket.on("roomComms", value => {
+            if (!this.online || !this.roomCommsEnabled) return;
+            const event = readRoomCommsEvent(value);
+            if (event) this.options.onRoomComms?.(event);
+        });
         this.socket.on("resolved", (id, reply) => this.pendingResolves.get(id)?.accept(reply));
         this.socket.on("udpPeerLeased", (id, reply) => { if (this.online && !this.closed) this.udpPeers.accept(id, reply); });
         this.socket.on("udpHostOpened", (id, reply) => { if (this.online && !this.closed) this.udpHosts.accept(id, reply); });
@@ -147,6 +159,7 @@ export class RelayLink implements NetTransport {
             if (this.closed) return;
             this.online = false;
             this.clearQueue();
+            this.updateRoomComms(false, this.socket.active && this.roomCommsEnabled);
             this.cancelResolves();
             this.udpPeers.disconnect(); this.udpHosts.disconnect(); this.tcpHosts.disconnect();
             this.socket.sendBuffer.length = 0;
@@ -157,6 +170,7 @@ export class RelayLink implements NetTransport {
         this.socket.on("connect_error", error => {
             if (this.closed) return;
             this.net.setConnected(false, error.message);
+            if (!this.socket.active) this.updateRoomComms(false);
             if (this.settled || explaining) return;
             explaining = true;
             void explainRelayFailure(url, error, origin).then(explained => this.failInitial(explained));
@@ -268,11 +282,13 @@ export class RelayLink implements NetTransport {
     private clearQueue(): void {
         this.reliableQueue.length = 0;
         this.queuedBytes = 0;
+        this.pendingVoice = undefined;
     }
     close(): void {
         if (this.closed) return;
         this.closed = true;
         this.online = false;
+        this.updateRoomComms(false);
         this.clearQueue();
         this.cancelResolves();
         this.udpPeers.disconnect(); this.udpHosts.disconnect(); this.tcpHosts.disconnect();
@@ -291,6 +307,38 @@ export class RelayLink implements NetTransport {
         this.settled = true;
         this.rejectReady(error);
         this.close();
+    }
+    sendRoomComms(value: unknown): boolean {
+        if (!this.online || this.closed || !this.roomCommsEnabled || !this.socket.connected) return false;
+        const request = readRoomCommsRequest(value);
+        const engine = this.socket.io.engine;
+        if (!request || !engine) return false;
+        if (request.kind === "voiceJoin" || request.kind === "voiceLeave") {
+            // Keep one coalesced membership intent if existing packets fill the transport.
+            // A later leave cancels a pending join, and recovery preserves leave-before-join.
+            if (request.kind === "voiceLeave") this.pendingVoice = "leave";
+            else if (!this.pendingVoice) this.pendingVoice = "join";
+            else if (this.pendingVoice === "leave") this.pendingVoice = "replace";
+            this.flushVoice();
+            return true;
+        }
+        if (engine.writeBuffer.length >= 16) return false;
+        this.socket.emit("roomComms", request);
+        return true;
+    }
+    private flushVoice(): void {
+        if (!this.pendingVoice || !this.online || !this.socket.connected
+            || this.socket.io.engine.writeBuffer.length >= 16) return;
+        const intent = this.pendingVoice;
+        this.pendingVoice = undefined;
+        if (intent !== "join") this.socket.emit("roomComms", { kind: "voiceLeave" });
+        if (intent !== "leave") this.socket.emit("roomComms", { kind: "voiceJoin" });
+    }
+    private updateRoomComms(enabled: boolean, recovering = false): void {
+        if (enabled === this.roomCommsEnabled && recovering === this.roomCommsRecovering) return;
+        this.roomCommsEnabled = enabled;
+        this.roomCommsRecovering = recovering;
+        this.options.onRoomComms?.({ kind: "available", enabled, ...(recovering ? { recovering: true } : {}) });
     }
     private acceptReady(info: LanReady): void {
         if (this.closed) return;
@@ -313,6 +361,7 @@ export class RelayLink implements NetTransport {
         this.net.configureGatewayIpv6(info.gatewayIpv6 ?? []);
         this.online = true;
         clearTimeout(this.deadline);
+        this.updateRoomComms(info.roomCommsV1 === true);
         this.net.setConnected(true);
         this.flush();
         if (!this.settled) { this.settled = true; this.resolveReady(); }

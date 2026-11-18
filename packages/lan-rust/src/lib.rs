@@ -11,6 +11,7 @@ use bottleship_lan_core::{
     gateway::DestinationPolicy,
     routes::{NativeAddress, ResolveCode, ResolveError, Routes},
     stats::{DEFAULT_UNIQUE_CAPACITY, ServerStats, StatsToken},
+    turn::TurnConfig,
 };
 use bottleship_lan_gateway::{
     Gateway, GatewayEvents, GatewayHandle, GatewayOptions, GatewayOutput,
@@ -64,6 +65,7 @@ impl LanServer {
     {
         config.validate().map_err(std::io::Error::other)?;
         let access = bottleship_lan_core::access::AccessPolicy::from_environment(config.room_access.clone())?;
+        let turn = TurnConfig::from_environment()?;
         let dns = Arc::new(Semaphore::new(config.max_dns_operations));
         let gateway = Arc::new(config.gateway.clone());
         let mut routes = Routes::new(config.gateway.clone())?;
@@ -129,6 +131,12 @@ impl LanServer {
         let mut limits = config.limits.clone();
         limits.max_binding_entries = Some(limits.binding_entry_budget(config.max_connections));
         let mut core = Core::new(limits, routes, access, epoch)?;
+        if let Some(turn) = turn {
+            let mut namespace = [0; 16];
+            getrandom::fill(&mut namespace)
+                .map_err(|_| std::io::Error::other("Could not initialize TURN credential namespace"))?;
+            core = core.with_turn(turn, namespace);
+        }
         let stats = match stats_token {
             Some(token) => {
                 let stats = Arc::new(ServerStats::new(epoch, DEFAULT_UNIQUE_CAPACITY, Box::new(os_salt))?);

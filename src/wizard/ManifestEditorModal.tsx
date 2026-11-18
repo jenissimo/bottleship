@@ -1,3 +1,4 @@
+import { X } from "@phosphor-icons/react";
 import React, { useEffect, useState } from "react";
 import { getEffectiveManifest, saveOverride, type ManifestOverride } from "../wgb-library";
 import { cx } from "../ui/cx";
@@ -164,7 +165,7 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
       >
         <div className={ms["modal-header"]}>
           <h2>Edit manifest</h2>
-          <button className={ms["modal-close"]} onClick={onClose}>×</button>
+          <button className={ms["modal-close"]} onClick={onClose} aria-label="Close"><X size={16} aria-hidden /></button>
         </div>
 
         <div className={ms["modal-body"]}>
@@ -203,7 +204,7 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
                 <span className={s["medit-label"]}>Resolution</span>
                 <div className={s["medit-res"]}>
                   <input className={s["addgame__field"]} type="number" placeholder="W" value={form.resW} onChange={(e) => set("resW", e.target.value)} />
-                  <span className={s["medit-x"]}>×</span>
+                  <span className={s["medit-x"]}><X size={14} aria-hidden /></span>
                   <input className={s["addgame__field"]} type="number" placeholder="H" value={form.resH} onChange={(e) => set("resH", e.target.value)} />
                   <input className={s["addgame__field"]} type="number" placeholder="bpp" value={form.resBpp} onChange={(e) => set("resBpp", e.target.value)} />
                 </div>

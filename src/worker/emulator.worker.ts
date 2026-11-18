@@ -179,7 +179,7 @@ import { frameProfiler } from "./core/frame-profiler";
 import { frameVarianceDiagnostics } from "./core/frame-variance-diagnostics";
 import { framePacer } from "./core/frame-pacer";
 import { EmulatorConfig } from "./core/emulator-config-manager";
-import { configureNetplay } from "./net/configure-netplay";
+import { configureNetplay, sendRoomComms } from "./net/configure-netplay";
 import { lanNetwork } from "./net/lan-network";
 import { networkConsent } from "./net/network-consent";
 import type { NetworkStatus } from "../network-config";
@@ -412,7 +412,7 @@ const applySessionNetwork = (value: unknown): void => {
     const config = EmulatorConfig.getInstance().setNetwork(value);
     networkConnecting = config !== null;
     postNetworkState({ state: config ? "connecting" : "offline" });
-    sessionNetworkReady = configureNetplay(config).then(() => {
+    sessionNetworkReady = configureNetplay(config, update => self.postMessage({ type: "room_comms_update", update })).then(() => {
       if (revision !== networkRevision) return;
       networkConnecting = false;
       postNetworkState({
@@ -3702,6 +3702,11 @@ const handleWorkerMessage = (event: MessageEvent): void => {
       : null;
     Logger.log(LogCategory.SYSTEM,
       `[ReExec] boot from host: image "${pendingReExecImage ?? "(manifest)"}" args "${pendingReExecArgs ?? ""}"`);
+    return;
+  }
+
+  if (message?.type === "room_comms_send") {
+    if (!sendRoomComms(message.request)) self.postMessage({ type: "room_comms_update", update: { kind: "error", code: "busy" } });
     return;
   }
 

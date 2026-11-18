@@ -1,3 +1,4 @@
+import { CaretDown, CaretRight, X } from "@phosphor-icons/react";
 import React, { useState, useEffect } from 'react';
 import ms from '../ui/Modal/Modal.module.css';
 import { ActionButton } from '../ui/ActionButton';
@@ -213,8 +214,8 @@ const RegistryTool: React.FC<RegistryToolProps> = ({ isOpen, onClose, worker }) 
       <div className={ms["modal-content"]} style={{ width: 'min(700px, 94vw)' }} onClick={(e) => e.stopPropagation()}>
         <div className={ms["modal-header"]}>
           <h2>Registry Tool {gameId && <span style={{ fontSize: '0.8em', opacity: 0.7 }}>({gameId})</span>}</h2>
-          <button className={ms["modal-close"]} onClick={onClose}>
-            ×
+          <button className={ms["modal-close"]} onClick={onClose} aria-label="Close">
+            <X size={16} aria-hidden />
           </button>
         </div>
 
@@ -287,7 +288,7 @@ const RegistryTool: React.FC<RegistryToolProps> = ({ isOpen, onClose, worker }) 
                         }}
                         onClick={() => handleToggleKey(key.path)}
                       >
-                        <span style={{ marginRight: '8px' }}>{key.isExpanded ? '▼' : '▶'}</span>
+                        <span style={{ marginRight: '8px' }}>{key.isExpanded ? <CaretDown size={12} aria-hidden /> : <CaretRight size={12} aria-hidden />}</span>
                         <span style={{ fontFamily: 'monospace', fontSize: '0.9em' }}>{key.path}</span>
                         <span style={{ marginLeft: '8px', color: '#999', fontSize: '0.85em' }}>
                           ({key.values.length} values)

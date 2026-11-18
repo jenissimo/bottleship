@@ -1,3 +1,4 @@
+import { Power, Warning } from "@phosphor-icons/react";
 import React from "react";
 import { formatGuestReport } from "../guest-report";
 import type { GuestExitInfo } from "../guest-report";
@@ -22,7 +23,7 @@ export default function ExitOverlay({ exitInfo, errorMessage, gameName, onDismis
               className={cx(s, "app__exit-glyph", exitInfo.crashed && "app__exit-glyph--crash")}
               aria-hidden
             >
-              {exitInfo.crashed ? "⚠" : "⏻"}
+              {exitInfo.crashed ? <Warning size={24} aria-hidden /> : <Power size={24} aria-hidden />}
             </div>
             <div className={s["app__exit-title"]}>{exitInfo.crashed ? "The game crashed" : "Game exited"}</div>
             <div className={s["app__exit-sub"]}>
@@ -60,7 +61,7 @@ export default function ExitOverlay({ exitInfo, errorMessage, gameName, onDismis
           </>
         ) : (
           <>
-            <div className={cx(s, "app__exit-glyph", "app__exit-glyph--crash")} aria-hidden>⚠</div>
+            <div className={cx(s, "app__exit-glyph", "app__exit-glyph--crash")} aria-hidden><Warning size={24} /></div>
             <div className={s["app__exit-title"]}>Couldn't load the game</div>
             <div className={s["app__exit-sub"]}>{errorMessage}</div>
             <div className={s["app__exit-actions"]}>

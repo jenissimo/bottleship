@@ -1,3 +1,4 @@
+import { Record as RecordIcon, SpeakerHigh, SpeakerSlash, Stop } from "@phosphor-icons/react";
 import React from "react";
 import { ActionButton } from "../ui/ActionButton";
 import s from "./DevPanel.module.css";
@@ -102,7 +103,7 @@ export default function DevPanel(props: DevPanelProps) {
             ? "Stop and SAVE the recording. Nothing is kept until you press this — closing the tab loses the session."
             : "Record every module the JIT compiles from now on. Play the parts that stutter, then press again to save; the next load of this game reuses them."}
         >
-          {props.aotRecording ? "⏹ AOT: Save" : "⏺ AOT: Record"}
+          {props.aotRecording ? <><Stop size={14} aria-hidden /> AOT: Save</> : <><RecordIcon size={14} aria-hidden /> AOT: Record</>}
         </ActionButton>
         <ActionButton
           variant="secondary"
@@ -123,7 +124,7 @@ export default function DevPanel(props: DevPanelProps) {
           onClick={props.onToggleLogging}
           title={props.loggingEnabled ? "Logging ON" : "Logging OFF"}
         >
-          {props.loggingEnabled ? "🔊 Logs ON" : "🔇 Logs OFF"}
+          {props.loggingEnabled ? <><SpeakerHigh size={14} aria-hidden /> Logs ON</> : <><SpeakerSlash size={14} aria-hidden /> Logs OFF</>}
         </ActionButton>
       </div>
     </div>

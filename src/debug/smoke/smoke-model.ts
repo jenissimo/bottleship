@@ -76,14 +76,6 @@ export const STATUS_LABEL: Record<SmokeStatus, string> = {
   skip: "Skipped",
 };
 
-/** Glyphs double the colour coding (colour alone must not carry the verdict). */
-export const STATUS_GLYPH: Record<SmokeStatus, string> = {
-  untested: "○",
-  ok: "✓",
-  regression: "✗",
-  skip: "–",
-};
-
 // ---------------------------------------------------------------------------
 // Sources and builds
 
@@ -358,13 +350,6 @@ function mdCell(text: string): string {
   return text.replace(/\r?\n/g, " ").replace(/\|/g, "\\|").trim();
 }
 
-const MD_STATUS: Record<SmokeStatus, string> = {
-  untested: "⬜ Unchecked",
-  ok: "✅ OK",
-  regression: "❌ Regression",
-  skip: "⏭️ Skipped",
-};
-
 /** Markdown report for pasting into a chat or an issue. */
 export function toMarkdown(run: SmokeRun, prev: SmokeRun | null | undefined, now: number): string {
   const c = countRun(run);
@@ -388,7 +373,7 @@ export function toMarkdown(run: SmokeRun, prev: SmokeRun | null | undefined, now
     const st = statusOf(run, it.key);
     const d = itemDiff(run, prev, it.key);
     const tag = d === "regressed" ? " **(new)**" : d === "fixed" ? " **(fixed)**" : "";
-    const cells = [String(i + 1), mdCell(it.name), MD_STATUS[st] + tag];
+    const cells = [String(i + 1), mdCell(it.name), STATUS_LABEL[st] + tag];
     if (prev) cells.push(statusOf(prev, it.key) === "untested" ? "—" : STATUS_LABEL[statusOf(prev, it.key)]);
     cells.push(mdCell(noteOf(run, it.key)));
     lines.push(`| ${cells.join(" | ")} |`);

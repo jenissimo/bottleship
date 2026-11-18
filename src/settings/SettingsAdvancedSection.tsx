@@ -1,5 +1,5 @@
 import React from "react";
-import { ArrowCounterClockwise } from "@phosphor-icons/react";
+import { ArrowCounterClockwise, CaretRight } from "@phosphor-icons/react";
 import type { SettingsDrawerProps } from "./types";
 import { SettingsRow, SettingsSection, Toggle } from "./SettingsRow";
 import { Button } from "../ui";
@@ -23,7 +23,7 @@ export default function SettingsAdvancedSection({
         }
       >
         <Button onClick={() => onOpenDevConsole?.()}>
-          Open ›
+          Open <CaretRight size={14} aria-hidden />
         </Button>
       </SettingsRow>
       <SettingsRow title="FPS / stats overlay" hint="Draw the live frame-rate and timing overlay on the canvas.">

@@ -1,3 +1,4 @@
+import { X } from "@phosphor-icons/react";
 import React from "react";
 import StorageManagerBody from "./StorageManagerBody";
 import ms from "../ui/Modal/Modal.module.css";
@@ -26,7 +27,7 @@ const StorageManagerModal: React.FC<Props> = ({ isOpen, onClose }) => {
             >
                 <div className={ms["modal-header"]}>
                     <h2>Storage</h2>
-                    <button className={ms["modal-close"]} onClick={onClose}>×</button>
+                    <button className={ms["modal-close"]} onClick={onClose} aria-label="Close"><X size={16} aria-hidden /></button>
                 </div>
                 <div className={ms["modal-body"]}>
                     <StorageManagerBody active={isOpen} />

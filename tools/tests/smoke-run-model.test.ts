@@ -252,15 +252,15 @@ describe("export", () => {
     expect(md).toContain("Compared with the run on `old0001` (2026-11-05 12:00 UTC): 1 new regression(s), 1 fixed");
     expect(md).toContain("- New regressions: A");
     expect(md).toContain("| # | Game | Status | Previous | Note |");
-    expect(md).toContain("| 1 | A | ❌ Regression **(new)** | OK | crash \\| on intro |");
-    expect(md).toContain("| 2 | B | ✅ OK **(fixed)** | Regression |  |");
-    expect(md).toContain("| 3 | C | ⬜ Unchecked | — |  |");
+    expect(md).toContain("| 1 | A | Regression **(new)** | OK | crash \\| on intro |");
+    expect(md).toContain("| 2 | B | OK **(fixed)** | Regression |  |");
+    expect(md).toContain("| 3 | C | Unchecked | — |  |");
   });
 
   test("markdown without a previous run has no Previous column", () => {
     const md = toMarkdown(setStatus(run(["a"]), "a", "skip", T0), null, T0);
     expect(md).toContain("| # | Game | Status | Note |");
-    expect(md).toContain("| 1 | A | ⏭️ Skipped |  |");
+    expect(md).toContain("| 1 | A | Skipped |  |");
     expect(md).not.toContain("Compared with");
   });
 

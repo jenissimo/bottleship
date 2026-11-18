@@ -1,7 +1,8 @@
+import { SmokeStatusIcon } from "./SmokeStatusIcon";
+import { Play, X } from "@phosphor-icons/react";
 import React, { useCallback, useState } from "react";
 import { cx } from "../../ui/cx";
 import {
-  STATUS_GLYPH,
   STATUS_LABEL,
   countRun,
   itemDiff,
@@ -77,7 +78,7 @@ export function SmokePanel({ onOpenList, onReturnFocus, hidden }: SmokePanelProp
     return (
       <div className={cx(s, "panel", "panel--collapsed")} data-host-keys>
         <button className={s["panel-pill"]} onMouseDown={keepFocus} onClick={toggle} title="Expand smoke-run panel">
-          <span className={cx(s, "glyph", `is-${st}`)}>{STATUS_GLYPH[st]}</span>
+          <span className={cx(s, "glyph", `is-${st}`)}><SmokeStatusIcon status={st} /></span>
           <span className={s["panel-pill-name"]}>{item.name}</span>
           <span className={s["panel-progress"]}>{c.done}/{c.total}</span>
         </button>
@@ -95,7 +96,7 @@ export function SmokePanel({ onOpenList, onReturnFocus, hidden }: SmokePanelProp
           onMouseDown={keepFocus}
           onClick={() => { clearActive(); setDismissed(true); onReturnFocus(); }}
           title="Hide the panel for this game (the run is kept — reopen it from the list)"
-        >×</button>
+        ><X size={16} aria-hidden /></button>
       </div>
       <div className={s["panel-title"]} title={item.launch.kind === "disk" ? item.launch.path : item.launch.id}>{item.name}</div>
       <div className={s["panel-sub"]}>
@@ -105,10 +106,10 @@ export function SmokePanel({ onOpenList, onReturnFocus, hidden }: SmokePanelProp
       </div>
       <div className={s["panel-marks"]}>
         <button className={cx(s, "verdict", "is-ok", st === "ok" && "is-on")} onMouseDown={keepFocus} onClick={() => mark("ok")}>
-          {STATUS_GLYPH.ok} OK
+          <SmokeStatusIcon status="ok" /> OK
         </button>
         <button className={cx(s, "verdict", "is-regression", st === "regression" && "is-on")} onMouseDown={keepFocus} onClick={() => mark("regression")}>
-          {STATUS_GLYPH.regression} Regression
+          <SmokeStatusIcon status="regression" /> Regression
         </button>
         <button className={cx(s, "verdict", "is-skip", st === "skip" && "is-on")} onMouseDown={keepFocus} onClick={() => mark("skip")}>
           Skip
@@ -130,7 +131,7 @@ export function SmokePanel({ onOpenList, onReturnFocus, hidden }: SmokePanelProp
           onClick={() => { if (next) void launchSmokeItem(active.source, next); }}
           title={next ? `Launch ${next.name}` : "Every item has a verdict"}
         >
-          {next ? "Next ▶" : "All checked"}
+          {next ? <>Next <Play size={14} aria-hidden /></> : "All checked"}
         </button>
       </div>
     </div>

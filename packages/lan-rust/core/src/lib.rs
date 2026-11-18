@@ -5,6 +5,7 @@ pub mod gateway;
 pub mod routes;
 mod server;
 pub mod stats;
+pub mod turn;
 pub mod wire;
 pub use server::{Command, Core, CoreError, Effect, GatewayEvent, GatewayInput, TcpChildKey, TcpOfferKey};
 pub use wire::{Arg, InboundEvent, ServerEvent};

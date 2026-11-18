@@ -357,6 +357,7 @@ impl TcpHostRequest {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundEvent {
+    RoomComms(crate::server::RoomCommsRequest),
     Multicast4 {
         datagram: Multicast4Datagram,
         generation: Option<u32>,
@@ -423,6 +424,7 @@ impl InboundEvent {
     /// Direct core callers use the same admission point; frame envelopes are exact.
     pub fn rate_size(&self)->usize {
         match self {
+            Self::RoomComms(request) => request.rate_size(),
             Self::Frame{datagram,..}=>12+datagram.payload.len(),
             Self::Multicast4{datagram,..}=>MULTICAST4_DGRAM_HEADER+datagram.datagram.payload.len(),
             Self::Resolve{request,..}=>64+request.host.len(),
@@ -451,6 +453,8 @@ pub fn decode_event(name: &str, args: &[Arg]) -> Result<InboundEvent, DecodeErro
     let j = |i| args.get(i).and_then(json_arg);
     let id = || j(0).and_then(|v| positive(v, u32::MAX));
     match name {
+        "roomComms" if args.len() == 1 => j(0).and_then(crate::server::RoomCommsRequest::decode)
+            .map(InboundEvent::RoomComms).ok_or(Ignore),
         "frame" => {
             if args.is_empty() || args.len() > 2 {
                 return Err(fail());

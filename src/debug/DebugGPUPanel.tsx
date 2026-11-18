@@ -1,3 +1,4 @@
+import { Check, Circle, X } from "@phosphor-icons/react";
 import React, { useEffect, useRef, useState } from "react";
 
 type FrameDebugSnapshot = {
@@ -219,13 +220,13 @@ function DxResourceTables({ data, apiLabel }: { data: DxResourcesData | null; ap
                                     {tex.levels}
                                 </td>
                                 <td style={{ padding: "6px 8px", color: tex.isDirty ? "#FF9800" : "#888" }}>
-                                    {tex.isDirty ? "✓" : "—"}
+                                    {tex.isDirty ? <Check size={14} aria-label="Yes" /> : "—"}
                                 </td>
                                 <td style={{ padding: "6px 8px", color: tex.isLocked ? "#FF9800" : "#888" }}>
-                                    {tex.isLocked ? "✓" : "—"}
+                                    {tex.isLocked ? <Check size={14} aria-label="Yes" /> : "—"}
                                 </td>
                                 <td style={{ padding: "6px 8px", color: tex.hasGpuTexture ? "#4CAF50" : "#f44336" }}>
-                                    {tex.hasGpuTexture ? "✓" : "✗"}
+                                    {tex.hasGpuTexture ? <Check size={14} aria-label="Yes" /> : <X size={14} aria-label="No" />}
                                 </td>
                             </tr>
                         ))}
@@ -263,13 +264,13 @@ function DxResourceTables({ data, apiLabel }: { data: DxResourcesData | null; ap
                                     0x{vb.fvf.toString(16)}
                                 </td>
                                 <td style={{ padding: "6px 8px", color: vb.isDirty ? "#FF9800" : "#888" }}>
-                                    {vb.isDirty ? "✓" : "—"}
+                                    {vb.isDirty ? <Check size={14} aria-label="Yes" /> : "—"}
                                 </td>
                                 <td style={{ padding: "6px 8px", color: vb.isLocked ? "#FF9800" : "#888" }}>
-                                    {vb.isLocked ? "✓" : "—"}
+                                    {vb.isLocked ? <Check size={14} aria-label="Yes" /> : "—"}
                                 </td>
                                 <td style={{ padding: "6px 8px", color: vb.hasGpuBuffer ? "#4CAF50" : "#f44336" }}>
-                                    {vb.hasGpuBuffer ? "✓" : "✗"}
+                                    {vb.hasGpuBuffer ? <Check size={14} aria-label="Yes" /> : <X size={14} aria-label="No" />}
                                 </td>
                             </tr>
                         ))}
@@ -307,13 +308,13 @@ function DxResourceTables({ data, apiLabel }: { data: DxResourcesData | null; ap
                                     {ib.format === 101 ? "16-bit" : "32-bit"}
                                 </td>
                                 <td style={{ padding: "6px 8px", color: ib.isDirty ? "#FF9800" : "#888" }}>
-                                    {ib.isDirty ? "✓" : "—"}
+                                    {ib.isDirty ? <Check size={14} aria-label="Yes" /> : "—"}
                                 </td>
                                 <td style={{ padding: "6px 8px", color: ib.isLocked ? "#FF9800" : "#888" }}>
-                                    {ib.isLocked ? "✓" : "—"}
+                                    {ib.isLocked ? <Check size={14} aria-label="Yes" /> : "—"}
                                 </td>
                                 <td style={{ padding: "6px 8px", color: ib.hasGpuBuffer ? "#4CAF50" : "#f44336" }}>
-                                    {ib.hasGpuBuffer ? "✓" : "✗"}
+                                    {ib.hasGpuBuffer ? <Check size={14} aria-label="Yes" /> : <X size={14} aria-label="No" />}
                                 </td>
                             </tr>
                         ))}
@@ -640,7 +641,7 @@ export default function DebugGPUPanel({ isOpen, onClose, worker }: DebugGPUPanel
                         }}
                     >
                         {tab === "ddraw" ? "DirectDraw" : tab === "d3d8" ? "DirectX8" : tab === "d3d9" ? "DirectX9" : tab === "glide" ? "Glide2x" : "WebGPU"}
-                        {activeBackend !== null && backendToTab[activeBackend] === tab ? " ●" : ""}
+                        {activeBackend !== null && backendToTab[activeBackend] === tab && <Circle size={8} weight="fill" aria-label="Active" />}
                     </button>
                 ))}
             </div>
@@ -959,7 +960,7 @@ export default function DebugGPUPanel({ isOpen, onClose, worker }: DebugGPUPanel
                                                     v{surface.version} c{surface.cpuVersion} g{surface.gpuVersion}
                                                 </td>
                                                 <td style={{ padding: "6px 8px", color: surface.hasGpuTexture ? "#4CAF50" : "#f44336" }}>
-                                                    {surface.hasGpuTexture ? "✓" : "✗"}
+                                                    {surface.hasGpuTexture ? <Check size={14} aria-label="Yes" /> : <X size={14} aria-label="No" />}
                                                 </td>
                                             </tr>
                                             {selectedSurface === surface.address && (
@@ -985,7 +986,7 @@ export default function DebugGPUPanel({ isOpen, onClose, worker }: DebugGPUPanel
                                                                 <div>Attached: 0x{surface.attachedSurfaceAddr.toString(16)}</div>
                                                             )}
                                                             {surface.isPrimaryChain && (
-                                                                <div style={{ color: "#4CAF50" }}>✓ Part of Primary Chain</div>
+                                                                <div style={{ color: "#4CAF50" }}><Check size={14} aria-hidden /> Part of Primary Chain</div>
                                                             )}
                                                         </div>
                                                         {surfacePreview && (
@@ -1183,9 +1184,9 @@ export default function DebugGPUPanel({ isOpen, onClose, worker }: DebugGPUPanel
                                 <div style={{ padding: 10, backgroundColor: "#1a2a3a", borderRadius: 4, marginBottom: 20 }}>
                                     <div style={{ fontSize: 11, lineHeight: 1.8 }}>
                                         <div>Format: {webgpuData.deviceInfo.format}</div>
-                                        <div>Has Device: {webgpuData.deviceInfo.hasDevice ? "✓" : "✗"}</div>
-                                        <div>Has Queue: {webgpuData.deviceInfo.hasQueue ? "✓" : "✗"}</div>
-                                        <div>Has Context: {webgpuData.deviceInfo.hasContext ? "✓" : "✗"}</div>
+                                        <div>Has Device: {webgpuData.deviceInfo.hasDevice ? <Check size={14} aria-label="Yes" /> : <X size={14} aria-label="No" />}</div>
+                                        <div>Has Queue: {webgpuData.deviceInfo.hasQueue ? <Check size={14} aria-label="Yes" /> : <X size={14} aria-label="No" />}</div>
+                                        <div>Has Context: {webgpuData.deviceInfo.hasContext ? <Check size={14} aria-label="Yes" /> : <X size={14} aria-label="No" />}</div>
                                     </div>
                                 </div>
 

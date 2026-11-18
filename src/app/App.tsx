@@ -1,3 +1,4 @@
+import { ArrowLeft, ArrowRight, ArrowsIn, ArrowsOut, DotsThree, Pause, Play } from "@phosphor-icons/react";
 import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SessionWorker } from './session-worker';
 import { AudioPauseSync } from "../audio/pause-sync";
@@ -41,6 +42,7 @@ import {
   type NetworkConfig, type NetworkStatus, type RememberedConsent,
 } from "../network-config";
 import NetworkPanel, { NetworkIndicator } from "./NetworkPanel";
+import { RoomCommsClient } from "./room-comms-client";
 import { useHostModal } from "../harness/use-host-modal";
 import DevPanel from "./DevPanel";
 import ExitOverlay from "./ExitOverlay";
@@ -418,6 +420,9 @@ export default function App() {
   const [network, setNetwork] = useState<NetworkConfig | null>(() => loadNetworkConfig());
   const networkRef = useRef(network);
   const [networkStatus, setNetworkStatus] = useState<NetworkStatus>({ state: "offline" });
+  const [roomComms] = useState(() => new RoomCommsClient(request =>
+    globalWorker?.postMessage({ type: "room_comms_send", request })));
+  useEffect(() => () => roomComms.reset(), [roomComms]);
   const handleNetworkChange = useCallback((config: NetworkConfig | null) => {
     networkRef.current = config;
     window.history.replaceState(null, "", networkInviteUrl(window.location.href, config));
@@ -441,9 +446,10 @@ export default function App() {
   }, []);
   /** Leave the relay without forgetting the saved server and room. */
   const dropNetwork = useCallback(() => {
+    roomComms.reset();
     globalWorker?.postMessage({ type: "set_network", network: null });
     setNetworkStatus({ state: "offline" });
-  }, []);
+  }, [roomComms]);
   const handleConsentConnect = useCallback((config: NetworkConfig, remember: boolean) => {
     const request = consentRequest;
     const memory: RememberedConsent | null = remember ? { choice: "connect", serverUrl: config.serverUrl, room: config.room } : null;
@@ -1462,6 +1468,10 @@ export default function App() {
 
     // 3. Setup Worker Message Handling
     worker.onmessage = (event: MessageEvent) => {
+      if (event.data?.type === "room_comms_update") {
+        roomComms.receive(event.data.update);
+        return;
+      }
       if (event.data?.type === "network_state") {
         consentHandlersRef.current.handleNetworkState(event.data.status as NetworkStatus);
         return;
@@ -3421,7 +3431,7 @@ export default function App() {
       {/* Top bar */}
       <header className={s["emu-topbar"]}>
         <button className={cx(s, "emu-topbar-btn", "emu-back-btn")} onClick={() => window.location.assign("/")} title="Back to game selection">
-          ← Menu
+          <ArrowLeft size={16} aria-hidden /> Menu
         </button>
         <div className={s["emu-game-title"]}>
           {(displayGame!.id !== "dev" || bundleDisplayName) && (
@@ -3435,7 +3445,8 @@ export default function App() {
         </div>
         <div className={s["emu-topbar-actions"]}>
           {networkTouched && (
-            <NetworkIndicator className={s["emu-topbar-btn"]} status={networkStatus} network={network} onClick={() => setNetworkPanelOpen(true)} />
+            <NetworkIndicator className={s["emu-topbar-btn"]} status={networkStatus} network={network}
+              roomComms={roomComms} onClick={() => setNetworkPanelOpen(true)} />
           )}
           <button
             className={cx(s, "emu-topbar-btn", isPaused && "emu-btn-active")}
@@ -3443,29 +3454,21 @@ export default function App() {
             disabled={workerStatus !== "ready" || isLoadingApp}
             title={isPaused ? "Resume" : "Pause"}
           >
-            {isPaused ? "▶" : "⏸"}
+            {isPaused ? <Play size={16} weight="fill" aria-hidden /> : <Pause size={16} weight="fill" aria-hidden />}
           </button>
           <button
             className={cx(s, "emu-topbar-btn", isFullscreen && "emu-btn-active")}
             onClick={toggleFullscreen}
             title={isFullscreen ? "Exit fullscreen (F11)" : "Fullscreen (F11)"}
           >
-            {isFullscreen ? (
-              <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
-                <path d="M5 1H1v4h1.5V2.5H5V1zM9 1v1.5h2.5V5H13V1H9zM1 9v4h4v-1.5H2.5V9H1zM11.5 11.5H9V13h4V9h-1.5v2.5z"/>
-              </svg>
-            ) : (
-              <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
-                <path d="M1 5V1h4v1.5H2.5V5H1zM9 1h4v4h-1.5V2.5H9V1zM1 9h1.5v2.5H5V13H1V9zM11.5 11.5V9H13v4H9v-1.5h2.5z"/>
-              </svg>
-            )}
+            {isFullscreen ? <ArrowsIn size={16} aria-hidden /> : <ArrowsOut size={16} aria-hidden />}
           </button>
           <button
             className={cx(s, "emu-topbar-btn", devPanelOpen && "emu-btn-active")}
             onClick={toggleDevPanel}
             title="Developer tools"
           >
-            ···
+            <DotsThree size={19} weight="bold" aria-hidden />
           </button>
         </div>
       </header>
@@ -3476,7 +3479,7 @@ export default function App() {
             <small>Include setup.exe and every setup-*.bin part. Download your WGB or free cached files in Settings → Storage.</small>
           </div>
           <button className={s["emu-topbar-btn"]} disabled={isLoadingApp} onClick={() => installerInputRef.current?.click()}>Import full game</button>
-          <a className={s["emu-info-gog"]} href={displayGame!.gogUrl} target="_blank" rel="noopener noreferrer">Get it on GOG →</a>
+          <a className={s["emu-info-gog"]} href={displayGame!.gogUrl} target="_blank" rel="noopener noreferrer">Get it on GOG <ArrowRight size={14} aria-hidden /></a>
           <input ref={installerInputRef} type="file" accept=".exe,.bin" multiple hidden onChange={(e) => {
             if (e.target.files?.length) handleDroppedFiles(e.target.files);
             e.target.value = "";
@@ -3669,6 +3672,7 @@ export default function App() {
           status={networkStatus}
           game={shareableGame}
           canRemember={!!consentRequest && !!consentGameKey}
+          roomComms={roomComms}
           onConnect={handleConsentConnect}
           onNotNow={handleConsentNotNow}
           onDisconnect={() => { consentDecisionRef.current = "denied"; dropNetwork(); }}

@@ -1,4 +1,6 @@
 // Wire layout derived from cszackrison/bottleship, Apache-2.0; see NOTICE.
+import type { RoomCommsEvent, RoomCommsRequest } from "./room-comms";
+
 export const PROTOCOL_VERSION = 1;
 export const SOCKET_PATH = "/socket.io";
 export const WIRE_DGRAM = 2;
@@ -55,6 +57,7 @@ export interface LanReady {
     udpHostListenV1?: UdpHostListenCapability;
     tcpHostListenV1?: TcpHostListenCapability;
     udpMulticast4V1?: true;
+    roomCommsV1?: true;
 }
 export function validBindingGeneration(value:unknown):value is number{return Number.isInteger(value)&&Number(value)>=1&&Number(value)<=0xffffffff;}
 export interface DecodedDatagram {
@@ -84,6 +87,7 @@ export function validUdpPeerLeaseRequest(value:unknown):value is UdpPeerLeaseReq
         r.node.every(n=>Number.isInteger(n)&&n>=0&&n<=255)&&isExternalNode(Uint8Array.from(r.node));
 }
 export interface ClientEvents {
+    roomComms: (request: RoomCommsRequest) => void;
     openTcpHost: (id: number, request: TcpHostOpenRequest) => void;
     cancelTcpHost: (id: number) => void;
     releaseTcpHost: (leaseId: number) => void;
@@ -99,6 +103,7 @@ export interface ClientEvents {
     releaseUdpPeer: (leaseId: number) => void;
 }
 export interface ServerEvents {
+    roomComms: (event: RoomCommsEvent) => void;
     tcpHostOpened: (id: number, reply: TcpHostOpenReply) => void;
     tcpHostClosed: (requestId: number, leaseId: number, error: {code: number; message: string}) => void;
     udpHostOpened: (id: number, reply: UdpHostOpenReply) => void;

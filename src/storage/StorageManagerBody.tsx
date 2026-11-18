@@ -1,5 +1,5 @@
 import React from "react";
-import { DownloadSimple, Trash, UploadSimple } from "@phosphor-icons/react";
+import { Check, DownloadSimple, Trash, UploadSimple } from "@phosphor-icons/react";
 import {
   type CachedBundleInfo,
   type GameStorageInfo,
@@ -67,7 +67,7 @@ export default function StorageManagerBody({ active }: { active: boolean }): Rea
             </span>
             <span style={{ marginLeft: "auto", color: "var(--fg-2)" }}>
               {formatBytes(estimate.usageBytes)} / {formatBytes(estimate.quotaBytes)} ·{" "}
-              {estimate.persisted ? "persistent ✓" : "not persistent"}
+              {estimate.persisted ? <>persistent <Check size={14} aria-hidden /></> : "not persistent"}
             </span>
           </div>
           {!estimate.persisted && (
