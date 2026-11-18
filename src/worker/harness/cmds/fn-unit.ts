@@ -27,11 +27,12 @@ export const FN_UNIT_STAT_NAMES = [
     "refusedNotM1", "refusedReturnForm", "refusedShape", "refusedState", "refusedMapping", "staleCensusRow",
     "deferredBusy", "skippedStack", "skippedGeneration", "skippedMapping", "skippedState", "unitInstructions",
     "chainSites", "chainUnchainedSites", "chainDependantsDropped", "chainStaleAtPublish", "maxRetiredPerEntry",
+    "noProgressFallthrough", "chainSiteTargetMismatch",
 ] as const;
 
 export const FN_UNIT_CHAIN_COUNTER_NAMES = [
     "calls", "fallbackDepth", "fallbackBudget", "fallbackToken", "fallbackMapping", "calleeExited", "callerTokenExit",
-    "retMatched", "retMismatch",
+    "retMatched", "retMismatch", "tokenMovedAfterPush",
 ] as const;
 
 export const FN_UNIT_CHAIN_MODES = ["off", "canonical", "private"] as const;
