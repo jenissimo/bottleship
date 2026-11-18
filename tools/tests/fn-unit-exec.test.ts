@@ -206,6 +206,33 @@ describe.skipIf(!HAVE_V86)('function units in v86 through the host', () => {
         }
     }), 60000);
 
+    for (const units of [false, true]) test(`a unit storing into the instruction it executes next leaves through the active-code-write exit (units ${units ? 'on' : 'off'})`, async () => withoutWindow(async () => {
+        const AHEAD = BASE + 0x4000, N = 2000000;
+        const mem = new Uint8Array(BASE + IMG);
+        header(mem);
+        functions(mem);
+        new Asm(mem, AHEAD).e(0xf7, 0xc1).u(0x3ffff).e(0x75, 0x06, 0x89, 0x0d).u(AHEAD + 15).e(0xb8).u(0x5555).e(0xc3);
+        const a = new Asm(mem, ENTRY);
+        a.e(0xbc).u(STACK).e(0x31, 0xff).e(0xb9).u(N);
+        const top = a.p;
+        a.e(0x51).call(AHEAD).e(0x01, 0xc7, 0x59, 0x49).jnz(top);
+        a.e(0x89, 0x3d).u(RES).e(0xf4);
+        let want = 0, prev = 0x5555;
+        for (let c = N; c > 0; c--) { if ((c & 0x3ffff) === 0) prev = c; want = (want + prev) % 2 ** 32; }
+        const m = await machine(units);
+        try {
+            m.cpu.load_multiboot(mem.slice(BASE).buffer);
+            expect(await runToHalt(m, () => { m.cpu.reg32[4] = STACK; m.cpu.instruction_pointer[0] = ENTRY; })).toBe(true);
+            expect(m.u32(RES)).toBe(want);
+            const st = m.stats();
+            if (units) {
+                expect(st.published!).toBeGreaterThan(0);
+                expect(st.exited!).toBeGreaterThan(0);
+                expect(st.matched! + st.exited!).toBe(st.entries!);
+            }
+        } finally { await m.em.destroy(); }
+    }), 60000);
+
     test('a fresh instance starts with units off and nothing carried over', async () => withoutWindow(async () => {
         const a = await machine(true);
         a.cpu.load_multiboot(mainImage(false).buffer);
