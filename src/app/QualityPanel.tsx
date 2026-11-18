@@ -1,3 +1,4 @@
+import { Warning } from "@phosphor-icons/react";
 import React from "react";
 import type { QualityConfig } from "../worker/core/quality-config";
 import { resolveEffectiveInternalScale, type InternalScaleSupport } from "../worker/backends/webgpu/shared/internal-resolution";
@@ -37,7 +38,7 @@ function GapNote({ unsupported, overridden, k }: {
   k: string;
 }): React.ReactElement | null {
   if (unsupported?.has(k)) {
-    return <span className={s["quality-gap"]} title={`The active graphics backend does not implement "${k}" — this control has no effect right now.`}> ⚠ unsupported here</span>;
+    return <span className={s["quality-gap"]} title={`The active graphics backend does not implement "${k}" — this control has no effect right now.`}> <Warning size={13} aria-hidden /> unsupported here</span>;
   }
   if (overridden?.has(k)) {
     return <span className={s["quality-override"]} title={`This game's bundle sets "${k}" itself, and the game's value wins. Your choice is kept and applies to games that do not set it.`}> set by this game</span>;

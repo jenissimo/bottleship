@@ -79,6 +79,51 @@ Rules worth keeping:
   retirement, not an acknowledgment by the remote application. TCP outputs are
   serialized per gateway; UDP keeps its separate drop policy.
 
+## Room communications and transports
+
+The host UI uses the root worker's existing relay link. It opts in with
+`roomCommsV1` during admission and waits for the capability in `ready`. The
+Socket.IO `roomComms` event carries live chat, voice membership and directed WebRTC
+signaling. Both servers take sender identity and room membership from the
+admitted connection. They bound messages and signaling, cap the voice room at
+six and expire memberships if the client stops refreshing them. Voice join
+creates a fresh ID so delayed signaling cannot target a new membership. The
+server keeps no chat history. Backpressure may drop social events while game
+traffic keeps its existing flow control. Voice membership refresh repairs a
+missed roster update.
+
+Audio goes over one WebRTC connection per pair of voice participants. ICE can
+select a direct path, usually over UDP, or fall back to the configured TURN
+relay. The game relay handles admission and signaling. The TURN service handles
+media for pairs that need it. Each voice participant receives its own expiring
+credential inside its roster update. The signing key stays with the two servers.
+Signed invitations bound the credential lifetime. Operators explicitly enable
+TURN for rooms that admit players by room name alone.
+
+The first connection and recovery both use the current ICE configuration.
+The browser owns the microphone, playback and peer connections. Leaving voice
+or changing rooms stops the microphone. If the same relay connection reconnects,
+the browser mutes the microphone while waiting for admission and rejoins voice
+within a bounded grace period. Normal signaling remains directed to the current
+voice membership, so an offer from a prior membership cannot revive a call. Keeping the participant cap small bounds the number of
+streams each browser sends. For a larger room, evaluate an SFU.
+
+The current game relay carries guest UDP, TCP and gateway controls over
+WebSocket with HTTP polling fallback. Browsers cannot open a raw UDP socket.
+For browser-to-browser game traffic, WebRTC DataChannel offers unordered,
+non-retransmitted datagrams. For browser-to-server traffic, WebTransport offers
+QUIC datagrams and reliable streams where HTTP/3 is available. Evaluate either
+as a separately negotiated path for guest datagrams, retaining the current
+relay for control, reliable traffic and fallback. Compare tail latency, loss
+and reordering on the same game workloads before choosing a path.
+
+The release checks for room communications cover both server implementations
+and both Socket.IO transports. Browser media checks should record the selected
+ICE candidate type and received audio packets in both directions. For a public
+deployment, check two devices on separate networks over HTTPS, then repeat
+with TURN forced and with UDP unavailable to verify the TLS relay path. Also
+exercise network loss and microphone cleanup.
+
 ## Implemented API surface
 
 | Path | Implemented behavior |

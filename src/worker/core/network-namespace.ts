@@ -1,6 +1,7 @@
 import { normalizeNetworkConfig, type NetworkConfig } from "../../network-config";
 import { LanNetwork, type LanPortRegistry, type NetTransport, type LanState, type LanSocketError, type LanPortDisconnect, type RawDeliveryTarget } from "../net/lan-network";
 import { RelayLink } from "../net/relay-link";
+import type { RoomCommsUpdate } from "../../../packages/lan/src/room-comms";
 import { copyLocalUdpContext, localUdpFrameBytes, type LocalUdpContext } from "../net/local-udp-context";
 import { UdpHostLeaseRpc, type UdpHostLease } from "../net/udp-host-lease-rpc";
 import { TcpHostLeaseRpc, type TcpHostLease } from "../net/tcp-host-lease-rpc";
@@ -417,7 +418,10 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         this.actor?.control.postMessage({type:"drop",...identity});
         this.actorClient?.port.close();this.actorClient=null;
     }
-    async configure(value: NetworkConfig | null): Promise<void> {
+    sendRoomComms(request: unknown): boolean {
+        return this.active?.link.sendRoomComms(request) ?? false;
+    }
+    async configure(value: NetworkConfig | null, onRoomComms?: (update: RoomCommsUpdate) => void): Promise<void> {
         if(this.closed||this.closing)throw new Error("Process namespace closed");
         const config = normalizeNetworkConfig(value);
         const key = config ? JSON.stringify(config) : "";
@@ -427,7 +431,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         this.backplane.configureWinsock(config?.winsock);
         this.active = null; this.backplane.attach(null);
         if (!config) { this.network.configureDirectPlay4(); this.network.configureDirectPlay8(); this.network.configureWinsock(); return; }
-        const link = new RelayLink(config.serverUrl, config.room, this.backplane, {invite: config.invite});
+        const link = new RelayLink(config.serverUrl, config.room, this.backplane, { invite: config.invite, onRoomComms });
         this.active = { key, link }; this.backplane.attach(link);
         try {
             await link.ready;

@@ -65,7 +65,6 @@ upstream projects referenced here.
 |---|---|
 | `react`, `react-dom` | MIT |
 | `pako` | MIT AND Zlib |
-| `lucide-react` | ISC |
 | `@phosphor-icons/react` | MIT |
 | `socket.io-client` (with `engine.io-client`, `engine.io-parser`, `socket.io-parser`, `@socket.io/component-emitter`, `debug`, `ms`) | MIT |
 

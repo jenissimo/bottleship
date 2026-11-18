@@ -4,6 +4,7 @@ import { createPublicLanServer as createLanServer } from "../../../packages/lan/
 import { LanNetwork, type LanDatagram } from "./lan-network";
 import { RelayLink, type RelayLinkOptions } from "./relay-link";
 import { RoomAccess } from "../../../packages/lan/src/access";
+import type { RoomCommsUpdate } from "../../../packages/lan/src/room-comms";
 import { PROTO_UDP, PROTO_TCP, UDP_MAX_PAYLOAD } from "./netplay-wire";
 
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -117,7 +118,8 @@ describe("worker LAN transport", () => {
         const server = createLanServer({ port: 0 });
         const port = await server.listen(), url = "http://127.0.0.1:" + port;
         const a = machine(1), b = machine(2), received: LanDatagram[] = [], states: boolean[] = [];
-        const fromA = link(url, "reconnect", a, { transports: ["websocket"] });
+        const roomUpdates: RoomCommsUpdate[] = [];
+        const fromA = link(url, "reconnect", a, { transports: ["websocket"], onRoomComms: update => roomUpdates.push(update) });
         const fromB = link(url, "reconnect", b, { transports: ["websocket"] });
         a.onStateChange(state => states.push(state.connected));
         b.bind(4000, { deliver: data => received.push(data) }, PROTO_UDP);
@@ -134,8 +136,51 @@ describe("worker LAN transport", () => {
             await pause(50);
             expect(received.map(data => data.data[0])).toEqual([2]);
             expect(states).toEqual([true, false, true]);
+            expect(roomUpdates).toEqual([
+                { kind: "available", enabled: true },
+                { kind: "available", enabled: false, recovering: true },
+                { kind: "available", enabled: true },
+            ]);
+
+            fromA.socket.io.engine.close();
+            await until(() => !a.connected, "disconnect before replacing the link");
+            a.attach(null);
+            expect(roomUpdates.slice(-2)).toEqual([
+                { kind: "available", enabled: false, recovering: true },
+                { kind: "available", enabled: false },
+            ]);
         } finally { a.attach(null); b.attach(null); await server.close(); }
     }, 15_000);
+
+    test("voice controls preserve leave before rejoin through signaling backpressure", async () => {
+        const server = createLanServer({ port: 0 });
+        const port = await server.listen(), net = machine(1);
+        const identities: string[] = [];
+        const relay = link("http://127.0.0.1:" + port, "voice-pressure", net, {
+            transports: ["websocket"],
+            onRoomComms: update => {
+                if (update.kind === "voice" && update.self) identities.push(update.self);
+            },
+        });
+        try {
+            await relay.ready;
+            expect(relay.sendRoomComms({ kind: "voiceJoin" })).toBe(true);
+            await until(() => identities.length === 1, "initial voice member");
+            const engine = relay.socket.io.engine;
+            engine.transport.writable = false;
+            for (let index = 0; index < 16; index++) {
+                expect(relay.sendRoomComms({ kind: "chat", text: "Fill the signaling queue" })).toBe(true);
+            }
+            expect(relay.sendRoomComms({ kind: "chat", text: "Backpressure" })).toBe(false);
+            expect(relay.sendRoomComms({ kind: "voiceLeave" })).toBe(true);
+            expect(relay.sendRoomComms({ kind: "voiceJoin" })).toBe(true);
+            expect(engine.writeBuffer).toHaveLength(16);
+            engine.transport.writable = true;
+            engine.flush();
+            await until(() => identities.length === 2, "replacement voice member");
+            expect(identities[1]).not.toBe(identities[0]);
+        } finally { net.attach(null); await server.close(); }
+    }, 10_000);
 
     test("peer disconnect reaches only its room and reliable sends to an offline lease report failure", async () => {
         const server = createLanServer({ port: 0 });

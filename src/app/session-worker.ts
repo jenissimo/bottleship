@@ -22,6 +22,9 @@ export class SessionWorker extends EventTarget implements Worker {
 
     private receive(event: MessageEvent, source: MessagePort | null): void {
         const data = event.data;
+        const roomUpdate = data?.type === "room_comms_update";
+        // The root owns relay admission, even when a child holds the display.
+        if (roomUpdate && source !== null) return;
         if (data?.type === 'process_exit' && (source === null || data.broker)) this.rootExited = true;
         if (source === null) {
             if (data?.type === 'audio_register') this.rootPresentation.set(`audio:${data.payload.id}`, data);
@@ -42,7 +45,7 @@ export class SessionWorker extends EventTarget implements Worker {
             this.ports.add(port);
             port.onmessage = next => this.receive(next, port);
             for (const setting of this.settings.values()) port.postMessage(setting);
-        } else if (source !== this.foreground && !reply) return;
+        } else if (source !== this.foreground && !reply && !roomUpdate) return;
         // A broker exit belongs to the parent. Its live child still owns the display.
         if (data?.type === 'process_exit' && data.broker) return;
         const childExit = data?.type === 'process_exit' && source !== null;
@@ -122,7 +125,7 @@ export class SessionWorker extends EventTarget implements Worker {
         // foreground. The parent keeps running (VFS broker) and owns the history a
         // promoted child's realm cannot see — its own childProcesses(), its thunk ring,
         // its VFS. Without an address for it that state is merely unreachable, not gone.
-        const toRoot = message?.type === 'harness_rpc' && message?.opts?.target === 'root';
+        const toRoot = (message?.type === 'harness_rpc' && message?.opts?.target === 'root') || message?.type === "room_comms_send";
         if (message?.type === 'harness_rpc') this.requests.set(message.id, toRoot ? null : this.foreground);
         if (toRoot) { this.root.postMessage(message, options as Transferable[]); return; }
         if (message?.type === 'harness_cancel' && this.requests.has(message.id)) {

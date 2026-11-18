@@ -1,3 +1,4 @@
+import { Circle } from "@phosphor-icons/react";
 import React, { useEffect, useState, useRef } from "react";
 
 type RegionInfo = {
@@ -497,7 +498,7 @@ export default function MemoryMonitorBody({ worker }: MemoryMonitorBodyProps) {
                 justifyContent: "space-between"
             }}>
                 <span>Last update: {new Date(lastUpdate).toLocaleTimeString()}</span>
-                <span>{isMonitoring ? "🔴 GC Tracking Active" : "⚪ GC Tracking Idle"}</span>
+                <span><Circle size={12} weight={isMonitoring ? "fill" : "regular"} color={isMonitoring ? "var(--coral)" : undefined} aria-hidden /> {isMonitoring ? "GC Tracking Active" : "GC Tracking Idle"}</span>
             </div>
         </div>
     );

@@ -1,10 +1,11 @@
+import { SmokeStatusIcon } from "./SmokeStatusIcon";
+import { Play, X } from "@phosphor-icons/react";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cx } from "../../ui/cx";
 import { ActionButton } from "../../ui/ActionButton";
 import ms from "../../ui/Modal/Modal.module.css";
 import type { GameEntry } from "../../library/GameSelectScreen";
 import {
-  STATUS_GLYPH,
   STATUS_LABEL,
   catalogItems,
   compareRuns,
@@ -269,7 +270,7 @@ const SmokeRunModal: React.FC<SmokeRunModalProps> = ({ isOpen, onClose, catalog 
       >
         <div className={ms["modal-header"]}>
           <h2>Smoke run</h2>
-          <button className={ms["modal-close"]} onClick={onClose} aria-label="Close">×</button>
+          <button className={ms["modal-close"]} onClick={onClose} aria-label="Close"><X size={16} aria-hidden /></button>
         </div>
 
         <div className={s["toolbar"]}>
@@ -321,9 +322,9 @@ const SmokeRunModal: React.FC<SmokeRunModalProps> = ({ isOpen, onClose, catalog 
               <span className={s["progress-num"]}>{counts.done}/{counts.total}</span>
               <span className={s["progress-cap"]}>checked</span>
               <span className={s["counts"]}>
-                <span className={cx(s, "count", "is-ok")}>{STATUS_GLYPH.ok} {counts.ok}</span>
-                <span className={cx(s, "count", "is-regression")}>{STATUS_GLYPH.regression} {counts.regression}</span>
-                <span className={cx(s, "count", "is-skip")}>{STATUS_GLYPH.skip} {counts.skip}</span>
+                <span className={cx(s, "count", "is-ok")}><SmokeStatusIcon status="ok" /> {counts.ok}</span>
+                <span className={cx(s, "count", "is-regression")}><SmokeStatusIcon status="regression" /> {counts.regression}</span>
+                <span className={cx(s, "count", "is-skip")}><SmokeStatusIcon status="skip" /> {counts.skip}</span>
               </span>
             </div>
             <div className={s["bar"]} aria-hidden>
@@ -372,7 +373,7 @@ const SmokeRunModal: React.FC<SmokeRunModalProps> = ({ isOpen, onClose, catalog 
                 onMouseEnter={() => setSelected(idx)}
                 title={it.launch.kind === "disk" ? it.launch.path : it.launch.id}
               >
-                <span className={cx(s, "glyph", `is-${st}`)} aria-label={STATUS_LABEL[st]}>{STATUS_GLYPH[st]}</span>
+                <span className={cx(s, "glyph", `is-${st}`)} aria-label={STATUS_LABEL[st]}><SmokeStatusIcon status={st} /></span>
                 <span className={s["name-cell"]}>
                   <span className={s["name"]}>
                     <span className={s["name-text"]}>{it.name}</span>
@@ -391,10 +392,10 @@ const SmokeRunModal: React.FC<SmokeRunModalProps> = ({ isOpen, onClose, catalog 
                   onCommit={(note) => mutate((r) => setNote(r, it.key, note, Date.now()))}
                 />
                 <span className={s["actions"]}>
-                  <button className={cx(s, "mark", "is-ok", st === "ok" && "is-on")} onClick={() => mark(it.key, st === "ok" ? "untested" : "ok")} title="OK (1)">{STATUS_GLYPH.ok}</button>
-                  <button className={cx(s, "mark", "is-regression", st === "regression" && "is-on")} onClick={() => mark(it.key, st === "regression" ? "untested" : "regression")} title="Regression (2)">{STATUS_GLYPH.regression}</button>
-                  <button className={cx(s, "mark", "is-skip", st === "skip" && "is-on")} onClick={() => mark(it.key, st === "skip" ? "untested" : "skip")} title="Skip — no time (3)">{STATUS_GLYPH.skip}</button>
-                  <button className={s["play"]} onClick={() => launch(it)} title="Launch (Enter)">▶</button>
+                  <button className={cx(s, "mark", "is-ok", st === "ok" && "is-on")} onClick={() => mark(it.key, st === "ok" ? "untested" : "ok")} title="OK (1)"><SmokeStatusIcon status="ok" /></button>
+                  <button className={cx(s, "mark", "is-regression", st === "regression" && "is-on")} onClick={() => mark(it.key, st === "regression" ? "untested" : "regression")} title="Regression (2)"><SmokeStatusIcon status="regression" /></button>
+                  <button className={cx(s, "mark", "is-skip", st === "skip" && "is-on")} onClick={() => mark(it.key, st === "skip" ? "untested" : "skip")} title="Skip — no time (3)"><SmokeStatusIcon status="skip" /></button>
+                  <button className={s["play"]} onClick={() => launch(it)} title="Launch (Enter)" aria-label="Launch"><Play size={14} aria-hidden /></button>
                 </span>
               </div>
             );

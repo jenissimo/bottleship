@@ -1,0 +1,42 @@
+.panel {
+    display: grid;
+    gap: 0.6rem;
+    min-width: 0;
+}
+.panel h3, .panel p {
+    margin: 0;
+}
+.panel h3 {
+    font-size: 0.9rem;
+}
+.messages {
+    border: 1px solid currentColor;
+    border-radius: 0.4rem;
+    overflow: auto;
+    min-height: 4rem;
+    max-height: 10rem;
+    padding: 0.5rem 0.65rem;
+    font-size: 0.85rem;
+    overflow-wrap: anywhere;
+}
+.messages p + p {
+    margin-top: 0.3rem;
+}
+.row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+.input {
+    flex: 1 1 12rem;
+    min-width: 0;
+    border: 1px solid currentColor;
+    border-radius: 0.4rem;
+    padding: 0.45rem 0.6rem;
+    color: inherit;
+    background: transparent;
+}
+.hint {
+    font-size: 0.8rem;
+    opacity: 0.8;
+}

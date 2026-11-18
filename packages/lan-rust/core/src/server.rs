@@ -4,6 +4,7 @@ use crate::{
     config::{ConfigError, Limits},
     gateway::{BindingRegistry, BindingToken},
     routes::{NativeAddress, ResolveCode, ResolveError, Routes, Target},
+    turn::{TurnConfig, TurnIssuer},
     wire::{
         self, Arg, Datagram, DecodeError, InboundEvent, JoinRequest, Node, ServerEvent,
         UdpLeaseRequest,
@@ -11,6 +12,8 @@ use crate::{
 };
 mod host;
 mod multicast4;
+mod room_comms;
+pub use room_comms::RoomCommsRequest;
 mod tcp_host;
 use host::HostState;
 use tcp_host::TcpHostState;
@@ -237,6 +240,7 @@ struct Active {
 }
 struct Participant {
     join: JoinRequest,
+    comms: room_comms::RoomComms,
     gateway: GatewayPermissions,
     access_expires_at: u64,
     /// Port slot -> released. Released slots are reclaimable oldest-first.
@@ -262,6 +266,7 @@ pub struct Core {
     participants: HashMap<ConnId, Participant>,
     next_operation: u64,
     access: AccessPolicy,
+    turn: Option<TurnIssuer>,
     epoch_unix_ms: u64,
     binding_entries: usize,
     binding_budget: usize,
@@ -309,6 +314,7 @@ impl Core {
             participants: HashMap::new(),
             next_operation: 0,
             access,
+            turn: None,
             epoch_unix_ms,
             binding_entries: 0,
             binding_budget,
@@ -316,6 +322,11 @@ impl Core {
             rooms_with_two_or_more: 0,
             stats: None,
         })
+    }
+    /// Enable short-lived TURN credentials for admitted voice memberships.
+    pub fn with_turn(mut self, config: TurnConfig, subject_namespace: [u8; 16]) -> Self {
+        self.turn = Some(TurnIssuer::new(config, subject_namespace));
+        self
     }
     /// Publish aggregate counters to an operator statistics sink.
     pub fn with_stats(mut self, stats: std::sync::Arc<crate::stats::ServerStats>) -> Self {
@@ -401,7 +412,7 @@ impl Core {
                 expires_at: u64::MAX,
             },
         );
-        let mut ready = json!({"version":1,"node":join.node,"ipv4":wire::node_ipv4(&join.node),"gatewayIpv4":self.routes.advertised_ipv4_for(&admission.gateway.routes),"gatewayIpv6":[],"udpMulticast4V1":true});
+        let mut ready = json!({"version":1,"node":join.node,"ipv4":wire::node_ipv4(&join.node),"gatewayIpv4":self.routes.advertised_ipv4_for(&admission.gateway.routes),"gatewayIpv6":[],"udpMulticast4V1":true,"roomCommsV1":true});
         ready["gatewayIpv6"] = Value::Array(
             self.routes
                 .advertised_ipv6_for(&admission.gateway.routes)
@@ -437,6 +448,7 @@ impl Core {
             Participant {
                 join,
                 gateway: admission.gateway,
+                comms: room_comms::RoomComms::new(auth.get("roomCommsV1") == Some(&Value::Bool(true))),
                 port_slots: HashMap::new(),
                 released_slots: Default::default(),
                 access_expires_at: admission.expires_at.map(|s|s.saturating_mul(1000).saturating_sub(self.epoch_unix_ms)).unwrap_or(u64::MAX),
@@ -648,6 +660,7 @@ impl Core {
     ) {
         if !self.reserve_port_state(connection, &event, now_ms, effects) { return; }
         match event {
+            InboundEvent::RoomComms(request) => self.room_comms(connection, request, now_ms, effects),
             InboundEvent::Multicast4 {
                 datagram,
                 generation,
@@ -1367,6 +1380,7 @@ impl Core {
         }
         let live_after = self.live_in_room(&p.join.room);
         self.room_liveness_changed(live_before, live_after);
+        self.room_comms_retired(&p.comms, &p.join.room, now_ms, effects);
         if let Some(room) = self.rooms.get(&p.join.room) {
             for recipient in room.values().filter_map(|p| p.connection) {
                 effects.push(emit(

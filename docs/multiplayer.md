@@ -40,6 +40,28 @@ the host's virtual IP, which the host's game usually shows in its lobby.
 If the connection drops, the virtual address stays the same, but running games lose
 their established connections. Rejoin the game after reconnecting.
 
+## Room chat and voice
+
+Open the network indicator after joining a room. **Room chat** sends plain text to
+the people currently connected, using their virtual LAN address as the sender
+label. The server keeps no chat history. A tab shows its last 100 messages and
+clears them when its relay connection closes.
+
+**Join voice** asks for microphone permission and connects browsers directly via
+WebRTC. You can mute the mic, leave voice, or close the panel while you play.
+Leaving the room stops the microphone and closes the calls. Voice supports up to
+six participants and requires HTTPS or localhost. Screen readers can read new
+chat messages, and typing in the chat field stays in the host UI.
+
+The relay carries room messages and voice setup. Audio travels directly between
+voice participants, who can learn each other's network addresses. The client uses
+public Google STUN by default. Set `VITE_ROOM_VOICE_STUN_URL` to your STUN server,
+or an empty string for local networks. A configured TURN server can forward encrypted audio when a direct path is
+unavailable. Invite-only rooms can use it by default when the operator enables TURN.
+An operator can also opt in to TURN for public, name-only rooms. Room text and game
+traffic continue to use the LAN relay. Both client and relay must support room
+communications. See the [voice operations guide](multiplayer-voice-operations.md).
+
 ## Run your own server
 
 The LAN server is `bottleship-lan`, a small Rust program in

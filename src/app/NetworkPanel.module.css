@@ -175,17 +175,23 @@
 }
 
 .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--fg-3);
+  color: var(--fg-3);
   flex-shrink: 0;
 }
 
-.indicator[data-state="online"] .dot { background: var(--mint); }
-.indicator[data-state="connecting"] .dot { background: var(--amber); }
-.indicator[data-state="error"] .dot { background: var(--coral); }
+.indicator[data-state="online"] .dot { color: var(--mint); }
+.indicator[data-state="connecting"] .dot { color: var(--amber); }
+.indicator[data-state="error"] .dot { color: var(--coral); }
 .indicator[data-state="online"] { color: var(--fg-1); }
+
+.mic {
+  color: var(--mint);
+  flex-shrink: 0;
+}
+
+.mic[data-muted="true"] {
+  color: var(--fg-3);
+}
 
 .indicator-label {
   max-width: 220px;

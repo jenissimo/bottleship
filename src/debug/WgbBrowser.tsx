@@ -1,3 +1,4 @@
+import { X } from "@phosphor-icons/react";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { cx } from '../ui/cx';
 import { ActionButton } from '../ui/ActionButton';
@@ -193,7 +194,7 @@ const WgbBrowser: React.FC<WgbBrowserProps> = ({ isOpen, onClose, onLaunch }) =>
       >
         <div className={ms['modal-header']}>
           <h2>Bundles</h2>
-          <button className={ms['modal-close']} onClick={onClose}>×</button>
+          <button className={ms['modal-close']} onClick={onClose} aria-label="Close"><X size={16} aria-hidden /></button>
         </div>
 
         <div className={s['wgb-toolbar']}>

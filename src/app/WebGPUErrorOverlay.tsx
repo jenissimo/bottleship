@@ -1,3 +1,4 @@
+import { Warning } from "@phosphor-icons/react";
 import React from "react";
 import type { WebGPUProbeResult } from "../browser-support";
 
@@ -65,7 +66,7 @@ export default function WebGPUErrorOverlay({
           alignItems: "center",
           justifyContent: "center",
           fontSize: "22px",
-        }}>⚠️</div>
+        }}><Warning size={24} aria-hidden /></div>
         <div>
           <h1 style={{ margin: 0, fontSize: "1.32rem", fontWeight: 700, color: "#ffe0cd", lineHeight: 1.15 }}>
             Can’t start graphics

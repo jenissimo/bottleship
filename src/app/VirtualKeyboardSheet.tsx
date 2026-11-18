@@ -1,3 +1,4 @@
+import { X } from "@phosphor-icons/react";
 // On-screen keyboard. Position-fixed, and marked `data-touch-reserved`, so it can be
 // mounted anywhere — including inside `.app__panel` — without leaking a contact into
 // the guest: the touch driver claims contacts that start under that attribute. Its own
@@ -192,7 +193,7 @@ const Sheet: React.FC<{ onClose: () => void }> = ({ onClose }) => {
                     onPointerDown={(e) => { stop(e); onClose(); }}
                     aria-label="Close keyboard"
                 >
-                    ✕
+                    <X size={16} aria-hidden />
                 </button>
             </div>
 

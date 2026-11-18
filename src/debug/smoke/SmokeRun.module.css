@@ -1,6 +1,6 @@
 /* Dev smoke-run tool: the checklist modal and the in-game corner panel.
    Verdict colours: mint = OK, coral = regression, fg-3 = skipped. Each is paired with a
-   glyph (✓ ✗ –) so the state never rests on red/green alone. */
+   icon so the state never rests on red/green alone. */
 
 /* ───────────────────────── Modal ───────────────────────── */
 

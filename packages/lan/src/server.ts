@@ -4,6 +4,7 @@ import { Server, type Socket } from "socket.io";
 import { GatewayRoutes, NativeGateway, type GatewayOptions } from "./gateway";
 import { NetResolveError } from "./resolve";
 import { RoomAccess, type RoomAccessConfig, type Admission } from "./access";
+import { attachRoomComms, RoomTurnConfig, type RoomVoiceMember } from "./room-comms-server";
 import {TcpHostOwner} from "./tcp-host-owner";
 import {TcpAcceptHostOwner} from "./tcp-accept-host-owner";
 import { DEFAULT_STATS_TOKEN_ENV, LanStats, StatsToken } from "./stats";
@@ -35,12 +36,14 @@ export interface LanServerOptions {
     maxBindingEntries?: number;
     gateway?: GatewayOptions;
     roomAccess?: RoomAccessConfig;
+    /** Override TURN operator environment for an embedded relay. */
+    roomTurn?: RoomTurnConfig | false;
     /** Environment variable holding the GET /stats bearer token; unset or empty: no endpoint. */
     statsTokenEnv?: string;
 }
 type PeerSocket = Socket<ClientEvents, ServerEvents>;
 interface Lease { clientId: string; node: Uint8Array; socket: PeerSocket | null; expiresAt: number }
-interface Room { peers: Map<string, Lease> }
+interface Room { peers: Map<string, Lease>; voice: Map<PeerSocket, RoomVoiceMember> }
 export interface LanServer {
     io: Server<ClientEvents, ServerEvents>;
     http: HttpServer;
@@ -67,6 +70,9 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
     }
     let bindingEntries=0;
     const access = new RoomAccess(options.roomAccess);
+    if (options.roomTurn !== undefined && options.roomTurn !== false && !(options.roomTurn instanceof RoomTurnConfig))
+        throw new Error("Invalid roomTurn operator override");
+    const turn = options.roomTurn === false ? undefined : options.roomTurn ?? RoomTurnConfig.fromEnvironment();
     const statsTokenEnv = options.statsTokenEnv ?? DEFAULT_STATS_TOKEN_ENV;
     if (typeof statsTokenEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(statsTokenEnv)) throw new Error("Invalid statsTokenEnv");
     // The token is reduced to a digest here; neither it nor its digest is logged.
@@ -203,7 +209,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
         let room = rooms.get(request.room);
         if (!room) {
             while (rooms.size >= limits.maxRooms) { if(!evictOfflineRoom()){next(new Error("LAN room limit reached"));return;} }
-            room = { peers: new Map() };
+            room = { peers: new Map(), voice: new Map() };
             rooms.set(request.room, room);
         }
         const key = nodeKey(node);
@@ -220,7 +226,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
         room.peers.set(key, lease);
         rooms.set(request.room,room);
         if (stats) { stats.roomLiveness(liveBefore, liveIn(room)); stats.joined(request.clientId); }
-        socket.data = { room, lease, admission };
+        socket.data = { room, lease, admission, comms: request.roomCommsV1 === true };
         next();
     });
     io.on("connection", socket => {
@@ -288,11 +294,22 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             }
             next();
         });
-        socket.emit("ready", { version: PROTOCOL_VERSION, node: Array.from(lease.node), ipv4: Array.from(nodeToIpv4(lease.node)), gatewayIpv4: gatewayRoutes.advertisedIpv4For(allowedRoutes), gatewayIpv6: gatewayRoutes.advertisedIpv6For(allowedRoutes), udpMulticast4V1: true });
+        socket.emit("ready", { version: PROTOCOL_VERSION, node: Array.from(lease.node), ipv4: Array.from(nodeToIpv4(lease.node)), gatewayIpv4: gatewayRoutes.advertisedIpv4For(allowedRoutes), gatewayIpv6: gatewayRoutes.advertisedIpv6For(allowedRoutes), udpMulticast4V1: true, roomCommsV1: true });
         const queue = { frames: 0, bytes: 0, notices:new Map<string,()=>void>() };
         pending.set(socket, queue);
         const releaseNotices=()=>{for(const release of queue.notices.values())release();queue.notices.clear();};
         socket.conn.on("drain", () => { queue.frames = 0; queue.bytes = 0; releaseNotices(); });
+        if (socket.data.comms) attachRoomComms(socket, room.voice, () =>
+            Array.from(room.peers.values(), peer => peer.socket).filter(
+                (peer): peer is PeerSocket => !!peer?.connected && peer.data.comms === true),
+            Array.from(nodeToIpv4(lease.node)).join("."), (recipient, event) => {
+                const output = pending.get(recipient);
+                if (!output || !recipient.connected) return;
+                const bytes = Buffer.byteLength(JSON.stringify(event)) + 32;
+                if (congested(recipient, bytes)) return;
+                output.frames++; output.bytes += bytes;
+                recipient.emit("roomComms", event);
+            }, admission.expiresAt, turn);
         const emitGateway = (frame: Uint8Array<ArrayBuffer>, reliable: boolean, bindingGeneration?: number): boolean => {
             if (!socket.connected) return false;
             if (congested(socket, frame.byteLength)) {

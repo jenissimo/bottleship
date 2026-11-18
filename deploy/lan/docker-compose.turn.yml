@@ -1,0 +1,51 @@
+# Optional TURN overlay for the Linux LAN relay host.
+# Use with docker-compose.yml after provisioning DNS, TLS and the host firewall.
+services:
+  bottleship-lan:
+    environment:
+      BS_LAN_TURN_URLS: ${BS_LAN_TURN_URLS:?Set the browser-facing TURN URLs}
+      BS_LAN_TURN_SECRET: ${BS_LAN_TURN_SECRET:?Inject the TURN REST secret}
+      BS_LAN_TURN_TTL_SECONDS: ${BS_LAN_TURN_TTL_SECONDS:-3600}
+      BS_LAN_TURN_ALLOW_PUBLIC: ${BS_LAN_TURN_ALLOW_PUBLIC:-false}
+
+  coturn:
+    image: coturn/coturn:4.19.1-r0@sha256:81f69dc7cb672eb73ab3414afbb199637c37ab8069919d1c6caaed96ff16fb88
+    restart: unless-stopped
+    network_mode: host
+    user: "65534:65534"
+    entrypoint: ["/bin/sh", "/opt/bottleship/start-turn.sh"]
+    environment:
+      BS_LAN_TURN_SECRET: ${BS_LAN_TURN_SECRET:?Inject the TURN REST secret}
+    volumes:
+      - type: bind
+        source: ./start-turn.sh
+        target: /opt/bottleship/start-turn.sh
+        read_only: true
+      - type: bind
+        source: ./turnserver.conf
+        target: /etc/bottleship/turnserver.conf
+        read_only: true
+      - type: bind
+        source: ./turnserver.network.conf
+        target: /etc/bottleship/turnserver.network.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BS_TURN_TLS_DIR:?Set the directory containing the TURN certificate and key}
+        target: /etc/bottleship/tls
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m,mode=1777
+      - /var/lib/coturn:rw,noexec,nosuid,nodev,size=8m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 128
+    cpus: 2.0
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

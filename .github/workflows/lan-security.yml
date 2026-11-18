@@ -61,3 +61,7 @@ jobs:
         run: |
           cargo build --locked --manifest-path packages/lan-rust/Cargo.toml --example conformance-server
           bun tools/lan-conformance/security-access.ts target/lan-security/debug/examples/conformance-server
+      - name: Room communications on the production relay and reference server
+        run: |
+          cargo build --locked --manifest-path packages/lan-rust/Cargo.toml --bin bottleship-lan
+          BS_TEST_RUST_ROOM_RELAY="$CARGO_TARGET_DIR/debug/bottleship-lan" bun test packages/lan/test/room-comms.test.ts

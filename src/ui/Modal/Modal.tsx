@@ -1,3 +1,4 @@
+import { X } from "@phosphor-icons/react";
 import React from "react";
 import { cx } from "../cx";
 import s from "./Modal.module.css";
@@ -52,8 +53,8 @@ export function ModalClose({
   onClick: () => void;
 }): React.ReactElement {
   return (
-    <button className={s["modal-close"]} onClick={onClick}>
-      ×
+    <button className={s["modal-close"]} onClick={onClick} aria-label="Close">
+      <X size={16} aria-hidden />
     </button>
   );
 }

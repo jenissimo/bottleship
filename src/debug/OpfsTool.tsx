@@ -1,3 +1,4 @@
+import { X } from "@phosphor-icons/react";
 import React, { useState, useEffect, useMemo } from 'react';
 import {
   type StorageEstimate,
@@ -458,7 +459,7 @@ const OpfsTool: React.FC<OpfsToolProps> = ({ isOpen, onClose }) => {
       >
         <div className={ms["modal-header"]}>
           <h2>OPFS Raw Browser</h2>
-          <button className={ms["modal-close"]} onClick={onClose}>×</button>
+          <button className={ms["modal-close"]} onClick={onClose} aria-label="Close"><X size={16} aria-hidden /></button>
         </div>
 
         {error && <div className={s["opfs-error"]}>{error}</div>}

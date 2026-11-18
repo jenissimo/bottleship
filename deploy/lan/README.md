@@ -42,9 +42,82 @@ The relay has no per-IP limits of its own. Limit connections and requests per cl
 
 If you also build and host the BottleShip site, set `VITE_LAN_SERVER=https://lan.example.org` when building it. Your players then get your relay as the default server. Builds without this variable have no default, and players enter a server address themselves.
 
+## TURN for room voice
+
+The standard setup supports direct WebRTC voice. For browsers that need a media relay, add the optional Linux coturn service. Its network, TLS, secret and verification steps are in the [voice operations guide](../../docs/multiplayer-voice-operations.md).
+
+## Local TURN smoke
+
+Run this from the repository root with Bun, Chrome or Chromium, and coturn
+available on the same machine. The commands use OpenSSL and netcat. The
+temporary coturn instance binds to
+loopback. This test-only configuration allows loopback relay peers so two
+synthetic microphones can exchange RTP through coturn.
+
+```sh
+(
+  export BS_TURN_SMOKE_SECRET="$(openssl rand -hex 32)"
+  export BS_TURN_SMOKE_URL='turn:127.0.0.1:34790?transport=tcp'
+  export BS_TURN_SMOKE_CHROME=/path/to/chrome
+  umask 077
+  workdir="$(mktemp -d)"
+  trap 'kill "${turn_pid:-}" 2>/dev/null || true; rm -rf -- "$workdir"' EXIT
+  cat > "$workdir/turn.conf" <<EOF
+realm=localhost
+listening-ip=127.0.0.1
+relay-ip=127.0.0.1
+listening-port=34790
+min-port=45000
+max-port=45019
+userdb=$workdir/turndb
+pidfile=$workdir/turn.pid
+log-file=stdout
+no-cli
+no-tls
+no-dtls
+no-tcp-relay
+allow-loopback-peers
+fingerprint
+use-auth-secret
+static-auth-secret=$BS_TURN_SMOKE_SECRET
+EOF
+  turnserver -c "$workdir/turn.conf" > "$workdir/turn.log" 2>&1 &
+  turn_pid=$!
+
+  # Start the smoke after coturn binds its listener.
+  retries=50
+  until nc -z 127.0.0.1 34790; do
+    retries=$((retries - 1))
+    if [ "$retries" -eq 0 ] || ! kill -0 "$turn_pid" 2>/dev/null; then
+      cat "$workdir/turn.log" >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+
+  bun --no-env-file deploy/lan/turn-smoke.ts
+)
+```
+
+The browser uses the BottleShip chat and voice client with only TURN candidates
+enabled. A passing report includes selected relay candidates and inbound and
+outbound audio packets on each connection, plus chat, mute and leave. The
+synthetic browser profile is created on each run. Set `BS_TURN_SMOKE_RUST` to
+a built `bottleship-lan` executable to run the smoke against the Rust relay.
+Two real clients on separate networks are needed to verify a production DNS,
+firewall and TLS deployment.
+
 ## Updating
+
+Use the same Compose files during updates as when starting the LAN server.
 
 ```sh
 git pull
 docker compose up -d --build
+```
+
+With TURN enabled, use the overlay for the update.
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.turn.yml up -d --build
 ```

@@ -1,3 +1,4 @@
+import { ChartBar, ListBullets, MagnifyingGlass, Skull, Trophy, Warning } from "@phosphor-icons/react";
 import React, { useEffect, useState, useRef, useCallback } from "react";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -431,8 +432,8 @@ function FrameComparison({ samples }: FrameComparisonProps) {
     return (
         <div style={{ fontSize: 11 }}>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6, padding: "0 6px" }}>
-                <span style={{ color: "#4ade80" }}>🏆 Best: {formatMs(best.frameMs)} ms</span>
-                <span style={{ color: "#ef4444" }}>💀 Worst: {formatMs(worst.frameMs)} ms</span>
+                <span style={{ color: "#4ade80" }}><Trophy size={15} aria-hidden /> Best: {formatMs(best.frameMs)} ms</span>
+                <span style={{ color: "#ef4444" }}><Skull size={15} aria-hidden /> Worst: {formatMs(worst.frameMs)} ms</span>
                 <span style={{ color: "#fbbf24" }}>Δ {formatMs(totalDelta)} ms</span>
             </div>
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10 }}>
@@ -456,7 +457,7 @@ function FrameComparison({ samples }: FrameComparisonProps) {
                                 backgroundColor: isCulprit ? "rgba(239, 68, 68, 0.15)" : undefined,
                             }}>
                                 <td style={{ padding: "2px 4px", color: CATEGORY_COLORS[cat] }}>
-                                    {isCulprit && "⚠️ "}{CATEGORY_LABELS[cat]}
+                                    {isCulprit && <Warning size={14} aria-hidden />} {CATEGORY_LABELS[cat]}
                                 </td>
                                 <td style={{ padding: "2px 4px", textAlign: "right", color: "#4ade80" }}>
                                     {formatMs(bestVal)}
@@ -865,7 +866,7 @@ export default function ProfilerPanel({ isOpen, onClose, worker }: ProfilerPanel
                         fontSize: 11,
                     }}
                 >
-                    📊 Frame Analysis
+                    <ChartBar size={16} aria-hidden /> Frame Analysis
                 </button>
                 <button
                     onClick={() => setActiveTab("worst")}
@@ -880,7 +881,7 @@ export default function ProfilerPanel({ isOpen, onClose, worker }: ProfilerPanel
                         fontSize: 11,
                     }}
                 >
-                    💀 Worst Frames
+                    <Skull size={15} aria-hidden /> Worst Frames
                 </button>
                 <button
                     onClick={() => setActiveTab("ops")}
@@ -895,7 +896,7 @@ export default function ProfilerPanel({ isOpen, onClose, worker }: ProfilerPanel
                         fontSize: 11,
                     }}
                 >
-                    📋 Operations
+                    <ListBullets size={16} aria-hidden /> Operations
                 </button>
             </div>
 
@@ -1064,7 +1065,7 @@ export default function ProfilerPanel({ isOpen, onClose, worker }: ProfilerPanel
                                         }}>
                                             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 12 }}>
                                                 <div style={{ fontSize: 13, fontWeight: "bold" }}>
-                                                    🔍 Inspecting Frame #{selected.id}
+                                                    <MagnifyingGlass size={16} aria-hidden /> Inspecting Frame #{selected.id}
                                                 </div>
                                                 <div style={{ fontSize: 11, color: "#888" }}>
                                                     {new Date(selected.timestamp).toLocaleTimeString()} · {selected.frameMs.toFixed(2)} ms

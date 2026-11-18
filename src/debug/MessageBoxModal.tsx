@@ -1,3 +1,4 @@
+import { X } from "@phosphor-icons/react";
 import React from "react";
 import { cx } from "../ui/cx";
 import s from "./MessageBoxModal.module.css";
@@ -59,7 +60,7 @@ export default function MessageBoxModal({ messageBox, onClose }: MessageBoxModal
       >
         <div className={ms["modal-header"]}>
           <h2>{messageBox.caption || "Message"}</h2>
-          <button className={ms["modal-close"]} onClick={() => close(messageBoxEscResult(buttons))}>×</button>
+          <button className={ms["modal-close"]} onClick={() => close(messageBoxEscResult(buttons))} aria-label="Close"><X size={16} aria-hidden /></button>
         </div>
         <div className={ms["modal-body"]}>
           <p className={s["messagebox-text"]}>{messageBox.text}</p>

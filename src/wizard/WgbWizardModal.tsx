@@ -12,6 +12,8 @@ import hm from "../ui/Hint/Hint.module.css";
 import { Spacer } from "../ui/Spacer";
 import { useHostModal } from "../harness/use-host-modal";
 import {
+  ArrowRight,
+  Check,
   X,
   UploadSimple,
   Folder,
@@ -868,7 +870,7 @@ export default function WgbWizardModal({
                   disabled={idx > maxStepReached}
                   onClick={() => goStep(idx)}
                 >
-                  <div className={s["step__dot"]}>{idx < step ? "✓" : idx}</div>
+                  <div className={s["step__dot"]}>{idx < step ? <Check size={14} weight="bold" aria-hidden /> : idx}</div>
                   <div className={s["step__txt"]}>
                     <span className={s["step__k"]}>{String(idx).padStart(2, "0")}</span>
                     <span className={s["step__t"]}>{name}</span>
@@ -932,7 +934,7 @@ export default function WgbWizardModal({
                 )}
                 {onEditLibrary && (
                   <button className={cx(ch, "chip", "chip--mount")} onClick={onEditLibrary}>
-                    <PencilSimple size={14} aria-hidden /> Edit one in your library →
+                    <PencilSimple size={14} aria-hidden /> Edit one in your library <ArrowRight size={14} aria-hidden />
                   </button>
                 )}
               </div>
@@ -1422,7 +1424,7 @@ function buildTree(entries: StagedEntry[]): TreeNode[] {
   return root.children ?? [];
 }
 
-// --- per-extension mime icon (lucide) ----------------------------------------------
+// --- per-extension mime icon (Phosphor) ----------------------------------------------
 
 const TEXT_EXTS = new Set(["txt", "log", "md", "nfo"]);
 const CFG_EXTS = new Set(["ini", "cfg", "cnf", "inf"]);
@@ -1447,7 +1449,7 @@ function isEditable(name: string, size: number): boolean {
   return EDITABLE_EXTS.has(extOf(name)) && size < EDITABLE_MAX_BYTES;
 }
 
-/** Pick a lucide icon component for a file by extension. */
+/** Pick a Phosphor icon component for a file by extension. */
 function fileIcon(name: string): Icon {
   const ext = extOf(name);
   if (ext === "json") return BracketsCurly;

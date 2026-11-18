@@ -1,7 +1,10 @@
+import { Circle, Microphone, MicrophoneSlash, X } from "@phosphor-icons/react";
 import React from "react";
 import ms from "../ui/Modal/Modal.module.css";
 import s from "./NetworkPanel.module.css";
 import { ActionButton } from "../ui/ActionButton";
+import RoomCommsPanel from "./RoomCommsPanel";
+import type { RoomCommsClient } from "./room-comms-client";
 import {
   buildFriendLink, generateRoomName, normalizeNetworkConfig, parseRoomInput,
   type NetworkConfig, type NetworkStatus, type NetworkSuggestion, type ShareableGame,
@@ -16,6 +19,7 @@ export interface NetworkPanelProps {
   /** The room this tab is in (or trying to join), if any. */
   network: NetworkConfig | null;
   status: NetworkStatus;
+  roomComms?: RoomCommsClient;
   game: ShareableGame;
   /** Remember is per game; without a game key there is nothing to remember it for. */
   canRemember: boolean;
@@ -26,6 +30,8 @@ export interface NetworkPanelProps {
 }
 
 type Choice = "create" | "join";
+const subscribeOffline = () => () => {};
+const offline = () => false;
 
 function copy(text: string, done: (message: string) => void): void {
   if (!navigator.clipboard) { done("Copy this link: " + text); return; }
@@ -33,9 +39,12 @@ function copy(text: string, done: (message: string) => void): void {
 }
 
 export default function NetworkPanel(props: NetworkPanelProps): React.ReactElement {
-  const { mode, suggestion, network, status, game, canRemember } = props;
+  const { mode, suggestion, network, status, game, canRemember, roomComms } = props;
+  const relayReconnecting = React.useSyncExternalStore(roomComms?.subscribe ?? subscribeOffline,
+    roomComms ? () => roomComms.snapshot().relayReconnecting : offline);
   const connected = status.state === "connected" && !!network;
-  const connecting = status.state === "connecting";
+  const inRoom = connected || (relayReconnecting && !!network);
+  const connecting = status.state === "connecting" && !inRoom;
   const [choice, setChoice] = React.useState<Choice>(suggestion.fromLink && suggestion.room ? "join" : "create");
   const [createdRoom, setCreatedRoom] = React.useState(() => generateRoomName());
   const [joinText, setJoinText] = React.useState(suggestion.fromLink ? suggestion.room : "");
@@ -63,7 +72,7 @@ export default function NetworkPanel(props: NetworkPanelProps): React.ReactEleme
   }, [choice, createdRoom, joinText, serverUrl, suggestion.room, suggestion.invite]);
 
   const linkFor = (config: NetworkConfig) => buildFriendLink(window.location.origin, config, game);
-  const shared = connected ? linkFor(network!) : target.config ? linkFor(target.config) : null;
+  const shared = inRoom ? linkFor(network!) : target.config ? linkFor(target.config) : null;
   const connect = () => {
     if (!target.config) { setInputError(target.error || "Paste the link your friend sent, or a room name."); return; }
     setInputError(""); props.onConnect(target.config, remember);
@@ -72,7 +81,7 @@ export default function NetworkPanel(props: NetworkPanelProps): React.ReactEleme
   const onKeyDown = (event: React.KeyboardEvent) => {
     if (event.key === "Escape") { event.preventDefault(); if (mode === "request") props.onNotNow(false); else props.onClose(); }
   };
-  const title = connected ? `Room ${network!.room}` : mode === "request" ? "Play over the network?" : "Network";
+  const title = inRoom ? `Room ${network!.room}` : mode === "request" ? "Play over the network?" : "Network";
 
   return (
     <div className={ms["modal-overlay"]} onKeyDown={onKeyDown}>
@@ -80,12 +89,14 @@ export default function NetworkPanel(props: NetworkPanelProps): React.ReactEleme
         ref={el => { if (el && !el.contains(document.activeElement)) el.focus(); }} onClick={e => e.stopPropagation()}>
         <div className={ms["modal-header"]}>
           <h2>{title}</h2>
-          {mode === "panel" && <button className={ms["modal-close"]} aria-label="Close" onClick={props.onClose}>×</button>}
+          {mode === "panel" && <button className={ms["modal-close"]} aria-label="Close" onClick={props.onClose}><X size={16} aria-hidden /></button>}
         </div>
         <div className={s.body}>
-          {connected ? (
+          {inRoom ? (
             <>
-              <p className={s.lead}>Connected to <span className={s.mono}>{new URL(network!.serverUrl).host}</span>. Your address on the virtual LAN is <span className={s.mono}>{status.address ?? "…"}</span>.</p>
+              {connected ?
+                <p className={s.lead}>Connected to <span className={s.mono}>{new URL(network!.serverUrl).host}</span>. Your address on the virtual LAN is <span className={s.mono}>{status.address ?? "…"}</span>.</p> :
+                <p className={s.lead} role="status">Reconnecting to <span className={s.mono}>{new URL(network!.serverUrl).host}</span>…</p>}
               <p className={s.hint}>Ask your friend to join room <span className={s.mono}>{network!.room}</span>, then choose LAN multiplayer in the game.</p>
               {shared && !shared.includesGame && <p className={s.note}>Your friend needs their own copy of this game: the link opens the room, not the game.</p>}
             </>
@@ -140,8 +151,9 @@ export default function NetworkPanel(props: NetworkPanelProps): React.ReactEleme
               )}
             </>
           )}
+          {roomComms && <RoomCommsPanel client={roomComms} />}
           {(() => {
-            const error = !connecting && (inputError || (!connected && failed));
+            const error = !connecting && (inputError || (!inRoom && failed));
             if (!connecting && !error && !notice) return null;
             return (
               <div className={s.status} data-tone={error ? "error" : "info"} role="status" aria-live="polite">
@@ -151,7 +163,7 @@ export default function NetworkPanel(props: NetworkPanelProps): React.ReactEleme
           })()}
         </div>
         <div className={s.footer}>
-          {connected ? (
+          {inRoom ? (
             <>
               <ActionButton type="button" onClick={props.onDisconnect}>Disconnect</ActionButton>
               <span className={s.spacer} />
@@ -175,17 +187,29 @@ export default function NetworkPanel(props: NetworkPanelProps): React.ReactEleme
   );
 }
 
+function VoiceIndicator({ client }: { client: RoomCommsClient }) {
+  const { voice, muted } = React.useSyncExternalStore(client.subscribe, client.snapshot);
+  if (voice !== "joined" && voice !== "reconnecting") return null;
+  const sending = voice === "joined" && !muted;
+  const Icon = sending ? Microphone : MicrophoneSlash;
+  const label = voice === "reconnecting" ? "Voice reconnecting" : muted ? "Microphone muted" : "Microphone on";
+  return <Icon size={14} weight={sending ? "fill" : "regular"} className={s.mic}
+    role="img" aria-label={label} data-muted={!sending} />;
+}
+
 /** Toolbar status: what the network is doing right now; a click opens the panel. */
-export function NetworkIndicator({ status, network, onClick, className }: {
-  status: NetworkStatus; network: NetworkConfig | null; onClick: () => void; className?: string;
+export function NetworkIndicator({ status, network, roomComms, onClick, className }: {
+  status: NetworkStatus; network: NetworkConfig | null; roomComms?: RoomCommsClient;
+  onClick: () => void; className?: string;
 }): React.ReactElement {
   const state = status.state === "connected" && network ? "online" : status.state === "connecting" ? "connecting" : status.state === "error" ? "error" : "offline";
   const label = state === "online" ? `Room ${network!.room}` : state === "connecting" ? "Connecting…" : state === "error" ? "Network error" : "Offline";
   return (
     <button type="button" className={`${className ?? ""} ${s.indicator}`} data-state={state} onClick={onClick}
       title={state === "online" ? `Connected to ${new URL(network!.serverUrl).host}` : "Network"}>
-      <span className={s.dot} aria-hidden />
+      <Circle className={s.dot} size={8} weight="fill" aria-hidden />
       <span className={s["indicator-label"]}>{label}</span>
+      {roomComms && <VoiceIndicator client={roomComms} />}
     </button>
   );
 }

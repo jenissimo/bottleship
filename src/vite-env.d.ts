@@ -9,4 +9,6 @@ declare const __APP_VERSION__: string;
 interface ImportMetaEnv {
   /** LAN relay offered by default in the network permission dialog (an HTTP(S) origin). */
   readonly VITE_LAN_SERVER?: string;
+  /** STUN server for direct room voice. Empty uses local candidates only. */
+  readonly VITE_ROOM_VOICE_STUN_URL?: string;
 }
