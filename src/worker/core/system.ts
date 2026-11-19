@@ -411,6 +411,13 @@ export class System {
         this.comResourceManager = new ComResourceManager();
         this.apiRegistry = APIRegistry.getInstance();
         this.scheduler = new Scheduler({ enabled: true });
+        this.windowManager.setQuitSource({
+            pending: (threadId) => {
+                const quit = this.scheduler.getQuitState(threadId);
+                return quit?.posted ? { exitCode: quit.exitCode } : null;
+            },
+            consume: (threadId) => this.scheduler.clearQuitFlag(threadId),
+        });
         this.registerSessionState();
     }
 
