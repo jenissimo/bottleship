@@ -34,6 +34,7 @@ const VALUES: Record<UnimplementedReturn, number> = {
     mcierror: MCIERR_UNSUPPORTED_FUNCTION,
     win32Status: ERROR_CALL_NOT_IMPLEMENTED,
     ntstatus: 0xC0000002,
+    configret: 0x34,
     unresolvable: 0,
 };
 
