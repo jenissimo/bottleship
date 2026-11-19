@@ -25,6 +25,7 @@ export interface ConfineRect { left: number; top: number; right: number; bottom:
 export class HostPointerTrack {
     private last: HostPoint | null = null;
     private confine: ConfineRect | null = null;
+    private resumeFromCursor = false;
 
     /**
      * ClipCursor confinement, or null when nothing confines the pointer.
@@ -52,6 +53,21 @@ export class HostPointerTrack {
     }
 
     /**
+     * Pointer Lock just released (guest Unacquire, ClipCursor release, ESC — any reason).
+     * While locked, motion came from movementX/Y and the host's absolute position was
+     * never tracked, so the physical pointer may now be anywhere on the page — a plain
+     * `lose()` would make the next sample re-seat at that raw point, teleporting the
+     * guest's cursor away from wherever it was actually drawn (it never moved on real
+     * Windows: DirectInput Unacquire does not move the cursor). The next sample instead
+     * holds the guest's current position and only resets the MOTION baseline, so tracking
+     * resumes invisibly from here.
+     */
+    resumeFromLock(): void {
+        this.last = null;
+        this.resumeFromCursor = true;
+    }
+
+    /**
      * Where the guest's pointer belongs after this host sample.
      *
      * @param host    host pointer in guest space
@@ -65,9 +81,11 @@ export class HostPointerTrack {
         const outside = host.x < 0 || host.y < 0 || host.x > bounds.x || host.y > bounds.y;
         const prev = outside ? null : this.last;
         this.last = outside ? null : host;
+        const resuming = this.resumeFromCursor;
+        this.resumeFromCursor = false;
         const target = prev
             ? { x: cursor.x + (host.x - prev.x), y: cursor.y + (host.y - prev.y) }
-            : { x: host.x, y: host.y };
+            : resuming ? { x: cursor.x, y: cursor.y } : { x: host.x, y: host.y };
         return this.clamp(target);
     }
 
