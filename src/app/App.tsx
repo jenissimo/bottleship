@@ -876,6 +876,7 @@ export default function App() {
     // Pointer Lock nor meaningful movementX/Y, so it belongs on the touch transport.
     if (pointerSourceRef.current !== "mouse") return;
     const req = canvas.requestPointerLock as (opts?: { unadjustedMovement?: boolean }) => Promise<void> | void;
+    hostPointerTrackRef.current.markLockForSession();
     Promise.resolve(req.call(canvas, { unadjustedMovement: true })).catch(() => {
       // Options unsupported (older Chromium) — retry bare.
       Promise.resolve(canvas.requestPointerLock()).catch(() => {});
@@ -932,7 +933,10 @@ export default function App() {
         pointerLockReleaseTimerRef.current = null;
       }
       const c = canvasRef.current;
-      if (c && document.hasFocus() && !pointerLockedRef.current && !userReleasedLockRef.current) {
+      if (pointerLockedRef.current) {
+        // A new game can claim a lock that the browser has yet to release.
+        hostPointerTrackRef.current.markLockForSession();
+      } else if (c && document.hasFocus() && !userReleasedLockRef.current) {
         requestPointerLockSafe(c);
         armPointerLockGesture();
       }
@@ -1914,9 +1918,8 @@ export default function App() {
         touchDriver.reset();
         assertVirtualPad();
         inputDevice.commit({ immediate: true });
+        hostPointerTrackRef.current.reset();
         relativeIntent.reset();
-        hostPointerTrackRef.current.lose();
-        hostPointerTrackRef.current.setConfine(null);
         if (pointerLockReleaseTimerRef.current) {
           clearTimeout(pointerLockReleaseTimerRef.current);
           pointerLockReleaseTimerRef.current = null;
@@ -2154,8 +2157,7 @@ export default function App() {
         inputDevice.setButtonsMask(event.buttons, "hw-mouse");
         inputDevice.commit();
         recordSample(inputView, 0, 0, event.movementX, event.movementY);
-        // The lock supplies motion directly; nothing here tracks an absolute host
-        // position, so releasing it must re-seat rather than resume an old one.
+        // Relative motion cannot establish an absolute host baseline.
         hostPointerTrackRef.current.lose();
         return;
       }
@@ -2429,6 +2431,7 @@ export default function App() {
     // Windows behavior where ShowCursor(FALSE) doesn't move the cursor. Seeding at screen
     // center would make LBUTTONUP jump to (width/2, height/2) mid-click (drag mismatch).
     const handlePointerLockChange = () => {
+      const wasLocked = pointerLockedRef.current;
       pointerLockedRef.current = document.pointerLockElement === canvas;
       syncCursorPresence();
       if (pointerLockedRef.current && !relativeIntent.get()) {
@@ -2446,7 +2449,7 @@ export default function App() {
         // force-exits lock on ESC). The next absolute-mode sample must resume from the
         // guest's own cursor, not re-seat at the physical pointer's position — see
         // HostPointerTrack.resumeFromLock.
-        hostPointerTrackRef.current.resumeFromLock();
+        if (wasLocked) hostPointerTrackRef.current.resumeFromLock();
         // If the guest still wants relative mouse and the user did NOT deliberately
         // release via Right Ctrl, arm a re-acquire. handlePointerDown re-requests on the
         // next click (the reliable gesture); we also opportunistically attempt on the

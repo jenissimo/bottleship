@@ -28,6 +28,7 @@ export class HostPointerTrack {
     private last: HostPoint | null = null;
     private confine: ConfineRect | null = null;
     private resumeFromCursor = false;
+    private lockBelongsToSession = false;
 
     /**
      * ClipCursor confinement, or null when nothing confines the pointer.
@@ -54,6 +55,18 @@ export class HostPointerTrack {
         this.last = null;
     }
 
+    /** Drop the previous game's position, confinement and pending lock transition. */
+    reset(): void {
+        this.lose();
+        this.confine = null;
+        this.resumeFromCursor = false;
+        this.lockBelongsToSession = false;
+    }
+
+    markLockForSession(): void {
+        this.lockBelongsToSession = true;
+    }
+
     /**
      * Pointer Lock just released (guest Unacquire, ClipCursor release, ESC — any reason).
      * While locked, motion came from movementX/Y and the host's absolute position was
@@ -65,7 +78,10 @@ export class HostPointerTrack {
      * resumes invisibly from here.
      */
     resumeFromLock(): void {
-        this.last = null;
+        // The browser can finish releasing a previous game's lock after input_reset.
+        if (!this.lockBelongsToSession) return;
+        this.lockBelongsToSession = false;
+        this.lose();
         this.resumeFromCursor = true;
     }
 
