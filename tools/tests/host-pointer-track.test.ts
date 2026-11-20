@@ -63,6 +63,52 @@ describe("HostPointerTrack", () => {
         expect(track.next({ x: 700, y: 300 }, CENTRE, BOUNDS)).toEqual({ x: 700, y: 300 });
     });
 
+    /**
+     * Pointer Lock release (e.g. a guest DirectInput Unacquire on a text field gaining
+     * focus). While locked, the host's raw position was never tracked — the physical
+     * pointer may be anywhere on the page — so re-seating there like a genuine lost
+     * track would teleport the guest's cursor away from wherever it was actually drawn.
+     */
+    it("resumes from the guest's own cursor after a Pointer Lock release, not the raw host point", () => {
+        const track = new HostPointerTrack();
+        track.next({ x: 100, y: 100 }, { x: 100, y: 100 }, BOUNDS);
+        track.markLockForSession();
+        track.resumeFromLock();
+        // The guest's self-drawn cursor sits at (900, 50); the real OS pointer, hidden
+        // throughout the lock, happens to be all the way over at (10, 700).
+        expect(track.next({ x: 10, y: 700 }, { x: 900, y: 50 }, BOUNDS)).toEqual({ x: 900, y: 50 });
+        // Tracking resumed from that sample: the next one reads as motion, same as any
+        // ordinary unlocked sweep.
+        expect(track.next({ x: 30, y: 700 }, { x: 900, y: 50 }, BOUNDS)).toEqual({ x: 920, y: 50 });
+    });
+
+    it("discards pending cursor resume and confinement at a game switch", () => {
+        const track = new HostPointerTrack();
+        track.setConfine({ left: 0, top: 0, right: 400, bottom: 300 });
+        track.markLockForSession();
+        track.resumeFromLock();
+
+        track.reset();
+
+        const host = { x: 700, y: 300 };
+        expect(track.next(host, CENTRE, BOUNDS)).toEqual(host);
+    });
+
+    it("disregards an old lock release delivered after a game switch", () => {
+        const track = new HostPointerTrack();
+        track.markLockForSession();
+
+        track.reset();
+        track.resumeFromLock();
+
+        const host = { x: 700, y: 300 };
+        expect(track.next(host, CENTRE, BOUNDS)).toEqual(host);
+
+        track.markLockForSession();
+        track.resumeFromLock();
+        expect(track.next(host, CENTRE, BOUNDS)).toEqual(CENTRE);
+    });
+
     it("a sample outside the guest space is a lost track, so a clamp cannot leak drift", () => {
         const track = new HostPointerTrack();
         // Drag out past the right edge with a button held, then back inside. Taking a

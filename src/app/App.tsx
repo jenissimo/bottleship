@@ -197,6 +197,15 @@ const PENDING_BUNDLE_KEY = "bs_pending_bundle";
 /** Chrome refuses requestPointerLock for ~1.25 s after a user-initiated exit; retries
  *  inside that window are silently rejected, so gate them rather than burn the gesture. */
 const POINTER_LOCK_EXIT_COOLDOWN_MS = 1300;
+/**
+ * How long a guest-driven "stop wanting relative mouse" has to hold before it actually
+ * releases Pointer Lock (see pointerLockReleaseTimerRef). Generous on purpose: the
+ * guest's own pointer renders from the same tracked absolute position whether or not
+ * the lock is held (guest-cursor.ts), so waiting here is invisible to the player — it
+ * only delays the real API round trip (and its banner) for a drop that turns out to be
+ * a momentary graze, not a committed interaction.
+ */
+const POINTER_LOCK_RELEASE_SUSTAIN_MS = 500;
 /** Bundle URL a pending re-exec must re-open once window.loadApp exists (dev/harness boots). */
 let reExecBundleUrl: string | null = null;
 let globalWorker: Worker | null = null;
@@ -838,6 +847,23 @@ export default function App() {
   // Right Ctrl deliberately released the lock — suppress auto re-acquire until the next
   // explicit re-engage gesture (a canvas click).
   const userReleasedLockRef = useRef(false);
+  /**
+   * Pending guest-driven release (updatePointerLockIntent's `else if`) — cancelled if
+   * intent returns before it fires. A title that toggles exclusive DirectInput
+   * acquisition on hover — unacquiring so a text-entry panel reads a normal caret
+   * cursor, reacquiring the instant the pointer leaves it — is faithful to real
+   * Windows, where that toggle is instantaneous and invisible. Pointer Lock is not:
+   * every engage shows the browser's own "press Esc to exit" banner. Requiring the
+   * drop to SUSTAIN past POINTER_LOCK_RELEASE_SUSTAIN_MS before acting on it costs
+   * nothing visible while it waits — guest-cursor.ts's renderer draws the guest's
+   * pointer from the same tracked absolute position regardless of lock state, and
+   * writePointer's locked branch still forwards button state, so a click lands
+   * correctly even if it arrives before the sustain timer fires. A steady back-and-
+   * forth graze across the panel's edge keeps re-arming this timer and so never once
+   * releases the lock; only an actual stop (or a deliberate Right-Ctrl/ESC, neither of
+   * which goes through this path) does.
+   */
+  const pointerLockReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Host F11 fullscreen — ref so the mount-stable input effect can call it. */
   const toggleFullscreenRef = useRef<() => void>(() => {});
   /** Reads the host pointer as motion whenever the guest has moved its own pointer out
@@ -850,6 +876,7 @@ export default function App() {
     // Pointer Lock nor meaningful movementX/Y, so it belongs on the touch transport.
     if (pointerSourceRef.current !== "mouse") return;
     const req = canvas.requestPointerLock as (opts?: { unadjustedMovement?: boolean }) => Promise<void> | void;
+    hostPointerTrackRef.current.markLockForSession();
     Promise.resolve(req.call(canvas, { unadjustedMovement: true })).catch(() => {
       // Options unsupported (older Chromium) — retry bare.
       Promise.resolve(canvas.requestPointerLock()).catch(() => {});
@@ -895,21 +922,35 @@ export default function App() {
   // Pointer Lock is the MOUSE transport for relative intent. Engaging always requires a
   // user gesture, so when not yet locked we only attempt an opportunistic acquire
   // (succeeds inside a gesture, otherwise armed for the next click via handlePointerDown).
-  // Releasing happens immediately when intent drops. The touch transport subscribes to
-  // the same store independently.
+  // Releasing waits for the drop to SUSTAIN (see pointerLockReleaseTimerRef) rather than
+  // acting on every momentary one. The touch transport subscribes to the same store
+  // independently.
   const updatePointerLockIntent = () => {
     const wants = relativeIntent.get();
     if (wants) {
+      if (pointerLockReleaseTimerRef.current) {
+        clearTimeout(pointerLockReleaseTimerRef.current);
+        pointerLockReleaseTimerRef.current = null;
+      }
       const c = canvasRef.current;
-      if (c && document.hasFocus() && !pointerLockedRef.current && !userReleasedLockRef.current) {
+      if (pointerLockedRef.current) {
+        // A new game can claim a lock that the browser has yet to release.
+        hostPointerTrackRef.current.markLockForSession();
+      } else if (c && document.hasFocus() && !userReleasedLockRef.current) {
         requestPointerLockSafe(c);
         armPointerLockGesture();
       }
     } else if (document.pointerLockElement) {
-      pointerLockCooldownRef.current = true;
-      document.exitPointerLock();
-      setTimeout(() => { pointerLockCooldownRef.current = false; }, 32);
-      disarmPointerLockGesture();
+      if (!pointerLockReleaseTimerRef.current) {
+        pointerLockReleaseTimerRef.current = setTimeout(() => {
+          pointerLockReleaseTimerRef.current = null;
+          if (relativeIntent.get() || !document.pointerLockElement) return;
+          pointerLockCooldownRef.current = true;
+          document.exitPointerLock();
+          setTimeout(() => { pointerLockCooldownRef.current = false; }, 32);
+          disarmPointerLockGesture();
+        }, POINTER_LOCK_RELEASE_SUSTAIN_MS);
+      }
     } else {
       disarmPointerLockGesture();
     }
@@ -1877,9 +1918,12 @@ export default function App() {
         touchDriver.reset();
         assertVirtualPad();
         inputDevice.commit({ immediate: true });
+        hostPointerTrackRef.current.reset();
         relativeIntent.reset();
-        hostPointerTrackRef.current.lose();
-        hostPointerTrackRef.current.setConfine(null);
+        if (pointerLockReleaseTimerRef.current) {
+          clearTimeout(pointerLockReleaseTimerRef.current);
+          pointerLockReleaseTimerRef.current = null;
+        }
         updatePointerLockIntent();
       }
       if (event.data?.type === "set_cursor_pos") {
@@ -2113,8 +2157,7 @@ export default function App() {
         inputDevice.setButtonsMask(event.buttons, "hw-mouse");
         inputDevice.commit();
         recordSample(inputView, 0, 0, event.movementX, event.movementY);
-        // The lock supplies motion directly; nothing here tracks an absolute host
-        // position, so releasing it must re-seat rather than resume an old one.
+        // Relative motion cannot establish an absolute host baseline.
         hostPointerTrackRef.current.lose();
         return;
       }
@@ -2388,6 +2431,7 @@ export default function App() {
     // Windows behavior where ShowCursor(FALSE) doesn't move the cursor. Seeding at screen
     // center would make LBUTTONUP jump to (width/2, height/2) mid-click (drag mismatch).
     const handlePointerLockChange = () => {
+      const wasLocked = pointerLockedRef.current;
       pointerLockedRef.current = document.pointerLockElement === canvas;
       syncCursorPresence();
       if (pointerLockedRef.current && !relativeIntent.get()) {
@@ -2402,10 +2446,14 @@ export default function App() {
         // seed we want; nothing to publish because the position has not changed.
       } else {
         // Lock was lost (commonly ESC, which is also Unreal's menu key — the browser
-        // force-exits lock on ESC). If the guest still wants relative mouse and the user did
-        // NOT deliberately release via Right Ctrl, arm a re-acquire. handlePointerDown
-        // re-requests on the next click (the reliable gesture); we also opportunistically
-        // attempt on the next pointermove via writePointer.
+        // force-exits lock on ESC). The next absolute-mode sample must resume from the
+        // guest's own cursor, not re-seat at the physical pointer's position — see
+        // HostPointerTrack.resumeFromLock.
+        if (wasLocked) hostPointerTrackRef.current.resumeFromLock();
+        // If the guest still wants relative mouse and the user did NOT deliberately
+        // release via Right Ctrl, arm a re-acquire. handlePointerDown re-requests on the
+        // next click (the reliable gesture); we also opportunistically attempt on the
+        // next pointermove via writePointer.
         if (relativeIntent.get() && !userReleasedLockRef.current) {
           // A browser-initiated exit rejects re-acquire for over a second, so the retry
           // cannot be a one-shot: arm the gesture listener as well, so the next trusted
@@ -2815,6 +2863,10 @@ export default function App() {
       // The armed capture-phase listener outlives this effect otherwise, and would keep
       // requesting lock against a stale canvasRef after unmount/remount.
       disarmPointerLockGesture();
+      if (pointerLockReleaseTimerRef.current) {
+        clearTimeout(pointerLockReleaseTimerRef.current);
+        pointerLockReleaseTimerRef.current = null;
+      }
       guestCursor.dispose();
       childSurface.dispose();
       // Keep loadApp exposed for buttons
