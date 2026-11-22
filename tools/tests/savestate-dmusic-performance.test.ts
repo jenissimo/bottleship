@@ -671,7 +671,7 @@ describe("dmusic saved fields of the playing objects", () => {
             .toEqual(keys(SYNTH_VOICE_FIELDS).filter(k => k !== "channel" && k !== "region"));
         expect(Object.keys(port.sink!).sort()).toEqual(keys(SINK_FIELDS));
         expect(Object.keys(of<SavedPort>(capture(), "dmusic-port")).sort()).toEqual(DMUSIC_SCHEMA.savedPort);
-        expect(savestateParticipants.schemas().dmusic).toEqual({ version: 7, schemaHash: "c41279b80774487e" });
+        expect(savestateParticipants.schemas().dmusic).toEqual({ version: 8, schemaHash: "ba77433f74c04e9d" });
     });
 });
 

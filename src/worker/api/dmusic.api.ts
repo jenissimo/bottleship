@@ -187,6 +187,20 @@ export const IDirectMusicAudioPath: InterfaceDescriptor = {
     ],
 };
 
+/** A tool graph: the performance's, a segment's or an audio path's chain of IDirectMusicTools. */
+export const IDirectMusicGraph: InterfaceDescriptor = {
+    name: "IDirectMusicGraph",
+    inherits: "IUnknown",
+    iid: "2befc277-5497-11d2-bccb-00a0c922e6eb",
+    methods: [
+        ...unknown(),
+        m("StampPMsg", 2),
+        m("InsertTool", 5),
+        m("GetTool", 3),
+        m("RemoveTool", 2),
+    ],
+};
+
 export const IDirectMusicComposer8: InterfaceDescriptor = {
     name: "IDirectMusicComposer8",
     inherits: "IUnknown",
@@ -352,6 +366,7 @@ export const dmusicModule: ModuleDescriptor = {
         IDirectMusicSegment8,
         IDirectMusicSegmentState8,
         IDirectMusicAudioPath,
+        IDirectMusicGraph,
         IDirectMusicComposer8,
         IDirectMusic8,
         IDirectMusicPort,

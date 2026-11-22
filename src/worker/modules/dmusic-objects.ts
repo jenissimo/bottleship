@@ -47,6 +47,7 @@ export const IID_IDirectMusicAudioPath = "c87631f5-23be-4986-8836-05832fcc48f9";
 export const IID_IDirectMusicStyle = "d2ac28bd-b39b-11d1-8704-00600893b1bd";
 export const IID_IDirectMusicStyle8 = "fd24ad8a-a260-453d-bf50-6f9384f70985";
 export const IID_IDirectMusicComposer = "d2ac28bf-b39b-11d1-8704-00600893b1bd";
+export const IID_IDirectMusicGraph = "2befc277-5497-11d2-bccb-00a0c922e6eb";
 export const IID_IDirectMusicBand = "d2ac28c0-b39b-11d1-8704-00600893b1bd";
 export const IID_IDirectMusicCollection = "d2ac287c-b39b-11d1-8704-00600893b1bd";
 export const IID_IDirectMusicTrack = "f96029a1-4282-11d2-8717-00600893b1bd";
@@ -176,14 +177,27 @@ export class AudioPathObject extends DMusicObject {
     readonly interfaces = { [IID_IDirectMusicAudioPath]: "IDirectMusicAudioPath" };
     performance: PerformanceObject | null = null;
     pathType = 0;
-    buffer = 0;
-    sink: DirectSoundSink | null = null;
+    /** 1 for a 3D path's mono buffer, 2 for the stereo ones. */
     channels = 2;
+    /** The path's IDirectSoundBuffer8 (DMUS_PATH_BUFFER 0), made on first request. */
+    buffer = 0;
+    /** The path's tool graph (DMUS_PATH_AUDIOPATH_GRAPH), made on first request. */
+    graph: GraphObject | null = null;
+    /** SetVolume's level, hundredths of a decibel. */
     volume = 0;
     volumeFrom = 0;
     volumeTarget = 0;
     volumeStarted = 0;
     volumeDuration = 0;
+    sink: DirectSoundSink | null = null;
+}
+
+/** An audio path’s ordered chain of guest DirectMusic tools. */
+export class GraphObject extends DMusicObject {
+    readonly primaryVtable = "IDirectMusicGraph";
+    readonly interfaces = { [IID_IDirectMusicGraph]: "IDirectMusicGraph" };
+    /** Guest IDirectMusicTool pointers, each holding the reference InsertTool took. */
+    readonly tools: number[] = [];
 }
 
 export class ComposerObject extends DMusicObject {

@@ -6,7 +6,7 @@ import {DMusic} from "../../src/worker/modules/dmusic";
 import {
     CLSID_DirectMusic, CLSID_DirectMusicPerformance, CLSID_DirectMusicSegment, CLSID_DirectMusicBand,
     CLSID_DirectMusicStyle, CLSID_DirectMusicCollection, IID_IUnknown, IID_IPersistStream,
-    type DMusicObject, type PerformanceObject, type SegmentObject, type PortObject, type LoadableObject,
+    GraphObject, type DMusicObject, type PerformanceObject, type SegmentObject, type PortObject, type LoadableObject,
 } from "../../src/worker/modules/dmusic-objects";
 import {PerfSegment, Performance} from "../../src/worker/core/audio/directmusic/performance";
 import {DlsSynth} from "../../src/worker/core/audio/directmusic/synth";
@@ -40,7 +40,7 @@ beforeEach(() => {
     internals = module as any;
     internals.process = process;
     module.vtables = new Proxy({}, {get: () => ({address: 0x1000})}) as any;
-    for (const method of ["registerObjectExports", "registerPerformanceExports", "registerPortExports", "registerSegmentStateExports"]) internals[method]();
+    for (const method of ["registerObjectExports", "registerPerformanceExports", "registerPortExports", "registerSegmentStateExports", "registerAudioPathExports", "registerGraphExports"]) internals[method]();
     new DataView(mem.buffer).setUint32(0x3000, 0x3100, true);
     new DataView(mem.buffer).setUint32(0x3100 + 3 * 4, 0x1300, true);
 });
@@ -263,4 +263,52 @@ describe("DirectMusic streams and COM lifetimes", () => {
             expect(Number.isFinite(engine.musicTime)).toBe(true);
         }
     });
+    test("an audio path makes its tool graph on first request and hands back the same one", () => {
+        const {ptr: perf} = make<PerformanceObject>(CLSID_DirectMusicPerformance);
+        const PP = 0x640, GUID_NULL = 0x660, IID = 0x680;
+        expect(call("IDirectMusicPerformance8_CreateStandardAudioPath", [perf, 8, 2, 1, PP])).toBe(0);
+        const path = Mem.readUint32(PP)!;
+        Mem.writeBytes(IID, new Uint8Array([0x77, 0xc2, 0xef, 0x2b, 0x97, 0x54, 0xd2, 0x11, 0xbc, 0xcb, 0x00, 0xa0, 0xc9, 0x22, 0xe6, 0xeb])); // IID_IDirectMusicGraph
+        const get = () => call("IDirectMusicAudioPath_GetObjectInPath", [path, 0, 0x2200, 0, GUID_NULL, 0, IID, 0x6a0]);
+        expect(get()).toBe(0);
+        const graph = Mem.readUint32(0x6a0)!;
+        expect(graph).not.toBe(0);
+        expect(get()).toBe(0);
+        expect(Mem.readUint32(0x6a0)).toBe(graph);
+        expect(call("IDirectMusicGraph_StampPMsg", [graph, 0x700])).toBe(0);
+        expect(call("IDirectMusicGraph_GetTool", [graph, 0, 0x6a4]) >>> 0).toBe(0x88781161); // DMUS_E_NOT_FOUND
+    });
+
+    test("immediate wave tools get the playback time and decoded duration", () => {
+        const perf = make<PerformanceObject>(CLSID_DirectMusicPerformance).obj;
+        perf.engine = new Performance(new DlsSynth(22_050, 8));
+        const graph = new GraphObject();
+        objects.push(graph);
+        graph.tools.push(0x3000);
+        const segment = new PerfSegment();
+        segment.wave = { rate: 22_050, frames: 44_100, left: new Float32Array(44_100), right: new Float32Array(44_100) };
+        const state = perf.engine.playSegment(segment, 0x80);
+        const routine = internals.deliverWaveToTools(perf, graph, state);
+        let step = routine.next();
+        expect(step.value.tag).toEndWith("GetMsgDeliveryType");
+        Mem.writeUint32(step.value.args[1], 4);
+        step = routine.next(0);
+        expect(step.value.tag).toEndWith("GetMediaTypeArraySize");
+        Mem.writeUint32(step.value.args[1], 1);
+        step = routine.next(0);
+        expect(step.value.tag).toEndWith("GetMediaTypes");
+        Mem.writeUint32(Mem.readUint32(step.value.args[1])!, 12);
+        step = routine.next(0);
+        expect(step.value.tag).toEndWith("ProcessPMsg(wave)");
+        const message = new DataView(mem.buffer, step.value.args[2], 88);
+        expect(message.getUint32(0, true)).toBe(88);
+        expect(message.getUint32(20, true)).toBe(7);
+        expect(message.getUint32(32, true)).toBe(0x3000);
+        expect(message.getUint32(36, true)).toBeGreaterThan(0);
+        expect(message.getUint32(40, true)).toBe(12);
+        expect(message.getBigInt64(64, true)).toBe(20_000_000n);
+        expect(routine.next(0)).toEqual({ done: true, value: 0 });
+        expect(heap.size).toBe(0);
+    });
+
 });
