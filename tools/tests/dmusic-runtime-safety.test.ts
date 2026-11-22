@@ -6,7 +6,7 @@ import {DMusic} from "../../src/worker/modules/dmusic";
 import {
     CLSID_DirectMusic, CLSID_DirectMusicPerformance, CLSID_DirectMusicSegment, CLSID_DirectMusicBand,
     CLSID_DirectMusicStyle, CLSID_DirectMusicCollection, IID_IUnknown, IID_IPersistStream,
-    GraphObject, type DMusicObject, type PerformanceObject, type SegmentObject, type PortObject, type LoadableObject,
+    GraphObject, type AudioPathObject, type DMusicObject, type PerformanceObject, type SegmentObject, type PortObject, type LoadableObject,
 } from "../../src/worker/modules/dmusic-objects";
 import {PerfSegment, Performance} from "../../src/worker/core/audio/directmusic/performance";
 import {DlsSynth} from "../../src/worker/core/audio/directmusic/synth";
@@ -277,6 +277,26 @@ describe("DirectMusic streams and COM lifetimes", () => {
         expect(Mem.readUint32(0x6a0)).toBe(graph);
         expect(call("IDirectMusicGraph_StampPMsg", [graph, 0x700])).toBe(0);
         expect(call("IDirectMusicGraph_GetTool", [graph, 0, 0x6a4]) >>> 0).toBe(0x88781161); // DMUS_E_NOT_FOUND
+    });
+
+    test("a looping wave starts without a one-shot tool message", () => {
+        const perf = make<PerformanceObject>(CLSID_DirectMusicPerformance);
+        perf.obj.engine = new Performance(new DlsSynth(22_050, 8));
+        const segment = make<SegmentObject>(CLSID_DirectMusicSegment);
+        const wave = new PerfSegment();
+        wave.wave = { rate: 22_050, frames: 2, left: new Float32Array(2), right: new Float32Array(2) };
+        wave.repeats = 0xffffffff;
+        segment.obj.segment = wave;
+        expect(call("IDirectMusicPerformance8_CreateStandardAudioPath", [perf.ptr, 8, 2, 1, OUT])).toBe(0);
+        const path = Mem.readUint32(OUT)!;
+        const object = rp.getComObjectByAddress(path) as AudioPathObject;
+        objects.push(object);
+        object.graph = new GraphObject();
+        object.graph.tools.push(0x3000);
+        internals.ensurePathOutput = () => true;
+        internals.deliverWaveToTools = () => { throw new Error("loop used one-shot wave delivery"); };
+        expect(call("IDirectMusicPerformance8_PlaySegmentEx", [perf.ptr, segment.ptr, 0, 0, 0x80, 0, 0, 0, 0, path])).toBe(0);
+        expect(perf.obj.engine.statesOnAudioPath(object)).toHaveLength(1);
     });
 
     test("immediate wave tools get the playback time and decoded duration", () => {

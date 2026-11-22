@@ -1497,7 +1497,9 @@ export class DMusic implements IModule {
             if (state) this.holdStateSegment(this.stateObject(perf, state), seg);
             const hr = this.publishState(perf, state, seg, ppState);
             const graph = path?.graph;
-            if (hr === S_OK && state?.output === path && graph?.tools.length) {
+            // A looping wave needs a new message at each iteration. A single
+            // duration here makes a tool report the wrong audio path lifetime.
+            if (hr === S_OK && state?.output === path && state.repeatsLeft === 0 && graph?.tools.length) {
                 return runGuestRoutine(ctx, mem, this.deliverWaveToTools(perf, graph, state), 40, "IDirectMusicPerformance8::PlaySegmentEx");
             }
             return hr;
