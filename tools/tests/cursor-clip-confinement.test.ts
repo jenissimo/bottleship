@@ -8,19 +8,29 @@
  * this constantly, and asking the host for a confining transport there would take the
  * mouse away from the user for nothing.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { describePointerPolicy, resetPointerPolicy } from "../../src/worker/core/pointer-policy";
+import { System } from "../../src/worker/core/system";
 import { getVirtualScreenRect, setCursorClipRect, getCursorClipRect } from "../../src/worker/modules/user32/shared-state";
 
-afterEach(() => {
-    setCursorClipRect(null);
-    resetPointerPolicy();
-});
-
 describe("ClipCursor → confinement claim", () => {
+    let previousMode: System["emulatedDisplayMode"];
+
+    beforeEach(() => {
+        const system = System.getInstance();
+        previousMode = system.emulatedDisplayMode;
+        system.emulatedDisplayMode = { width: 1024, height: 768, bpp: 32, refreshRate: 60 };
+        setCursorClipRect(null);
+        resetPointerPolicy();
+    });
+
+    afterEach(() => {
+        setCursorClipRect(null);
+        resetPointerPolicy();
+        System.getInstance().emulatedDisplayMode = previousMode;
+    });
+
     test("a clip smaller than the screen is confinement", () => {
-        EmulatorConfig.getInstance().screenResolution = { width: 1024, height: 768, bpp: 32, refreshRate: 60 };
         const screen = getVirtualScreenRect();
         expect(screen).toEqual({ left: 0, top: 0, right: 1024, bottom: 768 });
 
@@ -35,7 +45,6 @@ describe("ClipCursor → confinement claim", () => {
     });
 
     test("a clip covering the whole screen claims nothing, but still binds the pointer", () => {
-        EmulatorConfig.getInstance().screenResolution = { width: 1024, height: 768, bpp: 32, refreshRate: 60 };
         const full = getVirtualScreenRect();
         setCursorClipRect({ ...full });
         expect(describePointerPolicy().facts.clipped).toBe(false);
