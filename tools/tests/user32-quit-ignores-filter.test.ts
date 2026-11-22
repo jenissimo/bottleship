@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { System } from "../../src/worker/core/system";
-import { createMessageExports } from "../../src/worker/modules/user32/message";
+import { createMessageExports, registerFastPathMessageFunctions } from "../../src/worker/modules/user32/message";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { ThreadState, type Thread } from "../../src/worker/core/scheduler/types";
 
@@ -54,6 +54,15 @@ afterEach(() => {
     system.scheduler = savedScheduler as any;
     system.inputManager.poll = savedPoll as any;
     (system.windowManager as any).messageQueue.clear();
+    (system.scheduler as any).clearQuitFlag?.(THREAD);
+    // Re-install the default quit source (some tests detach it with setQuitSource(null)).
+    (system.windowManager as any).setQuitSource({
+        pending: (threadId: number) => {
+            const q = (system.scheduler as any).getQuitState?.(threadId);
+            return q?.posted ? { exitCode: q.exitCode } : null;
+        },
+        consume: (threadId: number) => (system.scheduler as any).clearQuitFlag(threadId),
+    });
     view.setUint32(OUT + 4, 0, true);
 });
 
@@ -117,5 +126,43 @@ describe("WM_QUIT bypasses the wMsgFilter range on the public APIs", () => {
         expect(readMsg().message).toBe(WM_QUIT);
         expect(quitPosted()).toBe(false);
         expect(peekPaintOnly(PM_NOREMOVE)).toBe(0);
+    });
+});
+
+describe("registered fast paths synthesize WM_QUIT when the queue lookup returns null", () => {
+    const ESP = 0x1000;
+    const fastPaths = new Map<string, (...args: any[]) => any>();
+    registerFastPathMessageFunctions({
+        registerFastPath: (_dll: string, fn: string, impl: (...args: any[]) => any) => { fastPaths.set(fn, impl); },
+    } as any);
+
+    function callFast(name: string, args: number[]): number | null {
+        for (let i = 0; i < args.length; i++) view.setUint32(ESP + 4 + 4 * i, args[i] >>> 0, true);
+        return fastPaths.get(name)!(ESP, view, memory) as number | null;
+    }
+
+    test("fast PeekMessageW returns the pending WM_QUIT for a paint-only range with the quit source detached", () => {
+        // Force the queue lookup to return null: with no quit source, MessageQueue
+        // does not synthesize WM_QUIT, so only the fast path's own fallback can.
+        (system.windowManager as any).setQuitSource(null);
+        postQuit(29);
+        const ret = callFast("PeekMessageW", [OUT, 0, WM_PAINT, WM_PAINT, PM_NOREMOVE]);
+        expect(ret).toBe(1);
+        expect(readMsg()).toEqual({ message: WM_QUIT, wParam: 29 });
+        expect(quitPosted()).toBe(true); // PM_NOREMOVE leaves the quit pending
+        const ret2 = callFast("PeekMessageW", [OUT, 0, WM_PAINT, WM_PAINT, PM_REMOVE]);
+        expect(ret2).toBe(1);
+        expect(readMsg()).toEqual({ message: WM_QUIT, wParam: 29 });
+        expect(quitPosted()).toBe(false); // PM_REMOVE consumes it
+        expect(callFast("PeekMessageW", [OUT, 0, WM_PAINT, WM_PAINT, PM_NOREMOVE])).toBe(0);
+    });
+
+    test("fast GetMessageW returns 0 with the pending WM_QUIT for a paint-only range with the quit source detached", () => {
+        (system.windowManager as any).setQuitSource(null);
+        postQuit(29);
+        const ret = callFast("GetMessageW", [OUT, 0, WM_PAINT, WM_PAINT]);
+        expect(ret).toBe(0); // GetMessage returns 0 on WM_QUIT
+        expect(readMsg()).toEqual({ message: WM_QUIT, wParam: 29 });
+        expect(quitPosted()).toBe(false);
     });
 });

@@ -413,7 +413,8 @@ export class System {
         this.scheduler = new Scheduler({ enabled: true });
         this.windowManager.setQuitSource({
             pending: (threadId) => {
-                const quit = this.scheduler.getQuitState(threadId);
+                // Optional call: test fixtures install a partial scheduler without getQuitState.
+                const quit = this.scheduler.getQuitState?.(threadId);
                 return quit?.posted ? { exitCode: quit.exitCode } : null;
             },
             consume: (threadId) => this.scheduler.clearQuitFlag(threadId),

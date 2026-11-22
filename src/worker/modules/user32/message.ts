@@ -2181,8 +2181,10 @@ export function registerFastPathMessageFunctions(dispatcher: HleDispatcher): voi
             if (paintTraceEnabled && system.windowManager.hasMessages(WM_PAINT, WM_PAINT, callerThreadId)) {
                 logPaintPendingBlocked('PeekMessageW(fastpath)', wMsgFilterMin, wMsgFilterMax, (wRemoveMsg & 1) !== 0);
             }
-            // Queue empty — check per-thread quit flag before returning FALSE
-            if (wMsgFilterMin === 0 && wMsgFilterMax === 0 || (WM_QUIT >= wMsgFilterMin && WM_QUIT <= wMsgFilterMax)) {
+            // Queue empty — check per-thread quit flag before returning FALSE.
+            // Like the slow path, the quit is retrieved regardless of the filter
+            // range (no range check here — see the PeekMessageW slow handler).
+            {
                 const quitState = system.scheduler.getQuitState?.(callerThreadId);
                 if (quitState && quitState.posted) {
                     if ((wRemoveMsg & 1) !== 0) {
@@ -2268,8 +2270,9 @@ export function registerFastPathMessageFunctions(dispatcher: HleDispatcher): voi
         }
         const msg = system.windowManager.peekMessage(true, wMsgFilterMin, wMsgFilterMax, callerThreadId);
         if (!msg) {
-            // Queue empty — check per-thread quit flag before falling to async
-            if (wMsgFilterMin === 0 && wMsgFilterMax === 0 || (WM_QUIT >= wMsgFilterMin && WM_QUIT <= wMsgFilterMax)) {
+            // Queue empty — check per-thread quit flag before falling to async.
+            // Like the slow path, the quit is retrieved regardless of the filter range.
+            {
                 const quitState = system.scheduler.getQuitState?.(callerThreadId);
                 if (quitState && quitState.posted) {
                     system.scheduler.clearQuitFlag(callerThreadId);
