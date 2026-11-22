@@ -1491,15 +1491,16 @@ export class DMusic implements IModule {
             if (!seg.segment) return E_FAIL;
             const requestedPath = pathPtr ? this.object<AudioPathObject>(pathPtr) : null;
             const path = requestedPath instanceof AudioPathObject ? requestedPath : null;
+            const playbackPath = path ?? this.defaultAudioPath(perf);
             const state = perf.engine.playSegment(seg.segment, flags >>> 0);
-            if (state) state.audioPath = path ?? this.defaultAudioPath(perf);
-            if (state && seg.segment.wave && path instanceof AudioPathObject && this.ensurePathOutput(path)) state.output = path;
+            if (state) state.audioPath = playbackPath;
+            if (state && seg.segment.wave && this.ensurePathOutput(playbackPath)) state.output = playbackPath;
             if (state) this.holdStateSegment(this.stateObject(perf, state), seg);
             const hr = this.publishState(perf, state, seg, ppState);
-            const graph = path?.graph;
+            const graph = playbackPath.graph;
             // A looping wave needs a new message at each iteration. A single
             // duration here makes a tool report the wrong audio path lifetime.
-            if (hr === S_OK && state?.output === path && state.repeatsLeft === 0 && graph?.tools.length) {
+            if (hr === S_OK && state?.output === playbackPath && state.repeatsLeft === 0 && graph?.tools.length) {
                 return runGuestRoutine(ctx, mem, this.deliverWaveToTools(perf, graph, state), 40, "IDirectMusicPerformance8::PlaySegmentEx");
             }
             return hr;
@@ -2040,6 +2041,25 @@ export class DMusic implements IModule {
 
     private registerAudioPathExports(): void {
         const e = this.exports;
+        const self = this;
+        e["IDirectMusicAudioPath_Release"] = (ctx, mem, a) => {
+            const path = this.object<AudioPathObject>(a[0]!);
+            if (!path) return 0;
+            if (path.refCount > 1) return path.release();
+            const graph = path.graph;
+            path.graph = null;
+            let tools: number[] = [];
+            if (graph) {
+                if (graph.refCount === 1) tools = graph.tools.splice(0);
+                graph.release();
+            }
+            const count = path.release();
+            if (!tools.length) return count;
+            return runGuestRoutine(ctx, mem, (function* (): GuestRoutine {
+                for (const tool of tools) yield self.vcall(tool, 2, [], "IDirectMusicTool::Release(audio path destroyed)");
+                return count;
+            })(), 4, "IDirectMusicAudioPath::Release");
+        };
         // GetObjectInPath(dwPChannel, dwStage, dwBuffer, guidObject, dwIndex, iidInterface, ppObject).
         // A path's own DirectSound buffer is the object asked for (to set its volume, pan or 3D
         // position); the stages inside the performance hold nothing a caller can use here.
@@ -2093,6 +2113,18 @@ export class DMusic implements IModule {
         const self = this;
         // Wave playback delivers immediate messages directly to the audio-path tools.
         e["IDirectMusicGraph_StampPMsg"] = (_c, _m, a) => (a[1] ? S_OK : E_POINTER);
+        e["IDirectMusicGraph_Release"] = (ctx, mem, a) => {
+            const graph = graphOf(a);
+            if (!graph) return 0;
+            if (graph.refCount > 1) return graph.release();
+            const tools = graph.tools.splice(0);
+            const count = graph.release();
+            if (!tools.length) return count;
+            return runGuestRoutine(ctx, mem, (function* (): GuestRoutine {
+                for (const tool of tools) yield self.vcall(tool, 2, [], "IDirectMusicTool::Release(graph destroyed)");
+                return count;
+            })(), 4, "IDirectMusicGraph::Release");
+        };
         // HRESULT InsertTool(IDirectMusicTool *pTool, DWORD *pdwPChannels, DWORD cPChannels, LONG lIndex)
         e["IDirectMusicGraph_InsertTool"] = (ctx, mem, a) => {
             const graph = graphOf(a), tool = a[1]! >>> 0;
