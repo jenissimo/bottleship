@@ -35,7 +35,6 @@ function rig(flags = DSBCAPS_CTRLFREQUENCY, sampleRate = 22050) {
     };
     const ds = new DSound();
     (ds as any).startNotificationPump = () => {};
-    (ds as any).signalRemix = () => {};
     const oldPost = globalThis.postMessage;
     globalThis.postMessage = () => {};
     try { ds.initialize(process as any); } finally { globalThis.postMessage = oldPost; }
@@ -50,7 +49,8 @@ function rig(flags = DSBCAPS_CTRLFREQUENCY, sampleRate = 22050) {
         expect((ds.exports["idirectsoundbuffer8_getfrequency"] as any)({}, mem, [OBJECT, OUT]) >>> 0).toBe(DS_OK);
         return new DataView(mem.buffer).getUint32(OUT, true);
     };
-    return { buffer, set, get };
+    const changeControl = (method: string, value: number) => ds.exports[method]!({} as never, mem, [OBJECT, value]);
+    return { buffer, set, get, ds, changeControl };
 }
 
 test("DSBFREQUENCY_ORIGINAL plays the buffer at its own format's rate", () => {
@@ -80,4 +80,20 @@ test("a rate outside DSBFREQUENCY_MIN..MAX is refused and changes nothing", () =
 
 test("a buffer without DSBCAPS_CTRLFREQUENCY has no frequency control", () => {
     expect(rig(0).set(0)).toBe(DSERR_CONTROLUNAVAIL);
+});
+
+test("gain and pan changes preserve a host-fed stream’s premix depth", () => {
+    const { buffer, ds, changeControl } = rig(0x80 | 0x40);
+    buffer.isPlaying = true;
+    buffer.premixMs = 200;
+    ds.setMixerFedBuffer(OBJECT, true);
+    expect(changeControl("idirectsoundbuffer8_setvolume", -600)).toBe(DS_OK);
+    expect(changeControl("idirectsoundbuffer8_setpan", 500)).toBe(DS_OK);
+    expect(buffer.volumeDb).toBe(-600);
+    expect(buffer.pan).toBe(500);
+    expect(buffer.premixMs).toBe(200);
+
+    ds.setMixerFedBuffer(OBJECT, false);
+    expect(changeControl("idirectsoundbuffer8_setvolume", -500)).toBe(DS_OK);
+    expect(buffer.premixMs).toBe(45);
 });

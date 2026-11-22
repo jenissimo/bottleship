@@ -7,6 +7,7 @@
 import { Logger, LogCategory } from "../core/logger";
 import { Mem } from "../core/memory/mem-accessor";
 import type { Process } from "../core/process";
+import type { DSound } from "./dsound/dsound";
 import type { ThunkImplementation, X86Context } from "../core/thunking/thunk-dispatcher";
 
 const DSBPLAY_LOOPING = 1;
@@ -80,6 +81,7 @@ export class DirectSoundSink {
         this.writeOffset = d.writeOffset;
         this.playing = d.playing;
         this.silentBytes = d.silentBytes;
+        if (this.playing) this.setMixerFed(true);
     }
 
     private call(method: string, args: number[]): number {
@@ -88,6 +90,11 @@ export class DirectSoundSink {
         if (!fn || !mem) return -1;
         const result = fn(NO_CONTEXT, mem, [this.buffer, ...args]);
         return typeof result === "number" ? result | 0 : -1;
+    }
+
+    private setMixerFed(active: boolean): void {
+        const dsound = this.process.getModule("dsound") as DSound | undefined;
+        dsound?.setMixerFedBuffer?.(this.buffer, active);
     }
 
     /** Start the buffer looping. Returns false when it is not a usable DirectSound buffer. */
@@ -106,12 +113,14 @@ export class DirectSoundSink {
         this.silentBytes = this.bufferBytes;
         this.writeOffset = -1;
         this.playing = this.call("play", [0, 0, DSBPLAY_LOOPING]) === 0;
+        if (this.playing) this.setMixerFed(true);
         return this.playing;
     }
 
     stop(): void {
         if (!this.playing) return;
         this.playing = false;
+        this.setMixerFed(false);
         this.call("stop", []);
     }
 
