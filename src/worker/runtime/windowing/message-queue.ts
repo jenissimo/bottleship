@@ -2,7 +2,7 @@
  * High-performance message queue using ring buffer
  * - O(1) enqueue/dequeue
  * - Mouse move coalescing
- * - Priority-based retrieval (WM_TIMER last)
+ * - Priority-based retrieval (posted, input, WM_QUIT, WM_PAINT, WM_TIMER last)
  */
 
 import { TimeService } from "../time";
@@ -27,6 +27,18 @@ export interface Message {
     timerEpoch?: number;
 }
 
+/**
+ * The per-thread PostQuitMessage flag, owned by the scheduler. The queue only asks for it,
+ * so WM_QUIT can be ordered against the messages the queue itself synthesizes.
+ */
+export interface QuitSource {
+    /** Exit code of the thread's unconsumed PostQuitMessage, or null when none is pending. */
+    pending(threadId: number): { exitCode: number } | null;
+    /** WM_QUIT was retrieved: clear the thread's flag. */
+    consume(threadId: number): void;
+}
+
+const WM_QUIT = 0x0012;
 const WM_SETCURSOR = 0x0020;
 const WM_MOUSEMOVE = 0x0200;
 const WM_PAINT = 0x000F;
@@ -550,6 +562,7 @@ export class MessageQueue {
 
     // Input poll callback - called when waiting for messages
     private inputPollCallback: (() => void) | null = null;
+    private quitSource: QuitSource | null = null;
     private keyStateCallback: ((packed: Uint8Array, threadId: number) => void) | null = null;
 
     // Last dequeued message coordinates/time for GetMessagePos/GetMessageTime
@@ -567,6 +580,30 @@ export class MessageQueue {
 
     setKeyStateCallback(callback: (packed: Uint8Array, threadId: number) => void): void {
         this.keyStateCallback = callback;
+    }
+
+    setQuitSource(source: QuitSource | null): void {
+        this.quitSource = source;
+    }
+
+    /**
+     * WM_QUIT for a thread whose PostQuitMessage flag is up. USER returns it after posted
+     * messages and input but before the WM_PAINT and WM_TIMER it generates on demand, so a
+     * window that keeps invalidating itself, or a running timer, cannot hold the quit back.
+     * GetMessage/PeekMessage retrieve WM_QUIT regardless of wMsgFilterMin/wMsgFilterMax, so
+     * the range is not consulted here.
+     */
+    private quitMessage(callerThreadId: number, remove: boolean): Message | null {
+        if (!this.quitSource) return null;
+        const quit = this.quitSource.pending(callerThreadId);
+        if (!quit) return null;
+        if (remove) this.quitSource.consume(callerThreadId);
+        const msg: Message = {
+            hwnd: 0, message: WM_QUIT, wParam: quit.exitCode, lParam: 0,
+            time: TimeService.getInstance().guestTickMs() | 0, ptX: 0, ptY: 0,
+        };
+        if (remove) this.trackDequeued(msg, callerThreadId);
+        return msg;
     }
 
     /**
@@ -814,7 +851,11 @@ export class MessageQueue {
             }
         }
 
-        // 3. WM_PAINT precedes synthesized timers in USER's retrieval order.
+        // 3. WM_QUIT, ahead of the messages generated below (whatever range was asked for).
+        const quit = this.quitMessage(callerThreadId, true);
+        if (quit) return quit;
+
+        // 4. WM_PAINT precedes synthesized timers in USER's retrieval order.
         if (this.paintPending.size > 0 && (noFilter || (WM_PAINT >= msgMin && WM_PAINT <= msgMax))) {
             for (const [hwnd, pending] of this.paintPending) {
                 if (callerThreadId > 0 && pending.targetThreadId > 0
@@ -832,7 +873,7 @@ export class MessageQueue {
             }
         }
 
-        // 4. USER synthesizes WM_TIMER only when no higher-priority message is ready.
+        // 5. USER synthesizes WM_TIMER only when no higher-priority message is ready.
         if (this.timerPending.size > 0 && (noFilter || (WM_TIMER >= msgMin && WM_TIMER <= msgMax))) {
             for (const [key, entry] of this.timerPending) {
                 const pending = entry.pending;
@@ -895,6 +936,8 @@ export class MessageQueue {
                 };
             }
         }
+        const quit = this.quitMessage(callerThreadId, false);
+        if (quit) return quit;
         if (this.paintPending.size > 0 && (noFilter || (WM_PAINT >= msgMin && WM_PAINT <= msgMax))) {
             for (const [hwnd, pending] of this.paintPending) {
                 if (callerThreadId > 0 && pending.targetThreadId > 0

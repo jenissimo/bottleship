@@ -696,12 +696,9 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         }
     }
 
-    /** Check whether WM_QUIT (0x0012) passes the message filter range. */
-    function isQuitInFilterRange(wMsgFilterMin: number, wMsgFilterMax: number): boolean {
-        if (wMsgFilterMin === 0 && wMsgFilterMax === 0) return true; // No filter
-        return WM_QUIT >= wMsgFilterMin && WM_QUIT <= wMsgFilterMax;
-    }
-
+    // WM_QUIT (0x0012) is retrieved regardless of wMsgFilterMin/wMsgFilterMax — GetMessageW and
+    // PeekMessageW document that the quit bypasses the message filter range — so the fallback
+    // synthesis below never consults the range.
     /** WH_KEYBOARD fires only for raw key up/down retrieval, not char messages. */
     function isKeyboardHookMessage(message: number): boolean {
         return message === 0x0100 || message === 0x0101 || message === 0x0104 || message === 0x0105;
@@ -1022,9 +1019,10 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             return { value: retVal, stackCleanup: 16 };
         }
 
-        // Queue empty — synthesize WM_QUIT if the per-thread flag is set
-        if (isQuitInFilterRange(wMsgFilterMin, wMsgFilterMax)) {
-            const quitState = system.scheduler.getQuitState(currentThreadId);
+        // Queue empty — synthesize WM_QUIT if the per-thread flag is set (the quit is
+        // retrieved regardless of the filter range).
+        {
+            const quitState = system.scheduler.getQuitState?.(currentThreadId);
             if (quitState && quitState.posted) {
                 system.scheduler.clearQuitFlag(currentThreadId);
                 Logger.log(LogCategory.USER32, `GetMessageW(sync): synthesizing WM_QUIT exitCode=${quitState.exitCode} for thread=${currentThreadId}`);
@@ -1054,8 +1052,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
                 // WM_NULL from timeout — check quit flag, otherwise keep waiting
                 if (waitMsg.message === WM_NULL && waitMsg.hwnd === 0) {
-                    if (isQuitInFilterRange(wMsgFilterMin, wMsgFilterMax)) {
-                        const quitState = system.scheduler.getQuitState(currentThreadId);
+                    {
+                        const quitState = system.scheduler.getQuitState?.(currentThreadId);
                         if (quitState && quitState.posted) {
                             system.scheduler.clearQuitFlag(currentThreadId);
                             // Note: Get fresh memory reference after async operation!
@@ -1343,9 +1341,10 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             if (paintTraceEnabled && system.windowManager.hasMessages(WM_PAINT, WM_PAINT, callerThreadId)) {
                 logPaintPendingBlocked('PeekMessageW', wMsgFilterMin, wMsgFilterMax, (wRemoveMsg & 1) !== 0);
             }
-            // Queue empty — synthesize WM_QUIT if per-thread flag is set
-            if (isQuitInFilterRange(wMsgFilterMin, wMsgFilterMax)) {
-                const quitState = system.scheduler.getQuitState(callerThreadId);
+            // Queue empty — synthesize WM_QUIT if per-thread flag is set (the quit is
+            // retrieved regardless of the filter range).
+            {
+                const quitState = system.scheduler.getQuitState?.(callerThreadId);
                 if (quitState && quitState.posted) {
                     if ((wRemoveMsg & 1) !== 0) {
                         system.scheduler.clearQuitFlag(callerThreadId);
@@ -2182,9 +2181,11 @@ export function registerFastPathMessageFunctions(dispatcher: HleDispatcher): voi
             if (paintTraceEnabled && system.windowManager.hasMessages(WM_PAINT, WM_PAINT, callerThreadId)) {
                 logPaintPendingBlocked('PeekMessageW(fastpath)', wMsgFilterMin, wMsgFilterMax, (wRemoveMsg & 1) !== 0);
             }
-            // Queue empty — check per-thread quit flag before returning FALSE
-            if (wMsgFilterMin === 0 && wMsgFilterMax === 0 || (WM_QUIT >= wMsgFilterMin && WM_QUIT <= wMsgFilterMax)) {
-                const quitState = system.scheduler.getQuitState(callerThreadId);
+            // Queue empty — check per-thread quit flag before returning FALSE.
+            // Like the slow path, the quit is retrieved regardless of the filter
+            // range (no range check here — see the PeekMessageW slow handler).
+            {
+                const quitState = system.scheduler.getQuitState?.(callerThreadId);
                 if (quitState && quitState.posted) {
                     if ((wRemoveMsg & 1) !== 0) {
                         system.scheduler.clearQuitFlag(callerThreadId);
@@ -2269,9 +2270,10 @@ export function registerFastPathMessageFunctions(dispatcher: HleDispatcher): voi
         }
         const msg = system.windowManager.peekMessage(true, wMsgFilterMin, wMsgFilterMax, callerThreadId);
         if (!msg) {
-            // Queue empty — check per-thread quit flag before falling to async
-            if (wMsgFilterMin === 0 && wMsgFilterMax === 0 || (WM_QUIT >= wMsgFilterMin && WM_QUIT <= wMsgFilterMax)) {
-                const quitState = system.scheduler.getQuitState(callerThreadId);
+            // Queue empty — check per-thread quit flag before falling to async.
+            // Like the slow path, the quit is retrieved regardless of the filter range.
+            {
+                const quitState = system.scheduler.getQuitState?.(callerThreadId);
                 if (quitState && quitState.posted) {
                     system.scheduler.clearQuitFlag(callerThreadId);
                     if (lpMsg && lpMsg + 28 <= mem8.length) {

@@ -2,7 +2,7 @@
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { MessageQueue } from './message-queue';
-import type { Message, MessageQueueState } from './message-queue';
+import type { Message, MessageQueueState, QuitSource } from './message-queue';
 import { pickSaved, type FieldPolicy } from '../../savestate/participant';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 
@@ -948,6 +948,10 @@ export class WindowManager {
      */
     setInputPollCallback(callback: () => void): void {
         this.messageQueue.setInputPollCallback(callback);
+    }
+
+    setQuitSource(source: QuitSource | null): void {
+        this.messageQueue.setQuitSource(source);
     }
 
     setKeyStateCallback(callback: (packed: Uint8Array, threadId: number) => void): void {
