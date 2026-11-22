@@ -81,13 +81,30 @@ describe("WM_QUIT is retrieved before generated WM_PAINT and WM_TIMER", () => {
     });
 });
 
-describe("WM_QUIT retrieval honours the message filter and the caller", () => {
-    it("a filter that excludes WM_QUIT returns the paint and leaves the quit pending", () => {
+describe("WM_QUIT retrieval ignores the message filter (as GetMessage/PeekMessage document) and honours the caller", () => {
+    it("a paint-only filter still returns the pending quit first, and the paint after it", () => {
         const { q, quits } = queueWithQuit();
         q.enqueue(HWND, WM_PAINT, 0, 0);
+        // WM_QUIT is retrieved regardless of wMsgFilterMin/wMsgFilterMax.
+        const quit = q.dequeue(WM_PAINT, WM_PAINT, 1);
+        expect(quit?.message).toBe(WM_QUIT);
+        expect(quit?.wParam).toBe(7);
+        expect(quits.consumed).toEqual([1]);
+        // The paint-only range still governs the generated paint.
         expect(q.dequeue(WM_PAINT, WM_PAINT, 1)?.message).toBe(WM_PAINT);
+        expect(q.dequeue(WM_PAINT, WM_PAINT, 1)).toBeNull();
+    });
+
+    it("a paint-only PM_NOREMOVE peek reports the quit and leaves it pending", () => {
+        const { q, quits } = queueWithQuit();
+        q.enqueue(HWND, WM_PAINT, 0, 0);
+        const peeked = q.peek(WM_PAINT, WM_PAINT, 1);
+        expect(peeked?.message).toBe(WM_QUIT);
+        expect(peeked?.wParam).toBe(7);
         expect(quits.consumed).toEqual([]);
-        expect(q.dequeue(WM_QUIT, WM_QUIT, 1)?.message).toBe(WM_QUIT);
+        expect(q.peek(WM_PAINT, WM_PAINT, 1)?.message).toBe(WM_QUIT);
+        expect(q.dequeue(WM_PAINT, WM_PAINT, 1)?.message).toBe(WM_QUIT);
+        expect(q.dequeue(WM_PAINT, WM_PAINT, 1)?.message).toBe(WM_PAINT);
     });
 
     it("a filter that includes WM_QUIT returns it ahead of the paint", () => {

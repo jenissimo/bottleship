@@ -590,9 +590,11 @@ export class MessageQueue {
      * WM_QUIT for a thread whose PostQuitMessage flag is up. USER returns it after posted
      * messages and input but before the WM_PAINT and WM_TIMER it generates on demand, so a
      * window that keeps invalidating itself, or a running timer, cannot hold the quit back.
+     * GetMessage/PeekMessage retrieve WM_QUIT regardless of wMsgFilterMin/wMsgFilterMax, so
+     * the range is not consulted here.
      */
-    private quitMessage(noFilter: boolean, msgMin: number, msgMax: number, callerThreadId: number, remove: boolean): Message | null {
-        if (!this.quitSource || !(noFilter || (WM_QUIT >= msgMin && WM_QUIT <= msgMax))) return null;
+    private quitMessage(callerThreadId: number, remove: boolean): Message | null {
+        if (!this.quitSource) return null;
         const quit = this.quitSource.pending(callerThreadId);
         if (!quit) return null;
         if (remove) this.quitSource.consume(callerThreadId);
@@ -849,8 +851,8 @@ export class MessageQueue {
             }
         }
 
-        // 3. WM_QUIT, ahead of the messages generated below.
-        const quit = this.quitMessage(noFilter, msgMin, msgMax, callerThreadId, true);
+        // 3. WM_QUIT, ahead of the messages generated below (whatever range was asked for).
+        const quit = this.quitMessage(callerThreadId, true);
         if (quit) return quit;
 
         // 4. WM_PAINT precedes synthesized timers in USER's retrieval order.
@@ -934,7 +936,7 @@ export class MessageQueue {
                 };
             }
         }
-        const quit = this.quitMessage(noFilter, msgMin, msgMax, callerThreadId, false);
+        const quit = this.quitMessage(callerThreadId, false);
         if (quit) return quit;
         if (this.paintPending.size > 0 && (noFilter || (WM_PAINT >= msgMin && WM_PAINT <= msgMax))) {
             for (const [hwnd, pending] of this.paintPending) {
