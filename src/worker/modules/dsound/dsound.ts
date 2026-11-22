@@ -278,6 +278,8 @@ const apiCursorCaches = new WeakMap<object, ApiCursorCache>();
 
 // @transient(writeSpanToLaps: the run of spans an app wrote back to back since its last cursor query -- its start, bytes so far, end, and that query's time; a load starts a new run)
 const spanChains = new WeakMap<object, { start: number; bytes: number; end: number; queryAt: number | undefined }>();
+// @transient(DirectMusic sinks re-register on start and restore)
+const mixerFedBuffers = new WeakSet<SoundBuffer>();
 
 function apiDebugFlags(): number {
     const g = globalThis as {
@@ -2209,7 +2211,7 @@ export class DSound implements IModule {
             if (buffer.sab) {
                 setCtrl(buffer.sab, CTRL_VOLUME, buffer.volumeDb);
             }
-            if (volumeChanged) this.signalRemix(buffer);
+            if (volumeChanged && !mixerFedBuffers.has(buffer)) this.signalRemix(buffer);
             return DS_OK;
         };
 
@@ -2429,7 +2431,7 @@ export class DSound implements IModule {
             if (buffer.sab) {
                 setCtrl(buffer.sab, CTRL_PAN, buffer.pan);
             }
-            if (panChanged) this.signalRemix(buffer);
+            if (panChanged && !mixerFedBuffers.has(buffer)) this.signalRemix(buffer);
             return DS_OK;
         };
         this.exports["idirectsoundbuffer8_restore"] = (ctx, mem, args) => {
@@ -2650,6 +2652,15 @@ export class DSound implements IModule {
         this.exports["idirectsoundcapturebuffer8_getfxstatus"] = () => DS_OK;
 
         this.startNotificationPump();
+    }
+
+    /** A host-fed stream applies gain and pan in the worklet. Resetting its
+     * synthetic premix depth would freeze the write cursor that drives refills. */
+    setMixerFedBuffer(ptr: number, active: boolean): void {
+        const buffer = this.getBuffer(ptr);
+        if (!buffer) return;
+        if (active) mixerFedBuffers.add(buffer);
+        else mixerFedBuffers.delete(buffer);
     }
 
     /** Snapshot every sound buffer's playback + notification state (dbg.audio()). */
