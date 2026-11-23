@@ -131,6 +131,7 @@ export class WindowManager {
     /** Optional point-based mouse routing override (user32 dialog-overlay registers it
      *  to prefer live native dialogs over a DDraw flip chain). Returns hwnd or 0. */
     private mouseTargetResolver: ((screenX: number, screenY: number) => number) | null = null;
+    private overlayFormResolver: ((screenX: number, screenY: number) => number) | null = null;
 
     /**
      * The parent → children sibling list, front to back. Win32 has ONE sibling order
@@ -196,6 +197,10 @@ export class WindowManager {
 
     registerMouseTargetResolver(resolver: (screenX: number, screenY: number) => number): void {
         this.mouseTargetResolver = resolver;
+    }
+
+    registerOverlayFormResolver(resolver: (screenX: number, screenY: number) => number): void {
+        this.overlayFormResolver = resolver;
     }
 
     registerChildZOrderProvider(provider: (parentHwnd: number) => number[] | undefined): void {
@@ -275,6 +280,13 @@ export class WindowManager {
      */
     getMouseTargetWindow(screenX: number, screenY: number): WindowObject | undefined {
         const fromPoint = this.windowFromPoint(screenX, screenY);
+        const form = this.overlayFormResolver?.(screenX, screenY) ?? 0;
+        if (form && fromPoint !== form && !this.isDescendantOf(fromPoint, form)) {
+            const win = this.windows.get(form);
+            if (win && win.visible) {
+                return this.windows.get(this.descendToChildAtPoint(form, win.rect.x, win.rect.y, screenX, screenY)) ?? win;
+            }
+        }
         const hit = fromPoint ? this.windows.get(fromPoint) : undefined;
         if (hit && !this.isDisabled(hit)) return hit;
         const hwnd = this.mouseTargetResolver?.(screenX, screenY) ?? 0;

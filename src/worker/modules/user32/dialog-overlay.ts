@@ -139,16 +139,29 @@ export function noteDialogOverlayCandidate(win: WindowInfo | undefined): void {
 }
 
 /**
- * A captioned top-level window of the app's own class (a Delphi/VCL TForm, an MFC
- * frame), smaller than the screen, shown while the game owns the screen. Showing it activates it, and an
- * activated top-level window takes the display from an exclusive-fullscreen device,
- * so it is on screen and receives the mouse even though it is not a #32770.
+ * An app top-level window (a Delphi/VCL TForm, an MFC frame, Game Maker's TMessageForm)
+ * smaller than the screen, shown while the game owns the screen. On Windows it is a
+ * window above the game's surface, so it is on screen and takes the mouse even though
+ * it is not a #32770 and often has neither caption nor system controls.
  */
 export function isOverlayFormCandidate(win: WindowInfo): boolean {
     if (win.nativeClassName === '#32770' || (win.style & WS_CHILD) !== 0) return false;
-    if ((win.style & WS_CAPTION) !== WS_CAPTION) return false;
     return win.width > 0 && win.height > 0
         && (win.width < virtualScreenWidth() || win.height < virtualScreenHeight());
+}
+
+/** The frontmost live overlay form whose visual bounds contain the point, or 0. */
+export function resolveOverlayFormHitHwnd(screenX: number, screenY: number): number {
+    let best = 0, bestRank = -Infinity;
+    for (const hwnd of overlayForms) {
+        const win = windows.get(hwnd);
+        if (!win || !win.visible || win.pendingDestroy || !win.overlayOnFlipScreen) continue;
+        const b = getWindowVisualBounds(hwnd);
+        if (!b || screenX < b.x || screenY < b.y || screenX >= b.x + b.w || screenY >= b.y + b.h) continue;
+        const rank = getOverlayWindowZRank(hwnd);
+        if (rank > bestRank) { best = hwnd; bestRank = rank; }
+    }
+    return best;
 }
 
 export interface DialogOverlayRect {
@@ -469,6 +482,7 @@ function getDialogRoot(hwnd: number): number {
  * occlusion: it hides the frame and shows an empty gray box.
  */
 function dialogGroupHasOverlayContent(root: number): boolean {
+    if (overlayForms.has(root)) return true;
     const stack = [root];
     const seen = new Set<number>();
     while (stack.length) {

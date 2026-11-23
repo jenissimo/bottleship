@@ -23,8 +23,8 @@ describe('isOverlayFormCandidate', () => {
     test('a child window is never a form overlay', () => {
         expect(isOverlayFormCandidate({ ...info(), style: WS_CHILD | WS_CAPTION | WS_VISIBLE } as WindowInfo)).toBe(false);
     });
-    test('a caption-less popup is not a form', () => {
-        expect(isOverlayFormCandidate({ ...info(), style: WS_POPUP | WS_VISIBLE } as WindowInfo)).toBe(false);
+    test('a caption-less popup (Game Maker TMessageForm) is a form too', () => {
+        expect(isOverlayFormCandidate({ ...info(), nativeClassName: 'TMessageForm', style: WS_POPUP | WS_VISIBLE, width: 320, height: 127 } as WindowInfo)).toBe(true);
     });
     test('a screen-sized game window is not a form overlay', () => {
         expect(isOverlayFormCandidate({ ...info(), width: 100000, height: 100000 } as WindowInfo)).toBe(false);
@@ -43,6 +43,20 @@ describe('mouse over a disabled top-level window', () => {
         wm.setWindowZOrder(game, 0);
         wm.registerMouseTargetResolver((x, y) => (x >= 100 && y >= 100 && x < 420 && y < 340 ? form : 0));
         expect(wm.getMouseTargetWindow(200, 200)?.hwnd).toBe(form);
+        expect(wm.getMouseTargetWindow(10, 10)?.hwnd).toBe(game);
+    });
+});
+
+describe('mouse over the game window with an overlay form on top', () => {
+    test('the overlay form takes the click even though the enabled game window is in front of it', () => {
+        const wm = new WindowManager();
+        const form = wm.createWindow('TMessageForm', '', WS_POPUP | WS_VISIBLE, 0, 352, 320, 320, 127, 0, 0, 0, 0);
+        const game = wm.createWindow('TRunnerForm', '', WS_POPUP | WS_VISIBLE, 0, 0, 0, 1024, 768, 0, 0, 0, 0);
+        wm.getWindow(form)!.visible = true;
+        wm.getWindow(game)!.visible = true;
+        wm.setWindowZOrder(game, 0);
+        wm.registerOverlayFormResolver((x, y) => (x >= 352 && y >= 320 && x < 672 && y < 447 ? form : 0));
+        expect(wm.getMouseTargetWindow(400, 350)?.hwnd).toBe(form);
         expect(wm.getMouseTargetWindow(10, 10)?.hwnd).toBe(game);
     });
 });
