@@ -63,6 +63,7 @@ import { DebugFlags, generatePipelineKey, generateMegaBatchPipelineKey, Pipeline
     pipelineKeyConfigsEqual, megaBatchPipelineKeyConfigsEqual } from "./types";
 import { ShaderGenerator, ShaderConfig } from "./shader-generator";
 import type { DirectVertexLayout } from "./direct-vertex-input";
+import { legacyDepthBias, legacyZBias } from "./depth-bias";
 import { BindGroupManager } from "./bind-group-manager";
 import { DirectDrawSurfaceState } from "../../../modules/ddraw/com-objects";
 import { FfpStagesState, MAX_FFP_SAMPLED_STAGES } from "./ffp-stages";
@@ -167,7 +168,7 @@ export function resolveBlendFactors(srcBlend: number, dstBlend: number, defaultS
 /**
  * Maps D3D depth compare function to WebGPU compare function
  */
-function mapDepthCompareFunction(d3dCmpFunc: number): GPUCompareFunction {
+export function mapDepthCompareFunction(d3dCmpFunc: number): GPUCompareFunction {
     switch (d3dCmpFunc) {
         case D3DCMP_NEVER: return "never";
         case D3DCMP_LESS: return "less";
@@ -362,7 +363,8 @@ export class PipelineFactory {
         missingTexture: boolean,
         renderStates: Int32Array,
         texture?: DirectDrawSurfaceState | null,
-        directVertex?: DirectVertexLayout
+        directVertex?: DirectVertexLayout,
+        fromD3D8 = false,
     ): GPURenderPipeline {
         const useTexture = (stages.sampledMask & 1) !== 0;
         // Read render states
@@ -372,7 +374,8 @@ export class PipelineFactory {
         const zFunc = renderStates[D3DRENDERSTATE_ZFUNC] || D3DCMP_LESSEQUAL;
         const zWrite = renderStates[D3DRENDERSTATE_ZWRITEENABLE];
         // D3DRENDERSTATE_ZBIAS: 0-16, used to reduce z-fighting for coplanar polygons (decals, shadows)
-        const zBias = renderStates[D3DRENDERSTATE_ZBIAS] || 0;
+        const rawBias = renderStates[D3DRENDERSTATE_ZBIAS] || 0;
+        const zBias = fromD3D8 ? legacyZBias(rawBias) : rawBias;
         const alphaBlend = renderStates[D3DRENDERSTATE_ALPHABLENDENABLE];
         const alphaTest = renderStates[D3DRENDERSTATE_ALPHATESTENABLE];
         const srcBlend = renderStates[D3DRENDERSTATE_SRCBLEND];
@@ -438,6 +441,7 @@ export class PipelineFactory {
         keyConfig.zWrite = effectiveZWrite;
         keyConfig.zBias = zEnable ? zBias : 0; // Only include zBias when depth testing is enabled
         keyConfig.coplanarPass = coplanarPass;
+        keyConfig.d3d8DepthBias = fromD3D8 && zEnable !== 0 && (zBias !== 0 || coplanarPass !== 0);
         keyConfig.alphaBlend = keyAlphaBlend;
         keyConfig.alphaTest = alphaTest;
         keyConfig.srcBlend = effectiveSrcBlend;
@@ -515,6 +519,7 @@ export class PipelineFactory {
             zWrite,
             zBias,
             coplanarPass,
+            fromD3D8,
             effectiveAlphaBlend, // Use normalized value
             alphaTest,
             effectiveSrcBlend,
@@ -558,7 +563,8 @@ export class PipelineFactory {
         stages: FfpStagesState,
         missingTexture: boolean,
         renderStates: Int32Array,
-        texture?: DirectDrawSurfaceState | null
+        texture?: DirectDrawSurfaceState | null,
+        fromD3D8 = false,
     ): GPURenderPipeline {
         const useTexture = (stages.sampledMask & 1) !== 0;
         // Read render states (same as regular pipeline)
@@ -567,7 +573,8 @@ export class PipelineFactory {
         const zEnable = zEnableRaw > 0 ? 1 : 0;
         const zFunc = renderStates[D3DRENDERSTATE_ZFUNC] || D3DCMP_LESSEQUAL;
         const zWrite = renderStates[D3DRENDERSTATE_ZWRITEENABLE];
-        const zBias = renderStates[D3DRENDERSTATE_ZBIAS] || 0;
+        const rawBias = renderStates[D3DRENDERSTATE_ZBIAS] || 0;
+        const zBias = fromD3D8 ? legacyZBias(rawBias) : rawBias;
         const alphaBlend = renderStates[D3DRENDERSTATE_ALPHABLENDENABLE];
         const alphaTest = renderStates[D3DRENDERSTATE_ALPHATESTENABLE];
         const srcBlend = renderStates[D3DRENDERSTATE_SRCBLEND];
@@ -630,6 +637,7 @@ export class PipelineFactory {
         keyConfig.zWrite = effectiveZWrite;
         keyConfig.zBias = zEnable ? zBias : 0;
         keyConfig.coplanarPass = coplanarPass;
+        keyConfig.d3d8DepthBias = fromD3D8 && zEnable !== 0 && (zBias !== 0 || coplanarPass !== 0);
         keyConfig.alphaBlend = keyAlphaBlend;
         keyConfig.alphaTest = alphaTest;
         keyConfig.srcBlend = effectiveSrcBlend;
@@ -691,6 +699,7 @@ export class PipelineFactory {
             zWrite,
             zBias,
             coplanarPass,
+            fromD3D8,
             effectiveAlphaBlend,
             alphaTest,
             effectiveSrcBlend,
@@ -731,6 +740,7 @@ export class PipelineFactory {
         zWrite: number,
         zBias: number,
         coplanarPass: number,
+        fromD3D8: boolean,
         effectiveAlphaBlend: number,
         alphaTest: number,
         srcBlend: number,
@@ -884,9 +894,13 @@ export class PipelineFactory {
                 // on writes-off alone — every blended particle and HUD quad is writes-off, and
                 // biasing those would pull them through geometry that occludes them. A
                 // game-supplied ZBIAS still wins.
-                depthBias: (zEnable !== 0 && zBias > 0) ? -zBias * 4 : (coplanarPass !== 0 ? -1 : 0),
-                depthBiasSlopeScale: (zEnable !== 0 && zBias > 0) || coplanarPass !== 0 ? -1.0 : 0,
-                depthBiasClamp: 0,
+                ...(fromD3D8
+                    ? legacyDepthBias(zBias, zEnable !== 0 && !this.debugFlags.forceDisableZTest, topology, coplanarPass !== 0)
+                    : {
+                        depthBias: (zEnable !== 0 && zBias > 0) ? -zBias * 4 : (coplanarPass !== 0 ? -1 : 0),
+                        depthBiasSlopeScale: (zEnable !== 0 && zBias > 0) || coplanarPass !== 0 ? -1 : 0,
+                        depthBiasClamp: 0,
+                    }),
                 stencilFront: stencilEnable !== 0 ? {
                     compare: mapDepthCompareFunction(stencilFunc),
                     failOp: mapStencilOperation(stencilFail),
@@ -916,7 +930,8 @@ export class PipelineFactory {
         zFunc: number,
         zWrite: number,
         zBias: number, // D3DRENDERSTATE_ZBIAS (0-16) for z-fighting prevention
-        coplanarPass: number, // draw asked for EQUAL with depth writes off
+        coplanarPass: number,
+        fromD3D8: boolean,
         effectiveAlphaBlend: number, // Already normalized (0 or 1)
         alphaTest: number,
         srcBlend: number, // Already resolved: defaults applied, BOTH*SRCALPHA fixup expanded
@@ -1085,18 +1100,19 @@ export class PipelineFactory {
                         ? mapDepthCompareFunction(zFunc)
                         : "always",
                 // D3DRENDERSTATE_ZBIAS: 0-16, used to reduce z-fighting for coplanar polygons
-                // Negative depthBias pushes geometry toward camera (smaller Z values)
-                // D3D ZBIAS is integer 0-16; we scale it appropriately for 24-bit depth buffer
-                // Each unit of D3D ZBIAS approximately corresponds to 1/65536 of depth range
                 // Coplanar overlay pass (see effectiveZFunc): nudge it toward the camera so it
                 // survives the depth compare. The SLOPE term carries grazing-angle surfaces,
                 // where dz/dx across a pixel dwarfs any constant. Keyed on coplanarPass, never
                 // on writes-off alone — every blended particle and HUD quad is writes-off, and
                 // biasing those would pull them through geometry that occludes them. A
                 // game-supplied ZBIAS still wins.
-                depthBias: (zEnable !== 0 && zBias > 0) ? -zBias * 4 : (coplanarPass !== 0 ? -1 : 0),
-                depthBiasSlopeScale: (zEnable !== 0 && zBias > 0) || coplanarPass !== 0 ? -1.0 : 0,
-                depthBiasClamp: 0,
+                ...(fromD3D8
+                    ? legacyDepthBias(zBias, zEnable !== 0 && !this.debugFlags.forceDisableZTest, topology, coplanarPass !== 0)
+                    : {
+                        depthBias: (zEnable !== 0 && zBias > 0) ? -zBias * 4 : (coplanarPass !== 0 ? -1 : 0),
+                        depthBiasSlopeScale: (zEnable !== 0 && zBias > 0) || coplanarPass !== 0 ? -1 : 0,
+                        depthBiasClamp: 0,
+                    }),
                 stencilFront: stencilEnable !== 0 ? {
                     compare: mapDepthCompareFunction(stencilFunc),
                     failOp: mapStencilOperation(stencilFail),

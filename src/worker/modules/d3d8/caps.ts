@@ -41,6 +41,7 @@ import { D3DTOP_DISABLE } from '../ddraw/constants';
 // ============================================================================
 
 const D3DCAPS8_SIZE = 212;
+const D3DPRASTERCAPS_ZBIAS = 0x00004000;
 const CONSERVATIVE_MAX_TEXTURE_DIMENSION_2D = 4096;
 
 /**
@@ -128,7 +129,8 @@ export function writeDeviceCaps8(pCaps: number, mem: Uint8Array): boolean {
     // combiner D3D8 uses), CLIPPLANESCALEDPOINTS (MaxUserClipPlanes is 0), NULLREFERENCE —
     // plus 0xCF's two reserved bits, which real hardware leaves clear.
     u32(32, 0x00000AF2);
-    u32(36, 0x00770077);    // RasterCaps
+    // Both draw paths implement the integer ZBIAS render state for depth-tested triangles.
+    u32(36, 0x00770077 | D3DPRASTERCAPS_ZBIAS);
     u32(40, 0x000000FF);    // ZCmpCaps: all compare funcs
     u32(44, 0x00001FFF);    // SrcBlendCaps: all D3D8 blend factors
     u32(48, 0x00001FFF);    // DestBlendCaps

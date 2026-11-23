@@ -2587,7 +2587,9 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
             stageTextures ?? null,
             isBatchableHint,
             texMatrices,
-            lighting
+            lighting,
+            undefined,
+            fromD3D8,
         );
         maybeClampContainedUv(this, prepareResult, memory, verticesAddr, count, stride, vertexType);
         drawCostProfiler.add(DC.prepare, _tPrep);
@@ -2785,7 +2787,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                 this.ffpStages,
                 false,
                 renderStates,
-                texture
+                texture,
+                fromD3D8,
             )
             : null;
 
@@ -3146,7 +3149,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
             isBatchableHint,
             texMatrices,
             lighting,
-            directStreams?.layout
+            directStreams?.layout,
+            fromD3D8,
         );
         if (!directStreams) maybeClampContainedUv(this, prepareResult, memory, sourceVerticesAddr, effectiveVCount, stride, vertexType);
         drawCostProfiler.add(DC.prepare, _tPrep);
@@ -3456,7 +3460,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                 this.ffpStages,
                 false,
                 renderStates,
-                texture
+                texture,
+                fromD3D8,
             )
             : null;
         drawCostProfiler.add(DC.s_pipe, _tSPipe);
@@ -4638,7 +4643,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         skipLegacyUniform?: boolean,
         texMatrices?: readonly (Float32Array | null)[] | null,
         lighting?: FFPLightingState,
-        directVertex?: DirectVertexLayout
+        directVertex?: DirectVertexLayout,
+        fromD3D8 = false,
     ): PrepareDrawResult {
         this.ensureSurfaceGPUResources(target);
 
@@ -4720,7 +4726,9 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                 this.ffpStages,
                 false,
                 renderStates,
-                null
+                null,
+                undefined,
+                fromD3D8,
             );
             pr.sampledMask = 0;
             pr.stageCount = this.ffpStages.stageCount;
@@ -5291,7 +5299,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
             stages.missingMask !== 0,
             renderStates,
             texture,
-            directVertex
+            directVertex,
+            fromD3D8,
         );
         drawCostProfiler.add(DC.p_pipe, _tPPipe);
 

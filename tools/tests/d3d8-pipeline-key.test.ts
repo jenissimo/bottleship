@@ -77,6 +77,22 @@ describe("d3d8-pipeline-key", () => {
         expect(buildD3D8FfpVariantKey(1, 0, s)).not.toBe(buildD3D8FfpVariantKey(1, 1, s));
     });
 
+
+    test("ZBIAS and ZFUNC select distinct programmable pipeline keys", () => {
+        const rs = new Int32Array(256);
+        rs[7] = 1;
+        const key = () => buildD3D8PipelineKey(rs, 1, 3, 32, 32, "triangle-list", false, "b0", "a0", 0);
+        const unbiased = key();
+        rs[47] = 3;
+        const biased = key();
+        expect(biased).not.toBe(unbiased);
+        rs[23] = 7;
+        expect(key()).not.toBe(biased);
+        rs[23] = 4;
+        rs[47] = 0x3f800000;
+        expect(key()).toBe(unbiased);
+    });
+
     test("identical state produces identical keys", () => {
         const rs = new Int32Array(256);
         rs[7] = 1;  // D3DRENDERSTATE_ZENABLE

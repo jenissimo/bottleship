@@ -253,6 +253,45 @@ describe("direct fixed-function vertex input", () => {
         expect(descriptors.map(descriptor => [...descriptor.vertex.buffers!][0]!.arrayStride)).toEqual([64, 12, 16]);
     });
 
+
+    test("D3D8 raster bias is independent of compare direction on all fixed-function paths", () => {
+        const descriptors: GPURenderPipelineDescriptor[] = [];
+        const device = {
+            createShaderModule: () => ({}),
+            createRenderPipeline: (descriptor: GPURenderPipelineDescriptor) => {
+                descriptors.push(descriptor);
+                return {};
+            },
+        } as unknown as GPUDevice;
+        const bindGroups = {
+            createPipelineLayout: () => ({}),
+            createMegaBatchPipelineLayout: () => ({}),
+        } as unknown as BindGroupManager;
+        const factory = new PipelineFactory(device, new ShaderGenerator(device), bindGroups, DEFAULT_DEBUG_FLAGS, "rgba8unorm");
+        const direct = makeDirectVertexLayout(2, [12])!;
+        const states = new Int32Array(256);
+        const stages = new FfpStagesState();
+        states[7] = 1;  // ZENABLE
+        states[23] = 4; // ZFUNC = LESSEQUAL
+        states[47] = 3; // legacy integer ZBIAS
+        const pipeline = factory.getOrCreatePipeline(2, D3DPT_TRIANGLELIST, stages, false, states, null, direct, true);
+        states[23] = 7; // GREATEQUAL, commonly used with reversed depth
+        expect(factory.getOrCreatePipeline(2, D3DPT_TRIANGLELIST, stages, false, states, null, direct, true)).not.toBe(pipeline);
+        factory.getOrCreateMegaBatchPipeline(2, D3DPT_TRIANGLELIST, stages, false, states, null, true);
+        factory.getOrCreatePipeline(2, D3DPT_LINELIST, stages, false, states, null, undefined, true);
+        factory.getOrCreatePipeline(2, D3DPT_TRIANGLELIST, stages, false, states);
+        states[47] = 0x3f800000; // Float 1.0 is not a valid ZBIAS DWORD.
+        factory.getOrCreatePipeline(2, D3DPT_TRIANGLELIST, stages, false, states, null, direct, true);
+        expect(descriptors.map(({ depthStencil: d }) => [d?.depthCompare, d?.depthBias, d?.depthBiasSlopeScale])).toEqual([
+            ["less-equal", -12, -3],
+            ["greater-equal", -12, -3],
+            ["greater-equal", -12, -3],
+            ["greater-equal", 0, 0],
+            ["greater-equal", -12, -1], // DDraw keeps its established approximation.
+            ["greater-equal", 0, 0],
+        ]);
+    });
+
     test("rejects transformed/skinned vertices and incomplete declaration offsets", () => {
         expect(makeDirectVertexLayout(4, [16])).toBeNull();
         expect(makeDirectVertexLayout(6, [16])).toBeNull();

@@ -22,7 +22,10 @@ import {
     D3DRENDERSTATE_NORMALIZENORMALS,
     D3DRENDERSTATE_RANGEFOGENABLE,
     D3DRENDERSTATE_TEXTUREFACTOR,
+    D3DCMP_LESSEQUAL,
+    D3DRENDERSTATE_ZBIAS,
     D3DRENDERSTATE_ZENABLE,
+    D3DRENDERSTATE_ZFUNC,
     D3DRENDERSTATE_ZWRITEENABLE,
     D3DTOP_DISABLE,
     D3DTSS_ALPHAARG0,
@@ -77,6 +80,8 @@ import { DxSamplerCache, dxSamplerShaderStatesKey, type SamplerSpec } from "../s
 import { decodeD3d8TssSampler } from "./d3d8-sampler";
 import { sanitizeViewportInto, type SanitizedViewport } from "../ddraw/types";
 import { dwordToFloat } from "../ddraw/dword-float";
+import { legacyDepthBias } from "../ddraw/depth-bias";
+import { mapDepthCompareFunction } from "../ddraw/pipeline-factory";
 import { pixelCenterClipDx, pixelCenterClipDy, withPixelCenterVersion } from "../pixel-center";
 import { buildD3D8PipelineKey, D3D8ShaderRegistry, type D3D8VsObject } from "./d3d8-shader-registry";
 import {
@@ -627,7 +632,10 @@ export class D3D8ProgrammableRenderer {
                     depthStencil: {
                         format: depthFormat,
                         depthWriteEnabled: zWrite !== 0,
-                        depthCompare: zEnable !== 0 ? "less-equal" : "always",
+                        depthCompare: zEnable !== 0
+                            ? mapDepthCompareFunction(this.getRS(adapter, D3DRENDERSTATE_ZFUNC) || D3DCMP_LESSEQUAL)
+                            : "always",
+                        ...legacyDepthBias(this.getRS(adapter, D3DRENDERSTATE_ZBIAS), zEnable !== 0, topology),
                     },
                 });
             } catch (error) {
