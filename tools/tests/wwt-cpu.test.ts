@@ -247,13 +247,20 @@ function minimalPe(entry: number): Uint8Array {
     return file;
 }
 
-test("automatic PE training reuses the recorded entry and cached translation across resets", async () => {
-    const globalOptions = globalThis as { __wwtPeAot?: string };
+test.each(["default", "explicit auto", "off", "no OPFS"])("PE loading with %s policy preserves guest execution across resets", async (mode) => {
+    const globalOptions = globalThis as { __wwtPeAot?: boolean | string };
     const previous = Object.getOwnPropertyDescriptor(globalThis, "navigator");
     const oldMode = globalOptions.__wwtPeAot;
     try {
-        installFakeOpfs();
-        globalOptions.__wwtPeAot = "auto";
+        if (mode === "no OPFS") {
+            Object.defineProperty(globalThis, "navigator", { configurable: true, value: {} });
+        } else {
+            installFakeOpfs();
+        }
+        if (mode === "off") globalOptions.__wwtPeAot = false;
+        else if (mode === "explicit auto") globalOptions.__wwtPeAot = "auto";
+        else delete globalOptions.__wwtPeAot;
+        const training = mode === "default" || mode === "explicit auto";
         const ramSize = 4 << 20;
         const host = new BottleShipMachine(await WwtCompiler.fromBytes(compilerBytes), ramSize);
         await host.init();
@@ -274,17 +281,20 @@ test("automatic PE training reuses the recorded entry and cached translation acr
             core.mem8.set(file.subarray(0x200), entry);
             core.registerCodeRange(entry, base + 0x3000);
             await core.registerPeImage("demo.exe", base, 0x3000, file);
-            expect(host.lookup(dynamicEntry) > 0).toBe(run > 0);
+            expect(host.lookup(dynamicEntry) > 0).toBe(training && run > 0);
             core.instruction_pointer[0] = dynamicEntry;
             core.reg32[2] = 0x1234;
             core.reg32[4] = stack;
             core.main_loop();
             expect(core.reg32[0]).toBe(19);
-            await core.flushPeProfile();
+            const profileFlush = core.flushPeProfile();
+            if (training) await profileFlush;
+            else expect(profileFlush).toBeUndefined();
         }
         const after = core.getTranslationStats().peAotCache;
-        expect(after.writes - before.writes).toBe(1);
-        expect(after.hits - before.hits).toBe(1);
+        expect(after.writes - before.writes).toBe(Number(training));
+        expect(after.hits - before.hits).toBe(Number(training));
+        expect(after.misses - before.misses).toBe(Number(training));
     } finally {
         if (oldMode === undefined) delete globalOptions.__wwtPeAot;
         else globalOptions.__wwtPeAot = oldMode;

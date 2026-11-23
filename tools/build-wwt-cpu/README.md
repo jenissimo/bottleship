@@ -13,9 +13,9 @@ bun run build
 
 ## Translating a game ahead of execution
 
-Pass `?wwtAot=on` on the game URL to compile its linked PE32 images as they load. To select modules, use filenames separated by commas, for example `wwtAot=core.dll,engine.dll`. Compiled modules live in local OPFS. Their keys cover the actual relocated image, patched imports and native hooks, compiler binary, translation options and guest RAM configuration. Missing addresses use demand translation. The first run includes compilation and browser module installation. The next run reads the matching modules from disk. The default uses demand translation.
+Pass `?wwtAot=on` on the game URL to compile its linked PE32 images as they load. To select modules, use filenames separated by commas, for example `wwtAot=core.dll,engine.dll`. Compiled modules live in local OPFS. Their keys cover the actual relocated image, patched imports and native hooks, compiler binary, translation options and guest RAM configuration. Missing addresses use demand translation. The first run includes compilation and browser module installation. The next run reads the matching modules from disk.
 
-With `wwtAot=auto`, the same launch URL learns the entry points on the first run and loads linked AOT code on subsequent runs. Both the profile and generated code stay in this browser. Modules with no saved hints continue learning. Use `wwtLinkage=page-local` to request page-local code in this mode.
+The default `wwtAot=auto` policy learns entry points on the first run and loads linked AOT code on subsequent runs. Both the profile and generated code stay in this browser's OPFS. Modules with no saved hints continue learning. Use `wwtAot=off` for demand translation only, or `wwtLinkage=page-local` to request page-local code in auto mode. Without OPFS, demand translation remains available.
 
 A training session with `wwtAot=learn` records dynamically reached addresses in local OPFS. Play the desired workload once, then run with `wwtAot=on`. The compiler uses the recorded entry points for matching game binaries. Hints are stored as relative offsets keyed by the original file SHA-256 and can be reused across loads at different bases.
 
