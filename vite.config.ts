@@ -24,6 +24,7 @@ const BUILD_SHA = (
 // COOP-COEP work over plain HTTP and automation needn't clear a self-signed
 // cert). Opt into a self-signed HTTPS dev/preview server with VITE_SSL=1.
 const useSsl = !!process.env.VITE_SSL;
+const wwtOnly = process.env.VITE_CPU_BACKEND !== "v86";
 
 // Remote harness bridge (tools/remote-bridge.ts): the page reaches the bridge through this
 // dev server so a cloudflared tunnel needs ONE public origin. BS_TUNNEL=1 admits the
@@ -35,6 +36,24 @@ const coopCoepHeaders = {
   "Cross-Origin-Opener-Policy": "same-origin",
   "Cross-Origin-Embedder-Policy": "require-corp"
 };
+
+/** Package only the translator and i386 host ABI used by BottleShip's own HLE. */
+function wwtCpuAssets(): Plugin {
+  const files = ["wwt_wasm.wasm"];
+  return {
+    name: "wwt-cpu-assets",
+    apply: "build",
+    buildStart() {
+      if (!wwtOnly) return;
+      const root = process.env.BS_WWT_PROVIDER_DIR ?? path.resolve(__dirname, "public/wwt-provider");
+      for (const file of files) {
+        const source = path.join(root, file);
+        if (!fs.existsSync(source)) this.error(`Missing WWT CPU asset ${file} in ${root}. Set BS_WWT_PROVIDER_DIR to the built provider.`);
+        this.emitFile({ type: "asset", fileName: "wwt-provider/" + file, source: fs.readFileSync(source) });
+      }
+    },
+  };
+}
 
 function audioWorkletPlugin(): Plugin {
   const src = path.resolve(__dirname, "src/audio/bottleship-audio-worklet.ts");
@@ -193,6 +212,25 @@ function serveWgbFromDisk(): Plugin {
   };
 }
 
+const legacyCpuFiles = ["v86.wasm", "bios/seabios.bin", "bios/vgabios.bin"];
+
+/** Clean known public copies from a reused output without touching user files. */
+function removeCopiedLegacyCpuFiles(publicDir: string, outDir: string): void {
+  if (publicDir === outDir) return;
+  for (const file of legacyCpuFiles) {
+    const source = path.join(publicDir, file);
+    const output = path.join(outDir, file);
+    const outputStat = fs.lstatSync(output, { throwIfNoEntry: false });
+    if (!outputStat?.isFile()) continue;
+    const outputRelative = path.relative(fs.realpathSync(outDir), fs.realpathSync(output));
+    if (outputRelative.split(path.sep).join("/") !== file) continue;
+    const sourceStat = fs.statSync(source, { throwIfNoEntry: false });
+    if (sourceStat?.size === outputStat.size && fs.readFileSync(source).equals(fs.readFileSync(output))) {
+      fs.unlinkSync(output);
+    }
+  }
+}
+
 // public/apps/ holds multi-GB bundled demo .wgb games (built locally by tools/internal/
 // build-*-demo-wgb.ts, gitignored). The dev server serves public/ live without copying, and
 // production serves games from an external mount (never bundled) — so the default copyPublicDir
@@ -212,8 +250,9 @@ function copyPublicDirExceptApps(): Plugin {
       if (!outDir) throw new Error("Resolved build.outDir required");
       if (!fs.existsSync(publicDir)) return;
       fs.mkdirSync(outDir, { recursive: true });
+      if (wwtOnly) removeCopiedLegacyCpuFiles(publicDir, outDir);
       for (const entry of fs.readdirSync(publicDir, { withFileTypes: true })) {
-        if (entry.name === "apps") continue;
+        if (entry.name === "apps" || (wwtOnly && ["v86.wasm", "bios", "wwt-provider"].includes(entry.name))) continue;
         fs.cpSync(path.join(publicDir, entry.name), path.join(outDir, entry.name), { recursive: true });
       }
     },
@@ -227,6 +266,7 @@ export default defineConfig({
   },
   plugins: [
     audioWorkletPlugin(),
+    wwtCpuAssets(),
     harnessHealthPlugin(),
     serveWgbFromDisk(),
     copyPublicDirExceptApps(),
@@ -282,12 +322,13 @@ export default defineConfig({
     alias: {
       react: path.resolve(__dirname, "./node_modules/react"),
       "react-dom": path.resolve(__dirname, "./node_modules/react-dom"),
-      v86: path.resolve(__dirname, "./vendor/v86/build/libv86.mjs"),
+      v86: path.resolve(__dirname, wwtOnly ? "./src/worker/wwt/no-legacy.ts" : "./vendor/v86/build/libv86.mjs"),
       "@bottleship/formats": path.resolve(__dirname, "./packages/formats/src"),
       "@bottleship/repack": path.resolve(__dirname, "./packages/repack/src")
     }
   },
   build: {
+    outDir: wwtOnly ? "dist" : "dist-v86",
     emptyOutDir: false,
     // We copy public/ ourselves (copyPublicDirExceptApps) — Vite's built-in publicDir
     // copy would drag every public/apps/*.wgb (plus the dev-only external-wgb symlink

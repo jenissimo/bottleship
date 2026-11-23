@@ -555,6 +555,24 @@ export class PELoader {
         markGuestPagesDirty(base >>> 0, length);
     }
 
+    private registerExecutableSections(
+        baseAddress: number, imageSize: number, sections: readonly import('./module-registry').PESection[],
+        originalFile: Uint8Array, name: string,
+    ): Promise<void> | undefined {
+        const v86 = System.getInstance().process?.v86;
+        const cpu = v86?.cpu ?? v86?.v86?.cpu;
+        if (!cpu?.registerCodeRange) return;
+        for (const section of sections) {
+            if (!(section.characteristics & 0x20000000)) continue; // IMAGE_SCN_MEM_EXECUTE
+            const size = Math.min(Math.max(section.virtualSize, section.rawSize), imageSize - section.virtualAddress);
+            if (size > 0) {
+                const start = baseAddress + section.virtualAddress;
+                cpu.registerCodeRange(start, start + size);
+            }
+        }
+        return cpu.registerPeImage?.(name, baseAddress, imageSize, originalFile);
+    }
+
     async loadExecutable(peData: Uint8Array): Promise<LoadedModule> {
         this.bootImagesLoaded = false;
         const peView = new DataView(peData.buffer, peData.byteOffset, peData.byteLength);
@@ -690,6 +708,9 @@ export class PELoader {
                 Logger.warn(LogCategory.SYSTEM, `[hooks] onModuleLoaded threw on EXE: ${e}`);
             }
         }
+
+        const aot = this.registerExecutableSections(baseAddress, sizeOfImage, sections, peData, system.executableName);
+        if (aot) await aot;
 
         // PE32 optional header offset 72 = SizeOfStackReserve
         const sizeOfStackReserve = peView.getUint32(optHeaderPtr + 72, true);
@@ -1020,6 +1041,9 @@ export class PELoader {
             Logger.warn(LogCategory.SYSTEM,
                 `[PE] Loaded real DLL "${dllName}" at 0x${baseAddress.toString(16)}, ` +
                 `exports: ${exports.size} by name, ${ordinals.size} by ordinal, entryPointRVA=0x${entryPointRVA.toString(16)}`);
+
+            const aot = this.registerExecutableSections(baseAddress, sizeOfImage, sections, peData, `${normalizeDllBaseName(dllPath)}.dll`);
+            if (aot) await aot;
 
             // Queue DllMain for bootloader trampoline (runs as x86 code before EXE entry).
             // Runtime LoadLibrary* path can defer this to thunk-dispatcher callback flow.

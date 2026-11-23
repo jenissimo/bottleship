@@ -17,8 +17,11 @@
  * general `any` usage.
  */
 
-export const asBufferSource = (v: ArrayBufferView): BufferSource =>
-  v as unknown as BufferSource;
+/** TextDecoder and SubtleCrypto can reject a view into a shared Wasm memory in Chrome. */
+export function asBufferSource(v: ArrayBufferView): BufferSource {
+  if (v.buffer instanceof ArrayBuffer) return v as ArrayBufferView<ArrayBuffer>;
+  return new Uint8Array(v.buffer, v.byteOffset, v.byteLength).slice();
+}
 
 export const asBlobPart = (v: ArrayBufferView): BlobPart =>
   v as unknown as BlobPart;

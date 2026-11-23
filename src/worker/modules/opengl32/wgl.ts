@@ -169,7 +169,7 @@ export function createWglExports(
         const mem = ctx.process.getCurrentMemory();
         let end = namePtr;
         while (mem[end]) end++;
-        const name = new TextDecoder().decode(mem.subarray(namePtr, end));
+        const name = new TextDecoder().decode(mem.slice(namePtr, end));
         if (!name) return 0;
 
         // No current context => NULL, per the WGL contract (an entry point is only

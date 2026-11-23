@@ -24,8 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # vendor/v86 is a file: dependency of package.json — bun install needs
-          # the submodule checked out even though the gate never builds it.
+          # The quality gate also checks the optional legacy emulator against its source.
           submodules: true
           # NOT the default depth of 1. checkout passes fetch-depth straight through as
           # `git submodule update --depth=N`, and a shallow submodule fetch brings only the

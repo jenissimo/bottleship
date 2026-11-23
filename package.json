@@ -107,8 +107,7 @@
     "pako": "^3.0.1",
     "react": "19.2.7",
     "react-dom": "19.2.7",
-    "socket.io-client": "^4.8.1",
-    "v86": "file:vendor/v86"
+    "socket.io-client": "^4.8.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

@@ -1232,6 +1232,11 @@ export default function App() {
         { type: "module" }
       ));
 
+      const cpuQuery = new URLSearchParams(window.location.search);
+      if (cpuQuery.get("engine") === "wwt-hle" || cpuQuery.has("wwtMemory")) {
+        globalWorker.postMessage({ type: "set_cpu_backend", backend: "wwt", memory: cpuQuery.get("wwtMemory") });
+      }
+
       // Expose worker to console for debugging
       (window as any).worker = globalWorker;
 
@@ -1289,6 +1294,18 @@ export default function App() {
         }
         if (Object.keys(merged).length) console.info("[bs] replayed debug flags:", merged);
       } catch { /* corrupt/no flags */ }
+      const linkage = cpuQuery.get("wwtLinkage");
+      if (linkage === "full" || linkage === "page-local") {
+        globalWorker.postMessage({type: "set_debug_flag", key: "__wwtPeAotLinkage", value: linkage});
+      }
+      const aot = cpuQuery.get("wwtAot")?.trim().toLowerCase();
+      if (aot) {
+        const modules = aot.split(",").map(name => name.trim()).filter(Boolean);
+        globalWorker.postMessage({
+          type: "set_debug_flag", key: "__wwtPeAot",
+          value: aot === "learn" ? "learn" : aot === "on" ? true : aot === "off" ? false : modules,
+        });
+      }
       (window as any).dbgFlag = (key: string, value: unknown, opts?: { scope?: "session" | "global" }) => {
         if (key === "__hostTools" && !session) {
           throw new Error("dbgFlag('__hostTools', ...): a ?bs=<session> URL is required");

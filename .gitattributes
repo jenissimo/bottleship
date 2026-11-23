@@ -7,3 +7,6 @@
 # Linux TURN deployment files are also archived from Windows checkouts.
 /deploy/lan/start-turn.sh text eol=lf
 /deploy/lan/*.conf text eol=lf
+
+# A space is the context marker for a blank line in this unified diff.
+/tools/build-wwt-cpu/bottleship.patch text eol=lf whitespace=-blank-at-eol

@@ -9,11 +9,25 @@ upstream projects referenced here.
 
 ## Emulation core
 
-### v86 (`vendor/v86`, ships as `public/v86.wasm` + `libv86.mjs`)
+### WWT i386 compiler (`public/wwt-provider/wwt_wasm.wasm`)
+
+The CPU compiler comes from the `wwt` and `wwt-wasm` crates in
+[WebWindows](https://github.com/Glavin001/WebWindows/tree/5c845c1b45659cfb5ed00a0da5d3870025c022f3).
+Both crates inherit the workspace's MIT OR Apache-2.0 license. The packaged compiler
+uses the Apache-2.0 option. BottleShip modifications are in
+`tools/build-wwt-cpu/bottleship.patch`. The binary's license notices ship in
+`public/wwt-compiler-NOTICES.txt`. BottleShip supplies the worker and HLE.
+
+### v86 (legacy comparison build, `vendor/v86`, `public/v86.wasm` and `libv86.mjs`)
 - x86 CPU/system emulator. Git submodule of the BottleShip fork of
   [copy/v86](https://github.com/copy/v86).
 - **License:** BSD-2-Clause (see `vendor/v86/LICENSE`). Portions of the floppy
   code derive from QEMU and are MIT-licensed (`vendor/v86/LICENSE.MIT`).
+
+### BottleShip WWT kernels (`public/wwt-hypercall.wasm` + `wwt-d3d9-arena.wasm`)
+- Includes the RTTI implementation and D3D9 command arena from the BottleShip fork
+  of v86. The source snapshots, revision and BSD-2-Clause license are in
+  `tools/build-wwt-hypercall/reused/`.
 
 ### SeaBIOS (`public/bios/seabios.bin`)
 - Open-source x86 BIOS, redistributed as an unmodified binary as shipped with v86.

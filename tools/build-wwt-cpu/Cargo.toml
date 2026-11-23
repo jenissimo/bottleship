@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = ["crates/wwt","crates/wwt-wasm"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/glavin001/WebWindows"
+
+[workspace.dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "instr_info", "intel", "op_code_info", "block_encoder"] }
+wasm-encoder = "0.261"
+wasmparser = "0.261"
+wasmprinter = "0.261"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+opt-level = 1
+
+# iced-x86 measures instruction lengths by subtracting buffer pointers
+# truncated to u32, which wraps (correctly) when the buffer straddles a 4 GB
+# address boundary. Overflow checks turn that into a panic in debug builds
+# (an intermittent "attempt to subtract with overflow" in the decoder,
+# depending on where the allocator puts the buffer).
+[profile.dev.package.iced-x86]
+overflow-checks = false
+
+[profile.test.package.iced-x86]
+overflow-checks = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+
+[profile.release-wasm]
+inherits = "release"
+# The translator runs during guest code discovery. On real 16 KiB UT2004
+# windows, optimizing for speed reduced warm translation time by 30%
+# with byte-identical emitted modules and a 110 KiB gzip increase.
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

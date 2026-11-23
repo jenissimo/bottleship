@@ -1,0 +1,1914 @@
+--- a/crates/wwt/src/abi.rs
++++ b/crates/wwt/src/abi.rs
+@@ -62,13 +62,37 @@
+     /// Translated calls currently nested in WebAssembly calls on this
+     /// thread: past a limit a call unwinds to the dispatch loop instead.
+     pub const CALL_DEPTH: u32 = 376;
++    /// Cumulative retired i386 instructions, wrapping as a u32. PREEMPT_AT uses the same units.
++    pub const RETIRED_INSNS: u32 = 380;
+     /// Scratch space for the host and kernel.
+     pub const SCRATCH: u32 = 384;
++    /// Physical address of the 32-bit guest page directory, or zero for flat memory.
++    pub const PAGE_DIRECTORY: u32 = 416;
++    /// Guest RAM size under paging. The runtime's native memory follows guest RAM.
++    pub const PAGE_RAM_SIZE: u32 = 420;
++    /// Non-zero if the host has an MMIO aperture to service non-identity data.
++    pub const PAGE_HAS_MMIO: u32 = 424;
++    /// Scratch for up to 16 bytes transferred by one checked MMIO access.
++    pub const MMIO_DATA: u32 = 432;
++    /// Native identity-page cache; zero disables caching.
++    pub const PAGE_TLB: u32 = 448;
++    /// Bounds of code pages written by the instruction currently executing.
++    /// A zero end page means the range is empty.
++    pub const SMC_FIRST_PAGE: u32 = 456;
++    pub const SMC_END_PAGE: u32 = 460;
+     pub const SIZE: u32 = 512;
+ 
+     pub const fn gpr(i: u32) -> u32 {
+         GPR + i * 4
+     }
++}
++
++pub mod page_tlb {
++    /// Two u32 cache tags per slot (read/execute and write), indexed by guest page.
++    pub const SLOTS: u32 = 1024;
++    pub const BYTES: u32 = SLOTS * 8;
++    /// A 4 KiB directory followed by 1024 contiguous 4 KiB page tables.
++    pub const TABLE_BYTES: u32 = 0x401000;
+ }
+ 
+ /// The x86-64 CPU struct. It keeps every field of [`cpu`] that does not
+@@ -186,6 +210,11 @@
+     /// Not a Windows code: a general protection fault (far transfers and
+     /// selector loads); the host raises ACCESS_VIOLATION [0, 0xffffffff].
+     pub const GENERAL_PROTECTION: u32 = 0xE057_0005;
++    /// Plain i386 OUT DX,EAX: the portable handler can complete it without JS.
++    /// When the instruction exits via fault, info is 0 (not attempted) or -1 (declined).
++    pub const PORT_OUT32: u32 = 0xE057_0006;
++    pub const SMC_EVICT: u32 = 0xE057_0007;
++    pub const SMC_RESUME: u32 = 0xE057_0008;
+ }
+ 
+ /// Flags of an access in `TRAPS_SECTION`. With `OPERAND`, the x86
+@@ -204,8 +233,8 @@
+ 
+ /// Addresses with special meaning to the dispatcher.
+ pub mod addr {
+-    /// Lowest valid guest address; everything below is the null region.
+-    pub const NULL_LIMIT: u32 = 0x0001_0000;
++    /// BottleShip's page tables decide whether page zero is accessible.
++    pub const NULL_LIMIT: u32 = 0;
+     /// Returning to this address stops the dispatcher loop (used as the
+     /// return address of thread entry points).
+     pub const STOP: u32 = 0xFFFF_FFF0;
+@@ -269,6 +298,10 @@
+     /// points at an empty second-level table.
+     pub const CODE_PAGES: &str = "code_pages";
+     pub const FAULT: &str = "fault";
++    /// mmio(cpu, linear, size, write) -> failing linear address, or -1 for success.
++    pub const MMIO: &str = "mmio";
++    pub const HLE_OUT32: &str = "hle_out32";
++    pub const HLE_OUT32_CONFIG: &str = "hle_out32_config";
+     pub const MATH: &str = "math";
+     pub const SIN: &str = "sin";
+     pub const COS: &str = "cos";
+@@ -296,7 +329,7 @@
+ /// address, flags (`trap`) and the x86 memory operand's displacement.
+ pub const TRAPS_SECTION: &str = "wwt.traps";
+ /// Bumped whenever generated code changes incompatibly, to invalidate caches.
+-pub const ABI_VERSION: u32 = 11;
++pub const ABI_VERSION: u32 = 12;
+ /// Every translated module exports its lazy-flags evaluator under this
+ /// name: `(fk, fr, fa, fb, fc) -> eflags` (the arithmetic flags).
+ pub const EFLAGS_EXPORT: &str = "eflags";
+@@ -349,9 +382,18 @@
+         ("FAULT_ADDR", FAULT_ADDR),
+         ("RESUME", RESUME),
+         ("PREEMPT_AT", PREEMPT_AT),
++        ("RETIRED_INSNS", RETIRED_INSNS),
+         ("CODE_WRITABLE", CODE_WRITABLE),
+         ("CALL_DEPTH", CALL_DEPTH),
+         ("SCRATCH", SCRATCH),
++        ("PAGE_DIRECTORY", PAGE_DIRECTORY),
++        ("PAGE_RAM_SIZE", PAGE_RAM_SIZE),
++        ("PAGE_HAS_MMIO", PAGE_HAS_MMIO),
++        ("MMIO_DATA", MMIO_DATA),
++        ("PAGE_TLB", PAGE_TLB),
++        ("SMC_FIRST_PAGE", SMC_FIRST_PAGE),
++        ("SMC_END_PAGE", SMC_END_PAGE),
++        ("PAGE_TLB_SLOTS", page_tlb::SLOTS),
+         ("SIZE", SIZE),
+     ]
+     .into_iter()
+@@ -397,6 +439,9 @@
+         ("ACCESS_VIOLATION_WRITE", fault::ACCESS_VIOLATION_WRITE),
+         ("ACCESS_VIOLATION_EXECUTE", fault::ACCESS_VIOLATION_EXECUTE),
+         ("GENERAL_PROTECTION", fault::GENERAL_PROTECTION),
++        ("PORT_OUT32", fault::PORT_OUT32),
++        ("SMC_EVICT", fault::SMC_EVICT),
++        ("SMC_RESUME", fault::SMC_RESUME),
+     ]
+     .into_iter()
+     .collect();
+--- a/crates/wwt/src/codegen.rs
++++ b/crates/wwt/src/codegen.rs
+@@ -21,6 +21,9 @@
+ };
+ 
+ use crate::abi::{self, addr::NULL_LIMIT, cpu, cpu64, fault, imports, native_layout, store_map};
++
++#[path = "page_walk.rs"]
++mod page_walk;
+ use crate::discover::CodeSource;
+ use crate::flags::{self, E};
+ use crate::ir::*;
+@@ -36,6 +39,15 @@
+     /// instruction, with the registers as last written back.
+     pub mem_traps: bool,
+     pub smc_checks: bool,
++    pub smc_deopt: bool,
++    /// Route external 32-bit data mappings through the host MMIO bus.
++    pub guest_mmio: bool,
++    /// Use a bounded linear guest address space without per-page permissions.
++    pub guest_flat: bool,
++    /// Cache checked identity pages when the host supplies a native TLB.
++    pub guest_page_tlb: bool,
++    /// Keep the identity cache probe inline and share one slow page walker per module.
++    pub outline_page_walk: bool,
+     /// Import a 64-bit (memory64) memory. Guest addresses narrower than the
+     /// memory are zero-extended; with a 32-bit memory, x86-64 addresses are
+     /// checked against the guest limit and wrapped.
+@@ -62,6 +74,11 @@
+             mem_checks: true,
+             mem_traps: false,
+             smc_checks: true,
++            smc_deopt: false,
++            guest_mmio: false,
++            guest_flat: false,
++            guest_page_tlb: false,
++            outline_page_walk: false,
+             mem64: false,
+             guest_limit: None,
+             osr: true,
+@@ -92,6 +109,7 @@
+ const F_COS: u32 = 3;
+ const F_PREEMPT: u32 = 4;
+ const F_FIRST_NATIVE: u32 = 5;
++const F_MMIO: u32 = F_FIRST_NATIVE;
+ 
+ // Imported global indices.
+ const G_TABLE_BASE: u32 = 0;
+@@ -102,6 +120,8 @@
+ const G_TICK: u32 = 5;
+ /// 64-bit code only.
+ const G_CODE_PAGES: u32 = 6;
++/// i386 modules with a scalar native port call.
++const G_HLE_OUT32_CONFIG: u32 = 6;
+ 
+ /// Translated calls nested in WebAssembly calls before one returns to the
+ /// dispatch loop instead (`call_depth_enter`). Browsers give a worker
+@@ -153,6 +173,8 @@
+     /// The x86 code, to describe trapping accesses' memory operands in
+     /// `wwt.traps`.
+     code: Option<&'a dyn CodeSource>,
++    smc_pages: Option<Vec<u32>>,
++    has_hle_out32: bool,
+ }
+ 
+ impl<'a> ModuleGen<'a> {
+@@ -189,6 +211,9 @@
+             }
+         }
+         let code64 = cfg.mem64 && funcs.first().is_some_and(|f| f.mode == Mode::X64);
++        let has_hle_out32 = !cfg.mem64 && funcs.iter().any(|f| {
++            f.blocks.iter().any(|b| matches!(b.term, Term::Fault { code: fault::PORT_OUT32, .. }))
++        });
+         ModuleGen {
+             cfg,
+             func_index,
+@@ -198,6 +223,8 @@
+             natives,
+             names: HashMap::new(),
+             code: None,
++            smc_pages: None,
++            has_hle_out32,
+         }
+     }
+ 
+@@ -229,19 +256,39 @@
+     }
+ 
+     fn num_func_imports(&self) -> u32 {
+-        F_FIRST_NATIVE + self.natives.len() as u32
++        self.first_native() + self.natives.len() as u32
++    }
++
++    fn has_mmio(&self) -> bool {
++        self.cfg.guest_mmio && self.cfg.mem_checks && !self.cfg.mem64 && !self.code64
++    }
++
++    fn hle_out32_index(&self) -> u32 {
++        F_FIRST_NATIVE + u32::from(self.has_mmio())
++    }
++
++    fn first_native(&self) -> u32 {
++        self.hle_out32_index() + u32::from(self.has_hle_out32)
+     }
+ 
+     fn native_func_index(&self, name: &str) -> u32 {
+-        F_FIRST_NATIVE + self.natives.iter().position(|n| n.0 == name).unwrap() as u32
++        self.first_native() + self.natives.iter().position(|n| n.0 == name).unwrap() as u32
+     }
+ 
+     fn helper_func_index(&self, h: Helper) -> u32 {
+         self.num_func_imports() + self.helpers.iter().position(|x| *x == h).unwrap() as u32
+     }
+ 
++    fn outlines_page_walk(&self) -> bool {
++        self.cfg.outline_page_walk && !self.cfg.guest_flat && !self.cfg.mem64 && !self.code64
++    }
++
++    fn page_walk_index(&self) -> u32 {
++        self.num_func_imports() + self.helpers.len() as u32
++    }
++
+     fn translated_func_index(&self, i: u32) -> u32 {
+-        self.num_func_imports() + self.helpers.len() as u32 + i
++        self.page_walk_index() + u32::from(self.outlines_page_walk()) + i
+     }
+ 
+     pub fn direct_target(&self, addr: u64) -> Option<u32> {
+@@ -269,6 +316,11 @@
+     }
+ 
+     /// Generates the module bytes.
++    pub fn with_smc_pages(mut self, pages: Vec<u32>) -> Self {
++        self.smc_pages = Some(pages);
++        self
++    }
++
+     pub fn build(mut self, funcs: &[Function], meta_json: &str) -> Vec<u8> {
+         let mut module = Module::new();
+         let at = self.addr_type();
+@@ -357,7 +409,15 @@
+             imports::PREEMPT,
+             EntityType::Function(T_PREEMPT),
+         );
+-        // Native implementations follow (F_FIRST_NATIVE on).
++        if self.has_mmio() {
++            // With 32-bit memory, the fault signature is four i32 args and an i32 result.
++            imp.import(imports::MODULE, imports::MMIO, EntityType::Function(T_FAULT));
++        }
++        if self.has_hle_out32 {
++            // The i386 preempt import already has signature (i32, i32) -> i32.
++            imp.import(imports::MODULE, imports::HLE_OUT32, EntityType::Function(T_PREEMPT));
++        }
++        // Native implementations follow the optional MMIO and port imports.
+         for (&(n, _), &t) in self.natives.iter().zip(&native_type_idx) {
+             imp.import(imports::MODULE, n, EntityType::Function(t));
+         }
+@@ -394,6 +454,9 @@
+         if self.code64 {
+             globals.push(imports::CODE_PAGES);
+         }
++        if self.has_hle_out32 {
++            globals.push(imports::HLE_OUT32_CONFIG);
++        }
+         for name in globals {
+             imp.import(
+                 imports::MODULE,
+@@ -416,6 +479,10 @@
+         for &t in &helper_type_idx {
+             fsec.function(t);
+         }
++        if self.outlines_page_walk() {
++            // Same four i32 parameters and i32 result as the i386 fault import.
++            fsec.function(T_FAULT);
++        }
+         for _ in funcs {
+             fsec.function(T_FN);
+         }
+@@ -453,6 +520,9 @@
+                 _ => eflags,
+             };
+             code.function(&gen_helper(h, eflags));
++        }
++        if self.outlines_page_walk() {
++            code.function(&page_walk::generate());
+         }
+         let mut residue = Vec::with_capacity(funcs.len());
+         // Trapping accesses, at first by their offset in the code section's
+@@ -515,6 +585,12 @@
+             name: Cow::Borrowed(abi::META_SECTION),
+             data: Cow::Borrowed(meta_json.as_bytes()),
+         });
++        if let Some(pages) = self.smc_pages.take() {
++            module.section(&CustomSection {
++                name: Cow::Borrowed("wwt.smc_pages"),
++                data: Cow::Owned(pages.iter().flat_map(|page| page.to_le_bytes()).collect()),
++            });
++        }
+         // Per function, in table order (see `Residue`).
+         module.section(&CustomSection {
+             name: Cow::Borrowed(abi::RESIDUE_SECTION),
+@@ -555,6 +631,7 @@
+     /// The function, the emulation left in it and its trapping accesses.
+     fn gen_function_full(&self, f: &Function) -> (wasm_encoder::Function, Residue, Vec<TrapSite>) {
+         let fixed;
++        let mut osr_latches = Vec::new();
+         // Blocks from here on are made by the passes below, not lifted.
+         let lifted = f.blocks.len();
+         // Where the optimizer kept the state a preemption check writes back.
+@@ -569,7 +646,7 @@
+             }
+             reducible::make_reducible(&mut c);
+             if self.cfg.osr {
+-                crate::osr::add_reentry(&mut c);
++                osr_latches = crate::osr::add_reentry(&mut c);
+             }
+             fixed = c;
+             &fixed
+@@ -578,6 +655,7 @@
+         let mut g = FnGen::new(self, f, &a);
+         g.lifted = lifted;
+         g.preempt = preempt;
++        g.osr_latches = osr_latches;
+         g.irreducible = irreducible;
+         g.run();
+         let r = g.residue;
+@@ -705,7 +783,12 @@
+     pending: Vec<(V, Inst, StateMask)>,
+     /// Scratch for the store-map byte in code-write checks.
+     tmp_map: u32,
++    smc_pending: u32,
+     tmp_i32b: u32,
++    mmio_access: u32,
++    mmio_address: u32,
++    tlb_slot: u32,
++    tlb_write_start: u32,
+     tmp_i64: u32,
+     tmp_i64b: u32,
+     /// Scratch address in the memory's address type.
+@@ -717,6 +800,7 @@
+     /// `opt::preempt_points` of the lifted function, and whether it was
+     /// irreducible: where its back edges' state survived the optimizer.
+     preempt: Vec<bool>,
++    osr_latches: Vec<BlockId>,
+     irreducible: bool,
+     emitted: Vec<bool>,
+     /// Addresses whose guest-limit check passed, as (vreg, lo, hi): some
+@@ -774,13 +858,19 @@
+             use_count: vec![],
+             pending: vec![],
+             tmp_map: 0,
++            smc_pending: UNASSIGNED,
+             tmp_i32b: 0,
++            mmio_access: UNASSIGNED,
++            mmio_address: UNASSIGNED,
++            tlb_slot: UNASSIGNED,
++            tlb_write_start: UNASSIGNED,
+             tmp_i64: 0,
+             tmp_i64b: 0,
+             tmp_ma: 0,
+             label_local: 0,
+             lifted: n,
+             preempt: vec![],
++            osr_latches: vec![],
+             irreducible: false,
+             emitted: vec![false; n],
+             facts_local: vec![],
+@@ -801,7 +891,18 @@
+         }
+         g.fault_eip = g.new_local(m.code_type());
+         g.tmp_map = g.new_local(ValType::I32);
++        if m.cfg.smc_deopt && f.mode == Mode::X86 && !m.cfg.mem64 {
++            g.smc_pending = g.new_local(ValType::I32);
++        }
+         g.tmp_i32b = g.new_local(ValType::I32);
++        if m.has_mmio() && f.mode == Mode::X86 {
++            g.mmio_access = g.new_local(ValType::I32);
++            g.mmio_address = g.new_local(ValType::I32);
++        }
++        if m.cfg.guest_page_tlb && !m.cfg.mem64 && f.mode == Mode::X86 {
++            g.tlb_slot = g.new_local(ValType::I32);
++            g.tlb_write_start = g.new_local(ValType::I32);
++        }
+         g.tmp_i64 = g.new_local(ValType::I64);
+         // Scratch for 64-bit addresses, only in code that has them (keeps
+         // 32-bit output unchanged).
+@@ -1104,10 +1205,31 @@
+         self.emit(W::LocalGet(0));
+         self.emit(W::LocalGet(self.fault_eip));
+         self.store_eip();
++        let port_dispatch = code == fault::PORT_OUT32 && self.m.has_hle_out32;
++        // Execute the registered portable Wasm leaf directly. When it accepts
++        // the OUT, tail-dispatch the guest's continuation in this WASM stack.
++        // A rejected leaf has left native CPU state unchanged and the usual
++        // fault path can still hand the instruction to BottleShip's dispatcher.
++        if port_dispatch {
++            self.emit(W::GlobalGet(G_HLE_OUT32_CONFIG));
++            self.emit(W::LocalGet(0));
++            self.emit(W::Call(self.m.hle_out32_index()));
++            self.emit(W::LocalTee(self.tmp_i32));
++            self.emit(W::I32Const(1));
++            self.emit(W::I32Eq);
++            self.emit(W::If(BlockType::Empty));
++            self.emit(W::LocalGet(self.fault_eip));
++            self.emit(W::I32Const(1));
++            self.emit(W::I32Add);
++            let next = self.tmp_code();
++            self.emit(W::LocalSet(next));
++            self.call_lookup(next, true);
++            self.emit(W::End);
++        }
+         self.emit(W::LocalGet(0));
+         self.emit(W::I32Const(code as i32));
+         self.emit(W::LocalGet(self.fault_eip));
+-        self.emit(W::LocalGet(self.fault_info()));
++        self.emit(W::LocalGet(if port_dispatch { self.tmp_i32 } else { self.fault_info() }));
+         self.emit(W::Call(F_FAULT));
+         self.emit(W::Return);
+     }
+@@ -1340,6 +1462,10 @@
+             }
+         }
+         self.compute_max_of(&order);
++        // A cycle can cross translated function boundaries without traversing
++        // an internal back edge (e.g. dispatcher exits or indirect tail jumps).
++        // Incoming state is already in the CPU record at this point.
++        self.preempt_at(f.entry, 0);
+         // Entry: load live state.
+         let live = self.a.state_live_in(0) & ALL_STATE;
+         self.reload(live);
+@@ -1481,17 +1607,27 @@
+     /// if so, the loop's frames return the yield address and the thread
+     /// resumes at the loop header later. Two loads and a compare otherwise.
+     fn preempt_check(&mut self, src: BlockId, tgt: BlockId) {
+-        let Some(resume) = self.resume_addr(src, tgt) else {
+-            return;
+-        };
+-        self.emit(W::GlobalGet(G_TICK));
+-        self.emit(W::I32Load(memarg(0, 2)));
++        if let Some(resume) = self.resume_addr(src, tgt) {
++            self.preempt_at(resume, self.a.dirty_end[src as usize]);
++        }
++    }
++
++    fn preempt_at(&mut self, resume: u64, dirty: StateMask) {
++        if dirty & opt::state_bit(RETIRED) != 0 {
++            self.get(RETIRED);
++        } else {
++            self.emit(W::LocalGet(0));
++            self.emit(W::I32Load(memarg(cpu::RETIRED_INSNS, 2)));
++        }
+         self.emit(W::LocalGet(0));
+         self.emit(W::I32Load(memarg(cpu::PREEMPT_AT, 2)));
+-        self.emit(W::I32GeU);
++        // Signed distance permits instruction counter wrap during a short timeslice.
++        self.emit(W::I32Sub);
++        self.emit(W::I32Const(0));
++        self.emit(W::I32GeS);
+         self.emit(W::If(BlockType::Empty));
+         self.ctx.push(Ctx::If);
+-        self.sync(self.a.dirty_end[src as usize]);
++        self.sync(dirty);
+         self.emit(W::LocalGet(0));
+         self.code_const(resume);
+         self.emit(W::Call(F_PREEMPT));
+@@ -1577,6 +1713,11 @@
+     fn terminator(&mut self, x: BlockId) {
+         let blk = &self.f.blocks[x as usize];
+         let dirty = self.a.dirty_end[x as usize] & opt::term_sync(self.f, x);
++        if self.osr_latches.contains(&x) {
++            // Resume at the actual x86 loop header even if the next edge
++            // would re-enter this WASM function through the OSR selector.
++            self.preempt_at(blk.addr, self.a.dirty_end[x as usize]);
++        }
+         match blk.term.clone() {
+             Term::Jump(t) => self.do_branch(x, t),
+             Term::Branch { t, f, .. } if t == f => self.do_branch(x, t),
+@@ -2027,6 +2168,369 @@
+         }
+     }
+ 
++    fn tlb_tag(&mut self, address: u32) {
++        self.emit(W::LocalGet(address));
++        self.emit(W::I32Const(!0xfff));
++        self.emit(W::I32And);
++        self.emit(W::I32Const(1));
++        self.emit(W::I32Or);
++    }
++
++    /// Skip the slow walk when this access has a matching identity tag.
++    fn tlb_probe(&mut self, address: u32, write: bool, skip: u32) {
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::PAGE_TLB, 2)));
++        self.emit(W::LocalTee(self.tlb_slot));
++        self.emit(W::If(BlockType::Empty));
++        self.emit(W::LocalGet(self.tlb_slot));
++        self.emit(W::LocalGet(address));
++        self.emit(W::I32Const(9));
++        self.emit(W::I32ShrU);
++        self.emit(W::I32Const((abi::page_tlb::BYTES - 8) as i32));
++        self.emit(W::I32And);
++        self.emit(W::I32Add);
++        self.emit(W::LocalTee(self.tlb_slot));
++        self.emit(W::I32Load(memarg(if write { 4 } else { 0 }, 2)));
++        self.tlb_tag(address);
++        self.emit(W::I32Eq);
++        self.emit(W::BrIf(skip));
++        self.emit(W::End);
++    }
++
++    /// A guest can modify its directory or tables directly. Drop cached entries
++    /// before publishing a store to the contiguous page-table reservation.
++    fn tlb_before_write(&mut self, last: u32) {
++        self.emit(W::LocalGet(last));
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::PAGE_DIRECTORY, 2)));
++        self.emit(W::I32GeU);
++        self.emit(W::LocalGet(self.tlb_write_start));
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::PAGE_DIRECTORY, 2)));
++        self.emit(W::I32Const(abi::page_tlb::TABLE_BYTES as i32));
++        self.emit(W::I32Add);
++        self.emit(W::I32LtU);
++        self.emit(W::I32And);
++        self.emit(W::If(BlockType::Empty));
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::PAGE_TLB, 2)));
++        self.emit(W::LocalTee(self.tlb_slot));
++        self.emit(W::If(BlockType::Empty));
++        self.emit(W::LocalGet(self.tlb_slot));
++        self.emit(W::I32Const(0));
++        self.emit(W::I32Const(abi::page_tlb::BYTES as i32));
++        self.emit(W::MemoryFill(0));
++        self.emit(W::End);
++        self.emit(W::End);
++    }
++
++    fn walk_pages_outlined(
++        &mut self, address: u32, last: u32, scalar_width: Option<u8>, write: bool,
++        mmio: bool, dirty: StateMask, code: u32, eip: u64,
++    ) {
++        let use_tlb = self.tlb_slot != UNASSIGNED;
++        self.emit(W::Block(BlockType::Empty));
++        if let Some(width) = scalar_width.filter(|_| use_tlb) {
++            if width > 1 {
++                self.emit(W::LocalGet(address));
++                self.emit(W::LocalGet(last));
++                self.emit(W::I32Xor);
++                self.emit(W::I32Const(0x1000));
++                self.emit(W::I32LtU);
++                self.emit(W::If(BlockType::Empty));
++                self.tlb_probe(address, write, 2);
++                self.emit(W::End);
++            } else {
++                self.tlb_probe(address, write, 1);
++            }
++        }
++        let permission = if write { 3 } else { 1 };
++        let mode = permission | if mmio { page_walk::ALLOW_MMIO } else { 0 }
++            | if use_tlb { page_walk::USE_TLB } else { 0 };
++        self.emit(W::LocalGet(0));
++        self.emit(W::LocalGet(address));
++        self.emit(W::LocalGet(last));
++        self.emit(W::I32Const(mode));
++        self.emit(W::Call(self.m.page_walk_index()));
++        self.emit(W::LocalTee(self.tmp_map));
++        self.emit(W::I32Const(0));
++        self.emit(W::I32LtS);
++        self.emit(W::If(BlockType::Empty));
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::FAULT_ADDR, 2)));
++        self.emit(W::LocalSet(self.tmp_i32b));
++        self.raise(dirty & FAULT_SYNC, code, eip);
++        self.emit(W::End);
++        if mmio {
++            self.emit(W::LocalGet(self.tmp_map));
++            self.emit(W::LocalSet(self.mmio_access));
++        }
++        self.emit(W::End);
++        if use_tlb && write {
++            self.tlb_before_write(last);
++        }
++    }
++
++    /// Validate a guest address range against both levels of the 32-bit page
++    /// tables. The fault address advances to the first failing byte. External
++    /// mappings are eligible only for data operations serviced by MMIO.
++
++    fn check_paged_range(
++        &mut self,
++        addr: Option<V>,
++        offset: u32,
++        size: u8,
++        len: Option<V>,
++        code: u32,
++        mmio: bool,
++        dirty: StateMask,
++        eip: u64,
++    ) {
++        if self.m.cfg.guest_flat || self.mem64() || addr.is_some_and(|v| self.f.ty(v) != Ty::I32) {
++            return;
++        }
++
++        let address = self.tmp_i32b;
++        let last = self.tmp_i32;
++        let entry = self.tmp_map;
++        let write = code == fault::ACCESS_VIOLATION_WRITE;
++        let permission = if write { 3 } else { 1 };
++        let use_tlb = self.tlb_slot != UNASSIGNED;
++        let frame_mask = !0xfff;
++
++        if mmio {
++            self.emit(W::I32Const(0));
++            self.emit(W::LocalSet(self.mmio_access));
++        }
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::PAGE_DIRECTORY, 2)));
++        self.emit(W::If(BlockType::Empty));
++
++        if let Some(addr) = addr {
++            self.get(addr);
++            if offset != 0 {
++                self.emit(W::I32Const(offset as i32));
++                self.emit(W::I32Add);
++            }
++        } else {
++            self.emit(W::I32Const(eip as i32));
++        }
++        if mmio {
++            self.emit(W::LocalTee(self.mmio_address));
++        }
++        if use_tlb && write {
++            self.emit(W::LocalTee(self.tlb_write_start));
++        }
++        self.emit(W::LocalSet(address));
++
++        if let Some(len) = len {
++            self.get(len);
++            self.emit(W::If(BlockType::Empty));
++        }
++
++        self.emit(W::LocalGet(address));
++        if let Some(len) = len {
++            self.get(len);
++            self.emit(W::I32Const(1));
++            self.emit(W::I32Sub);
++            self.emit(W::I32Add);
++        } else if size != 1 {
++            self.emit(W::I32Const(size as i32 - 1));
++            self.emit(W::I32Add);
++        }
++        if self.m.outlines_page_walk() {
++            self.emit(W::LocalSet(last));
++            self.walk_pages_outlined(address, last, len.is_none().then_some(size), write, mmio, dirty, code, eip);
++            if len.is_some() {
++                self.emit(W::End);
++            }
++            self.emit(W::End);
++            return;
++        }
++
++        self.emit(W::LocalTee(last));
++        self.emit(W::LocalGet(address));
++        self.emit(W::I32LtU);
++        self.emit(W::If(BlockType::Empty));
++        self.raise(dirty & FAULT_SYNC, code, eip);
++        self.emit(W::End);
++
++        self.emit(W::Loop(BlockType::Empty));
++        if use_tlb {
++            self.emit(W::Block(BlockType::Empty));
++            self.tlb_probe(address, write, 1);
++        }
++
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::PAGE_DIRECTORY, 2)));
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::PAGE_RAM_SIZE, 2)));
++        self.emit(W::I32GeU);
++        self.emit(W::If(BlockType::Empty));
++        self.raise(dirty & FAULT_SYNC, code, eip);
++        self.emit(W::End);
++
++        self.emit(W::LocalGet(address));
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::PAGE_RAM_SIZE, 2)));
++        self.emit(W::I32GeU);
++        if NULL_LIMIT != 0 {
++            self.emit(W::LocalGet(address));
++            self.emit(W::I32Const(NULL_LIMIT as i32));
++            self.emit(W::I32LtU);
++            self.emit(W::I32Or);
++        }
++        self.emit(W::If(BlockType::Empty));
++        self.raise(dirty & FAULT_SYNC, code, eip);
++        self.emit(W::End);
++
++        // PDE = page_directory[(address >> 22)]. The runtime supplies a
++        // page-aligned directory. PS entries require another MMU mode.
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::PAGE_DIRECTORY, 2)));
++        self.emit(W::LocalGet(address));
++        self.emit(W::I32Const(22));
++        self.emit(W::I32ShrU);
++        self.emit(W::I32Const(2));
++        self.emit(W::I32Shl);
++        self.emit(W::I32Add);
++        self.emit(W::I32Load(memarg(0, 2)));
++        self.emit(W::LocalTee(entry));
++        self.emit(W::I32Const(permission | 0x80));
++        self.emit(W::I32And);
++        self.emit(W::I32Const(permission));
++        self.emit(W::I32Ne);
++        self.emit(W::LocalGet(entry));
++        self.emit(W::I32Const(frame_mask));
++        self.emit(W::I32And);
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::PAGE_RAM_SIZE, 2)));
++        self.emit(W::I32GeU);
++        self.emit(W::I32Or);
++        self.emit(W::If(BlockType::Empty));
++        self.raise(dirty & FAULT_SYNC, code, eip);
++        self.emit(W::End);
++
++        if use_tlb {
++            // Cache only PDEs that still point into the managed contiguous tables.
++            self.emit(W::LocalGet(entry));
++            self.emit(W::I32Const(frame_mask));
++            self.emit(W::I32And);
++            self.emit(W::LocalGet(0));
++            self.emit(W::I32Load(memarg(cpu::PAGE_DIRECTORY, 2)));
++            self.emit(W::LocalGet(address));
++            self.emit(W::I32Const(22));
++            self.emit(W::I32ShrU);
++            self.emit(W::I32Const(12));
++            self.emit(W::I32Shl);
++            self.emit(W::I32Add);
++            self.emit(W::I32Const(0x1000));
++            self.emit(W::I32Add);
++            self.emit(W::I32Ne);
++            self.emit(W::If(BlockType::Empty));
++            self.emit(W::I32Const(0));
++            self.emit(W::LocalSet(self.tlb_slot));
++            self.emit(W::End);
++        }
++
++        // PTE = page_table[(address >> 12) & 1023]. Check permissions before
++        // selecting identity RAM or a host-owned external data mapping.
++        self.emit(W::LocalGet(entry));
++        self.emit(W::I32Const(frame_mask));
++        self.emit(W::I32And);
++        self.emit(W::LocalGet(address));
++        self.emit(W::I32Const(10));
++        self.emit(W::I32ShrU);
++        self.emit(W::I32Const(0xffc));
++        self.emit(W::I32And);
++        self.emit(W::I32Add);
++        self.emit(W::I32Load(memarg(0, 2)));
++        if mmio {
++            self.emit(W::LocalTee(entry));
++            self.emit(W::I32Const(permission));
++            self.emit(W::I32And);
++            self.emit(W::I32Const(permission));
++            self.emit(W::I32Ne);
++            self.emit(W::If(BlockType::Empty));
++            self.raise(dirty & FAULT_SYNC, code, eip);
++            self.emit(W::End);
++            self.emit(W::LocalGet(entry));
++        }
++        self.emit(W::I32Const(if mmio { frame_mask } else { frame_mask | permission }));
++        self.emit(W::I32And);
++        self.emit(W::LocalGet(address));
++        self.emit(W::I32Const(frame_mask));
++        self.emit(W::I32And);
++        if !mmio {
++            self.emit(W::I32Const(permission));
++            self.emit(W::I32Or);
++        }
++        self.emit(W::I32Ne);
++        self.emit(W::If(BlockType::Empty));
++        if mmio {
++            // Non-identity mappings inside RAM are outside the supported layout.
++            // External data pages require an MMIO bus; the host validates every
++            // byte belongs to a registered aperture before the actual access.
++            self.emit(W::LocalGet(entry));
++            self.emit(W::I32Const(frame_mask));
++            self.emit(W::I32And);
++            self.emit(W::LocalGet(0));
++            self.emit(W::I32Load(memarg(cpu::PAGE_RAM_SIZE, 2)));
++            self.emit(W::I32LtU);
++            self.emit(W::LocalGet(0));
++            self.emit(W::I32Load(memarg(cpu::PAGE_HAS_MMIO, 2)));
++            self.emit(W::I32Eqz);
++            self.emit(W::I32Or);
++            self.emit(W::If(BlockType::Empty));
++            self.raise(dirty & FAULT_SYNC, code, eip);
++            self.emit(W::End);
++            self.emit(W::I32Const(1));
++            self.emit(W::LocalSet(self.mmio_access));
++        } else {
++            self.raise(dirty & FAULT_SYNC, code, eip);
++        }
++        if use_tlb {
++            self.emit(W::Else);
++            self.emit(W::LocalGet(self.tlb_slot));
++            self.emit(W::If(BlockType::Empty));
++            // A successful write walk also establishes readability.
++            self.emit(W::LocalGet(self.tlb_slot));
++            self.tlb_tag(address);
++            self.emit(W::I32Store(memarg(0, 2)));
++            if write {
++                self.emit(W::LocalGet(self.tlb_slot));
++                self.tlb_tag(address);
++                self.emit(W::I32Store(memarg(4, 2)));
++            }
++            self.emit(W::End);
++        }
++        self.emit(W::End);
++        if use_tlb {
++            self.emit(W::End);
++        }
++
++        if size != 1 || len.is_some() {
++            self.emit(W::LocalGet(address));
++            self.emit(W::I32Const(frame_mask));
++            self.emit(W::I32And);
++            self.emit(W::I32Const(0x1000));
++            self.emit(W::I32Add);
++            self.emit(W::LocalTee(address));
++            self.emit(W::LocalGet(last));
++            self.emit(W::I32LeU);
++            self.emit(W::BrIf(0));
++        }
++        self.emit(W::End);
++        if use_tlb && write {
++            self.tlb_before_write(last);
++        }
++
++        if len.is_some() {
++            self.emit(W::End);
++        }
++        self.emit(W::End);
++    }
++
+     /// Emits an address check for the access at vreg `v` + `off`.
+     fn check_addr(&mut self, v: V, off: u32, write: bool, dirty: StateMask, eip: u64) {
+         self.residue.checks += 1;
+@@ -2090,6 +2594,64 @@
+     /// `ma` is a local holding the address in the memory's address type;
+     /// with 64-bit memory it must have passed the address check (the store
+     /// map covers the guest region).
++    fn smc_store_end(&mut self, ma: u32, off: u32, size: u8) {
++        if self.smc_pending == UNASSIGNED || size <= 1 {
++            return;
++        }
++        self.emit(W::LocalGet(ma));
++        // A wrapped end must fail the normal guest-range check before this.
++        if off != 0 {
++            self.emit(W::I32Const(off as i32));
++            self.emit(W::I32Add);
++        }
++        self.emit(W::I32Const(0xfff));
++        self.emit(W::I32And);
++        self.emit(W::I32Const(0x1000 - size as i32));
++        self.emit(W::I32GtU);
++        self.emit(W::If(BlockType::Empty));
++        self.check_code_write(ma, off + size as u32 - 1);
++        self.emit(W::End);
++    }
++
++    fn smc_atomic_write(&mut self, addr: V, mem: &Mem, dirty: StateMask, eip: u64) {
++        if self.smc_pending == UNASSIGNED || mem.space == Space::Native {
++            return;
++        }
++        self.check_addr(addr, mem.offset, true, dirty, eip);
++        self.check_store_map(addr, mem.offset, mem.size, dirty, eip);
++    }
++
++    /// Accumulate a pending code write without introducing a call at every store.
++    fn smc_note_page(&mut self, page: u32) {
++        self.emit(W::I32Const(1));
++        self.emit(W::LocalSet(self.smc_pending));
++        let end = self.tmp_map;
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::SMC_END_PAGE, 2)));
++        self.emit(W::LocalTee(end));
++        self.emit(W::I32Eqz);
++        self.emit(W::LocalGet(page));
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::SMC_FIRST_PAGE, 2)));
++        self.emit(W::I32LtU);
++        self.emit(W::I32Or);
++        self.emit(W::If(BlockType::Empty));
++        self.emit(W::LocalGet(0));
++        self.emit(W::LocalGet(page));
++        self.emit(W::I32Store(memarg(cpu::SMC_FIRST_PAGE, 2)));
++        self.emit(W::End);
++        self.emit(W::LocalGet(page));
++        self.emit(W::LocalGet(end));
++        self.emit(W::I32GeU);
++        self.emit(W::If(BlockType::Empty));
++        self.emit(W::LocalGet(0));
++        self.emit(W::LocalGet(page));
++        self.emit(W::I32Const(1));
++        self.emit(W::I32Add);
++        self.emit(W::I32Store(memarg(cpu::SMC_END_PAGE, 2)));
++        self.emit(W::End);
++    }
++
+     fn check_code_write(&mut self, ma: u32, off: u32) {
+         if self.mem64() {
+             // page = (ma + off) >> 12; L1 entries are 8 bytes. A page with
+@@ -2162,10 +2724,13 @@
+         self.emit(W::I32Const(!(store_map::CODE as i32)));
+         self.emit(W::I32And);
+         self.emit(W::I32Store8(memarg(o, 0)));
++        if self.smc_pending != UNASSIGNED {
++            self.smc_note_page(a);
++        }
+         self.emit(W::End);
+     }
+ 
+-    /// The checks before a plain store: one store-map lookup on the fast
++    /// Checks before a plain store: one store-map lookup on the fast
+     /// path; pages that need more (code, the null region, the guest limit)
+     /// get the precise address check and the code-write notification.
+     /// The host hears about a code write before the store happens, which is
+@@ -2177,7 +2742,7 @@
+     /// 64-bit addresses (x86-64 code, or a 64-bit memory) have no fast
+     /// path: the map covers only the guest region, so the address is
+     /// checked first, then the map's CODE bit.
+-    fn check_store(&mut self, v: V, off: u32, covered: bool, dirty: StateMask, eip: u64) {
++    fn check_store(&mut self, v: V, off: u32, size: u8, covered: bool, dirty: StateMask, eip: u64) {
+         let (mem, smc) = (self.m.cfg.mem_checks, self.m.cfg.smc_checks);
+         let plain = mem && !covered;
+         if !smc {
+@@ -2194,9 +2759,14 @@
+             self.check_code_write(la, off);
+             return;
+         }
++        if self.smc_pending != UNASSIGNED {
++            // This embedder may execute writable pages. The map is always authoritative.
++            self.check_store_map(v, off, size, dirty, eip);
++            return;
++        }
+         self.code_writable();
+         self.emit(W::If(BlockType::Empty));
+-        self.check_store_map(v, off, dirty, eip);
++        self.check_store_map(v, off, size, dirty, eip);
+         if plain {
+             self.emit(W::Else);
+             self.check_addr(v, off, true, dirty, eip);
+@@ -2212,7 +2782,7 @@
+ 
+     /// The store-map path of a 32-bit store: one lookup; pages that need
+     /// more get the precise address check and the code-write notification.
+-    fn check_store_map(&mut self, v: V, off: u32, dirty: StateMask, eip: u64) {
++    fn check_store_map(&mut self, v: V, off: u32, size: u8, dirty: StateMask, eip: u64) {
+         self.residue.store_maps += 1;
+         let mem = self.m.cfg.mem_checks;
+         let addr = self.local_of[v as usize];
+@@ -2231,6 +2801,7 @@
+             self.residue.checks -= 1;
+         }
+         self.check_code_write(addr, off);
++        self.smc_store_end(addr, off, size);
+         self.emit(W::End);
+     }
+ 
+@@ -2272,6 +2843,41 @@
+         mem.space == Space::Guest && self.m.cfg.mem_checks
+     }
+ 
++    fn mmio_candidate(&self, addr: V, mem: &Mem) -> bool {
++        self.mmio_access != UNASSIGNED && self.needs_check(mem) && !mem.atomic && self.f.ty(addr) == Ty::I32
++    }
++
++    /// Calls the host after page validation, using native CPU scratch to transfer
++    /// values of any width without converting floats or SIMD lanes.
++    fn mmio_transfer(&mut self, size: u8, write: bool, dirty: StateMask, eip: u64) {
++        self.sync(dirty & opt::state_bit(RETIRED));
++        self.emit(W::LocalGet(0));
++        self.emit(W::LocalGet(self.mmio_address));
++        self.emit(W::I32Const(size as i32));
++        self.emit(W::I32Const(i32::from(write)));
++        self.emit(W::Call(F_MMIO));
++        self.emit(W::LocalTee(self.tmp_i32b));
++        self.emit(W::I32Const(-1));
++        self.emit(W::I32Ne);
++        self.emit(W::If(BlockType::Empty));
++        self.raise(dirty & FAULT_SYNC, Self::av_code(write), eip);
++        self.emit(W::End);
++    }
++
++    fn effective_addr32(&mut self, addr: V, offset: u32) {
++        self.get(addr);
++        if offset != 0 {
++            self.emit(W::I32Const(offset as i32));
++            self.emit(W::I32Add);
++        }
++    }
++
++    fn mmio_scratch_address(&mut self) {
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Const(cpu::MMIO_DATA as i32));
++        self.emit(W::I32Add);
++    }
++
+     fn inst(&mut self, inst: &Inst, dirty: StateMask) {
+         self.inst_value(inst, dirty, false);
+     }
+@@ -2279,7 +2885,38 @@
+     /// Emits `inst`; with `keep`, its value stays on the stack instead of
+     /// going to its local (a stackified value, emitted at its use).
+     fn inst_value(&mut self, inst: &Inst, dirty: StateMask, keep: bool) {
++        // The embedder handles engine traps outside the fault blocks.
++        if self.m.cfg.mem_traps && inst.op.may_fault() {
++            self.sync(dirty & opt::state_bit(RETIRED));
++        }
+         let ty = inst.dst.map(|d| self.f.ty(d));
++        if self.m.cfg.guest_flat {
++            if let Op::Load { addr, mem } | Op::Store { addr, mem, .. } = &inst.op {
++                if matches!(mem.space, Space::Trusted | Space::GuardedTrusted) && !self.check_covered(*addr, mem.offset) {
++                    self.check_addr(*addr, mem.offset, matches!(inst.op, Op::Store { .. }), dirty, inst.eip);
++                    self.checked(*addr, mem.offset);
++                }
++            }
++        }
++        match &inst.op {
++            Op::Load { addr, mem } | Op::Store { addr, mem, .. }
++            | Op::AtomicRmw { addr, mem, .. } | Op::AtomicCmpxchg { addr, mem, .. }
++                if self.needs_check(mem) =>
++            {
++                let code = Self::av_code(!matches!(inst.op, Op::Load { .. }));
++                let mmio = self.mmio_candidate(*addr, mem)
++                    && matches!(inst.op, Op::Load { .. } | Op::Store { .. });
++                self.check_paged_range(Some(*addr), mem.offset, mem.size, None, code, mmio, dirty, inst.eip);
++            }
++            Op::MemCopy { dst, src, len } if self.m.cfg.mem_checks => {
++                self.check_paged_range(Some(*src), 0, 0, Some(*len), fault::ACCESS_VIOLATION, false, dirty, inst.eip);
++                self.check_paged_range(Some(*dst), 0, 0, Some(*len), fault::ACCESS_VIOLATION_WRITE, false, dirty, inst.eip);
++            }
++            Op::MemFill { dst, len, .. } if self.m.cfg.mem_checks => {
++                self.check_paged_range(Some(*dst), 0, 0, Some(*len), fault::ACCESS_VIOLATION_WRITE, false, dirty, inst.eip);
++            }
++            _ => {}
++        }
+         match &inst.op {
+             Op::Const(c) => {
+                 let c = *c;
+@@ -2306,6 +2943,20 @@
+                 self.get(*f);
+                 self.get(*cond);
+                 self.emit(W::Select);
++            }
++            Op::Load { addr, mem } if self.mmio_candidate(*addr, mem) => {
++                self.emit(W::LocalGet(self.mmio_access));
++                self.emit(W::If(BlockType::Result(ValType::I32)));
++                self.mmio_transfer(mem.size, false, dirty, inst.eip);
++                self.mmio_scratch_address();
++                self.emit(W::Else);
++                if !self.check_covered(*addr, mem.offset) {
++                    self.check_addr(*addr, mem.offset, false, dirty, inst.eip);
++                    self.checked(*addr, mem.offset);
++                }
++                self.effective_addr32(*addr, mem.offset);
++                self.emit(W::End);
++                self.emit(load_instr(ty.unwrap(), &Mem { offset: 0, ..*mem }, false));
+             }
+             Op::Load { addr, mem }
+                 if self.trap_access(*addr, mem) && !self.check_covered(*addr, mem.offset) =>
+@@ -2339,10 +2990,27 @@
+                     self.emit(load_instr(ty, mem, mem.atomic));
+                 }
+             }
++            Op::Store { addr, val, mem } if self.mmio_candidate(*addr, mem) => {
++                self.emit(W::LocalGet(self.mmio_access));
++                self.emit(W::If(BlockType::Result(ValType::I32)));
++                self.mmio_scratch_address();
++                self.emit(W::Else);
++                let covered = self.check_covered(*addr, mem.offset);
++                self.check_store(*addr, mem.offset, mem.size, covered, dirty, inst.eip);
++                self.checked(*addr, mem.offset);
++                self.effective_addr32(*addr, mem.offset);
++                self.emit(W::End);
++                self.get(*val);
++                self.emit(store_instr(self.f.ty(*val), &Mem { offset: 0, ..*mem }, false));
++                self.emit(W::LocalGet(self.mmio_access));
++                self.emit(W::If(BlockType::Empty));
++                self.mmio_transfer(mem.size, true, dirty, inst.eip);
++                self.emit(W::End);
++            }
+             Op::Store { addr, val, mem }
+                 if self.trap_access(*addr, mem) && !self.check_covered(*addr, mem.offset) =>
+             {
+-                self.check_store(*addr, mem.offset, true, dirty, inst.eip);
++                self.check_store(*addr, mem.offset, mem.size, true, dirty, inst.eip);
+                 let la = self.addr_local(*addr);
+                 self.trap_addr(la, mem.offset);
+                 self.get(*val);
+@@ -2353,12 +3021,15 @@
+             Op::Store { addr, val, mem } => {
+                 if mem.space == Space::Guest {
+                     let covered = self.check_covered(*addr, mem.offset);
+-                    self.check_store(*addr, mem.offset, covered, dirty, inst.eip);
++                    self.check_store(*addr, mem.offset, mem.size, covered, dirty, inst.eip);
+                     if self.m.cfg.mem_checks {
+                         self.checked(*addr, mem.offset);
+                     }
+                 }
+                 let la = self.addr_local(*addr);
++                if self.smc_pending != UNASSIGNED && matches!(mem.space, Space::Trusted | Space::GuardedTrusted) {
++                    self.check_store(*addr, mem.offset, mem.size, false, dirty, inst.eip);
++                }
+                 let vty = self.f.ty(*val);
+                 if mem.atomic && mem.size > 1 {
+                     self.misaligned(la, mem.offset, mem.size);
+@@ -2379,9 +3050,10 @@
+                 }
+             }
+             Op::AtomicRmw { op, addr, val, mem } => {
+-                if mem.space == Space::Guest && self.m.cfg.mem_checks {
++                if self.smc_pending == UNASSIGNED && mem.space == Space::Guest && self.m.cfg.mem_checks {
+                     self.check_addr(*addr, mem.offset, true, dirty, inst.eip);
+                 }
++                self.smc_atomic_write(*addr, mem, dirty, inst.eip);
+                 let mut la = self.addr_local(*addr);
+                 // The result may take over the address's local (the address
+                 // dies here), but the code-write check below still needs the
+@@ -2439,7 +3111,7 @@
+                     self.emit(rmw_instr(*op, mem, wide));
+                     self.emit(W::End);
+                 }
+-                if mem.space == Space::Guest && self.m.cfg.smc_checks {
++                if mem.space == Space::Guest && self.m.cfg.smc_checks && self.smc_pending == UNASSIGNED {
+                     if let Some(d) = inst.dst {
+                         self.set(d);
+                     } else {
+@@ -2458,9 +3130,10 @@
+                 new,
+                 mem,
+             } => {
+-                if mem.space == Space::Guest && self.m.cfg.mem_checks {
++                if self.smc_pending == UNASSIGNED && mem.space == Space::Guest && self.m.cfg.mem_checks {
+                     self.check_addr(*addr, mem.offset, true, dirty, inst.eip);
+                 }
++                self.smc_atomic_write(*addr, mem, dirty, inst.eip);
+                 let la = self.addr_local(*addr);
+                 let ty = ty.unwrap_or(Ty::I32);
+                 let (tmp, eq) = if ty == Ty::I64 {
+@@ -2562,6 +3235,21 @@
+                     }
+                     self.emit(vec_instr(op));
+                 }
++            }
++            Op::SmcBarrier(next) => {
++                self.emit(W::LocalGet(self.smc_pending));
++                self.emit(W::If(BlockType::Empty));
++                self.sync(dirty);
++                self.emit(W::LocalGet(0));
++                self.emit(W::I32Const(abi::fault::SMC_RESUME as i32));
++                self.get_code(*next);
++                self.emit(W::I32Const(0));
++                self.emit(W::Call(F_FAULT));
++                self.emit(W::Return);
++                self.emit(W::End);
++            }
++            Op::CheckFetch { size } => {
++                self.check_paged_range(None, 0, *size, None, fault::ACCESS_VIOLATION_EXECUTE, false, dirty, inst.eip);
+             }
+             Op::FaultIf { cond, code, info } => {
+                 self.get(*cond);
+@@ -2653,7 +3341,7 @@
+                 }
+                 deferred[j] = true;
+                 let (sub, sub_effects) = FnGen::stack_operands(&p.op);
+-                cursor = claim(blk, deferred, one_use, &sub, sub_effects, j);
++                cursor = claim(blk, deferred, one_use, &sub, effects && sub_effects, j);
+             }
+             cursor
+         }
+@@ -2701,20 +3389,15 @@
+             self.emit(W::End);
+             return;
+         }
+-        // fault if addr < NULL_LIMIT || addr + len > guest_limit || overflow
++        // Widen before adding: a wrapping REP length must never reach native memory.
+         self.get(addr);
+-        self.emit(W::LocalSet(self.tmp_i32b));
+-        self.get(addr);
+-        self.emit(W::I32Const(NULL_LIMIT as i32));
+-        self.emit(W::I32LtU);
+-        self.get(addr);
++        self.emit(W::LocalTee(self.tmp_i32b));
++        self.emit(W::I64ExtendI32U);
+         self.get(len);
+-        self.emit(W::I32Add);
+-        self.emit(W::I32Const(NULL_LIMIT as i32));
+-        self.emit(W::I32Sub);
+-        self.guest_check_value();
+-        self.emit(W::I32GtU);
+-        self.emit(W::I32Or);
++        self.emit(W::I64ExtendI32U);
++        self.emit(W::I64Add);
++        self.guest_check_i64();
++        self.emit(W::I64GtU);
+         self.emit(W::If(BlockType::Empty));
+         self.raise(dirty & FAULT_SYNC, Self::av_code(write), eip);
+         self.emit(W::End);
+--- a/crates/wwt/src/ir.rs
++++ b/crates/wwt/src/ir.rs
+@@ -78,6 +78,8 @@
+ pub const MXCSR: V = 19;
+ /// xmm0..xmm7.
+ pub const XMM0: V = 20;
++/// Cumulative retired guest instructions, flushed with architectural state.
++pub const RETIRED: V = 28;
+ /// The CPU struct pointer (the function's parameter). Never written.
+ pub const CPU: V = 31;
+ /// mm0..mm7 (MMX), as i64.
+@@ -156,6 +158,7 @@
+         FPU_SW => (cpu::FPU_SW, Ty::I32),
+         MXCSR => (cpu::MXCSR, Ty::I32),
+         XMM0..=27 => (cpu::XMM + (v - XMM0) * 16, Ty::V128),
++        RETIRED => (cpu::RETIRED_INSNS, Ty::I32),
+         MM0..=39 => (cpu::MMX + (v - MM0) * 8, Ty::I64),
+         _ => return None,
+     })
+@@ -178,7 +181,7 @@
+     const NAMES: [&str; 32] = [
+         "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "fk", "fr", "fa", "fb", "fc", "df",
+         "fsbase", "gsbase", "ftop", "fcw", "fsw", "mxcsr", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4",
+-        "xmm5", "xmm6", "xmm7", "s28", "s29", "s30", "cpu",
++        "xmm5", "xmm6", "xmm7", "retired", "s29", "s30", "cpu",
+     ];
+     const NAMES64: [&str; 16] = [
+         "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "xmm8", "xmm9", "xmm10", "xmm11",
+@@ -437,6 +440,8 @@
+     /// Guest memory the translator trusts: the stack and constant addresses
+     /// in data sections. No null checks and no code-write checks.
+     Trusted,
++    /// Trusted address with an explicit guest bounds check.
++    GuardedTrusted,
+     /// The native region (CPU struct and runtime tables). Never checked.
+     Native,
+ }
+@@ -761,6 +766,10 @@
+     },
+     /// A 128-bit vector operation.
+     Vec(VecOp, Vec<V>),
++    /// Checks the mapped pages covering instruction bytes at Inst::eip.
++    CheckFetch { size: u8 },
++    /// Leave the compiled stack after a completed instruction invalidated code.
++    SmcBarrier(V),
+     /// Raises a fault when `cond` is non-zero, after writing back registers.
+     FaultIf {
+         cond: V,
+@@ -773,8 +782,8 @@
+     /// Registers read by the operation.
+     pub fn uses(&self) -> Vec<V> {
+         match self {
+-            Op::Const(_) | Op::Cond(_) | Op::Eflags => vec![],
+-            Op::Copy(a) | Op::Un(_, a) => vec![*a],
++            Op::Const(_) | Op::Cond(_) | Op::Eflags | Op::CheckFetch { .. } => vec![],
++            Op::Copy(a) | Op::Un(_, a) | Op::SmcBarrier(a) => vec![*a],
+             Op::Bin(_, a, b) => vec![*a, *b],
+             Op::Select { cond, t, f } => vec![*cond, *t, *f],
+             Op::Load { addr, .. } => vec![*addr],
+@@ -797,8 +806,8 @@
+ 
+     pub fn uses_mut(&mut self) -> Vec<&mut V> {
+         match self {
+-            Op::Const(_) | Op::Cond(_) | Op::Eflags => vec![],
+-            Op::Copy(a) | Op::Un(_, a) => vec![a],
++            Op::Const(_) | Op::Cond(_) | Op::Eflags | Op::CheckFetch { .. } => vec![],
++            Op::Copy(a) | Op::Un(_, a) | Op::SmcBarrier(a) => vec![a],
+             Op::Bin(_, a, b) => vec![a, b],
+             Op::Select { cond, t, f } => vec![cond, t, f],
+             Op::Load { addr, .. } => vec![addr],
+@@ -827,9 +836,11 @@
+             | Op::AtomicCmpxchg { .. }
+             | Op::MemCopy { .. }
+             | Op::MemFill { .. }
++            | Op::CheckFetch { .. }
++            | Op::SmcBarrier(_)
+             | Op::FaultIf { .. } => true,
+             // Checked guest loads can fault; atomic loads order memory.
+-            Op::Load { mem, .. } => mem.atomic || mem.space == Space::Guest,
++            Op::Load { mem, .. } => mem.atomic || matches!(mem.space, Space::Guest | Space::GuardedTrusted),
+             Op::Bin(op, _, _) => op.can_trap(),
+             _ => false,
+         }
+@@ -838,11 +849,11 @@
+     /// Operations that may raise a guest fault.
+     pub fn may_fault(&self) -> bool {
+         match self {
+-            Op::FaultIf { .. } => true,
++            Op::FaultIf { .. } | Op::CheckFetch { .. } | Op::SmcBarrier(_) => true,
+             Op::Load { mem, .. }
+             | Op::Store { mem, .. }
+             | Op::AtomicRmw { mem, .. }
+-            | Op::AtomicCmpxchg { mem, .. } => mem.space == Space::Guest,
++            | Op::AtomicCmpxchg { mem, .. } => matches!(mem.space, Space::Guest | Space::GuardedTrusted),
+             Op::MemCopy { .. } | Op::MemFill { .. } => true,
+             _ => false,
+         }
+@@ -1243,6 +1254,7 @@
+     let space = match m.space {
+         Space::Guest => "",
+         Space::Trusted => ".trusted",
++        Space::GuardedTrusted => ".guarded_trusted",
+         Space::Native => ".native",
+     };
+     let sign = if m.signed { "s" } else { "" };
+@@ -1334,7 +1346,9 @@
+                 }
+                 write!(f, ")")
+             }
+-            Op::FaultIf { cond, code, info } => {
++            Op::SmcBarrier(next) => write!(f, "smc_barrier v{next}"),
++            Op::CheckFetch { size } => write!(f, "check_fetch {size}"),
++        Op::FaultIf { cond, code, info } => {
+                 write!(
+                     f,
+                     "fault_if {} code={code:#x} info={}",
+--- a/crates/wwt/src/lift.rs
++++ b/crates/wwt/src/lift.rs
+@@ -60,6 +60,7 @@
+     pub mem_checks: bool,
+     /// Emit code-page checks on stores that might modify translated code.
+     pub smc_checks: bool,
++    pub smc_deopt: bool,
+     /// Make every guest memory access atomic (strict memory ordering).
+     pub strict_ordering: bool,
+     /// Upper bound on x86 basic blocks per function before splitting.
+@@ -81,6 +82,7 @@
+         LiftConfig {
+             mem_checks: true,
+             smc_checks: true,
++            smc_deopt: false,
+             strict_ordering: false,
+             max_blocks: 4000,
+             mode: Mode::X86,
+@@ -1110,14 +1112,63 @@
+             });
+             return;
+         }
++        let mut pending = 0;
++        let mut checked_page = None;
+         for i in &insts {
+             self.eip = i.ip();
+             self.next = i.next_ip();
+-            if !self.lift_inst(i) {
+-                // The instruction ended the block (control flow or fault).
++            let first_page = self.eip >> 12;
++            let last_page = (self.eip + i.len() as u64 - 1) >> 12;
++            if !self.x64() && !self.f.mem64 && (checked_page != Some(first_page) || first_page != last_page) {
++                self.retire_group(pending);
++                pending = 0;
++                self.effect(Op::CheckFetch { size: i.len() as u8 });
++                checked_page = Some(last_page);
++            }
++            // Retire a straight-line group together. Flush before anything that can
++            // fault or create internal IR branches, so a fault observes its prefix.
++            let simple = matches!(i.mnemonic(), Mnemonic::Mov | Mnemonic::Add | Mnemonic::Sub |
++                Mnemonic::And | Mnemonic::Or | Mnemonic::Xor | Mnemonic::Test |
++                Mnemonic::Cmp | Mnemonic::Inc | Mnemonic::Dec | Mnemonic::Nop)
++                && i.op_kinds().all(|op| matches!(op, OpKind::Register | OpKind::Immediate8 |
++                    OpKind::Immediate16 | OpKind::Immediate32 | OpKind::Immediate8to16 | OpKind::Immediate8to32))
++                && (0..i.op_count()).all(|n| i.op_kind(n) != OpKind::Register || i.op_register(n).is_gpr());
++            if !simple {
++                self.retire_group(pending);
++                pending = 0;
++            }
++            let before = self.cur as usize;
++            let before_ops = self.f.blocks[before].insts.len();
++            let before_blocks = self.f.blocks.len();
++            let continues = self.lift_inst(i);
++            if continues && self.smc_deopt() {
++                let writes = |inst: &Inst| match inst.op {
++                    Op::Store { mem, .. } | Op::AtomicRmw { mem, .. }
++                    | Op::AtomicCmpxchg { mem, .. } => mem.space != Space::Native,
++                    Op::MemCopy { .. } | Op::MemFill { .. } => true,
++                    _ => false,
++                };
++                if self.f.blocks[before].insts[before_ops..].iter().any(writes)
++                    || self.f.blocks[before_blocks..].iter().any(|b| b.insts.iter().any(writes))
++                {
++                    self.retire_group(pending + 1);
++                    pending = 0;
++                    let resume = self.ac(i.next_ip());
++                    self.effect(Op::SmcBarrier(resume));
++                    continue;
++                }
++            }
++            if !continues {
++                if !matches!(self.f.blocks[self.cur as usize].term, Term::Fault { .. }) {
++                    if !(self.smc_deopt() && i.mnemonic() == Mnemonic::Call) {
++                        self.retire_group(pending + 1);
++                    }
++                }
+                 return;
+             }
+-        }
++            pending += 1;
++        }
++        self.retire_group(pending);
+         match fall {
+             Some(n) => {
+                 let t = self.target_block(n);
+@@ -1133,10 +1184,25 @@
+         }
+     }
+ 
++    fn smc_deopt(&self) -> bool {
++        self.cfg.smc_deopt && self.cfg.smc_checks && !self.x64() && !self.f.mem64
++    }
++
++    fn retire_group(&mut self, amount: u32) {
++        if amount == 0 { return; }
++        let amount = self.c32(amount);
++        self.emit_to(RETIRED, Op::Bin(BinOp::I32Add, RETIRED, amount));
++    }
++
+     /// Lifts one instruction. Returns false when it terminated the block.
+     fn lift_inst(&mut self, i: &Instruction) -> bool {
+         use Mnemonic as M;
+         let m = i.mnemonic();
++        if !self.x64() && !self.cfg.mem64 && m == M::Out && i.len() == 1 &&
++            i.op0_register() == Register::DX && i.op1_register() == Register::EAX {
++            self.terminate(Term::Fault { code: fault::PORT_OUT32, eip: self.eip });
++            return false;
++        }
+         if i.is_privileged() && !matches!(m, M::Hlt) {
+             self.terminate(Term::Fault {
+                 code: fault::PRIVILEGED_INSTRUCTION,
+@@ -3299,6 +3365,36 @@
+                 let same = self.wop(BinOp::I32Eq, w, rep_, v);
+                 self.bin(BinOp::I32And, fwd, same)
+             };
++            // REP faults after retiring every element before the failing page.
++            // Bulk operations are all-or-nothing, so on a paged CPU use them only
++            // where the complete operand(s) fit in a single page.
++            let ok = if !self.x64() && !self.f.mem64 {
++                let directory = self.load_native(Ty::I32, 4, crate::abi::cpu::PAGE_DIRECTORY);
++                let flat = self.is_zero(directory);
++                let size_bits = size.trailing_zeros();
++                let dst_offset = self.bini(BinOp::I32And, EDI, 0xfff);
++                let dst_room = self.c32(0x1000);
++                let dst_room = self.bin(BinOp::I32Sub, dst_room, dst_offset);
++                let dst_count = self.bini(BinOp::I32ShrU, dst_room, size_bits);
++                let dst_fits = self.bin(BinOp::I32LeU, ECX, dst_count);
++                let fits = if matches!(m, M::Movsb | M::Movsw | M::Movsd | M::Movsq) {
++                    let src_offset = self.bini(BinOp::I32And, ESI, 0xfff);
++                    let src_room = self.c32(0x1000);
++                    let src_room = self.bin(BinOp::I32Sub, src_room, src_offset);
++                    let src_count = self.bini(BinOp::I32ShrU, src_room, size_bits);
++                    let src_fits = self.bin(BinOp::I32LeU, ECX, src_count);
++                    self.bin(BinOp::I32And, dst_fits, src_fits)
++                } else {
++                    dst_fits
++                };
++                let mapped_bus = self.load_native(Ty::I32, 4, crate::abi::cpu::PAGE_HAS_MMIO);
++                let no_mmio = self.is_zero(mapped_bus);
++                let paged = self.bin(BinOp::I32And, fits, no_mmio);
++                let can_batch = self.bin(BinOp::I32Or, flat, paged);
++                self.bin(BinOp::I32And, ok, can_batch)
++            } else {
++                ok
++            };
+             let fast = self.new_block();
+             self.terminate(Term::Branch {
+                 cond: ok,
+@@ -3535,6 +3631,11 @@
+                 let t = branch_target(i, 0).unwrap();
+                 let r = self.ac(ret);
+                 self.push_val(r, ws);
++                if self.smc_deopt() {
++                    self.retire_group(1);
++                    let resume = self.ac(t);
++                    self.effect(Op::SmcBarrier(resume));
++                }
+                 if t == ret {
+                     // get-PC idiom.
+                     let b = self.target_block(ret);
+@@ -3554,6 +3655,10 @@
+                 let target = self.read_op(i, 0);
+                 let r = self.ac(ret);
+                 self.push_val(r, ws);
++                if self.smc_deopt() {
++                    self.retire_group(1);
++                    self.effect(Op::SmcBarrier(target));
++                }
+                 let cont = self.target_block(ret);
+                 self.terminate(Term::Call {
+                     target: CallTarget::Indirect(target),
+--- a/crates/wwt/src/opt.rs
++++ b/crates/wwt/src/opt.rs
+@@ -490,10 +490,8 @@
+     }
+ }
+ 
+-/// State written back at fault points: everything except the lazy flag
+-/// state, whose precision at faults we do not guarantee.
+-pub const FAULT_SYNC: StateMask =
+-    !(1u64 << FK | 1u64 << FR | 1u64 << FA | 1u64 << FB | 1u64 << FC | 1u64 << CPU);
++/// A guest fault exposes the complete architectural register state.
++pub const FAULT_SYNC: StateMask = ALL_STATE;
+ pub const ALL_STATE: StateMask = !(1u64 << CPU);
+ 
+ /// The import slot `v` was loaded from, when block `b` loads it from a
+@@ -834,7 +832,7 @@
+             }
+         }
+         if inst.op.may_fault() {
+-            add_mask(&mut live, trace[k] & FAULT_SYNC);
++            add_mask(&mut live, trace[k] & if matches!(inst.op, Op::SmcBarrier(_)) { ALL_STATE } else { FAULT_SYNC });
+         }
+     }
+     live
+@@ -901,7 +899,7 @@
+                     }
+                 }
+                 if inst.op.may_fault() {
+-                    add_mask(&mut live_g, trace[k] & FAULT_SYNC);
++                    add_mask(&mut live_g, trace[k] & if matches!(inst.op, Op::SmcBarrier(_)) { ALL_STATE } else { FAULT_SYNC });
+                 }
+             }
+             if round > 0 {
+--- a/crates/wwt/src/osr.rs
++++ b/crates/wwt/src/osr.rs
+@@ -25,20 +25,19 @@
+     Mem::native(4, offset)
+ }
+ 
+-/// Adds re-entry points to `f`'s loops (which must be reducible). Returns
+-/// whether anything changed.
+-pub fn add_reentry(f: &mut Function) -> bool {
++/// Adds re-entry points to reducible loops and returns their synthetic latches.
++pub fn add_reentry(f: &mut Function) -> Vec<BlockId> {
+     let before = f.clone();
+-    let changed = add_reentry_points(f);
++    let latches = add_reentry_points(f);
+     // Never trade structured code for re-entry.
+-    if changed && !crate::reducible::is_reducible(f) {
++    if !latches.is_empty() && !crate::reducible::is_reducible(f) {
+         *f = before;
+-        return false;
+-    }
+-    changed
++        return vec![];
++    }
++    latches
+ }
+ 
+-fn add_reentry_points(f: &mut Function) -> bool {
++fn add_reentry_points(f: &mut Function) -> Vec<BlockId> {
+     let order = f.rpo();
+     let n = f.blocks.len();
+     let mut rpo_num = vec![u32::MAX; n];
+@@ -57,7 +56,7 @@
+         }
+     }
+     if headers.is_empty() {
+-        return false;
++        return vec![];
+     }
+     // Only outermost loops: making an inner loop's header reachable from
+     // the entry would give its enclosing loop a second entry (irreducible).
+@@ -96,7 +95,7 @@
+                 .all(|(d, &v)| v < NUM_STATE || !a.live_in[h as usize].contains(d))
+     });
+     if headers.is_empty() {
+-        return false;
++        return vec![];
+     }
+     // Block 0 must stay the entry: move its code to a new block.
+     let old_entry = f.blocks.len() as BlockId;
+@@ -191,9 +190,11 @@
+     f.blocks[cur as usize].term = Term::Jump(old_entry);
+     // Back edges: count, and re-enter when the count runs out.
+     let preds = f.predecessors();
++    let mut latches = Vec::with_capacity(headers.len());
+     for (k, &h) in headers.iter().enumerate() {
+         let addr = f.blocks[h as usize].addr;
+         let latch = f.new_block(addr);
++        latches.push(latch);
+         let exit = f.new_block(addr);
+         let (one, dec, z, kc) = (
+             f.new_vreg(Ty::I32),
+@@ -260,5 +261,5 @@
+             }
+         }
+     }
+-    true
++    latches
+ }
+--- /dev/null
++++ b/crates/wwt/src/page_walk.rs
+@@ -0,0 +1,112 @@
++//! Outlined i386 page walk for the translated module's cache-miss path.
++use crate::abi::{addr::NULL_LIMIT, cpu, page_tlb};
++use wasm_encoder::{BlockType, Function, Instruction as W, MemArg, ValType};
++
++pub const ALLOW_MMIO: i32 = 4;
++pub const USE_TLB: i32 = 8;
++
++fn mem(offset: u32) -> MemArg {
++    MemArg { offset: offset as u64, align: 2, memory_index: 0 }
++}
++
++/// (cpu, first, last-inclusive, requested permissions and mode) -> route.
++/// Returns 0 for RAM, 1 for MMIO, or -1 with the first failing linear
++/// address recorded in cpu::FAULT_ADDR. The caller delivers the x86 fault.
++pub fn generate() -> Function {
++    const CPU: u32 = 0;
++    const ADDRESS: u32 = 1;
++    const LAST: u32 = 2;
++    const MODE: u32 = 3;
++    const DIRECTORY: u32 = 4;
++    const RAM: u32 = 5;
++    const PERM: u32 = 6;
++    const PDE: u32 = 7;
++    const PTE: u32 = 8;
++    const ROUTE: u32 = 9;
++    const TLB: u32 = 10;
++    const SLOT: u32 = 11;
++    const FRAME: i32 = !0xfff;
++    let mut f = Function::new([(8, ValType::I32)]);
++    macro_rules! emit {
++        ($($inst:expr),+ $(,)?) => { $(f.instruction(&$inst);)+ };
++    }
++    // Every invalid range jumps out of the validation body to one fault return.
++    emit!(
++        W::LocalGet(CPU), W::I32Load(mem(cpu::PAGE_DIRECTORY)), W::LocalSet(DIRECTORY),
++        W::LocalGet(CPU), W::I32Load(mem(cpu::PAGE_RAM_SIZE)), W::LocalSet(RAM),
++        W::LocalGet(MODE), W::I32Const(3), W::I32And, W::LocalSet(PERM),
++        W::LocalGet(MODE), W::I32Const(USE_TLB), W::I32And, W::If(BlockType::Empty),
++            W::LocalGet(CPU), W::I32Load(mem(cpu::PAGE_TLB)), W::LocalSet(TLB),
++        W::End,
++        W::Block(BlockType::Empty),
++        W::LocalGet(LAST), W::LocalGet(ADDRESS), W::I32LtU,
++        W::LocalGet(DIRECTORY), W::LocalGet(RAM), W::I32GeU, W::I32Or,
++        W::BrIf(0),
++        W::Loop(BlockType::Empty),
++        W::Block(BlockType::Empty),
++    );
++    // An identity tag implies a validated page within RAM.
++    emit!(
++        W::LocalGet(TLB), W::If(BlockType::Empty),
++            W::LocalGet(TLB),
++            W::LocalGet(ADDRESS), W::I32Const(9), W::I32ShrU,
++            W::I32Const((page_tlb::BYTES - 8) as i32), W::I32And,
++            W::I32Add, W::LocalTee(SLOT),
++            W::LocalGet(PERM), W::I32Const(2), W::I32And, W::I32Const(1), W::I32Shl,
++            W::I32Add, W::I32Load(mem(0)),
++            W::LocalGet(ADDRESS), W::I32Const(FRAME), W::I32And, W::I32Const(1), W::I32Or,
++            W::I32Eq, W::BrIf(1),
++        W::End,
++        W::LocalGet(ADDRESS), W::LocalGet(RAM), W::I32GeU,
++    );
++    if NULL_LIMIT != 0 {
++        emit!(W::LocalGet(ADDRESS), W::I32Const(NULL_LIMIT as i32), W::I32LtU, W::I32Or);
++    }
++    emit!(
++        W::BrIf(2),
++        // PDE Present/RW and regular 4 KiB pages only.
++        W::LocalGet(DIRECTORY), W::LocalGet(ADDRESS), W::I32Const(22), W::I32ShrU,
++        W::I32Const(2), W::I32Shl, W::I32Add, W::I32Load(mem(0)), W::LocalTee(PDE),
++        W::LocalGet(PERM), W::I32Const(0x80), W::I32Or, W::I32And, W::LocalGet(PERM), W::I32Ne,
++        W::LocalGet(PDE), W::I32Const(FRAME), W::I32And, W::LocalTee(PDE),
++        W::LocalGet(RAM), W::I32GeU, W::I32Or, W::BrIf(2),
++
++        W::LocalGet(PDE), W::LocalGet(ADDRESS), W::I32Const(10), W::I32ShrU,
++        W::I32Const(0xffc), W::I32And, W::I32Add, W::I32Load(mem(0)), W::LocalTee(PTE),
++        W::LocalGet(PERM), W::I32And, W::LocalGet(PERM), W::I32Ne, W::BrIf(2),
++        W::LocalGet(PTE), W::I32Const(FRAME), W::I32And, W::LocalTee(PTE),
++        W::LocalGet(ADDRESS), W::I32Const(FRAME), W::I32And, W::I32Ne,
++        W::If(BlockType::Empty),
++            W::LocalGet(PTE), W::LocalGet(RAM), W::I32LtU,
++            W::LocalGet(MODE), W::I32Const(ALLOW_MMIO), W::I32And, W::I32Eqz, W::I32Or,
++            W::LocalGet(CPU), W::I32Load(mem(cpu::PAGE_HAS_MMIO)), W::I32Eqz, W::I32Or,
++            W::BrIf(3),
++            W::I32Const(1), W::LocalSet(ROUTE),
++        W::Else,
++            // Cache only identity entries from contiguous managed page tables.
++            W::LocalGet(TLB), W::If(BlockType::Empty),
++                W::LocalGet(PDE), W::LocalGet(DIRECTORY), W::I32Const(0x1000), W::I32Add,
++                W::LocalGet(ADDRESS), W::I32Const(22), W::I32ShrU, W::I32Const(12), W::I32Shl,
++                W::I32Add, W::I32Eq, W::If(BlockType::Empty),
++                    W::LocalGet(SLOT), W::LocalGet(PTE), W::I32Const(1), W::I32Or, W::I32Store(mem(0)),
++                    W::LocalGet(PERM), W::I32Const(2), W::I32And, W::If(BlockType::Empty),
++                        W::LocalGet(SLOT), W::LocalGet(PTE), W::I32Const(1), W::I32Or, W::I32Store(mem(4)),
++                    W::End,
++                W::End,
++            W::End,
++        W::End,
++        W::End,
++        // Continue at the first byte of the next page when the span crosses it.
++        W::LocalGet(ADDRESS), W::I32Const(12), W::I32ShrU,
++        W::LocalGet(LAST), W::I32Const(12), W::I32ShrU, W::I32Eq,
++        W::If(BlockType::Empty), W::LocalGet(ROUTE), W::Return, W::End,
++        W::LocalGet(ADDRESS), W::I32Const(FRAME), W::I32And, W::I32Const(0x1000), W::I32Add,
++        W::LocalSet(ADDRESS), W::Br(0),
++        W::End,
++        W::End,
++        W::LocalGet(CPU), W::LocalGet(ADDRESS), W::I32Store(mem(cpu::FAULT_ADDR)),
++        W::I32Const(-1),
++        W::End,
++    );
++    f
++}
+--- a/crates/wwt/src/translate.rs
++++ b/crates/wwt/src/translate.rs
+@@ -31,6 +31,9 @@
+     pub scan_data: bool,
+     /// Inline small leaf functions into their callers (opt level 1).
+     pub inline: bool,
++    /// Emit only single-page functions with runtime lookups between entries.
++    pub page_local_pe: bool,
++    pub linked_pe_smc: bool,
+     /// Give exported memory functions (`memmove`, `memset`, ...) built-in
+     /// bodies using WebAssembly's bulk memory operations.
+     pub builtins: bool,
+@@ -60,6 +63,8 @@
+             opt_level: 1,
+             scan_data: true,
+             inline: true,
++            page_local_pe: false,
++            linked_pe_smc: false,
+             builtins: true,
+             c_abi: None,
+             prove_flags_abi: false,
+@@ -446,6 +451,13 @@
+     names: &HashMap<u64, String>,
+     tried: &HashMap<u64, (&'static str, Vec<u32>)>,
+ ) -> Result<Translation> {
++    if cfg.page_local_pe {
++        // Page-local bodies cannot specialize a jump table on another page.
++        d.jump_tables.retain(|pc, table| {
++            let end = table.base + table.targets.len() as u64 * table.entry_size as u64;
++            table.base >> 12 == *pc >> 12 && end.saturating_sub(1) >> 12 == *pc >> 12
++        });
++    }
+     let mut report = Report::default();
+     for k in d.seed_kinds.values() {
+         *report.seeds.entry(format!("{k:?}")).or_default() += 1;
+@@ -498,7 +510,29 @@
+             funcs.push(f);
+         }
+     }
+-    call_through_import_stubs(&mut funcs);
++    if cfg.page_local_pe {
++        // The host and translated stores invalidate one page at a time. No
++        // installed body may depend on instruction bytes on another page.
++        funcs.retain(|f| {
++            let page = f.entry >> 12;
++            !f.blocks.is_empty() && f.blocks.iter().all(|b| {
++                b.insts.iter().all(|inst| {
++                    if inst.eip >> 12 != page {
++                        return false;
++                    }
++                    let Some(decoded) = d.insts.get(&inst.eip) else { return false; };
++                    (inst.eip + decoded.len() as u64 - 1) >> 12 == page
++                })
++            })
++        });
++    } else if !cfg.linked_pe_smc {
++        call_through_import_stubs(&mut funcs);
++    }
++    if cfg.codegen.guest_flat {
++        for f in &mut funcs {
++            mark_guarded_trusted(f);
++        }
++    }
+     if cfg.prove_flags_abi {
+         // Imports: Wine's exports never read the flags on entry, except
+         // `_chkesp` (MSVC debug builds' stack check after calls).
+@@ -544,6 +578,19 @@
+         .with_code64(cfg.mode() == Mode::X64 && cfg.codegen.mem64)
+         .with_names(names)
+         .with_code(src);
++    let gen = if cfg.page_local_pe { gen.without_direct_calls() } else { gen };
++    let mut smc_pages = BTreeSet::new();
++    if cfg.linked_pe_smc {
++        for (&start, decoded) in &d.insts {
++            let end = start + decoded.len() as u64 - 1;
++            smc_pages.extend((start >> 12..=end >> 12).map(|page| page as u32));
++        }
++        for table in d.jump_tables.values().filter(|table| !table.targets.is_empty()) {
++            let end = table.base + table.targets.len() as u64 * table.entry_size as u64 - 1;
++            smc_pages.extend((table.base >> 12..=end >> 12).map(|page| page as u32));
++        }
++    }
++    let gen = if cfg.linked_pe_smc { gen.with_smc_pages(smc_pages.into_iter().collect()) } else { gen };
+     let wasm = gen.build(&funcs, &meta_json);
+     report.wasm_bytes = wasm.len();
+     Ok(Translation {
+@@ -837,6 +884,16 @@
+     }
+ }
+ 
++fn mark_guarded_trusted(f: &mut Function) {
++    for inst in f.blocks.iter_mut().flat_map(|block| &mut block.insts) {
++        if let Op::Load { mem, .. } | Op::Store { mem, .. } = &mut inst.op {
++            if mem.space == Space::Trusted {
++                mem.space = Space::GuardedTrusted;
++            }
++        }
++    }
++}
++
+ /// Translates a single code snippet at `base` (used by the instruction test
+ /// suite): everything outside the snippet is an exit.
+ pub fn translate_snippet(code: &[u8], base: u64, cfg: &Config) -> (Function, Vec<(u64, String)>) {
+@@ -849,6 +906,9 @@
+     d.explore(&src);
+     let lifted = lift_function(&src, &d, base, &cfg.lift);
+     let mut f = lifted.func;
++    if cfg.codegen.guest_flat {
++        mark_guarded_trusted(&mut f);
++    }
+     opt::optimize(&mut f, cfg.opt_level);
+     (f, lifted.unsupported)
+ }
+--- a/crates/wwt-wasm/src/lib.rs
++++ b/crates/wwt-wasm/src/lib.rs
+@@ -19,13 +19,16 @@
+ 
+ /// Bit 0: disable memory checks; bit 1: disable code-write checks; bit 2:
+ /// the code is x86-64 (for `wwt_translate`; PE files carry their own mode);
+-/// bit 3: target a 64-bit (memory64) memory; bit 4: fast mode (see
+-/// `CodegenConfig::mem_traps`).
++/// Bit 3 targets 64-bit memory, bit 4 selects trapping access lowering, and
++/// bit 5 lowers 32-bit external MMIO routes. Bit 8 retains inline page walks.
+ const FLAG_NO_MEM_CHECKS: u32 = 1;
+ const FLAG_NO_SMC_CHECKS: u32 = 2;
+ const FLAG_X64: u32 = 4;
+ const FLAG_MEM64: u32 = 8;
+ const FLAG_MEM_TRAPS: u32 = 16;
++const FLAG_GUEST_MMIO: u32 = 32;
++const FLAG_FLAT_RAM: u32 = 64;
++const FLAG_INLINE_PAGE_WALK: u32 = 1 << 8;
+ 
+ fn apply_flags(cfg: wwt::Config, flags: u32) -> wwt::Config {
+     let mut cfg = cfg;
+@@ -33,9 +36,15 @@
+     let sc = flags & FLAG_NO_SMC_CHECKS == 0;
+     cfg.lift.mem_checks = mc;
+     cfg.codegen.mem_checks = mc;
++    cfg.codegen.guest_flat = flags & (FLAG_FLAT_RAM | FLAG_GUEST_MMIO) == FLAG_FLAT_RAM;
++    cfg.codegen.guest_mmio = flags & FLAG_GUEST_MMIO != 0;
++    cfg.codegen.guest_page_tlb = true;
++    cfg.codegen.outline_page_walk = flags & FLAG_INLINE_PAGE_WALK == 0;
+     cfg.codegen.mem_traps = flags & FLAG_MEM_TRAPS != 0;
+     cfg.lift.smc_checks = sc;
+     cfg.codegen.smc_checks = sc;
++    cfg.lift.smc_deopt = flags & (1 << 10) != 0;
++    cfg.codegen.smc_deopt = cfg.lift.smc_deopt;
+     let mode = if flags & FLAG_X64 != 0 {
+         wwt::ir::Mode::X64
+     } else {
+@@ -144,9 +153,29 @@
+         flags,
+     );
+     cfg.codegen.guest_limit = guest_limit(flags);
++    const FLAG_PAGE_LOCAL_PE: u32 = 128;
++    const FLAG_LINKED_PE: u32 = 1 << 9;
++    if flags & FLAG_PAGE_LOCAL_PE != 0 {
++        cfg.page_local_pe = true;
++        cfg.inline = false;
++    } else if flags & FLAG_LINKED_PE != 0 {
++        if !cfg.codegen.smc_deopt || !cfg.codegen.smc_checks || cfg.codegen.mem64 {
++            return result(vec![]);
++        }
++        cfg.linked_pe_smc = true;
++    }
++    if cfg.page_local_pe || cfg.linked_pe_smc {
++        cfg.builtins = false;
++        cfg.native_heap = false;
++        cfg.native_strings = false;
++        cfg.c_abi = Some(false);
++    }
+     let Ok(pe) = wwt::pe::PeFile::parse(data) else {
+         return result(vec![]);
+     };
++    if cfg.linked_pe_smc && pe.mode != wwt::ir::Mode::X86 {
++        return result(vec![]);
++    }
+     match wwt::translate_pe(&pe, &cfg, &profile) {
+         Ok(t) => result(t.wasm),
+         Err(_) => result(vec![]),
+@@ -169,6 +198,9 @@
+ }
+ 
+ #[no_mangle]
++pub extern "C" fn wwt_pe_aot_policy_version() -> u32 { 2 }
++
++#[no_mangle]
+ pub extern "C" fn wwt_abi() -> *mut u8 {
+     result(wwt::abi::abi_json().into_bytes())
+ }
