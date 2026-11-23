@@ -64,7 +64,7 @@ impl EaglTokenCfg {
 }
 
 pub(super) unsafe fn dispatch(guest: Guest, page: u32) -> Option<u32> {
-    let c = EaglTokenCfg::read(guest, u32_at(page + 0x1c54))?;
+    let c = EaglTokenCfg::read(guest, u32_at(page + super::OFF_HC_EAGL_TOKEN_CFG_PTR))?;
     let this_ctx = u32_at(guest.regs + 4) as i32;
     let node = guest.arg(0)? as i32;
     let mut stage = guest.arg(1)? as i32;

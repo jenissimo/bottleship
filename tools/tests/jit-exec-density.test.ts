@@ -186,7 +186,7 @@ async function runGuest({ map, count }: { map: boolean; count: boolean }) {
     }
 }
 
-describe.skipIf(!HAVE_V86)('executed density in v86', () => {
+describe.skipIf(process.env.BS_RUN_LEGACY_TESTS === "0" || !HAVE_V86)('executed density in v86', () => {
     it('is the hot block\'s density, not the static average', async () => {
         const { hot, cold } = image();
         const mapped = await withoutWindow(() => runGuest({ map: true, count: false }));

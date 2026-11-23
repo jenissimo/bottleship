@@ -1,9 +1,7 @@
 //! HeapAlloc/HeapFree slab fast paths for the existing BottleShip guest control ABI.
 //! The same blocks are shared with the generated x86 allocator stubs and JS heap.
 
-use super::{put_u32, u32_at, write_bytes, Guest};
-
-const CONTROL_POINTER: u32 = 0x1444;
+use super::{put_u32, u32_at, write_bytes, Guest, OFF_HC_SLAB_CTL_PTR};
 const CONTROL_SIZE: u32 = 128;
 const BUMP: u32 = 0x08;
 const ALLOC_COUNT: u32 = 0x10;
@@ -14,7 +12,7 @@ const FREELIST_TAIL: u32 = 0x48;
 const FIFO_BIN: u32 = 6;
 const MAX_BIN: u32 = 8;
 const HEADER_SIZE: u32 = 16;
-const LINK: u32 = 8;
+const SLAB_LINK: u32 = 8;
 const MAGIC_BUSY: u32 = 0x534c4100;
 const MAGIC_FREE: u32 = 0x534c4600;
 
@@ -28,7 +26,7 @@ struct Slab {
 
 impl Slab {
     unsafe fn new(guest: Guest, page: u32) -> Option<Self> {
-        let control = u32_at(page + CONTROL_POINTER);
+        let control = u32_at(page + OFF_HC_SLAB_CTL_PTR);
         if control & 3 != 0 || !guest.span(control, CONTROL_SIZE, true) {
             return None;
         }
@@ -85,7 +83,7 @@ impl Slab {
             if !self.free_node(head, size, bin) {
                 return None;
             }
-            let next = u32_at(head - LINK);
+            let next = u32_at(head - SLAB_LINK);
             if next == head || (next != 0 && !self.free_node(next, size, bin)) {
                 return None;
             }
@@ -139,18 +137,18 @@ impl Slab {
             if (head == 0) != (tail == 0) {
                 return None;
             }
-            if tail != 0 && (!self.free_node(tail, size, bin) || u32_at(tail - LINK) != 0) {
+            if tail != 0 && (!self.free_node(tail, size, bin) || u32_at(tail - SLAB_LINK) != 0) {
                 return None;
             }
-            put_u32(ptr - LINK, 0);
+            put_u32(ptr - SLAB_LINK, 0);
             if tail == 0 {
                 put_u32(list, ptr);
             } else {
-                put_u32(tail - LINK, ptr);
+                put_u32(tail - SLAB_LINK, ptr);
             }
             put_u32(tail_slot, ptr);
         } else {
-            put_u32(ptr - LINK, head);
+            put_u32(ptr - SLAB_LINK, head);
             put_u32(list, ptr);
         }
         put_u32(ptr - 4, MAGIC_FREE | bin);

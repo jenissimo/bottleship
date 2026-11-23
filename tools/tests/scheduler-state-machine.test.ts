@@ -2268,12 +2268,12 @@ describe("scheduler/urgent exit — the switched-in thread gets the slice back",
     /** Point the singleton at a private hypercall page; returns the undo. */
     function armPreemption(): () => void {
         const pm = preemptionManager as any;
-        const keys = ["wasmExports", "hpBase", "initialized", "wasmMemoryObj", "wasmMemory", "view",
+        const keys = ["wasmExports", "hpBase", "cycleBudgetBase", "initialized", "wasmMemoryObj", "wasmMemory", "view",
             "sliceGrant", "urgentExitPending", "sliceEndHeld", "sliceResumes"];
         const saved = Object.fromEntries(keys.map((k) => [k, pm[k]]));
         const memory = new WebAssembly.Memory({ initial: 1 });
         Object.assign(pm, { wasmExports: { memory }, wasmMemoryObj: memory, wasmMemory: null, view: null,
-            hpBase: 0x100, initialized: true, sliceResumes: 0 });
+            hpBase: 0x100, cycleBudgetBase: 0x100, initialized: true, sliceResumes: 0 });
         return () => Object.assign(pm, saved);
     }
     function parkAndSwitch(peerEip: number): { s: Scheduler; t2: Thread; cpu: V86Cpu } {

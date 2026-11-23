@@ -1,5 +1,10 @@
 #![no_std]
 
+#[allow(dead_code)]
+#[path = "hypercall-layout.rs"]
+mod hypercall_layout;
+use hypercall_layout::*;
+
 use core::panic::PanicInfo;
 use core::ptr::{copy, read_unaligned, write_bytes, write_unaligned};
 
@@ -321,7 +326,7 @@ unsafe fn interlocked(guest: Guest, handler: u8) -> Option<u32> {
 
 unsafe fn critical_section(guest: Guest, page: u32, enter: bool) -> Option<u32> {
     let ptr = guest.arg(0)?;
-    let thread = u32_at(page + 0x34);
+    let thread = u32_at(page + OFF_HC_CURRENT_THREAD_ID);
     if thread == 0 || !guest.span(ptr, 20, true) {
         return None;
     }
@@ -360,13 +365,13 @@ unsafe fn tls(guest: Guest, page: u32, write: bool) -> Option<u32> {
     if index >= 64 {
         return None;
     }
-    let teb = u32_at(page + 0x28);
+    let teb = u32_at(page + OFF_HC_TEB_BASE);
     if teb == 0 {
         return None;
     }
     let slot = teb.checked_add(0xe10 + index * 4)?;
     if write {
-        if byte(page + 0xb8 + index) == 0 || !guest.span(slot, 4, true) {
+        if byte(page + OFF_HC_TLS_ALLOCATED + index) == 0 || !guest.span(slot, 4, true) {
             return None;
         }
         put_u32(slot, guest.arg(1)?);
@@ -377,7 +382,7 @@ unsafe fn tls(guest: Guest, page: u32, write: bool) -> Option<u32> {
         return None;
     }
     put_u32(teb + 0x34, 0);
-    put_u32(page + 0x24, 0);
+    put_u32(page + OFF_HC_LAST_ERROR, 0);
     Some(value)
 }
 
@@ -465,19 +470,19 @@ unsafe fn synchronization_mirror(guest: Guest, page: u32, id: u8) -> Option<u32>
     if slot >= 2048 {
         return None;
     }
-    let event_address = (page + 0x1448 + slot) as *mut u8;
+    let event_address = (page + OFF_HC_EVENT_TABLE + slot) as *mut u8;
     let flags = *event_address;
     if id == 72 {
         if flags & EVENT_VALID == 0 || flags & EVENT_HAS_WAITERS != 0 {
             return None;
         }
-        let counter = u32_at(page + 0x1c48);
-        let limit = u32_at(page + 0x1c4c);
+        let counter = u32_at(page + OFF_HC_EVENT_STARVATION_COUNTER);
+        let limit = u32_at(page + OFF_HC_EVENT_STARVATION_LIMIT);
         if limit != 0 && counter >= limit {
-            put_u32(page + 0x1c48, 0);
+            put_u32(page + OFF_HC_EVENT_STARVATION_COUNTER, 0);
             return None;
         }
-        put_u32(page + 0x1c48, counter.wrapping_add(1));
+        put_u32(page + OFF_HC_EVENT_STARVATION_COUNTER, counter.wrapping_add(1));
         let wake = if flags & EVENT_MANUAL != 0 {
             EVENT_PENDING_WAKE
         } else {
@@ -486,7 +491,7 @@ unsafe fn synchronization_mirror(guest: Guest, page: u32, id: u8) -> Option<u32>
         *event_address = flags | EVENT_SIGNALED | wake;
         return Some(1);
     }
-    let thread = u32_at(page + 0x34);
+    let thread = u32_at(page + OFF_HC_CURRENT_THREAD_ID);
     if thread == 0 || thread > MUTEX_OWNER {
         return None;
     }
@@ -502,7 +507,7 @@ unsafe fn synchronization_mirror(guest: Guest, page: u32, id: u8) -> Option<u32>
         }
         return (timeout == 0).then_some(WAIT_TIMEOUT);
     }
-    let mirror = u32_at(page + 0x1c50);
+    let mirror = u32_at(page + OFF_HC_MUTEX_MIRROR_PTR);
     if mirror == 0 {
         return None;
     }
@@ -587,7 +592,7 @@ unsafe fn performance_counter(guest: Guest, page: u32, frequency: bool) -> Optio
     if !guest.span(ptr, 8, true) {
         return None;
     }
-    let off = if frequency { 0x1c } else { 0x14 };
+    let off = if frequency { OFF_HC_PERF_FREQ_LO } else { OFF_HC_PERF_COUNTER_LO };
     let base = (u32_at(page + off) as u64) | ((u32_at(page + off + 4) as u64) << 32);
     let value = if frequency {
         base
@@ -601,8 +606,8 @@ unsafe fn performance_counter(guest: Guest, page: u32, frequency: bool) -> Optio
 
 unsafe fn delta_us(retired: u32, page: u32) -> u32 {
     u32_at(retired)
-        .wrapping_sub(u32_at(page + 0x2c))
-        .checked_div(u32_at(page + 0x30))
+        .wrapping_sub(u32_at(page + OFF_HC_INSN_AT_TIME_UPDATE))
+        .checked_div(u32_at(page + OFF_HC_MIPS_ESTIMATE))
         .unwrap_or(0)
 }
 
@@ -677,15 +682,15 @@ pub unsafe extern "C" fn guest_span_readable(cpu_base: u32, address: u32, len: u
 unsafe fn handle(guest: Guest, page: u32, id: u8) -> Option<u32> {
     match id {
         3 | 4 => performance_counter(guest, page, id == 4),
-        5 => Some(u32_at(page + 0x24)),
+        5 => Some(u32_at(page + OFF_HC_LAST_ERROR)),
         6 => {
             let value = guest.arg(0)?;
-            let teb = u32_at(page + 0x28);
+            let teb = u32_at(page + OFF_HC_TEB_BASE);
             if teb == 0 || !guest.span(teb.checked_add(0x34)?, 4, true) {
                 return None;
             }
             put_u32(teb + 0x34, value);
-            put_u32(page + 0x24, value);
+            put_u32(page + OFF_HC_LAST_ERROR, value);
             Some(0)
         }
         7..=10 => interlocked(guest, id),
@@ -698,23 +703,23 @@ unsafe fn handle(guest: Guest, page: u32, id: u8) -> Option<u32> {
             }
             let (x, y) = if id == 14 {
                 (
-                    u32_at(ptr).wrapping_sub(u32_at(page + 0x88)),
-                    u32_at(ptr + 4).wrapping_sub(u32_at(page + 0x8c)),
+                    u32_at(ptr).wrapping_sub(u32_at(page + OFF_HC_WINDOW_X)),
+                    u32_at(ptr + 4).wrapping_sub(u32_at(page + OFF_HC_WINDOW_Y)),
                 )
             } else {
-                (u32_at(page + 0x80), u32_at(page + 0x84))
+                (u32_at(page + OFF_HC_CURSOR_X), u32_at(page + OFF_HC_CURSOR_Y))
             };
             put_u32(ptr, x);
             put_u32(ptr + 4, y);
             Some(1)
         }
         16 => {
-            let counter = u32_at(page + 0x94);
-            if counter >= u32_at(page + 0x98) || u32_at(page + 0x90) != 0 {
-                put_u32(page + 0x94, 0);
+            let counter = u32_at(page + OFF_HC_PEEK_STARVATION_COUNTER);
+            if counter >= u32_at(page + OFF_HC_PEEK_STARVATION_LIMIT) || u32_at(page + OFF_HC_MSG_QUEUE_FLAG) != 0 {
+                put_u32(page + OFF_HC_PEEK_STARVATION_COUNTER, 0);
                 return None;
             }
-            put_u32(page + 0x94, counter + 1);
+            put_u32(page + OFF_HC_PEEK_STARVATION_COUNTER, counter + 1);
             Some(0)
         }
         17 => float_to_integer(guest),
@@ -808,23 +813,23 @@ unsafe fn handle(guest: Guest, page: u32, id: u8) -> Option<u32> {
             if guest.arg(0)? != 0 {
                 return None;
             }
-            if u32_at(page + 0x9c) == 0 {
+            if u32_at(page + OFF_HC_HAS_RUNNABLE_PEERS) == 0 {
                 return Some(0);
             }
-            let counter = u32_at(page + 0xa0);
-            if counter >= u32_at(page + 0xa4) {
-                put_u32(page + 0xa0, 0);
+            let counter = u32_at(page + OFF_HC_SLEEP_STARVATION_COUNTER);
+            if counter >= u32_at(page + OFF_HC_SLEEP_STARVATION_LIMIT) {
+                put_u32(page + OFF_HC_SLEEP_STARVATION_COUNTER, 0);
                 return None;
             }
-            put_u32(page + 0xa0, counter + 1);
+            put_u32(page + OFF_HC_SLEEP_STARVATION_COUNTER, counter + 1);
             Some(0)
         }
         64 | 86 => tls(guest, page, id == 86),
         65 => {
-            let seed = u32_at(page + 0xb0)
+            let seed = u32_at(page + OFF_HC_RAND_SEED)
                 .wrapping_mul(214013)
                 .wrapping_add(2531011);
-            put_u32(page + 0xb0, seed);
+            put_u32(page + OFF_HC_RAND_SEED, seed);
             Some((seed >> 16) & 0x7fff)
         }
         66 | 75 => substring(guest, if id == 66 { 2 } else { 1 }),
@@ -848,7 +853,7 @@ unsafe fn handle(guest: Guest, page: u32, id: u8) -> Option<u32> {
         70 | 71 => heap_slab::dispatch(guest, page, id == 70),
         72 | 80 | 81 => synchronization_mirror(guest, page, id),
         73 => {
-            let tid = u32_at(page + 0x34);
+            let tid = u32_at(page + OFF_HC_CURRENT_THREAD_ID);
             (tid != 0).then_some(tid)
         }
         77 => {
@@ -877,11 +882,11 @@ unsafe fn handle(guest: Guest, page: u32, id: u8) -> Option<u32> {
             }
             guest.span(ptr, size, false).then_some(0)
         }
-        82 => Some(u32_at(page + 0xb4)),
+        82 => Some(u32_at(page + OFF_HC_CAPTURE_HWND)),
         83 => {
             let handle = guest.arg(0)?;
             for i in 0..32 {
-                let entry = page + 0x2800 + 8 * i;
+                let entry = page + OFF_HC_THREAD_SUSPEND + 8 * i;
                 let candidate = u32_at(entry);
                 if candidate == 0 {
                     break;
@@ -965,13 +970,13 @@ pub unsafe extern "C" fn dispatch_integer_native(config: u32, wwt_cpu: u32) -> i
 }
 
 unsafe fn lookup_handler(page: u32, function_id: u32) -> u8 {
-    if function_id == 0 || function_id >= 65536 || u32_at(page + 8) == 0 {
+    if function_id == 0 || function_id >= HC_DISPATCH_LIMIT || u32_at(page + OFF_HC_ENABLED) == 0 {
         return 0;
     }
-    let offset = if function_id < 4096 {
-        0x100 + function_id
+    let offset = if function_id < HC_DISPATCH_BASE_COUNT {
+        OFF_HC_DISPATCH_TABLE + function_id
     } else {
-        0x4000 + function_id - 4096
+        OFF_HC_DISPATCH_TABLE_EXT + function_id - HC_DISPATCH_BASE_COUNT
     };
     let handler = byte(page + offset);
     if supports_handler(handler as u32) != 0 {
@@ -983,15 +988,15 @@ unsafe fn lookup_handler(page: u32, function_id: u32) -> u8 {
 
 #[inline]
 unsafe fn tick_count(page: u32, retired: u32) -> u32 {
-    u32_at(page + 0x10).wrapping_add(delta_us(retired, page) / 1000)
+    u32_at(page + OFF_HC_TICK_COUNT).wrapping_add(delta_us(retired, page) / 1000)
 }
 
 #[inline]
 unsafe fn record_success(page: u32, handler: u8, regs: u32, eax: u32) {
-    let counter = page + 0x2000 + 4 * handler as u32;
+    let counter = page + OFF_HC_HANDLER_CALLS + 4 * handler as u32;
     put_u32(counter, u32_at(counter).saturating_add(1));
     put_u32(regs, eax);
-    put_u32(page + 0xc, u32_at(page + 0xc).wrapping_add(1));
+    put_u32(page + OFF_HC_CALL_COUNT, u32_at(page + OFF_HC_CALL_COUNT).wrapping_add(1));
 }
 
 unsafe fn dispatch_handler(guest: Guest, page: u32, handler: u8) -> bool {
@@ -999,7 +1004,7 @@ unsafe fn dispatch_handler(guest: Guest, page: u32, handler: u8) -> bool {
         record_success(page, handler, guest.regs, eax);
         return true;
     }
-    let counter = page + 0x2400 + 4 * handler as u32;
+    let counter = page + OFF_HC_HANDLER_FALLBACKS + 4 * handler as u32;
     put_u32(counter, u32_at(counter).saturating_add(1));
     false
 }

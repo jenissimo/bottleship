@@ -24,14 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # The quality gate also checks the optional legacy emulator against its source.
-          submodules: true
-          # NOT the default depth of 1. checkout passes fetch-depth straight through as
-          # `git submodule update --depth=N`, and a shallow submodule fetch brings only the
-          # submodule's DEFAULT branch (master); our gitlink lives on `bottleship`, so checkout
-          # falls back to asking for the bare SHA and the server refuses it ("not our ref").
-          # Full depth also gives validate-jit-exports the submodule history its staleness
-          # check reads — shallow, that check finds no commits and passes vacuously.
+          submodules: false
           fetch-depth: 0
 
       - uses: oven-sh/setup-bun@v2
@@ -59,6 +52,28 @@ jobs:
       - name: Quality gate
         run: bun run gate
 
+  legacy-cpu:
+    name: Optional v86 ABI and execution coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+          # The gitlink lives on the submodule's bottleship branch. The JIT freshness
+          # validator also needs its full history, so a shallow submodule is insufficient.
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Legacy backend ABI and execution tests
+        run: bun run gate:legacy
+
   dedup-scan:
     name: Dedup / dead-export scan (advisory)
     runs-on: ubuntu-latest
@@ -68,8 +83,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Same submodule contract as the gate job above.
-          submodules: true
+          submodules: false
           fetch-depth: 0
 
       - uses: oven-sh/setup-bun@v2

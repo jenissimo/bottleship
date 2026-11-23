@@ -378,90 +378,85 @@ handoffs, audits, experiment reports and research registries stay in ignored `pl
 dumps, traces and raw measurements stay in ignored `logs/`. Share evidence in the issue or PR;
 commit reusable harness scenarios under `tools/harness/`, without links to local session artifacts.
 
-Quality Gate (mandatory order):
+Quality Gate (`bun run gate`, mandatory order)
   1. bun tools/generate-index.ts
   2. bun tools/validate-signatures.ts
   3. bun tools/validate-struct-offsets.ts
   4. bun tools/validate-guest-code-writes.ts
-  5. bun tools/validate-stub-tables.ts   (a stub table shadowing a real handler; ALSO one export
+  5. bun tools/validate-queue-writes.ts   (texture writes respect GPU submit ordering)
+  6. bun tools/validate-stub-tables.ts   (a stub table shadowing a real handler; ALSO one export
      key registered by two factories merged into the same generated index)
-  6. bun tools/validate-data-export-binding.ts   (one address per HLE export: `hleImageExportAddress`
+  7. bun tools/validate-data-export-binding.ts   (one address per HLE export: `hleImageExportAddress`
      stays private to the precedence owner, plus a pinned census of API-descriptor/registerDataExport
      doubles)
-  7. bun tools/validate-api-export-uniqueness.ts   (a module descriptor declares each export
+  8. bun tools/validate-api-export-uniqueness.ts   (a module descriptor declares each export
      name ONCE — a name declared twice lays two stub bodies at two addresses under one name,
      so the PE walk and `exportAddresses` can answer with different ones, and a title that
      compares GetProcAddress against its own IAT reads that as a hooked API)
-  8. bun tools/validate-d3d9-export-collisions.ts   (the hand-composed d3d9 tables: a resource
+  9. bun tools/validate-d3d9-export-collisions.ts   (the hand-composed d3d9 tables: a resource
      constructor has ONE owner, so merge order cannot pick the fallback)
-  9. bun tools/validate-unimplemented-returns.ts  (a declared export with no handler must answer
+ 10. bun tools/validate-unimplemented-returns.ts  (a declared export with no handler must answer
      FAILURE — the default "zero" is SUCCESS under HRESULT/MMSYSERR/MCI/LSTATUS, so those
      descriptors must carry onUnimplemented, and a makeFunc factory must spread its overrides)
- 10. bun tools/validate-file-cursor.ts
- 11. bun tools/validate-jit-exports.ts   (checks the BUILT v86 artifact — skips cleanly if absent)
- 12. bun tools/validate-guest-pointer-guards.ts   (ddraw + d3d9 HANDLER tables. It models
+ 11. bun tools/validate-file-cursor.ts
+ 12. bun tools/validate-wwt-cpu-abi.ts   (the shipped translator and native HLE crossing run x86 in paged and flat modes)
+ 13. bun tools/validate-guest-pointer-guards.ts   (ddraw + d3d9 HANDLER tables. It models
      `Iface_Method: (ctx, mem, args) => …`; the d3d9 backend draw paths take guest pointers
      too and are outside that model — a code-shape gap, not a scope one)
- 13. bun tools/validate-guest-memory-borrow.ts   (raw guest-memory Proxy access confined to its owners)
- 14. bun tools/validate-guest-memory-views.ts    (no PLAIN guest view stored past the turn that derived it)
- 15. bun tools/validate-cpu-proxy-reads.ts      (v86 publishes the CPU state block — reg32, EIP,
+ 14. bun tools/validate-guest-memory-borrow.ts   (raw guest-memory Proxy access confined to its owners)
+ 15. bun tools/validate-guest-memory-views.ts    (no PLAIN guest view stored past the turn that derived it)
+ 16. bun tools/validate-cpu-proxy-reads.ts      (v86 publishes the CPU state block — reg32, EIP,
      instruction_counter, segment_offsets — as `view()` Proxies, so every INDEX is a get trap +
      resolve() + buffer compare, per access, on the thunk/scheduler hot paths. core/cpu/cpu-views.ts
      is the single owner of plain views over those bytes and of the pinned offsets;
      `cpuViews(cpu)` / `readEip` / `readEsp` / `readRetiredInsns` are the sanctioned spellings.
      Ownership + a pinned per-file census, so the class can shrink but never grow — a bare
      comment cannot hold it, because indexing the Proxy is always CORRECT)
- 16. bun tools/validate-hypercall-abi.ts         (Rust/TS hypercall page offsets + handler ids agree)
- 17. bun tools/validate-jit-shipping-config.ts   (the ONE shipping JIT envelope, tools/jit-config/shipping.mjs,
-     is what PreemptionManager applies and what every offline arm calls "shipping")
- 18. bun tools/validate-census-abi.ts            (opcode-census key layout agrees between opstats.rs and
-     guest-opcode-classes.ts)
- 19. bun tools/validate-tlb-mirror.mjs           (`tlb_data` has ONE writer, cpu::set_tlb_entry, in any
-     assignment spelling — the permission bitmap is a mirror of it)
- 20. bun tools/validate-eagl-read-cursor.mjs     (every function that CLEARS a TLB entry
-     — `set_tlb_entry(page, 0)` — also drops the EAGL read cursor. That containment is the
-     whole safety argument for the cursor outliving a hypercall; a fifth clearing site
-     would otherwise let it answer from a page the CPU no longer maps, and the read would
-     succeed with the wrong bytes)
- 21. bun tools/validate-video-plane-policy.ts   (the video plane has ONE composite policy —
+ 17. bun tools/validate-session-state.ts   (worker state is assigned to a reset or savestate owner)
+ 18. bun tools/validate-hypercall-abi.ts    (owned Rust/TS page layout and native handler exports agree)
+ 19. bun tools/validate-video-plane-policy.ts   (the video plane has ONE composite policy —
      `video/video-plane-policy.ts`. Six present paths reach the screen; when each decided for
      itself from "the plane still holds a bitmap" they disagreed about when it STOPS being on
      screen, and a finished movie covered the menu. Nothing outside `src/worker/video/` may
      reach `getOverlayService()`)
- 22. bun tools/validate-render-space-ownership.ts   (the host canvas size is not a guest-space
+ 20. bun tools/validate-render-space-ownership.ts   (the host canvas size is not a guest-space
      quantity. Guest space is the extent the app asked for — viewport, scissor, the XYZRHW
      divisor, every readback extent; the canvas is the present target, sized by the host
      container. D3D9 conflated them and rendered a 640x480 game into the top-left corner of a
      1557x1168 canvas. Reading the canvas is a pinned census of file+member: the present pass
      and the internal-scale resolver, nothing else)
- 23. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
+ 21. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
      arity that helper declares — our shaders are template strings, invisible to the typechecker,
      and one bad call blackens a whole pass)
- 24. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches arena.rs
-     LAYOUT_TABLE, and the arena exports in public/v86.wasm match the ones arena.rs declares —
-     missing AND stale extras, so a not-rebuilt artifact cannot silently disable the arena)
- 25. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
+ 22. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches the owned Rust
+     LAYOUT_TABLE and the exports and private memory of the shipped WWT arena)
+ 23. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
      from the live device, not read off globalThis, and the probe is AWAITED as an unconditional
      statement before the device is published)
- 26. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
+ 24. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
      predicts the path: the checked-in reference D3DCAPS9 blob AND the caps we answer with)
- 27. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
+ 25. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
      writes a missing snapshot and exits 0, so without the file the assertion asserts nothing)
- 28. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
+ 26. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
      is reporting-only and exits 0 for everything; this wrapper fails on an unreadable/invalid
      capture and on any divergence NOT recorded in tools/d3d9-capture-expected.json — the
      intentional ones of plan/dx9c-review-findings-2026-08-26.md §B2. Record a new intentional
      one with `--update-baseline`)
- 29. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
+ 27. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
      naga is an error instead of a silent skip)
- 30. bun run typecheck
- 31. bun test                                    (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
+ 28. bun run typecheck
+ 29. bun run test                                (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
      every describe.skipIf in wgsl-smoke.test.ts vanishes and the suite is green without it)
 
-`bun run gate` runs all of it in order — including the test suite as the final step. CI runs
-that same script, not a hand-copied subset (.github/workflows/ci.yml), so the two cannot drift.
-`census-selftest` and `perm-map-differential` are NOT in it: they need the vendor build
-(vendor/v86/build/libv86.mjs) and SKIP without it, so they are run by hand after a v86 rebuild.
+The default CI job runs `bun run gate` on a checkout without the v86 submodule. It verifies the
+compiler and sidecars delivered in `public/`, then runs the common and WWT execution suites.
+
+The separate legacy CI job runs `bun run gate:legacy` after checking out `vendor/v86` with full
+history. It checks the built v86 JIT exports and shipping configuration, the opcode census,
+the single TLB permission-mirror writer, EAGL read-cursor invalidation, and the legacy
+hypercall/arena ABI. `bun run test:legacy` runs the v86 source and executable fixtures. Its
+input check requires both the vendor artifacts and the published legacy Wasm.
+`census-selftest` and `perm-map-differential` remain opt-in diagnostics after a v86 rebuild.
 
 A validator that cannot fail is worse than no validator: it converts an unchecked invariant
 into a false assurance. When one of these passes, confirm it CAN fail — feed it the bypass it
@@ -566,7 +561,7 @@ Archive / installer formats — USE OUR OWN READERS, never `apt install` a third
   (which reader for which container, make-wgb usage, and the empty-directory pitfall) — invoke it when
   packing/repacking a bundle or diagnosing one that boots but won't save.
 
-v86 core (vendor/v86/ — a git submodule; clone with --recurse-submodules):
+Optional v86 core (initialize the vendor/v86 submodule for legacy development)
   - Use bracket notation (this["prop"]) for all properties accessed from TS code.
     Closure Compiler advanced optimizations rename dot-notation properties → silent runtime breakage.
   - Build: vendor/v86/build-wasm.sh. Generated Rust files (jit.rs etc.) are not in git —
