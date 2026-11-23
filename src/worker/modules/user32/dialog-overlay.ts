@@ -295,6 +295,7 @@ export function isWindowFullyCoveredByHigherTopLevel(
 ): boolean {
     if (!bounds) return false;
     if ((win.style & WS_CHILD) !== 0) return false;
+    if (overlayForms.has(win.handle)) return false;
     const wm = System.getInstance().windowManager;
     const zOrder = wm.getZOrder();
     const index = zOrder.indexOf(win.handle);
