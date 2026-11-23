@@ -275,17 +275,17 @@ export class WindowManager {
      */
     getMouseTargetWindow(screenX: number, screenY: number): WindowObject | undefined {
         const fromPoint = this.windowFromPoint(screenX, screenY);
-        if (fromPoint) {
-            const win = this.windows.get(fromPoint);
-            if (win) return win;
-        }
-        // Fallback: dialog-overlay point router (Phase 5 will retire this).
+        const hit = fromPoint ? this.windows.get(fromPoint) : undefined;
+        if (hit && !this.isDisabled(hit)) return hit;
         const hwnd = this.mouseTargetResolver?.(screenX, screenY) ?? 0;
         if (hwnd) {
             const win = this.windows.get(hwnd);
-            if (win && win.visible) return win;
+            if (win && win.visible) {
+                const inner = this.windows.get(this.descendToChildAtPoint(hwnd, win.rect.x, win.rect.y, screenX, screenY));
+                return inner ?? win;
+            }
         }
-        return undefined;
+        return hit;
     }
 
     /**

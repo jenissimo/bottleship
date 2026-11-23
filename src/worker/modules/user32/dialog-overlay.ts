@@ -30,12 +30,15 @@ import {
     isWindowUpdateLocked,
     hasSystemControlChildren,
     isEffectivelyVisible,
+    virtualScreenWidth,
+    virtualScreenHeight,
 } from './shared-state';
 import { getComboDropdownRect } from './controls';
 import { invokeOverlayRepairRepaint } from './control-interaction';
 import { paintTraceEnabled, logOverlayMutation } from './paint-trace';
 
 const WS_CHILD = 0x40000000;
+const WS_CAPTION = 0x00c00000;
 
 function getDDrawContext(): any {
     return (System.getInstance().process?.getModule('ddraw') as any)?.context;
@@ -123,12 +126,27 @@ export function noteDialogOverlayCandidate(win: WindowInfo | undefined): void {
     // #32770 dialogs, plus plain windows hosting JS system controls (a launcher /
     // options window built via CreateWindowEx("BUTTON"...) is real UI, not a stray
     // helper window) — both must composite over a game-owned screen.
-    if (win.nativeClassName !== '#32770' && !hasSystemControlChildren(win)) return;
+    const form = isOverlayFormCandidate(win);
+    if (win.nativeClassName !== '#32770' && !hasSystemControlChildren(win) && !form) return;
     if (isScreenOwnerWindow(win.handle)) return;
     if (!isGameScreenOwned()) return;
     if (!win.overlayOnFlipScreen) {
         win.overlayOnFlipScreen = true;
     }
+    if (form) win.overlayForm = true;
+}
+
+/**
+ * A captioned top-level window of the app's own class (a Delphi/VCL TForm, an MFC
+ * frame), smaller than the screen, shown while the game owns the screen. Showing it activates it, and an
+ * activated top-level window takes the display from an exclusive-fullscreen device,
+ * so it is on screen and receives the mouse even though it is not a #32770.
+ */
+export function isOverlayFormCandidate(win: WindowInfo): boolean {
+    if (win.nativeClassName === '#32770' || (win.style & WS_CHILD) !== 0) return false;
+    if ((win.style & WS_CAPTION) !== WS_CAPTION) return false;
+    return win.width > 0 && win.height > 0
+        && (win.width < virtualScreenWidth() || win.height < virtualScreenHeight());
 }
 
 export interface DialogOverlayRect {
@@ -346,6 +364,7 @@ export function eraseDialogOverlay(hwnd: number): void {
     // Stop compositing this dialog before erase (DestroyWindow path: still visible).
     if (win) {
         win.overlayOnFlipScreen = false;
+        win.overlayForm = false;
     }
 
     // +2px margin to cover anti-aliased edges / the default 1px dialog border.
@@ -436,7 +455,6 @@ function getDialogRoot(hwnd: number): number {
     return cur;
 }
 
-const WS_CAPTION = 0x00c00000;
 
 /**
  * True if the overlay actually holds pixels for this dialog group: an OS-drawn
@@ -562,7 +580,7 @@ export function getLiveDialogOverlays(renderActive?: RenderActive | null): Array
         // A window flagged before the app took exclusive fullscreen can become the
         // screen owner afterwards; re-check here, the one place the rects are consumed.
         if (!dialogOverlayComposites({
-            gdiOutputOnScreen,
+            gdiOutputOnScreen: gdiOutputOnScreen || !!win.overlayForm,
             isScreenOwnerWindow: isScreenOwnerWindow(win.handle),
             isDialogRoot: getDialogRoot(win.handle) === win.handle,
             hasOverlayContent: dialogGroupHasOverlayContent(win.handle),
@@ -595,7 +613,7 @@ export function dialogNeedsPointMouseRouting(win: WindowInfo): boolean {
     if (win.nativeClassName !== '#32770') {
         // Plain window hosting system controls: point-route only while it's the
         // live overlay over a game-owned screen (windowed mode routes normally).
-        return !!win.overlayOnFlipScreen && hasSystemControlChildren(win);
+        return !!win.overlayOnFlipScreen && (!!win.overlayForm || hasSystemControlChildren(win));
     }
 
     // Every other visible #32770 point-routes. Being hidden behind an exclusive-fullscreen
