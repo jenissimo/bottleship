@@ -38,18 +38,20 @@ and back the faithfulness claim with a public citation.
 ## Getting set up
 
 ```bash
-git clone --recurse-submodules <repo-url>   # vendor/v86 is a submodule
+git clone <repo-url>
 cd bottleship
 bun install
 bun run dev                                  # http://localhost:5174
 ```
 
-If you forgot `--recurse-submodules`: `git submodule update --init --recursive`.
+The default setup uses the shipped WWT backend. It requires [Bun](https://bun.sh/) and a
+WebGPU-capable browser (Chrome/Edge 113+). Most work is in TypeScript and needs no WASM rebuild.
 
-Requirements: [Bun](https://bun.sh/), a WebGPU-capable browser (Chrome/Edge 113+). The
-engine core (`vendor/v86`) is Rust→WASM; rebuilding it needs the `wasm32-unknown-unknown`
-target, clang, and Node — see `vendor/v86/build-wasm.sh`. You only need that if you change
-the emulator core; most work is in TypeScript and needs no WASM rebuild.
+Initialize the optional v86 submodule for legacy development with
+`git submodule update --init --recursive vendor/v86`. Use `VITE_CPU_BACKEND=v86` to
+select the legacy backend for dev or build, and `bun run gate:legacy` to check it.
+Rebuilding the legacy core requires Rust with the `wasm32-unknown-unknown` target,
+clang, and Node. See `vendor/v86/build-wasm.sh`.
 
 ## The quality gate (required before every PR)
 
@@ -60,7 +62,7 @@ bun tools/generate-index.ts          # regenerate module indexes
 bun tools/validate-signatures.ts     # WinAPI signatures vs reference data
 bun tools/validate-struct-offsets.ts # struct layout/offset checks
 bun run typecheck
-bun test
+bun run test
 ```
 
 ## Project layout
@@ -74,7 +76,7 @@ bun test
 | `src/app/`, `src/harness/` | React host UI and the main-thread automation harness |
 | `packages/` | Standalone libraries (archive formats, repack) with no engine dependency |
 | `tools/` | Build, bundling (`make-wgb`, `wgb`), the harness CLI, RE service, validators |
-| `vendor/v86/` | The x86 emulator core (Rust→WASM), a submodule |
+| `vendor/v86/` | Optional legacy x86 emulator (Rust→WASM), a submodule |
 
 ## Conventions
 

@@ -809,10 +809,8 @@ export default function App() {
     // saw a blocked launch would also be the last, and the game would never start.
   }, [launchBlocked, selectedGame, workerStatus]);
 
-  // Cover the worker/v86 boot phase too: before the worker posts "ready" there is no
-  // load_bundle progress yet, so without this the user stares at a bare canvas while
-  // v86.wasm + BIOS download and instantiate (often the slowest part of a cold start).
-  // Show an indeterminate "Booting emulator" overlay for any game that will auto-launch.
+  // Show an indeterminate "Booting emulator" overlay for games that auto-launch
+  // while the worker initializes the CPU backend. Bundle progress starts once the worker is ready.
   useEffect(() => {
     if (!browserSupport.supported || !displayGame) return;
     const params = new URLSearchParams(window.location.search);
