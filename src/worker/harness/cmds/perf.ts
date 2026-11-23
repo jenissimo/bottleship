@@ -23,6 +23,11 @@ import { d3d8LockCounters } from "../../modules/d3d8/lock-flags";
 import { d3d9LockCounters, d3d9ReadbackCounters } from "../../modules/d3d9/lock-stats";
 import { prefetchCounters } from "../../modules/ddraw/surface-readback-prefetch";
 import { drawCostProfiler } from "../../backends/webgpu/ddraw/draw-cost-profiler";
+import { ffpMultiBindGroupStats } from "../../backends/webgpu/ddraw/bind-group-manager";
+import { ffpVertexSourceUploadStats } from "../../backends/webgpu/ddraw/compute/vertex-converter";
+import { ffpRetainedIndexStats, ffpRetainedVertexStats } from "../../backends/webgpu/ddraw/retained-geometry";
+import { ffpDirectVertexStats } from "../../backends/webgpu/ddraw/direct-vertex-input";
+import { ffpEncoderSubmitStats, type DDrawWebGPUExecutor } from "../../backends/webgpu/ddraw/ddraw-backend-executor";
 import { lockCostProfiler } from "../../modules/ddraw/lock-cost-profiler";
 import { getBufferUploadCensus, resetBufferUploadCensus } from "../../backends/webgpu/buffer-upload";
 import { cpu, sys, symbolize, proc } from "../serialize";
@@ -132,6 +137,12 @@ type CounterSnapshot = {
      *  it is not. */
     wasmGrowths: number;
     hypercalls: number;
+    ffpMultiBindGroups: typeof ffpMultiBindGroupStats;
+    ffpVertexSourceUploads: typeof ffpVertexSourceUploadStats;
+    ffpRetainedVertex: typeof ffpRetainedVertexStats;
+    ffpRetainedIndex: typeof ffpRetainedIndexStats;
+    ffpDirectVertex: typeof ffpDirectVertexStats;
+    ffpRender: { drawRequests: number; indexedRequests: number; encoderSubmits: number; passes: number };
     handlers: ReturnType<typeof hypercallDataManager.getHandlerReport>;
 };
 
@@ -149,6 +160,9 @@ function snapshotCounters(render: RenderLike | undefined): CounterSnapshot {
     try {
         tier2 = (dbg.tier2Stats?.() as unknown as Record<string, number> | null) ?? null;
     } catch { /* same */ }
+    const ddraw = proc()?.getModule("ddraw") as { context?: { executor?: DDrawWebGPUExecutor } } | undefined;
+    const executor = ddraw?.context?.executor ?? (globalThis as { __ddrawExecutor?: DDrawWebGPUExecutor }).__ddrawExecutor;
+    const ffpStats = executor?.getRenderStats();
     return {
         atMs: Math.round(performance.now()),
         presentSerial: render?.getPresentSerial?.() ?? null,
@@ -160,6 +174,17 @@ function snapshotCounters(render: RenderLike | undefined): CounterSnapshot {
         codeInvalidations: guestCodeInvalidationStats(),
         wasmGrowths: getWasmGrowthStats().growths,
         hypercalls: hypercallDataManager.getCallCount(),
+        ffpMultiBindGroups: { ...ffpMultiBindGroupStats },
+        ffpVertexSourceUploads: { ...ffpVertexSourceUploadStats },
+        ffpRetainedVertex: { ...ffpRetainedVertexStats },
+        ffpRetainedIndex: { ...ffpRetainedIndexStats },
+        ffpDirectVertex: { ...ffpDirectVertexStats },
+        ffpRender: {
+            drawRequests: ffpStats?.drawReq ?? 0,
+            indexedRequests: ffpStats?.drawIndexedReq ?? 0,
+            encoderSubmits: ffpEncoderSubmitStats.count,
+            passes: ffpStats?.passes ?? 0,
+        },
         handlers: hypercallDataManager.getHandlerReport(),
     };
 }
@@ -226,6 +251,12 @@ function counterDelta(base: CounterSnapshot | null, now: CounterSnapshot) {
             wired: now.codeInvalidations.wired,
         },
         wasmGrowths: now.wasmGrowths - base.wasmGrowths,
+        ffpMultiBindGroups: diffNumbers(base.ffpMultiBindGroups, now.ffpMultiBindGroups),
+        ffpVertexSourceUploads: diffNumbers(base.ffpVertexSourceUploads, now.ffpVertexSourceUploads),
+        ffpRetainedVertex: diffNumbers(base.ffpRetainedVertex, now.ffpRetainedVertex),
+        ffpRetainedIndex: diffNumbers(base.ffpRetainedIndex, now.ffpRetainedIndex),
+        ffpDirectVertex: diffNumbers(base.ffpDirectVertex, now.ffpDirectVertex),
+        ffpRender: diffNumbers(base.ffpRender, now.ffpRender),
         hypercalls: {
             delta: hcDelta,
             wrapCaveat: "32-bit wrapping total; delta is computed unsigned so ONE wrap is recovered.",

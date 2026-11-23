@@ -62,6 +62,7 @@ import {
 import { DebugFlags, generatePipelineKey, generateMegaBatchPipelineKey, PipelineKeyConfig, makeEmptyPipelineKeyConfig,
     pipelineKeyConfigsEqual, megaBatchPipelineKeyConfigsEqual } from "./types";
 import { ShaderGenerator, ShaderConfig } from "./shader-generator";
+import type { DirectVertexLayout } from "./direct-vertex-input";
 import { BindGroupManager } from "./bind-group-manager";
 import { DirectDrawSurfaceState } from "../../../modules/ddraw/com-objects";
 import { FfpStagesState, MAX_FFP_SAMPLED_STAGES } from "./ffp-stages";
@@ -256,6 +257,7 @@ export class PipelineFactory {
     }
     private lastGetPipelineConfig: PipelineKeyConfig | null = null;
     private lastGetPipelinePipeline: GPURenderPipeline | null = null;
+    private lastDirectVertexKey: string | undefined;
 
     // MegaBatch last-config fast path
     private lastMegaBatchConfig: PipelineKeyConfig | null = null;
@@ -359,7 +361,8 @@ export class PipelineFactory {
         stages: FfpStagesState,
         missingTexture: boolean,
         renderStates: Int32Array,
-        texture?: DirectDrawSurfaceState | null
+        texture?: DirectDrawSurfaceState | null,
+        directVertex?: DirectVertexLayout
     ): GPURenderPipeline {
         const useTexture = (stages.sampledMask & 1) !== 0;
         // Read render states
@@ -467,13 +470,15 @@ export class PipelineFactory {
         if (this.lastGetPipelineConfig !== null &&
             this.lastGetPipelinePipeline !== null &&
             keyConfig !== this.lastGetPipelineConfig &&
+            this.lastDirectVertexKey === directVertex?.key &&
             pipelineKeyConfigsEqual(keyConfig, this.lastGetPipelineConfig)) {
             return this.lastGetPipelinePipeline;
         }
 
         // sampleCount prefix keeps MSAA and non-MSAA pipelines distinct without touching the
         // shared PipelineKeyConfig in types.ts (sampleCount is a factory-global, not per-draw).
-        const key = this.sampleCount + "|" + this.colorFormat + "|" + generatePipelineKey(keyConfig);
+        const key = this.sampleCount + "|" + this.colorFormat + "|" + generatePipelineKey(keyConfig) +
+            (directVertex ? "|direct:" + directVertex.key : "");
 
         // Check cache
         let pipeline = this.pipelineCache.get(key);
@@ -486,6 +491,7 @@ export class PipelineFactory {
             }
             this.lastGetPipelineConfig = keyConfig;
             this.lastGetPipelinePipeline = pipeline;
+            this.lastDirectVertexKey = directVertex?.key;
             this.getPipelineKeyIdx ^= 1;
             return pipeline;
         }
@@ -526,12 +532,14 @@ export class PipelineFactory {
             needsUVFlip,
             keyConfig.flatShading,
             colorWriteMask,
-            blendOp
+            blendOp,
+            directVertex
         );
 
         this.pipelineCache.set(key, pipeline);
         this.lastGetPipelineConfig = keyConfig;
         this.lastGetPipelinePipeline = pipeline;
+        this.lastDirectVertexKey = directVertex?.key;
         this.getPipelineKeyIdx ^= 1;
         Logger.verbose(LogCategory.SYSTEM, `PipelineFactory: Created new pipeline with key: ${key}`);
         return pipeline;
@@ -926,7 +934,8 @@ export class PipelineFactory {
         needsUVFlip: boolean,
         flatShading: boolean,
         colorWriteMask: number,
-        blendOp: number
+        blendOp: number,
+        directVertex?: DirectVertexLayout
     ): GPURenderPipeline {
         const useTexture = (sampledMask & 1) !== 0;
         const isRHWVertex = (vertexType & D3DFVF_XYZRHW) !== 0;
@@ -993,6 +1002,7 @@ export class PipelineFactory {
             colorKey: null,
             debugFlags: this.debugFlags,
             needsUVFlip,
+            directVertex,
         };
         const shader = this.shaderGenerator.getOrCreateShader(shaderConfig);
 
@@ -1029,7 +1039,7 @@ export class PipelineFactory {
             vertex: {
                 module: shader,
                 entryPoint: "vs_main",
-                buffers: [
+                buffers: directVertex?.layouts ?? [
                     {
                         arrayStride: 64,
                         attributes: [

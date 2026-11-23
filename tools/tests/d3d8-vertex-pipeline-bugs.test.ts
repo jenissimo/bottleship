@@ -11,6 +11,12 @@ import {
     primCountToVertexCount,
 } from "../../src/worker/backends/webgpu/d3d8/d3d8-device-adapter";
 import { declToSyntheticFvf } from "../../src/worker/backends/webgpu/d3d8/decl-to-ffp";
+import { directVertexBytes, makeDirectVertexLayout } from "../../src/worker/backends/webgpu/ddraw/direct-vertex-input";
+import { generateShaderCode, ShaderGenerator, type ShaderConfig } from "../../src/worker/backends/webgpu/ddraw/shader-generator";
+import { PipelineFactory } from "../../src/worker/backends/webgpu/ddraw/pipeline-factory";
+import type { BindGroupManager } from "../../src/worker/backends/webgpu/ddraw/bind-group-manager";
+import { FfpStagesState } from "../../src/worker/backends/webgpu/ddraw/ffp-stages";
+import { DEFAULT_DEBUG_FLAGS } from "../../src/worker/backends/webgpu/ddraw/types";
 import { parseVsdDeclaration } from "../../src/worker/backends/webgpu/d3d8/vsd-parser";
 import {
     D3DVSD_STREAM,
@@ -176,6 +182,86 @@ describe("decl-to-ffp D3DCOLOR vs UBYTE4 disambiguation (Finding 1)", () => {
         expect(mapping.interleave).toBeTruthy();
         const colorCopy = mapping.interleave!.find(c => c.dstOffset === 12)!;
         expect(colorCopy.swizzleColorBytes).toBe(true);
+    });
+});
+
+describe("direct fixed-function vertex input", () => {
+    test("reads per-stream byte offsets, padded strides, and D3D color byte order", () => {
+        const plan = [
+            { stream: 2, srcOffset: 4, dstOffset: 0, size: 12, slotSize: 12 },
+            { stream: 2, srcOffset: 16, dstOffset: 12, size: 12, slotSize: 12 },
+            { stream: 0, srcOffset: 0, dstOffset: 24, size: 4, slotSize: 4, swizzleColorBytes: true },
+            { stream: 3, srcOffset: 8, dstOffset: 28, size: 8, slotSize: 8 },
+        ];
+        const layout = makeDirectVertexLayout(0x152, [8, 0, 32, 20], plan)!;
+        expect(layout.streamNumbers).toEqual([2, 0, 3]);
+        expect(layout.layouts).toEqual([
+            { arrayStride: 32, attributes: [
+                { shaderLocation: 0, format: "float32x3", offset: 4 },
+                { shaderLocation: 1, format: "float32x3", offset: 16 },
+            ] },
+            { arrayStride: 8, attributes: [{ shaderLocation: 2, format: "unorm8x4", offset: 0 }] },
+            { arrayStride: 20, attributes: [{ shaderLocation: 4, format: "float32x2", offset: 8 }] },
+        ]);
+        expect(directVertexBytes(layout, 4)).toBe(240);
+        expect(layout.shaderPrologue).toContain("let color = raw_color.bgra;");
+        expect(layout.shaderPrologue).toContain("let uv1 = uv;");
+        expect(layout.shaderPrologue).toContain("let uv2 = uv1;");
+    });
+
+    test("keeps fixed-function shader body identical and reconstructs converter defaults", () => {
+        const directVertex = makeDirectVertexLayout(2, [12])!;
+        const config: ShaderConfig = {
+            sampledMask: 3, stageCount: 2, flatShading: false, alphaTestEnabled: true, alphaFunc: 5,
+            shouldEnableBlending: true, missingTexture: false, colorKeyEnabled: false, colorKey: null,
+            debugFlags: DEFAULT_DEBUG_FLAGS,
+        };
+        const original = generateShaderCode(config);
+        const direct = generateShaderCode({ ...config, directVertex });
+        const shading = "var out: VertexOutput;";
+        expect(direct.slice(direct.indexOf(shading))).toBe(original.slice(original.indexOf(shading)));
+        expect(direct).toContain("@location(0) raw_pos: vec3f");
+        expect(direct).toContain("let pos = vec4f(raw_pos, 1.0);");
+        expect(direct).toContain("let normal = vec3f(0.0, 0.0, 1.0);");
+        expect(direct).toContain("let color = vec4f(1.0);");
+        expect(direct).toContain("let specular = vec4f(0.0, 0.0, 0.0, 1.0);");
+    });
+
+    test("pipeline memo selects input layouts independently of identical FVF state", () => {
+        const descriptors: GPURenderPipelineDescriptor[] = [];
+        const device = {
+            createShaderModule: () => ({}),
+            createRenderPipeline: (descriptor: GPURenderPipelineDescriptor) => {
+                descriptors.push(descriptor);
+                return {};
+            },
+        } as unknown as GPUDevice;
+        const bindGroups = { createPipelineLayout: () => ({}) } as unknown as BindGroupManager;
+        const factory = new PipelineFactory(device, new ShaderGenerator(device), bindGroups, DEFAULT_DEBUG_FLAGS, "rgba8unorm");
+        const plain = makeDirectVertexLayout(2, [12])!;
+        const padded = makeDirectVertexLayout(2, [16])!;
+        const states = new Int32Array(256);
+        const stages = new FfpStagesState();
+        const pipeline = (input?: typeof plain) => factory.getOrCreatePipeline(2, 4, stages, false, states, null, input);
+        const canonical = pipeline();
+        const a = pipeline(plain);
+        const b = pipeline(padded);
+        expect(a).not.toBe(canonical);
+        expect(b).not.toBe(a);
+        expect(pipeline(plain)).toBe(a);
+        expect(pipeline()).toBe(canonical);
+        expect(descriptors.map(descriptor => [...descriptor.vertex.buffers!][0]!.arrayStride)).toEqual([64, 12, 16]);
+    });
+
+    test("rejects transformed/skinned vertices and incomplete declaration offsets", () => {
+        expect(makeDirectVertexLayout(4, [16])).toBeNull();
+        expect(makeDirectVertexLayout(6, [16])).toBeNull();
+        expect(makeDirectVertexLayout(0x102, [16])).toBeNull();
+        const truncated = [
+            { stream: 0, srcOffset: 0, dstOffset: 0, size: 12, slotSize: 12 },
+            { stream: 0, srcOffset: 12, dstOffset: 12, size: 4, slotSize: 8 },
+        ];
+        expect(makeDirectVertexLayout(0x102, [16], truncated)).toBeNull();
     });
 });
 

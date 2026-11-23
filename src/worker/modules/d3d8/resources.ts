@@ -705,7 +705,11 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
-    exports['IDirect3DVertexBuffer8_Unlock'] = () => D3D_OK;
+    exports['IDirect3DVertexBuffer8_Unlock'] = (_ctx, _mem, args) => {
+        const ptr = args[0] >>> 0;
+        resourceToDevice.get(ptr)?.unlockGeometryBuffer("vb", ptr);
+        return D3D_OK;
+    };
     exports['IDirect3DVertexBuffer8_GetType'] = (_ctx, _mem, args) => {
         return resourceToDevice.has(args[0]) ? D3DRTYPE_VERTEXBUFFER : D3DRTYPE_UNKNOWN;
     };
@@ -753,7 +757,11 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
-    exports['IDirect3DIndexBuffer8_Unlock'] = () => D3D_OK;
+    exports['IDirect3DIndexBuffer8_Unlock'] = (_ctx, _mem, args) => {
+        const ptr = args[0] >>> 0;
+        resourceToDevice.get(ptr)?.unlockGeometryBuffer("ib", ptr);
+        return D3D_OK;
+    };
     exports['IDirect3DIndexBuffer8_GetType'] = (_ctx, _mem, args) => {
         return resourceToDevice.has(args[0]) ? D3DRTYPE_INDEXBUFFER : D3DRTYPE_UNKNOWN;
     };

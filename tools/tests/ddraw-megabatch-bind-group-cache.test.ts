@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { BindGroupManager, MEGA_BATCH_CACHE_LIMIT } from "../../src/worker/backends/webgpu/ddraw/bind-group-manager";
 import type { StageSamplerState } from "../../src/worker/backends/webgpu/ddraw/ffp-stages";
-import { useWebGpuFlags } from "./helpers/scoped-globals";
+import { scopedGlobals, useWebGpuFlags } from "./helpers/scoped-globals";
 
 function fakeDevice() {
     const made: Array<{ entries: Array<{ binding: number; resource: unknown }> }> = [];
@@ -18,8 +18,9 @@ const view = (n: string) => ({ n }) as unknown as GPUTextureView;
 const buffer = (n: string) => ({ n }) as unknown as GPUBuffer;
 const DUMMY = view("dummy");
 
+useWebGpuFlags("GPUShaderStage");
+
 describe("MegaBatch bind groups are keyed by resource identity", () => {
-    useWebGpuFlags("GPUShaderStage");
 
     function rig() {
         const { device, made } = fakeDevice();
@@ -191,4 +192,124 @@ test("a cached group is bound again in every pass a batch is flushed into", asyn
     ex.currentBatch = batch(); flush();
     ex.currentBatch = batch(); flush();
     expect(bound).toEqual([[1, cached], [2, cached]]);
+});
+
+describe("ordinary multi-texture bind groups", () => {
+    scopedGlobals({ __ffpMultiBindCache: true });
+
+    test("matches the uncached descriptor and reuses bindings after resource-content changes", () => {
+        const { device, made } = fakeDevice();
+        const manager = new BindGroupManager(device);
+        const pipeline = {} as GPURenderPipeline;
+        const uniform = buffer("uniform"), lights = buffer("lights"), clip = buffer("clip");
+        const a = view("a"), b = view("b"), dormant = view("unused");
+        const maps = [a, dormant, b];
+        const modes = [sampler(), sampler(), sampler({ addressU: 1 })];
+        const call = () => manager.getOrCreateBindGroup(pipeline, uniform, 5, maps, modes, DUMMY, lights, clip);
+        const original = call();
+        const globalFlag = globalThis as { __ffpMultiBindCache?: boolean };
+        globalFlag.__ffpMultiBindCache = false;
+        call();
+        globalFlag.__ffpMultiBindCache = true;
+        expect(made[0]).toEqual(made[1]);
+        maps[1] = view("changed unsampled stage");
+        modes[1] = sampler({ magFilter: 1 });
+        expect(call()).toBe(original);
+        expect(made).toHaveLength(2);
+    });
+
+    test("resolves every sampled and buffer identity on each draw and clears on reset", () => {
+        const { device, made } = fakeDevice();
+        const manager = new BindGroupManager(device);
+        const pipeline = {} as GPURenderPipeline;
+        const originalUniform = buffer("uniform");
+        const originalLights = buffer("lights");
+        const originalClip = buffer("clip");
+        let uniform = originalUniform, lights = originalLights, clip = originalClip;
+        const a = view("a"), b = view("b");
+        const maps = [a, b];
+        const modes = [sampler(), sampler()];
+        const call = () => manager.getOrCreateBindGroup(pipeline, uniform, 3, maps, modes, DUMMY, lights, clip);
+        const original = call();
+        modes[1].magFilter = 1;
+        expect(call()).not.toBe(original);
+        modes[1].magFilter = 2;
+        maps[1] = view("replacement");
+        expect(call()).not.toBe(original);
+        maps[1] = b;
+        uniform = buffer("rotated uniform ring");
+        expect(call()).not.toBe(original);
+        uniform = originalUniform;
+        lights = buffer("rotated light ring");
+        expect(call()).not.toBe(original);
+        lights = originalLights;
+        clip = buffer("replacement clip buffer");
+        expect(call()).not.toBe(original);
+        clip = originalClip;
+        expect(call()).toBe(original);
+        manager.clearCache();
+        expect(call()).not.toBe(original);
+        expect(made).toHaveLength(7);
+    });
+
+    test("the default cache evicts when more than 512 distinct groups are requested", () => {
+        const globalFlag = globalThis as { __ffpMultiBindCache?: boolean };
+        delete globalFlag.__ffpMultiBindCache;
+        const { device, made } = fakeDevice();
+        const manager = new BindGroupManager(device);
+        const pipeline = {} as GPURenderPipeline;
+        const uniform = buffer("uniform"), lights = buffer("lights"), clip = buffer("clip");
+        const a = view("a");
+        const modes = [sampler(), sampler()];
+        const secondStages = Array.from({ length: 513 }, (_, index) => view(String(index)));
+        const draw = (second: GPUTextureView) => manager.getOrCreateBindGroup(pipeline, uniform, 3, [a, second], modes, DUMMY, lights, clip);
+        expect(draw(secondStages[0]!)).toBe(draw(secondStages[0]!));
+        for (const next of secondStages.slice(1)) draw(next);
+        expect(made).toHaveLength(513);
+        for (const next of secondStages) draw(next);
+        expect(made.length).toBeGreaterThan(513);
+        globalFlag.__ffpMultiBindCache = true;
+    });
+
+    test("the real binding path selects each draw's dynamic uniform and light data", async () => {
+        const { DDrawWebGPUExecutor, STAGE_SAMPLER_KEY_LANES } = await import("../../src/worker/backends/webgpu/ddraw/ddraw-backend-executor");
+        const { MAX_FFP_SAMPLED_STAGES } = await import("../../src/worker/backends/webgpu/ddraw/ffp-stages");
+        const { device, made } = fakeDevice();
+        const bound: Array<{ group: GPUBindGroup; offsets: number[] }> = [];
+        const uniform = buffer("uniform"), lights = buffer("lights");
+        const executor = Object.assign(Object.create(DDrawWebGPUExecutor.prototype), {
+            bindGroupManager: new BindGroupManager(device),
+            ringBufferManager: { getCurrentUniformBuffer: () => uniform, getCurrentLightsBuffer: () => lights },
+            clipPlanesBuffer: buffer("clip"),
+            dummyTextureView: DUMMY,
+            currentRenderPass: {
+                setPipeline() {},
+                setStencilReference() {},
+                setBindGroup(_binding: number, group: GPUBindGroup, offsets: number[]) { bound.push({ group, offsets }); },
+            },
+            lastPipeline: null,
+            lastBindGroup: null,
+            lastUniformOffset: -1,
+            lastLightsOffset: -1,
+            lastStageViews: new Array(MAX_FFP_SAMPLED_STAGES).fill(null),
+            stageSamplerKeyScratch: new Int32Array(MAX_FFP_SAMPLED_STAGES * STAGE_SAMPLER_KEY_LANES),
+            lastStageSamplerKeys: new Int32Array(MAX_FFP_SAMPLED_STAGES * STAGE_SAMPLER_KEY_LANES).fill(-1),
+        });
+        const pipeline = {} as GPURenderPipeline;
+        const a = view("a"), b = view("b"), c = view("c");
+        const stageViews = [a, b, null, null];
+        const stageSamplers = [sampler(), sampler()];
+        const draw = (uniformOffset: number, lightsOffset: number) => executor.setupPipelineAndBindings({
+            pipeline, stencilRef: 0, sampledMask: 3, stageViews, stageSamplers, uniformOffset, lightsOffset,
+        });
+        draw(0, 256);
+        stageViews[1] = c;
+        draw(256, 512);
+        stageViews[1] = b;
+        draw(512, 1024);
+        expect(made).toHaveLength(2);
+        expect(bound[2]!.group).toBe(bound[0]!.group);
+        expect(bound[1]!.group).not.toBe(bound[0]!.group);
+        expect(bound.map(row => row.offsets)).toEqual([[0, 256], [256, 512], [512, 1024]]);
+    });
 });

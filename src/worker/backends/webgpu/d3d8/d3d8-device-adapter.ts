@@ -6,7 +6,11 @@
  * 2. On draw calls, resolves state into FFPRenderer parameters and calls through
  */
 
-import { DDrawWebGPUExecutor } from '../ddraw/ddraw-backend-executor';
+import { DDrawWebGPUExecutor, ffpEncoderSubmitStats } from '../ddraw/ddraw-backend-executor';
+import { finishDrawCommands } from '../ddraw/compute/vertex-prepass';
+import { ffpRetainedIndexStats, ffpRetainedVertexStats, retainedVertexMode, reuseRetainedGeometry,
+    type RetainedGeometryKey } from '../ddraw/retained-geometry';
+import { directVertexBytes, makeDirectVertexLayout, type DirectVertexLayout, type DirectVertexStreams } from '../ddraw/direct-vertex-input';
 import type { DirectDrawSurfaceState, RenderSurface, BitmapTextureSurface } from '../../../modules/ddraw/com-objects';
 import { surfaceSyncManager } from '../../../modules/ddraw/surface-sync';
 import type { Viewport } from '../ddraw/types';
@@ -347,11 +351,9 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     private ibGpuBuffers = new Map<number, GPUBuffer>();
     /**
      * Byte range of each retained buffer the guest has rewritten since its last upload.
-     * D3D8 hands the guest a raw pointer into the buffer's guest memory and its Unlock is a
-     * no-op, so without this every draw re-uploaded every bound buffer whole. Writing to a
-     * vertex buffer outside a Lock/Unlock bracket is undefined behaviour in D3D8, which is
-     * what makes Lock the faithful "it changed" signal; the mark is taken at Lock rather than
-     * Unlock because the upload happens at draw time, strictly after both.
+     * D3D8 hands the guest a pointer to its own memory. A writable Lock marks the upload range.
+     * Retained geometry bypasses its cache while the region is open for writes. Unlock then
+     * closes the write generation. Uploads at draw time take a snapshot of the guest bytes.
      */
     private vbDirty = new Map<number, { start: number; end: number }>();
     private ibDirty = new Map<number, { start: number; end: number }>();
@@ -364,6 +366,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     private declStreamStrides: number[] = [];
     /** Reusable interleave scratch (vertices + appended index range). */
     private declScratch = new Uint8Array(0);
+    private declScratchVertexKey: string | undefined;
+    private declScratchVertexCount = 0;
+    private declScratchIndexKey: RetainedGeometryKey | undefined;
+    private readonly directFvfLayouts = new Map<string, DirectVertexLayout | null>();
+    private readonly directDeclLayouts = new WeakMap<object, Map<string, DirectVertexLayout | null>>();
 
     // D3DPT_TRIANGLEFAN expansion scratch: the gathered original indices and the emitted
     // triangle-list, in both index widths. Grown, never shrunk — a fan draw is per-frame work
@@ -607,6 +614,12 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         const end = size > 0 ? Math.min(offset + size, totalSize) : totalSize;
         if (end <= offset) return;
         noteGuestBufferWrite("d3d8", end - offset);
+        const resource = (kind === "vb" ? this.vbData : this.ibData).get(ptr);
+        if (resource) {
+            const locks = D3D8DeviceAdapter.geometryWriteLocks;
+            locks.set(resource, (locks.get(resource) ?? 0) + 1);
+        }
+        this.invalidateGeometryVersion(kind, ptr);
         const map = kind === "vb" ? this.vbDirty : this.ibDirty;
         const cur = map.get(ptr);
         if (cur && cur.end > cur.start) {
@@ -619,7 +632,131 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
 
     /** Buffer created or re-created: nothing on the GPU corresponds to it yet. */
     markBufferAllDirty(kind: "vb" | "ib", ptr: number, totalSize: number): void {
+        this.invalidateGeometryVersion(kind, ptr);
         (kind === "vb" ? this.vbDirty : this.ibDirty).set(ptr, { start: 0, end: totalSize });
+    }
+
+    /** @transient(unique renderer cache tokens can keep increasing across guest sessions) */
+    private static nextGeometryVersion = 1;
+    /** @transient(tokens are weakly keyed by live resource and shader objects) */
+    private static readonly geometryVersions = new WeakMap<object, number>();
+    /** @transient(cache suppression is scoped to the current live buffer object's writable lock) */
+    private static readonly geometryWriteLocks = new WeakMap<object, number>();
+
+    private geometryVersion(object: object): number {
+        const version = D3D8DeviceAdapter.geometryVersions.get(object);
+        if (version !== undefined) return version;
+        const next = D3D8DeviceAdapter.nextGeometryVersion++;
+        D3D8DeviceAdapter.geometryVersions.set(object, next);
+        return next;
+    }
+
+    private geometryBufferVersion(buffer: object): number | undefined {
+        return D3D8DeviceAdapter.geometryWriteLocks.has(buffer) ? undefined : this.geometryVersion(buffer);
+    }
+
+    unlockGeometryBuffer(kind: "vb" | "ib", ptr: number): void {
+        const resource = (kind === "vb" ? this.vbData : this.ibData).get(ptr);
+        if (!resource) return;
+        const locks = D3D8DeviceAdapter.geometryWriteLocks;
+        const depth = locks.get(resource);
+        if (depth === undefined) return;
+        if (depth > 1) {
+            locks.set(resource, depth - 1);
+        } else {
+            locks.delete(resource);
+            this.invalidateGeometryVersion(kind, ptr);
+        }
+    }
+
+    private invalidateGeometryVersion(kind: "vb" | "ib", ptr: number): void {
+        if (D3D8DeviceAdapter.nextGeometryVersion === 1) return;
+        const resource = (kind === "vb" ? this.vbData : this.ibData).get(ptr);
+        if (resource) {
+            D3D8DeviceAdapter.geometryVersions.delete(resource);
+        }
+    }
+
+    private retainedIndexKey(buffer: object, offset: number, count: number, isUint32: boolean): RetainedGeometryKey | undefined {
+        if (!retainedVertexMode() || D3D8DeviceAdapter.geometryWriteLocks.has(buffer)) return undefined;
+        return `i:${this.geometryVersion(buffer)}:${offset}:${count}:${Number(isUint32)}`;
+    }
+
+    private canUseDirectFfp(primitiveType: number, indexIsUint32: boolean): boolean {
+        return (globalThis as { __ffpDirectVertexInput?: boolean }).__ffpDirectVertexInput !== false &&
+            !frameCapture.isCapturing() &&
+            (this.renderStates[D3DRENDERSTATE_VERTEXBLEND] | 0) === 0 &&
+            (this.renderStates[D3DRENDERSTATE_INDEXEDVERTEXBLENDENABLE] | 0) === 0 &&
+            this.renderer.canUseDirectVertexInput(primitiveType, indexIsUint32);
+    }
+
+    private directFvfInput(fvf: number, sourceStride: number, address: number, vertexCount: number, mem: Uint8Array, sourceBuffer: object): DirectVertexStreams | undefined {
+        const key = `${fvf}:${sourceStride}`;
+        let layout = this.directFvfLayouts.get(key);
+        if (layout === undefined) {
+            if (this.directFvfLayouts.size >= 128) this.directFvfLayouts.clear();
+            layout = makeDirectVertexLayout(fvf, [sourceStride]);
+            this.directFvfLayouts.set(key, layout);
+        }
+        const bytes = vertexCount * sourceStride;
+        return layout && address >= 0 && address + bytes <= mem.length && bytes <= (8 << 20)
+            ? { layout, addresses: [address], versions: retainedVertexMode() ? [this.geometryBufferVersion(sourceBuffer)] : undefined }
+            : undefined;
+    }
+
+    private directDeclInput(baseVertex: number, vertexCount: number, mem: Uint8Array): DirectVertexStreams | undefined {
+        const vs = this.shaders.getActiveVs();
+        if (!vs || !this.declInterleave || baseVertex < 0 || vertexCount <= 0) return undefined;
+        const strides: number[] = [];
+        const bases: number[] = [];
+        const versions: (number | undefined)[] | undefined = retainedVertexMode() ? [] : undefined;
+        for (const copy of this.declInterleave) {
+            const stream = copy.stream;
+            if (bases[stream] !== undefined) continue;
+            const source = this.streamSources[stream];
+            const buffer = this.vbData.get(source.vb);
+            const stride = source.stride > 0 ? source.stride : (this.declStreamStrides[stream] ?? 0);
+            if (!buffer || stride <= 0 || (baseVertex + vertexCount) * stride > buffer.size) return undefined;
+            const address = buffer.guestPtr + baseVertex * stride;
+            if (address < 0 || address + vertexCount * stride > mem.length) return undefined;
+            bases[stream] = address;
+            strides[stream] = stride;
+            if (versions) versions[stream] = this.geometryBufferVersion(buffer);
+        }
+        const strideKey = strides.join(",");
+        let variants = this.directDeclLayouts.get(vs);
+        if (!variants) this.directDeclLayouts.set(vs, variants = new Map());
+        let layout = variants.get(strideKey);
+        if (layout === undefined) {
+            if (variants.size >= 16) variants.clear();
+            layout = makeDirectVertexLayout(this.syntheticDeclFvf, strides, this.declInterleave);
+            variants.set(strideKey, layout);
+        }
+        return layout && directVertexBytes(layout, vertexCount) <= (8 << 20)
+            ? { layout, addresses: layout.streamNumbers.map(stream => bases[stream]),
+                versions: versions && layout.streamNumbers.map(stream => versions[stream]) }
+            : undefined;
+    }
+
+    private retainedDeclVertexKey(baseVertex: number): string | undefined {
+        if (!retainedVertexMode()) return undefined;
+        const vs = this.shaders.getActiveVs();
+        if (!vs || !this.declInterleave) return undefined;
+        let key = `d:${this.geometryVersion(vs)}:${baseVertex}`;
+        let seenStreams = 0;
+        for (const copy of this.declInterleave) {
+            const bit = 1 << copy.stream;
+            if (seenStreams & bit) continue;
+            seenStreams |= bit;
+            const source = this.streamSources[copy.stream];
+            const buffer = this.vbData.get(source.vb);
+            if (!buffer) return undefined;
+            const version = this.geometryBufferVersion(buffer);
+            if (version === undefined) return undefined;
+            const stride = source.stride || this.declStreamStrides[copy.stream];
+            key += `:${version}:${buffer.guestPtr}:${stride}`;
+        }
+        return key;
     }
 
     /** Release the GPU allocation and bookkeeping of a retired vertex/index buffer. */
@@ -630,6 +767,9 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         const gpuBuffers = kind === "vb" ? this.vbGpuBuffers : this.ibGpuBuffers;
         gpuBuffers.get(ptr)?.destroy();
         gpuBuffers.delete(ptr);
+        this.invalidateGeometryVersion(kind, ptr);
+        const resource = (kind === "vb" ? this.vbData : this.ibData).get(ptr);
+        if (resource) D3D8DeviceAdapter.geometryWriteLocks.delete(resource);
         (kind === "vb" ? this.vbDirty : this.ibDirty).delete(ptr);
 
         // Final release invalidates bindings to the retired object.
@@ -1700,6 +1840,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         mem: Uint8Array,
         extraBytes: number,
         upStream0: { guestPtr: number; stride: number } | null = null,
+        retainedKey?: string,
     ): Uint8Array | null {
         const plan = this.declInterleave!;
         const dstStride = this.syntheticDeclStride;
@@ -1710,8 +1851,17 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         const total = (vertexBytes + extraBytes + 3) & ~3;
         if (this.declScratch.length < total) {
             this.declScratch = new Uint8Array(Math.max(total, this.declScratch.length * 2, 4096));
+            this.declScratchVertexKey = undefined;
         }
         const scratch = this.declScratch;
+        if (retainedKey !== undefined && retainedKey === this.declScratchVertexKey &&
+            vertexCount === this.declScratchVertexCount && reuseRetainedGeometry()) {
+            ffpRetainedVertexStats.declInterleaveHits++;
+            ffpRetainedVertexStats.declInterleaveBytesSaved += vertexBytes;
+            return scratch;
+        }
+        this.declScratchVertexKey = undefined;
+        this.declScratchIndexKey = undefined;
 
         // Resolve per-stream sources once.
         const bases: number[] = [];
@@ -1749,6 +1899,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         if (!interleaveDeclVertices(plan, scratch, dstStride, firstVertex, vertexCount, mem, bases, strides)) {
             return null;
         }
+        this.declScratchVertexKey = retainedKey;
+        this.declScratchVertexCount = vertexCount;
         return scratch;
     }
 
@@ -1782,7 +1934,9 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             this.getTexMatricesForDraw(),
             this.getFFPLightingState() ?? undefined,
             this.syntheticDeclStride,
-            this.getWorldViewMatrix() // point-sprite attenuation (D3DRS_POINTSCALEENABLE)
+            this.getWorldViewMatrix(), // point-sprite attenuation (D3DRS_POINTSCALEENABLE)
+            undefined,
+            true
         );
         this.captureDrawIfArmed(primitiveType, this.syntheticDeclFvf, 0, vertexCount, false, 0, 0, scratch, this.syntheticDeclStride, true);
         return 0;
@@ -1803,6 +1957,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         let indexIsUint32: boolean;
         let ibGuestPtr: number;
         let indexByteOffset: number;
+        let retainedIndexKey: RetainedGeometryKey | undefined;
         if (upIndices) {
             indexIsUint32 = upIndices.is32;
             ibGuestPtr = upIndices.guestPtr;
@@ -1825,19 +1980,33 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                 return 0x8876086c;
             }
             ibGuestPtr = ib.guestPtr;
+            retainedIndexKey = this.retainedIndexKey(ib, indexByteOffset, indexCount, indexIsUint32);
         }
         const indexBytes = indexCount * (indexIsUint32 ? 4 : 2);
 
         const mem = this.getMemoryView();
         const vertexRangeCount = (minIndex >>> 0) + numVertices;
         const baseVertex = upStream0 ? 0 : this.baseVertexIndex;
-        const scratch = this.interleaveDeclStreams(baseVertex, vertexRangeCount, mem, indexBytes, upStream0);
-        if (!scratch) return 0x8876086c;
-
-        const indicesOffset = vertexRangeCount * this.syntheticDeclStride;
         const ibStart = ibGuestPtr + indexByteOffset;
         if (ibStart < 0 || ibStart + indexBytes > mem.length) return 0x8876086c;
-        scratch.set(mem.subarray(ibStart, ibStart + indexBytes), indicesOffset);
+        const direct = !upStream0 && this.canUseDirectFfp(primitiveType, indexIsUint32)
+            ? this.directDeclInput(baseVertex, vertexRangeCount, mem) : undefined;
+        const retainedVertexKey = upStream0 || direct ? undefined : this.retainedDeclVertexKey(baseVertex);
+        let drawMem = mem;
+        let indicesOffset = ibStart;
+        if (!direct) {
+            const scratch = this.interleaveDeclStreams(baseVertex, vertexRangeCount, mem, indexBytes, upStream0, retainedVertexKey);
+            if (!scratch) return 0x8876086c;
+            drawMem = scratch;
+            indicesOffset = vertexRangeCount * this.syntheticDeclStride;
+            if (retainedIndexKey !== undefined && retainedIndexKey === this.declScratchIndexKey && reuseRetainedGeometry()) {
+                ffpRetainedIndexStats.declCopyHits++;
+                ffpRetainedIndexStats.declCopyBytesSaved += indexBytes;
+            } else {
+                scratch.set(mem.subarray(ibStart, ibStart + indexBytes), indicesOffset);
+                this.declScratchIndexKey = retainedIndexKey;
+            }
+        }
 
         this.flushProgrammablePending();
         const mvp = this.getMVP();
@@ -1849,7 +2018,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             vertexRangeCount,
             indicesOffset,
             indexCount,
-            scratch,
+            drawMem,
             this.viewport,
             this.stageTexForDraw(0),
             this.renderStates,
@@ -1860,9 +2029,14 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             0,
             this.getFFPLightingState() ?? undefined,
             this.syntheticDeclStride,
-            indexIsUint32
+            indexIsUint32,
+            undefined,
+            retainedVertexKey,
+            retainedIndexKey,
+            direct,
+            true
         );
-        this.captureDrawIfArmed(primitiveType, this.syntheticDeclFvf, 0, vertexRangeCount, true, indicesOffset, indexCount, scratch, this.syntheticDeclStride, true);
+        if (!direct) this.captureDrawIfArmed(primitiveType, this.syntheticDeclFvf, 0, vertexRangeCount, true, indicesOffset, indexCount, drawMem, this.syntheticDeclStride, true);
         return 0;
     }
 
@@ -1981,7 +2155,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             ctx.lighting,
             sourceStride,
             ctx.worldView, // point-sprite attenuation (D3DRS_POINTSCALEENABLE)
-            ctx.blend      // fixed-function vertex blend (GPU skinning)
+            ctx.blend,     // fixed-function vertex blend (GPU skinning)
+            true
         );
         this.captureDrawIfArmed(primitiveType, activeFvf, verticesAddr, vertexCount, false, 0, 0, mem, sourceStride);
         return 0;
@@ -2091,7 +2266,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             ctx.lighting,
             effectiveStride,
             ctx.worldView, // point-sprite attenuation (D3DRS_POINTSCALEENABLE)
-            ctx.blend      // fixed-function vertex blend (GPU skinning)
+            ctx.blend,     // fixed-function vertex blend (GPU skinning)
+            true
         );
         this.captureDrawIfArmed(primitiveType, activeFvf, dataPtr, vertexCount, false, 0, 0, mem, effectiveStride);
         return 0;
@@ -2214,8 +2390,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         const verticesAddr = vb.guestPtr + baseVertexByteOffset;
         const indicesAddr = ib.guestPtr + indexByteOffset;
         const ctx = this.buildFfpDrawContext(activeFvf);
+        const direct = !ctx.blend && this.canUseDirectFfp(primitiveType, indexIsUint32)
+            ? this.directFvfInput(activeFvf, sourceStride, verticesAddr, vertexRangeCount, mem, vb) : undefined;
 
         this.drawDiagLog("DIP", verticesAddr, indexCount, sourceStride, activeFvf, indicesAddr);
+        const retainedVersion = !direct && retainedVertexMode() ? this.geometryBufferVersion(vb) : undefined;
 
         this.renderer.drawIndexedPrimitive(
             this.activeRenderTarget,
@@ -2237,7 +2416,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             ctx.lighting,
             sourceStride,
             indexIsUint32,
-            ctx.blend // fixed-function vertex blend (GPU skinning)
+            ctx.blend, // fixed-function vertex blend (GPU skinning)
+            retainedVersion === undefined ? undefined : `b:${retainedVersion}`,
+            this.retainedIndexKey(ib, indexByteOffset, indexCount, indexIsUint32),
+            direct,
+            true
         );
         this.captureDrawIfArmed(primitiveType, activeFvf, verticesAddr, vertexRangeCount, true, indicesAddr, indexCount, mem, sourceStride);
         return 0;
@@ -2384,7 +2567,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             ctx.lighting,
             effectiveStride,
             indexIsUint32,
-            ctx.blend // fixed-function vertex blend (GPU skinning)
+            ctx.blend, // fixed-function vertex blend (GPU skinning)
+            undefined,
+            undefined,
+            undefined,
+            true
         );
         this.captureDrawIfArmed(primitiveType, activeFvf, dataPtr, vertexRangeCount, true, indexPtr, indexCount, mem, effectiveStride);
         return 0;
@@ -2595,7 +2782,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             this.renderer.ringBufferManager.flushStorageBuffer();
 
             const submitStart = frameProfiler.startTimer();
-            queue.submit([encoder.finish()]);
+            queue.submit(finishDrawCommands(encoder));
+            ffpEncoderSubmitStats.count++;
             frameProfiler.endTimer("gpu", submitStart);
 
             // Post-submit cleanup: rotate ring buffers, destroy pending resources

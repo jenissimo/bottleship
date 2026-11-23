@@ -91,6 +91,20 @@ interface MegaBatchCacheNode {
     byBuffer: WeakMap<GPUBuffer, GPUBindGroup> | null;
 }
 
+interface MultiTextureBindGroup {
+    layout: GPUBindGroupLayout;
+    uniform: GPUBuffer;
+    lights: GPUBuffer | null;
+    clipPlanes: GPUBuffer | null;
+    mask: number;
+    views: ReadonlyArray<GPUTextureView>;
+    samplers: ReadonlyArray<GPUSampler>;
+    group: GPUBindGroup;
+}
+
+const MULTI_TEXTURE_CACHE_SIZE = 512;
+export const ffpMultiBindGroupStats = { created: 0, reused: 0 };
+
 /** Cached MegaBatch bind groups before the whole cache is dropped and rebuilt on demand. */
 export const MEGA_BATCH_CACHE_LIMIT = 4096;
 
@@ -121,6 +135,14 @@ export class BindGroupManager {
     private megaBatchCached = 0;
     readonly megaBatchCacheStats = { hits: 0, misses: 0, uncached: 0, resets: 0 };
     private readonly megaBatchCacheOff: boolean;
+
+    // Ordinary FFP draw groups bind full rings. Per-draw uniform/light offsets are
+    // passed separately by setBindGroup; the group only captures resource identity.
+    private readonly multiTextureCache = new Array<MultiTextureBindGroup | undefined>(MULTI_TEXTURE_CACHE_SIZE);
+    private readonly multiTextureIds = new WeakMap<object, number>();
+    private nextMultiTextureId = 1;
+    private readonly sampledViews: GPUTextureView[] = [];
+    private readonly sampledSamplers: GPUSampler[] = [];
 
     private readonly maxCacheSize: number;
 
@@ -246,7 +268,7 @@ export class BindGroupManager {
 
     /**
      * Get or create a bind group for the given configuration.
-     * Multi-texture (any stage above 0 sampling) bind groups are not cached.
+     * Ordinary multi-texture groups may share the same set of bound resources.
      *
      * @param views    per-stage texture views (index = stage); stage 0 may fall back to
      *                 dummyTextureView, other stages must have been demoted if unresolvable.
@@ -267,11 +289,19 @@ export class BindGroupManager {
         const sampler0 = this.getOrCreateStageSampler(samplers[0]);
         const textureView0 = useTexture ? views[0] || dummyTextureView : null;
 
-        // Multi-texture: no cache, create bind group each time.
+        // Multi-texture groups share buffers and views even when their contents change.
+        // Keep the existing path available for a paired capture while measuring reuse.
         // The layout declares bindings for every sampling stage, so a missing view here
         // cannot produce a valid group — the executor demotes stages before the pipeline
         // is created; this guard only reports the (should-be-impossible) gap.
         if ((sampledMask & ~1) !== 0) {
+            if ((globalThis as { __ffpMultiBindCache?: boolean }).__ffpMultiBindCache !== false) {
+                return this.getOrCreateMultiTextureGroup(
+                    layout, uniformBuffer, sampledMask, views, samplers, textureView0,
+                    sampler0, lightsBuffer, clipPlanesBuffer,
+                );
+            }
+
             const entries: GPUBindGroupEntry[] = [
                 { binding: 0, resource: { buffer: uniformBuffer, offset: 0, size: UNIFORM_SLOT_SIZE } },
             ];
@@ -294,7 +324,9 @@ export class BindGroupManager {
             }
             if (lightsBuffer) entries.push({ binding: 5, resource: { buffer: lightsBuffer, offset: 0, size: FFP_LIGHTSET_BYTES } });
             if (clipPlanesBuffer) entries.push({ binding: 6, resource: { buffer: clipPlanesBuffer, offset: 0, size: FFP_CLIP_PLANES_BYTES } });
-            return this.device.createBindGroup({ layout, entries });
+            const group = this.device.createBindGroup({ layout, entries });
+            ffpMultiBindGroupStats.created++;
+            return group;
         }
 
         // Single-texture: use cache
@@ -343,6 +375,86 @@ export class BindGroupManager {
         bindGroup = this.device.createBindGroup({ layout, entries });
         samplerMap.set(sampler0, bindGroup);
         return bindGroup;
+    }
+
+    private multiTextureKey(hash: number, resource: object | null): number {
+        if (resource === null) return Math.imul(hash, 16777619);
+        let id = this.multiTextureIds.get(resource);
+        if (id === undefined) {
+            id = this.nextMultiTextureId++;
+            this.multiTextureIds.set(resource, id);
+        }
+        return Math.imul(hash ^ id, 16777619);
+    }
+
+    private getOrCreateMultiTextureGroup(
+        layout: GPUBindGroupLayout,
+        uniform: GPUBuffer,
+        mask: number,
+        views: ReadonlyArray<GPUTextureView | null>,
+        samplers: ReadonlyArray<StageSamplerState>,
+        view0: GPUTextureView | null,
+        sampler0: GPUSampler,
+        lights: GPUBuffer | null,
+        clipPlanes: GPUBuffer | null,
+    ): GPUBindGroup | null {
+        const sampledViews = this.sampledViews;
+        const sampledSamplers = this.sampledSamplers;
+        let hash = this.multiTextureKey(mask, uniform);
+        hash = this.multiTextureKey(hash, lights);
+        hash = this.multiTextureKey(hash, clipPlanes);
+        let count = 0;
+        for (let stage = 0; stage < MAX_FFP_SAMPLED_STAGES; stage++) {
+            if ((mask & (1 << stage)) === 0) continue;
+            const view = stage === 0 ? view0 : views[stage];
+            if (!view) {
+                Logger.warn(LogCategory.DDRAW, `BindGroupManager: multi-texture bind group missing stage ${stage} view (sampledMask=${mask})`);
+                return null;
+            }
+            const sampler = stage === 0 ? sampler0 : this.getOrCreateStageSampler(samplers[stage]);
+            sampledViews[count] = view;
+            sampledSamplers[count++] = sampler;
+            hash = this.multiTextureKey(this.multiTextureKey(hash, view), sampler);
+        }
+        sampledViews.length = count;
+        sampledSamplers.length = count;
+        const slot = hash & (MULTI_TEXTURE_CACHE_SIZE - 1);
+        const cached = this.multiTextureCache[slot];
+        if (cached && cached.layout === layout && cached.mask === mask && cached.uniform === uniform &&
+            cached.lights === lights && cached.clipPlanes === clipPlanes) {
+            let same = true;
+            for (let i = 0; i < count; i++) {
+                if (cached.views[i] !== sampledViews[i] || cached.samplers[i] !== sampledSamplers[i]) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                ffpMultiBindGroupStats.reused++;
+                return cached.group;
+            }
+        }
+
+        const entries: GPUBindGroupEntry[] = [
+            { binding: 0, resource: { buffer: uniform, offset: 0, size: UNIFORM_SLOT_SIZE } },
+        ];
+        let index = 0;
+        for (let stage = 0; stage < MAX_FFP_SAMPLED_STAGES; stage++) {
+            if ((mask & (1 << stage)) === 0) continue;
+            const [samplerBinding, textureBinding] = STAGE_BINDINGS[stage];
+            entries.push(
+                { binding: samplerBinding, resource: sampledSamplers[index] },
+                { binding: textureBinding, resource: sampledViews[index++] },
+            );
+        }
+        if (lights) entries.push({ binding: 5, resource: { buffer: lights, offset: 0, size: FFP_LIGHTSET_BYTES } });
+        if (clipPlanes) entries.push({ binding: 6, resource: { buffer: clipPlanes, offset: 0, size: FFP_CLIP_PLANES_BYTES } });
+        const group = this.device.createBindGroup({ layout, entries });
+        ffpMultiBindGroupStats.created++;
+        this.multiTextureCache[slot] = {
+            layout, uniform, lights, clipPlanes, mask, views: sampledViews.slice(), samplers: sampledSamplers.slice(), group,
+        };
+        return group;
     }
 
     /**
@@ -499,6 +611,9 @@ export class BindGroupManager {
         this.bindGroupLayoutCache.clear();
         this.megaBatchLayoutCache.clear();
         this.resetMegaBatchCache();
+        this.multiTextureCache.fill(undefined);
+        this.sampledViews.length = 0;
+        this.sampledSamplers.length = 0;
         this.samplers.clear();
     }
 }

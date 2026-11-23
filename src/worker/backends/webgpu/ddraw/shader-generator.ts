@@ -95,6 +95,7 @@ export const STAGE_BINDINGS: ReadonlyArray<readonly [number, number]> = [
  * Shader generation configuration
  */
 export interface ShaderConfig {
+    directVertex?: import("./direct-vertex-input").DirectVertexLayout;
     /** Bit N set = stage N binds + samples a texture (N < MAX_FFP_SAMPLED_STAGES). */
     sampledMask: number;
     /** Number of cascade stage blocks to emit (1 + highest enabled stage). */
@@ -514,14 +515,16 @@ export function generateShaderCode(config: ShaderConfig): string {
     const vertexShader = `
             @vertex
             fn vs_main(
-                @location(0) pos: vec4f,
-                @location(1) normal: vec3f,
-                @location(2) color: vec4f,
-                @location(3) specular: vec4f,
-                @location(4) uv: vec2f,
-                @location(5) uv1: vec2f,
-                @location(6) uv2: vec2f
+                ${config.directVertex?.shaderParameters ?? `
+                    @location(0) pos: vec4f,
+                    @location(1) normal: vec3f,
+                    @location(2) color: vec4f,
+                    @location(3) specular: vec4f,
+                    @location(4) uv: vec2f,
+                    @location(5) uv1: vec2f,
+                    @location(6) uv2: vec2f`}
             ) -> VertexOutput {
+                ${config.directVertex?.shaderPrologue ?? ""}
                 var out: VertexOutput;
 
                 // Camera-space texgen inputs (D3DTSS_TCI_CAMERASPACE*): the vertex
