@@ -6,6 +6,7 @@ import { emulateWwtPortIo } from "./port-io";
 import { packMappedPe } from "./pe-aot";
 import { PeProfileRecorder, peProfileEntries } from "./pe-profile";
 import { peAotCacheStats } from "./pe-aot-cache";
+import { sha256Hex } from "../savestate/chunk-store";
 import { installWwtHypercall, type WwtHypercall } from "./hypercall";
 import { WwtMmio } from "./mmio";
 import { TimeService } from "../runtime/time";
@@ -417,27 +418,31 @@ export class WwtCpu {
     do_many_cycles(): void { this.main_loop(); }
 
     async registerPeImage(name: string, base: number, size: number, file: Uint8Array): Promise<void> {
-        const options = globalThis as { __wwtPeAot?: boolean | "learn" | string[]; __wwtPeAotLinkage?: "page-local" | "full" };
+        const options = globalThis as { __wwtPeAot?: boolean | "learn" | "auto" | string[]; __wwtPeAotLinkage?: "page-local" | "full" };
         const selector = options.__wwtPeAot;
-        if (selector !== true && selector !== "learn" && (!Array.isArray(selector) || !selector.includes(name.toLowerCase()))) return;
+        if (selector !== true && selector !== "learn" && selector !== "auto" && (!Array.isArray(selector) || !selector.includes(name.toLowerCase()))) return;
         if (base < 0 || size <= 0 || base + size > this.mem8.length) return;
         const ranges = this.moduleRanges.filter(range => range.start >= base && range.end <= base + size);
         if (ranges.length === 0) return;
         const reportFailure = (error: unknown) => console.warn(`[WWT AOT] ${name}: ${String(error)}`);
         try {
-            if (selector === "learn") {
+            const generation = this.peAotGeneration;
+            const digest = await sha256Hex(file);
+            const profile = selector === "learn" ? [] : await peProfileEntries(digest, base, size);
+            if (this.peAotGeneration !== generation) return;
+            if (selector === "learn" || (selector === "auto" && !profile.length)) {
                 this.profileRecorder ??= new PeProfileRecorder();
-                await this.profileRecorder.watch(file, base, ranges);
+                this.profileRecorder.watch(digest, base, ranges);
                 return;
             }
-            const generation = this.peAotGeneration;
             const packed = packMappedPe(this.mem8.subarray(base, base + size), file, base);
-            const profile = await peProfileEntries(file, base, size);
+            const linkage = options.__wwtPeAotLinkage ?? (selector === "auto" ? "full" : "page-local");
+            const imageBounds = linkage === "full" ? { base, end: base + size } : undefined;
             await this.machine.loadPeAot(packed, name, pc => ranges.some(range => range.start <= pc && pc < range.end), () => {
                 if (this.peAotGeneration !== generation) return false;
                 const fresh = packMappedPe(this.mem8.subarray(base, base + size), file, base);
                 return fresh.length === packed.length && fresh.every((byte, index) => byte === packed[index]);
-            }, profile, options.__wwtPeAotLinkage === "full" ? { base, end: base + size } : undefined);
+            }, profile, imageBounds);
         } catch (error) {
             reportFailure(error);
         }

@@ -1,27 +1,28 @@
 import { expect, test } from "bun:test";
 import { getOrBuild } from "../../src/worker/wwt/pe-aot-cache";
 import { peProfileEntries, PeProfileRecorder } from "../../src/worker/wwt/pe-profile";
+import { sha256Hex } from "../../src/worker/savestate/chunk-store";
 import { installFakeOpfs } from "./fixtures/fake-opfs";
 
 test("training stores relative executable entries and merges independent sessions for the same PE", async () => {
     const previous = Object.getOwnPropertyDescriptor(globalThis, "navigator");
-    const file = Uint8Array.of(8, 12, 11);
+    const hash = await sha256Hex(Uint8Array.of(8, 12, 11));
     try {
         installFakeOpfs();
         const first = new PeProfileRecorder();
-        await first.watch(file, 0x10000, [{start:0x10100, end:0x10400}]);
+        first.watch(hash, 0x10000, [{start:0x10100, end:0x10400}]);
         first.miss(0x10140);
         first.miss(0x10140);
         first.miss(0x10500);
         await first.flush();
         const second = new PeProfileRecorder();
-        await second.watch(file, 0x20000, [{start:0x20100, end:0x20400}]);
+        second.watch(hash, 0x20000, [{start:0x20100, end:0x20400}]);
         second.miss(0x20280);
         second.reset();
         await second.flush();
-        expect(await peProfileEntries(file, 0x30000, 0x1000)).toEqual([0x30140,0x30280]);
-        expect(await peProfileEntries(file, 0x30000, 0x200)).toEqual([0x30140]);
-        expect(await peProfileEntries(Uint8Array.of(0), 0x30000, 0x1000)).toEqual([]);
+        expect(await peProfileEntries(hash, 0x30000, 0x1000)).toEqual([0x30140,0x30280]);
+        expect(await peProfileEntries(hash, 0x30000, 0x200)).toEqual([0x30140]);
+        expect(await peProfileEntries(await sha256Hex(Uint8Array.of(0)), 0x30000, 0x1000)).toEqual([]);
     } finally {
         if (previous) Object.defineProperty(globalThis, "navigator", previous);
         else Reflect.deleteProperty(globalThis, "navigator");

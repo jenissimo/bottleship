@@ -1,5 +1,3 @@
-import { sha256Hex } from "../savestate/chunk-store";
-
 const MAX_ENTRIES = 65536;
 type CodeRange = { start: number; end: number };
 
@@ -23,8 +21,7 @@ async function readRvas(dir: FileSystemDirectoryHandle, name: string): Promise<n
     }
 }
 
-export async function peProfileEntries(file: Uint8Array, base: number, size: number): Promise<number[]> {
-    const digest = await sha256Hex(file);
+export async function peProfileEntries(digest: string, base: number, size: number): Promise<number[]> {
     const profiles = (globalThis as { __wwtPeProfile?: Record<string, unknown> }).__wwtPeProfile;
     const dir = profiles ? undefined : await openDirectory(false);
     const hints = profiles?.[digest] ?? (dir ? await readRvas(dir, digest) : []);
@@ -33,19 +30,15 @@ export async function peProfileEntries(file: Uint8Array, base: number, size: num
         .sort((a, b) => a - b).map(rva => base + rva);
 }
 
-/** Only enabled for an explicit training run. All disk operations happen outside the miss handler. */
+/** Record demand translations while the game runs. Disk operations stay outside the miss handler. */
 export class PeProfileRecorder {
     private ranges: Array<CodeRange & { base: number; hash: string }> = [];
     private seen = new Map<string, Set<number>>();
     private dirty = new Set<string>();
     private timer?: ReturnType<typeof setTimeout>;
     private pending = Promise.resolve();
-    private generation = 0;
 
-    async watch(file: Uint8Array, base: number, ranges: CodeRange[]): Promise<void> {
-        const generation = this.generation;
-        const hash = await sha256Hex(file);
-        if (generation !== this.generation) return;
+    watch(hash: string, base: number, ranges: CodeRange[]): void {
         if (!this.seen.has(hash)) this.seen.set(hash, new Set());
         for (const range of ranges) this.ranges.push({ ...range, hash, base });
     }
@@ -101,7 +94,6 @@ export class PeProfileRecorder {
 
     reset(): void {
         void this.flush();
-        this.generation++;
         this.ranges = [];
         this.seen.clear();
     }

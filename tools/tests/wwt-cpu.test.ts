@@ -14,6 +14,7 @@ import { preserveSavestateParticipants } from "./helpers/scoped-process-state";
 
 preserveSavestateParticipants();
 import { packMappedPe } from "../../src/worker/wwt/pe-aot";
+import { installFakeOpfs } from "./fixtures/fake-opfs";
 
 let compilerBytes: ArrayBuffer;
 let machine: BottleShipMachine;
@@ -245,6 +246,52 @@ function minimalPe(entry: number): Uint8Array {
     dword(text + 36, 0x60000020);
     return file;
 }
+
+test("automatic PE training reuses the recorded entry and cached translation across resets", async () => {
+    const globalOptions = globalThis as { __wwtPeAot?: string };
+    const previous = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    const oldMode = globalOptions.__wwtPeAot;
+    try {
+        installFakeOpfs();
+        globalOptions.__wwtPeAot = "auto";
+        const ramSize = 4 << 20;
+        const host = new BottleShipMachine(await WwtCompiler.fromBytes(compilerBytes), ramSize);
+        await host.init();
+        const cpuState = host.nativeAlloc(4096, 4096);
+        const wasm = (name: string) => Bun.file(new URL("../../public/" + name, import.meta.url)).arrayBuffer();
+        const hooks = await installWwtHypercall(host, ramSize, cpuState, {
+            hypercall: await wasm("wwt-hypercall.wasm"), d3d9Arena: await wasm("wwt-d3d9-arena.wasm"),
+        });
+        const core = new WwtCpu(host, ramSize, hooks, cpuState);
+        const base = 0x90000, entry = base + 0x1000, dynamicEntry = entry + 0x100;
+        const file = minimalPe(0x1000);
+        file.set([0xc3], 0x200);
+        file.set([0xb8, 19, 0, 0, 0, 0xef], 0x300);
+        core.io.register_write(0x1234, null, undefined, undefined, () => core.requestYield());
+        const before = core.getTranslationStats().peAotCache;
+        for (let run = 0; run < 3; run++) {
+            core.reset();
+            core.mem8.set(file.subarray(0x200), entry);
+            core.registerCodeRange(entry, base + 0x3000);
+            await core.registerPeImage("demo.exe", base, 0x3000, file);
+            expect(host.lookup(dynamicEntry) > 0).toBe(run > 0);
+            core.instruction_pointer[0] = dynamicEntry;
+            core.reg32[2] = 0x1234;
+            core.reg32[4] = stack;
+            core.main_loop();
+            expect(core.reg32[0]).toBe(19);
+            await core.flushPeProfile();
+        }
+        const after = core.getTranslationStats().peAotCache;
+        expect(after.writes - before.writes).toBe(1);
+        expect(after.hits - before.hits).toBe(1);
+    } finally {
+        if (oldMode === undefined) delete globalOptions.__wwtPeAot;
+        else globalOptions.__wwtPeAot = oldMode;
+        if (previous) Object.defineProperty(globalThis, "navigator", previous);
+        else Reflect.deleteProperty(globalThis, "navigator");
+    }
+});
 
 test("linked PE AOT observes a guest code write before calling the old entry", async () => {
     const base = 0x90000;

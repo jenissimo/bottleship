@@ -1303,7 +1303,7 @@ export default function App() {
         const modules = aot.split(",").map(name => name.trim()).filter(Boolean);
         globalWorker.postMessage({
           type: "set_debug_flag", key: "__wwtPeAot",
-          value: aot === "learn" ? "learn" : aot === "on" ? true : aot === "off" ? false : modules,
+          value: aot === "learn" || aot === "auto" ? aot : aot === "on" ? true : aot === "off" ? false : modules,
         });
       }
       (window as any).dbgFlag = (key: string, value: unknown, opts?: { scope?: "session" | "global" }) => {

@@ -274,18 +274,25 @@ export class BottleShipMachine implements WwtMachine {
             translated = true;
             return wasm;
         });
+        const compiling = performance.now();
+        const compiled = await WebAssembly.compile(bytes);
         if (this.guestMmio !== guestMmio || !verifyCurrent()) return;
         const installing = performance.now();
-        const module = this.loadModuleSync(bytes, name, executable, fullImage);
+        const module = this.installCompiledModule(compiled, name, executable, fullImage);
         const report = { name, policy, seeds: profile.length, source: translated ? "compiler" : "cache", translateMs,
-            lookupAndStoreMs: installing - started - translateMs, installMs: performance.now() - installing,
+            lookupAndStoreMs: compiling - started - translateMs, compileModuleMs: installing - compiling,
+            installMs: performance.now() - installing,
             wasmBytes: bytes.length, entries: module.entries };
         console.info("[WWT AOT] " + JSON.stringify(report));
     }
 
     loadModuleSync(bytes: Uint8Array, name: string, canInstall?: (address: number) => boolean,
         fullImage?: WwtPeImageBounds): WwtModule & { entries: number } {
-        const module = new WebAssembly.Module(bytes as Uint8Array<ArrayBuffer>);
+        return this.installCompiledModule(new WebAssembly.Module(bytes as Uint8Array<ArrayBuffer>), name, canInstall, fullImage);
+    }
+
+    private installCompiledModule(module: WebAssembly.Module, name: string, canInstall?: (address: number) => boolean,
+        fullImage?: WwtPeImageBounds): WwtModule & { entries: number } {
         const [section] = WebAssembly.Module.customSections(module, this.abi.funcs_section);
         if (!section) throw new Error(`Missing i386 function map in ${name}`);
         const map = new Uint32Array(section);
