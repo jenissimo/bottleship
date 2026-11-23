@@ -1,6 +1,6 @@
 --- a/crates/wwt/src/abi.rs
 +++ b/crates/wwt/src/abi.rs
-@@ -62,13 +62,37 @@
+@@ -62,13 +62,43 @@
      /// Translated calls currently nested in WebAssembly calls on this
      /// thread: past a limit a call unwinds to the dispatch loop instead.
      pub const CALL_DEPTH: u32 = 376;
@@ -33,12 +33,18 @@
 +    /// Two u32 cache tags per slot (read/execute and write), indexed by guest page.
 +    pub const SLOTS: u32 = 1024;
 +    pub const BYTES: u32 = SLOTS * 8;
++    // One byte per possible i386 linear page. The host allocates the buffer
++    // from PAGE_TLB_SLOTS in units of eight bytes, including for inline mode.
++    pub const DENSE_BYTES: u32 = 1 << 20;
++    pub const ALLOCATION_SLOTS: u32 = DENSE_BYTES / 8;
++    pub const READ: i32 = 1;
++    pub const WRITE: i32 = 2;
 +    /// A 4 KiB directory followed by 1024 contiguous 4 KiB page tables.
 +    pub const TABLE_BYTES: u32 = 0x401000;
  }
  
  /// The x86-64 CPU struct. It keeps every field of [`cpu`] that does not
-@@ -186,6 +210,11 @@
+@@ -186,6 +216,11 @@
      /// Not a Windows code: a general protection fault (far transfers and
      /// selector loads); the host raises ACCESS_VIOLATION [0, 0xffffffff].
      pub const GENERAL_PROTECTION: u32 = 0xE057_0005;
@@ -50,7 +56,7 @@
  }
  
  /// Flags of an access in `TRAPS_SECTION`. With `OPERAND`, the x86
-@@ -204,8 +233,8 @@
+@@ -204,8 +239,8 @@
  
  /// Addresses with special meaning to the dispatcher.
  pub mod addr {
@@ -61,7 +67,7 @@
      /// Returning to this address stops the dispatcher loop (used as the
      /// return address of thread entry points).
      pub const STOP: u32 = 0xFFFF_FFF0;
-@@ -269,6 +298,10 @@
+@@ -269,6 +304,10 @@
      /// points at an empty second-level table.
      pub const CODE_PAGES: &str = "code_pages";
      pub const FAULT: &str = "fault";
@@ -72,7 +78,7 @@
      pub const MATH: &str = "math";
      pub const SIN: &str = "sin";
      pub const COS: &str = "cos";
-@@ -296,7 +329,7 @@
+@@ -296,7 +335,7 @@
  /// address, flags (`trap`) and the x86 memory operand's displacement.
  pub const TRAPS_SECTION: &str = "wwt.traps";
  /// Bumped whenever generated code changes incompatibly, to invalidate caches.
@@ -81,7 +87,7 @@
  /// Every translated module exports its lazy-flags evaluator under this
  /// name: `(fk, fr, fa, fb, fc) -> eflags` (the arithmetic flags).
  pub const EFLAGS_EXPORT: &str = "eflags";
-@@ -349,9 +382,18 @@
+@@ -349,9 +388,18 @@
          ("FAULT_ADDR", FAULT_ADDR),
          ("RESUME", RESUME),
          ("PREEMPT_AT", PREEMPT_AT),
@@ -96,11 +102,11 @@
 +        ("PAGE_TLB", PAGE_TLB),
 +        ("SMC_FIRST_PAGE", SMC_FIRST_PAGE),
 +        ("SMC_END_PAGE", SMC_END_PAGE),
-+        ("PAGE_TLB_SLOTS", page_tlb::SLOTS),
++        ("PAGE_TLB_SLOTS", page_tlb::ALLOCATION_SLOTS),
          ("SIZE", SIZE),
      ]
      .into_iter()
-@@ -397,6 +439,9 @@
+@@ -397,6 +445,9 @@
          ("ACCESS_VIOLATION_WRITE", fault::ACCESS_VIOLATION_WRITE),
          ("ACCESS_VIOLATION_EXECUTE", fault::ACCESS_VIOLATION_EXECUTE),
          ("GENERAL_PROTECTION", fault::GENERAL_PROTECTION),
@@ -487,7 +493,7 @@
          match blk.term.clone() {
              Term::Jump(t) => self.do_branch(x, t),
              Term::Branch { t, f, .. } if t == f => self.do_branch(x, t),
-@@ -2027,6 +2168,369 @@
+@@ -2027,6 +2168,394 @@
          }
      }
  
@@ -547,29 +553,47 @@
 +        self.emit(W::End);
 +    }
 +
++    fn dense_page_probe(&mut self, address: u32, last: u32, size: u8, write: bool) {
++        if self.tlb_slot == UNASSIGNED {
++            return;
++        }
++        // A managed directory supplies this pointer. Unmanaged and unpaged
++        // execution pass zero and take the normal directory check below.
++        self.emit(W::LocalGet(0));
++        self.emit(W::I32Load(memarg(cpu::PAGE_TLB, 2)));
++        self.emit(W::LocalTee(self.tlb_slot));
++        self.emit(W::If(BlockType::Empty));
++        self.emit(W::LocalGet(self.tlb_slot));
++        self.emit(W::LocalGet(address));
++        self.emit(W::I32Const(12));
++        self.emit(W::I32ShrU);
++        self.emit(W::I32Add);
++        self.emit(W::I32Load8U(memarg(0, 0)));
++        self.emit(W::I32Const(if write { abi::page_tlb::WRITE } else { abi::page_tlb::READ }));
++        self.emit(W::I32And);
++        if size > 1 {
++            if write {
++                self.emit(W::I32Const(1));
++                self.emit(W::I32ShrU);
++            }
++            self.emit(W::LocalGet(address));
++            self.emit(W::LocalGet(last));
++            self.emit(W::I32Xor);
++            self.emit(W::I32Const(0x1000));
++            self.emit(W::I32LtU);
++            self.emit(W::I32And);
++        }
++        self.emit(W::BrIf(1));
++        self.emit(W::End);
++    }
++
 +    fn walk_pages_outlined(
-+        &mut self, address: u32, last: u32, scalar_width: Option<u8>, write: bool,
++        &mut self, address: u32, last: u32, write: bool,
 +        mmio: bool, dirty: StateMask, code: u32, eip: u64,
 +    ) {
-+        let use_tlb = self.tlb_slot != UNASSIGNED;
-+        self.emit(W::Block(BlockType::Empty));
-+        if let Some(width) = scalar_width.filter(|_| use_tlb) {
-+            if width > 1 {
-+                self.emit(W::LocalGet(address));
-+                self.emit(W::LocalGet(last));
-+                self.emit(W::I32Xor);
-+                self.emit(W::I32Const(0x1000));
-+                self.emit(W::I32LtU);
-+                self.emit(W::If(BlockType::Empty));
-+                self.tlb_probe(address, write, 2);
-+                self.emit(W::End);
-+            } else {
-+                self.tlb_probe(address, write, 1);
-+            }
-+        }
 +        let permission = if write { 3 } else { 1 };
 +        let mode = permission | if mmio { page_walk::ALLOW_MMIO } else { 0 }
-+            | if use_tlb { page_walk::USE_TLB } else { 0 };
++            | if self.tlb_slot != UNASSIGNED { page_walk::USE_TLB } else { 0 };
 +        self.emit(W::LocalGet(0));
 +        self.emit(W::LocalGet(address));
 +        self.emit(W::LocalGet(last));
@@ -587,10 +611,6 @@
 +        if mmio {
 +            self.emit(W::LocalGet(self.tmp_map));
 +            self.emit(W::LocalSet(self.mmio_access));
-+        }
-+        self.emit(W::End);
-+        if use_tlb && write {
-+            self.tlb_before_write(last);
 +        }
 +    }
 +
@@ -625,9 +645,12 @@
 +            self.emit(W::I32Const(0));
 +            self.emit(W::LocalSet(self.mmio_access));
 +        }
-+        self.emit(W::LocalGet(0));
-+        self.emit(W::I32Load(memarg(cpu::PAGE_DIRECTORY, 2)));
-+        self.emit(W::If(BlockType::Empty));
++        let outlined = self.m.outlines_page_walk();
++        if !outlined {
++            self.emit(W::LocalGet(0));
++            self.emit(W::I32Load(memarg(cpu::PAGE_DIRECTORY, 2)));
++            self.emit(W::If(BlockType::Empty));
++        }
 +
 +        if let Some(addr) = addr {
 +            self.get(addr);
@@ -641,7 +664,7 @@
 +        if mmio {
 +            self.emit(W::LocalTee(self.mmio_address));
 +        }
-+        if use_tlb && write {
++        if !outlined && use_tlb && write {
 +            self.emit(W::LocalTee(self.tlb_write_start));
 +        }
 +        self.emit(W::LocalSet(address));
@@ -661,9 +684,17 @@
 +            self.emit(W::I32Const(size as i32 - 1));
 +            self.emit(W::I32Add);
 +        }
-+        if self.m.outlines_page_walk() {
++        if outlined {
 +            self.emit(W::LocalSet(last));
-+            self.walk_pages_outlined(address, last, len.is_none().then_some(size), write, mmio, dirty, code, eip);
++            self.emit(W::Block(BlockType::Empty));
++            if len.is_none() {
++                self.dense_page_probe(address, last, size, write);
++            }
++            self.emit(W::LocalGet(0));
++            self.emit(W::I32Load(memarg(cpu::PAGE_DIRECTORY, 2)));
++            self.emit(W::If(BlockType::Empty));
++            self.walk_pages_outlined(address, last, write, mmio, dirty, code, eip);
++            self.emit(W::End);
 +            if len.is_some() {
 +                self.emit(W::End);
 +            }
@@ -857,7 +888,7 @@
      /// Emits an address check for the access at vreg `v` + `off`.
      fn check_addr(&mut self, v: V, off: u32, write: bool, dirty: StateMask, eip: u64) {
          self.residue.checks += 1;
-@@ -2090,6 +2594,64 @@
+@@ -2090,6 +2619,64 @@
      /// `ma` is a local holding the address in the memory's address type;
      /// with 64-bit memory it must have passed the address check (the store
      /// map covers the guest region).
@@ -922,7 +953,7 @@
      fn check_code_write(&mut self, ma: u32, off: u32) {
          if self.mem64() {
              // page = (ma + off) >> 12; L1 entries are 8 bytes. A page with
-@@ -2162,10 +2724,13 @@
+@@ -2162,10 +2749,13 @@
          self.emit(W::I32Const(!(store_map::CODE as i32)));
          self.emit(W::I32And);
          self.emit(W::I32Store8(memarg(o, 0)));
@@ -937,7 +968,7 @@
      /// path; pages that need more (code, the null region, the guest limit)
      /// get the precise address check and the code-write notification.
      /// The host hears about a code write before the store happens, which is
-@@ -2177,7 +2742,7 @@
+@@ -2177,7 +2767,7 @@
      /// 64-bit addresses (x86-64 code, or a 64-bit memory) have no fast
      /// path: the map covers only the guest region, so the address is
      /// checked first, then the map's CODE bit.
@@ -946,7 +977,7 @@
          let (mem, smc) = (self.m.cfg.mem_checks, self.m.cfg.smc_checks);
          let plain = mem && !covered;
          if !smc {
-@@ -2194,9 +2759,14 @@
+@@ -2194,9 +2784,14 @@
              self.check_code_write(la, off);
              return;
          }
@@ -962,7 +993,7 @@
          if plain {
              self.emit(W::Else);
              self.check_addr(v, off, true, dirty, eip);
-@@ -2212,7 +2782,7 @@
+@@ -2212,7 +2807,7 @@
  
      /// The store-map path of a 32-bit store: one lookup; pages that need
      /// more get the precise address check and the code-write notification.
@@ -971,7 +1002,7 @@
          self.residue.store_maps += 1;
          let mem = self.m.cfg.mem_checks;
          let addr = self.local_of[v as usize];
-@@ -2231,6 +2801,7 @@
+@@ -2231,6 +2826,7 @@
              self.residue.checks -= 1;
          }
          self.check_code_write(addr, off);
@@ -979,7 +1010,7 @@
          self.emit(W::End);
      }
  
-@@ -2272,6 +2843,41 @@
+@@ -2272,6 +2868,41 @@
          mem.space == Space::Guest && self.m.cfg.mem_checks
      }
  
@@ -1021,7 +1052,7 @@
      fn inst(&mut self, inst: &Inst, dirty: StateMask) {
          self.inst_value(inst, dirty, false);
      }
-@@ -2279,7 +2885,38 @@
+@@ -2279,7 +2910,38 @@
      /// Emits `inst`; with `keep`, its value stays on the stack instead of
      /// going to its local (a stackified value, emitted at its use).
      fn inst_value(&mut self, inst: &Inst, dirty: StateMask, keep: bool) {
@@ -1060,7 +1091,7 @@
          match &inst.op {
              Op::Const(c) => {
                  let c = *c;
-@@ -2306,6 +2943,20 @@
+@@ -2306,6 +2968,20 @@
                  self.get(*f);
                  self.get(*cond);
                  self.emit(W::Select);
@@ -1081,7 +1112,7 @@
              }
              Op::Load { addr, mem }
                  if self.trap_access(*addr, mem) && !self.check_covered(*addr, mem.offset) =>
-@@ -2339,10 +2990,27 @@
+@@ -2339,10 +3015,27 @@
                      self.emit(load_instr(ty, mem, mem.atomic));
                  }
              }
@@ -1110,7 +1141,7 @@
                  let la = self.addr_local(*addr);
                  self.trap_addr(la, mem.offset);
                  self.get(*val);
-@@ -2353,12 +3021,15 @@
+@@ -2353,12 +3046,15 @@
              Op::Store { addr, val, mem } => {
                  if mem.space == Space::Guest {
                      let covered = self.check_covered(*addr, mem.offset);
@@ -1127,7 +1158,7 @@
                  let vty = self.f.ty(*val);
                  if mem.atomic && mem.size > 1 {
                      self.misaligned(la, mem.offset, mem.size);
-@@ -2379,9 +3050,10 @@
+@@ -2379,9 +3075,10 @@
                  }
              }
              Op::AtomicRmw { op, addr, val, mem } => {
@@ -1139,7 +1170,7 @@
                  let mut la = self.addr_local(*addr);
                  // The result may take over the address's local (the address
                  // dies here), but the code-write check below still needs the
-@@ -2439,7 +3111,7 @@
+@@ -2439,7 +3136,7 @@
                      self.emit(rmw_instr(*op, mem, wide));
                      self.emit(W::End);
                  }
@@ -1148,7 +1179,7 @@
                      if let Some(d) = inst.dst {
                          self.set(d);
                      } else {
-@@ -2458,9 +3130,10 @@
+@@ -2458,9 +3155,10 @@
                  new,
                  mem,
              } => {
@@ -1160,7 +1191,7 @@
                  let la = self.addr_local(*addr);
                  let ty = ty.unwrap_or(Ty::I32);
                  let (tmp, eq) = if ty == Ty::I64 {
-@@ -2562,6 +3235,21 @@
+@@ -2562,6 +3260,21 @@
                      }
                      self.emit(vec_instr(op));
                  }
@@ -1182,7 +1213,7 @@
              }
              Op::FaultIf { cond, code, info } => {
                  self.get(*cond);
-@@ -2653,7 +3341,7 @@
+@@ -2653,7 +3366,7 @@
                  }
                  deferred[j] = true;
                  let (sub, sub_effects) = FnGen::stack_operands(&p.op);
@@ -1191,7 +1222,7 @@
              }
              cursor
          }
-@@ -2701,20 +3389,15 @@
+@@ -2701,20 +3414,15 @@
              self.emit(W::End);
              return;
          }
@@ -1609,7 +1640,7 @@
  }
 --- /dev/null
 +++ b/crates/wwt/src/page_walk.rs
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,121 @@
 +//! Outlined i386 page walk for the translated module's cache-miss path.
 +use crate::abi::{addr::NULL_LIMIT, cpu, page_tlb};
 +use wasm_encoder::{BlockType, Function, Instruction as W, MemArg, ValType};
@@ -1619,6 +1650,10 @@
 +
 +fn mem(offset: u32) -> MemArg {
 +    MemArg { offset: offset as u64, align: 2, memory_index: 0 }
++}
++
++fn mem_byte() -> MemArg {
++    MemArg { offset: 0, align: 0, memory_index: 0 }
 +}
 +
 +/// (cpu, first, last-inclusive, requested permissions and mode) -> route.
@@ -1636,7 +1671,7 @@
 +    const PTE: u32 = 8;
 +    const ROUTE: u32 = 9;
 +    const TLB: u32 = 10;
-+    const SLOT: u32 = 11;
++    const FIRST: u32 = 11;
 +    const FRAME: i32 = !0xfff;
 +    let mut f = Function::new([(8, ValType::I32)]);
 +    macro_rules! emit {
@@ -1650,68 +1685,73 @@
 +        W::LocalGet(MODE), W::I32Const(USE_TLB), W::I32And, W::If(BlockType::Empty),
 +            W::LocalGet(CPU), W::I32Load(mem(cpu::PAGE_TLB)), W::LocalSet(TLB),
 +        W::End,
++        W::LocalGet(ADDRESS), W::LocalSet(FIRST),
 +        W::Block(BlockType::Empty),
 +        W::LocalGet(LAST), W::LocalGet(ADDRESS), W::I32LtU,
 +        W::LocalGet(DIRECTORY), W::LocalGet(RAM), W::I32GeU, W::I32Or,
 +        W::BrIf(0),
 +        W::Loop(BlockType::Empty),
-+        W::Block(BlockType::Empty),
-+    );
-+    // An identity tag implies a validated page within RAM.
-+    emit!(
-+        W::LocalGet(TLB), W::If(BlockType::Empty),
-+            W::LocalGet(TLB),
-+            W::LocalGet(ADDRESS), W::I32Const(9), W::I32ShrU,
-+            W::I32Const((page_tlb::BYTES - 8) as i32), W::I32And,
-+            W::I32Add, W::LocalTee(SLOT),
-+            W::LocalGet(PERM), W::I32Const(2), W::I32And, W::I32Const(1), W::I32Shl,
-+            W::I32Add, W::I32Load(mem(0)),
-+            W::LocalGet(ADDRESS), W::I32Const(FRAME), W::I32And, W::I32Const(1), W::I32Or,
-+            W::I32Eq, W::BrIf(1),
-+        W::End,
 +        W::LocalGet(ADDRESS), W::LocalGet(RAM), W::I32GeU,
 +    );
 +    if NULL_LIMIT != 0 {
 +        emit!(W::LocalGet(ADDRESS), W::I32Const(NULL_LIMIT as i32), W::I32LtU, W::I32Or);
 +    }
 +    emit!(
-+        W::BrIf(2),
++        W::BrIf(1),
 +        // PDE Present/RW and regular 4 KiB pages only.
 +        W::LocalGet(DIRECTORY), W::LocalGet(ADDRESS), W::I32Const(22), W::I32ShrU,
 +        W::I32Const(2), W::I32Shl, W::I32Add, W::I32Load(mem(0)), W::LocalTee(PDE),
 +        W::LocalGet(PERM), W::I32Const(0x80), W::I32Or, W::I32And, W::LocalGet(PERM), W::I32Ne,
 +        W::LocalGet(PDE), W::I32Const(FRAME), W::I32And, W::LocalTee(PDE),
-+        W::LocalGet(RAM), W::I32GeU, W::I32Or, W::BrIf(2),
++        W::LocalGet(RAM), W::I32GeU, W::I32Or, W::BrIf(1),
 +
 +        W::LocalGet(PDE), W::LocalGet(ADDRESS), W::I32Const(10), W::I32ShrU,
 +        W::I32Const(0xffc), W::I32And, W::I32Add, W::I32Load(mem(0)), W::LocalTee(PTE),
-+        W::LocalGet(PERM), W::I32And, W::LocalGet(PERM), W::I32Ne, W::BrIf(2),
++        W::LocalGet(PERM), W::I32And, W::LocalGet(PERM), W::I32Ne, W::BrIf(1),
 +        W::LocalGet(PTE), W::I32Const(FRAME), W::I32And, W::LocalTee(PTE),
 +        W::LocalGet(ADDRESS), W::I32Const(FRAME), W::I32And, W::I32Ne,
 +        W::If(BlockType::Empty),
 +            W::LocalGet(PTE), W::LocalGet(RAM), W::I32LtU,
 +            W::LocalGet(MODE), W::I32Const(ALLOW_MMIO), W::I32And, W::I32Eqz, W::I32Or,
 +            W::LocalGet(CPU), W::I32Load(mem(cpu::PAGE_HAS_MMIO)), W::I32Eqz, W::I32Or,
-+            W::BrIf(3),
++            W::BrIf(2),
 +            W::I32Const(1), W::LocalSet(ROUTE),
 +        W::Else,
-+            // Cache only identity entries from contiguous managed page tables.
++            // Only the managed, contiguous tables can grant persistent access.
 +            W::LocalGet(TLB), W::If(BlockType::Empty),
 +                W::LocalGet(PDE), W::LocalGet(DIRECTORY), W::I32Const(0x1000), W::I32Add,
 +                W::LocalGet(ADDRESS), W::I32Const(22), W::I32ShrU, W::I32Const(12), W::I32Shl,
-+                W::I32Add, W::I32Eq, W::If(BlockType::Empty),
-+                    W::LocalGet(SLOT), W::LocalGet(PTE), W::I32Const(1), W::I32Or, W::I32Store(mem(0)),
-+                    W::LocalGet(PERM), W::I32Const(2), W::I32And, W::If(BlockType::Empty),
-+                        W::LocalGet(SLOT), W::LocalGet(PTE), W::I32Const(1), W::I32Or, W::I32Store(mem(4)),
-+                    W::End,
++                W::I32Add, W::I32Eq,
++                // Admit a whole page only after proving it fits in guest RAM.
++                W::LocalGet(PTE), W::I32Const(0xfff), W::I32Or, W::LocalGet(RAM), W::I32LtU,
++                W::I32And, W::If(BlockType::Empty),
++                    W::LocalGet(TLB), W::LocalGet(ADDRESS), W::I32Const(12), W::I32ShrU, W::I32Add,
++                    // Grant writes only for validated writes outside the table reservation.
++                    // A store to a table page must keep going through the walk to flush the cache.
++                    W::I32Const(page_tlb::READ | page_tlb::WRITE), W::I32Const(page_tlb::READ),
++                    W::LocalGet(PERM), W::I32Const(2), W::I32And,
++                    W::LocalGet(PTE), W::LocalGet(DIRECTORY), W::I32Sub,
++                    W::I32Const(page_tlb::TABLE_BYTES as i32), W::I32GeU,
++                    W::I32Const(1), W::I32Shl, W::I32And, W::Select,
++                    W::I32Store8(mem_byte()),
 +                W::End,
 +            W::End,
-+        W::End,
 +        W::End,
 +        // Continue at the first byte of the next page when the span crosses it.
 +        W::LocalGet(ADDRESS), W::I32Const(12), W::I32ShrU,
 +        W::LocalGet(LAST), W::I32Const(12), W::I32ShrU, W::I32Eq,
-+        W::If(BlockType::Empty), W::LocalGet(ROUTE), W::Return, W::End,
++        W::If(BlockType::Empty),
++            W::LocalGet(TLB), W::I32Eqz, W::I32Eqz,
++            W::LocalGet(PERM), W::I32Const(3), W::I32Eq, W::I32And,
++            W::LocalGet(LAST), W::LocalGet(DIRECTORY), W::I32GeU, W::I32And,
++            W::LocalGet(FIRST), W::LocalGet(DIRECTORY),
++            W::I32Const(page_tlb::TABLE_BYTES as i32), W::I32Add, W::I32LtU, W::I32And,
++            W::If(BlockType::Empty),
++                W::LocalGet(TLB), W::I32Const(0), W::I32Const(page_tlb::DENSE_BYTES as i32),
++                W::MemoryFill(0),
++            W::End,
++            W::LocalGet(ROUTE), W::Return,
++        W::End,
 +        W::LocalGet(ADDRESS), W::I32Const(FRAME), W::I32And, W::I32Const(0x1000), W::I32Add,
 +        W::LocalSet(ADDRESS), W::Br(0),
 +        W::End,

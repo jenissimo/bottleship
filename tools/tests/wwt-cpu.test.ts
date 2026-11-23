@@ -491,3 +491,48 @@ test("partial REP fault publishes earlier code writes before dispatching SEH", a
     expect(host.run(state, writer)).toBe(host.stopAddress);
     expect(received).toBe(1);
 });
+
+test("guest page-table writes revoke cached permissions before the next access", async () => {
+    const ramSize = 4 << 20;
+    const host = new BottleShipMachine(await WwtCompiler.fromBytes(compilerBytes), ramSize);
+    await host.init();
+    const state = host.newCpu();
+    const A = host.abi.cpu;
+    const bytes = new Uint8Array(host.memory.buffer);
+    const view = new DataView(bytes.buffer);
+    const setWord = (address: number, value: number) => view.setUint32(address, value, true);
+    const directory = 0x100000;
+    const table = directory + 0x1000;
+    const data = 0x5a000;
+    setWord(directory, table | 7);
+    for (let page = 0; page < ramSize >>> 12; page++) setWord(table + page * 4, page * 4096 + 7);
+    setWord(state + A.PAGE_DIRECTORY, directory);
+    setWord(state + A.PAGE_RAM_SIZE, ramSize);
+    setWord(state + A.PAGE_TLB, host.nativeAlloc(A.PAGE_TLB_SLOTS * 8, 8));
+    setWord(state + A.PREEMPT_AT, 10000);
+    bytes.set([0x89, 0x11, 0xc3], pc); // mov [ecx], edx; ret
+    bytes.set([0x8b, 0x01, 0xc3], pc + 32); // mov eax, [ecx]; ret
+    let fault: number[] | undefined;
+    host.onFault = (_cpu, code, eip, address) => {
+        fault = [code, eip, address];
+        return host.stopAddress;
+    };
+    function run(entry: number, address: number, value = 0): void {
+        fault = undefined;
+        setWord(state + A.GPR + 4, address);
+        setWord(state + A.GPR + 8, value);
+        setWord(state + A.GPR + 16, stack);
+        setWord(stack, host.stopAddress);
+        expect(host.run(state, entry)).toBe(host.stopAddress);
+    }
+    run(pc, data, 0x11223344);
+    expect(fault).toBeUndefined();
+    run(pc, table + (data >>> 12) * 4, data | 5);
+    expect(fault).toBeUndefined();
+    run(pc + 32, data);
+    expect(fault).toBeUndefined();
+    expect(view.getUint32(state + A.GPR, true)).toBe(0x11223344);
+    run(pc, data, 0xfeedbeef);
+    expect(fault).toEqual([host.abi.fault.ACCESS_VIOLATION_WRITE, pc, data]);
+    expect(view.getUint32(data, true)).toBe(0x11223344);
+});
