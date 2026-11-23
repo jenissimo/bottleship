@@ -37,6 +37,7 @@ import { dbg, type FastmemStats } from "../../core/debug/dbg-commands";
 import { guestCodeInvalidationStats, invalidateAllGuestCode } from "../../core/memory/guest-code";
 import { getWasmGrowthStats } from "../../core/cpu/cpu-views";
 import { hypercallDataManager } from "../../core/cpu/hypercall-data";
+import { preemptionManager } from "../../core/cpu/preemption-manager";
 import { compareScenes, probeScene, type SceneProbe } from "./scene";
 import type { SplitReplayStats } from "../../backends/webgpu/d3d9/split-replay";
 
@@ -154,12 +155,13 @@ function snapshotCounters(render: RenderLike | undefined): CounterSnapshot {
     } | undefined;
     let fastmem: CounterSnapshot["fastmem"] = null;
     let tier2: CounterSnapshot["tier2"] = null;
+    const exports = preemptionManager.getWasmExports();
     try {
-        fastmem = projectFastmem(dbg.fastmemStats?.() ?? null);
-    } catch { /* wasm debug exports absent in this build */ }
+        if (typeof exports?.get_jit_config === "function") fastmem = projectFastmem(dbg.fastmemStats());
+    } catch { /* A backend's optional diagnostics may be unavailable during reset. */ }
     try {
-        tier2 = (dbg.tier2Stats?.() as unknown as Record<string, number> | null) ?? null;
-    } catch { /* same */ }
+        if (typeof exports?.jit_get_tier2_page_count === "function") tier2 = dbg.tier2Stats();
+    } catch { /* Same lifecycle as the fast-memory counters. */ }
     const ddraw = proc()?.getModule("ddraw") as { context?: { executor?: DDrawWebGPUExecutor } } | undefined;
     const executor = ddraw?.context?.executor ?? (globalThis as { __ddrawExecutor?: DDrawWebGPUExecutor }).__ddrawExecutor;
     const ffpStats = executor?.getRenderStats();
@@ -1297,6 +1299,8 @@ export function registerPerfCommands(svc: HarnessService): void {
      *
      * Flow: frameReport({reset:true, budgetMs:33.34}) -> play/tickFrames -> frameReport().
      */
+    svc.register("wwtJitStats", () => cpu()?.getTranslationStats?.() ?? null);
+
     svc.register("frameReport", (args) => {
         const opts = (args[0] ?? {}) as FrameWindowOptions & { reset?: boolean };
         if (opts.reset) return armFrameWindow(opts);
