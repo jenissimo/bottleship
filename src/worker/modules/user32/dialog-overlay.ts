@@ -20,6 +20,7 @@
  */
 
 import { System } from '../../core/system';
+import { setPointerOverlayFormLive } from '../../core/pointer-policy';
 import type { RenderActive } from '../../runtime/runtime-services';
 import { isGdiSurfaceHidden, ddrawOwnsScreen, ddrawShowsContent, shouldSuppress3DGdiOverlay } from '../ddraw/gdi-visibility';
 import {
@@ -135,7 +136,10 @@ export function noteDialogOverlayCandidate(win: WindowInfo | undefined): void {
     if (!win.overlayOnFlipScreen) {
         win.overlayOnFlipScreen = true;
     }
-    if (form) overlayForms.add(win.handle);
+    if (form) {
+        overlayForms.add(win.handle);
+        setPointerOverlayFormLive(true);
+    }
 }
 
 /**
@@ -148,6 +152,27 @@ export function isOverlayFormCandidate(win: WindowInfo): boolean {
     if (win.nativeClassName === '#32770' || (win.style & WS_CHILD) !== 0) return false;
     return win.width > 0 && win.height > 0
         && (win.width < virtualScreenWidth() || win.height < virtualScreenHeight());
+}
+
+export function isOverlayForm(hwnd: number): boolean {
+    return overlayForms.has(hwnd);
+}
+
+export function forgetOverlayForm(hwnd: number): void {
+    if (!overlayForms.delete(hwnd)) return;
+    setPointerOverlayFormLive(resolveFrontOverlayFormHwnd() !== 0);
+}
+
+/** The frontmost live overlay form, or 0. Keystrokes go to it: it is the modal UI on screen. */
+export function resolveFrontOverlayFormHwnd(): number {
+    let best = 0, bestRank = -Infinity;
+    for (const hwnd of overlayForms) {
+        const win = windows.get(hwnd);
+        if (!win || !win.visible || win.pendingDestroy || !win.overlayOnFlipScreen) continue;
+        const rank = getOverlayWindowZRank(hwnd);
+        if (rank > bestRank) { best = hwnd; bestRank = rank; }
+    }
+    return best;
 }
 
 /** The frontmost live overlay form whose visual bounds contain the point, or 0. */
@@ -380,7 +405,7 @@ export function eraseDialogOverlay(hwnd: number): void {
     // Stop compositing this dialog before erase (DestroyWindow path: still visible).
     if (win) {
         win.overlayOnFlipScreen = false;
-        overlayForms.delete(win.handle);
+        forgetOverlayForm(win.handle);
     }
 
     // +2px margin to cover anti-aliased edges / the default 1px dialog border.

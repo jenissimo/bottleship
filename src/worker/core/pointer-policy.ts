@@ -100,8 +100,25 @@ let clipRect: PointerClipRect | null = null;
 // devices, and the last one to Unacquire is what releases the claim.
 const exclusiveMouseOwners = new Set<object>();
 
+let overlayFormLive = false;
+
+
+/**
+ * An app window shown over the game's surface (a modal message or form) is driven with
+ * the mouse on Windows, which draws its class cursor over it whatever the game set for
+ * its own window. While one is live the pointer is shown and no relative claim holds.
+ */
+export function setPointerOverlayFormLive(live: boolean): void {
+    if (overlayFormLive === live) return;
+    overlayFormLive = live;
+    publish();
+}
+
 function publish(): void {
-    const out = derivePointerOutputs(facts);
+    const derived = derivePointerOutputs(facts);
+    const out = overlayFormLive
+        ? { pointerShown: true, captured: false, confinedRelative: false, warping: false }
+        : derived;
     const sys = System.getInstance();
     sys.requestHostCursorVisible(out.pointerShown);
     sys.requestHostMouseCapture(out.captured);
@@ -195,4 +212,5 @@ export function resetPointerPolicy(): void {
     clipRect = null;
     facts.warping = false;
     facts.exclusiveMouse = false;
+    overlayFormLive = false;
 }

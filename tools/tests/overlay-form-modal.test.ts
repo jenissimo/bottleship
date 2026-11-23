@@ -60,3 +60,19 @@ describe('mouse over the game window with an overlay form on top', () => {
         expect(wm.getMouseTargetWindow(10, 10)?.hwnd).toBe(game);
     });
 });
+
+describe('keyboard while an overlay form is up', () => {
+    test('keystrokes go to the frontmost overlay form, not the focused game window', () => {
+        const wm = new WindowManager();
+        const form = wm.createWindow('TMessageForm', '', WS_POPUP | WS_VISIBLE, 0, 352, 320, 320, 127, 0, 0, 0, 0);
+        const game = wm.createWindow('TRunnerForm', '', WS_POPUP | WS_VISIBLE, 0, 0, 0, 1024, 768, 0, 0, 0, 0);
+        wm.getWindow(form)!.visible = true;
+        wm.getWindow(game)!.visible = true;
+        wm.setFocus(game);
+        let live = form;
+        wm.registerOverlayFormResolver(() => 0, () => live);
+        expect(wm.getKeyboardTargetWindow()?.hwnd).toBe(form);
+        live = 0;
+        expect(wm.getKeyboardTargetWindow()?.hwnd).toBe(game);
+    });
+});

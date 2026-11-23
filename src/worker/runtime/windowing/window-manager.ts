@@ -132,6 +132,7 @@ export class WindowManager {
      *  to prefer live native dialogs over a DDraw flip chain). Returns hwnd or 0. */
     private mouseTargetResolver: ((screenX: number, screenY: number) => number) | null = null;
     private overlayFormResolver: ((screenX: number, screenY: number) => number) | null = null;
+    private overlayFormKeyResolver: (() => number) | null = null;
 
     /**
      * The parent → children sibling list, front to back. Win32 has ONE sibling order
@@ -199,8 +200,9 @@ export class WindowManager {
         this.mouseTargetResolver = resolver;
     }
 
-    registerOverlayFormResolver(resolver: (screenX: number, screenY: number) => number): void {
+    registerOverlayFormResolver(resolver: (screenX: number, screenY: number) => number, keyResolver?: () => number): void {
         this.overlayFormResolver = resolver;
+        this.overlayFormKeyResolver = keyResolver ?? null;
     }
 
     registerChildZOrderProvider(provider: (parentHwnd: number) => number[] | undefined): void {
@@ -709,6 +711,11 @@ export class WindowManager {
      * Falls back to the active window (and then the legacy topmost) when no focus is set.
      */
     getKeyboardTargetWindow(): WindowObject | undefined {
+        const form = this.overlayFormKeyResolver?.() ?? 0;
+        if (form && this.focusHwnd !== form && !this.isDescendantOf(this.focusHwnd, form)) {
+            const win = this.windows.get(form);
+            if (win && win.visible) return win;
+        }
         const focus = this.windows.get(this.focusHwnd);
         if (focus && focus.visible) return focus;
         const active = this.windows.get(this.activeHwnd);
