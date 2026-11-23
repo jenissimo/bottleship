@@ -419,7 +419,7 @@ export class WwtCpu {
 
     async registerPeImage(name: string, base: number, size: number, file: Uint8Array): Promise<void> {
         const options = globalThis as { __wwtPeAot?: boolean | "learn" | "auto" | string[]; __wwtPeAotLinkage?: "page-local" | "full" };
-        const selector = options.__wwtPeAot === undefined && globalThis.navigator?.storage?.getDirectory
+        const selector = options.__wwtPeAot === undefined && typeof globalThis.navigator?.storage?.getDirectory === "function"
             ? "auto"
             : options.__wwtPeAot;
         if (selector !== true && selector !== "learn" && selector !== "auto" && (!Array.isArray(selector) || !selector.includes(name.toLowerCase()))) return;
