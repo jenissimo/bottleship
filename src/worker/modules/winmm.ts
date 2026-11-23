@@ -16,7 +16,7 @@ import { Logger, LogCategory } from "../core/logger";
 import { System } from "../core/system";
 import { Mem } from "../core/memory/mem-accessor";
 import { Marshaler } from "../core/memory/marshaler";
-import { TimerKind } from "../core/scheduler/types";
+import { ThreadState, TimerKind } from "../core/scheduler/types";
 import { setTimerHandler } from "../core/scheduler/timer-wheel";
 import { pickDefined, savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
 import { CaptureRefusal } from "../savestate/object-codecs";
@@ -83,11 +83,16 @@ const JOYERR_NOERROR = 0;
 const JOYERR_UNPLUGGED = 167;
 
 // waveOut callback messages
+const WOM_OPEN = 0x3BB;
+const WOM_CLOSE = 0x3BC;
 const WOM_DONE = 0x3BD;
 
 // waveOut callback type flags
 const CALLBACK_NULL = 0x00000000;
+const CALLBACK_WINDOW = 0x00010000;
+const CALLBACK_THREAD = 0x00020000;
 const CALLBACK_FUNCTION = 0x00030000;
+const CALLBACK_EVENT = 0x00050000;
 const CALLBACK_TYPEMASK = 0x00070000;
 
 // MMIO constants
@@ -1155,6 +1160,32 @@ export class WinMM implements IModule {
         device.lastPlayCursor = playCursor;
     }
 
+    /**
+     * Deliver a WOM_* notification to a CALLBACK_WINDOW / CALLBACK_THREAD / CALLBACK_EVENT handle
+     * (as PostMessage, PostThreadMessage and SetEvent do on Windows). CALLBACK_FUNCTION is
+     * delivered on the timer thread by checkCompletions and is not handled here. A window or
+     * thread that no longer exists receives nothing, as the post fails silently on Windows.
+     */
+    private notifyWaveOut(device: WaveOutDevice, message: number, param1: number): void {
+        if (!device.callback) return;
+        const system = System.getInstance();
+        switch (device.flags & CALLBACK_TYPEMASK) {
+            case CALLBACK_WINDOW:
+                system.windowManager.postMessage(device.callback, message, device.id, param1);
+                break;
+            case CALLBACK_THREAD: {
+                const thread = system.scheduler.getThreadStateById(device.callback);
+                if (thread && thread.state !== ThreadState.TERMINATED) {
+                    system.windowManager.postMessage(0, message, device.id, param1, 0, 0, device.callback, undefined, 0, false);
+                }
+                break;
+            }
+            case CALLBACK_EVENT:
+                system.scheduler.setEvent(device.callback);
+                break;
+        }
+    }
+
     private checkCompletions(device: WaveOutDevice): void {
         if (!device.sab || device.pendingBuffers.length === 0) return;
 
@@ -1196,6 +1227,8 @@ export class WinMM implements IModule {
                         dwUser: device.instance,
                         args: [device.id, WOM_DONE, device.instance, pending.pwh, 0],
                     });
+                } else {
+                    this.notifyWaveOut(device, WOM_DONE, pending.pwh);
                 }
             } else {
                 break;
@@ -1929,6 +1962,7 @@ export class WinMM implements IModule {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             if (phwo) view.setUint32(phwo, hwo, true);
 
+            this.notifyWaveOut(device, WOM_OPEN, 0);
             return MMSYSERR_NOERROR;
         };
 
@@ -1944,6 +1978,7 @@ export class WinMM implements IModule {
                     device.registered = false;
                 }
                 this.waveOutDevices.delete(hwo);
+                this.notifyWaveOut(device, WOM_CLOSE, 0);
             }
             return MMSYSERR_NOERROR;
         };
@@ -2078,6 +2113,8 @@ export class WinMM implements IModule {
                     const flags = view.getUint32(pending.pwh + 16, true);
                     view.setUint32(pending.pwh + 16, (flags | WHDR_DONE) & ~WHDR_INQUEUE, true);
                 }
+                // Windows returns every queued buffer with WOM_DONE on reset
+                for (const pending of device.pendingBuffers) this.notifyWaveOut(device, WOM_DONE, pending.pwh);
                 device.pendingBuffers.length = 0;
 
                 if (device.sab) {
