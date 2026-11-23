@@ -93,9 +93,6 @@ export interface WindowInfo {
      *  fullscreen). The presenter composites these windows' rects from the GDI overlay
      *  on top of every flip, and mouse routing prefers them. See dialog-overlay.ts. */
     overlayOnFlipScreen?: boolean;
-    /** A captioned app top-level window (not #32770) flagged as a live overlay; it is
-     *  composited and point-routed even over an exclusive-fullscreen device. */
-    overlayForm?: boolean;
     /** Screen rect the last full overlay paint of this window covered. The flat overlay
      *  has no per-window layer, so a paint that covers LESS than the previous one leaves
      *  the difference behind for good; this is what the next paint erases. */
@@ -1102,7 +1099,7 @@ export const WINDOW_INFO_FIELDS = {
     dialogBaseUnitX: 'save', dialogBaseUnitY: 'save', guestCustomPaint: 'save', paintCycleRan: 'save',
     wndProcSubclassed: 'save', createSyncVisibleDelivered: 'save', sizeMovePending: 'save', createSyncActivationDelivered: 'save',
     activationDelivered: 'save', dialogInitInProgress: 'transient', createInProgress: 'transient',
-    pendingDestroy: 'save', overlayOnFlipScreen: 'save', overlayForm: 'save', lastOverlayFillBounds: 'host',
+    pendingDestroy: 'save', overlayOnFlipScreen: 'save', lastOverlayFillBounds: 'host',
 } as const satisfies Record<keyof WindowInfo, FieldPolicy>;
 
 export const LIST_CONTROL_FIELDS = {

@@ -40,6 +40,8 @@ import { paintTraceEnabled, logOverlayMutation } from './paint-trace';
 const WS_CHILD = 0x40000000;
 const WS_CAPTION = 0x00c00000;
 
+const overlayForms = new Set<number>();
+
 function getDDrawContext(): any {
     return (System.getInstance().process?.getModule('ddraw') as any)?.context;
 }
@@ -133,7 +135,7 @@ export function noteDialogOverlayCandidate(win: WindowInfo | undefined): void {
     if (!win.overlayOnFlipScreen) {
         win.overlayOnFlipScreen = true;
     }
-    if (form) win.overlayForm = true;
+    if (form) overlayForms.add(win.handle);
 }
 
 /**
@@ -364,7 +366,7 @@ export function eraseDialogOverlay(hwnd: number): void {
     // Stop compositing this dialog before erase (DestroyWindow path: still visible).
     if (win) {
         win.overlayOnFlipScreen = false;
-        win.overlayForm = false;
+        overlayForms.delete(win.handle);
     }
 
     // +2px margin to cover anti-aliased edges / the default 1px dialog border.
@@ -580,7 +582,7 @@ export function getLiveDialogOverlays(renderActive?: RenderActive | null): Array
         // A window flagged before the app took exclusive fullscreen can become the
         // screen owner afterwards; re-check here, the one place the rects are consumed.
         if (!dialogOverlayComposites({
-            gdiOutputOnScreen: gdiOutputOnScreen || !!win.overlayForm,
+            gdiOutputOnScreen: gdiOutputOnScreen || overlayForms.has(win.handle),
             isScreenOwnerWindow: isScreenOwnerWindow(win.handle),
             isDialogRoot: getDialogRoot(win.handle) === win.handle,
             hasOverlayContent: dialogGroupHasOverlayContent(win.handle),
@@ -613,7 +615,7 @@ export function dialogNeedsPointMouseRouting(win: WindowInfo): boolean {
     if (win.nativeClassName !== '#32770') {
         // Plain window hosting system controls: point-route only while it's the
         // live overlay over a game-owned screen (windowed mode routes normally).
-        return !!win.overlayOnFlipScreen && (!!win.overlayForm || hasSystemControlChildren(win));
+        return !!win.overlayOnFlipScreen && (overlayForms.has(win.handle) || hasSystemControlChildren(win));
     }
 
     // Every other visible #32770 point-routes. Being hidden behind an exclusive-fullscreen
