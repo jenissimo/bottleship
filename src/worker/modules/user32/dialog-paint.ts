@@ -251,7 +251,7 @@ export function restoreClientRectFromAncestors(win: WindowInfo): boolean {
  *
  * Overlay repair excludes `win`, so this is safe both before a move and after a hide.
  */
-export function eraseHiddenWindowPixels(win: WindowInfo): void {
+export function eraseHiddenWindowPixels(win: WindowInfo, moving = false): void {
     const bounds = getWindowVisualBounds(win.handle);
     if (restoreClientRectFromAncestors(win)) {
         if (bounds) repairOverlayWindowsOverlappingRect(bounds, win.handle);
@@ -259,7 +259,7 @@ export function eraseHiddenWindowPixels(win: WindowInfo): void {
     }
 
     if ((win.style & WS_CHILD) === 0) {
-        eraseDialogOverlay(win.handle);
+        eraseDialogOverlay(win.handle, moving);
         return;
     }
 
@@ -268,7 +268,7 @@ export function eraseHiddenWindowPixels(win: WindowInfo): void {
     // flat overlay now; leaving it in place makes the next transparent sibling
     // inherit stale buttons/text. eraseDialogOverlay repairs all still-visible
     // overlapping windows back-to-front and excludes this now-hidden subtree.
-    eraseDialogOverlay(win.handle);
+    eraseDialogOverlay(win.handle, moving);
     const parentHwnd = win.parent;
     invalidateWindow(parentHwnd, {
         left: win.x | 0,

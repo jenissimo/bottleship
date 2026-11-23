@@ -395,7 +395,7 @@ export function registerOverlayPaintRepair(): void {
  * ghost over the game) or moves (else it smears its old position). Call BEFORE the
  * window is destroyed / repositioned, while its current rect is still known.
  */
-export function eraseDialogOverlay(hwnd: number): void {
+export function eraseDialogOverlay(hwnd: number, moving = false): void {
     const gdi = System.getInstance().gdiContext;
     if (!gdi?.clearOverlayRect) return;
     const win = windows.get(hwnd);
@@ -403,7 +403,7 @@ export function eraseDialogOverlay(hwnd: number): void {
     if (!bounds) return;
 
     // Stop compositing this dialog before erase (DestroyWindow path: still visible).
-    if (win) {
+    if (win && !(moving && overlayForms.has(hwnd))) {
         win.overlayOnFlipScreen = false;
         forgetOverlayForm(win.handle);
     }

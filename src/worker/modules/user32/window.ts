@@ -414,7 +414,7 @@ function applyWindowPosGeometry(
 
     if ((moving || resizing) && !(uFlags & 0x0008 /* SWP_NOREDRAW */)
         && isEffectivelyVisible(window)) {
-        eraseHiddenWindowPixels(window);
+        eraseHiddenWindowPixels(window, true);
     }
     if (!(uFlags & SWP_NOMOVE_GEO)) {
         window.x = x;
