@@ -297,6 +297,7 @@ export class Scheduler {
      *  Armed lazily at the first tick boundary because wasm exports are not reliably
      *  available during initialize(). */
     private parkEipArmed = false;
+    private releaseWwtPark?: () => void;
     /** True while a winmm timer callback is executing under its atomic-execution pin.
      *  A dedicated single-token pin (one kernelPinCount increment over its lifetime) so it
      *  composes with any nested suspended-frame/SEH pin the callback itself may take. See
@@ -926,6 +927,9 @@ export class Scheduler {
     }
 
     reset(): void {
+        this.releaseWwtPark?.();
+        this.releaseWwtPark = undefined;
+        this.parkEipArmed = false;
         for (const thread of this.threads.values()) {
             this.discardThreadApcs(thread);
             this.resourceProvider.unregisterKernelObject(thread.handle);
@@ -1038,6 +1042,8 @@ export class Scheduler {
     /** True once `thread` has retired a full quantum's worth of guest instructions since its last
      *  switch. Deterministic — independent of wall-clock and platform speed. */
     private quantumExpired(thread: Thread, cpu: V86Cpu): boolean {
+        const wallQuantum = (cpu as V86Cpu & { wallClockQuantumMs?: number }).wallClockQuantumMs;
+        if (wallQuantum !== undefined) return performance.now() - thread.lastSwitchTime >= wallQuantum;
         const quantumInsns = (this.config.minQuantumMs * TARGET_INSN_PER_MS) >>> 0;
         if (quantumInsns === 0) return true; // degenerate config → always eligible (matches old <=0 ms)
         const delta = this.insnsSinceSwitch(thread, cpu);
@@ -1057,12 +1063,15 @@ export class Scheduler {
      * Sleep(1) for a whole slice even after the app asked for timeBeginPeriod(1). At the NT
      * default (15.6ms) the result always exceeds the normal slice and changes nothing.
      */
-    timerSliceBudgetInsns(): number {
+    timerSliceBudgetMs(): number {
         const d = this.timerWheel.nextFireIn(this.timeService.nowMs());
         if (!Number.isFinite(d)) return 0;
         const res = this.timeService.timerResolutionMs;
-        const ms = Math.max(res, Math.ceil(d / res) * res);
-        return Math.ceil(ms * TARGET_INSN_PER_MS);
+        return Math.max(res, Math.ceil(d / res) * res);
+    }
+
+    timerSliceBudgetInsns(): number {
+        return Math.ceil(this.timerSliceBudgetMs() * TARGET_INSN_PER_MS);
     }
 
     /**
@@ -1172,6 +1181,15 @@ export class Scheduler {
         this.ensureMainThread();
     }
 
+    private ownsWwtPark(pc: number): boolean {
+        if (!this.process || pc !== this.spinLoopBase) return false;
+        const thread = this.getCurrentThread();
+        if (!thread) return false;
+        return (thread.state === ThreadState.WAITING && !!thread.waitInfo) ||
+            thread.state === ThreadState.SUSPENDED ||
+            (thread.state === ThreadState.RUNNING && this.onThreadOwnsSuspendedFrame?.(thread.id) === true);
+    }
+
     /**
      * Called from tick_hooks_after — clean instruction boundary.
      */
@@ -1189,7 +1207,12 @@ export class Scheduler {
         // executes JMP $ slice tails without it).
         if (!this.parkEipArmed && this.spinLoopBase > 0) {
             const ex = preemptionManager.getWasmExports?.();
-            if (ex?.set_park_eip) {
+            if (ex?.set_wwt_park_exit) {
+                this.releaseWwtPark?.();
+                this.releaseWwtPark = ex.set_wwt_park_exit(this.spinLoopBase >>> 0,
+                    (pc: number) => this.ownsWwtPark(pc));
+                this.parkEipArmed = true;
+            } else if (ex?.set_park_eip) {
                 ex.set_park_eip(this.spinLoopBase >>> 0);
                 // E2b safety: indirect-region growth must never pull targets from the
                 // thunk/callback/spin bucket (stub pages full of OUT traps → wasm trap

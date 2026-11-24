@@ -11,6 +11,13 @@ const [compilerBytes, hypercall, d3d9Arena] = await Promise.all([
     load("wwt-provider/wwt_wasm.wasm"), load("wwt-hypercall.wasm"), load("wwt-d3d9-arena.wasm"),
 ]);
 
+const upstream = await WwtCompiler.fromBytes(await load("wwt-provider/wwt_abi11.wasm"), true);
+assert.equal(upstream.cacheId, "95f8ad6ee983acd0f7f466f25ebe71be3965da796d47befbc44b1cf56e958f42",
+    "The fast compiler must match the pinned upstream artifact");
+assert.equal(upstream.abi.version, 11);
+assert(WebAssembly.validate(upstream.kernel()), "Invalid upstream i386 kernel");
+console.log("WWT fast compiler OK (original ABI 11)");
+
 const cpuFields: Record<string, number> = {
     GPR: 32, EIP: 4, FS_BASE: 4, GS_BASE: 4, SEG_SEL: 12,
     FK: 4, FR: 4, DF: 4, EFLAGS_SYS: 4, PREEMPT_AT: 4, RETIRED_INSNS: 4,

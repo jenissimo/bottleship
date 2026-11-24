@@ -1,6 +1,8 @@
 import type { WwtMachine, WwtModule, WwtPeImageBounds } from "./cpu-provider";
 import { WwtCompiler } from "./translator";
 import { getOrBuild } from "./pe-aot-cache";
+import { WwtWallClock } from "./wall-clock";
+import { trapAddress, WwtTrapMap } from "./traps";
 
 const PAGE = 4096;
 const PAGE_COUNT = 1 << 20;
@@ -52,6 +54,15 @@ export class BottleShipMachine implements WwtMachine {
     readonly zeroL2;
     readonly storeMap;
     readonly tickAddr;
+    readonly wallClock?: WwtWallClock;
+    refreshWallTimers?: () => void;
+    canWriteCode?: (address: number) => boolean;
+    private readonly traps?: WwtTrapMap;
+    private readonly writableCodePages = new Set<number>();
+    private readonly cpus = new Set<number>();
+    private tableUsed = 2;
+    private parkExit?: { address: number; ownsPark: (pc: number) => boolean; publish: (cpu: number, pc: number) => void };
+    private parkTrampoline?: WebAssembly.Module;
     readonly natives: Record<string, WebAssembly.ImportValue> = {};
     private readonly lookupL1;
     private readonly bytes;
@@ -88,6 +99,10 @@ export class BottleShipMachine implements WwtMachine {
         this.words = new Uint32Array(this.memory.buffer);
         this.cursor = this.storeMap + PAGE_COUNT;
         this.tickAddr = this.nativeAlloc(4);
+        if (this.abi.version === 11) {
+            this.wallClock = new WwtWallClock(this.memory, this.tickAddr);
+            if (compiler.memTraps) this.traps = new WwtTrapMap();
+        }
         this.words.fill(this.zeroL2, this.lookupL1 / 4, this.lookupL1 / 4 + PAGE_COUNT);
         this.bytes.fill(2, this.storeMap, this.storeMap + Math.ceil(this.abi.null_limit / PAGE));
         this.bytes.fill(2, this.storeMap + Math.floor((guestLimit - 1) / PAGE), this.storeMap + PAGE_COUNT);
@@ -104,7 +119,12 @@ export class BottleShipMachine implements WwtMachine {
         this.kernelRun = kernel.exports.run as WasmFn;
         const helper = this.guestLimit - 0x20000;
         this.loadModuleSync(this.compiler.translate(Uint8Array.of(0xc3), helper, [], this.guestLimit), "flags");
-        this.setL1(helper >>> 12, this.zeroL2);
+        const helperPage = helper >>> 12;
+        this.setL1(helperPage, this.zeroL2);
+        this.entriesByPage.delete(helperPage);
+        this.traps?.remove(helper);
+        this.bytes[this.storeMap + helperPage] &= ~STORE_MAP_CODE;
+        this.writableCodePages.delete(helperPage);
     }
 
     nativeAlloc(size: number, alignment = 8): number {
@@ -118,10 +138,21 @@ export class BottleShipMachine implements WwtMachine {
         const A = this.abi.cpu;
         const at = this.recycledCpus.pop() ?? this.nativeAlloc(A.SIZE, 64);
         this.bytes.fill(0, at, at + A.SIZE);
-        this.words[(at + A.CODE_WRITABLE) >>> 2] = 1;
+        if (this.wallClock) this.cpus.add(at);
+        this.words[(at + A.CODE_WRITABLE) >>> 2] = Number(!this.wallClock || this.writableCodePages.size > 0);
         return at;
     }
-    freeCpu(cpu: number): void { this.recycledCpus.push(cpu); }
+    freeCpu(cpu: number): void {
+        this.cpus.delete(cpu);
+        this.recycledCpus.push(cpu);
+    }
+
+    dispose(): void {
+        this.wallClock?.dispose();
+        this.refreshWallTimers = undefined;
+        this.parkExit = undefined;
+        this.traps?.clear();
+    }
 
     l1At(page: number): number { return this.words[this.lookupL1 / 4 + page]; }
     setL1(page: number, value: number): void { this.words[this.lookupL1 / 4 + page] = value; }
@@ -195,7 +226,8 @@ export class BottleShipMachine implements WwtMachine {
         }
         // A region can inline or directly link any entry in its source window.
         // A separate translation rooted anywhere in that window can publish entries.
-        const reach = this.abi.fault.SMC_RESUME === undefined ? 0 : this.regionWindow / PAGE;
+        const fullReset = first === 0 && end >= Math.ceil(this.guestLimit / PAGE);
+        const reach = this.abi.fault.SMC_RESUME === undefined && !this.wallClock ? 0 : this.regionWindow / PAGE;
         first = Math.max(0, first - Math.max(1, reach));
         end = Math.min(PAGE_COUNT, end + reach);
         for (let page = first; page < end; page++) {
@@ -203,12 +235,21 @@ export class BottleShipMachine implements WwtMachine {
                 this.setL1(page, this.zeroL2);
                 invalidated = true;
             }
+            const entries = this.entriesByPage.get(page);
+            if (entries && this.traps) for (const pc of entries) this.traps.remove(pc);
             this.entriesByPage.delete(page);
+            if (this.wallClock) {
+                this.bytes[this.storeMap + page] &= ~STORE_MAP_CODE;
+                this.writableCodePages.delete(page);
+            }
         }
+        if (fullReset) this.traps?.clear();
+        this.publishCodeWritePolicy();
         return invalidated;
     }
 
     enableMmio(): boolean {
+        if (this.wallClock) throw new Error("This device needs MMIO. Select protected WWT mode.");
         if (this.guestMmio) return false;
         this.guestMmio = true;
         while (this.linkedPeBySource.size) {
@@ -224,6 +265,65 @@ export class BottleShipMachine implements WwtMachine {
         }
         this.entriesByPage.clear();
         return true;
+    }
+
+    setParkExit(address: number, ownsPark: (pc: number) => boolean,
+        publish: (cpu: number, pc: number) => void): () => void {
+        if (!this.wallClock || !Number.isInteger(address) || address <= 0 || address + 1 >= this.guestLimit) {
+            throw new RangeError("Invalid WWT scheduler park address");
+        }
+        if (this.parkExit) this.invalidateParkEntry(this.parkExit.address);
+        const binding = { address, ownsPark, publish };
+        this.parkExit = binding;
+        const slot = this.lookup(address);
+        if (slot > 1) this.wrapParkEntry(address, slot);
+        return () => {
+            if (this.parkExit !== binding) return;
+            this.parkExit = undefined;
+            this.invalidateParkEntry(address);
+        };
+    }
+
+    private invalidateParkEntry(address: number): void {
+        this.invalidateTranslationPages(address >>> 12, ((address + 1) >>> 12) + 1);
+    }
+
+    private isParkInstruction(address: number): boolean {
+        return this.bytes[address] === 0xeb && this.bytes[address + 1] === 0xfe;
+    }
+
+    private wrapParkEntry(address: number, slot: number): void {
+        const binding = this.parkExit;
+        if (binding?.address !== address || !this.isParkInstruction(address)) return;
+        const original = this.table.get(slot);
+        if (typeof original !== "function") throw new Error("Missing WWT scheduler park entry");
+        const decide = (cpu: number): number => {
+            if (!this.isParkInstruction(address) || this.canExecute?.(address) === false ||
+                ((address & (PAGE - 1)) === PAGE - 1 && this.canExecute?.(address + 1) === false)) {
+                this.invalidateParkEntry(address);
+                this.restartAfterSmc = address;
+                return this.yieldAddress;
+            }
+            if (this.parkExit !== binding || !binding.ownsPark(address)) return 0;
+            binding.publish(cpu, address);
+            return this.yieldAddress;
+        };
+        // A park decision exits the kernel; otherwise tail-call the original entry.
+        // Both functions and the dispatcher use the same (cpu: i32) -> pc signature.
+        const body = [1, 1, 0x7f, 0x20, 0, 0x10, 0, 0x22, 1, 0x04, 0x40,
+            0x20, 1, 0x0f, 0x0b, 0x20, 0, 0x12, 1, 0x0b];
+        const name = (value: string) => [value.length, ...new TextEncoder().encode(value)];
+        const section = (id: number, data: number[]) => [id, data.length, ...data];
+        const imported = (field: string) => [...name("env"), ...name(field), 0, 0];
+        this.parkTrampoline ??= new WebAssembly.Module(Uint8Array.of(
+            0, 97, 115, 109, 1, 0, 0, 0,
+            ...section(1, [1, 0x60, 1, 0x7f, 1, 0x7f]),
+            ...section(2, [2, ...imported("decide"), ...imported("original")]),
+            ...section(3, [1, 0]), ...section(7, [1, ...name("enter"), 0, 2]),
+            ...section(10, [1, body.length, ...body]),
+        ));
+        const wrapped = new WebAssembly.Instance(this.parkTrampoline, { env: { decide, original } });
+        this.table.set(slot, wrapped.exports.enter as WasmFn);
     }
 
     private translateAt(cpu: number, address: number): number {
@@ -243,7 +343,10 @@ export class BottleShipMachine implements WwtMachine {
         const start = performance.now();
         const wasm = this.compiler.translate(source, address, known, this.guestLimit, this.guestMmio, this.regionOpt);
         const built = performance.now();
-        this.loadModuleSync(wasm, address.toString(16));
+        this.installCompiledModule(new WebAssembly.Module(wasm), address.toString(16),
+            undefined, undefined, this.wallClock !== undefined);
+        // ABI 11 publishes CODE when an entry first installs an L2 for its page.
+        // A demand window contains potential input, including unused writable pages.
         if (this.abi.fault.SMC_RESUME !== undefined) {
             for (let page = address >>> 12; page <= (end - 1) >>> 12; page++) {
                 this.markCodePage(page);
@@ -261,7 +364,8 @@ export class BottleShipMachine implements WwtMachine {
     async loadPeAot(file: Uint8Array<ArrayBuffer>, name: string, executable: (address: number) => boolean,
         verifyCurrent: () => boolean, profile: number[] = [], fullImage?: WwtPeImageBounds): Promise<void> {
         const guestMmio = this.guestMmio;
-        const policy = fullImage ? "linked-smc-v2" : "page-local-v2";
+        if (this.wallClock && (!fullImage || !this.canLinkUpstreamImage(fullImage))) return;
+        const policy = this.wallClock ? "upstream-linked-v1" : fullImage ? "linked-smc-v2" : "page-local-v2";
         const modeKey = `${this.compiler.cacheId}/${this.guestLimit}/${this.compiler.flags(this.guestLimit, guestMmio)}/${policy}-opt1`;
         const started = performance.now();
         let translateMs = 0;
@@ -277,6 +381,7 @@ export class BottleShipMachine implements WwtMachine {
         const compiling = performance.now();
         const compiled = await WebAssembly.compile(bytes);
         if (this.guestMmio !== guestMmio || !verifyCurrent()) return;
+        if (this.wallClock && fullImage && !this.canLinkUpstreamImage(fullImage)) return;
         const installing = performance.now();
         const module = this.installCompiledModule(compiled, name, executable, fullImage);
         const report = { name, policy, seeds: profile.length, source: translated ? "compiler" : "cache", translateMs,
@@ -292,7 +397,7 @@ export class BottleShipMachine implements WwtMachine {
     }
 
     private installCompiledModule(module: WebAssembly.Module, name: string, canInstall?: (address: number) => boolean,
-        fullImage?: WwtPeImageBounds): WwtModule & { entries: number } {
+        fullImage?: WwtPeImageBounds, keepExisting = false): WwtModule & { entries: number } {
         const [section] = WebAssembly.Module.customSections(module, this.abi.funcs_section);
         if (!section) throw new Error(`Missing i386 function map in ${name}`);
         const map = new Uint32Array(section);
@@ -302,7 +407,14 @@ export class BottleShipMachine implements WwtMachine {
         }
         let sourcePages: Uint32Array | undefined;
         if (fullImage) {
-            const [dependencies] = WebAssembly.Module.customSections(module, "wwt.smc_pages");
+            let [dependencies] = WebAssembly.Module.customSections(module, "wwt.smc_pages");
+            if (this.wallClock && fullImage.executableRanges) {
+                const pages = new Set<number>();
+                for (const range of fullImage.executableRanges) {
+                    for (let page = range.start >>> 12; page <= (range.end - 1) >>> 12; page++) pages.add(page);
+                }
+                dependencies = Uint32Array.from([...pages].sort((a, b) => a - b)).buffer;
+            }
             if (!dependencies || dependencies.byteLength % 4 ||
                 !Number.isInteger(fullImage.base) || !Number.isInteger(fullImage.end) ||
                 fullImage.base < this.abi.null_limit || fullImage.base >= fullImage.end || fullImage.end > this.guestLimit) {
@@ -322,9 +434,14 @@ export class BottleShipMachine implements WwtMachine {
             if (map.subarray(1).some(pc => !declared.has(pc >>> 12))) {
                 throw new Error(`PE AOT entry missing a source dependency in ${name}`);
             }
+            // The stock compiler can directly link across executable pages. Only
+            // install an upstream linked image while all of its source is read-only.
+            if (this.wallClock && pages.some(page => this.isWritableCodePage(page))) {
+                throw new Error(`Cannot link writable executable pages in ${name}`);
+            }
             sourcePages = pages;
         }
-        const base = this.table.grow(map[0]);
+        const base = this.wallClock ? this.reserveUpstreamTableSlots(map[0]) : this.table.grow(map[0]);
         const instance = new WebAssembly.Instance(module, {env: {
             memory: this.memory, table: this.table, table_base: base, lookup_l1: this.lookupL1,
             store_map: this.storeMap, zero_l2: this.zeroL2, tick: this.tickAddr,
@@ -336,7 +453,11 @@ export class BottleShipMachine implements WwtMachine {
             hle_out32: () => 0, hle_out32_config: 0, ...this.natives,
         }});
         this.evalFlags ??= instance.exports.eflags as WasmFn;
-        for (let i = 1; i < map.length; i++) this.installEntry(map[i], base + i - 1);
+        const traps = this.abi.traps_section && WebAssembly.Module.customSections(module, this.abi.traps_section)[0];
+        if (traps) this.traps?.register(map.subarray(1), traps);
+        for (let i = 1; i < map.length; i++) {
+            if (!keepExisting || !this.lookup(map[i])) this.installEntry(map[i], base + i - 1);
+        }
         if (sourcePages?.length && map[0]) {
             const linked: LinkedPeModule = { sourcePages, firstSlot: base, slotCount: map[0],
                 entryPages: new Set(map.subarray(1).map(pc => pc >>> 12)) };
@@ -344,14 +465,67 @@ export class BottleShipMachine implements WwtMachine {
                 let dependencies = this.linkedPeBySource.get(page);
                 if (!dependencies) this.linkedPeBySource.set(page, dependencies = new Set());
                 dependencies.add(linked);
-                this.markCodePage(page);
+                if (!this.wallClock) this.markCodePage(page);
             }
         }
         return {instance, entries: map[0]};
     }
 
+    private reserveUpstreamTableSlots(count: number): number {
+        const base = this.tableUsed;
+        const end = base + count;
+        if (end > this.table.length) this.table.grow(Math.max(this.table.length, end - this.table.length));
+        this.tableUsed = end;
+        return base;
+    }
+
+    private canLinkUpstreamImage(image: WwtPeImageBounds): boolean {
+        if (!image.executableRanges?.length) return false;
+        for (const range of image.executableRanges) {
+            for (let page = range.start >>> 12; page <= (range.end - 1) >>> 12; page++) {
+                if (this.isWritableCodePage(page)) return false;
+            }
+        }
+        return true;
+    }
+
+    private isWritableCodePage(page: number): boolean {
+        const address = page * PAGE;
+        return address >= this.abi.null_limit && (this.canWriteCode?.(address) ?? true);
+    }
+
+    private publishCodeWritePolicy(): void {
+        if (!this.wallClock) return;
+        // A guest write can clear CODE inside translated Wasm before the next host update.
+        for (const page of this.writableCodePages) {
+            if (!(this.bytes[this.storeMap + page] & STORE_MAP_CODE)) this.writableCodePages.delete(page);
+        }
+        const writable = Number(this.writableCodePages.size > 0);
+        for (const cpu of this.cpus) this.words[(cpu + this.abi.cpu.CODE_WRITABLE) >>> 2] = writable;
+    }
+
+    updateCodePermissions(first: number, end: number): boolean {
+        if (!this.wallClock) return false;
+        let invalidated = false;
+        for (let page = first; page < end; page++) {
+            if (!(this.bytes[this.storeMap + page] & STORE_MAP_CODE) && !this.linkedPeBySource.has(page)) continue;
+            const writable = this.isWritableCodePage(page);
+            if (writable && this.linkedPeBySource.has(page)) {
+                invalidated = this.invalidateTranslationPages(page, page + 1) || invalidated;
+            }
+            if (writable && (this.bytes[this.storeMap + page] & STORE_MAP_CODE)) this.writableCodePages.add(page);
+            else this.writableCodePages.delete(page);
+        }
+        this.publishCodeWritePolicy();
+        return invalidated;
+    }
+
     private markCodePage(page: number): void {
         this.bytes[this.storeMap + page] |= STORE_MAP_CODE;
+        if (this.wallClock && this.isWritableCodePage(page) && !this.writableCodePages.has(page)) {
+            this.writableCodePages.add(page);
+            this.publishCodeWritePolicy();
+        }
         // A write starting on the preceding page can straddle into this
         // code page. Keep that uncommon range check inside the map slow path.
         if (page > 0 && this.abi.fault.SMC_RESUME !== undefined) {
@@ -372,6 +546,7 @@ export class BottleShipMachine implements WwtMachine {
         }
         this.words[l2 / 4 + (pc & (PAGE - 1))] = slot;
         this.entriesByPage.get(page)!.add(pc);
+        if (this.parkExit?.address === pc) this.wrapParkEntry(pc, slot);
     }
 
     eflags(cpu: number): number {
@@ -382,17 +557,34 @@ export class BottleShipMachine implements WwtMachine {
     }
 
     run(cpu: number, eip: number): number {
-        for (;;) {
-            let result: number;
-            try {
-                result = this.kernelRun(cpu, eip) >>> 0;
-            } finally {
-                this.flushSmc(cpu);
+        const depth = this.abi.cpu.CALL_DEPTH;
+        const depthWord = (cpu + depth) >>> 2;
+        const savedDepth = this.wallClock && depth !== undefined ? this.words[depthWord] : undefined;
+        try {
+            for (;;) {
+                let result: number;
+                try {
+                    result = this.kernelRun(cpu, eip) >>> 0;
+                } catch (error) {
+                    const site = this.traps?.find(error);
+                    if (!site) throw error;
+                    if (savedDepth !== undefined) this.words[depthWord] = savedDepth;
+                    this.words[(cpu + this.abi.cpu.EIP) >>> 2] = site.eip;
+                    const fault = (site.flags & this.abi.trap!.WRITE)
+                        ? this.abi.fault.ACCESS_VIOLATION_WRITE : this.abi.fault.ACCESS_VIOLATION;
+                    eip = this.resumeFault(cpu, fault, site.eip, trapAddress(this.words, this.abi, cpu, site));
+                    if (eip === this.stopAddress || eip === this.yieldAddress) return eip;
+                    continue;
+                } finally {
+                    this.flushSmc(cpu);
+                }
+                const resume = this.restartAfterSmc;
+                if (resume === undefined) return result;
+                this.restartAfterSmc = undefined;
+                eip = resume;
             }
-            const resume = this.restartAfterSmc;
-            if (resume === undefined) return result;
-            this.restartAfterSmc = undefined;
-            eip = resume;
+        } finally {
+            if (savedDepth !== undefined) this.words[depthWord] = savedDepth;
         }
     }
 }

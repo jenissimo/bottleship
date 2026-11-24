@@ -247,7 +247,9 @@ function minimalPe(entry: number): Uint8Array {
     return file;
 }
 
-test.each(["default", "explicit auto", "off", "no OPFS"])("PE loading with %s policy preserves guest execution across resets", async (mode) => {
+test.each(["default", "explicit auto", "off", "no OPFS", "fast default", "fast off"])("PE loading with %s policy preserves guest execution across resets", async (mode) => {
+    const fast = mode.startsWith("fast ");
+    const off = mode.endsWith("off");
     const globalOptions = globalThis as { __wwtPeAot?: boolean | string };
     const previous = Object.getOwnPropertyDescriptor(globalThis, "navigator");
     const oldMode = globalOptions.__wwtPeAot;
@@ -257,12 +259,15 @@ test.each(["default", "explicit auto", "off", "no OPFS"])("PE loading with %s po
         } else {
             installFakeOpfs();
         }
-        if (mode === "off") globalOptions.__wwtPeAot = false;
+        if (off) globalOptions.__wwtPeAot = false;
         else if (mode === "explicit auto") globalOptions.__wwtPeAot = "auto";
         else delete globalOptions.__wwtPeAot;
-        const training = mode === "default" || mode === "explicit auto";
+        const training = mode === "default" || mode === "explicit auto" || mode === "fast default";
         const ramSize = 4 << 20;
-        const host = new BottleShipMachine(await WwtCompiler.fromBytes(compilerBytes), ramSize);
+        const bytes = fast
+            ? await Bun.file(new URL("../../public/wwt-provider/wwt_abi11.wasm", import.meta.url)).arrayBuffer()
+            : compilerBytes;
+        const host = new BottleShipMachine(await WwtCompiler.fromBytes(bytes, fast), ramSize);
         await host.init();
         const cpuState = host.nativeAlloc(4096, 4096);
         const wasm = (name: string) => Bun.file(new URL("../../public/" + name, import.meta.url)).arrayBuffer();
@@ -270,6 +275,7 @@ test.each(["default", "explicit auto", "off", "no OPFS"])("PE loading with %s po
             hypercall: await wasm("wwt-hypercall.wasm"), d3d9Arena: await wasm("wwt-d3d9-arena.wasm"),
         });
         const core = new WwtCpu(host, ramSize, hooks, cpuState);
+        if (fast) core.setCodePermissionReader(() => true);
         const base = 0x90000, entry = base + 0x1000, dynamicEntry = entry + 0x100;
         const file = minimalPe(0x1000);
         file.set([0xc3], 0x200);
@@ -279,8 +285,9 @@ test.each(["default", "explicit auto", "off", "no OPFS"])("PE loading with %s po
         for (let run = 0; run < 3; run++) {
             core.reset();
             core.mem8.set(file.subarray(0x200), entry);
-            core.registerCodeRange(entry, base + 0x3000);
+            core.registerCodeRange(entry, base + 0x3000, !fast);
             await core.registerPeImage("demo.exe", base, 0x3000, file);
+            expect(host.lookup(entry) > 0).toBe((fast && !off) || (training && run > 0));
             expect(host.lookup(dynamicEntry) > 0).toBe(training && run > 0);
             core.instruction_pointer[0] = dynamicEntry;
             core.reg32[2] = 0x1234;
@@ -292,9 +299,10 @@ test.each(["default", "explicit auto", "off", "no OPFS"])("PE loading with %s po
             else expect(profileFlush).toBeUndefined();
         }
         const after = core.getTranslationStats().peAotCache;
-        expect(after.writes - before.writes).toBe(Number(training));
+        const compiled = training ? (fast ? 2 : 1) : 0;
+        expect(after.writes - before.writes).toBe(compiled);
         expect(after.hits - before.hits).toBe(Number(training));
-        expect(after.misses - before.misses).toBe(Number(training));
+        expect(after.misses - before.misses).toBe(compiled);
     } finally {
         if (oldMode === undefined) delete globalOptions.__wwtPeAot;
         else globalOptions.__wwtPeAot = oldMode;

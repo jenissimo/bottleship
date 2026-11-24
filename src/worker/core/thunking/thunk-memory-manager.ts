@@ -176,31 +176,31 @@ export class ThunkMemoryManager {
                 
                 // Use MemoryManager's bump allocator (starts at 0x03000000)
                 // Allocate sequentially
-                callbackStubPoolBase = memoryManager.alloc(callbackStubPoolSize, "CALLBACK_STUB");
-                spinLoopAddress = memoryManager.alloc(spinLoopSize, "SPIN_LOOP");
+                callbackStubPoolBase = memoryManager.alloc(callbackStubPoolSize, "CALLBACK_STUB", "rx");
+                spinLoopAddress = memoryManager.alloc(spinLoopSize, "SPIN_LOOP", "rx");
                 thunkGeneratorBase = memoryManager.alloc(initialThunkGeneratorSize, "THUNK_CODE", "rx");
             } else {
                 // Try to reserve preferred addresses
                 // Note: allocAt may fail if address is already reserved
                 // In that case, fall back to bump allocator
                 try {
-                    memoryManager.allocAt(callbackStubPoolBase, callbackStubPoolSize, "CALLBACK_STUB");
-                    memoryManager.allocAt(spinLoopAddress, spinLoopSize, "SPIN_LOOP");
+                    memoryManager.allocAt(callbackStubPoolBase, callbackStubPoolSize, "CALLBACK_STUB", "rx");
+                    memoryManager.allocAt(spinLoopAddress, spinLoopSize, "SPIN_LOOP", "rx");
                     memoryManager.allocAt(thunkGeneratorBase, initialThunkGeneratorSize, "THUNK_CODE", "rx");
                 } catch (e) {
                     // Preferred addresses in use, fall back to bump allocator
                     Logger.warn(LogCategory.SYSTEM, 
                         `Preferred thunk memory addresses in use, falling back to bump allocator: ${e}`);
-                    callbackStubPoolBase = memoryManager.alloc(callbackStubPoolSize, "CALLBACK_STUB");
-                    spinLoopAddress = memoryManager.alloc(spinLoopSize, "SPIN_LOOP");
+                    callbackStubPoolBase = memoryManager.alloc(callbackStubPoolSize, "CALLBACK_STUB", "rx");
+                    spinLoopAddress = memoryManager.alloc(spinLoopSize, "SPIN_LOOP", "rx");
                     thunkGeneratorBase = memoryManager.alloc(initialThunkGeneratorSize, "THUNK_CODE", "rx");
                 }
             }
         } catch (e) {
             // Fallback: use bump allocator
             Logger.warn(LogCategory.SYSTEM, `Thunk memory allocation error, using bump allocator: ${e}`);
-            callbackStubPoolBase = memoryManager.alloc(callbackStubPoolSize, "CALLBACK_STUB");
-            spinLoopAddress = memoryManager.alloc(spinLoopSize, "SPIN_LOOP");
+            callbackStubPoolBase = memoryManager.alloc(callbackStubPoolSize, "CALLBACK_STUB", "rx");
+            spinLoopAddress = memoryManager.alloc(spinLoopSize, "SPIN_LOOP", "rx");
             thunkGeneratorBase = memoryManager.alloc(initialThunkGeneratorSize, "THUNK_CODE", "rx");
         }
 

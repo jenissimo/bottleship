@@ -567,7 +567,7 @@ export class PELoader {
             const size = Math.min(Math.max(section.virtualSize, section.rawSize), imageSize - section.virtualAddress);
             if (size > 0) {
                 const start = baseAddress + section.virtualAddress;
-                cpu.registerCodeRange(start, start + size);
+                cpu.registerCodeRange(start, start + size, Boolean(section.characteristics & 0x80000000));
             }
         }
         return cpu.registerPeImage?.(name, baseAddress, imageSize, originalFile);

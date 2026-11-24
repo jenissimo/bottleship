@@ -39,16 +39,19 @@ const coopCoepHeaders = {
 
 /** Package only the translator and i386 host ABI used by BottleShip's own HLE. */
 function wwtCpuAssets(): Plugin {
-  const files = ["wwt_wasm.wasm"];
+  const bundled = path.resolve(__dirname, "public/wwt-provider");
   return {
     name: "wwt-cpu-assets",
     apply: "build",
     buildStart() {
       if (!wwtOnly) return;
-      const root = process.env.BS_WWT_PROVIDER_DIR ?? path.resolve(__dirname, "public/wwt-provider");
-      for (const file of files) {
-        const source = path.join(root, file);
-        if (!fs.existsSync(source)) this.error(`Missing WWT CPU asset ${file} in ${root}. Set BS_WWT_PROVIDER_DIR to the built provider.`);
+      const files = [
+        path.join(bundled, "wwt_abi11.wasm"),
+        path.join(process.env.BS_WWT_PROVIDER_DIR ?? bundled, "wwt_wasm.wasm"),
+      ];
+      for (const source of files) {
+        const file = path.basename(source);
+        if (!fs.existsSync(source)) this.error(`Missing WWT CPU asset: ${source}`);
         this.emitFile({ type: "asset", fileName: "wwt-provider/" + file, source: fs.readFileSync(source) });
       }
     },

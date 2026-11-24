@@ -29,14 +29,21 @@ export class WwtEmulator {
     run(): void {
         if (this.running) return;
         this.running = true;
+        this.cpu.setClockRunning(true);
         this.idle = true;
         this.queueTick(0, ++this.tick_counter);
     }
 
     stop(): Promise<void> {
         this.running = false;
+        this.cpu.setClockRunning(false);
         if (!this.idle) this.cpu.requestYield();
         return this.cpu.flushPeProfile() ?? Promise.resolve();
+    }
+
+    dispose(): void {
+        void this.stop();
+        this.cpu.dispose();
     }
 
     restart(): void {

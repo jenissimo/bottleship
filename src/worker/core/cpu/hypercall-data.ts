@@ -1324,7 +1324,13 @@ export class HypercallDataManager {
         // (observed: vtActive=false). Then GetTickCount/QPC/timeGetTime — and now RDTSC, which reads
         // the SAME HYPERCALL_PAGE base — all fell back to raw performance.now(). enableVirtualTime()
         // is idempotent (guards on virtualTimeActive), so calling it unconditionally up-front is safe.
-        TimeService.getInstance().enableVirtualTime();
+        const machine = this.cpu?.machine;
+        if (machine?.wallClock) {
+            TimeService.getInstance().useWallTime();
+            machine.refreshWallTimers = () => this.refreshTimeAfterThunk(this.cpu);
+        } else {
+            TimeService.getInstance().enableVirtualTime();
+        }
 
         this.refreshViews();
         if (!this.view) {

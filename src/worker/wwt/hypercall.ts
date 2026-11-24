@@ -57,7 +57,21 @@ export async function installWwtHypercall(
     wasm.__stack_pointer.value = stackBottom + STACK_SIZE;
     const storeMap = machine.storeMap;
     const page = new Uint8Array(machine.memory.buffer, pageAddress, PAGE_SIZE);
-    const dispatch = (id: number) => wasm.dispatch(pageAddress, storeMap, cpuStateBase, id) !== 0;
+    const clock = machine.wallClock;
+    let publishedTimerTick = -1;
+    const dispatch = (id: number) => {
+        if (clock && id > 0 && id < 0x10000) {
+            const handler = page[id < 4096 ? 0x100 + id : 0x4000 + id - 4096];
+            if (handler >= 1 && handler <= 3) {
+                const tick = clock.now();
+                if (tick !== publishedTimerTick) {
+                    machine.refreshWallTimers?.();
+                    publishedTimerTick = tick;
+                }
+            }
+        }
+        return wasm.dispatch(pageAddress, storeMap, cpuStateBase, id) !== 0;
+    };
     const supported = Uint8Array.from({ length: 256 }, (_unused, id) => wasm.supports_handler(id));
     const { GPR, RETIRED_INSNS, SIZE } = machine.abi?.cpu ?? {};
     let directInteger: WwtHypercall["directInteger"];

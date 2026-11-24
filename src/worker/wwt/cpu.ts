@@ -10,6 +10,8 @@ import { sha256Hex } from "../savestate/chunk-store";
 import { installWwtHypercall, type WwtHypercall } from "./hypercall";
 import { WwtMmio } from "./mmio";
 import { TimeService } from "../runtime/time";
+import type { WwtMode } from "./mode";
+import { WWT_WALL_QUANTUM_MS } from "./wall-clock";
 
 const PAGE = 0x1000;
 const ARITHMETIC_FLAGS = 0x8d5;
@@ -45,8 +47,13 @@ class WwtIo {
 
     mmap_register(...args: Parameters<WwtMmio["register"]>): () => void {
         const release = this.mmio.register(...args);
-        this.enableMmio();
-        return release;
+        try {
+            this.enableMmio();
+            return release;
+        } catch (error) {
+            release();
+            throw error;
+        }
     }
 
     register_write(port: number, device: unknown, write8?: WritePort, write16?: WritePort, write32?: WritePort): void {
@@ -62,6 +69,7 @@ interface WwtCpuOptions {
     providerBase?: string;
     memorySize: number;
     directHypercall?: boolean;
+    mode?: WwtMode;
     flatRam?: boolean;
 }
 
@@ -79,13 +87,18 @@ export async function createWwtCpu(options: WwtCpuOptions): Promise<WwtCpu> {
     }
     // BottleShip implements host thunks in its own PE address space. Passing the
     // real RAM limit lets the compiler specialize bounds and lookup-table addresses.
-    const machine = await loadWwtProvider(providerBase, memorySize, options.flatRam);
-    const cpuStateBase = machine.nativeAlloc(PAGE, PAGE);
-    const hypercall = await installWwtHypercall(machine, memorySize, cpuStateBase);
-    const portable = directHypercall ? hypercall.directInteger : undefined;
-    machine.natives.hle_out32 = portable?.dispatch ?? (() => 0);
-    machine.natives.hle_out32_config = portable?.configAddress ?? 0;
-    return new WwtCpu(machine, memorySize, hypercall, cpuStateBase);
+    const machine = await loadWwtProvider(providerBase, memorySize, options.mode ?? options.flatRam);
+    try {
+        const cpuStateBase = machine.nativeAlloc(PAGE, PAGE);
+        const hypercall = await installWwtHypercall(machine, memorySize, cpuStateBase);
+        const portable = directHypercall ? hypercall.directInteger : undefined;
+        machine.natives.hle_out32 = portable?.dispatch ?? (() => 0);
+        machine.natives.hle_out32_config = portable?.configAddress ?? 0;
+        return new WwtCpu(machine, memorySize, hypercall, cpuStateBase);
+    } catch (error) {
+        machine.dispose?.();
+        throw error;
+    }
 }
 
 export class WwtCpu {
@@ -142,7 +155,7 @@ export class WwtCpu {
     private readonly pageTlb: Uint32Array;
     private managedPageDirectory = 0;
     private profileRecorder?: PeProfileRecorder;
-    private readonly moduleRanges: Array<{ start: number; end: number }> = [];
+    private readonly moduleRanges: Array<{ start: number; end: number; writable: boolean }> = [];
     private readonly pageLimit: number;
     private cpu: number;
     private sliceDeadline = 0;
@@ -219,6 +232,10 @@ export class WwtCpu {
             wasm_table: machine.table,
             exports: {
                 memory: this.wasm_memory,
+                ...(machine.wallClock && machine.setParkExit ? {
+                    set_wwt_park_exit: (address: number, ownsPark: (pc: number) => boolean) =>
+                        machine.setParkExit!(address, ownsPark, (cpu, eip) => this.publishGuestState(cpu, eip)),
+                } : {}),
                 get_cycle_budget_ptr: () => budgetAddress,
                 full_clear_tlb: () => this.invalidatePaging(),
                 get_relaxed_fpu: () => 1,
@@ -249,6 +266,52 @@ export class WwtCpu {
     }
 
     private peAotGeneration = 0;
+    private wallDeadline = 0;
+    private timerSliceMs = 0;
+    private readCodePermission?: (address: number) => boolean;
+    private readonly codeWriteOverrides = new Map<number, boolean>();
+
+    get wallClockQuantumMs(): number | undefined {
+        return this.machine.wallClock ? WWT_WALL_QUANTUM_MS : undefined;
+    }
+
+    setTimerSliceMs(ms: number): void { this.timerSliceMs = ms; }
+
+    setClockRunning(running: boolean): void { this.machine.wallClock?.setRunning(running); }
+    dispose(): void { this.machine.dispose?.(); }
+
+    setCodePermissionReader(canWrite: (address: number) => boolean): void {
+        this.readCodePermission = canWrite;
+        this.machine.canWriteCode = address => this.canWriteCode(address);
+    }
+
+    updateCodePermissions(base: number, size: number): void {
+        if (!this.machine.wallClock || !this.readCodePermission || size <= 0) return;
+        const first = base >>> 12;
+        const end = Math.min(this.pageLimit, Math.ceil((base + size) / PAGE));
+        // The Windows loader's allocation record normally covers the whole image.
+        // Once VirtualProtect changes an executable page, use its explicit protection.
+        for (const range of this.moduleRanges) {
+            const from = Math.max(first, range.start >>> 12);
+            const to = Math.min(end, Math.ceil(range.end / PAGE));
+            for (let page = from; page < to; page++) {
+                this.codeWriteOverrides.set(page, this.readCodePermission(page * PAGE));
+            }
+        }
+        if (this.machine.updateCodePermissions?.(first, end) && this.running) this.requestYield();
+    }
+
+    private canWriteCode(address: number): boolean {
+        const overridden = this.codeWriteOverrides.get(address >>> 12);
+        if (overridden !== undefined) return overridden;
+        let executable = false;
+        for (const range of this.moduleRanges) {
+            if (range.start >= address + PAGE || address >= range.end) continue;
+            if (range.writable) return true;
+            executable = true;
+        }
+        return executable ? false : (this.readCodePermission?.(address) ?? true);
+    }
 
     reset(): void {
         this.peAotGeneration++;
@@ -264,6 +327,9 @@ export class WwtCpu {
         this.fpu_stack_empty[0] = 0xff;
         this.cycleBudget[0] = DEFAULT_SLICE_BUDGET;
         this.moduleRanges.length = 0;
+        this.codeWriteOverrides.clear();
+        this.timerSliceMs = 0;
+        this.machine.wallClock?.reset();
         this.invalidateCode(0, this.mem8.length);
         this.machine.freeCpu(this.cpu);
         this.cpu = this.machine.newCpu();
@@ -389,13 +455,24 @@ export class WwtCpu {
     main_loop(): number {
         if (this.running || this.in_hlt[0] || this.cycleBudget[0] === 0) return 0;
         this.yieldRequested = false;
-        this.sliceDeadline = performance.now() + SLICE_MS;
+        const clock = this.machine.wallClock;
+        if (clock) {
+            clock.setRunning(true);
+            const duration = this.timerSliceMs > 0 ? Math.min(this.timerSliceMs, WWT_WALL_QUANTUM_MS) : WWT_WALL_QUANTUM_MS;
+            const deadline = clock.arm(duration);
+            if (deadline === undefined) return 1;
+            this.wallDeadline = deadline;
+        } else {
+            this.sliceDeadline = performance.now() + SLICE_MS;
+        }
         this.running = true;
         try {
             // RDTSC uses the same virtual clock as QPC and GetTickCount.
-            this.words[this.machine.tickAddr >>> 2] = TimeService.getInstance().nowMs();
+            if (!clock) this.words[this.machine.tickAddr >>> 2] = TimeService.getInstance().nowMs();
             const A = this.machine.abi.cpu;
-            if (A.RETIRED_INSNS !== undefined) {
+            if (clock) {
+                this.setCpuWord(this.cpu, A.PREEMPT_AT, this.wallDeadline);
+            } else if (A.RETIRED_INSNS !== undefined) {
                 const deadline = (this.cpuWord(this.cpu, A.RETIRED_INSNS) + this.cycleBudget[0]) >>> 0;
                 this.setCpuWord(this.cpu, A.PREEMPT_AT, deadline);
             } else {
@@ -419,9 +496,10 @@ export class WwtCpu {
 
     async registerPeImage(name: string, base: number, size: number, file: Uint8Array): Promise<void> {
         const options = globalThis as { __wwtPeAot?: boolean | "learn" | "auto" | string[]; __wwtPeAotLinkage?: "page-local" | "full" };
-        const selector = options.__wwtPeAot === undefined && typeof globalThis.navigator?.storage?.getDirectory === "function"
-            ? "auto"
-            : options.__wwtPeAot;
+        const fast = this.machine.wallClock !== undefined;
+        const defaultFast = fast && options.__wwtPeAot === undefined;
+        const hasOpfs = typeof globalThis.navigator?.storage?.getDirectory === "function";
+        const selector = options.__wwtPeAot ?? (fast ? true : hasOpfs ? "auto" : undefined);
         if (selector !== true && selector !== "learn" && selector !== "auto" && (!Array.isArray(selector) || !selector.includes(name.toLowerCase()))) return;
         if (base < 0 || size <= 0 || base + size > this.mem8.length) return;
         const ranges = this.moduleRanges.filter(range => range.start >= base && range.end <= base + size);
@@ -430,17 +508,23 @@ export class WwtCpu {
         try {
             const generation = this.peAotGeneration;
             const digest = await sha256Hex(file);
-            const profile = selector === "learn" ? [] : await peProfileEntries(digest, base, size);
+            const executable = (pc: number) => ranges.some(range => range.start <= pc && pc < range.end);
+            const saved = selector === "learn" ? [] : await peProfileEntries(digest, base, size);
+            // Keep the canonical RVA order and leave obsolete, non-executable entries
+            // out of the cache key for the current image.
+            const profile = defaultFast ? saved.filter(executable) : saved;
             if (this.peAotGeneration !== generation) return;
-            if (selector === "learn" || (selector === "auto" && !profile.length)) {
+            const learnOnly = selector === "learn" || (selector === "auto" && !profile.length);
+            if (!learnOnly && fast && options.__wwtPeAotLinkage === "page-local") return;
+            if (learnOnly || (defaultFast && hasOpfs)) {
                 this.profileRecorder ??= new PeProfileRecorder();
                 this.profileRecorder.watch(digest, base, ranges);
-                return;
             }
+            if (learnOnly) return;
             const packed = packMappedPe(this.mem8.subarray(base, base + size), file, base);
-            const linkage = options.__wwtPeAotLinkage ?? (selector === "auto" ? "full" : "page-local");
-            const imageBounds = linkage === "full" ? { base, end: base + size } : undefined;
-            await this.machine.loadPeAot(packed, name, pc => ranges.some(range => range.start <= pc && pc < range.end), () => {
+            const linkage = fast ? "full" : (options.__wwtPeAotLinkage ?? (selector === "auto" ? "full" : "page-local"));
+            const imageBounds = linkage === "full" ? { base, end: base + size, executableRanges: ranges } : undefined;
+            await this.machine.loadPeAot(packed, name, executable, () => {
                 if (this.peAotGeneration !== generation) return false;
                 const fresh = packMappedPe(this.mem8.subarray(base, base + size), file, base);
                 return fresh.length === packed.length && fresh.every((byte, index) => byte === packed[index]);
@@ -450,8 +534,12 @@ export class WwtCpu {
         }
     }
 
-    registerCodeRange(start: number, end: number): void {
-        if (start >= 0 && end <= this.mem8.length && start < end) this.moduleRanges.push({ start, end });
+    registerCodeRange(start: number, end: number, writable = true): void {
+        if (start < 0 || end > this.mem8.length || start >= end) return;
+        if (this.machine.wallClock) {
+            for (let page = start >>> 12; page < Math.ceil(end / PAGE); page++) this.codeWriteOverrides.delete(page);
+        }
+        this.moduleRanges.push({ start, end, writable });
     }
 
     private codeEnd(address: number): number {
@@ -460,7 +548,7 @@ export class WwtCpu {
             if (range.start <= address && address < range.end) return range.end;
         }
         // Keep default translation local to a page, with room to decode a straddling instruction.
-        return Math.min((address & ~(PAGE - 1)) + PAGE + 14, this.mem8.length);
+        return this.machine.wallClock ? this.mem8.length : Math.min((address & ~(PAGE - 1)) + PAGE + 14, this.mem8.length);
     }
 
     invalidateCode(start: number, end: number): void {
@@ -548,11 +636,18 @@ export class WwtCpu {
     }
 
     private shouldYield(): boolean {
-        return this.yieldRequested || this.cycleBudget[0] === 0 || performance.now() >= this.sliceDeadline;
+        if (this.yieldRequested || this.cycleBudget[0] === 0) return true;
+        const clock = this.machine.wallClock;
+        return clock ? clock.now() >= this.wallDeadline : performance.now() >= this.sliceDeadline;
     }
 
     private preempt(cpu: number, eip: number): boolean {
         const A = this.machine.abi.cpu;
+        if (this.machine.wallClock) {
+            if (!this.shouldYield()) return false;
+            this.publishGuestState(cpu, eip);
+            return true;
+        }
         // A provider without instruction budgets calls here at backward edges, with
         // PREEMPT_AT set to the frozen tick. Count those observed retirements only.
         if (A.RETIRED_INSNS === undefined) {

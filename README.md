@@ -64,6 +64,8 @@ flowchart LR
   copy-on-write overlay).
 - Hot guest/host calls stay entirely inside WASM for speed.
 
+Games use the original WebWindows ABI 11 compiler by default. BottleShip supplies Win32 and DirectX in both CPU modes. If a game needs page permissions or external memory-mapped I/O, set `"wwtMode": "protected"` in the `emulator` object of its WGB manifest. To try either mode without repacking, add `wwtMode=protected` or `wwtMode=fast` to the game URL. The URL overrides the bundle for that launch.
+
 [Read the architecture guide →](docs/architecture.md)
 
 ## Run locally

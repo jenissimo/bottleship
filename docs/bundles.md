@@ -132,6 +132,14 @@ bun tools/wgb.ts replace game.wgb path/in/zip local-file
 bun tools/wgb.ts patch-manifest game.wgb …  # (alias: pm)
 ```
 
+To test a game in the protected CPU mode, open its usual game URL with `wwtMode=protected` in the query string. If that resolves a compatibility issue, set the choice in the game’s store-only bundle before publishing or compressing it. The command updates the specified file in place.
+
+```sh
+bun tools/wgb.ts patch-manifest game.wgb emulator.wwtMode protected
+```
+
+An omitted `emulator.wwtMode` uses the fast WebWindows ABI 11 compiler. `wwtMode=fast` in the URL overrides a bundle’s protected setting for a comparison run.
+
 ## Bringing your own game
 
 `manifest.emulator.graphicsAdapter` selects the virtual adapter identity exposed by

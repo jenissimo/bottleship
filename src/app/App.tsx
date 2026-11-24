@@ -1231,8 +1231,12 @@ export default function App() {
       ));
 
       const cpuQuery = new URLSearchParams(window.location.search);
-      if (cpuQuery.get("engine") === "wwt-hle" || cpuQuery.has("wwtMemory")) {
-        globalWorker.postMessage({ type: "set_cpu_backend", backend: "wwt", memory: cpuQuery.get("wwtMemory") });
+      if (cpuQuery.get("engine") === "wwt-hle" || cpuQuery.has("wwtMode") ||
+          cpuQuery.has("wwtMemory") || cpuQuery.has("wwtLinkage")) {
+        globalWorker.postMessage({
+          type: "set_cpu_backend", backend: "wwt", mode: cpuQuery.get("wwtMode"),
+          memory: cpuQuery.get("wwtMemory"), linkage: cpuQuery.get("wwtLinkage"),
+        });
       }
 
       // Expose worker to console for debugging

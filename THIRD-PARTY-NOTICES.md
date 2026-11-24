@@ -9,13 +9,14 @@ upstream projects referenced here.
 
 ## Emulation core
 
-### WWT i386 compiler (`public/wwt-provider/wwt_wasm.wasm`)
+### WWT i386 compilers (`public/wwt-provider`)
 
 The CPU compiler comes from the `wwt` and `wwt-wasm` crates in
 [WebWindows](https://github.com/Glavin001/WebWindows/tree/5c845c1b45659cfb5ed00a0da5d3870025c022f3).
 Both crates inherit the workspace's MIT OR Apache-2.0 license. The packaged compiler
-uses the Apache-2.0 option. BottleShip modifications are in
-`tools/build-wwt-cpu/bottleship.patch`. The binary's license notices ship in
+uses the Apache-2.0 option. `wwt_abi11.wasm` is the original upstream compiler.
+`wwt_wasm.wasm` is the protected compiler with BottleShip's changes in
+`tools/build-wwt-cpu/bottleship.patch`. License notices for both binaries ship in
 `public/wwt-compiler-NOTICES.txt`. BottleShip supplies the worker and HLE.
 
 ### v86 (legacy comparison build, `vendor/v86`, `public/v86.wasm` and `libv86.mjs`)

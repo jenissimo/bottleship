@@ -6,6 +6,24 @@ const FLAG_PAGE_LOCAL_PE = 1 << 7;
 const FLAG_INLINE_PAGE_WALK = 1 << 8;
 const FLAG_LINKED_PE = 1 << 9;
 const FLAG_SMC_DEOPT = 1 << 10;
+const FLAG_MEM_TRAPS = 1 << 4;
+
+// @transient(browser WebAssembly trap stack capability, independent of the guest)
+let supportsTrapOffsets: boolean | undefined;
+function canMapWasmTrap(): boolean {
+    if (supportsTrapOffsets !== undefined) return supportsTrapOffsets;
+    // (module (func (export "f") unreachable))
+    const probe = Uint8Array.of(0, 97, 115, 109, 1, 0, 0, 0,
+        1, 4, 1, 96, 0, 0, 3, 2, 1, 0, 7, 5, 1, 1, 102, 0, 0, 10, 5, 1, 3, 0, 0, 11);
+    const f = new WebAssembly.Instance(new WebAssembly.Module(probe)).exports.f as () => void;
+    try {
+        f();
+    } catch (error) {
+        return supportsTrapOffsets = error instanceof WebAssembly.RuntimeError &&
+            /wasm-function\[\d+\]:0x[0-9a-f]+/i.test(error.stack ?? "");
+    }
+    return supportsTrapOffsets = false;
+}
 
 interface TranslatorExports {
     memory: WebAssembly.Memory;
@@ -22,9 +40,11 @@ interface TranslatorExports {
 /** Owns the allocations returned by the CPU compiler's C API. Its heap is separate from guest RAM. */
 export class WwtCompiler {
     readonly abi: WwtAbi;
+    readonly memTraps: boolean;
 
     constructor(private readonly wasm: TranslatorExports, readonly flatRam = false, private readonly inlinePageWalk = false, readonly cacheId = "") {
         this.abi = JSON.parse(new TextDecoder().decode(this.take(wasm.wwt_abi())));
+        this.memTraps = this.abi.version === 11 && canMapWasmTrap();
     }
 
     static async load(url: string, flatRam = false, inlinePageWalk = false): Promise<WwtCompiler> {
@@ -43,6 +63,10 @@ export class WwtCompiler {
 
     flags(guestLimit: number, guestMmio = false): number {
         const fixedLimit = guestLimit % (1 << 20) === 0 ? (guestLimit / (1 << 20)) << 16 : 0;
+        if (this.abi.version === 11) {
+            if (guestMmio) throw new Error("WWT ABI11 has no MMIO lowering. Use protected WWT.");
+            return fixedLimit | (this.memTraps ? FLAG_MEM_TRAPS : 0);
+        }
         return fixedLimit | (guestMmio ? FLAG_GUEST_MMIO : this.flatRam ? FLAG_FLAT_RAM : 0)
             | (this.inlinePageWalk ? FLAG_INLINE_PAGE_WALK : 0)
             | (this.abi.fault.SMC_RESUME !== undefined ? FLAG_SMC_DEOPT : 0);
@@ -76,7 +100,7 @@ export class WwtCompiler {
     translatePe(file: Uint8Array, profile: number[], guestLimit: number, guestMmio: boolean, pageLocal = true): Uint8Array<ArrayBuffer> {
         const ex = this.wasm;
         const policy = ex.wwt_pe_aot_policy_version?.() ?? 0;
-        if (policy < (pageLocal ? 1 : 2) || !pageLocal && this.abi.fault.SMC_RESUME === undefined) {
+        if (this.abi.version !== 11 && (policy < (pageLocal ? 1 : 2) || !pageLocal && this.abi.fault.SMC_RESUME === undefined)) {
             throw new Error("WWT compiler lacks the requested PE AOT policy");
         }
         const input = ex.wwt_alloc(file.length);
@@ -86,7 +110,8 @@ export class WwtCompiler {
             new Uint8Array(ex.memory.buffer, input, file.length).set(file);
             const view = new DataView(ex.memory.buffer, seeds, profileBytes);
             profile.forEach((value, index) => view.setBigUint64(index * 8, BigInt(value), true));
-            const flags = this.flags(guestLimit, guestMmio) | (pageLocal ? FLAG_PAGE_LOCAL_PE : FLAG_LINKED_PE);
+            const flags = this.flags(guestLimit, guestMmio) |
+                (this.abi.version === 11 ? 0 : pageLocal ? FLAG_PAGE_LOCAL_PE : FLAG_LINKED_PE);
             const wasm = this.take(ex.wwt_translate_pe(input, file.length, seeds, profile.length, 1, flags));
             if (wasm.length === 0) throw new Error("WWT could not translate the linked PE");
             return wasm;
