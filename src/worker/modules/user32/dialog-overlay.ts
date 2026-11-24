@@ -35,6 +35,7 @@ import {
     virtualScreenHeight,
 } from './shared-state';
 import { getComboDropdownRect } from './controls';
+import { presentingDeviceWindow } from '../../runtime/windowing/fullscreen-window';
 import { invokeOverlayRepairRepaint } from './control-interaction';
 import { paintTraceEnabled, logOverlayMutation } from './paint-trace';
 
@@ -129,7 +130,7 @@ export function noteDialogOverlayCandidate(win: WindowInfo | undefined): void {
     // #32770 dialogs, plus plain windows hosting JS system controls (a launcher /
     // options window built via CreateWindowEx("BUTTON"...) is real UI, not a stray
     // helper window) — both must composite over a game-owned screen.
-    const form = isOverlayFormCandidate(win) && floatsOverGameWindow(win);
+    const form = isFloatingOverlayForm(win);
     if (win.nativeClassName !== '#32770' && !hasSystemControlChildren(win) && !form) return;
     if (isScreenOwnerWindow(win.handle)) return;
     if (!isGameScreenOwned()) return;
@@ -152,6 +153,20 @@ export function isOverlayFormCandidate(win: WindowInfo): boolean {
     if (win.nativeClassName === '#32770' || (win.style & WS_CHILD) !== 0) return false;
     return win.width > 0 && win.height > 0
         && (win.width < virtualScreenWidth() || win.height < virtualScreenHeight());
+}
+
+export function isFloatingOverlayForm(win: WindowInfo): boolean {
+    return isOverlayFormCandidate(win) && floatsOverGameWindow(win) && !ownsGameSurface(win.handle);
+}
+
+export function ownsGameSurface(hwnd: number): boolean {
+    if (isScreenOwnerWindow(hwnd)) return true;
+    let cur = presentingDeviceWindow();
+    for (let depth = 0; cur && depth < 32; depth++) {
+        if (cur === hwnd) return true;
+        cur = windows.get(cur)?.parent ?? 0;
+    }
+    return false;
 }
 
 export function floatsOverGameWindow(win: WindowInfo): boolean {

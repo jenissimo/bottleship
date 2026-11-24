@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { WindowManager } from '../../src/worker/runtime/windowing/window-manager';
-import { isOverlayFormCandidate, floatsOverGameWindow } from '../../src/worker/modules/user32/dialog-overlay';
+import { isOverlayFormCandidate, floatsOverGameWindow, ownsGameSurface, isFloatingOverlayForm } from '../../src/worker/modules/user32/dialog-overlay';
 import { windows } from '../../src/worker/modules/user32/shared-state';
+import { publishPresentedClient } from '../../src/worker/runtime/windowing/fullscreen-window';
 import type { WindowInfo } from '../../src/worker/modules/user32/shared-state';
 
 const WS_POPUP = 0x80000000;
@@ -50,6 +51,39 @@ describe('floatsOverGameWindow', () => {
         windows.set(msg.handle, msg);
         expect(floatsOverGameWindow(msg)).toBe(true);
         expect(floatsOverGameWindow(game)).toBe(false);
+        windows.clear();
+    });
+});
+
+describe('ownsGameSurface', () => {
+    test('the window a windowed device presents into, and its ancestors, own the game surface', () => {
+        windows.clear();
+        const top = { ...info(), handle: 0x10030, nativeClassName: 'TRunnerForm', width: 640, height: 480 } as WindowInfo;
+        const view = { ...info(), handle: 0x10031, nativeClassName: 'TPanel', style: WS_CHILD | WS_VISIBLE, parent: 0x10030, width: 640, height: 480 } as WindowInfo;
+        windows.set(top.handle, top);
+        windows.set(view.handle, view);
+        publishPresentedClient(view.handle);
+        expect(ownsGameSurface(view.handle)).toBe(true);
+        expect(ownsGameSurface(top.handle)).toBe(true);
+        expect(ownsGameSurface(0x10099)).toBe(false);
+        publishPresentedClient(0);
+        windows.clear();
+    });
+});
+
+describe('only top-level game window smaller than the screen', () => {
+    test('is never made an overlay form', () => {
+        windows.clear();
+        const game = { ...info(), handle: 0x10040, nativeClassName: 'TRunnerForm', width: 640, height: 480 } as WindowInfo;
+        windows.set(game.handle, game);
+        expect(isOverlayFormCandidate(game)).toBe(true);
+        expect(isFloatingOverlayForm(game)).toBe(false);
+        const msg = { ...info(), handle: 0x10041, nativeClassName: 'TMessageForm', width: 320, height: 127 } as WindowInfo;
+        windows.set(msg.handle, msg);
+        expect(isFloatingOverlayForm(msg)).toBe(true);
+        publishPresentedClient(msg.handle);
+        expect(isFloatingOverlayForm(msg)).toBe(false);
+        publishPresentedClient(0);
         windows.clear();
     });
 });
