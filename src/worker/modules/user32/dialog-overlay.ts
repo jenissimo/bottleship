@@ -41,6 +41,7 @@ import { paintTraceEnabled, logOverlayMutation } from './paint-trace';
 const WS_CHILD = 0x40000000;
 const WS_CAPTION = 0x00c00000;
 
+// @transient(overlay-form marks, re-derived when the form is shown again)
 const overlayForms = new Set<number>();
 
 function getDDrawContext(): any {

@@ -100,6 +100,7 @@ let clipRect: PointerClipRect | null = null;
 // devices, and the last one to Unacquire is what releases the claim.
 const exclusiveMouseOwners = new Set<object>();
 
+// @transient(host pointer override, re-derived when an overlay form is shown)
 let overlayFormLive = false;
 
 
