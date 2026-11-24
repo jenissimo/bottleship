@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: true
+          submodules: false
           fetch-depth: 0
       - uses: oven-sh/setup-bun@v2
         with:

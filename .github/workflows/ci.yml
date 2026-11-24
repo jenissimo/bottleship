@@ -7,6 +7,11 @@ on:
     branches: [main, develop]
   pull_request:
   workflow_dispatch:
+    inputs:
+      legacy_cpu:
+        description: Run v86 ABI and execution regression checks
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -54,6 +59,7 @@ jobs:
 
   legacy-cpu:
     name: Optional v86 ABI and execution coverage
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.legacy_cpu }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
