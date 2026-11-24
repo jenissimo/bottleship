@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { BottleShipMachine } from "../../src/worker/wwt/machine";
 import { resolveWwtMode } from "../../src/worker/wwt/mode";
-import { WwtCompiler } from "../../src/worker/wwt/translator";
+import { WwtCompiler, WwtTranslationStackOverflow } from "../../src/worker/wwt/translator";
 import { WwtWallClock } from "../../src/worker/wwt/wall-clock";
 
 const GUEST_LIMIT = 4 << 20;
@@ -73,6 +73,47 @@ describe("stock ABI11 in the BottleShip runtime", () => {
             expect(state.getUint32(cpu + GPR, true)).toBe(42);
             expect(observed).toHaveLength(1);
             release();
+        } finally {
+            machine.dispose();
+        }
+    });
+
+    test("an oversized demand CFG retries with bounded input and preserves installed entries", async () => {
+        const { compiler, machine } = await fastMachine();
+        try {
+            const cpu = machine.newCpu();
+            const { GPR, PREEMPT_AT } = machine.abi.cpu;
+            const bytes = new Uint8Array(machine.memory.buffer);
+            const state = new DataView(bytes.buffer);
+            const near = PARK + 12;
+            const far = PARK + 0x1040;
+            const known = [near, far];
+            for (const pc of known) {
+                bytes[pc] = 0xc3; // ret
+                machine.loadModuleSync(compiler.translate(bytes.subarray(pc, pc + 1), pc, [], GUEST_LIMIT), "known");
+            }
+            const slots = known.map(pc => machine.lookup(pc));
+            const attempts: Array<{ length: number; knownEntries: number[] }> = [];
+            const translate = compiler.translate.bind(compiler);
+            compiler.translate = (source, address, knownEntries, ...args) => {
+                attempts.push({ length: source.length, knownEntries });
+                if (source.length > 15) throw new WwtTranslationStackOverflow("Maximum call stack size exceeded");
+                return translate(source, address, knownEntries, ...args);
+            };
+            machine.codeEnd = () => PARK + 0x2000;
+            bytes.set([0xb8, 42, 0, 0, 0, 0xc3], PARK); // mov eax,42; ret
+            state.setUint32(cpu + GPR + 16, STACK, true);
+            state.setUint32(cpu + PREEMPT_AT, 0xffffffff, true);
+            state.setUint32(STACK, machine.stopAddress, true);
+
+            expect(machine.run(cpu, PARK)).toBe(machine.stopAddress);
+            expect(state.getUint32(cpu + GPR, true)).toBe(42);
+            expect(attempts).toEqual([
+                { length: 0x2000, knownEntries: known },
+                { length: 0x1000, knownEntries: [near] },
+                { length: 15, knownEntries: [near] },
+            ]);
+            expect(known.map(pc => machine.lookup(pc))).toEqual(slots);
         } finally {
             machine.dispose();
         }

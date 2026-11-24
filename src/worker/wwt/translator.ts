@@ -37,13 +37,18 @@ interface TranslatorExports {
         known: number, knownCount: number, optLevel: number, flags: number): number;
 }
 
+export class WwtTranslationStackOverflow extends Error {}
+
 /** Owns the allocations returned by the CPU compiler's C API. Its heap is separate from guest RAM. */
 export class WwtCompiler {
     readonly abi: WwtAbi;
     readonly memTraps: boolean;
+    private wasm: TranslatorExports;
 
-    constructor(private readonly wasm: TranslatorExports, readonly flatRam = false, private readonly inlinePageWalk = false, readonly cacheId = "") {
-        this.abi = JSON.parse(new TextDecoder().decode(this.take(wasm.wwt_abi())));
+    private constructor(private readonly module: WebAssembly.Module, readonly flatRam: boolean,
+        private readonly inlinePageWalk: boolean, readonly cacheId: string) {
+        this.wasm = this.instantiate();
+        this.abi = JSON.parse(new TextDecoder().decode(this.take(this.wasm.wwt_abi())));
         this.memTraps = this.abi.version === 11 && canMapWasmTrap();
     }
 
@@ -54,11 +59,11 @@ export class WwtCompiler {
     }
 
     static async fromBytes(bytes: BufferSource, flatRam = false, inlinePageWalk = false): Promise<WwtCompiler> {
-        const [{instance}, digest] = await Promise.all([
-            WebAssembly.instantiate(bytes), crypto.subtle.digest("SHA-256", bytes),
+        const [module, digest] = await Promise.all([
+            WebAssembly.compile(bytes), crypto.subtle.digest("SHA-256", bytes),
         ]);
         const cacheId = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2,"0")).join("");
-        return new WwtCompiler(instance.exports as unknown as TranslatorExports, flatRam, inlinePageWalk, cacheId);
+        return new WwtCompiler(module, flatRam, inlinePageWalk, cacheId);
     }
 
     flags(guestLimit: number, guestMmio = false): number {
@@ -87,13 +92,15 @@ export class WwtCompiler {
             args.setBigUint64(0, BigInt(address), true);
             known.forEach((value, index) => args.setBigUint64((index + 1) * 8, BigInt(value), true));
             const flags = this.flags(guestLimit, guestMmio);
-            const output = this.take(ex.wwt_translate(code, memory.length, BigInt(address), entries, 1,
+            const output = this.invokeTranslation(() => ex.wwt_translate(code, memory.length, BigInt(address), entries, 1,
                 entries + 8, known.length, optLevel, flags));
             if (output.length === 0) throw new Error(`WWT translation failed at 0x${address.toString(16)}`);
             return output;
         } finally {
-            ex.wwt_free(entries, count * 8);
-            ex.wwt_free(code, memory.length);
+            if (ex === this.wasm) {
+                ex.wwt_free(entries, count * 8);
+                ex.wwt_free(code, memory.length);
+            }
         }
     }
 
@@ -112,13 +119,35 @@ export class WwtCompiler {
             profile.forEach((value, index) => view.setBigUint64(index * 8, BigInt(value), true));
             const flags = this.flags(guestLimit, guestMmio) |
                 (this.abi.version === 11 ? 0 : pageLocal ? FLAG_PAGE_LOCAL_PE : FLAG_LINKED_PE);
-            const wasm = this.take(ex.wwt_translate_pe(input, file.length, seeds, profile.length, 1, flags));
+            const wasm = this.invokeTranslation(() => ex.wwt_translate_pe(input, file.length, seeds, profile.length, 1, flags));
             if (wasm.length === 0) throw new Error("WWT could not translate the linked PE");
             return wasm;
         } finally {
-            ex.wwt_free(seeds, profileBytes);
-            ex.wwt_free(input, file.length);
+            if (ex === this.wasm) {
+                ex.wwt_free(seeds, profileBytes);
+                ex.wwt_free(input, file.length);
+            }
         }
+    }
+
+    private instantiate(): TranslatorExports {
+        return new WebAssembly.Instance(this.module).exports as unknown as TranslatorExports;
+    }
+
+    private invokeTranslation(translate: () => number): Uint8Array<ArrayBuffer> {
+        let result: number;
+        try {
+            result = translate();
+        } catch (error) {
+            if (!(error instanceof Error) || !/^(Maximum call stack size exceeded\.?|too much recursion)$/i.test(error.message)) {
+                throw error;
+            }
+            // A Wasm stack overflow can leave the Rust stack pointer and heap
+            // in use by abandoned frames. Discard that instance before retrying.
+            this.wasm = this.instantiate();
+            throw new WwtTranslationStackOverflow(error.message, { cause: error });
+        }
+        return this.take(result);
     }
 
     private take(address: number): Uint8Array<ArrayBuffer> {

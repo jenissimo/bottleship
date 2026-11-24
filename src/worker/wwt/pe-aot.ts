@@ -15,8 +15,9 @@ function align(value: number, alignment: number): number {
 }
 
 export function packMappedPe(image: Uint8Array, originalFile: Uint8Array, imageBase: number): Uint8Array<ArrayBuffer> {
-    if (originalFile.length < 64 || originalFile.length > MAX_FILE_SIZE ||
-        image.length > MAX_FILE_SIZE || imageBase % 0x10000 !== 0 ||
+    // The original can contain a large overlay, such as game data. Only
+    // its headers and the mapped image contribute to the compiler input.
+    if (originalFile.length < 64 || image.length > MAX_FILE_SIZE || imageBase % 0x10000 !== 0 ||
         imageBase < 0x10000 || imageBase + image.length > 2 ** 32) {
         throw new Error("Unsupported AOT image size or address");
     }

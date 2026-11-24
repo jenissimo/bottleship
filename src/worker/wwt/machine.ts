@@ -1,11 +1,12 @@
 import type { WwtMachine, WwtModule, WwtPeImageBounds } from "./cpu-provider";
-import { WwtCompiler } from "./translator";
+import { WwtCompiler, WwtTranslationStackOverflow } from "./translator";
 import { getOrBuild } from "./pe-aot-cache";
 import { WwtWallClock } from "./wall-clock";
 import { trapAddress, WwtTrapMap } from "./traps";
 
 const PAGE = 4096;
 const PAGE_COUNT = 1 << 20;
+const MAX_INSTRUCTION_BYTES = 15;
 const TRANSLATION_WINDOW = 0x4000;
 const STORE_MAP_CODE = 1;
 const STORE_MAP_CODE_NEXT = 4;
@@ -331,9 +332,8 @@ export class BottleShipMachine implements WwtMachine {
             this.words[(cpu + this.abi.cpu.EIP) >>> 2] = this.resumeFault(cpu, this.abi.fault.ACCESS_VIOLATION_EXECUTE, address, address);
             return 1;
         }
-        const end = Math.min(address + this.regionWindow, this.codeEnd?.(address) ?? this.guestLimit, this.guestLimit);
-        const source = this.bytes.subarray(address, end);
-        const known: number[] = [];
+        let end = Math.min(address + this.regionWindow, this.codeEnd?.(address) ?? this.guestLimit, this.guestLimit);
+        let known: number[] = [];
         for (let page = address >>> 12; page <= (end - 1) >>> 12; page++) {
             const entries = this.entriesByPage.get(page);
             if (entries && this.l1At(page) !== this.zeroL2) for (const pc of entries) {
@@ -341,7 +341,22 @@ export class BottleShipMachine implements WwtMachine {
             }
         }
         const start = performance.now();
-        const wasm = this.compiler.translate(source, address, known, this.guestLimit, this.guestMmio, this.regionOpt);
+        let wasm: Uint8Array<ArrayBuffer>;
+        for (;;) {
+            try {
+                wasm = this.compiler.translate(this.bytes.subarray(address, end), address, known,
+                    this.guestLimit, this.guestMmio, this.regionOpt);
+                break;
+            } catch (error) {
+                if (!(error instanceof WwtTranslationStackOverflow)) throw error;
+                // Bound the compiler's recursive CFG walk. The shortest retry
+                // still has room to decode a complete x86 instruction.
+                const shorterEnd = address + (end - address > PAGE ? PAGE : MAX_INSTRUCTION_BYTES);
+                if (shorterEnd >= end) throw error;
+                end = shorterEnd;
+                known = known.filter(pc => pc < end);
+            }
+        }
         const built = performance.now();
         this.installCompiledModule(new WebAssembly.Module(wasm), address.toString(16),
             undefined, undefined, this.wallClock !== undefined);

@@ -247,6 +247,21 @@ function minimalPe(entry: number): Uint8Array {
     return file;
 }
 
+test("packs a small mapped PE even when the original has a large file overlay", () => {
+    const base = 0x90000;
+    const file = minimalPe(0x1000);
+    const originalWithOverlay = new Uint8Array((32 << 20) + 1);
+    originalWithOverlay.set(file);
+    originalWithOverlay[originalWithOverlay.length - 1] = 0xa5;
+    const image = new Uint8Array(0x3000);
+    image.set([0xb8, 42, 0, 0, 0, 0xc3], 0x1000); // mov eax,42; ret
+
+    const expected = packMappedPe(image, file, base);
+    const packed = packMappedPe(image, originalWithOverlay, base);
+    expect(packed).toEqual(expected);
+    expect(() => packMappedPe(originalWithOverlay, file, base)).toThrow("Unsupported AOT image size or address");
+});
+
 test.each(["default", "explicit auto", "off", "no OPFS", "fast default", "fast off"])("PE loading with %s policy preserves guest execution across resets", async (mode) => {
     const fast = mode.startsWith("fast ");
     const off = mode.endsWith("off");
