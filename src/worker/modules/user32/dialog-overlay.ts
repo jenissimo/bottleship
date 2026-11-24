@@ -129,7 +129,7 @@ export function noteDialogOverlayCandidate(win: WindowInfo | undefined): void {
     // #32770 dialogs, plus plain windows hosting JS system controls (a launcher /
     // options window built via CreateWindowEx("BUTTON"...) is real UI, not a stray
     // helper window) — both must composite over a game-owned screen.
-    const form = isOverlayFormCandidate(win);
+    const form = isOverlayFormCandidate(win) && floatsOverGameWindow(win);
     if (win.nativeClassName !== '#32770' && !hasSystemControlChildren(win) && !form) return;
     if (isScreenOwnerWindow(win.handle)) return;
     if (!isGameScreenOwned()) return;
@@ -152,6 +152,16 @@ export function isOverlayFormCandidate(win: WindowInfo): boolean {
     if (win.nativeClassName === '#32770' || (win.style & WS_CHILD) !== 0) return false;
     return win.width > 0 && win.height > 0
         && (win.width < virtualScreenWidth() || win.height < virtualScreenHeight());
+}
+
+export function floatsOverGameWindow(win: WindowInfo): boolean {
+    const area = win.width * win.height;
+    for (const other of windows.values()) {
+        if (other.handle === win.handle || !other.visible || other.pendingDestroy) continue;
+        if ((other.style & WS_CHILD) !== 0 || other.nativeClassName === '#32770' || overlayForms.has(other.handle)) continue;
+        if (other.width * other.height > area) return true;
+    }
+    return false;
 }
 
 export function isOverlayForm(hwnd: number): boolean {

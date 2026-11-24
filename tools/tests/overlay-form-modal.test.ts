@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { WindowManager } from '../../src/worker/runtime/windowing/window-manager';
-import { isOverlayFormCandidate } from '../../src/worker/modules/user32/dialog-overlay';
+import { isOverlayFormCandidate, floatsOverGameWindow } from '../../src/worker/modules/user32/dialog-overlay';
+import { windows } from '../../src/worker/modules/user32/shared-state';
 import type { WindowInfo } from '../../src/worker/modules/user32/shared-state';
 
 const WS_POPUP = 0x80000000;
@@ -28,6 +29,28 @@ describe('isOverlayFormCandidate', () => {
     });
     test('a screen-sized game window is not a form overlay', () => {
         expect(isOverlayFormCandidate({ ...info(), width: 100000, height: 100000 } as WindowInfo)).toBe(false);
+    });
+});
+
+describe('floatsOverGameWindow', () => {
+    test('the only visible game window is not lifted over its own 3D output', () => {
+        windows.clear();
+        const app = { ...info(), handle: 0x10001, nativeClassName: 'TApplication', width: 800, height: 600, visible: false } as WindowInfo;
+        const game = { ...info(), handle: 0x10018, nativeClassName: 'TRunnerForm', width: 640, height: 480 } as WindowInfo;
+        windows.set(app.handle, app);
+        windows.set(game.handle, game);
+        expect(floatsOverGameWindow(game)).toBe(false);
+        windows.clear();
+    });
+    test('a message form over a visible larger game window floats', () => {
+        windows.clear();
+        const game = { ...info(), handle: 0x10018, nativeClassName: 'TRunnerForm', width: 640, height: 480 } as WindowInfo;
+        const msg = { ...info(), handle: 0x10020, nativeClassName: 'TMessageForm', width: 320, height: 127 } as WindowInfo;
+        windows.set(game.handle, game);
+        windows.set(msg.handle, msg);
+        expect(floatsOverGameWindow(msg)).toBe(true);
+        expect(floatsOverGameWindow(game)).toBe(false);
+        windows.clear();
     });
 });
 
