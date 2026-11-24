@@ -31,8 +31,7 @@ import {
     isWindowUpdateLocked,
     hasSystemControlChildren,
     isEffectivelyVisible,
-    virtualScreenWidth,
-    virtualScreenHeight,
+    getVirtualScreenRect,
 } from './shared-state';
 import { getComboDropdownRect } from './controls';
 import { presentingDeviceWindow } from '../../runtime/windowing/fullscreen-window';
@@ -151,10 +150,13 @@ export function adoptOverlayForm(hwnd: number): void {
  * window above the game's surface, so it is on screen and takes the mouse even though
  * it is not a #32770 and often has neither caption nor system controls.
  */
+function screenRight(): number { return getVirtualScreenRect().right; }
+function screenBottom(): number { return getVirtualScreenRect().bottom; }
+
 export function isOverlayFormCandidate(win: WindowInfo): boolean {
     if (win.nativeClassName === '#32770' || (win.style & WS_CHILD) !== 0) return false;
     return win.width > 0 && win.height > 0
-        && (win.width < virtualScreenWidth() || win.height < virtualScreenHeight());
+        && (win.width < screenRight() || win.height < screenBottom());
 }
 
 export function isFloatingOverlayForm(win: WindowInfo): boolean {

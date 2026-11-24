@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { WindowManager } from '../../src/worker/runtime/windowing/window-manager';
 import { isOverlayFormCandidate, floatsOverGameWindow, ownsGameSurface, isFloatingOverlayForm } from '../../src/worker/modules/user32/dialog-overlay';
 import { windows } from '../../src/worker/modules/user32/shared-state';
-import { publishPresentedClient } from '../../src/worker/runtime/windowing/fullscreen-window';
+import { notePresentingDeviceWindow as publishPresentedClient } from '../../src/worker/runtime/windowing/fullscreen-window';
 import type { WindowInfo } from '../../src/worker/modules/user32/shared-state';
 
 const WS_POPUP = 0x80000000;

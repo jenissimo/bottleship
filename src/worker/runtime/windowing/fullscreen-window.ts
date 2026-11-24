@@ -112,7 +112,20 @@ export function deviceWindowClientExtent(hwnd: number): { width: number; height:
  * which is reported as a screen position, lands on the picture. A fullscreen device is a
  * mode set and goes through System.requestHostResize instead.
  */
+// @transient(the window the last windowed device presented into; the next present sets it again)
+let windowedDeviceWindow = 0;
+
+/** The window a windowed device presented into last, 0 when none or when a device owns the screen. */
+export function presentingDeviceWindow(): number {
+    return windowedDeviceWindow;
+}
+
+export function notePresentingDeviceWindow(hwnd: number): void {
+    windowedDeviceWindow = hwnd >>> 0;
+}
+
 export function requestWindowedDeviceHostView(hwnd: number, width: number, height: number): void {
+    notePresentingDeviceWindow(hwnd);
     const win = hwnd ? sharedWindows.get(hwnd >>> 0) : undefined;
     const origin = win ? getAbsoluteWindowPosition(win) : null;
     System.getInstance().requestHostViewAt(origin?.x ?? 0, origin?.y ?? 0, width, height);
