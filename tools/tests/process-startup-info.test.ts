@@ -196,7 +196,6 @@ describe('the launcher state a ShowWindow spends', () => {
     let savedProcess: unknown;
     let savedWindowManager: Record<string, unknown>;
     const memProperties = new Map<string, PropertyDescriptor | undefined>();
-    /** WM_SHOWWINDOW resolutions waiting for the guest window procedure to return. */
     const pendingReturns: Array<((ret: number) => unknown) | undefined> = [];
 
     function place(handle: number, style: number, parent?: number): void {
@@ -213,9 +212,11 @@ describe('the launcher state a ShowWindow spends', () => {
 
     function showWindow(handle: number, cmd: number): void {
         createWindowExports()['ShowWindow']!({ esp: ESP } as never, mem, [handle, cmd] as never);
-        // The visibility change is applied when the guest's WM_SHOWWINDOW handler
-        // returns, the way the emulator resumes it. Drain that here.
-        for (const resume of pendingReturns.splice(0)) resume?.(0);
+        for (let i = 0; i < pendingReturns.length; i++) {
+            expect(i).toBeLessThan(32);
+            pendingReturns[i]?.(0);
+        }
+        pendingReturns.length = 0;
     }
 
     /** Adopt what a launcher that ran the child with SW_SHOWMINNOACTIVE would pass. */
@@ -227,6 +228,7 @@ describe('the launcher state a ShowWindow spends', () => {
     }
 
     beforeEach(() => {
+        pendingReturns.length = 0;
         mem = new Uint8Array(0x10000);
         new DataView(mem.buffer).setUint32(ESP, 0x00402000, true);
         for (const key of ['memoryGetter', 'validateRange', 'getRegion']) memProperties.set(key, Object.getOwnPropertyDescriptor(Mem, key));

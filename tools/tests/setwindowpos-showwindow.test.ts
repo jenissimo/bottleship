@@ -215,7 +215,7 @@ test('ShowWindow(SW_SHOW) on a hidden window sends one WM_SHOWWINDOW(TRUE) first
     // The message precedes the transition, not the other way round.
     expect(windows.get(HWND)!.visible).toBe(false);
 
-    invoked[0].complete?.(0);
+    completeAll();
     expect(windows.get(HWND)!.visible).toBe(true);
     expect(showMessages()).toHaveLength(1);
 });
@@ -228,7 +228,7 @@ test('ShowWindow(SW_HIDE) on a visible window sends one WM_SHOWWINDOW(FALSE) fir
     expect(invoked[0].args[2]).toBe(0);
     expect(windows.get(HWND)!.visible).toBe(true);
 
-    invoked[0].complete?.(0);
+    completeAll();
     expect(windows.get(HWND)!.visible).toBe(false);
     expect(showMessages()).toHaveLength(1);
 });
@@ -257,4 +257,49 @@ test('ShowWindow(SW_SHOWNA) sends WM_SHOWWINDOW even on an already-visible windo
     const shows = showMessages();
     expect(shows).toHaveLength(1);
     expect(shows[0].wParam).toBe(1);
+});
+
+test('ShowWindow visibility transitions deliver WINDOWPOS pair and release its storage once', () => {
+    for(const show of [true,false]) {
+        invoked=[];posted=[];let allocated=0,freed=0;
+        const process=System.getInstance().process as any;
+        process.memory.alloc=()=>{allocated++;return SCRATCH;};process.memory.free=(p:number)=>{expect(p).toBe(SCRATCH);freed++;};
+        windows.set(HWND,makeWindow(!show));showWindow(show?SW_SHOW:SW_HIDE);
+        invoked[0].complete?.(0);
+        expect(received()).toEqual([WM_SHOWWINDOW,WM_WINDOWPOSCHANGING]);
+        expect(windows.get(HWND)!.visible).toBe(!show);
+        expect(Mem.readUint32(SCRATCH+24)! & (SWP_SHOWWINDOW|SWP_HIDEWINDOW)).toBe(show?SWP_SHOWWINDOW:SWP_HIDEWINDOW);
+        invoked[1].complete?.(0);
+        let next=2;
+        while(invoked[next] && invoked[next].args[1]!==WM_WINDOWPOSCHANGED) invoked[next++].complete?.(0);
+        expect(received().filter(m=>[WM_SHOWWINDOW,WM_WINDOWPOSCHANGING,WM_WINDOWPOSCHANGED].includes(m)))
+            .toEqual([WM_SHOWWINDOW,WM_WINDOWPOSCHANGING,WM_WINDOWPOSCHANGED]);
+        expect(windows.get(HWND)!.visible).toBe(show);expect(freed).toBe(0);
+        expect(invoked[next].args[3]).toBe(SCRATCH);invoked[next].complete?.(0);
+        expect(allocated).toBe(1);expect(freed).toBe(1);
+    }
+});
+
+test('destroying the target during ShowWindow changing frees WINDOWPOS and stops the chain',()=>{
+    let freed=0;(System.getInstance().process as any).memory.free=()=>{freed++;};
+    windows.set(HWND,makeWindow(false));showWindow(SW_SHOW);invoked[0].complete?.(0);
+    expect(received()).toEqual([WM_SHOWWINDOW,WM_WINDOWPOSCHANGING]);
+    windows.delete(HWND);invoked[1].complete?.(0);
+    expect(received()).toEqual([WM_SHOWWINDOW,WM_WINDOWPOSCHANGING]);expect(freed).toBe(1);
+});
+
+
+test('ShowWindow honors guest geometry changes during WINDOWPOSCHANGING',()=>{
+    windows.set(HWND,makeWindow(false));showWindow(SW_SHOW);invoked[0].complete?.(0);
+    Mem.writeUint32(SCRATCH+16,640);Mem.writeUint32(SCRATCH+20,480);
+    Mem.writeUint32(SCRATCH+24,Mem.readUint32(SCRATCH+24)! & ~SWP_NOSIZE);
+    for(let i=1;i<invoked.length;i++)invoked[i].complete?.(0);
+    expect(windows.get(HWND)!.width).toBe(640);expect(windows.get(HWND)!.height).toBe(480);
+    expect(Mem.readUint32(SCRATCH+24)! & 0x800).toBe(0);
+});
+
+test('redundant ShowWindow leaves allocator untouched',()=>{
+    (System.getInstance().process as any).memory.alloc=()=>{throw Error('unexpected allocation');};
+    windows.set(HWND,makeWindow(true));showWindow(SW_SHOW);
+    expect(received()).toEqual([]);
 });
