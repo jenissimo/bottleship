@@ -9,6 +9,9 @@
  * (tools/tests/smoke-run-model.test.ts).
  */
 
+import { parseWwtMode } from "../../worker/wwt/mode";
+
+export type SmokeCpu = "WWT fast" | "WWT protected" | "v86";
 export type SmokeStatus = "untested" | "ok" | "regression" | "skip";
 export type SmokeFilter = "all" | "unchecked" | "regressions";
 /** Item-level comparison with the previous run on the same source. */
@@ -30,6 +33,7 @@ export interface SmokeItem {
 }
 
 export interface SmokeResult {
+  cpu?: SmokeCpu;
   status: SmokeStatus;
   note: string;
   at: number;
@@ -170,9 +174,11 @@ function formatSize(bytes: number): string {
 /** Page URL (relative query) that boots an item: `?game=<id>` like the library, or
  *  `?game=dev&load=<bundleUrl>` like the Add-Game flow. `bundleUrl` is the streaming URL
  *  of a disk bundle (diskBundleUrl) and is ignored for catalog items. */
-export function launchUrl(item: SmokeItem, bundleUrl: string | null): string {
-  if (item.launch.kind === "catalog") return `?game=${encodeURIComponent(item.launch.id)}`;
-  return `?game=dev&load=${encodeURIComponent(bundleUrl ?? "")}`;
+export function launchUrl(item: SmokeItem, bundleUrl: string | null, requestedMode?: string | null): string {
+  const mode = parseWwtMode(requestedMode);
+  const url = item.launch.kind === "catalog" ? `?game=${encodeURIComponent(item.launch.id)}`
+    : `?game=dev&load=${encodeURIComponent(bundleUrl ?? "")}`;
+  return mode ? url + `&wwtMode=${mode}` : url;
 }
 
 /** Is the page open right now the one the item launches? Keeps the in-game panel from
@@ -228,15 +234,15 @@ export function noteOf(run: SmokeRun | null | undefined, key: string): string {
   return run?.results[key]?.note ?? "";
 }
 
-export function setStatus(run: SmokeRun, key: string, status: SmokeStatus, now: number): SmokeRun {
+export function setStatus(run: SmokeRun, key: string, status: SmokeStatus, now: number, cpu?: SmokeCpu): SmokeRun {
   const prev = run.results[key];
-  return { ...run, results: { ...run.results, [key]: { status, note: prev?.note ?? "", at: now } } };
+  return { ...run, results: { ...run.results, [key]: { status, note: prev?.note ?? "", at: now, ...(cpu && status !== "untested" ? { cpu } : {}) } } };
 }
 
 export function setNote(run: SmokeRun, key: string, note: string, now: number): SmokeRun {
   const prev = run.results[key];
   if ((prev?.note ?? "") === note) return run;
-  return { ...run, results: { ...run.results, [key]: { status: prev?.status ?? "untested", note, at: now } } };
+  return { ...run, results: { ...run.results, [key]: { ...prev, status: prev?.status ?? "untested", note, at: now } } };
 }
 
 export interface SmokeCounts {
@@ -367,14 +373,16 @@ export function toMarkdown(run: SmokeRun, prev: SmokeRun | null | undefined, now
     if (cmp.regressed.length > 0) lines.push(`- New regressions: ${cmp.regressed.map((it) => mdCell(it.name)).join(", ")}`);
   }
   lines.push("");
-  lines.push(prev ? "| # | Game | Status | Previous | Note |" : "| # | Game | Status | Note |");
-  lines.push(prev ? "|---|---|---|---|---|" : "|---|---|---|---|");
+  const showCpu = run.items.some((item) => run.results[item.key]?.cpu);
+  const headers = ["#", "Game", "Status", ...(prev ? ["Previous"] : []), ...(showCpu ? ["CPU"] : []), "Note"];
+  lines.push(`| ${headers.join(" | ")} |`, `|${headers.map(() => "---").join("|")}|`);
   run.items.forEach((it, i) => {
     const st = statusOf(run, it.key);
     const d = itemDiff(run, prev, it.key);
     const tag = d === "regressed" ? " **(new)**" : d === "fixed" ? " **(fixed)**" : "";
     const cells = [String(i + 1), mdCell(it.name), STATUS_LABEL[st] + tag];
     if (prev) cells.push(statusOf(prev, it.key) === "untested" ? "—" : STATUS_LABEL[statusOf(prev, it.key)]);
+    if (showCpu) cells.push(run.results[it.key]?.cpu ?? "—");
     cells.push(mdCell(noteOf(run, it.key)));
     lines.push(`| ${cells.join(" | ")} |`);
   });
@@ -392,7 +400,7 @@ export interface SmokeJsonExport {
     appVersion: string;
     startedAt: string;
     counts: SmokeCounts;
-    items: Array<{ key: string; name: string; status: SmokeStatus; note: string; previous: SmokeStatus | null; diff: SmokeDiff }>;
+    items: Array<{ key: string; name: string; cpu?: SmokeCpu; status: SmokeStatus; note: string; previous: SmokeStatus | null; diff: SmokeDiff }>;
   };
   previous: { build: string; startedAt: string } | null;
 }
@@ -413,6 +421,7 @@ export function toJsonExport(run: SmokeRun, prev: SmokeRun | null | undefined, n
         key: it.key,
         name: it.name,
         status: statusOf(run, it.key),
+        ...(run.results[it.key]?.cpu ? { cpu: run.results[it.key].cpu } : {}),
         note: noteOf(run, it.key),
         previous: prev ? statusOf(prev, it.key) : null,
         diff: itemDiff(run, prev, it.key),

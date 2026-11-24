@@ -34,7 +34,7 @@ import {
   type SmokeSource,
   type SmokeStatus,
 } from "./smoke-model";
-import { getActive, launchSmokeItem, updateSmokeStore, useSmokeStore } from "./smoke-store";
+import { cpuForItem, getActive, launchSmokeItem, updateSmokeStore, useSmokeStore } from "./smoke-store";
 import { currentAppVersion, currentBuild } from "./smoke-env";
 import { NoteInput } from "./NoteInput";
 import s from "./SmokeRun.module.css";
@@ -178,7 +178,7 @@ const SmokeRunModal: React.FC<SmokeRunModalProps> = ({ isOpen, onClose, catalog 
   }, [srcKey]);
 
   const mark = useCallback((key: string, status: SmokeStatus) => {
-    mutate((r) => setStatus(r, key, status, Date.now()));
+    mutate((r) => setStatus(r, key, status, Date.now(), cpuForItem(r.items.find((item) => item.key === key))));
   }, [mutate]);
 
   const launch = useCallback((it: SmokeItem) => {

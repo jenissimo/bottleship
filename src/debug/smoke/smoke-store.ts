@@ -4,6 +4,8 @@ import {
   SMOKE_STORE_KEY,
   parseStore,
   launchUrl,
+  itemMatchesLocation,
+  type SmokeCpu,
   type SmokeItem,
   type SmokeStore,
 } from "./smoke-model";
@@ -84,8 +86,17 @@ export function clearActive(): void {
   emit();
 }
 
+export function cpuForItem(item: SmokeItem | undefined): SmokeCpu | undefined {
+  if (!item || !itemMatchesLocation(item, window.location.search)) return undefined;
+  const host = window as Window & { __BS__?: { harness?: { lastEvent(name: string): unknown } } };
+  const ready = host.__BS__?.harness?.lastEvent("cpu_backend_ready") as { backend?: string; wwtMode?: string } | null;
+  if (ready?.backend === "v86") return "v86";
+  if (ready?.backend === "wwt" && (ready.wwtMode === "fast" || ready.wwtMode === "protected")) return `WWT ${ready.wwtMode}`;
+  return undefined;
+}
+
 export async function launchSmokeItem(sourceKey: string, item: SmokeItem): Promise<void> {
   try { sessionStorage.setItem(ACTIVE_KEY, JSON.stringify({ source: sourceKey, key: item.key } satisfies SmokeActive)); } catch { /* panel just won't show */ }
   const bundle = item.launch.kind === "disk" ? (await diskBundleUrl(item.launch.path)).url : null;
-  window.location.assign(launchUrl(item, bundle));
+  window.location.assign(launchUrl(item, bundle, new URLSearchParams(window.location.search).get("wwtMode")));
 }

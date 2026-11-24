@@ -17,7 +17,7 @@ import {
   type SmokeRun,
   type SmokeStatus,
 } from "./smoke-model";
-import { clearActive, getActive, launchSmokeItem, updateSmokeStore, useSmokeStore } from "./smoke-store";
+import { clearActive, cpuForItem, getActive, launchSmokeItem, updateSmokeStore, useSmokeStore } from "./smoke-store";
 import { NoteInput } from "./NoteInput";
 import s from "./SmokeRun.module.css";
 
@@ -72,7 +72,7 @@ export function SmokePanel({ onOpenList, onReturnFocus, hidden }: SmokePanelProp
       const cur = stor.runs[active.source]?.current;
       return cur ? putCurrent(stor, fn(cur)) : stor;
     });
-  const mark = (status: SmokeStatus) => mutate((r) => setStatus(r, item.key, statusOf(r, item.key) === status ? "untested" : status, Date.now()));
+  const mark = (status: SmokeStatus) => mutate((r) => setStatus(r, item.key, statusOf(r, item.key) === status ? "untested" : status, Date.now(), cpuForItem(item)));
 
   if (collapsed) {
     return (

@@ -138,6 +138,10 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
             deliverEvent(evt.event, evt.data);
             return;
         }
+        if (m.type === "cpu_backend_ready" || m.type === "process_exit" || m.type === "error") {
+            deliverEvent(m.type, m);
+            return;
+        }
         // Legacy dbg_event (dialogShow/dlgList/dlgClick) — keep waitForEvent working.
         if (m.type === "dbg_event" && typeof m.event === "string") {
             deliverEvent(m.event, m.data);
