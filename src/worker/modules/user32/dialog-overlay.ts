@@ -137,10 +137,12 @@ export function noteDialogOverlayCandidate(win: WindowInfo | undefined): void {
     if (!win.overlayOnFlipScreen) {
         win.overlayOnFlipScreen = true;
     }
-    if (form) {
-        overlayForms.add(win.handle);
-        setPointerOverlayFormLive(true);
-    }
+    if (form) adoptOverlayForm(win.handle);
+}
+
+export function adoptOverlayForm(hwnd: number): void {
+    overlayForms.add(hwnd);
+    setPointerOverlayFormLive(true);
 }
 
 /**
@@ -179,7 +181,21 @@ export function floatsOverGameWindow(win: WindowInfo): boolean {
     return false;
 }
 
+export function pruneOverlayForms(): void {
+    if (overlayForms.size === 0) return;
+    let changed = false;
+    for (const hwnd of [...overlayForms]) {
+        const win = windows.get(hwnd);
+        if (win && isFloatingOverlayForm(win)) continue;
+        overlayForms.delete(hwnd);
+        if (win) win.overlayOnFlipScreen = false;
+        changed = true;
+    }
+    if (changed) setPointerOverlayFormLive(resolveFrontOverlayFormHwnd() !== 0);
+}
+
 export function isOverlayForm(hwnd: number): boolean {
+    pruneOverlayForms();
     return overlayForms.has(hwnd);
 }
 
@@ -190,6 +206,7 @@ export function forgetOverlayForm(hwnd: number): void {
 
 /** The frontmost live overlay form, or 0. Keystrokes go to it: it is the modal UI on screen. */
 export function resolveFrontOverlayFormHwnd(): number {
+    pruneOverlayForms();
     let best = 0, bestRank = -Infinity;
     for (const hwnd of overlayForms) {
         const win = windows.get(hwnd);
@@ -202,6 +219,7 @@ export function resolveFrontOverlayFormHwnd(): number {
 
 /** The frontmost live overlay form whose visual bounds contain the point, or 0. */
 export function resolveOverlayFormHitHwnd(screenX: number, screenY: number): number {
+    pruneOverlayForms();
     let best = 0, bestRank = -Infinity;
     for (const hwnd of overlayForms) {
         const win = windows.get(hwnd);
@@ -640,6 +658,7 @@ export function getLiveDialogOverlayRects(renderActive?: RenderActive | null): D
 
 /** getLiveDialogOverlayRects with the owning window — the diagnostic form (harness `overlay`). */
 export function getLiveDialogOverlays(renderActive?: RenderActive | null): Array<{ hwnd: number; title: string; cls: string; rect: DialogOverlayRect }> {
+    pruneOverlayForms();
     const gdiOutputOnScreen = isGdiOutputOnScreen(renderActive);
     const entries: Array<{ hwnd: number; title: string; cls: string; rect: DialogOverlayRect; rank: number }> = [];
     for (const win of windows.values()) {

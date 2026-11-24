@@ -88,6 +88,24 @@ describe('only top-level game window smaller than the screen', () => {
     });
 });
 
+describe('an overlay form that stops floating', () => {
+    test('is dropped once the screen shrinks to its size', async () => {
+        const mod = await import('../../src/worker/modules/user32/dialog-overlay');
+        windows.clear();
+        const app = { ...info(), handle: 0x10050, nativeClassName: 'TApplication', width: 800, height: 600 } as WindowInfo;
+        const game = { ...info(), handle: 0x10051, nativeClassName: 'TRunnerForm', width: 640, height: 480, overlayOnFlipScreen: true } as WindowInfo;
+        windows.set(app.handle, app);
+        windows.set(game.handle, game);
+        mod.adoptOverlayForm(game.handle);
+        expect(mod.isOverlayForm(game.handle)).toBe(true);
+        publishPresentedClient(game.handle);
+        expect(mod.isOverlayForm(game.handle)).toBe(false);
+        expect(game.overlayOnFlipScreen).toBe(false);
+        publishPresentedClient(0);
+        windows.clear();
+    });
+});
+
 describe('mouse over a disabled top-level window', () => {
     test('a click is routed to the point-routed overlay form, not dropped on the disabled window', () => {
         const wm = new WindowManager();
