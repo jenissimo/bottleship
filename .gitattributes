@@ -8,5 +8,5 @@
 /deploy/lan/start-turn.sh text eol=lf
 /deploy/lan/*.conf text eol=lf
 
-# A space is the context marker for a blank line in this unified diff.
-/tools/build-wwt-cpu/bottleship.patch text eol=lf whitespace=-blank-at-eol
+# A space is the context marker for a blank line in a unified diff.
+/tools/build-wwt-cpu/*.patch text eol=lf whitespace=-blank-at-eol

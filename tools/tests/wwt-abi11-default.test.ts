@@ -43,7 +43,40 @@ describe("WWT execution mode", () => {
     });
 });
 
-describe("stock ABI11 in the BottleShip runtime", () => {
+describe("fast ABI11 in the BottleShip runtime", () => {
+    for (const opt of [0, 1]) {
+        test(`an OSR loop at opt ${opt} yields with the live state and resumes at its header`, async () => {
+            const { compiler, machine } = await fastMachine();
+            try {
+                const cpu = machine.newCpu();
+                const { GPR, PREEMPT_AT, RESUME } = machine.abi.cpu;
+                const bytes = new Uint8Array(machine.memory.buffer);
+                const words = new Uint32Array(bytes.buffer);
+                // mov ecx,112; dec ecx; jnz back to dec; ret. The finite count
+                // lets a compiler missing its deadline poll fail without hanging.
+                const code = Uint8Array.of(0xb9, 112, 0, 0, 0, 0x49, 0x75, 0xfd, 0xc3);
+                bytes.set(code, PARK);
+                machine.codeEnd = () => PARK + code.length;
+                machine.loadModuleSync(compiler.translate(code, PARK, [], GUEST_LIMIT, false, opt), "countdown");
+                words[(cpu + GPR + 16) >>> 2] = STACK;
+                words[STACK >>> 2] = machine.stopAddress;
+                words[machine.tickAddr >>> 2] = 100;
+                words[(cpu + PREEMPT_AT) >>> 2] = 99;
+                let resume = 0;
+                machine.onPreempt = (_cpu, pc) => { resume = pc; return true; };
+                expect(machine.run(cpu, PARK)).toBe(machine.yieldAddress);
+                expect(resume).toBe(PARK + 5);
+                expect(words[(cpu + GPR + 4) >>> 2]).toBe(111);
+                expect(words[(cpu + GPR + 16) >>> 2]).toBe(STACK);
+                expect(words[(cpu + RESUME) >>> 2]).toBe(0);
+                words[(cpu + PREEMPT_AT) >>> 2] = 101;
+                expect(machine.run(cpu, resume)).toBe(machine.stopAddress);
+                expect(words[(cpu + GPR + 4) >>> 2]).toBe(0);
+                expect(words[(cpu + GPR + 16) >>> 2]).toBe(STACK + 4);
+            } finally { machine.dispose(); }
+        });
+    }
+
     test("exits the scheduler's park with current registers and redispatches changed code", async () => {
         const { compiler, machine } = await fastMachine();
         try {

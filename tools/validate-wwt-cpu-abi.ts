@@ -1,6 +1,7 @@
 /** Validate the compiler, kernel and direct HLE crossing shipped by the default build. */
 import assert from "node:assert/strict";
 import { WwtCompiler } from "../src/worker/wwt/translator";
+import { WWT_ABI11_SHA256 } from "../src/worker/wwt/cpu-provider";
 import { BottleShipMachine } from "../src/worker/wwt/machine";
 import { WwtCpu } from "../src/worker/wwt/cpu";
 import { installWwtHypercall } from "../src/worker/wwt/hypercall";
@@ -11,12 +12,11 @@ const [compilerBytes, hypercall, d3d9Arena] = await Promise.all([
     load("wwt-provider/wwt_wasm.wasm"), load("wwt-hypercall.wasm"), load("wwt-d3d9-arena.wasm"),
 ]);
 
-const upstream = await WwtCompiler.fromBytes(await load("wwt-provider/wwt_abi11.wasm"), true);
-assert.equal(upstream.cacheId, "95f8ad6ee983acd0f7f466f25ebe71be3965da796d47befbc44b1cf56e958f42",
-    "The fast compiler must match the pinned upstream artifact");
-assert.equal(upstream.abi.version, 11);
-assert(WebAssembly.validate(upstream.kernel()), "Invalid upstream i386 kernel");
-console.log("WWT fast compiler OK (original ABI 11)");
+const fast = await WwtCompiler.fromBytes(await load("wwt-provider/wwt_abi11.wasm"), true);
+assert.equal(fast.cacheId, WWT_ABI11_SHA256, "The fast compiler must match the pinned BottleShip artifact");
+assert.equal(fast.abi.version, 11);
+assert(WebAssembly.validate(fast.kernel()), "Invalid ABI 11 i386 kernel");
+console.log("WWT fast compiler OK (ABI 11 with OSR preemption)");
 
 const cpuFields: Record<string, number> = {
     GPR: 32, EIP: 4, FS_BASE: 4, GS_BASE: 4, SEG_SEL: 12,

@@ -1,0 +1,145 @@
+diff --git a/crates/wwt/src/codegen.rs b/crates/wwt/src/codegen.rs
+--- a/crates/wwt/src/codegen.rs
++++ b/crates/wwt/src/codegen.rs
+@@ -555,6 +555,7 @@
+     /// The function, the emulation left in it and its trapping accesses.
+     fn gen_function_full(&self, f: &Function) -> (wasm_encoder::Function, Residue, Vec<TrapSite>) {
+         let fixed;
++        let mut osr_latches = Vec::new();
+         // Blocks from here on are made by the passes below, not lifted.
+         let lifted = f.blocks.len();
+         // Where the optimizer kept the state a preemption check writes back.
+@@ -569,7 +570,7 @@
+             }
+             reducible::make_reducible(&mut c);
+             if self.cfg.osr {
+-                crate::osr::add_reentry(&mut c);
++                osr_latches = crate::osr::add_reentry(&mut c);
+             }
+             fixed = c;
+             &fixed
+@@ -578,6 +579,7 @@
+         let mut g = FnGen::new(self, f, &a);
+         g.lifted = lifted;
+         g.preempt = preempt;
++        g.osr_latches = osr_latches;
+         g.irreducible = irreducible;
+         g.run();
+         let r = g.residue;
+@@ -717,6 +719,7 @@
+     /// `opt::preempt_points` of the lifted function, and whether it was
+     /// irreducible: where its back edges' state survived the optimizer.
+     preempt: Vec<bool>,
++    osr_latches: Vec<BlockId>,
+     irreducible: bool,
+     emitted: Vec<bool>,
+     /// Addresses whose guest-limit check passed, as (vreg, lo, hi): some
+@@ -781,6 +784,7 @@
+             label_local: 0,
+             lifted: n,
+             preempt: vec![],
++            osr_latches: vec![],
+             irreducible: false,
+             emitted: vec![false; n],
+             facts_local: vec![],
+@@ -1484,6 +1488,10 @@
+         let Some(resume) = self.resume_addr(src, tgt) else {
+             return;
+         };
++        self.preempt_at(resume, self.a.dirty_end[src as usize]);
++    }
++
++    fn preempt_at(&mut self, resume: u64, dirty: StateMask) {
+         self.emit(W::GlobalGet(G_TICK));
+         self.emit(W::I32Load(memarg(0, 2)));
+         self.emit(W::LocalGet(0));
+@@ -1491,7 +1499,7 @@
+         self.emit(W::I32GeU);
+         self.emit(W::If(BlockType::Empty));
+         self.ctx.push(Ctx::If);
+-        self.sync(self.a.dirty_end[src as usize]);
++        self.sync(dirty);
+         self.emit(W::LocalGet(0));
+         self.code_const(resume);
+         self.emit(W::Call(F_PREEMPT));
+@@ -1577,6 +1585,11 @@
+     fn terminator(&mut self, x: BlockId) {
+         let blk = &self.f.blocks[x as usize];
+         let dirty = self.a.dirty_end[x as usize] & opt::term_sync(self.f, x);
++        if self.osr_latches.contains(&x) {
++            // The synthetic latch replaced a checked x86 back edge. At this
++            // point RESUME is still clear and blk.addr is the x86 loop header.
++            self.preempt_at(blk.addr, self.a.dirty_end[x as usize]);
++        }
+         match blk.term.clone() {
+             Term::Jump(t) => self.do_branch(x, t),
+             Term::Branch { t, f, .. } if t == f => self.do_branch(x, t),
+diff --git a/crates/wwt/src/osr.rs b/crates/wwt/src/osr.rs
+--- a/crates/wwt/src/osr.rs
++++ b/crates/wwt/src/osr.rs
+@@ -25,20 +25,19 @@
+     Mem::native(4, offset)
+ }
+ 
+-/// Adds re-entry points to `f`'s loops (which must be reducible). Returns
+-/// whether anything changed.
+-pub fn add_reentry(f: &mut Function) -> bool {
++/// Adds re-entry points to reducible loops and returns their synthetic latches.
++pub fn add_reentry(f: &mut Function) -> Vec<BlockId> {
+     let before = f.clone();
+-    let changed = add_reentry_points(f);
++    let latches = add_reentry_points(f);
+     // Never trade structured code for re-entry.
+-    if changed && !crate::reducible::is_reducible(f) {
++    if !latches.is_empty() && !crate::reducible::is_reducible(f) {
+         *f = before;
+-        return false;
+-    }
+-    changed
++        return vec![];
++    }
++    latches
+ }
+ 
+-fn add_reentry_points(f: &mut Function) -> bool {
++fn add_reentry_points(f: &mut Function) -> Vec<BlockId> {
+     let order = f.rpo();
+     let n = f.blocks.len();
+     let mut rpo_num = vec![u32::MAX; n];
+@@ -57,7 +56,7 @@
+         }
+     }
+     if headers.is_empty() {
+-        return false;
++        return vec![];
+     }
+     // Only outermost loops: making an inner loop's header reachable from
+     // the entry would give its enclosing loop a second entry (irreducible).
+@@ -96,7 +95,7 @@
+                 .all(|(d, &v)| v < NUM_STATE || !a.live_in[h as usize].contains(d))
+     });
+     if headers.is_empty() {
+-        return false;
++        return vec![];
+     }
+     // Block 0 must stay the entry: move its code to a new block.
+     let old_entry = f.blocks.len() as BlockId;
+@@ -191,9 +190,11 @@
+     f.blocks[cur as usize].term = Term::Jump(old_entry);
+     // Back edges: count, and re-enter when the count runs out.
+     let preds = f.predecessors();
++    let mut latches = Vec::with_capacity(headers.len());
+     for (k, &h) in headers.iter().enumerate() {
+         let addr = f.blocks[h as usize].addr;
+         let latch = f.new_block(addr);
++        latches.push(latch);
+         let exit = f.new_block(addr);
+         let (one, dec, z, kc) = (
+             f.new_vreg(Ty::I32),
+@@ -260,5 +261,5 @@
+             }
+         }
+     }
+-    true
++    latches
+ }

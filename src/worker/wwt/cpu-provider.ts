@@ -3,7 +3,7 @@ import { WwtCompiler } from "./translator";
 import type { WwtMode } from "./mode";
 import type { WwtWallClock } from "./wall-clock";
 
-export const WWT_ABI11_SHA256 = "95f8ad6ee983acd0f7f466f25ebe71be3965da796d47befbc44b1cf56e958f42";
+export const WWT_ABI11_SHA256 = "41879d5b9f8e8eafd7e224d69861be0fe2b2f06e0912891dc886070eb1e38364";
 
 export interface WwtAbi {
     version: number;

@@ -11,6 +11,11 @@ statuses include maintainer and contributor reports; every title has not been re
 release. Observed demo stages are listed separately below. Successful
 GOG extraction does not establish gameplay coverage for that installer edition.
 
+The ratings below include gameplay reports from the v86 backend. During the WWT
+migration, record the backend, game edition and furthest verified checkpoint when
+retesting a title. The five-game smoke and the manual checklist use the same local
+bundles on WWT and v86. [Smoke instructions](harness.md#smokes-during-the-wwt-migration)
+
 **How to read the table**
 
 - **Status** — `playable` (reaches gameplay and is enjoyable), `boots` (reaches menu / early

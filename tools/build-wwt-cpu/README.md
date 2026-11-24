@@ -4,17 +4,22 @@ Both CPU modes run PE code with BottleShip’s PE loader, Win32 HLE and graphics
 
 | Mode | Shipped compiler in `public/wwt-provider/` | Selection |
 | --- | --- | --- |
-| Fast | `wwt_abi11.wasm`, original WebWindows ABI 11 | Default, or `wwtMode=fast` |
+| Fast | `wwt_abi11.wasm`, WebWindows ABI 11 with the OSR preemption fix | Default, or `wwtMode=fast` |
 | Protected | `wwt_wasm.wasm`, BottleShip’s extended compiler | `wwtMode=protected` |
 
-The shipped original comes from WebWindows commit `5c845c1b45659cfb5ed00a0da5d3870025c022f3`, with Rust 1.99.0. Its binary SHA-256 is `95f8ad6ee983acd0f7f466f25ebe71be3965da796d47befbc44b1cf56e958f42`. Use `sha256sum public/wwt-provider/wwt_abi11.wasm` to verify it. Set `VITE_CPU_BACKEND=v86` to build the legacy comparison app from the optional submodule.
+The WebWindows + Wine reference uses unmodified WebWindows commit `5c845c1b45659cfb5ed00a0da5d3870025c022f3` and Rust 1.99.0. Its compiler SHA-256 is `95f8ad6ee983acd0f7f466f25ebe71be3965da796d47befbc44b1cf56e958f42`. BottleShip builds its fast compiler from the same commit and adds [one OSR fix](abi11-osr-preempt.patch). The compiler checks the scheduling deadline at a synthetic loop latch before setting the internal OSR resume token. This lets the host resume at the corresponding x86 loop header.
 
-To reproduce the fast compiler, start in the unmodified WebWindows commit above on Linux with its original `Cargo.lock` and the `wasm32-unknown-unknown` target installed for Rust 1.99.0. The upstream CI build uses the `release-wasm` profile. Compare the resulting file with the shipped SHA-256.
+To reproduce `wwt_abi11.wasm`, select Rust 1.99.0 for x86-64 Linux and install its `wasm32-unknown-unknown` target. Use Python 3.12 or newer. The script checks the source archive SHA-256, builds the unmodified compiler with the upstream lockfile and profile, and compares it with the Wine reference before applying the latch fix and rebuilding.
 
 ```sh
-cargo +1.99.0 build --locked -p wwt-wasm -p wwt-heap -p wwt-strings --target wasm32-unknown-unknown --profile release-wasm
-sha256sum target/wasm32-unknown-unknown/release-wasm/wwt_wasm.wasm
+rustup toolchain install 1.99.0 --target wasm32-unknown-unknown
+RUSTUP_TOOLCHAIN=1.99.0 python3 tools/build-wwt-cpu/build-fast.py WebWindows-5c845c1b45659cfb5ed00a0da5d3870025c022f3.tar.gz public/wwt-provider
+sha256sum public/wwt-provider/wwt_abi11.wasm
 ```
+
+The shipped fast compiler SHA-256 is `41879d5b9f8e8eafd7e224d69861be0fe2b2f06e0912891dc886070eb1e38364`.
+
+Use `--offline` for a populated Cargo cache, or `--vendor DIRECTORY` for a cargo-vendor tree. Set `TMPDIR` and `CARGO_TARGET_DIR` to place the build outside the checkout. Set `VITE_CPU_BACKEND=v86` to build the legacy comparison app from the optional submodule.
 
 To rebuild the protected compiler, install Python 3, Git and Rust with the `wasm32-unknown-unknown` target. Use the GitHub source archive of Glavin001/WebWindows at `5c845c1b45659cfb5ed00a0da5d3870025c022f3`. The script verifies the archive checksum, applies the BottleShip changes in a temporary directory and uses the locked Cargo dependencies.
 
