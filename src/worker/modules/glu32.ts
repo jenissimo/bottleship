@@ -67,6 +67,8 @@ function mat4Ortho(
 
 /** @transient(matrix scratch, fully written before each multiply) */
 const _tempMat = new Float32Array(16);
+// @transient(scratch output of gluPickMatrix, overwritten on every call)
+const _pickOut = new Float32Array(16);
 
 function multiplyCurrentMatrix(process: Process, temp: Float32Array): void {
     const gl32 = process.getModule("opengl32") as OpenGL32 | undefined;
@@ -197,8 +199,8 @@ export class Glu32 implements IModule {
             _tempMat[12] = (vw + 2 * (vx - x)) / width;
             _tempMat[13] = (vh + 2 * (vy - y)) / height;
             const cur = ctx.currentMatrix();
-            // mat4Multiply caches the left operand, so in-place output is safe.
-            mat4Multiply(cur, cur, _tempMat);
+            mat4Multiply(_pickOut, cur, _tempMat);
+            cur.set(_pickOut);
             return 0;
         };
 
