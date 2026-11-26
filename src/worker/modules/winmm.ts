@@ -356,6 +356,9 @@ const WHDR_ENDLOOP = 0x00000008;
 const WHDR_INQUEUE = 0x00000010;
 
 const WAVE_FORMAT_QUERY  = 0x0001;
+const WAVECAPS_VOLUME = 0x0004;
+const WAVECAPS_SAMPLEACCURATE = 0x0020;
+const WAVEOUT_SUPPORT = WAVECAPS_VOLUME | WAVECAPS_SAMPLEACCURATE;
 const WAVE_FORMAT_DIRECT = 0x0008;
 
 // Target queued-ahead depth (ms of audio in the SAB ring past the play cursor)
@@ -2206,7 +2209,8 @@ export class WinMM implements IModule {
                 }
                 view.setUint32(pwoc + 40, 0x00FF00FF, true);
                 view.setUint16(pwoc + 44, 2, true);
-                view.setUint32(pwoc + 48, 0x0033, true); // VOLUME | LRVOLUME | PITCH | PLAYBACKRATE
+                view.setUint16(pwoc + 46, 0, true);
+                view.setUint32(pwoc + 48, WAVEOUT_SUPPORT, true);
             }
             return MMSYSERR_NOERROR;
         };
@@ -2227,7 +2231,7 @@ export class WinMM implements IModule {
                 view.setUint32(pwoc + 72, 0x00FF00FF, true);
                 view.setUint16(pwoc + 76, 2, true);
                 view.setUint16(pwoc + 78, 0, true);
-                view.setUint32(pwoc + 80, 0x0033, true); // VOLUME | LRVOLUME | PITCH | PLAYBACKRATE
+                view.setUint32(pwoc + 80, WAVEOUT_SUPPORT, true);
             }
             return MMSYSERR_NOERROR;
         };
