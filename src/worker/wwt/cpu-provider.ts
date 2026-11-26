@@ -1,9 +1,10 @@
 import { BottleShipMachine } from "./machine";
+import type { PeAotStatus } from "./pe-aot-progress";
 import { WwtCompiler } from "./translator";
 import type { WwtMode } from "./mode";
 import type { WwtWallClock } from "./wall-clock";
 
-export const WWT_ABI11_SHA256 = "41879d5b9f8e8eafd7e224d69861be0fe2b2f06e0912891dc886070eb1e38364";
+export const WWT_ABI11_SHA256 = "40d94930bdfd9bc752447de17001a5e57597a817bf9b9a53947fcbafc58cbc6b";
 
 export interface WwtAbi {
     version: number;
@@ -44,7 +45,7 @@ export interface WwtMachine {
     refreshWallTimers?: () => void;
     canWriteCode?: (pageAddress: number) => boolean;
     updateCodePermissions?(firstPage: number, endPage: number): boolean;
-    setParkExit?(address: number, ownsPark: (pc: number) => boolean, publish: (cpu: number, pc: number) => void): () => void;
+    setParkExit?(address: number, publish: (cpu: number, pc: number) => void): () => void;
     dispose?(): void;
     codeEnd?: (address: number) => number;
     invalidateTranslationPages?(first: number, end: number): boolean;
@@ -63,7 +64,8 @@ export interface WwtMachine {
     setL1(page: number, value: number): void;
     loadModuleSync(bytes: Uint8Array, name: string): WwtModule;
     loadPeAot(file: Uint8Array<ArrayBuffer>, name: string, executable: (address: number) => boolean,
-        verifyCurrent: () => boolean, profile?: number[], fullImage?: WwtPeImageBounds): Promise<void>;
+        verifyCurrent: () => boolean, profile?: number[], fullImage?: WwtPeImageBounds,
+        onStatus?: (status: PeAotStatus) => void): Promise<void>;
     eflags(cpu: number): number;
     run(cpu: number, eip: number): number;
 }

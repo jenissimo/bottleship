@@ -25,6 +25,10 @@ function canMapWasmTrap(): boolean {
     return supportsTrapOffsets = false;
 }
 
+type TranslatePe = (file: number, length: number, profile: number, profileCount: number,
+    optLevel: number, flags: number) => number;
+type PeProgressSink = (phase: number, completed: number, total: number) => void;
+
 interface TranslatorExports {
     memory: WebAssembly.Memory;
     wwt_alloc(length: number): number;
@@ -32,7 +36,8 @@ interface TranslatorExports {
     wwt_kernel(): number;
     wwt_abi(): number;
     wwt_pe_aot_policy_version?(): number;
-    wwt_translate_pe(file: number, length: number, profile: number, profileCount: number, optLevel: number, flags: number): number;
+    wwt_translate_pe: TranslatePe;
+    wwt_translate_pe_with_progress?: TranslatePe;
     wwt_translate(code: number, length: number, base: bigint, entries: number, entryCount: number,
         known: number, knownCount: number, optLevel: number, flags: number): number;
 }
@@ -45,11 +50,17 @@ export class WwtCompiler {
     readonly memTraps: boolean;
     private wasm: TranslatorExports;
 
-    private constructor(private readonly module: WebAssembly.Module, readonly flatRam: boolean,
-        private readonly inlinePageWalk: boolean, readonly cacheId: string) {
+    private constructor(readonly module: WebAssembly.Module, readonly flatRam: boolean,
+        private readonly inlinePageWalk: boolean, readonly cacheId: string, private readonly peProgress?: PeProgressSink) {
         this.wasm = this.instantiate();
         this.abi = JSON.parse(new TextDecoder().decode(this.take(this.wasm.wwt_abi())));
         this.memTraps = this.abi.version === 11 && canMapWasmTrap();
+    }
+
+    static fromAbi11Module(module: WebAssembly.Module, cacheId: string, peProgress?: PeProgressSink): WwtCompiler {
+        const compiler = new WwtCompiler(module, false, false, cacheId, peProgress);
+        if (compiler.abi.version !== 11) throw new Error("Expected WWT ABI 11 compiler");
+        return compiler;
     }
 
     static async load(url: string, flatRam = false, inlinePageWalk = false): Promise<WwtCompiler> {
@@ -119,7 +130,8 @@ export class WwtCompiler {
             profile.forEach((value, index) => view.setBigUint64(index * 8, BigInt(value), true));
             const flags = this.flags(guestLimit, guestMmio) |
                 (this.abi.version === 11 ? 0 : pageLocal ? FLAG_PAGE_LOCAL_PE : FLAG_LINKED_PE);
-            const wasm = this.invokeTranslation(() => ex.wwt_translate_pe(input, file.length, seeds, profile.length, 1, flags));
+            const translate = (this.peProgress && ex.wwt_translate_pe_with_progress) || ex.wwt_translate_pe;
+            const wasm = this.invokeTranslation(() => translate(input, file.length, seeds, profile.length, 1, flags));
             if (wasm.length === 0) throw new Error("WWT could not translate the linked PE");
             return wasm;
         } finally {
@@ -131,7 +143,8 @@ export class WwtCompiler {
     }
 
     private instantiate(): TranslatorExports {
-        return new WebAssembly.Instance(this.module).exports as unknown as TranslatorExports;
+        const imports = { bottleship: { pe_progress: this.peProgress ?? (() => {}) } };
+        return new WebAssembly.Instance(this.module, imports).exports as unknown as TranslatorExports;
     }
 
     private invokeTranslation(translate: () => number): Uint8Array<ArrayBuffer> {

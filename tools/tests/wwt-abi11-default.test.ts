@@ -44,6 +44,81 @@ describe("WWT execution mode", () => {
 });
 
 describe("fast ABI11 in the BottleShip runtime", () => {
+    test("copies full-width integers through FILD, FXCH and FISTP", async () => {
+        const { compiler, machine } = await fastMachine();
+        try {
+            const cpu = machine.newCpu();
+            const { GPR, PREEMPT_AT, FPU_TOP, FPU_TAG } = machine.abi.cpu;
+            const bytes = new Uint8Array(machine.memory.buffer);
+            const view = new DataView(bytes.buffer);
+            const source = STACK + 0x100;
+            const target = STACK + 0x200;
+            const code = Uint8Array.of(
+                0xdf, 0x2e,                         // fild qword [esi]
+                0xdf, 0x6e, 0x08,                   // fild qword [esi+8]
+                0xd9, 0xc9,                         // fxch st(1)
+                0x26, 0xdf, 0x3f,                   // fistp qword es:[edi]
+                0x26, 0xdf, 0x7f, 0x08,             // fistp qword es:[edi+8]
+                0xc3,
+            );
+            bytes.set(code, PARK);
+            view.setBigInt64(source, 0x7fff_ffff_ffff_ffffn, true);
+            view.setBigInt64(source + 8, -0x1234_5678_9abc_defn, true);
+            view.setUint32(cpu + GPR + 4 * 4, STACK, true);
+            view.setUint32(cpu + GPR + 6 * 4, source, true);
+            view.setUint32(cpu + GPR + 7 * 4, target, true);
+            view.setUint32(STACK, machine.stopAddress, true);
+            view.setUint32(cpu + PREEMPT_AT, 1000, true);
+            machine.loadModuleSync(compiler.translate(code, PARK, [], GUEST_LIMIT, false, 1), "x87-copy");
+            expect(machine.run(cpu, PARK)).toBe(machine.stopAddress);
+            expect(view.getBigInt64(target, true)).toBe(view.getBigInt64(source, true));
+            expect(view.getBigInt64(target + 8, true)).toBe(view.getBigInt64(source + 8, true));
+            expect(view.getUint32(cpu + FPU_TOP, true)).toBe(0);
+            expect(view.getUint8(cpu + FPU_TAG)).toBe(0);
+        } finally { machine.dispose(); }
+    });
+
+    for (const stackSelector of [0x10, 0x2b]) {
+        test(`flat DS/ES selector 0x10 follows the active stack selector 0x${stackSelector.toString(16)}`, async () => {
+            const { compiler, machine } = await fastMachine();
+            try {
+                const cpu = machine.newCpu();
+                const { GPR, PREEMPT_AT, SEG_SEL } = machine.abi.cpu;
+                const bytes = new Uint8Array(machine.memory.buffer);
+                const view = new DataView(bytes.buffer);
+                // mov ds,[ebp+0x14]; mov es,[ebp+0xc]; mov eax,42; ret
+                const code = Uint8Array.of(0x66, 0x8e, 0x5d, 0x14, 0x66, 0x8e, 0x45, 0x0c, 0xb8, 42, 0, 0, 0, 0xc3);
+                bytes.set(code, PARK);
+                machine.loadModuleSync(compiler.translate(code, PARK, [], GUEST_LIMIT, false, 1), "segment-load");
+                view.setUint32(cpu + GPR + 4 * 4, STACK, true);
+                view.setUint32(cpu + GPR + 5 * 4, STACK, true);
+                view.setUint32(STACK, machine.stopAddress, true);
+                view.setUint16(STACK + 0x0c, 0x10, true);
+                view.setUint16(STACK + 0x14, 0x10, true);
+                view.setUint16(cpu + SEG_SEL + 2 * 2, stackSelector, true);
+                view.setUint16(cpu + SEG_SEL, 0x2b, true);
+                view.setUint16(cpu + SEG_SEL + 3 * 2, 0x2b, true);
+                view.setUint32(cpu + PREEMPT_AT, 1000, true);
+                const faults: { code: number; eip: number }[] = [];
+                machine.onFault = (_cpu, code, eip) => {
+                    faults.push({ code, eip });
+                    return machine.stopAddress;
+                };
+                expect(machine.run(cpu, PARK)).toBe(machine.stopAddress);
+                if (stackSelector === 0x10) {
+                    expect(faults).toEqual([]);
+                    expect(view.getUint16(cpu + SEG_SEL + 3 * 2, true)).toBe(0x10);
+                    expect(view.getUint16(cpu + SEG_SEL, true)).toBe(0x10);
+                    expect(view.getUint32(cpu + GPR, true)).toBe(42);
+                } else {
+                    expect(faults).toEqual([{ code: machine.abi.fault.GENERAL_PROTECTION, eip: PARK }]);
+                    expect(view.getUint16(cpu + SEG_SEL + 3 * 2, true)).toBe(0x2b);
+                    expect(view.getUint16(cpu + SEG_SEL, true)).toBe(0x2b);
+                }
+            } finally { machine.dispose(); }
+        });
+    }
+
     for (const opt of [0, 1]) {
         test(`an OSR loop at opt ${opt} yields with the live state and resumes at its header`, async () => {
             const { compiler, machine } = await fastMachine();
@@ -75,9 +150,74 @@ describe("fast ABI11 in the BottleShip runtime", () => {
                 expect(words[(cpu + GPR + 16) >>> 2]).toBe(STACK + 4);
             } finally { machine.dispose(); }
         });
+
+        test(`an entry loop at opt ${opt} still yields when OSR relocates its header`, async () => {
+            const { compiler, machine } = await fastMachine();
+            try {
+                const cpu = machine.newCpu();
+                const { GPR, PREEMPT_AT, RESUME } = machine.abi.cpu;
+                const bytes = new Uint8Array(machine.memory.buffer);
+                const words = new Uint32Array(bytes.buffer);
+                // Two successive countdowns. OSR applies to the second loop
+                // and moves the original entry, which is itself a loop header.
+                const code = Uint8Array.of(0x48, 0x75, 0xfd, 0x49, 0x75, 0xfd, 0xc3);
+                bytes.set(code, PARK);
+                machine.codeEnd = () => PARK + code.length;
+                machine.loadModuleSync(compiler.translate(code, PARK, [], GUEST_LIMIT, false, opt), "entry-loop");
+                words[(cpu + GPR) >>> 2] = 112;
+                words[(cpu + GPR + 4) >>> 2] = 83;
+                words[(cpu + GPR + 16) >>> 2] = STACK;
+                words[STACK >>> 2] = machine.stopAddress;
+                words[machine.tickAddr >>> 2] = 100;
+                words[(cpu + PREEMPT_AT) >>> 2] = 99;
+                let resume = 0;
+                machine.onPreempt = (_cpu, pc) => { resume = pc; return true; };
+                expect(machine.run(cpu, PARK)).toBe(machine.yieldAddress);
+                expect(resume).toBe(PARK);
+                expect(words[(cpu + GPR) >>> 2]).toBe(111);
+                expect(words[(cpu + GPR + 4) >>> 2]).toBe(83);
+                expect(words[(cpu + RESUME) >>> 2]).toBe(0);
+                words[(cpu + PREEMPT_AT) >>> 2] = 101;
+                expect(machine.run(cpu, resume)).toBe(machine.stopAddress);
+                expect(words[(cpu + GPR) >>> 2]).toBe(0);
+                expect(words[(cpu + GPR + 4) >>> 2]).toBe(0);
+                expect(words[(cpu + GPR + 16) >>> 2]).toBe(STACK + 4);
+            } finally { machine.dispose(); }
+        });
+
+        test(`a backward jump to another demand module at opt ${opt} polls the scheduler`, async () => {
+            const { compiler, machine } = await fastMachine();
+            try {
+                const cpu = machine.newCpu();
+                const { GPR, PREEMPT_AT } = machine.abi.cpu;
+                const words = new Uint32Array(machine.memory.buffer);
+                const bytes = new Uint8Array(words.buffer);
+                const later = PARK + 0x20;
+                const target = Uint8Array.of(0xc3);
+                const source = Uint8Array.of(0x40, 0xeb, 0xdd); // inc eax; jmp PARK
+                bytes.set(target, PARK);
+                bytes.set(source, later);
+                machine.loadModuleSync(compiler.translate(target, PARK, [], GUEST_LIMIT, false, opt), "target");
+                machine.loadModuleSync(compiler.translate(source, later, [], GUEST_LIMIT, false, opt), "source");
+                words[(cpu + GPR) >>> 2] = 10;
+                words[(cpu + GPR + 16) >>> 2] = STACK;
+                words[STACK >>> 2] = machine.stopAddress;
+                words[machine.tickAddr >>> 2] = 100;
+                words[(cpu + PREEMPT_AT) >>> 2] = 99;
+                let resume = 0;
+                machine.onPreempt = (_cpu, pc) => { resume = pc; return true; };
+                expect(machine.run(cpu, later)).toBe(machine.yieldAddress);
+                expect(resume).toBe(PARK);
+                expect(words[(cpu + GPR) >>> 2]).toBe(11);
+                expect(words[(cpu + GPR + 16) >>> 2]).toBe(STACK);
+                words[(cpu + PREEMPT_AT) >>> 2] = 101;
+                expect(machine.run(cpu, resume)).toBe(machine.stopAddress);
+                expect(words[(cpu + GPR + 16) >>> 2]).toBe(STACK + 4);
+            } finally { machine.dispose(); }
+        });
     }
 
-    test("exits the scheduler's park with current registers and redispatches changed code", async () => {
+    test("yields at the scheduler's park without an ownership check and redispatches changed code", async () => {
         const { compiler, machine } = await fastMachine();
         try {
             const cpu = machine.newCpu();
@@ -89,14 +229,15 @@ describe("fast ABI11 in the BottleShip runtime", () => {
             bytes.set(instruction, PARK);
             machine.loadModuleSync(compiler.translate(instruction, PARK, [], GUEST_LIMIT), "park");
             const observed: Array<[number, number]> = [];
-            let owner = true;
-            const release = machine.setParkExit(PARK, pc => owner && pc === PARK,
+            const release = machine.setParkExit(PARK,
                 (slot, pc) => observed.push([pc, state.getUint32(slot + GPR, true)]));
             write(cpu + GPR, 0x12345678);
             write(cpu + PREEMPT_AT, 0xffffffff);
             expect(machine.run(cpu, PARK)).toBe(machine.yieldAddress);
             expect(observed).toEqual([[PARK, 0x12345678]]);
-            owner = false;
+            write(cpu + GPR, 7);
+            expect(machine.run(cpu, PARK)).toBe(machine.yieldAddress);
+            expect(observed).toEqual([[PARK, 0x12345678], [PARK, 7]]);
             const finished = Uint8Array.of(0xb8, 0x2a, 0, 0, 0, 0xc3); // mov eax,42; ret
             machine.codeEnd = () => PARK + finished.length;
             bytes.set(finished, PARK);
@@ -104,7 +245,7 @@ describe("fast ABI11 in the BottleShip runtime", () => {
             write(STACK, machine.stopAddress);
             expect(machine.run(cpu, PARK)).toBe(machine.stopAddress);
             expect(state.getUint32(cpu + GPR, true)).toBe(42);
-            expect(observed).toHaveLength(1);
+            expect(observed).toHaveLength(2);
             release();
         } finally {
             machine.dispose();

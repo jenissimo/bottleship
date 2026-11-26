@@ -1,5 +1,6 @@
 import { parseIoProfile, profileChunkOrder, type WgbIoPolicy } from "@bottleship/formats/wgb/io-profile";
 import { WwtEmulator } from "./wwt/emulator";
+import type { PeAotProgress } from "./wwt/pe-aot-progress";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { adoptFreshGuestMemory } from "./core/memory/guest-page-dirty";
 import { noteBootError, noteBootIdentity, restorePendingAtEntry, savestatesEnabled, type BundleEntryKey } from "./savestate/host";
@@ -385,9 +386,16 @@ const resetHleReady = (): void => {
   hleReady = new Promise<void>((resolve) => { resolveHleReady = resolve; });
 };
 
-let pendingPeData: Uint8Array | null = null;
-let pendingBundle: { data?: Uint8Array; url?: string; blob?: Blob; preload?: boolean; io?: WgbIoPolicy } | null = null;
-let preparedPendingBundle: { payload: { data?: Uint8Array; url?: string; blob?: Blob; preload?: boolean; io?: WgbIoPolicy }; bundle: import("./runtime/filesystem/wgb-loader").WgbBundle } | null = null;
+type BundleLoadPayload = {
+  data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean; io?: WgbIoPolicy; launchId?: number;
+};
+let pendingPeData: { bytes: Uint8Array; launchId: number } | null = null;
+let pendingBundle: BundleLoadPayload | null = null;
+/** @transient(host launch token replaced whenever a different load starts) */
+let peAotLaunchId = 0;
+/** @transient(monotonic AOT progress identifier scoped to the host worker lifetime) */
+let peAotAttempt = 0;
+let preparedPendingBundle: { payload: BundleLoadPayload; bundle: import("./runtime/filesystem/wgb-loader").WgbBundle } | null = null;
 let heartbeatInterval: number | null = null;
 let schedulerInterval: number | null = null;
 let registryFlushInterval: number | null = null;
@@ -476,7 +484,7 @@ networkConsent.onWaitingChange(waiting => {
 /** True once a PE has been booted in this worker session (loadApp / load_bundle without page reload). */
 let gameSessionActive = false;
 /** The payload that booted the current game — replayed verbatim by a self re-exec. */
-let lastBundlePayload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean; io?: WgbIoPolicy } | null = null;
+let lastBundlePayload: BundleLoadPayload | null = null;
 /** Command line the next boot must use instead of the manifest's `args` (self re-exec). */
 let pendingReExecArgs: string | null = null;
 /** Harness boot-args override (load_bundle `args`): replaces the manifest's args for one
@@ -1217,11 +1225,11 @@ const drawPlaceholder = () => {
  *  or the host is told the load succeeded and keeps its launch overlay up over the crash. */
 type PeLoadResult = "ok" | "queued" | "failed";
 
-const loadPeData = async (peData: Uint8Array, skipReset: boolean = false): Promise<PeLoadResult> => {
+const loadPeData = async (peData: Uint8Array, skipReset: boolean = false, launchId = peAotLaunchId): Promise<PeLoadResult> => {
   const system = System.getInstance();
   if (!system.process) {
     Logger.log(LogCategory.SYSTEM, "System not ready, queuing PE data");
-    pendingPeData = peData;
+    pendingPeData = { bytes: peData, launchId };
     return "queued";
   }
   // The Process exists but the dispatch table may still be empty (see hleReady).
@@ -1230,7 +1238,8 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false): Promi
   // Reset system state before loading new application
   if (!skipReset) {
     await prepareFullGameSwitch();
-    if (await switchWwtRuntime(wwtModeFor(), () => { pendingPeData = peData; })) return "queued";
+    peAotLaunchId = launchId;
+    if (await switchWwtRuntime(wwtModeFor(), () => { pendingPeData = { bytes: peData, launchId }; })) return "queued";
   }
 
   await finishProcessNetworkLifetime();
@@ -1684,7 +1693,7 @@ const postBundleMeta = (manifest: WgbManifest, gameId: string): void => {
 /** @transient(boots this worker has run; a savestate loads only on the first, into untouched module state) */
 let bootsInThisWorker = 0;
 
-const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean; io?: WgbIoPolicy }) => {
+const loadBundleImpl = async (payload: BundleLoadPayload) => {
   const system = System.getInstance();
   if (!system.process) {
     pendingBundle = payload;
@@ -1704,6 +1713,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
   const prepared = preparedPendingBundle && preparedPendingBundle.payload === payload ? preparedPendingBundle.bundle : null;
   preparedPendingBundle = null;
   await prepareFullGameSwitch(prepared !== null);
+  peAotLaunchId = payload.launchId ?? 0;
 
   // Restart placeholder drawing
   placeholderActive = true;
@@ -2417,7 +2427,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
   }
 };
 
-const loadBundle = (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean; io?: WgbIoPolicy }) => {
+const loadBundle = (payload: BundleLoadPayload) => {
   lastBundlePayload = payload;
   loadBundleChain = loadBundleChain
     .then(() => loadBundleImpl(payload))
@@ -2642,7 +2652,19 @@ const initEmulator = async (canvas: OffscreenCanvas, previousWwt?: WwtEmulator) 
     const wwt = cpuBackend === "wwt";
     const createWwtRuntime = async () => {
       const { createWwtCpu } = await import("./wwt/cpu");
-      const cpu = await createWwtCpu({ memorySize: ramSize, mode: wwtMode });
+      const cpu = await createWwtCpu({
+        memorySize: ramSize,
+        mode: wwtMode,
+        beginPeAot: module => {
+          const launchId = peAotLaunchId;
+          const attempt = ++peAotAttempt;
+          return status => {
+            if (!launchId || peAotLaunchId !== launchId) return;
+            const message: PeAotProgress = { type: "pe_aot_progress", launchId, attempt, module, ...status };
+            self.postMessage(message);
+          };
+        },
+      });
       activeWwtMode = wwtMode;
       return new WwtEmulator(cpu, error => System.getInstance().reportGuestCrash({
         reason: `WWT execution failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -3536,7 +3558,7 @@ const initEmulator = async (canvas: OffscreenCanvas, previousWwt?: WwtEmulator) 
       if (pendingPeData) {
         const buffered = pendingPeData;
         pendingPeData = null;
-        loadPeData(buffered);
+        loadPeData(buffered.bytes, false, buffered.launchId);
       }
       if (pendingBundle) {
         const buffered = pendingBundle;
@@ -3988,7 +4010,7 @@ const handleWorkerMessage = (event: MessageEvent): void => {
   if (message?.type === "load_pe") {
     if (Object.hasOwn(message, "network")) applySessionNetwork(message.network);
     const peData = message.data as Uint8Array;
-    loadPeData(peData).catch(err => Logger.error(LogCategory.SYSTEM, `load_pe failed: ${err}`));
+    loadPeData(peData, false, message.launchId ?? 0).catch(err => Logger.error(LogCategory.SYSTEM, `load_pe failed: ${err}`));
   }
 
   if (message?.type === "hle_enable") {
@@ -4037,7 +4059,8 @@ const handleWorkerMessage = (event: MessageEvent): void => {
     // The launcher's own re-exec still outranks this (it is what the guest asked for);
     // this only replaces the manifest's boot args, and only for this load.
     bootArgsOverride = typeof message.args === "string" ? message.args : null;
-    loadBundle({ data: message.data, url: message.url, blob: message.blob, blobs: message.blobs, preload: message.preload, io: message.io });
+    loadBundle({ data: message.data, url: message.url, blob: message.blob, blobs: message.blobs,
+      preload: message.preload, io: message.io, launchId: message.launchId });
   }
 
   // --- WGB wizard build service (Stage 1) — additive, separate from the boot path above. -----

@@ -1,0 +1,318 @@
+--- a/crates/wwt/src/discover.rs
++++ b/crates/wwt/src/discover.rs
+@@ -179,12 +179,20 @@
+     /// Explores everything reachable from the current functions and leaders.
+     /// `region` restricts decoding to `[start, end)` when given.
+     pub fn explore(&mut self, src: &dyn CodeSource) {
++        self.explore_reporting(src, &mut None);
++    }
++
++    pub(crate) fn explore_reporting(
++        &mut self,
++        src: &dyn CodeSource,
++        progress: &mut Option<&mut dyn FnMut(usize)>,
++    ) {
+         let mut work: VecDeque<u64> = self.leaders.iter().copied().collect();
+         let mut done: BTreeSet<u64> = BTreeSet::new();
+         // Indirect jumps whose table bound was not found when first seen.
+         let mut deferred: Vec<(u64, Instruction)> = vec![];
+         loop {
+-            self.explore_from(src, &mut work, &mut done, &mut deferred);
++            self.explore_from(src, &mut work, &mut done, &mut deferred, progress);
+             if deferred.is_empty() {
+                 break;
+             }
+@@ -262,6 +270,7 @@
+         work: &mut VecDeque<u64>,
+         done: &mut BTreeSet<u64>,
+         deferred: &mut Vec<(u64, Instruction)>,
++        progress: &mut Option<&mut dyn FnMut(usize)>,
+     ) {
+         while let Some(start) = work.pop_front() {
+             if !done.insert(start) || self.external.contains(&start) {
+@@ -278,6 +287,12 @@
+                     None => match decode_one_in(src, va, self.mode) {
+                         Some(i) => {
+                             self.insts.insert(va, i);
++                            if let Some(report) = progress {
++                                let decoded = self.insts.len();
++                                if decoded % 4096 == 0 {
++                                    report(decoded);
++                                }
++                            }
+                             i
+                         }
+                         None => {
+--- a/crates/wwt/src/translate.rs
++++ b/crates/wwt/src/translate.rs
+@@ -185,6 +185,16 @@
+ /// Discovers code in a PE image from all static seeds plus `profile` (code
+ /// found at run time on earlier launches).
+ pub fn discover_pe(pe: &PeFile, img: &dyn CodeSource, profile: &[u64], cfg: &Config) -> Discovery {
++    discover_pe_reporting(pe, img, profile, cfg, None)
++}
++
++fn discover_pe_reporting(
++    pe: &PeFile,
++    img: &dyn CodeSource,
++    profile: &[u64],
++    cfg: &Config,
++    mut decoded: Option<&mut dyn FnMut(usize)>,
++) -> Discovery {
+     let mut d = Discovery::new_in(pe.mode);
+     if let Some(e) = pe.entry_point() {
+         d.add_function_seed(e, SeedKind::Entry);
+@@ -226,7 +236,7 @@
+             }
+         }
+     }
+-    d.explore(img);
++    d.explore_reporting(img, &mut decoded);
+     // Code pointers in data: relocation targets (always present in DLLs),
+     // otherwise a scan of data sections. Addresses already known as
+     // instruction starts are reached some other way (jump tables, calls).
+@@ -276,7 +286,7 @@
+             d.add_function_seed(v, kind);
+         }
+     }
+-    d.explore(img);
++    d.explore_reporting(img, &mut decoded);
+     // setjmp returns a second time through longjmp, after its caller's
+     // frame has moved on: its return sites must be entry points.
+     let setjmp_slots: Vec<u64> = pe
+@@ -317,20 +327,43 @@
+         for r in returns {
+             d.add_function_seed(r, SeedKind::Call);
+         }
+-        d.explore(img);
++        d.explore_reporting(img, &mut decoded);
++    }
++    if let Some(report) = decoded {
++        report(d.insts.len());
+     }
+     d
+ }
++
++#[repr(u32)]
++pub enum PePhase {
++    Discover,
++    Lift,
++    Optimize,
++    Emit,
++}
++
++/// Reports phase, completed work and total work (zero when still unknown).
++pub type PeProgress<'a> = dyn FnMut(PePhase, usize, usize) + 'a;
+ 
+ /// Translates a PE file ahead of time. The mode (x86 or x86-64) comes from
+ /// the file. A 64-bit image preferred above 4 GB is folded below it when the
+ /// target is a 32-bit memory.
+ pub fn translate_pe(pe: &PeFile, cfg: &Config, profile: &[u64]) -> Result<Translation> {
++    translate_pe_with_progress(pe, cfg, profile, None)
++}
++
++pub fn translate_pe_with_progress(
++    pe: &PeFile,
++    cfg: &Config,
++    profile: &[u64],
++    mut progress: Option<&mut PeProgress<'_>>,
++) -> Result<Translation> {
+     let mut cfg = cfg.clone().with_mode(pe.mode);
+     if !cfg.codegen.mem64 && pe.image_base >> 32 != 0 {
+         let mut low = pe.clone();
+         low.fold_below_4gb()?;
+-        return translate_pe(&low, &cfg, profile);
++        return translate_pe_with_progress(&low, &cfg, profile, progress);
+     }
+     match cfg.c_abi {
+         Some(true) => cfg.lift.abi = CallAbi::c(),
+@@ -353,7 +386,12 @@
+     }
+     let cfg = &cfg;
+     let img = pe.image()?;
+-    let mut d = discover_pe(pe, &img, profile, cfg);
++    let mut d = if let Some(report) = &mut progress {
++        report(PePhase::Discover, 0, 0);
++        discover_pe_reporting(pe, &img, profile, cfg, Some(&mut |n| report(PePhase::Discover, n, 0)))
++    } else {
++        discover_pe(pe, &img, profile, cfg)
++    };
+     let meta = image_meta(pe);
+     let names: HashMap<u64, String> = pe.code_names().into_iter().collect();
+     let tried = if cfg.native_strings && pe.is_wine_builtin() {
+@@ -361,7 +399,7 @@
+     } else {
+         HashMap::new()
+     };
+-    translate_discovered(&img, &mut d, cfg, Some(&meta), &names, &tried)
++    translate_discovered_reporting(&img, &mut d, cfg, Some(&meta), &names, &tried, progress)
+ }
+ 
+ /// Native implementations to try first, by function entry: those
+@@ -446,7 +484,22 @@
+     names: &HashMap<u64, String>,
+     tried: &HashMap<u64, (&'static str, Vec<u32>)>,
+ ) -> Result<Translation> {
++    translate_discovered_reporting(src, d, cfg, meta, names, tried, None)
++}
++
++fn translate_discovered_reporting(
++    src: &dyn CodeSource,
++    d: &mut Discovery,
++    cfg: &Config,
++    meta: Option<&ImageMeta>,
++    names: &HashMap<u64, String>,
++    tried: &HashMap<u64, (&'static str, Vec<u32>)>,
++    mut progress: Option<&mut PeProgress<'_>>,
++) -> Result<Translation> {
+     let mut report = Report::default();
++    if let Some(progress) = &mut progress {
++        progress(PePhase::Lift, 0, 0);
++    }
+     for k in d.seed_kinds.values() {
+         *report.seeds.entry(format!("{k:?}")).or_default() += 1;
+     }
+@@ -496,7 +549,17 @@
+                 }
+             };
+             funcs.push(f);
+-        }
++            if funcs.len() % 64 == 0 {
++                if let Some(progress) = &mut progress {
++                    progress(PePhase::Lift, funcs.len(), 0);
++                }
++            }
++        }
++    }
++    let total = funcs.len();
++    if let Some(progress) = &mut progress {
++        progress(PePhase::Lift, total, 0);
++        progress(PePhase::Optimize, 0, total);
+     }
+     call_through_import_stubs(&mut funcs);
+     if cfg.prove_flags_abi {
+@@ -518,9 +581,14 @@
+         }
+         report.flag_free_returns = prove_flags_abi(&mut funcs, reading);
+     }
+-    for f in &mut funcs {
++    for (index, f) in funcs.iter_mut().enumerate() {
+         opt::optimize(f, cfg.opt_level);
+         report.blocks += f.blocks.len();
++        if (index + 1) % 64 == 0 || index + 1 == total {
++            if let Some(progress) = &mut progress {
++                progress(PePhase::Optimize, index + 1, total);
++            }
++        }
+     }
+     if cfg.opt_level > 0 && cfg.inline {
+         for i in crate::inline::inline_leaves(&mut funcs) {
+@@ -544,7 +612,12 @@
+         .with_code64(cfg.mode() == Mode::X64 && cfg.codegen.mem64)
+         .with_names(names)
+         .with_code(src);
+-    let wasm = gen.build(&funcs, &meta_json);
++    let wasm = if let Some(progress) = progress {
++        progress(PePhase::Emit, 0, total);
++        gen.build_reporting(&funcs, &meta_json, Some(&mut |n| progress(PePhase::Emit, n, total)))
++    } else {
++        gen.build(&funcs, &meta_json)
++    };
+     report.wasm_bytes = wasm.len();
+     Ok(Translation {
+         wasm,
+--- a/crates/wwt/src/codegen.rs
++++ b/crates/wwt/src/codegen.rs
+@@ -269,7 +269,16 @@
+     }
+ 
+     /// Generates the module bytes.
+-    pub fn build(mut self, funcs: &[Function], meta_json: &str) -> Vec<u8> {
++    pub fn build(self, funcs: &[Function], meta_json: &str) -> Vec<u8> {
++        self.build_reporting(funcs, meta_json, None)
++    }
++
++    pub(crate) fn build_reporting(
++        mut self,
++        funcs: &[Function],
++        meta_json: &str,
++        mut progress: Option<&mut dyn FnMut(usize)>,
++    ) -> Vec<u8> {
+         let mut module = Module::new();
+         let at = self.addr_type();
+         let ct = self.code_type();
+@@ -458,7 +467,7 @@
+         // Trapping accesses, at first by their offset in the code section's
+         // entries.
+         let mut traps = Vec::new();
+-        for f in funcs {
++        for (index, f) in funcs.iter().enumerate() {
+             let (body, r, t) = self.gen_function_full(f);
+             let start = code.byte_len() + leb_len(body.byte_len());
+             traps.extend(t.into_iter().map(|t| TrapSite {
+@@ -467,6 +476,11 @@
+             }));
+             code.function(&body);
+             residue.push(r);
++            if (index + 1) % 64 == 0 || index + 1 == funcs.len() {
++                if let Some(progress) = &mut progress {
++                    progress(index + 1);
++                }
++            }
+         }
+         // The entries start after the section's id, size and count.
+         let count = (self.helpers.len() + funcs.len()) as u32;
+--- a/crates/wwt-wasm/src/lib.rs
++++ b/crates/wwt-wasm/src/lib.rs
+@@ -129,6 +129,42 @@
+     opt_level: u32,
+     flags: u32,
+ ) -> *mut u8 {
++    translate_pe_impl(file, file_len, profile, n_profile, opt_level, flags, None)
++}
++
++#[cfg(target_arch = "wasm32")]
++#[link(wasm_import_module = "bottleship")]
++extern "C" {
++    fn pe_progress(phase: u32, completed: usize, total: usize);
++}
++
++/// Translates a PE with progress reported through the host import.
++///
++/// # Safety
++/// The pointers follow the same contract as `wwt_translate_pe`.
++#[cfg(target_arch = "wasm32")]
++#[no_mangle]
++pub unsafe extern "C" fn wwt_translate_pe_with_progress(
++    file: *const u8,
++    file_len: usize,
++    profile: *const u64,
++    n_profile: usize,
++    opt_level: u32,
++    flags: u32,
++) -> *mut u8 {
++    translate_pe_impl(file, file_len, profile, n_profile, opt_level, flags,
++        Some(&mut |phase, completed, total| pe_progress(phase as u32, completed, total)))
++}
++
++unsafe fn translate_pe_impl(
++    file: *const u8,
++    file_len: usize,
++    profile: *const u64,
++    n_profile: usize,
++    opt_level: u32,
++    flags: u32,
++    progress: Option<&mut wwt::translate::PeProgress<'_>>,
++) -> *mut u8 {
+     let data = std::slice::from_raw_parts(file, file_len).to_vec();
+     let profile = if n_profile == 0 {
+         vec![]
+@@ -147,7 +183,7 @@
+     let Ok(pe) = wwt::pe::PeFile::parse(data) else {
+         return result(vec![]);
+     };
+-    match wwt::translate_pe(&pe, &cfg, &profile) {
++    match wwt::translate::translate_pe_with_progress(&pe, &cfg, &profile, progress) {
+         Ok(t) => result(t.wasm),
+         Err(_) => result(vec![]),
+     }

@@ -4,6 +4,8 @@ import { loadWwtProvider, type WwtMachine } from "./cpu-provider";
 import { deliverProtectedFault, emulateProtectedInstruction, updateSegment } from "./cpu-protected";
 import { emulateWwtPortIo } from "./port-io";
 import { packMappedPe } from "./pe-aot";
+import { PeAotCompileTimeoutError } from "./pe-aot-compiler";
+import type { PeAotStatus } from "./pe-aot-progress";
 import { PeProfileRecorder, peProfileEntries } from "./pe-profile";
 import { peAotCacheStats } from "./pe-aot-cache";
 import { sha256Hex } from "../savestate/chunk-store";
@@ -71,6 +73,7 @@ interface WwtCpuOptions {
     directHypercall?: boolean;
     mode?: WwtMode;
     flatRam?: boolean;
+    beginPeAot?: (name: string) => (status: PeAotStatus) => void;
 }
 
 interface ProtectedModeRegisters {
@@ -94,7 +97,7 @@ export async function createWwtCpu(options: WwtCpuOptions): Promise<WwtCpu> {
         const portable = directHypercall ? hypercall.directInteger : undefined;
         machine.natives.hle_out32 = portable?.dispatch ?? (() => 0);
         machine.natives.hle_out32_config = portable?.configAddress ?? 0;
-        return new WwtCpu(machine, memorySize, hypercall, cpuStateBase);
+        return new WwtCpu(machine, memorySize, hypercall, cpuStateBase, options.beginPeAot);
     } catch (error) {
         machine.dispose?.();
         throw error;
@@ -173,6 +176,7 @@ export class WwtCpu {
         memorySize: number,
         readonly wwtHypercall: WwtHypercall,
         readonly cpuStateBase: number,
+        private readonly beginPeAot?: WwtCpuOptions["beginPeAot"],
     ) {
         this.wasm_memory = machine.memory;
         const buffer = this.wasm_memory.buffer;
@@ -233,8 +237,8 @@ export class WwtCpu {
             exports: {
                 memory: this.wasm_memory,
                 ...(machine.wallClock && machine.setParkExit ? {
-                    set_wwt_park_exit: (address: number, ownsPark: (pc: number) => boolean) =>
-                        machine.setParkExit!(address, ownsPark, (cpu, eip) => this.publishGuestState(cpu, eip)),
+                    set_wwt_park_exit: (address: number) =>
+                        machine.setParkExit!(address, (cpu, eip) => this.publishGuestState(cpu, eip)),
                 } : {}),
                 get_cycle_budget_ptr: () => budgetAddress,
                 full_clear_tlb: () => this.invalidatePaging(),
@@ -505,8 +509,9 @@ export class WwtCpu {
         const ranges = this.moduleRanges.filter(range => range.start >= base && range.end <= base + size);
         if (ranges.length === 0) return;
         const reportFailure = (error: unknown) => console.warn(`[WWT AOT] ${name}: ${String(error)}`);
+        const generation = this.peAotGeneration;
+        let onStatus: ((status: PeAotStatus) => void) | undefined;
         try {
-            const generation = this.peAotGeneration;
             const digest = await sha256Hex(file);
             const executable = (pc: number) => ranges.some(range => range.start <= pc && pc < range.end);
             const saved = selector === "learn" ? [] : await peProfileEntries(digest, base, size);
@@ -521,6 +526,13 @@ export class WwtCpu {
                 this.profileRecorder.watch(digest, base, ranges);
             }
             if (learnOnly) return;
+            const publish = this.beginPeAot?.(name);
+            if (publish) {
+                onStatus = status => {
+                    if (this.peAotGeneration === generation) publish(status);
+                };
+                onStatus({ phase: "lookup" });
+            }
             const packed = packMappedPe(this.mem8.subarray(base, base + size), file, base);
             const linkage = fast ? "full" : (options.__wwtPeAotLinkage ?? (selector === "auto" ? "full" : "page-local"));
             const imageBounds = linkage === "full" ? { base, end: base + size, executableRanges: ranges } : undefined;
@@ -528,9 +540,12 @@ export class WwtCpu {
                 if (this.peAotGeneration !== generation) return false;
                 const fresh = packMappedPe(this.mem8.subarray(base, base + size), file, base);
                 return fresh.length === packed.length && fresh.every((byte, index) => byte === packed[index]);
-            }, profile, imageBounds);
+            }, profile, imageBounds, onStatus);
         } catch (error) {
             reportFailure(error);
+            onStatus?.(error instanceof PeAotCompileTimeoutError
+                ? { phase: "fallback", reason: "timeout", budgetMs: error.budgetMs }
+                : { phase: "fallback", reason: "error" });
         }
     }
 

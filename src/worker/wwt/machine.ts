@@ -1,6 +1,8 @@
 import type { WwtMachine, WwtModule, WwtPeImageBounds } from "./cpu-provider";
 import { WwtCompiler, WwtTranslationStackOverflow } from "./translator";
 import { getOrBuild } from "./pe-aot-cache";
+import { compileAbi11Pe } from "./pe-aot-compiler";
+import type { PeAotStatus } from "./pe-aot-progress";
 import { WwtWallClock } from "./wall-clock";
 import { trapAddress, WwtTrapMap } from "./traps";
 
@@ -62,7 +64,7 @@ export class BottleShipMachine implements WwtMachine {
     private readonly writableCodePages = new Set<number>();
     private readonly cpus = new Set<number>();
     private tableUsed = 2;
-    private parkExit?: { address: number; ownsPark: (pc: number) => boolean; publish: (cpu: number, pc: number) => void };
+    private parkExit?: { address: number; publish: (cpu: number, pc: number) => void };
     private parkTrampoline?: WebAssembly.Module;
     readonly natives: Record<string, WebAssembly.ImportValue> = {};
     private readonly lookupL1;
@@ -268,13 +270,12 @@ export class BottleShipMachine implements WwtMachine {
         return true;
     }
 
-    setParkExit(address: number, ownsPark: (pc: number) => boolean,
-        publish: (cpu: number, pc: number) => void): () => void {
+    setParkExit(address: number, publish: (cpu: number, pc: number) => void): () => void {
         if (!this.wallClock || !Number.isInteger(address) || address <= 0 || address + 1 >= this.guestLimit) {
             throw new RangeError("Invalid WWT scheduler park address");
         }
         if (this.parkExit) this.invalidateParkEntry(this.parkExit.address);
-        const binding = { address, ownsPark, publish };
+        const binding = { address, publish };
         this.parkExit = binding;
         const slot = this.lookup(address);
         if (slot > 1) this.wrapParkEntry(address, slot);
@@ -305,7 +306,9 @@ export class BottleShipMachine implements WwtMachine {
                 this.restartAfterSmc = address;
                 return this.yieldAddress;
             }
-            if (this.parkExit !== binding || !binding.ownsPark(address)) return 0;
+            if (this.parkExit !== binding) return 0;
+            // Give the scheduler a boundary even if the current thread has not
+            // completed its transition into a wait state.
             binding.publish(cpu, address);
             return this.yieldAddress;
         };
@@ -377,33 +380,60 @@ export class BottleShipMachine implements WwtMachine {
     }
 
     async loadPeAot(file: Uint8Array<ArrayBuffer>, name: string, executable: (address: number) => boolean,
-        verifyCurrent: () => boolean, profile: number[] = [], fullImage?: WwtPeImageBounds): Promise<void> {
+        verifyCurrent: () => boolean, profile: number[] = [], fullImage?: WwtPeImageBounds,
+        onStatus?: (status: PeAotStatus) => void): Promise<void> {
         const guestMmio = this.guestMmio;
-        if (this.wallClock && (!fullImage || !this.canLinkUpstreamImage(fullImage))) return;
+        if (this.wallClock && (!fullImage || !this.canLinkUpstreamImage(fullImage))) {
+            onStatus?.({ phase: "fallback", reason: "ineligible" });
+            return;
+        }
         const policy = this.wallClock ? "upstream-linked-v1" : fullImage ? "linked-smc-v2" : "page-local-v2";
         const modeKey = `${this.compiler.cacheId}/${this.guestLimit}/${this.compiler.flags(this.guestLimit, guestMmio)}/${policy}-opt1`;
         const started = performance.now();
         let translateMs = 0;
         let translated = false;
         const profileKey = profile.length ? modeKey + "/seeds/" + profile.join(",") : modeKey;
-        const bytes = await getOrBuild(file, profileKey, () => {
+        const bytes = await getOrBuild(file, profileKey, async () => {
             const start = performance.now();
-            const wasm = this.compiler.translatePe(file, profile, this.guestLimit, guestMmio, !fullImage);
+            let wasm: Uint8Array<ArrayBuffer>;
+            if (this.wallClock && typeof Worker !== "undefined") {
+                onStatus?.({ phase: "starting" });
+                wasm = await compileAbi11Pe({
+                    module: this.compiler.module,
+                    cacheId: this.compiler.cacheId,
+                    file,
+                    profile,
+                    guestLimit: this.guestLimit,
+                }, ({ startedAt, work }) => onStatus?.({ phase: "compiling", startedAt, work }));
+            } else {
+                onStatus?.({ phase: "compiling", startedAt: performance.timeOrigin + performance.now() });
+                wasm = this.compiler.translatePe(file, profile, this.guestLimit, guestMmio, !fullImage);
+            }
             translateMs = performance.now() - start;
             translated = true;
+            onStatus?.({ phase: "output" });
             return wasm;
         });
+        const source = translated ? "compiler" : "cache";
+        onStatus?.({ phase: "finalizing", source });
         const compiling = performance.now();
         const compiled = await WebAssembly.compile(bytes);
-        if (this.guestMmio !== guestMmio || !verifyCurrent()) return;
-        if (this.wallClock && fullImage && !this.canLinkUpstreamImage(fullImage)) return;
+        if (this.guestMmio !== guestMmio || !verifyCurrent()) {
+            onStatus?.({ phase: "fallback", reason: "image-changed" });
+            return;
+        }
+        if (this.wallClock && fullImage && !this.canLinkUpstreamImage(fullImage)) {
+            onStatus?.({ phase: "fallback", reason: "ineligible" });
+            return;
+        }
         const installing = performance.now();
         const module = this.installCompiledModule(compiled, name, executable, fullImage);
-        const report = { name, policy, seeds: profile.length, source: translated ? "compiler" : "cache", translateMs,
+        const report = { name, policy, seeds: profile.length, source, translateMs,
             lookupAndStoreMs: compiling - started - translateMs, compileModuleMs: installing - compiling,
             installMs: performance.now() - installing,
             wasmBytes: bytes.length, entries: module.entries };
         console.info("[WWT AOT] " + JSON.stringify(report));
+        onStatus?.({ phase: "ready", source });
     }
 
     loadModuleSync(bytes: Uint8Array, name: string, canInstall?: (address: number) => boolean,

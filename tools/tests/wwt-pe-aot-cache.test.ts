@@ -34,7 +34,7 @@ test("PE translations are reused only for the same image and mode and recover fr
     try {
         const root = installFakeOpfs();
         let builds = 0;
-        const build = () => Uint8Array.of(++builds);
+        const build = async () => Uint8Array.of(++builds);
         const image = Uint8Array.of(1);
         expect(await getOrBuild(image, "compiler-1/paged", build)).toEqual(Uint8Array.of(1));
         expect(await getOrBuild(image, "compiler-1/paged", build)).toEqual(Uint8Array.of(1));
@@ -47,6 +47,10 @@ test("PE translations are reused only for the same image and mode and recover fr
         expect(await getOrBuild(Uint8Array.of(2), "compiler-1/paged", build)).toEqual(Uint8Array.of(4));
         expect(await getOrBuild(image, "compiler-1/paged", build)).toEqual(Uint8Array.of(2));
         expect(builds).toBe(4);
+        await expect(getOrBuild(image, "timed-out", async () => {
+            throw new Error("Cold PE translation timed out");
+        })).rejects.toThrow("Cold PE translation timed out");
+        expect(await getOrBuild(image, "timed-out", build)).toEqual(Uint8Array.of(5));
     } finally {
         if (previous) Object.defineProperty(globalThis, "navigator", previous);
         else Reflect.deleteProperty(globalThis, "navigator");

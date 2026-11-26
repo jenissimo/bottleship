@@ -49,7 +49,8 @@ async function makeRoom(dir: Directory, except: string, required: number): Promi
 
 /** A translation is specific to the mapped image and the compiler/backend configuration. */
 export async function getOrBuild(
-    image: Uint8Array<ArrayBuffer>, modeKey: string, build: () => Uint8Array<ArrayBuffer>,
+    image: Uint8Array<ArrayBuffer>, modeKey: string,
+    build: () => Uint8Array<ArrayBuffer> | Promise<Uint8Array<ArrayBuffer>>,
 ): Promise<Uint8Array<ArrayBuffer>> {
     const dir = await cacheDirectory();
     if (!dir) { stats.misses++; return build(); }
@@ -62,7 +63,7 @@ export async function getOrBuild(
         return cached;
     }
     stats.misses++;
-    const bytes = build();
+    const bytes = await build();
     if (!bytes.length || bytes.length + HEADER_BYTES > DISK_BUDGET) return bytes;
     try {
         await makeRoom(dir, key, bytes.length + HEADER_BYTES);

@@ -14,7 +14,9 @@ upstream projects referenced here.
 The CPU compiler comes from the `wwt` and `wwt-wasm` crates in
 [WebWindows](https://github.com/Glavin001/WebWindows/tree/5c845c1b45659cfb5ed00a0da5d3870025c022f3).
 Both crates inherit the workspace's MIT OR Apache-2.0 license. The packaged compiler
-uses the Apache-2.0 option. `wwt_abi11.wasm` is the original upstream compiler.
+uses the Apache-2.0 option. `wwt_abi11.wasm` includes BottleShip's scheduler,
+flat data segment, x87, and PE progress changes. The patches and reproducible
+build are in [tools/build-wwt-cpu](tools/build-wwt-cpu/README.md).
 `wwt_wasm.wasm` is the protected compiler with BottleShip's changes in
 `tools/build-wwt-cpu/bottleship.patch`. License notices for both binaries ship in
 `public/wwt-compiler-NOTICES.txt`. BottleShip supplies the worker and HLE.

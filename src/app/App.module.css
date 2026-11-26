@@ -317,6 +317,61 @@
   text-transform: uppercase;
 }
 
+.loading-overlay__aot {
+  box-sizing: border-box;
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  color: var(--fg-2);
+  background: rgba(7, 12, 17, 0.65);
+  border: 1px solid var(--line-1);
+  border-radius: 8px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  text-align: left;
+}
+
+.loading-overlay__aot-heading,
+.loading-overlay__aot-module strong {
+  color: var(--fg-1);
+}
+
+.loading-overlay__aot-module strong {
+  overflow-wrap: anywhere;
+}
+
+.loading-overlay__aot-status,
+.loading-overlay__aot-active,
+.loading-overlay__aot-module {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.loading-overlay__aot-status {
+  gap: 8px;
+}
+
+.loading-overlay__aot-elapsed {
+  font-variant-numeric: tabular-nums;
+}
+
+.loading-overlay__aot-history summary {
+  cursor: pointer;
+}
+
+.loading-overlay__aot-history ul {
+  margin: 6px 0 0;
+  padding-inline-start: 20px;
+  max-height: min(132px, 22vh);
+  overflow-y: auto;
+}
+
+.loading-overlay__aot-history li + li {
+  margin-top: 6px;
+}
+
 .loading-overlay__steps {
   display: flex;
   align-items: flex-start;

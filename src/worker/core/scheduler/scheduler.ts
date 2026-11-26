@@ -1181,15 +1181,6 @@ export class Scheduler {
         this.ensureMainThread();
     }
 
-    private ownsWwtPark(pc: number): boolean {
-        if (!this.process || pc !== this.spinLoopBase) return false;
-        const thread = this.getCurrentThread();
-        if (!thread) return false;
-        return (thread.state === ThreadState.WAITING && !!thread.waitInfo) ||
-            thread.state === ThreadState.SUSPENDED ||
-            (thread.state === ThreadState.RUNNING && this.onThreadOwnsSuspendedFrame?.(thread.id) === true);
-    }
-
     /**
      * Called from tick_hooks_after — clean instruction boundary.
      */
@@ -1209,8 +1200,7 @@ export class Scheduler {
             const ex = preemptionManager.getWasmExports?.();
             if (ex?.set_wwt_park_exit) {
                 this.releaseWwtPark?.();
-                this.releaseWwtPark = ex.set_wwt_park_exit(this.spinLoopBase >>> 0,
-                    (pc: number) => this.ownsWwtPark(pc));
+                this.releaseWwtPark = ex.set_wwt_park_exit(this.spinLoopBase >>> 0);
                 this.parkEipArmed = true;
             } else if (ex?.set_park_eip) {
                 ex.set_park_eip(this.spinLoopBase >>> 0);

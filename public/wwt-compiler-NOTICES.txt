@@ -1,5 +1,9 @@
 WebWindows CPU compilers, 5c845c1b45659cfb5ed00a0da5d3870025c022f3, Apache-2.0
-wwt_abi11.wasm is the original WebWindows compiler. wwt_wasm.wasm includes BottleShip modifications.
+wwt_abi11.wasm includes BottleShip changes to scheduler preemption, flat
+data segments, x87 integer copies, and PE compilation progress.
+wwt_wasm.wasm includes BottleShip's protected-mode changes.
+The source revision, patches and build instructions are documented in
+tools/build-wwt-cpu/README.md in the BottleShip repository.
 
 Apache License
                         Version 2.0, January 2004

@@ -5,7 +5,7 @@ diff --git a/crates/wwt/src/codegen.rs b/crates/wwt/src/codegen.rs
      /// The function, the emulation left in it and its trapping accesses.
      fn gen_function_full(&self, f: &Function) -> (wasm_encoder::Function, Residue, Vec<TrapSite>) {
          let fixed;
-+        let mut osr_latches = Vec::new();
++        let mut osr_reentry = None;
          // Blocks from here on are made by the passes below, not lifted.
          let lifted = f.blocks.len();
          // Where the optimizer kept the state a preemption check writes back.
@@ -14,7 +14,7 @@ diff --git a/crates/wwt/src/codegen.rs b/crates/wwt/src/codegen.rs
              reducible::make_reducible(&mut c);
              if self.cfg.osr {
 -                crate::osr::add_reentry(&mut c);
-+                osr_latches = crate::osr::add_reentry(&mut c);
++                osr_reentry = crate::osr::add_reentry(&mut c);
              }
              fixed = c;
              &fixed
@@ -22,7 +22,7 @@ diff --git a/crates/wwt/src/codegen.rs b/crates/wwt/src/codegen.rs
          let mut g = FnGen::new(self, f, &a);
          g.lifted = lifted;
          g.preempt = preempt;
-+        g.osr_latches = osr_latches;
++        g.osr_reentry = osr_reentry;
          g.irreducible = irreducible;
          g.run();
          let r = g.residue;
@@ -30,7 +30,7 @@ diff --git a/crates/wwt/src/codegen.rs b/crates/wwt/src/codegen.rs
      /// `opt::preempt_points` of the lifted function, and whether it was
      /// irreducible: where its back edges' state survived the optimizer.
      preempt: Vec<bool>,
-+    osr_latches: Vec<BlockId>,
++    osr_reentry: Option<crate::osr::Reentry>,
      irreducible: bool,
      emitted: Vec<bool>,
      /// Addresses whose guest-limit check passed, as (vreg, lo, hi): some
@@ -38,7 +38,7 @@ diff --git a/crates/wwt/src/codegen.rs b/crates/wwt/src/codegen.rs
              label_local: 0,
              lifted: n,
              preempt: vec![],
-+            osr_latches: vec![],
++            osr_reentry: None,
              irreducible: false,
              emitted: vec![false; n],
              facts_local: vec![],
@@ -62,11 +62,31 @@ diff --git a/crates/wwt/src/codegen.rs b/crates/wwt/src/codegen.rs
          self.emit(W::LocalGet(0));
          self.code_const(resume);
          self.emit(W::Call(F_PREEMPT));
-@@ -1577,6 +1585,11 @@
+@@ -1521,9 +1529,16 @@
+     /// setter, whose predecessors' edges into the loop entry it marked.
+     fn resume_addr(&self, src: BlockId, tgt: BlockId) -> Option<u64> {
+         let s = &self.f.blocks[src as usize];
+-        if (src as usize) < self.lifted {
+-            if !self.preempt.get(src as usize).copied().unwrap_or(false)
+-                || tgt as usize >= self.lifted
++        let moved_entry = self.osr_reentry.as_ref().map(|reentry| reentry.moved_entry);
++        // OSR replaces block zero with a dispatcher. Its moved entry still
++        // represents the original lifted x86 block at both ends of an edge.
++        if src == 0 && moved_entry.is_some() {
++            return None;
++        }
++        let lifted_src = if Some(src) == moved_entry { 0 } else { src as usize };
++        if lifted_src < self.lifted {
++            if !self.preempt.get(lifted_src).copied().unwrap_or(false)
++                || (tgt as usize >= self.lifted && Some(tgt) != moved_entry)
+             {
+                 return None;
+             }
+@@ -1577,6 +1592,11 @@
      fn terminator(&mut self, x: BlockId) {
          let blk = &self.f.blocks[x as usize];
          let dirty = self.a.dirty_end[x as usize] & opt::term_sync(self.f, x);
-+        if self.osr_latches.contains(&x) {
++        if self.osr_reentry.as_ref().is_some_and(|reentry| reentry.latches.contains(&x)) {
 +            // The synthetic latch replaced a checked x86 back edge. At this
 +            // point RESUME is still clear and blk.addr is the x86 loop header.
 +            self.preempt_at(blk.addr, self.a.dirty_end[x as usize]);
@@ -74,57 +94,77 @@ diff --git a/crates/wwt/src/codegen.rs b/crates/wwt/src/codegen.rs
          match blk.term.clone() {
              Term::Jump(t) => self.do_branch(x, t),
              Term::Branch { t, f, .. } if t == f => self.do_branch(x, t),
+@@ -1694,6 +1714,11 @@
+                 self.do_branch(x, cont);
+             }
+             Term::Exit(addr) => {
++                // Demand translation can split a loop across modules at a
++                // known code entry. Its backward exit is still a back edge.
++                if addr <= blk.addr {
++                    self.preempt_at(addr, dirty);
++                }
+                 self.sync(dirty);
+                 match self.m.direct_target(addr) {
+                     Some(fi) => {
 diff --git a/crates/wwt/src/osr.rs b/crates/wwt/src/osr.rs
 --- a/crates/wwt/src/osr.rs
 +++ b/crates/wwt/src/osr.rs
-@@ -25,20 +25,19 @@
+@@ -25,20 +25,25 @@
      Mem::native(4, offset)
  }
  
 -/// Adds re-entry points to `f`'s loops (which must be reducible). Returns
 -/// whether anything changed.
 -pub fn add_reentry(f: &mut Function) -> bool {
-+/// Adds re-entry points to reducible loops and returns their synthetic latches.
-+pub fn add_reentry(f: &mut Function) -> Vec<BlockId> {
++pub struct Reentry {
++    /// The lifted entry after block zero is replaced by the OSR dispatcher.
++    pub moved_entry: BlockId,
++    pub latches: Vec<BlockId>,
++}
++
++/// Adds re-entry points to reducible loops and returns the moved entry and latches.
++pub fn add_reentry(f: &mut Function) -> Option<Reentry> {
      let before = f.clone();
 -    let changed = add_reentry_points(f);
-+    let latches = add_reentry_points(f);
++    let reentry = add_reentry_points(f)?;
      // Never trade structured code for re-entry.
 -    if changed && !crate::reducible::is_reducible(f) {
-+    if !latches.is_empty() && !crate::reducible::is_reducible(f) {
++    if !crate::reducible::is_reducible(f) {
          *f = before;
 -        return false;
 -    }
 -    changed
-+        return vec![];
-+    }
-+    latches
- }
- 
+-}
+-
 -fn add_reentry_points(f: &mut Function) -> bool {
-+fn add_reentry_points(f: &mut Function) -> Vec<BlockId> {
++        return None;
++    }
++    Some(reentry)
++}
++
++fn add_reentry_points(f: &mut Function) -> Option<Reentry> {
      let order = f.rpo();
      let n = f.blocks.len();
      let mut rpo_num = vec![u32::MAX; n];
-@@ -57,7 +56,7 @@
+@@ -57,7 +62,7 @@
          }
      }
      if headers.is_empty() {
 -        return false;
-+        return vec![];
++        return None;
      }
      // Only outermost loops: making an inner loop's header reachable from
      // the entry would give its enclosing loop a second entry (irreducible).
-@@ -96,7 +95,7 @@
+@@ -96,7 +101,7 @@
                  .all(|(d, &v)| v < NUM_STATE || !a.live_in[h as usize].contains(d))
      });
      if headers.is_empty() {
 -        return false;
-+        return vec![];
++        return None;
      }
      // Block 0 must stay the entry: move its code to a new block.
      let old_entry = f.blocks.len() as BlockId;
-@@ -191,9 +190,11 @@
+@@ -191,9 +196,11 @@
      f.blocks[cur as usize].term = Term::Jump(old_entry);
      // Back edges: count, and re-enter when the count runs out.
      let preds = f.predecessors();
@@ -136,10 +176,159 @@ diff --git a/crates/wwt/src/osr.rs b/crates/wwt/src/osr.rs
          let exit = f.new_block(addr);
          let (one, dec, z, kc) = (
              f.new_vreg(Ty::I32),
-@@ -260,5 +261,5 @@
+@@ -260,5 +267,5 @@
              }
          }
      }
 -    true
-+    latches
+-}
++    Some(Reentry { moved_entry: old_entry, latches })
++}
+diff --git a/crates/wwt/src/lift.rs b/crates/wwt/src/lift.rs
+--- a/crates/wwt/src/lift.rs
++++ b/crates/wwt/src/lift.rs
+@@ -127,6 +127,8 @@
+     /// For each GPR, the address vreg it was last loaded from in the current
+     /// x86 block (used to lower jump tables reached through a register).
+     loaded_from: [Option<V>; 16],
++    /// Integer values carried through a straight-line x87 copy in this block.
++    fpu_int64: [Option<V>; 8],
+     unsupported: Vec<(u64, String)>,
+     extra_entries: Vec<u64>,
  }
+@@ -249,6 +251,7 @@
+         eip: entry,
+         next: entry,
+         loaded_from: [None; 16],
++        fpu_int64: [None; 8],
+         unsupported: vec![],
+         extra_entries: vec![],
+     };
+@@ -1053,7 +1056,8 @@
+     /// Programs run in Windows' flat segments: the selectors Windows gives
+     /// user code (0x23 code, 0x2b data, 0x53 the TEB, or null) load and read
+     /// back; anything else raises a general protection fault, with the
+-    /// selector as the fault information when it names an LDT entry. Only
++    /// selector as the fault information when it names an LDT entry. The
++    /// flat BottleShip data selector is also valid for ES and DS. Only
+     /// the TEB segment has a base (fs), so loads do not change addressing.
+     fn load_segment(&mut self, idx: u32, v: V) {
+         let sel = self.bini(BinOp::I32And, v, 0xffff);
+@@ -1066,6 +1070,16 @@
+         for &a in allowed {
+             let e = self.bini(BinOp::I32Eq, sel, a);
+             ok = self.bin(BinOp::I32Or, ok, e);
++        }
++        // BottleShip's boot GDT pairs SS=0x10 with flat ES and DS. The
++        // Wine selectors above still apply to callers using the upstream GDT.
++        if matches!(idx, 0 | 3) {
++            const BOTTLESHIP_DATA: u32 = 0x10;
++            let ss = self.load_native(Ty::I32, 2, crate::abi::cpu::SEG_SEL + 2 * 2);
++            let bottleship_stack = self.bini(BinOp::I32Eq, ss, BOTTLESHIP_DATA);
++            let bottleship_data = self.bini(BinOp::I32Eq, sel, BOTTLESHIP_DATA);
++            let valid = self.bin(BinOp::I32And, bottleship_stack, bottleship_data);
++            ok = self.bin(BinOp::I32Or, ok, valid);
+         }
+         let bad = self.bini(BinOp::I32Xor, ok, 1);
+         // info = sel & ~7 for an LDT selector (TI set), else 0.
+@@ -1101,6 +1115,7 @@
+     fn lift_block(&mut self, start: u64) {
+         self.cur = self.blocks[&start];
+         self.loaded_from = [None; 16];
++        self.fpu_int64 = [None; 8];
+         let (insts, fall) = self.disc.block(start);
+         if insts.is_empty() {
+             self.eip = start;
+@@ -1113,6 +1128,9 @@
+         for i in &insts {
+             self.eip = i.ip();
+             self.next = i.next_ip();
++            if !matches!(i.mnemonic(), Mnemonic::Fild | Mnemonic::Fxch | Mnemonic::Fistp | Mnemonic::Fisttp) {
++                self.fpu_int64 = [None; 8];
++            }
+             if !self.lift_inst(i) {
+                 // The instruction ended the block (control flow or fault).
+                 return;
+diff --git a/crates/wwt/src/lift/fpu.rs b/crates/wwt/src/lift/fpu.rs
+--- a/crates/wwt/src/lift/fpu.rs
++++ b/crates/wwt/src/lift/fpu.rs
+@@ -95,10 +95,14 @@
+         self.emit_to(FPU_TOP, Op::Copy(t));
+         self.set_st(0, v);
+         self.tag_update(true);
++        self.fpu_int64.rotate_right(1);
++        self.fpu_int64[0] = None;
+     }
+
+     fn fpop(&mut self) {
+         self.tag_update(false);
++        self.fpu_int64.rotate_left(1);
++        self.fpu_int64[7] = None;
+         let t = self.bini(BinOp::I32Add, FPU_TOP, 1);
+         let t = self.bini(BinOp::I32And, t, 7);
+         self.emit_to(FPU_TOP, Op::Copy(t));
+@@ -166,16 +170,6 @@
+                 );
+                 self.un(UnOp::F64ConvertI32S, v)
+             }
+-            MemorySize::Int64 => {
+-                let v = self.emit(
+-                    Ty::I64,
+-                    Op::Load {
+-                        addr: a,
+-                        mem: m(self, 8),
+-                    },
+-                );
+-                self.un(UnOp::F64ConvertI64S, v)
+-            }
+             _ => return None,
+         })
+     }
+@@ -246,6 +240,12 @@
+             }
+             MemorySize::Int16 | MemorySize::Int32 | MemorySize::Int64 => {
+                 let size = i.memory_size().size() as u32;
++                if size == 8 {
++                    if let Some(exact) = self.fpu_int64[0] {
++                        self.effect(Op::Store { addr: a, val: exact, mem: mem(self, 8) });
++                        return true;
++                    }
++                }
+                 let r = if i.mnemonic() == Mnemonic::Fisttp {
+                     self.un(UnOp::F64Trunc, v)
+                 } else {
+@@ -369,11 +369,21 @@
+                 self.fpush(v);
+             }
+             M::Fild => {
+-                let v = match self.fload_mem(i) {
+-                    Some(v) => v,
+-                    None => bail!(),
+-                };
+-                self.fpush(v);
++                if i.memory_size() == MemorySize::Int64 {
++                    let (addr, space) = self.ea(i);
++                    let exact = self.emit(Ty::I64, Op::Load { addr, mem: self.mem(8, space) });
++                    let v = self.un(UnOp::F64ConvertI64S, exact);
++                    self.fpush(v);
++                    // x87 loads a signed qword exactly. Retain its bits for an
++                    // integer store reached before any intervening computation.
++                    self.fpu_int64[0] = Some(exact);
++                } else {
++                    let v = match self.fload_mem(i) {
++                        Some(v) => v,
++                        None => bail!(),
++                    };
++                    self.fpush(v);
++                }
+             }
+             M::Fld1 | M::Fldz | M::Fldpi | M::Fldl2e | M::Fldl2t | M::Fldlg2 | M::Fldln2 => {
+                 let c = match m {
+@@ -426,6 +436,7 @@
+                 let b = self.st(j);
+                 self.set_st(0, b);
+                 self.set_st(j, a);
++                self.fpu_int64.swap(0, j as usize);
+                 // Both registers become valid (exchanging with an empty
+                 // register would raise a stack fault).
+                 let z = self.c32(0);
