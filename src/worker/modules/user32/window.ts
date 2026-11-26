@@ -30,7 +30,7 @@ import {
 } from './paint-region';
 import { WH_CBT, HCBT_CREATEWND, getHooksOfType } from './hooks';
 import { registerWindowDrawingExports, eraseWindowBackgroundWithClassBrush } from './window-drawing';
-import { registerWindowGeometryExports, removeWindowPlacement, clientSizeFromWindowSize, clientRectFromWindowPos } from './window-geometry';
+import { registerWindowGeometryExports, removeWindowPlacement, clientSizeFromWindowSize, clientRectFromWindowPos, windowRectFromClientRect } from './window-geometry';
 import { registerWindowQueryExports } from './window-query';
 import { registerWindowPropExports } from './window-props';
 import { GDIContext } from '../gdi32/context';
@@ -1973,6 +1973,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             return resultValue;
         }
 
+        let skipZOrder = noZOrder;
+        let insertAfter = 0;
         let activationPlan: SyncActivationPlan | undefined;
         const applyShowState = (): number => {
             const live = windows.get(hWnd);
@@ -2021,7 +2023,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                         }
                     }
                 } else if (isEffectivelyVisible(live)) {
-                    if (!noZOrder && !isChild) wm.setWindowZOrder(hWnd, 0 /* HWND_TOP */);
+                    if (!skipZOrder && !isChild) wm.setWindowZOrder(hWnd, insertAfter | 0);
                     noteDialogOverlayCandidate(live);
                     invalidateWindow(hWnd, null, true);
                     if (live.isSystemControl && live.parent) {
@@ -2060,11 +2062,36 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         let chainDirect: { returnAddr: number; postEsp: number } | undefined;
         let pendingSizeMoveSuspension: { callbackId: number; reusedFrame: boolean } | null = null;
         const minMaxBefore = window.style & (WS_MINIMIZE | WS_MAXIMIZE);
+        const process = System.getInstance().process;
+        let windowPosPtr = 0;
+        let positionGeometryChanged = false;
+        const finishPosition = (): number | null => {
+            if (windowPosPtr && process) {
+                const ptr = windowPosPtr;
+                windowPosPtr = 0;
+                process.memory.free(ptr);
+            }
+            return sendPendingSizeMove();
+        };
+        const sendPositionMessage = (message: number, complete: () => number | null): number | null => {
+            if (windows.get(hWnd) !== window || window.pendingDestroy
+                || (message === 0x0047 && window.visible !== show)) return finishPosition();
+            const sync = trySuspendForSyncWindowMessage(
+                ctx, hWnd, message, 0, windowPosPtr, 'ShowWindow', stackCleanup,
+                complete, chainFrameId || undefined, chainDirect,
+            );
+            if (!sync.suspended) return complete();
+            pendingSizeMoveSuspension = sync;
+            chainFrameId = sync.frameId || chainFrameId;
+            chainDirect = sync.directThunkReturn;
+            return null;
+        };
         const sendPendingSizeMove = (): number | null => {
             const live = windows.get(hWnd);
             if (live !== window || live.pendingDestroy || !show || !live.sizeMovePending) return resultValue;
             if (!visibilityChanged && (live.style & (WS_MINIMIZE | WS_MAXIMIZE)) === minMaxBefore) return resultValue;
             live.sizeMovePending = false;
+            if (positionGeometryChanged) return resultValue;
             const sizeType = (live.style & WS_MAXIMIZE) !== 0 ? 2 : ((live.style & WS_MINIMIZE) !== 0 ? 1 : 0);
             const sizeLParam = sizeType === 1 ? 0 : makeGeometryLParam(live.width, live.height);
             const sendMove = (): number | null => {
@@ -2087,23 +2114,58 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             return null;
         };
         const showThenSizeMove = (): number | null => {
+            if (windows.get(hWnd) !== window || window.pendingDestroy) return finishPosition();
+            if (windowPosPtr) {
+                const flags = Mem.readUint32(windowPosPtr + 24) ?? 3;
+                insertAfter = Mem.readUint32(windowPosPtr + 4) ?? 0;
+                skipZOrder = (flags & 0x0004) !== 0 || !isWindowPosZOrderRequestValid(window, insertAfter, flags);
+                const pos = clientRectFromWindowPos(window,
+                    Mem.readInt32(windowPosPtr + 8) ?? window.x,
+                    Mem.readInt32(windowPosPtr + 12) ?? window.y,
+                    Mem.readInt32(windowPosPtr + 16) ?? window.width,
+                    Mem.readInt32(windowPosPtr + 20) ?? window.height);
+                const geometry = applyWindowPosGeometry(hWnd, pos.x, pos.y, pos.width, pos.height, flags);
+                positionGeometryChanged = !!(geometry?.moved || geometry?.resized);
+                const finalFlags = (flags & ~(0x40 | 0x80 | 0x800 | 0x1000))
+                    | (show ? 0x40 : 0x80)
+                    | (geometry?.moved ? 0 : 0x1000) | (geometry?.resized ? 0 : 0x800);
+                Mem.writeUint32(windowPosPtr + 24, finalFlags);
+            }
             applyShowState();
             const frame = { id: chainFrameId, direct: chainDirect };
             const activation = createSyncActivationDelivery(ctx, activationPlan, 'ShowWindow', stackCleanup, frame);
             const result = activation.run(() => {
                 chainFrameId = frame.id;
                 chainDirect = frame.direct;
-                return sendPendingSizeMove();
+                return windowPosPtr ? sendPositionMessage(0x0047, finishPosition)
+                    : sendPendingSizeMove();
             });
             if (activation.suspension?.suspended) pendingSizeMoveSuspension = activation.suspension;
             return result;
+        };
+        const beginPositionChange = (): number | null => {
+            if (windows.get(hWnd) !== window || window.pendingDestroy) return resultValue;
+            const wndProc = resolveGuestWndProc(window);
+            if (visibilityChanged && wndProc && !isSentinelWndProc(wndProc)
+                && (!window.isSystemControl || window.wndProcSubclassed) && process?.memory?.alloc) {
+                windowPosPtr = process.memory.alloc(28, 'HEAP', 'rw');
+                if (windowPosPtr) {
+                    const rect = windowRectFromClientRect(window, window.x, window.y);
+                    const flags = 3 | (show ? 0x40 : 0x80)
+                        | (noActivate ? 0x10 : 0) | (noZOrder ? 4 : 0);
+                    [hWnd, 0, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, flags]
+                        .forEach((value, i) => Mem.writeUint32(windowPosPtr + i * 4, value >>> 0));
+                    return sendPositionMessage(0x0046, showThenSizeMove);
+                }
+            }
+            return showThenSizeMove();
         };
 
         // USER sends WM_SHOWWINDOW synchronously before SetWindowPos changes WS_VISIBLE.
         if (visibilityChanged || nCmdShow === 8 /* SW_SHOWNA */) {
             const sync = trySuspendForSyncWindowMessage(
                 ctx, hWnd, 0x0018 /* WM_SHOWWINDOW */, show ? 1 : 0, 0,
-                'ShowWindow', stackCleanup, showThenSizeMove, existingFrameId || undefined,
+                'ShowWindow', stackCleanup, beginPositionChange, existingFrameId || undefined,
             );
             if (sync.suspended) {
                 chainFrameId = sync.frameId || existingFrameId;
@@ -2118,7 +2180,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 };
             }
         }
-        if (showThenSizeMove() === null && pendingSizeMoveSuspension) {
+        if (beginPositionChange() === null && pendingSizeMoveSuspension) {
             const s: { callbackId: number; reusedFrame: boolean } = pendingSizeMoveSuspension;
             return {
                 value: resultValue,
