@@ -113,7 +113,7 @@ export interface ChildBoot extends ChildProcessRequest {
     /** The parent's host JIT mode: the page that decided it is not this worker's. */
     jitMode?: HostJitMode;
     /** Why the page chose it, so the child labels its own JIT mode the same way. */
-    jitReason?: 'default' | 'query' | 'ios-webkit-27';
+    jitReason?: 'default' | 'query' | 'ios-webkit-27' | 'mobile';
 }
 
 export interface ChildProcessRecord extends ChildProcessRequest {

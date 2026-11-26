@@ -11,6 +11,7 @@ const IPHONE_CHROME_FROZEN = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac O
 const IPHONE_CHROME_18_5 = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/138.0.7204.156 Mobile/15E148 Safari/604.1";
 const MAC_SAFARI_27 = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.2 Safari/605.1.15";
 const MAC_CHROME = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+const ANDROID_CHROME = "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36";
 const WINDOWS_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
 const policy = (userAgent: string, maxTouchPoints = 5, search = "") =>
@@ -29,10 +30,16 @@ describe("host JIT policy", () => {
         expect(policy(MAC_SAFARI_27, 0)).toEqual({ mode: "on", reason: "default" });
     });
 
-    test("iOS 26 and earlier keep the JIT", () => {
-        expect(policy(IPHONE_26).mode).toBe("on");
-        expect(policy(IPHONE_17).mode).toBe("on");
-        expect(policy(IPHONE_CHROME_18_5).mode).toBe("on");
+    test("iOS 26 and earlier keep the JIT without direct block chaining", () => {
+        expect(policy(IPHONE_26)).toEqual({ mode: "nochain", reason: "mobile" });
+        expect(policy(IPHONE_17).mode).toBe("nochain");
+        expect(policy(IPHONE_CHROME_18_5).mode).toBe("nochain");
+    });
+
+    test("Android keeps the JIT without direct block chaining", () => {
+        expect(policy(ANDROID_CHROME, 5)).toEqual({ mode: "nochain", reason: "mobile" });
+        expect(policy(ANDROID_CHROME, 5, "?jit=1")).toEqual({ mode: "on", reason: "query" });
+        expect(policy(WINDOWS_CHROME, 0, "?jit=nochain").mode).toBe("nochain");
     });
 
     test("a frozen OS token with no Version token is treated as affected", () => {
@@ -75,6 +82,12 @@ describe("applyHostJitMode", () => {
         const r = recorder();
         applyHostJitMode(r.ex, "notail");
         expect(r.calls).toEqual([[4, 0], [12, 0]]);
+    });
+
+    test("nochain turns off direct block chaining only", () => {
+        const r = recorder();
+        applyHostJitMode(r.ex, "nochain");
+        expect(r.calls).toEqual([[4, 0]]);
     });
 
     test("a rejected slot is an error, not a silent JIT-on", () => {

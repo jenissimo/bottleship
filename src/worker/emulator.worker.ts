@@ -3083,9 +3083,9 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           }
           // Host policy (iOS WebKit 27 gate / ?jit=). Same placement and reason as above.
           const hostJitWrites = applyHostJitMode(cpu.wm.exports, hostJitMode);
-          if (hostJitWrites.length) {
-            Logger.log(LogCategory.SYSTEM, `[JIT] host mode "${hostJitMode}": set_jit_config ${hostJitWrites.map(([i, v]) => `${i}=${v}`).join(",")}`);
-          }
+          const appliedJit = typeof cpu.wm.exports.get_jit_config === "function"
+            ? [0, 4, 12].map(i => `${i}=${cpu.wm.exports.get_jit_config(i) >>> 0}`).join(",") : "unknown";
+          Logger.log(LogCategory.SYSTEM, `[JIT] host mode "${hostJitMode}" (${execHealth.getPolicyReason()}): wrote ${hostJitWrites.map(([i, v]) => `${i}=${v}`).join(",") || "nothing"}; applied ${appliedJit}`);
           const jitExports = cpu.wm.exports;
           execHealth.attach({
             readInsns: () => readRetiredInsns(cpu),
@@ -3664,7 +3664,7 @@ const handleWorkerMessage = (event: MessageEvent): void => {
     // Must arrive before load_bundle: the mode is applied when v86 initialises.
     if (isHostJitMode(message.mode)) hostJitMode = message.mode;
     const reason = message.reason as JitReason | undefined;
-    execHealth.setPolicy(hostJitMode, reason === "query" || reason === "ios-webkit-27" ? reason : "default");
+    execHealth.setPolicy(hostJitMode, reason === "query" || reason === "ios-webkit-27" || reason === "mobile" ? reason : "default");
     // JIT_DISABLED only stops compiling; a replayed AOT recording would still run modules.
     if (hostJitMode === "off") (globalThis as Record<string, unknown>).__aotNoAutoLoad = true;
     return;
