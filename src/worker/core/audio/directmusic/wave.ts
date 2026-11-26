@@ -1,3 +1,4 @@
+import { Gsm610Decoder, GSM610_WAV49_BLOCK_BYTES, GSM610_WAV49_SAMPLES_PER_BLOCK } from './gsm610';
 export interface WaveData {
     left: Float32Array;
     right: Float32Array;
@@ -10,6 +11,7 @@ const WAVE_FORMAT_ADPCM = 2;
 const WAVE_FORMAT_IEEE_FLOAT = 3;
 const WAVE_FORMAT_IMA_ADPCM = 0x11;
 const WAVE_FORMAT_EXTENSIBLE = 0xfffe;
+const WAVE_FORMAT_GSM610 = 0x31;
 
 const MS_COEF1 = [256, 512, 0, 192, 240, 460, 392];
 const MS_COEF2 = [0, -256, 0, 64, 0, -208, -232];
@@ -165,6 +167,9 @@ export function decodeWave(bytes: Uint8Array): WaveData | null {
             ? Math.floor(((rest - header) * 2) / ch) + 2
             : Math.floor(((rest - header) * 8) / (4 * ch)) + 1;
         capacity = whole * per + partial;
+    } else if (tag === WAVE_FORMAT_GSM610) {
+        if (ch !== 1 || format.blockAlign !== GSM610_WAV49_BLOCK_BYTES) return null;
+        capacity = Math.floor(data.length / GSM610_WAV49_BLOCK_BYTES) * GSM610_WAV49_SAMPLES_PER_BLOCK;
     } else if ((tag === WAVE_FORMAT_PCM && (format.bits === 8 || format.bits === 16 || format.bits === 24 || format.bits === 32))
         || (tag === WAVE_FORMAT_IEEE_FLOAT && format.bits === 32)) {
         capacity = Math.floor(data.length / ((format.bits >> 3) * ch));
@@ -175,6 +180,12 @@ export function decodeWave(bytes: Uint8Array): WaveData | null {
     let frames = capacity;
     if (tag === WAVE_FORMAT_ADPCM) frames = decodeMsAdpcm(data, format, channels);
     else if (tag === WAVE_FORMAT_IMA_ADPCM) frames = decodeImaAdpcm(data, format, channels);
+    else if (tag === WAVE_FORMAT_GSM610) {
+        const decoder = new Gsm610Decoder();
+        for (let b = 0; b * GSM610_WAV49_SAMPLES_PER_BLOCK < capacity; b++) {
+            decoder.decodeWav49Block(data, b * GSM610_WAV49_BLOCK_BYTES, channels[0]!, b * GSM610_WAV49_SAMPLES_PER_BLOCK);
+        }
+    }
     else {
         const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
         for (let f = 0; f < capacity; f++) {

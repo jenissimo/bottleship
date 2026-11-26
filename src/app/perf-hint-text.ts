@@ -1,7 +1,7 @@
 /** The worker's perf_hint payload (core/execution-health.ts PerfHintMessage), as the page keeps it. */
 export interface PerfHint {
-    jit: "on" | "off" | "notail" | "unknown";
-    reason: "default" | "query" | "ios-webkit-27" | "runtime";
+    jit: "on" | "off" | "notail" | "nochain" | "unknown";
+    reason: "default" | "query" | "ios-webkit-27" | "mobile" | "runtime";
     mips: number;
 }
 

@@ -1,5 +1,6 @@
 import { ModuleDescriptor, UnimplementedReturn, calculateStackCleanup } from "../api/types";
 import { setupapiModule } from "../api/setupapi.api";
+import { cfgmgr32Module } from "../api/cfgmgr32.api";
 import { hidModule } from "../api/hid.api";
 import { combaseModule } from "../api/combase.api";
 import { shcoreModule } from "../api/shcore.api";
@@ -92,6 +93,7 @@ export class APIRegistry {
         // Static imports for modules added after the last Vite glob scan (import.meta.glob
         // is fixed at compile time — new *.api.ts files are invisible until rebuild).
         this.registerModule(setupapiModule);
+        this.registerModule(cfgmgr32Module);
         this.registerModule(hidModule);
         this.registerModule(combaseModule);
         this.registerModule(shcoreModule);

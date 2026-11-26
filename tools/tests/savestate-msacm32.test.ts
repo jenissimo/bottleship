@@ -302,7 +302,7 @@ describe("msacm32 participant", () => {
         const undo = guest.acm.registerSavestate();
         try {
             expect(savestateParticipants.coveredModules().has("msacm32")).toBe(true);
-            expect(savestateParticipants.schemas().msacm32).toEqual({ version: 1, schemaHash: "c39672b19cccb835" });
+            expect(savestateParticipants.schemas().msacm32).toEqual({ version: 2, schemaHash: "2b1b07360cb46df2" });
             const participant = savestateParticipants.all().find(p => p.id === "msacm32")!;
             const saved = participant.capture({} as never);
             expect(bytes(saved)).toBe(bytes(guest.acm.captureSavestate()));

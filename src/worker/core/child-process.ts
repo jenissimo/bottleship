@@ -116,7 +116,7 @@ export interface ChildBoot extends ChildProcessRequest {
     wwtFlatRam?: boolean;
     wwtMode?: import("../wwt/mode").WwtMode;
     /** Why the page chose it, so the child labels its own JIT mode the same way. */
-    jitReason?: 'default' | 'query' | 'ios-webkit-27';
+    jitReason?: 'default' | 'query' | 'ios-webkit-27' | 'mobile';
 }
 
 export interface ChildProcessRecord extends ChildProcessRequest {

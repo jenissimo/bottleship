@@ -86,6 +86,13 @@ export class ThunkGenerator {
     private dataExportAddresses: Map<string, number> = new Map();
 
     /** stdcall RET-N bytes: explicit override → argCount×4 → MSVC-mangled-name derivation. */
+    canGenerateStub(exportName: string, info: { argCount?: number; stackCleanupBytes?: number; callingConvention?: string }): boolean {
+        const isStdcall = !info.callingConvention || info.callingConvention === 'stdcall';
+        if (!isStdcall) return true;
+        const bytesToPop = this.resolveBytesToPop(exportName, true, info.argCount, info.stackCleanupBytes);
+        return bytesToPop !== undefined && bytesToPop >= 0;
+    }
+
     private resolveBytesToPop(
         exportName: string,
         isStdcall: boolean,

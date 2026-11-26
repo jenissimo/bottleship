@@ -1414,7 +1414,7 @@ export class VertexConverter {
                 return new Uint8Array(0);
             }
 
-            const result = outBuffer && outBuffer.length >= dstSize ? outBuffer : new Uint8Array(dstSize);
+            const result = outBuffer && outBuffer.length >= dstSize ? outBuffer.subarray(0, dstSize) : new Uint8Array(dstSize);
 
             // Create Float32 view for efficient writes
             const dstF32 = new Float32Array(result.buffer, result.byteOffset, dstSize / 4);

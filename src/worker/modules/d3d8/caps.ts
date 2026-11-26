@@ -4,6 +4,7 @@ import { getD3D9WebGpuCapabilityLimits } from '../../backends/webgpu/shared/webg
 import { FFP_D3D8_IMPLEMENTED_OPS } from '../../backends/webgpu/ddraw/shader-generator';
 import { MAX_FFP_STAGES, MAX_FFP_SAMPLED_STAGES } from '../../backends/webgpu/ddraw/ffp-stages';
 import { D3DTOP_DISABLE } from '../ddraw/constants';
+import { D3DPRASTERCAPS_FOGTABLE, D3DPRASTERCAPS_FOGVERTEX } from '../../core/cpu/emulator-config';
 
 // ============================================================================
 // Single source of truth for D3DCAPS8 (212 bytes — NOT D3DCAPS9's 304/332).
@@ -129,8 +130,9 @@ export function writeDeviceCaps8(pCaps: number, mem: Uint8Array): boolean {
     // combiner D3D8 uses), CLIPPLANESCALEDPOINTS (MaxUserClipPlanes is 0), NULLREFERENCE —
     // plus 0xCF's two reserved bits, which real hardware leaves clear.
     u32(32, 0x00000AF2);
-    // Both draw paths implement the integer ZBIAS render state for depth-tested triangles.
-    u32(36, 0x00770077 | D3DPRASTERCAPS_ZBIAS);
+    // Both draw paths implement integer ZBIAS for depth-tested triangles.
+    // The shared FFP evaluates both vertex and table fog.
+    u32(36, 0x00770077 | D3DPRASTERCAPS_ZBIAS | D3DPRASTERCAPS_FOGVERTEX | D3DPRASTERCAPS_FOGTABLE);
     u32(40, 0x000000FF);    // ZCmpCaps: all compare funcs
     u32(44, 0x00001FFF);    // SrcBlendCaps: all D3D8 blend factors
     u32(48, 0x00001FFF);    // DestBlendCaps
@@ -188,8 +190,11 @@ export function writeDeviceCaps8(pCaps: number, mem: Uint8Array): boolean {
     u32(156, 0x0000003B);   // VertexProcessingCaps: TEXGEN|MATERIALSOURCE7|DIR|POS lights|LOCALVIEWER
     u32(160, 8);            // MaxActiveLights (FFP supports 8)
     u32(164, 0);            // MaxUserClipPlanes: not implemented in WGSL — honest 0
-    u32(168, 0);            // MaxVertexBlendMatrices: not implemented — honest 0
-    u32(172, 0);            // MaxVertexBlendMatrixIndex
+    // Vertex blend: the D3D8 device adapter lowers D3DRS_VERTEXBLEND up to D3DVBF_3WEIGHTS
+    // (four matrices) and D3DRS_INDEXEDVERTEXBLENDENABLE over D3DTS_WORLDMATRIX(0..7), the
+    // same contract D3DCAPS9 advertises (d3d9/caps.ts).
+    u32(168, 4);            // MaxVertexBlendMatrices
+    u32(172, 7);            // MaxVertexBlendMatrixIndex
     f32(176, 1.0);          // MaxPointSize: 1.0 = no point sprites (honest minimum)
     u32(180, 0x0000FFFF);   // MaxPrimitiveCount
     u32(184, 0x0000FFFF);   // MaxVertexIndex

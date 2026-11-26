@@ -70,6 +70,7 @@ export class PreemptionManager {
     /** Dynamic dispatch wave, default ON. Both paths respect the
      *  budget/in_hlt guard so async-park is honored. Kill-switches:
      *  setRetChaining/setRetSpeculation(false) or dbg.jitRetChain/jitRetSpec(false). */
+    private blockChainingEnabled = true;        // config idx 4 (host-jit-policy notail forces 0)
     private retChainingEnabled = true;          // config idx 12
     private retSpeculationEnabled = true;       // config idx 13
 
@@ -222,6 +223,14 @@ export class PreemptionManager {
     }
     isPushRunCoalescingEnabled(): boolean { return this.pushRunCoalescingEnabled; }
 
+    setBlockChaining(on: boolean): void {
+        this.blockChainingEnabled = on;
+        const ex = this.wasmExports;
+        this.applyJitConfig(ex, 4, on ? 1 : 0);
+        if (ex?.jit_clear_cache_js) ex.jit_clear_cache_js();
+    }
+    isBlockChainingEnabled(): boolean { return this.blockChainingEnabled; }
+
     setRetChaining(on: boolean): void {
         this.retChainingEnabled = on;
         const ex = this.wasmExports;
@@ -313,9 +322,10 @@ export class PreemptionManager {
             // Dynamic-dispatch wave (idx 12/13) — default ON, re-applied per init (wasm
             // codegen defaults are OFF). Applied at boot = cold cache, so the implied
             // recompile is free (no mid-run cache clear).
+            this.applyJitConfig(this.wasmExports, 4, this.blockChainingEnabled ? 1 : 0);
             this.applyJitConfig(this.wasmExports, 12, this.retChainingEnabled ? 1 : 0);
             this.applyJitConfig(this.wasmExports, 13, this.retSpeculationEnabled ? 1 : 0);
-            console.log(`[PERF] dynamic dispatch: retChain=${this.retChainingEnabled ? "on" : "off"} retSpec=${this.retSpeculationEnabled ? "on" : "off"}`);
+            console.log(`[PERF] dynamic dispatch: blockChain=${this.blockChainingEnabled ? "on" : "off"} retChain=${this.retChainingEnabled ? "on" : "off"} retSpec=${this.retSpeculationEnabled ? "on" : "off"}`);
 
             // Hotness tiering (idx 15) — re-applied every init; the TS field is the
             // authority (wasm statics reset per game load).

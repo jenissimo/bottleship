@@ -138,3 +138,15 @@ describe("D3DCAPS8 capability limits", () => {
         expect(caps.getUint32(144, true) & 0x00600000).toBe(0);
     });
 });
+
+describe("D3DCAPS8 fixed-function contract", () => {
+    test("advertises the fog modes and vertex blend palette the FFP implements", () => {
+        const memory = new Uint8Array(0x1000);
+        expect(writeDeviceCaps8(CAPS_PTR, memory)).toBe(true);
+        const caps = new DataView(memory.buffer, CAPS_PTR, 212);
+        expect(caps.getUint32(36, true) & 0x00000180).toBe(0x00000180);
+        expect(caps.getUint32(168, true)).toBe(4);
+        expect(caps.getUint32(172, true)).toBe(7);
+        expect(caps.getUint32(164, true)).toBe(0);
+    });
+});

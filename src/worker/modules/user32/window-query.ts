@@ -10,6 +10,7 @@ import { Marshaler } from '../../core/memory/marshaler';
 import { WindowInfo, windows, getChildZOrderSibling, getZOrderWindow } from './shared-state';
 import { getWindowClass } from './class';
 import { System } from '../../core/system';
+import { VIRTUAL_CURRENT_PROCESS_ID } from '../kernel32/process/virtual-process-manager';
 
 export function registerWindowQueryExports(exports: Record<string, ThunkImplementation>): void {
     const getClassFilter = (memory: Uint8Array, ptr: number, isWide: boolean): string | number | null => {
@@ -263,13 +264,17 @@ export function registerWindowQueryExports(exports: Record<string, ThunkImplemen
     };
 
     exports['GetWindowThreadProcessId'] = (ctx, mem, args) => {
-        const hWnd = args[0];
-        const lpdwProcessId = args[1];
+        const hWnd = args[0] >>> 0;
+        const lpdwProcessId = args[1] >>> 0;
+        const wmWin = System.getInstance().windowManager.getWindow(hWnd);
+        const own = windows.has(hWnd) || !!wmWin;
+        const pid = own ? VIRTUAL_CURRENT_PROCESS_ID >>> 0 : 1;
+        const tid = own ? ((wmWin?.creatorThreadId || System.getInstance().scheduler.getCurrentThreadId()) >>> 0) : 1;
         if (lpdwProcessId && lpdwProcessId + 4 <= mem.length) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(lpdwProcessId, 1, true);
+            view.setUint32(lpdwProcessId, pid, true);
         }
-        return 1; // Stub: fake thread id
+        return tid;
     };
 
     // SetParent - changes the parent of a child window

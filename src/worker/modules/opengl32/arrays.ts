@@ -80,13 +80,13 @@ function drawClientArrays(ctx: OpenGLContext, mode: number, idx: Uint32Array, co
     if (direct >= 0) {
         if (direct === 0) return;
         const base = arenaReserve(ctx, direct);
-        const space = gatherVertices(ctx, idx, direct, ctx.vertArena.data, base, true);
+        const space = gatherVertices(ctx, idx, direct, ctx.vertArena.data, base, ctx.renderMode !== 0x1c02 /* GL_SELECT */);
         emitArenaDraw(ctx, mode, base, direct, space === VertexSpace.CLIP);
         return;
     }
 
     const scratch = ensureGatherScratch(count);
-    const space = gatherVertices(ctx, idx, count, scratch, 0, true);
+    const space = gatherVertices(ctx, idx, count, scratch, 0, ctx.renderMode !== 0x1c02 /* GL_SELECT */);
     emitDrawCommandFlat(ctx, mode, scratch, count, space === VertexSpace.CLIP);
 }
 

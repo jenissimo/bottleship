@@ -12,14 +12,16 @@
 // `?jit=` on the page URL overrides the gate for on-device experiments:
 //   1 | on     JIT on (shipping configuration)
 //   0 | off    no compilation at all
-//   notail     JIT on, but no module contains return_call_indirect (RET chaining off;
-//              block chaining is already off in shipping)
+//   notail     JIT on, but no module contains return_call_indirect (RET chaining off,
+//              direct block chaining off)
+//   nochain    JIT on, direct block chaining off (the default on Android and on iOS/iPadOS
+//              below 27, where block chaining has not been measured)
 
-export type HostJitMode = "on" | "off" | "notail";
+export type HostJitMode = "on" | "off" | "notail" | "nochain";
 
 export interface HostJitPolicy {
     mode: HostJitMode;
-    reason: "default" | "query" | "ios-webkit-27";
+    reason: "default" | "query" | "ios-webkit-27" | "mobile";
 }
 
 export interface HostJitSignals {
@@ -33,11 +35,11 @@ export interface HostJitSignals {
 export const IOS_WEBKIT_JIT_BROKEN_MAJOR = 27;
 
 const QUERY_MODES: Record<string, HostJitMode> = {
-    "1": "on", on: "on", "0": "off", off: "off", notail: "notail",
+    "1": "on", on: "on", "0": "off", off: "off", notail: "notail", nochain: "nochain",
 };
 
 export function isHostJitMode(value: unknown): value is HostJitMode {
-    return value === "on" || value === "off" || value === "notail";
+    return value === "on" || value === "off" || value === "notail" || value === "nochain";
 }
 
 function isAppleMobileWebKit(ua: string, maxTouchPoints: number): boolean {
@@ -71,7 +73,9 @@ export function resolveHostJitPolicy(signals: HostJitSignals): HostJitPolicy {
         if (major === null || major >= IOS_WEBKIT_JIT_BROKEN_MAJOR) {
             return { mode: "notail", reason: "ios-webkit-27" };
         }
+        return { mode: "nochain", reason: "mobile" };
     }
+    if (/\bAndroid\b/.test(signals.userAgent)) return { mode: "nochain", reason: "mobile" };
     return { mode: "on", reason: "default" };
 }
 
@@ -85,7 +89,7 @@ interface JitConfigExports {
  */
 export function applyHostJitMode(ex: JitConfigExports | undefined, mode: HostJitMode): Array<[number, number]> {
     const writes: Array<[number, number]> =
-        mode === "off" ? [[0, 1]] : mode === "notail" ? [[4, 0], [12, 0]] : [];
+        mode === "off" ? [[0, 1]] : mode === "notail" ? [[4, 0], [12, 0]] : mode === "nochain" ? [[4, 0]] : [];
     if (typeof ex?.set_jit_config !== "function") return [];
     for (const [index, value] of writes) {
         const status = ex.set_jit_config(index, value) >>> 0;

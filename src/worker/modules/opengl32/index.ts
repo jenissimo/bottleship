@@ -72,7 +72,7 @@ export class OpenGL32 implements IModule {
 
     registerSavestate(): () => void {
         return savestateParticipants.add({
-            id: 'opengl32', version: 3, order: 59, covers: ['opengl32', 'glu32'], schema: OPENGL32_SCHEMA as unknown as SaveValue,
+            id: 'opengl32', version: 4, order: 59, covers: ['opengl32', 'glu32'], schema: OPENGL32_SCHEMA as unknown as SaveValue,
             prepare: () => prepareOpenGL(this.context),
             capture: (io) => {
                 if (!this.context) throw new Error("opengl32: the module is not initialized");
@@ -116,6 +116,10 @@ export class OpenGL32 implements IModule {
             "glGenLists",
             "glListBase",
             "glIsList",
+            // Client selection/feedback state is executed even during GL_COMPILE.
+            "glSelectBuffer",
+            "glFeedbackBuffer",
+            "glRenderMode",
         ]);
 
         for (const [name, impl] of Object.entries(this.exports)) {

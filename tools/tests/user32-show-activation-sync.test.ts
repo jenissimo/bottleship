@@ -88,17 +88,17 @@ test('creation/init defers activation and reentrant same-window activation does 
     windows.set(A, { ...win(A), createInProgress: true }); active = A; show(); drain();
     expect(messages()).toEqual([]);
     calls = []; windows.get(A)!.createInProgress = false; windows.get(A)!.visible = false; windows.get(A)!.style &= ~0x10000000;
-    show(); calls[0]!.complete?.(0);
+    show(); calls[0]!.complete?.(0); calls[1]!.complete?.(0);
     expect(windows.get(A)!.activationDelivered).toBe(true);
     const before = posts.length; createWindowExports().SetActiveWindow!({ esp: ESP } as never, mem, [A] as never);
-    expect(posts.length).toBe(before); for (let i = 1; i < calls.length; i++) calls[i]!.complete?.(0);
+    expect(posts.length).toBe(before); for (let i = 2; i < calls.length; i++) calls[i]!.complete?.(0);
     expect(messages().filter(x => x[1] === APP)).toHaveLength(1);
 });
 test('callbacks re-resolve subclass and stop activation after window destruction', () => {
-    windows.set(A, win(A)); show(); calls[0]!.complete?.(0);
-    windows.get(A)!.wndProc = 0x405000; calls[1]!.complete?.(0);
-    expect(calls[2]!.proc).toBe(0x405000);
-    windows.delete(A); calls[2]!.complete?.(0);
+    windows.set(A, win(A)); show(); calls[0]!.complete?.(0); calls[1]!.complete?.(0);
+    windows.get(A)!.wndProc = 0x405000; calls[2]!.complete?.(0);
+    expect(calls[3]!.proc).toBe(0x405000);
+    windows.delete(A); calls[3]!.complete?.(0);
     expect(messages().map(x => x[1])).toEqual([APP, NC]);
 });
 test('nested show preserves direct callback return context through the activation chain', () => {
@@ -110,21 +110,22 @@ test('nested show preserves direct callback return context through the activatio
 
 test('outgoing handlers see the old active window, incoming handlers see the new one', () => {
     windows.set(A, win(A, true)); active = A; windows.set(B, win(B));
-    show(B); calls[0]!.complete?.(0);
+    show(B); calls[0]!.complete?.(0); calls[1]!.complete?.(0);
     expect(active).toBe(A); // outgoing NCACTIVATE
-    calls[1]!.complete?.(0); expect(active).toBe(A); // outgoing ACTIVATE
-    calls[2]!.complete?.(0); expect(active).toBe(B); // incoming NCACTIVATE
-    for (let i = 3; i < calls.length; i++) calls[i]!.complete?.(0);
+    calls[2]!.complete?.(0); expect(active).toBe(A); // outgoing ACTIVATE
+    calls[3]!.complete?.(0); expect(active).toBe(B); // incoming NCACTIVATE
+    for (let i = 4; i < calls.length; i++) calls[i]!.complete?.(0);
 });
 test('incoming handler activation of another window cancels remaining stale steps', () => {
-    windows.set(A, win(A)); show(); calls[0]!.complete?.(0);
-    active = B; calls[1]!.complete?.(0);
+    windows.set(A, win(A)); show(); calls[0]!.complete?.(0); calls[1]!.complete?.(0);
+    active = B; calls[2]!.complete?.(0);
     expect(messages().map(x => x[1])).toEqual([APP]); expect(active).toBe(B);
 });
 test('incoming handler hiding its target cancels remaining stale steps', () => {
-    windows.set(A, win(A)); show(); calls[0]!.complete?.(0);
-    windows.get(A)!.visible = false; calls[1]!.complete?.(0);
+    windows.set(A, win(A)); show(); calls[0]!.complete?.(0); calls[1]!.complete?.(0);
+    windows.get(A)!.visible = false; calls[2]!.complete?.(0);
     expect(messages().map(x => x[1])).toEqual([APP]);
+    expect(calls.some(c => c.args[1] === 0x47)).toBe(false);
 });
 test('a KILLFOCUS handler moving focus elsewhere is not overwritten by a stale SETFOCUS', () => {
     const wm = System.getInstance().windowManager as any;

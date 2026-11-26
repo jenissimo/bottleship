@@ -580,7 +580,7 @@ export interface OpenGLContext {
     textureUnits: GLTextureUnit[];
     textures: Map<number, GLTextureObject>;
     nextTextureId: number;
-    /** 6 user clip plane equations (4 doubles each), as glClipPlane was given them. */
+    /** 6 user clip plane equations (4 doubles each), in eye coordinates (inverse-transpose modelview at definition time). */
     clipPlanes: Float64Array;
 
     // ---- Selection / feedback ----
@@ -591,6 +591,13 @@ export interface OpenGLContext {
     nameStackTop: number;
     selectBufferPtr: number;
     selectBufferSize: number;
+    selectBufferSet: boolean;
+    selectWriteOffset: number;
+    selectHits: number;
+    selectOverflow: boolean;
+    selectHit: boolean;
+    selectMinZ: number;
+    selectMaxZ: number;
     feedbackBufferPtr: number;
     feedbackBufferSize: number;
     feedbackBufferType: number;
@@ -885,6 +892,13 @@ export function createOpenGLContext(process: Process): OpenGLContext {
         nameStackTop: -1,
         selectBufferPtr: 0,
         selectBufferSize: 0,
+        selectBufferSet: false,
+        selectWriteOffset: 0,
+        selectHits: 0,
+        selectOverflow: false,
+        selectHit: false,
+        selectMinZ: 1,
+        selectMaxZ: 0,
         feedbackBufferPtr: 0,
         feedbackBufferSize: 0,
         feedbackBufferType: 0,

@@ -2270,14 +2270,29 @@ export class PELoader {
         });
 
         markHleModuleLoaded(dllName);
-        const stubDll = this.thunkGenerator.generateStubDll(dllName, stubInfos);
+        const trapped = new Set<string>();
+        const stubbable = stubInfos.filter(info => {
+            if (this.thunkGenerator.canGenerateStub(info.name, info)) return true;
+            trapped.add(info.name.toLowerCase());
+            return false;
+        });
+        if (trapped.size) {
+            this.thunkGenerator.writeTrapStub(this.memory);
+            Logger.warn(LogCategory.SYSTEM,
+                `[PE] ${dllName}: ${trapped.size} import(s) without a known stack cleanup bound to the trap stub; ` +
+                `a call fails there instead of aborting the load`);
+        }
+        const stubDll = this.thunkGenerator.generateStubDll(dllName, stubbable);
 
         // Patch IAT
         let addr = iatAddr;
         for (const func of functions) {
-            const stubAddress = stubDll.exportTable.get(this.resolveImportName(dllName, func).toLowerCase());
+            const importName = this.resolveImportName(dllName, func).toLowerCase();
+            const stubAddress = stubDll.exportTable.get(importName);
             if (stubAddress) {
                 this.view.setUint32(addr, stubAddress, true);
+            } else if (trapped.has(importName)) {
+                this.view.setUint32(addr, this.thunkGenerator.getTrapStubAddress(), true);
             } else {
                 Logger.warn(LogCategory.SYSTEM, `[PE] Failed to generate stub for ${dllName}:${this.resolveImportName(dllName, func)}`);
             }

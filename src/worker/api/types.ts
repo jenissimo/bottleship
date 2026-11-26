@@ -61,6 +61,8 @@ export type UnimplementedReturn =
     | "win32Status"
     /** STATUS_NOT_IMPLEMENTED — NTSTATUS exports, where zero is STATUS_SUCCESS. */
     | "ntstatus"
+    /** CR_CALL_NOT_IMPLEMENTED — Configuration Manager exports returning CONFIGRET. */
+    | "configret"
     /**
      * No value reads as failure — every bit pattern is a legal answer (GetTickCount64).
      * Returning anything at all is a lie, so the export does not resolve: GetProcAddress
