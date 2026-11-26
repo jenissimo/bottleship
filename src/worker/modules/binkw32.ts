@@ -1027,8 +1027,10 @@ export class BinkW32 implements IModule {
      * The file still has to EXIST and still has to be Bink — skipping playback is not a
      * licence to answer for a clip the bundle does not carry, and a guest that handles a
      * genuinely missing video must keep seeing that. What it gets instead of decoded
-     * frames is an HBINK whose FrameNum already equals Frames, so the guest's own loop
-     * observes end-of-stream on its next poll and completes normally.
+     * frames is a finished one-frame clip. FrameNum already equals Frames for callers
+     * that poll HBINK; BinkGetSummary also reports one frame for callers that count
+     * frames themselves. Advertising the original duration can otherwise make a
+     * guest repeatedly render and present a movie that has already been skipped.
      *
      * Dimensions come from the 44-byte Bink header rather than being invented: a guest
      * sizes its video panel from HBINK before the first frame.
@@ -1066,7 +1068,8 @@ export class BinkW32 implements IModule {
         }
 
         const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
-        const frames = view.getUint32(8, true);
+        const sourceFrames = view.getUint32(8, true);
+        const frames = 1;
         const width = view.getUint32(20, true);
         const height = view.getUint32(24, true);
         const fpsDividend = view.getUint32(28, true);
@@ -1109,7 +1112,7 @@ export class BinkW32 implements IModule {
         });
         Logger.log(LogCategory.SYSTEM,
             `BinkOpen(${label}) → 0x${guestPtr.toString(16)} SKIPPED as a finished stream ` +
-            `(${width}×${height} ${frames}f)`);
+            `(${width}×${height}, ${sourceFrames} source frames)`);
         return guestPtr;
     }
 
