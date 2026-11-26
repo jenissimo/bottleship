@@ -361,6 +361,50 @@ describe("msacm32 GSM 6.10 decode", () => {
         expect(call("acmStreamClose", has, 0)).toBe(MMSYSERR_NOERROR);
     });
 
+    test("ACM_STREAMCONVERTF_START decodes the chunk as a fresh stream does", () => {
+        const ACM_STREAMCONVERTF_START = 0x10;
+        writeGsmFormat();
+        writePcmFormat(DST_FMT, 1, 8000);
+        const data = new Uint8Array(GSM_BLOCK_BYTES * 2);
+        let seed = 7;
+        for (let i = 0; i < data.length; i++) {
+            seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+            data[i] = (seed >>> 16) & 0xff;
+        }
+        mem.set(data, SRC_DATA);
+        const open = (): number => {
+            expect(call("acmStreamOpen", HAS_PTR, 0, SRC_FMT, DST_FMT, 0, 0, 0, 0)).toBe(MMSYSERR_NOERROR);
+            const has = view.getUint32(HAS_PTR, true);
+            mem.fill(0, HDR, HDR + ACMSTREAMHEADER_SIZE);
+            view.setUint32(HDR, ACMSTREAMHEADER_SIZE, true);
+            view.setUint32(HDR + 28, DST_DATA, true);
+            view.setUint32(HDR + 32, PCM_BLOCK_BYTES, true);
+            expect(call("acmStreamPrepareHeader", has, HDR, 0)).toBe(MMSYSERR_NOERROR);
+            return has;
+        };
+        const convert = (has: number, block: number, flags: number): Int16Array => {
+            view.setUint32(HDR + 12, SRC_DATA + block * GSM_BLOCK_BYTES, true);
+            view.setUint32(HDR + 16, GSM_BLOCK_BYTES, true);
+            expect(call("acmStreamConvert", has, HDR, flags)).toBe(MMSYSERR_NOERROR);
+            expect(view.getUint32(HDR + 36, true)).toBe(PCM_BLOCK_BYTES);
+            return new Int16Array(mem.slice(DST_DATA, DST_DATA + PCM_BLOCK_BYTES).buffer);
+        };
+
+        const fresh = open();
+        const expected = convert(fresh, 1, 0);
+        expect(call("acmStreamClose", fresh, 0)).toBe(MMSYSERR_NOERROR);
+
+        const continued = open();
+        convert(continued, 0, 0);
+        expect(convert(continued, 1, 0)).not.toEqual(expected);
+        expect(call("acmStreamClose", continued, 0)).toBe(MMSYSERR_NOERROR);
+
+        const reused = open();
+        convert(reused, 0, 0);
+        expect(convert(reused, 1, ACM_STREAMCONVERTF_START)).toEqual(expected);
+        expect(call("acmStreamClose", reused, 0)).toBe(MMSYSERR_NOERROR);
+    });
+
     test("PCM to GSM is refused", () => {
         writeGsmFormat();
         writePcmFormat(DST_FMT, 1, 8000);

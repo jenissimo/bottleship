@@ -45,6 +45,7 @@ const WAVE_FORMAT_ADPCM = 2;
 /** imaadp32.acm — IMA/DVI ADPCM. */
 const WAVE_FORMAT_IMA_ADPCM = 0x11;
 const WAVE_FORMAT_GSM610 = 0x31;
+const ACM_STREAMCONVERTF_START = 0x00000010;
 const GSM610_SAMPLE_RATE = 8000;
 
 const ACM_STREAMOPENF_QUERY = 0x00000001;
@@ -1204,6 +1205,7 @@ export class Msacm32 implements IModule {
             if (v.getUint32(pash + ASH.cbStruct, true) < ACMSTREAMHEADER_SIZE) return MMSYSERR_INVALPARAM;
             const status = v.getUint32(pash + ASH.fdwStatus, true);
             if ((status & ACMSTREAMHEADER_STATUSF_PREPARED) === 0) return ACMERR_UNPREPARED;
+            if (((args[2] >>> 0) & ACM_STREAMCONVERTF_START) !== 0 && stream.gsm) stream.gsm = new Gsm610Decoder();
 
             const pbSrc = v.getUint32(pash + ASH.pbSrc, true);
             const cbSrcLength = v.getUint32(pash + ASH.cbSrcLength, true);
