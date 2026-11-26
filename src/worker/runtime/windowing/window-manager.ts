@@ -712,7 +712,8 @@ export class WindowManager {
      */
     getKeyboardTargetWindow(): WindowObject | undefined {
         const form = this.overlayFormKeyResolver?.() ?? 0;
-        if (form && this.focusHwnd !== form && !this.isDescendantOf(this.focusHwnd, form)) {
+        const formActive = form !== 0 && (this.activeHwnd === form || this.isDescendantOf(this.activeHwnd, form));
+        if (formActive && this.focusHwnd !== form && !this.isDescendantOf(this.focusHwnd, form)) {
             const win = this.windows.get(form);
             if (win && win.visible) return win;
         }

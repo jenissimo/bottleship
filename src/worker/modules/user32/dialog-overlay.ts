@@ -41,8 +41,29 @@ import { paintTraceEnabled, logOverlayMutation } from './paint-trace';
 const WS_CHILD = 0x40000000;
 const WS_CAPTION = 0x00c00000;
 
-// @transient(overlay-form marks, re-derived when the form is shown again)
+// @transient(overlay-form marks, re-derived when the form is shown again or after a restore)
 const overlayForms = new Set<number>();
+// @transient(set by a restore until the marks are re-derived from the restored windows)
+let rederiveAfterRestore = false;
+
+export function noteOverlayFormsRestored(): void {
+    overlayForms.clear();
+    rederiveAfterRestore = true;
+}
+
+function ensureOverlayFormsDerived(): void {
+    if (!rederiveAfterRestore) return;
+    rederiveAfterRestore = false;
+    for (const win of windows.values()) {
+        if (win.overlayOnFlipScreen && win.visible && !win.pendingDestroy && isFloatingOverlayForm(win)) overlayForms.add(win.handle);
+    }
+    setPointerOverlayFormLive(overlayForms.size > 0);
+}
+
+function hasOverlayForm(hwnd: number): boolean {
+    ensureOverlayFormsDerived();
+    return overlayForms.has(hwnd);
+}
 
 function getDDrawContext(): any {
     return (System.getInstance().process?.getModule('ddraw') as any)?.context;
@@ -178,13 +199,14 @@ export function floatsOverGameWindow(win: WindowInfo): boolean {
     const area = win.width * win.height;
     for (const other of windows.values()) {
         if (other.handle === win.handle || !other.visible || other.pendingDestroy) continue;
-        if ((other.style & WS_CHILD) !== 0 || other.nativeClassName === '#32770' || overlayForms.has(other.handle)) continue;
+        if ((other.style & WS_CHILD) !== 0 || other.nativeClassName === '#32770' || hasOverlayForm(other.handle)) continue;
         if (other.width * other.height > area) return true;
     }
     return false;
 }
 
 export function pruneOverlayForms(): void {
+    ensureOverlayFormsDerived();
     if (overlayForms.size === 0) return;
     let changed = false;
     for (const hwnd of [...overlayForms]) {
@@ -199,7 +221,7 @@ export function pruneOverlayForms(): void {
 
 export function isOverlayForm(hwnd: number): boolean {
     pruneOverlayForms();
-    return overlayForms.has(hwnd);
+    return hasOverlayForm(hwnd);
 }
 
 export function forgetOverlayForm(hwnd: number): void {
@@ -366,7 +388,7 @@ export function isWindowFullyCoveredByHigherTopLevel(
 ): boolean {
     if (!bounds) return false;
     if ((win.style & WS_CHILD) !== 0) return false;
-    if (overlayForms.has(win.handle)) return false;
+    if (hasOverlayForm(win.handle)) return false;
     const wm = System.getInstance().windowManager;
     const zOrder = wm.getZOrder();
     const index = zOrder.indexOf(win.handle);
@@ -449,7 +471,7 @@ export function eraseDialogOverlay(hwnd: number, moving = false): void {
     if (!bounds) return;
 
     // Stop compositing this dialog before erase (DestroyWindow path: still visible).
-    if (win && !(moving && overlayForms.has(hwnd))) {
+    if (win && !(moving && hasOverlayForm(hwnd))) {
         win.overlayOnFlipScreen = false;
         forgetOverlayForm(win.handle);
     }
@@ -554,7 +576,7 @@ function getDialogRoot(hwnd: number): number {
  * occlusion: it hides the frame and shows an empty gray box.
  */
 function dialogGroupHasOverlayContent(root: number): boolean {
-    if (overlayForms.has(root)) return true;
+    if (hasOverlayForm(root)) return true;
     const stack = [root];
     const seen = new Set<number>();
     while (stack.length) {
@@ -669,7 +691,7 @@ export function getLiveDialogOverlays(renderActive?: RenderActive | null): Array
         // A window flagged before the app took exclusive fullscreen can become the
         // screen owner afterwards; re-check here, the one place the rects are consumed.
         if (!dialogOverlayComposites({
-            gdiOutputOnScreen: gdiOutputOnScreen || overlayForms.has(win.handle),
+            gdiOutputOnScreen: gdiOutputOnScreen || hasOverlayForm(win.handle),
             isScreenOwnerWindow: isScreenOwnerWindow(win.handle),
             isDialogRoot: getDialogRoot(win.handle) === win.handle,
             hasOverlayContent: dialogGroupHasOverlayContent(win.handle),
@@ -702,7 +724,7 @@ export function dialogNeedsPointMouseRouting(win: WindowInfo): boolean {
     if (win.nativeClassName !== '#32770') {
         // Plain window hosting system controls: point-route only while it's the
         // live overlay over a game-owned screen (windowed mode routes normally).
-        return !!win.overlayOnFlipScreen && (overlayForms.has(win.handle) || hasSystemControlChildren(win));
+        return !!win.overlayOnFlipScreen && (hasOverlayForm(win.handle) || hasSystemControlChildren(win));
     }
 
     // Every other visible #32770 point-routes. Being hidden behind an exclusive-fullscreen

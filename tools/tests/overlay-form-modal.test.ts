@@ -143,11 +143,52 @@ describe('keyboard while an overlay form is up', () => {
         const game = wm.createWindow('TRunnerForm', '', WS_POPUP | WS_VISIBLE, 0, 0, 0, 1024, 768, 0, 0, 0, 0);
         wm.getWindow(form)!.visible = true;
         wm.getWindow(game)!.visible = true;
+        wm.setActiveWindow(form);
         wm.setFocus(game);
         let live = form;
         wm.registerOverlayFormResolver(() => 0, () => live);
         expect(wm.getKeyboardTargetWindow()?.hwnd).toBe(form);
         live = 0;
         expect(wm.getKeyboardTargetWindow()?.hwnd).toBe(game);
+    });
+
+    test('a form shown without activation (SW_SHOWNA) leaves the keystrokes with the focused game window', () => {
+        const wm = new WindowManager();
+        const form = wm.createWindow('TMessageForm', '', WS_POPUP | WS_VISIBLE, 0, 352, 320, 320, 127, 0, 0, 0, 0);
+        const game = wm.createWindow('TRunnerForm', '', WS_POPUP | WS_VISIBLE, 0, 0, 0, 1024, 768, 0, 0, 0, 0);
+        wm.getWindow(form)!.visible = true;
+        wm.getWindow(game)!.visible = true;
+        wm.setActiveWindow(game);
+        wm.setFocus(game);
+        wm.registerOverlayFormResolver(() => 0, () => form);
+        expect(wm.getKeyboardTargetWindow()?.hwnd).toBe(game);
+        wm.setActiveWindow(form);
+        expect(wm.getKeyboardTargetWindow()?.hwnd).toBe(form);
+    });
+});
+
+describe('an overlay form across a savestate', () => {
+    test('a restore into a fresh worker brings the form back as a live overlay form', async () => {
+        const mod = await import('../../src/worker/modules/user32/dialog-overlay');
+        const { captureUser32State, restoreUser32State } = await import('../../src/worker/modules/user32/savestate');
+        windows.clear();
+        const game = { ...info(), handle: 0x10060, nativeClassName: 'TRunnerForm', width: 800, height: 600 } as WindowInfo;
+        const form = { ...info(), handle: 0x10061, nativeClassName: 'TMessageForm', width: 320, height: 127, overlayOnFlipScreen: true } as WindowInfo;
+        const plain = { ...info(), handle: 0x10062, nativeClassName: 'TOther', width: 200, height: 100 } as WindowInfo;
+        windows.set(game.handle, game);
+        windows.set(form.handle, form);
+        windows.set(plain.handle, plain);
+        mod.adoptOverlayForm(form.handle);
+        expect(mod.resolveFrontOverlayFormHwnd()).toBe(form.handle);
+        const saved = structuredClone(captureUser32State());
+        mod.forgetOverlayForm(form.handle);
+        windows.clear();
+        expect(mod.resolveFrontOverlayFormHwnd()).toBe(0);
+        restoreUser32State(saved);
+        expect(windows.get(form.handle)?.overlayOnFlipScreen).toBe(true);
+        expect(mod.resolveFrontOverlayFormHwnd()).toBe(form.handle);
+        expect(mod.isOverlayForm(form.handle)).toBe(true);
+        expect(mod.isOverlayForm(plain.handle)).toBe(false);
+        windows.clear();
     });
 });
