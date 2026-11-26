@@ -22,7 +22,7 @@ import { loadBitmapFromPeResource, parseResourceNameFromTitle } from '../kernel3
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
 import { isGroupBoxSystemControl, hitTestSystemControlAtClient, applyComboBoxClosedHeight } from './controls';
 import { clickAutoButton, handleSystemControlMouseAtScreen, resetControlInteractionState, takePendingControlNotification } from './control-interaction';
-import { resolveMouseTargetHwnd, eraseDialogOverlay, registerOverlayPaintRepair } from './dialog-overlay';
+import { resolveMouseTargetHwnd, resolveOverlayFormHitHwnd, resolveFrontOverlayFormHwnd, eraseDialogOverlay, registerOverlayPaintRepair } from './dialog-overlay';
 import { showDialogWindow } from './window-visibility';
 import { paintDialogToOverlay, finalizeDialogPaint, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleSystemControlMessage, applyStaticSetImageAutoSize, isContentChangingMessage } from './dialog-control-messages';
@@ -1735,6 +1735,7 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
     // chain (TS "Select Campaign"): InputManager asks the WindowManager for the
     // window under the cursor; this resolver implements the dialog preference.
     System.getInstance().windowManager.registerMouseTargetResolver(resolveMouseTargetHwnd);
+    System.getInstance().windowManager.registerOverlayFormResolver(resolveOverlayFormHitHwnd, resolveFrontOverlayFormHwnd);
 
     registerMessageBoxExports(exports);
 

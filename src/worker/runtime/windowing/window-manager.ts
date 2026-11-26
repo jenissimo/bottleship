@@ -131,6 +131,8 @@ export class WindowManager {
     /** Optional point-based mouse routing override (user32 dialog-overlay registers it
      *  to prefer live native dialogs over a DDraw flip chain). Returns hwnd or 0. */
     private mouseTargetResolver: ((screenX: number, screenY: number) => number) | null = null;
+    private overlayFormResolver: ((screenX: number, screenY: number) => number) | null = null;
+    private overlayFormKeyResolver: (() => number) | null = null;
 
     /**
      * The parent → children sibling list, front to back. Win32 has ONE sibling order
@@ -196,6 +198,11 @@ export class WindowManager {
 
     registerMouseTargetResolver(resolver: (screenX: number, screenY: number) => number): void {
         this.mouseTargetResolver = resolver;
+    }
+
+    registerOverlayFormResolver(resolver: (screenX: number, screenY: number) => number, keyResolver?: () => number): void {
+        this.overlayFormResolver = resolver;
+        this.overlayFormKeyResolver = keyResolver ?? null;
     }
 
     registerChildZOrderProvider(provider: (parentHwnd: number) => number[] | undefined): void {
@@ -275,17 +282,24 @@ export class WindowManager {
      */
     getMouseTargetWindow(screenX: number, screenY: number): WindowObject | undefined {
         const fromPoint = this.windowFromPoint(screenX, screenY);
-        if (fromPoint) {
-            const win = this.windows.get(fromPoint);
-            if (win) return win;
+        const form = this.overlayFormResolver?.(screenX, screenY) ?? 0;
+        if (form && fromPoint !== form && !this.isDescendantOf(fromPoint, form)) {
+            const win = this.windows.get(form);
+            if (win && win.visible) {
+                return this.windows.get(this.descendToChildAtPoint(form, win.rect.x, win.rect.y, screenX, screenY)) ?? win;
+            }
         }
-        // Fallback: dialog-overlay point router (Phase 5 will retire this).
+        const hit = fromPoint ? this.windows.get(fromPoint) : undefined;
+        if (hit && !this.isDisabled(hit)) return hit;
         const hwnd = this.mouseTargetResolver?.(screenX, screenY) ?? 0;
         if (hwnd) {
             const win = this.windows.get(hwnd);
-            if (win && win.visible) return win;
+            if (win && win.visible) {
+                const inner = this.windows.get(this.descendToChildAtPoint(hwnd, win.rect.x, win.rect.y, screenX, screenY));
+                return inner ?? win;
+            }
         }
-        return undefined;
+        return hit;
     }
 
     /**
@@ -697,6 +711,12 @@ export class WindowManager {
      * Falls back to the active window (and then the legacy topmost) when no focus is set.
      */
     getKeyboardTargetWindow(): WindowObject | undefined {
+        const form = this.overlayFormKeyResolver?.() ?? 0;
+        const formActive = form !== 0 && (this.activeHwnd === form || this.isDescendantOf(this.activeHwnd, form));
+        if (formActive && this.focusHwnd !== form && !this.isDescendantOf(this.focusHwnd, form)) {
+            const win = this.windows.get(form);
+            if (win && win.visible) return win;
+        }
         const focus = this.windows.get(this.focusHwnd);
         if (focus && focus.visible) return focus;
         const active = this.windows.get(this.activeHwnd);

@@ -19,6 +19,7 @@ import {
     setPointerClipped,
     setPointerVisibilityFacts,
     setPointerWarping,
+    setPointerOverlayFormLive,
     type PointerFacts,
 } from "../../src/worker/core/pointer-policy";
 
@@ -137,6 +138,20 @@ describe("pointer policy publication", () => {
 
     afterEach(() => {
         resetPointerPolicy();
+    });
+
+    test("a live overlay form shows the pointer and drops the capture the game holds", () => {
+        const device = {};
+        setPointerVisibilityFacts(false, "none");
+        setExclusiveMouseOwner(device, true);
+        visible = []; captured = [];
+        setPointerOverlayFormLive(true);
+        expect(visible).toEqual([true]);
+        expect(captured).toEqual([false]);
+        setPointerOverlayFormLive(false);
+        expect(visible).toEqual([true, false]);
+        expect(captured).toEqual([false, true]);
+        setExclusiveMouseOwner(device, false);
     });
 
     test("acquire hides the pointer and captures; unacquire restores both", () => {

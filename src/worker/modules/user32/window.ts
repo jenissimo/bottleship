@@ -58,7 +58,7 @@ import { applyDefaultSetText, handleSystemControlMessage, isContentChangingMessa
 import { encodeAnsi, readAnsiOrWideFromGuest } from '../codepage-utils';
 
 const ERROR_CANNOT_FIND_WND_CLASS = 1407;
-import { noteDialogOverlayCandidate, eraseDialogOverlay, isWindowFullyCoveredByHigherTopLevel } from './dialog-overlay';
+import { noteDialogOverlayCandidate, eraseDialogOverlay, isWindowFullyCoveredByHigherTopLevel, isOverlayForm } from './dialog-overlay';
 import { eraseControlOverlayRect, eraseHiddenWindowPixels, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, requestGuestDialogPaint } from './dialog-paint';
 import {
     resetControlInteractionState,
@@ -414,7 +414,7 @@ function applyWindowPosGeometry(
 
     if ((moving || resizing) && !(uFlags & 0x0008 /* SWP_NOREDRAW */)
         && isEffectivelyVisible(window)) {
-        eraseHiddenWindowPixels(window);
+        eraseHiddenWindowPixels(window, true);
     }
     if (!(uFlags & SWP_NOMOVE_GEO)) {
         window.x = x;
@@ -1669,6 +1669,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (windowInfo.nativeClassName === '#32770') {
             eraseDialogOverlay(hWnd);
             resetControlInteractionState();
+        } else if (isOverlayForm(hWnd)) {
+            eraseDialogOverlay(hWnd);
         }
 
         const ownerHwnd = windowInfo.parent ?? 0;

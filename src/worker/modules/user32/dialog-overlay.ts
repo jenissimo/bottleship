@@ -20,6 +20,7 @@
  */
 
 import { System } from '../../core/system';
+import { setPointerOverlayFormLive } from '../../core/pointer-policy';
 import type { RenderActive } from '../../runtime/runtime-services';
 import { isGdiSurfaceHidden, ddrawOwnsScreen, ddrawShowsContent, shouldSuppress3DGdiOverlay } from '../ddraw/gdi-visibility';
 import {
@@ -30,12 +31,39 @@ import {
     isWindowUpdateLocked,
     hasSystemControlChildren,
     isEffectivelyVisible,
+    getVirtualScreenRect,
 } from './shared-state';
 import { getComboDropdownRect } from './controls';
+import { presentingDeviceWindow } from '../../runtime/windowing/fullscreen-window';
 import { invokeOverlayRepairRepaint } from './control-interaction';
 import { paintTraceEnabled, logOverlayMutation } from './paint-trace';
 
 const WS_CHILD = 0x40000000;
+const WS_CAPTION = 0x00c00000;
+
+// @transient(overlay-form marks, re-derived when the form is shown again or after a restore)
+const overlayForms = new Set<number>();
+// @transient(set by a restore until the marks are re-derived from the restored windows)
+let rederiveAfterRestore = false;
+
+export function noteOverlayFormsRestored(): void {
+    overlayForms.clear();
+    rederiveAfterRestore = true;
+}
+
+function ensureOverlayFormsDerived(): void {
+    if (!rederiveAfterRestore) return;
+    rederiveAfterRestore = false;
+    for (const win of windows.values()) {
+        if (win.overlayOnFlipScreen && win.visible && !win.pendingDestroy && isFloatingOverlayForm(win)) overlayForms.add(win.handle);
+    }
+    setPointerOverlayFormLive(overlayForms.size > 0);
+}
+
+function hasOverlayForm(hwnd: number): boolean {
+    ensureOverlayFormsDerived();
+    return overlayForms.has(hwnd);
+}
 
 function getDDrawContext(): any {
     return (System.getInstance().process?.getModule('ddraw') as any)?.context;
@@ -123,12 +151,110 @@ export function noteDialogOverlayCandidate(win: WindowInfo | undefined): void {
     // #32770 dialogs, plus plain windows hosting JS system controls (a launcher /
     // options window built via CreateWindowEx("BUTTON"...) is real UI, not a stray
     // helper window) — both must composite over a game-owned screen.
-    if (win.nativeClassName !== '#32770' && !hasSystemControlChildren(win)) return;
+    const form = isFloatingOverlayForm(win);
+    if (win.nativeClassName !== '#32770' && !hasSystemControlChildren(win) && !form) return;
     if (isScreenOwnerWindow(win.handle)) return;
     if (!isGameScreenOwned()) return;
     if (!win.overlayOnFlipScreen) {
         win.overlayOnFlipScreen = true;
     }
+    if (form) adoptOverlayForm(win.handle);
+}
+
+export function adoptOverlayForm(hwnd: number): void {
+    overlayForms.add(hwnd);
+    setPointerOverlayFormLive(true);
+}
+
+/**
+ * An app top-level window (a Delphi/VCL TForm, an MFC frame, Game Maker's TMessageForm)
+ * smaller than the screen, shown while the game owns the screen. On Windows it is a
+ * window above the game's surface, so it is on screen and takes the mouse even though
+ * it is not a #32770 and often has neither caption nor system controls.
+ */
+function screenRight(): number { return getVirtualScreenRect().right; }
+function screenBottom(): number { return getVirtualScreenRect().bottom; }
+
+export function isOverlayFormCandidate(win: WindowInfo): boolean {
+    if (win.nativeClassName === '#32770' || (win.style & WS_CHILD) !== 0) return false;
+    return win.width > 0 && win.height > 0
+        && (win.width < screenRight() || win.height < screenBottom());
+}
+
+export function isFloatingOverlayForm(win: WindowInfo): boolean {
+    return isOverlayFormCandidate(win) && floatsOverGameWindow(win) && !ownsGameSurface(win.handle);
+}
+
+export function ownsGameSurface(hwnd: number): boolean {
+    if (isScreenOwnerWindow(hwnd)) return true;
+    let cur = presentingDeviceWindow();
+    for (let depth = 0; cur && depth < 32; depth++) {
+        if (cur === hwnd) return true;
+        cur = windows.get(cur)?.parent ?? 0;
+    }
+    return false;
+}
+
+export function floatsOverGameWindow(win: WindowInfo): boolean {
+    const area = win.width * win.height;
+    for (const other of windows.values()) {
+        if (other.handle === win.handle || !other.visible || other.pendingDestroy) continue;
+        if ((other.style & WS_CHILD) !== 0 || other.nativeClassName === '#32770' || hasOverlayForm(other.handle)) continue;
+        if (other.width * other.height > area) return true;
+    }
+    return false;
+}
+
+export function pruneOverlayForms(): void {
+    ensureOverlayFormsDerived();
+    if (overlayForms.size === 0) return;
+    let changed = false;
+    for (const hwnd of [...overlayForms]) {
+        const win = windows.get(hwnd);
+        if (win && isFloatingOverlayForm(win)) continue;
+        overlayForms.delete(hwnd);
+        if (win) win.overlayOnFlipScreen = false;
+        changed = true;
+    }
+    if (changed) setPointerOverlayFormLive(resolveFrontOverlayFormHwnd() !== 0);
+}
+
+export function isOverlayForm(hwnd: number): boolean {
+    pruneOverlayForms();
+    return hasOverlayForm(hwnd);
+}
+
+export function forgetOverlayForm(hwnd: number): void {
+    if (!overlayForms.delete(hwnd)) return;
+    setPointerOverlayFormLive(resolveFrontOverlayFormHwnd() !== 0);
+}
+
+/** The frontmost live overlay form, or 0. Keystrokes go to it: it is the modal UI on screen. */
+export function resolveFrontOverlayFormHwnd(): number {
+    pruneOverlayForms();
+    let best = 0, bestRank = -Infinity;
+    for (const hwnd of overlayForms) {
+        const win = windows.get(hwnd);
+        if (!win || !win.visible || win.pendingDestroy || !win.overlayOnFlipScreen) continue;
+        const rank = getOverlayWindowZRank(hwnd);
+        if (rank > bestRank) { best = hwnd; bestRank = rank; }
+    }
+    return best;
+}
+
+/** The frontmost live overlay form whose visual bounds contain the point, or 0. */
+export function resolveOverlayFormHitHwnd(screenX: number, screenY: number): number {
+    pruneOverlayForms();
+    let best = 0, bestRank = -Infinity;
+    for (const hwnd of overlayForms) {
+        const win = windows.get(hwnd);
+        if (!win || !win.visible || win.pendingDestroy || !win.overlayOnFlipScreen) continue;
+        const b = getWindowVisualBounds(hwnd);
+        if (!b || screenX < b.x || screenY < b.y || screenX >= b.x + b.w || screenY >= b.y + b.h) continue;
+        const rank = getOverlayWindowZRank(hwnd);
+        if (rank > bestRank) { best = hwnd; bestRank = rank; }
+    }
+    return best;
 }
 
 export interface DialogOverlayRect {
@@ -262,6 +388,7 @@ export function isWindowFullyCoveredByHigherTopLevel(
 ): boolean {
     if (!bounds) return false;
     if ((win.style & WS_CHILD) !== 0) return false;
+    if (hasOverlayForm(win.handle)) return false;
     const wm = System.getInstance().windowManager;
     const zOrder = wm.getZOrder();
     const index = zOrder.indexOf(win.handle);
@@ -336,7 +463,7 @@ export function registerOverlayPaintRepair(): void {
  * ghost over the game) or moves (else it smears its old position). Call BEFORE the
  * window is destroyed / repositioned, while its current rect is still known.
  */
-export function eraseDialogOverlay(hwnd: number): void {
+export function eraseDialogOverlay(hwnd: number, moving = false): void {
     const gdi = System.getInstance().gdiContext;
     if (!gdi?.clearOverlayRect) return;
     const win = windows.get(hwnd);
@@ -344,8 +471,9 @@ export function eraseDialogOverlay(hwnd: number): void {
     if (!bounds) return;
 
     // Stop compositing this dialog before erase (DestroyWindow path: still visible).
-    if (win) {
+    if (win && !(moving && hasOverlayForm(hwnd))) {
         win.overlayOnFlipScreen = false;
+        forgetOverlayForm(win.handle);
     }
 
     // +2px margin to cover anti-aliased edges / the default 1px dialog border.
@@ -436,7 +564,6 @@ function getDialogRoot(hwnd: number): number {
     return cur;
 }
 
-const WS_CAPTION = 0x00c00000;
 
 /**
  * True if the overlay actually holds pixels for this dialog group: an OS-drawn
@@ -449,6 +576,7 @@ const WS_CAPTION = 0x00c00000;
  * occlusion: it hides the frame and shows an empty gray box.
  */
 function dialogGroupHasOverlayContent(root: number): boolean {
+    if (hasOverlayForm(root)) return true;
     const stack = [root];
     const seen = new Set<number>();
     while (stack.length) {
@@ -555,6 +683,7 @@ export function getLiveDialogOverlayRects(renderActive?: RenderActive | null): D
 
 /** getLiveDialogOverlayRects with the owning window — the diagnostic form (harness `overlay`). */
 export function getLiveDialogOverlays(renderActive?: RenderActive | null): Array<{ hwnd: number; title: string; cls: string; rect: DialogOverlayRect }> {
+    pruneOverlayForms();
     const gdiOutputOnScreen = isGdiOutputOnScreen(renderActive);
     const entries: Array<{ hwnd: number; title: string; cls: string; rect: DialogOverlayRect; rank: number }> = [];
     for (const win of windows.values()) {
@@ -562,7 +691,7 @@ export function getLiveDialogOverlays(renderActive?: RenderActive | null): Array
         // A window flagged before the app took exclusive fullscreen can become the
         // screen owner afterwards; re-check here, the one place the rects are consumed.
         if (!dialogOverlayComposites({
-            gdiOutputOnScreen,
+            gdiOutputOnScreen: gdiOutputOnScreen || hasOverlayForm(win.handle),
             isScreenOwnerWindow: isScreenOwnerWindow(win.handle),
             isDialogRoot: getDialogRoot(win.handle) === win.handle,
             hasOverlayContent: dialogGroupHasOverlayContent(win.handle),
@@ -595,7 +724,7 @@ export function dialogNeedsPointMouseRouting(win: WindowInfo): boolean {
     if (win.nativeClassName !== '#32770') {
         // Plain window hosting system controls: point-route only while it's the
         // live overlay over a game-owned screen (windowed mode routes normally).
-        return !!win.overlayOnFlipScreen && hasSystemControlChildren(win);
+        return !!win.overlayOnFlipScreen && (hasOverlayForm(win.handle) || hasSystemControlChildren(win));
     }
 
     // Every other visible #32770 point-routes. Being hidden behind an exclusive-fullscreen

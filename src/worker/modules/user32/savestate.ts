@@ -1,4 +1,5 @@
 import { System } from '../../core/system';
+import { noteOverlayFormsRestored } from './dialog-overlay';
 import { savestateParticipants, stateKeys, type FieldPolicy } from '../../savestate/participant';
 import { CaptureRefusal } from '../../savestate/object-codecs';
 import type { SaveValue } from '../../savestate/value-codec';
@@ -170,6 +171,7 @@ export function restoreUser32State(s: User32State): void {
     setWheelScrollLines(s.wheelScrollLines);
     restoreEditControls(s.editControls);
     restoreUser32Windows(s.windows);
+    noteOverlayFormsRestored();
 }
 
 function refusing<T>(run: () => T): T {
