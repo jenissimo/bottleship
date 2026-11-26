@@ -21,7 +21,8 @@ export const SUPPORTED_INDICES = Object.freeze(
  * a reused process cannot leak a diagnostic value into a run labelled "shipping".
  */
 export const SHIPPING_JIT = new Map([
-    [0, 0], [1, 3], [2, 1], [3, 250], [4, 0],
+    [0, 0], [1, 3], [2, 1], [3, 250],
+    [4, 1],                     // PreemptionManager: direct block chaining ON
     [5, 1],                     // PreemptionManager: dead-flag elision ON
     [6, 0], [7, 5], [8, 8],
     [10, 0],                    // PreemptionManager: x87 stack-top locals OFF

@@ -31,9 +31,9 @@ export const MIN_BUSY_SHARE_FOR_MIPS = 0.2;
 const SMOOTH_TAU_MS = 2000;
 
 /** JIT as the engine is running it right now, read back from v86's config slots. */
-export type JitEffective = "on" | "off" | "notail" | "unknown";
+export type JitEffective = "on" | "off" | "notail" | "nochain" | "unknown";
 /** Why: the page's policy (host-jit-policy.ts) or a runtime switch nobody asked the page for. */
-export type JitReason = "default" | "query" | "ios-webkit-27" | "runtime";
+export type JitReason = "default" | "query" | "ios-webkit-27" | "mobile" | "runtime";
 
 export interface ExecCounters {
     atMs: number;
@@ -99,15 +99,16 @@ export function smoothMips(prev: number | null, w: ExecWindow): number | null {
     return prev + (w.busyMips - prev) * Math.min(1, w.busyMs / SMOOTH_TAU_MS);
 }
 
-/** v86 jit config slot 0 = JIT_DISABLED, slot 12 = RET chaining (`notail` clears it). */
+/** v86 jit config slot 0 = JIT_DISABLED, slot 12 = RET chaining (`notail` clears it), slot 4 = direct block chaining (`nochain` clears it). */
 export function effectiveJit(getJitConfig: ((i: number) => number) | undefined): JitEffective {
     if (typeof getJitConfig !== "function") return "unknown";
     if ((getJitConfig(0) >>> 0) !== 0) return "off";
-    return (getJitConfig(12) >>> 0) === 0 ? "notail" : "on";
+    if ((getJitConfig(12) >>> 0) === 0) return "notail";
+    return (getJitConfig(4) >>> 0) === 0 ? "nochain" : "on";
 }
 
 /** The page decided `policyMode`; anything the engine reports beyond that was switched at runtime. */
-export function jitReason(policyMode: "on" | "off" | "notail", policyReason: Exclude<JitReason, "runtime">,
+export function jitReason(policyMode: "on" | "off" | "notail" | "nochain", policyReason: Exclude<JitReason, "runtime">,
                           live: JitEffective): JitReason {
     if (live === "unknown" || live === policyMode) return policyReason;
     return "runtime";
@@ -241,12 +242,12 @@ export class ExecutionHealth {
     private detector = new SlowExecutionDetector();
     private jit: JitEffective = "unknown";
     private reason: JitReason = "default";
-    private policyMode: "on" | "off" | "notail" = "on";
+    private policyMode: "on" | "off" | "notail" | "nochain" = "on";
     private policyReason: Exclude<JitReason, "runtime"> = "default";
     private onHint: ((m: PerfHintMessage) => void) | null = null;
     private onUpdate: ((s: ExecHealthSnapshot) => void) | null = null;
 
-    setPolicy(mode: "on" | "off" | "notail", reason: Exclude<JitReason, "runtime">): void {
+    setPolicy(mode: "on" | "off" | "notail" | "nochain", reason: Exclude<JitReason, "runtime">): void {
         this.policyMode = mode;
         this.policyReason = reason;
     }

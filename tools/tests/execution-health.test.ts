@@ -78,16 +78,19 @@ describe("smoothMips", () => {
 
 describe("JIT mode as the engine reports it", () => {
     const cfg = (slots: Record<number, number>) => (i: number) => slots[i] ?? 0;
-    test("slot 0 set = off, slot 12 clear = notail, otherwise on", () => {
-        expect(effectiveJit(cfg({ 0: 1, 12: 1 }))).toBe("off");
-        expect(effectiveJit(cfg({ 0: 0, 12: 0 }))).toBe("notail");
-        expect(effectiveJit(cfg({ 0: 0, 12: 1 }))).toBe("on");
+    test("slot 0 set = off, slot 12 clear = notail, slot 4 clear = nochain, otherwise on", () => {
+        expect(effectiveJit(cfg({ 0: 1, 4: 1, 12: 1 }))).toBe("off");
+        expect(effectiveJit(cfg({ 0: 0, 4: 0, 12: 0 }))).toBe("notail");
+        expect(effectiveJit(cfg({ 0: 0, 4: 0, 12: 1 }))).toBe("nochain");
+        expect(effectiveJit(cfg({ 0: 0, 4: 1, 12: 1 }))).toBe("on");
         expect(effectiveJit(undefined)).toBe("unknown");
     });
 
     test("a mode the page did not choose is attributed to a runtime switch", () => {
         expect(jitReason("off", "query", "off")).toBe("query");
         expect(jitReason("notail", "ios-webkit-27", "notail")).toBe("ios-webkit-27");
+        expect(jitReason("nochain", "mobile", "nochain")).toBe("mobile");
+        expect(jitReason("nochain", "mobile", "on")).toBe("runtime");
         expect(jitReason("on", "default", "off")).toBe("runtime");
     });
 });
