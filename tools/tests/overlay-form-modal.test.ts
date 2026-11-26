@@ -171,24 +171,48 @@ describe('an overlay form across a savestate', () => {
     test('a restore into a fresh worker brings the form back as a live overlay form', async () => {
         const mod = await import('../../src/worker/modules/user32/dialog-overlay');
         const { captureUser32State, restoreUser32State } = await import('../../src/worker/modules/user32/savestate');
-        windows.clear();
-        const game = { ...info(), handle: 0x10060, nativeClassName: 'TRunnerForm', width: 800, height: 600 } as WindowInfo;
-        const form = { ...info(), handle: 0x10061, nativeClassName: 'TMessageForm', width: 320, height: 127, overlayOnFlipScreen: true } as WindowInfo;
-        const plain = { ...info(), handle: 0x10062, nativeClassName: 'TOther', width: 200, height: 100 } as WindowInfo;
-        windows.set(game.handle, game);
-        windows.set(form.handle, form);
-        windows.set(plain.handle, plain);
-        mod.adoptOverlayForm(form.handle);
-        expect(mod.resolveFrontOverlayFormHwnd()).toBe(form.handle);
-        const saved = structuredClone(captureUser32State());
-        mod.forgetOverlayForm(form.handle);
-        windows.clear();
-        expect(mod.resolveFrontOverlayFormHwnd()).toBe(0);
-        restoreUser32State(saved);
-        expect(windows.get(form.handle)?.overlayOnFlipScreen).toBe(true);
-        expect(mod.resolveFrontOverlayFormHwnd()).toBe(form.handle);
-        expect(mod.isOverlayForm(form.handle)).toBe(true);
-        expect(mod.isOverlayForm(plain.handle)).toBe(false);
-        windows.clear();
+        const { resetUser32SharedState } = await import('../../src/worker/modules/user32/shared-state');
+        const { resetListViewStatesForTests } = await import('../../src/worker/modules/user32/list-view-control');
+        const { resetTabStatesForTests } = await import('../../src/worker/modules/user32/tab-control');
+        const { resetRichEditStatesForTests } = await import('../../src/worker/modules/user32/rich-edit-control');
+        const { resetEditStatesForTests } = await import('../../src/worker/modules/user32/edit-control');
+        const { resetHooks } = await import('../../src/worker/modules/user32/hooks');
+        const { resetMenuState } = await import('../../src/worker/modules/user32/menu');
+        const { restorePaintRegions } = await import('../../src/worker/modules/user32/paint-region');
+        const { activeDialogs } = await import('../../src/worker/modules/user32/modal-dialog-state');
+        const resetStores = () => {
+            resetUser32SharedState();
+            resetHooks();
+            resetMenuState();
+            restorePaintRegions([]);
+            activeDialogs.clear();
+            resetEditStatesForTests();
+            resetRichEditStatesForTests();
+            resetTabStatesForTests();
+            resetListViewStatesForTests();
+        };
+        resetStores();
+        try {
+            const game = { ...info(), handle: 0x10060, nativeClassName: 'TRunnerForm', width: 800, height: 600 } as WindowInfo;
+            const form = { ...info(), handle: 0x10061, nativeClassName: 'TMessageForm', width: 320, height: 127, overlayOnFlipScreen: true } as WindowInfo;
+            const plain = { ...info(), handle: 0x10062, nativeClassName: 'TOther', width: 200, height: 100 } as WindowInfo;
+            windows.set(game.handle, game);
+            windows.set(form.handle, form);
+            windows.set(plain.handle, plain);
+            mod.adoptOverlayForm(form.handle);
+            expect(mod.resolveFrontOverlayFormHwnd()).toBe(form.handle);
+            const saved = structuredClone(captureUser32State());
+            mod.forgetOverlayForm(form.handle);
+            windows.clear();
+            expect(mod.resolveFrontOverlayFormHwnd()).toBe(0);
+            restoreUser32State(saved);
+            expect(windows.get(form.handle)?.overlayOnFlipScreen).toBe(true);
+            expect(mod.resolveFrontOverlayFormHwnd()).toBe(form.handle);
+            expect(mod.isOverlayForm(form.handle)).toBe(true);
+            expect(mod.isOverlayForm(plain.handle)).toBe(false);
+        } finally {
+            mod.forgetOverlayForm(0x10061);
+            resetStores();
+        }
     });
 });
