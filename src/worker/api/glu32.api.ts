@@ -24,6 +24,7 @@ export const glu32Module: ModuleDescriptor = {
     name: "glu32",
     functions: [
         // Matrix utilities
+        glu("gluPickMatrix", [d("x"), d("y"), d("width"), d("height"), p("viewport")]),
         glu("gluPerspective", [d("fovy"), d("aspect"), d("zNear"), d("zFar")]),
         glu("gluOrtho2D", [d("left"), d("right"), d("bottom"), d("top")]),
         glu("gluLookAt", [d("eyeX"), d("eyeY"), d("eyeZ"), d("centerX"), d("centerY"), d("centerZ"), d("upX"), d("upY"), d("upZ")]),
