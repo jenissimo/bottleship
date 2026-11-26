@@ -3267,12 +3267,14 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         }
 
         let expandedIndices: Uint8Array | null = null;
+        let expandedIndexBytes = 0;
         if (primitiveType === D3DPT_TRIANGLEFAN && iCount >= 3) {
             // Expand indexed triangle fan to triangle list: for each triangle (0, i+1, i+2) create 3 indices
             finalIndexCount = (iCount - 2) * 3;
             const expandedIndexSize = finalIndexCount * (indexFormat === "uint32" ? 4 : 2);
             const alignedExpandedSize = (expandedIndexSize + 3) & ~3;
             expandedIndices = this.ensureScratchBuffer(alignedExpandedSize);
+            expandedIndexBytes = alignedExpandedSize;
             
             // Read original indices
             const originalIndices = memory.subarray(indicesAddr, indicesAddr + indexDataSize);
@@ -3362,7 +3364,7 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                 }
             }
         }
-        const alignedIndexSize = expandedIndices ? expandedIndices.length : ((indexDataSize + 3) & ~3);
+        const alignedIndexSize = expandedIndices ? expandedIndexBytes : ((indexDataSize + 3) & ~3);
         const indexAlloc = this.ringBufferManager.allocateIndexData(
             indexScratch.subarray(0, alignedIndexSize)
         );
