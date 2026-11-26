@@ -1,16 +1,14 @@
 /**
  * MSACM32.dll — the Audio Compression Manager.
  *
- * We provide what every Windows 95–XP install ships: the PCM converter (msacm.pcm —
- * bit depth, channel count, sample rate) plus the two ADPCM decoders (msadp32.acm and
- * imaadp32.acm). Those three are stock, so a title with IMA-ADPCM speech is entitled
+ * We provide the PCM converter (msacm.pcm — bit depth, channel count, sample rate),
+ * the two ADPCM decoders (msadp32.acm and imaadp32.acm), and the GSM 6.10 decoder.
+ * A title with IMA-ADPCM speech is entitled
  * to find them; refusing would not read to the caller as "this machine lacks a codec"
  * but as "there is no sound", and titles take the no-audio branch over it.
  *
- * What we do NOT have is an ADPCM *encoder* or any of the optional codecs (GSM 6.10,
- * MP3, Voxware). Those fail the way Windows fails a missing driver —
- * ACMERR_NOTPOSSIBLE out of acmStreamOpen — with a WARN naming the format tag, so the
- * gap is visible rather than silent.
+ * Encoding to ADPCM or GSM 6.10 and codecs such as MP3 and Voxware are unsupported.
+ * acmStreamOpen returns ACMERR_NOTPOSSIBLE and logs a WARN naming the format tag.
  *
  * Every documented export exists. Callers reach ACM through LoadLibrary +
  * GetProcAddress and — because on Windows the DLL is always there — routinely skip the
@@ -24,6 +22,7 @@ import { Logger, LogCategory } from "../core/logger";
 import { System } from "../core/system";
 import { isValidAddress } from "../core/memory/address-guard";
 import { borrowGuestMemory } from "../core/memory/guest-memory";
+import { Gsm610Decoder, GSM610_WAV49_BLOCK_BYTES, GSM610_WAV49_SAMPLES_PER_BLOCK } from "../core/audio/directmusic/gsm610";
 import { encodeAnsi } from "./codepage-utils";
 import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
 import type { SaveValue } from "../savestate/value-codec";
@@ -45,6 +44,9 @@ const WAVE_FORMAT_PCM = 1;
 const WAVE_FORMAT_ADPCM = 2;
 /** imaadp32.acm — IMA/DVI ADPCM. */
 const WAVE_FORMAT_IMA_ADPCM = 0x11;
+const WAVE_FORMAT_GSM610 = 0x31;
+const ACM_STREAMCONVERTF_START = 0x00000010;
+const GSM610_SAMPLE_RATE = 8000;
 
 const ACM_STREAMOPENF_QUERY = 0x00000001;
 const ACM_STREAMOPENF_ASYNC = 0x00000002;
@@ -147,6 +149,16 @@ interface WaveFormat {
 interface AcmStream {
     src: WaveFormat;
     dst: WaveFormat;
+    gsm?: Gsm610Decoder;
+}
+
+interface Gsm610State {
+    dp0: Int16Array;
+    larpp: Int16Array[];
+    j: number;
+    nrp: number;
+    v: Int16Array;
+    msr: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +219,7 @@ const st = {
 };
 
 /** Samples per channel in one block, as each codec's block layout defines it. */
-function adpcmSamplesPerBlock(f: WaveFormat): number {
+function samplesPerBlock(f: WaveFormat): number {
     if (f.samplesPerBlock > 0) return f.samplesPerBlock;
     if (f.formatTag === WAVE_FORMAT_ADPCM) {
         // 7 header bytes per channel, then two samples per byte, plus the two the
@@ -366,6 +378,7 @@ const FORMAT_TAGS: FormatTagInfo[] = [
     { tag: WAVE_FORMAT_ADPCM, name: "Microsoft ADPCM", formatSize: WAVEFORMATEX_SIZE + 2 + 2 + 7 * 4, standardFormats: ADPCM_FORMAT_COUNT },
     // IMA-ADPCM extra data: wSamplesPerBlock.
     { tag: WAVE_FORMAT_IMA_ADPCM, name: "IMA ADPCM", formatSize: WAVEFORMATEX_SIZE + 2, standardFormats: ADPCM_FORMAT_COUNT },
+    { tag: WAVE_FORMAT_GSM610, name: "GSM 6.10", formatSize: WAVEFORMATEX_SIZE + 2, standardFormats: 1 },
 ];
 const MAX_FORMAT_SIZE = Math.max(...FORMAT_TAGS.map(t => t.formatSize));
 
@@ -381,6 +394,7 @@ export interface Msacm32StreamState {
     handle: number;
     src: WaveFormat;
     dst: WaveFormat;
+    gsm?: Gsm610State;
 }
 
 export interface Msacm32State {
@@ -393,7 +407,8 @@ export const MSACM32_SCHEMA = {
     format: stateKeys<WaveFormat>({
         formatTag: true, channels: true, samplesPerSec: true, bitsPerSample: true, blockAlign: true, samplesPerBlock: true, coefs: true,
     }),
-    stream: stateKeys<Msacm32StreamState>({ handle: true, src: true, dst: true }),
+    stream: stateKeys<Msacm32StreamState>({ handle: true, src: true, dst: true, gsm: true }),
+    gsm: stateKeys<Gsm610State>({ dp0: true, larpp: true, j: true, nrp: true, v: true, msr: true }),
     state: stateKeys<Msacm32State>({ nextStreamHandle: true, streams: true }),
 };
 
@@ -402,6 +417,28 @@ function copyFormat(f: WaveFormat): WaveFormat {
         formatTag: f.formatTag, channels: f.channels, samplesPerSec: f.samplesPerSec, bitsPerSample: f.bitsPerSample,
         blockAlign: f.blockAlign, samplesPerBlock: f.samplesPerBlock, coefs: f.coefs ? new Int16Array(f.coefs) : null,
     };
+}
+
+function captureGsmState(decoder: Gsm610Decoder): Gsm610State {
+    return {
+        dp0: decoder["dp0"].slice(),
+        larpp: decoder["larpp"].map(row => row.slice()),
+        j: decoder["j"],
+        nrp: decoder["nrp"],
+        v: decoder["v"].slice(),
+        msr: decoder["msr"],
+    };
+}
+
+function restoreGsmState(saved: Gsm610State): Gsm610Decoder {
+    const decoder = new Gsm610Decoder();
+    decoder["dp0"].set(saved.dp0);
+    decoder["larpp"].forEach((row, i) => row.set(saved.larpp[i]!));
+    decoder["j"] = saved.j;
+    decoder["nrp"] = saved.nrp;
+    decoder["v"].set(saved.v);
+    decoder["msr"] = saved.msr;
+    return decoder;
 }
 
 function describeFormat(f: WaveFormat): string {
@@ -419,7 +456,11 @@ export class Msacm32 implements IModule {
     captureSavestate(): Msacm32State {
         return {
             nextStreamHandle: this.nextStreamHandle,
-            streams: [...this.streams].map(([handle, s]) => ({ handle, src: copyFormat(s.src), dst: copyFormat(s.dst) })),
+            streams: [...this.streams].map(([handle, s]) => {
+                const row: Msacm32StreamState = { handle, src: copyFormat(s.src), dst: copyFormat(s.dst) };
+                if (s.gsm) row.gsm = captureGsmState(s.gsm);
+                return row;
+            }),
         };
     }
 
@@ -431,8 +472,12 @@ export class Msacm32 implements IModule {
             if (streams.has(row.handle) || row.handle >= s.nextStreamHandle) {
                 throw new Error(`msacm32: saved ${name} does not fit the saved handle counter 0x${s.nextStreamHandle.toString(16)}`);
             }
-            if (!this.isSupportedFormat(stream.dst) || !(this.isSupportedFormat(stream.src) || this.isDecodableAdpcm(stream.src))) {
+            if (!this.isSupportedFormat(stream.dst) || !(this.isSupportedFormat(stream.src) || this.isDecodableBlockFormat(stream.src))) {
                 throw new Error(`msacm32: saved ${name} is not a conversion this build performs`);
+            }
+            if (stream.src.formatTag === WAVE_FORMAT_GSM610) {
+                if (!row.gsm) throw new Error(`msacm32: saved ${name} is missing its decoder state`);
+                stream.gsm = restoreGsmState(row.gsm);
             }
             streams.set(row.handle, stream);
         }
@@ -442,7 +487,7 @@ export class Msacm32 implements IModule {
 
     registerSavestate(): () => void {
         return savestateParticipants.add({
-            id: 'msacm32', version: 1, order: 78, covers: ['msacm32'], schema: MSACM32_SCHEMA as unknown as SaveValue,
+            id: 'msacm32', version: 2, order: 78, covers: ['msacm32'], schema: MSACM32_SCHEMA as unknown as SaveValue,
             capture: () => this.captureSavestate() as unknown as SaveValue,
             restore: (saved) => this.restoreSavestate(saved as unknown as Msacm32State),
         });
@@ -487,7 +532,7 @@ export class Msacm32 implements IModule {
         // The ADPCM tags carry their block geometry in the WAVEFORMATEX extra bytes, and
         // MS-ADPCM its own coefficient table. Deriving them instead of reading them would
         // decode a stream that used a non-standard encoder into noise.
-        if (formatTag === WAVE_FORMAT_ADPCM || formatTag === WAVE_FORMAT_IMA_ADPCM) {
+        if (formatTag === WAVE_FORMAT_ADPCM || formatTag === WAVE_FORMAT_IMA_ADPCM || formatTag === WAVE_FORMAT_GSM610) {
             const cbSize = v.getUint16(ptr + WFX.cbSize, true);
             if (cbSize >= 2 && isValidAddress(mem, ptr + WAVEFORMATEX_SIZE, 2, "r")) {
                 f.samplesPerBlock = v.getUint16(ptr + WAVEFORMATEX_SIZE, true);
@@ -527,7 +572,18 @@ export class Msacm32 implements IModule {
 
     /** One of a codec's advertised standard formats: rate × channels, at that rate's
      *  block size. samplesPerBlock follows from the block layout, never guessed. */
-    private standardAdpcmFormatAt(tag: number, index: number): WaveFormat {
+    private standardBlockFormatAt(tag: number, index: number): WaveFormat {
+        if (tag === WAVE_FORMAT_GSM610) {
+            return {
+                formatTag: tag,
+                channels: 1,
+                samplesPerSec: GSM610_SAMPLE_RATE,
+                bitsPerSample: 0,
+                blockAlign: GSM610_WAV49_BLOCK_BYTES,
+                samplesPerBlock: GSM610_WAV49_SAMPLES_PER_BLOCK,
+                coefs: null,
+            };
+        }
         const entry = ADPCM_RATE_BLOCKS[Math.floor(index / 2)]!;
         const channels = (index % 2) + 1;
         const f: WaveFormat = {
@@ -539,15 +595,15 @@ export class Msacm32 implements IModule {
             samplesPerBlock: 0,
             coefs: tag === WAVE_FORMAT_ADPCM ? MS_STANDARD_COEFS : null,
         };
-        f.samplesPerBlock = adpcmSamplesPerBlock(f);
+        f.samplesPerBlock = samplesPerBlock(f);
         return f;
     }
 
     /** WAVEFORMATEX + the tag's extra bytes, exactly as the codec's own driver writes
      *  them — a caller feeds this straight back into acmStreamOpen. */
-    private writeAdpcmFormat(mem: Uint8Array, ptr: number, f: WaveFormat): void {
+    private writeBlockFormat(mem: Uint8Array, ptr: number, f: WaveFormat): void {
         const v = this.view(mem);
-        const samplesPerBlock = f.samplesPerBlock || adpcmSamplesPerBlock(f);
+        const framesPerBlock = samplesPerBlock(f);
         const isMs = f.formatTag === WAVE_FORMAT_ADPCM;
         const coefs = f.coefs ?? MS_STANDARD_COEFS;
         const nCoef = coefs.length >> 1;
@@ -557,11 +613,11 @@ export class Msacm32 implements IModule {
         v.setUint32(ptr + WFX.nSamplesPerSec, f.samplesPerSec, true);
         // One block holds samplesPerBlock frames, so the byte rate follows from both.
         v.setUint32(ptr + WFX.nAvgBytesPerSec,
-            Math.round((f.samplesPerSec * f.blockAlign) / samplesPerBlock), true);
+            Math.round((f.samplesPerSec * f.blockAlign) / framesPerBlock), true);
         v.setUint16(ptr + WFX.nBlockAlign, f.blockAlign, true);
-        v.setUint16(ptr + WFX.wBitsPerSample, 4, true);
+        v.setUint16(ptr + WFX.wBitsPerSample, f.bitsPerSample, true);
         v.setUint16(ptr + WFX.cbSize, cbSize, true);
-        v.setUint16(ptr + WAVEFORMATEX_SIZE, samplesPerBlock, true);
+        v.setUint16(ptr + WAVEFORMATEX_SIZE, framesPerBlock, true);
         if (isMs) {
             v.setUint16(ptr + WAVEFORMATEX_SIZE + 2, nCoef, true);
             for (let i = 0; i < nCoef * 2; i++) {
@@ -586,12 +642,16 @@ export class Msacm32 implements IModule {
     }
 
     /** ADPCM we can DECODE. Encoding is a different driver half we do not have. */
-    private isDecodableAdpcm(f: WaveFormat): boolean {
+    private isDecodableBlockFormat(f: WaveFormat): boolean {
+        if (f.formatTag === WAVE_FORMAT_GSM610) {
+            return f.channels === 1 && f.samplesPerSec === GSM610_SAMPLE_RATE && f.bitsPerSample === 0
+                && f.blockAlign === GSM610_WAV49_BLOCK_BYTES && f.samplesPerBlock === GSM610_WAV49_SAMPLES_PER_BLOCK;
+        }
         if (f.formatTag !== WAVE_FORMAT_ADPCM && f.formatTag !== WAVE_FORMAT_IMA_ADPCM) return false;
         if (f.channels !== 1 && f.channels !== 2) return false;
         if (f.samplesPerSec <= 0 || f.bitsPerSample !== 4) return false;
         const header = f.formatTag === WAVE_FORMAT_ADPCM ? 7 : 4;
-        return f.blockAlign > header * f.channels && adpcmSamplesPerBlock(f) > 0;
+        return f.blockAlign > header * f.channels && samplesPerBlock(f) > 0;
     }
 
     private standardFormatAt(index: number): WaveFormat {
@@ -625,13 +685,13 @@ export class Msacm32 implements IModule {
     /** Source bytes → source FRAMES (samples per channel), for either source kind. */
     private srcFramesInBytes(s: AcmStream, bytes: number): number {
         if (!this.isBlockSource(s)) return Math.floor(bytes / frameBytes(s.src));
-        return Math.floor(bytes / s.src.blockAlign) * adpcmSamplesPerBlock(s.src);
+        return Math.floor(bytes / s.src.blockAlign) * samplesPerBlock(s.src);
     }
 
     /** Source FRAMES → the source bytes that hold them (whole blocks, rounded up). */
     private srcBytesForFrames(s: AcmStream, frames: number): number {
         if (!this.isBlockSource(s)) return frames * frameBytes(s.src);
-        const perBlock = adpcmSamplesPerBlock(s.src);
+        const perBlock = samplesPerBlock(s.src);
         return Math.ceil(frames / perBlock) * s.src.blockAlign;
     }
 
@@ -859,14 +919,14 @@ export class Msacm32 implements IModule {
             }
             const format = tag === WAVE_FORMAT_PCM
                 ? this.standardFormatAt(index)
-                : this.standardAdpcmFormatAt(tag, index);
+                : this.standardBlockFormatAt(tag, index);
             if (tag === WAVE_FORMAT_PCM) this.writePcmFormat(mem, pwfx, format);
-            else this.writeAdpcmFormat(mem, pwfx, format);
+            else this.writeBlockFormat(mem, pwfx, format);
 
             v.setUint32(pafd + AFD.dwFormatTag, tag, true);
             v.setUint32(pafd + AFD.fdwSupport, DRIVER_SUPPORT, true);
-            const depth = tag === WAVE_FORMAT_PCM ? `${format.bitsPerSample} Bit` : "4 Bit";
-            const label = `${format.samplesPerSec} Hz, ${depth}, ${format.channels === 1 ? "Mono" : "Stereo"}`;
+            const depth = format.bitsPerSample ? `, ${format.bitsPerSample} Bit` : "";
+            const label = `${format.samplesPerSec} Hz${depth}, ${format.channels === 1 ? "Mono" : "Stereo"}`;
             const labelBytes = wide ? AFD_FORMAT_CHARS * 2 : AFD_FORMAT_CHARS;
             if (isValidAddress(mem, pafd + AFD.szFormat, labelBytes, "rw")) {
                 if (wide) {
@@ -942,6 +1002,7 @@ export class Msacm32 implements IModule {
                 return MMSYSERR_INVALPARAM;
             }
             if ((fdwSuggest & ~ACM_FORMATSUGGESTF_TYPEMASK) !== 0) return MMSYSERR_INVALFLAG;
+            if (src.formatTag === WAVE_FORMAT_GSM610 && !this.isDecodableBlockFormat(src)) return ACMERR_NOTPOSSIBLE;
 
             const v = this.view(mem);
             // Each SUGGESTF flag means "this destination field is fixed, honour it";
@@ -1038,14 +1099,14 @@ export class Msacm32 implements IModule {
             // PCM→PCM is the converter; ADPCM→PCM is a decode. Anything else (an ADPCM
             // *encode*, an ADPCM→ADPCM transcode, or a codec we do not ship) is refused
             // the way Windows refuses a driver it cannot find.
-            const decodes = this.isDecodableAdpcm(src) && this.isSupportedFormat(dst);
+            const decodes = this.isDecodableBlockFormat(src) && this.isSupportedFormat(dst);
             const converts = this.isSupportedFormat(src) && this.isSupportedFormat(dst);
             if (!decodes && !converts) {
                 Logger.warn(
                     LogCategory.SYSTEM,
                     `msacm32:acmStreamOpen ${src.formatTag}/${src.bitsPerSample}bit/${src.channels}ch/${src.samplesPerSec}Hz ` +
                     `-> ${dst.formatTag}/${dst.bitsPerSample}bit/${dst.channels}ch/${dst.samplesPerSec}Hz: ` +
-                    `ACMERR_NOTPOSSIBLE (installed: PCM converter, MS-ADPCM and IMA-ADPCM decode)`
+                    `ACMERR_NOTPOSSIBLE (installed: PCM converter, MS-ADPCM, IMA-ADPCM and GSM 6.10 decode)`
                 );
                 if (!query && phas) this.view(mem).setUint32(phas, 0, true);
                 return ACMERR_NOTPOSSIBLE;
@@ -1054,7 +1115,9 @@ export class Msacm32 implements IModule {
             if (query) return MMSYSERR_NOERROR;
 
             const handle = this.nextStreamHandle++;
-            this.streams.set(handle, { src, dst });
+            const stream: AcmStream = { src, dst };
+            if (src.formatTag === WAVE_FORMAT_GSM610) stream.gsm = new Gsm610Decoder();
+            this.streams.set(handle, stream);
             this.view(mem).setUint32(phas, handle, true);
             Logger.verbose(
                 LogCategory.SYSTEM,
@@ -1072,8 +1135,10 @@ export class Msacm32 implements IModule {
 
         this.exports["acmStreamReset"] = (ctx, mem, args) => {
             if (args[1] >>> 0) return MMSYSERR_INVALFLAG;
-            // Conversion is stateless here — there is no queue or resampler phase to drop.
-            return this.streams.has(args[0] >>> 0) ? MMSYSERR_NOERROR : MMSYSERR_INVALHANDLE;
+            const stream = this.streams.get(args[0] >>> 0);
+            if (!stream) return MMSYSERR_INVALHANDLE;
+            if (stream.gsm) stream.gsm = new Gsm610Decoder();
+            return MMSYSERR_NOERROR;
         };
 
         this.exports["acmStreamMessage"] = (ctx, mem, args) =>
@@ -1140,6 +1205,7 @@ export class Msacm32 implements IModule {
             if (v.getUint32(pash + ASH.cbStruct, true) < ACMSTREAMHEADER_SIZE) return MMSYSERR_INVALPARAM;
             const status = v.getUint32(pash + ASH.fdwStatus, true);
             if ((status & ACMSTREAMHEADER_STATUSF_PREPARED) === 0) return ACMERR_UNPREPARED;
+            if (((args[2] >>> 0) & ACM_STREAMCONVERTF_START) !== 0 && stream.gsm) stream.gsm = new Gsm610Decoder();
 
             const pbSrc = v.getUint32(pash + ASH.pbSrc, true);
             const cbSrcLength = v.getUint32(pash + ASH.cbSrcLength, true);
@@ -1208,8 +1274,8 @@ export class Msacm32 implements IModule {
         srcPtr: number, cbSrcLength: number,
         dstPtr: number, dstFrames: number
     ): { srcFrames: number; dstFrames: number } {
-        const { src } = stream;
-        const perBlock = adpcmSamplesPerBlock(src);
+        const { src, gsm } = stream;
+        const perBlock = samplesPerBlock(src);
         const blocksAvailable = Math.floor(cbSrcLength / src.blockAlign);
         if (perBlock <= 0 || blocksAvailable <= 0 || dstFrames <= 0) {
             return { srcFrames: 0, dstFrames: 0 };
@@ -1220,10 +1286,17 @@ export class Msacm32 implements IModule {
         const need = blocks * perBlock * src.channels;
         if (this.pcmScratch.length < need) this.pcmScratch = new Int16Array(need);
         const pcm = this.pcmScratch;
+        const gsmBlock = gsm ? new Float32Array(perBlock) : null;
 
         let frames = 0;
         for (let b = 0; b < blocks; b++) {
             const at = srcPtr + b * src.blockAlign;
+            if (gsm && gsmBlock) {
+                gsm.decodeWav49Block(mem, at, gsmBlock, 0);
+                for (let i = 0; i < perBlock; i++) pcm[frames + i] = gsmBlock[i]! * 32768;
+                frames += perBlock;
+                continue;
+            }
             const written = src.formatTag === WAVE_FORMAT_ADPCM
                 ? decodeMsAdpcmBlock(mem, at, src.blockAlign, src.channels,
                     src.coefs ?? MS_STANDARD_COEFS, perBlock, pcm, frames * src.channels)

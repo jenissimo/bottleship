@@ -21,7 +21,9 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { Msacm32 } from "../../src/worker/modules/msacm32";
+import { Msacm32, type Msacm32State } from "../../src/worker/modules/msacm32";
+import { Gsm610Decoder } from "../../src/worker/core/audio/directmusic/gsm610";
+import { decodeValue, encodeValue, type SaveValue } from "../../src/worker/savestate/value-codec";
 import type { ThunkImplementation } from "../../src/worker/core/thunking/thunk-dispatcher";
 
 const MMSYSERR_NOERROR = 0;
@@ -248,6 +250,167 @@ describe("msacm32 ADPCM decode does not pay per-nibble costs", () => {
         // shape can cross, on any machine this suite runs on.
         expect(nsPerBlock).toBeLessThan(200_000);
         expect(call("acmStreamClose", has, 0)).toBe(MMSYSERR_NOERROR);
+    });
+});
+
+describe("msacm32 GSM 6.10 decode", () => {
+    const GSM_TAG = 0x31;
+    const GSM_BLOCK_BYTES = 65;
+    const GSM_BLOCK_SAMPLES = 320;
+    const PCM_BLOCK_BYTES = GSM_BLOCK_SAMPLES * 2;
+    const ACMERR_NOTPOSSIBLE = 512;
+    const DETAILS = 0x1500;
+
+    function writeGsmFormat(): void {
+        view.setUint16(SRC_FMT, GSM_TAG, true);
+        view.setUint16(SRC_FMT + 2, 1, true);
+        view.setUint32(SRC_FMT + 4, 8000, true);
+        view.setUint32(SRC_FMT + 8, 1625, true);
+        view.setUint16(SRC_FMT + 12, GSM_BLOCK_BYTES, true);
+        view.setUint16(SRC_FMT + 14, 0, true);
+        view.setUint16(SRC_FMT + 16, 2, true);
+        view.setUint16(SRC_FMT + 18, GSM_BLOCK_SAMPLES, true);
+    }
+
+    test("advertises the standard GSM format and suggests matching 16-bit PCM", () => {
+        view.setUint32(DETAILS + 8, GSM_TAG, true);
+        expect(call("acmFormatTagDetailsA", 0, DETAILS, 1)).toBe(MMSYSERR_NOERROR);
+        expect(view.getUint32(DETAILS + 12, true)).toBe(20);
+        expect(view.getUint32(DETAILS + 20, true)).toBe(1);
+        expect(new TextDecoder().decode(mem.subarray(DETAILS + 24, DETAILS + 32))).toBe("GSM 6.10");
+        const tagIndex = view.getUint32(DETAILS + 4, true);
+        view.setUint32(DETAILS + 8, 0, true);
+        expect(call("acmFormatTagDetailsA", 0, DETAILS, 0)).toBe(MMSYSERR_NOERROR);
+        expect(view.getUint32(DETAILS + 4, true)).toBe(tagIndex);
+        expect(view.getUint32(DETAILS + 8, true)).toBe(GSM_TAG);
+
+        writeGsmFormat();
+        const gsmFormat = mem.slice(SRC_FMT, SRC_FMT + 20);
+        mem.fill(0, SRC_FMT, SRC_FMT + 20);
+        view.setUint32(DETAILS + 4, 0, true);
+        view.setUint32(DETAILS + 16, SRC_FMT, true);
+        view.setUint32(DETAILS + 20, 20, true);
+        expect(call("acmFormatDetailsA", 0, DETAILS, 0)).toBe(MMSYSERR_NOERROR);
+        expect(mem.slice(SRC_FMT, SRC_FMT + 20)).toEqual(gsmFormat);
+
+        writePcmFormat(DST_FMT, 1, 8000);
+        const pcmFormat = mem.slice(DST_FMT, DST_FMT + 18);
+        mem.fill(0, DST_FMT, DST_FMT + 18);
+        expect(call("acmFormatSuggest", 0, SRC_FMT, DST_FMT, 18, 0)).toBe(MMSYSERR_NOERROR);
+        expect(mem.slice(DST_FMT, DST_FMT + 18)).toEqual(pcmFormat);
+    });
+
+    test("matches the direct decoder and leaves an incomplete source block for the next call", () => {
+        writeGsmFormat();
+        writePcmFormat(DST_FMT, 1, 8000);
+        expect(call("acmStreamOpen", HAS_PTR, 0, SRC_FMT, DST_FMT, 0, 0, 0, 0)).toBe(MMSYSERR_NOERROR);
+        const has = view.getUint32(HAS_PTR, true);
+        expect(has).not.toBe(0);
+
+        expect(call("acmStreamSize", has, GSM_BLOCK_BYTES - 1, SIZE_OUT, ACM_STREAMSIZEF_SOURCE))
+            .toBe(ACMERR_NOTPOSSIBLE);
+        expect(call("acmStreamSize", has, GSM_BLOCK_BYTES * 2 - 1, SIZE_OUT, ACM_STREAMSIZEF_SOURCE))
+            .toBe(MMSYSERR_NOERROR);
+        expect(view.getUint32(SIZE_OUT, true)).toBe(PCM_BLOCK_BYTES);
+        expect(call("acmStreamSize", has, PCM_BLOCK_BYTES + 2, SIZE_OUT, 1)).toBe(MMSYSERR_NOERROR);
+        expect(view.getUint32(SIZE_OUT, true)).toBe(GSM_BLOCK_BYTES * 2);
+
+        const data = new Uint8Array(GSM_BLOCK_BYTES * 2);
+        let seed = 1;
+        for (let i = 0; i < data.length; i++) {
+            seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+            data[i] = (seed >>> 16) & 0xff;
+        }
+        mem.set(data, SRC_DATA);
+
+        const decoder = new Gsm610Decoder();
+        const expected = new Float32Array(GSM_BLOCK_SAMPLES * 2);
+        decoder.decodeWav49Block(data, 0, expected, 0);
+        decoder.decodeWav49Block(data, GSM_BLOCK_BYTES, expected, GSM_BLOCK_SAMPLES);
+
+        mem.fill(0, HDR, HDR + ACMSTREAMHEADER_SIZE);
+        view.setUint32(HDR, ACMSTREAMHEADER_SIZE, true);
+        view.setUint32(HDR + 28, DST_DATA, true);
+        view.setUint32(HDR + 32, PCM_BLOCK_BYTES * 2, true);
+        expect(call("acmStreamPrepareHeader", has, HDR, 0)).toBe(MMSYSERR_NOERROR);
+
+        view.setUint32(HDR + 12, SRC_DATA, true);
+        view.setUint32(HDR + 16, GSM_BLOCK_BYTES - 1, true);
+        expect(call("acmStreamConvert", has, HDR, 0)).toBe(MMSYSERR_NOERROR);
+        expect(view.getUint32(HDR + 20, true)).toBe(0);
+        expect(view.getUint32(HDR + 36, true)).toBe(0);
+
+        const convert = (offset: number, length: number, block: number): void => {
+            view.setUint32(HDR + 12, SRC_DATA + offset, true);
+            view.setUint32(HDR + 16, length, true);
+            expect(call("acmStreamConvert", has, HDR, 0)).toBe(MMSYSERR_NOERROR);
+            expect(view.getUint32(HDR + 20, true)).toBe(GSM_BLOCK_BYTES);
+            expect(view.getUint32(HDR + 36, true)).toBe(PCM_BLOCK_BYTES);
+            const pcm = new Int16Array(mem.buffer, DST_DATA, GSM_BLOCK_SAMPLES);
+            const start = block * GSM_BLOCK_SAMPLES;
+            expect(pcm).toEqual(Int16Array.from(expected.subarray(start, start + GSM_BLOCK_SAMPLES), x => x * 32768));
+        };
+        convert(0, data.length - 1, 0);
+        expect(mem.slice(SRC_DATA, SRC_DATA + data.length)).toEqual(data);
+        const saved = encodeValue(acm.captureSavestate() as unknown as SaveValue);
+        convert(GSM_BLOCK_BYTES, GSM_BLOCK_BYTES, 1);
+        acm.restoreSavestate(decodeValue(saved) as unknown as Msacm32State);
+        convert(GSM_BLOCK_BYTES, GSM_BLOCK_BYTES, 1);
+        expect(call("acmStreamReset", has, 0)).toBe(MMSYSERR_NOERROR);
+        convert(0, GSM_BLOCK_BYTES, 0);
+        expect(call("acmStreamClose", has, 0)).toBe(MMSYSERR_NOERROR);
+    });
+
+    test("ACM_STREAMCONVERTF_START decodes the chunk as a fresh stream does", () => {
+        const ACM_STREAMCONVERTF_START = 0x10;
+        writeGsmFormat();
+        writePcmFormat(DST_FMT, 1, 8000);
+        const data = new Uint8Array(GSM_BLOCK_BYTES * 2);
+        let seed = 7;
+        for (let i = 0; i < data.length; i++) {
+            seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+            data[i] = (seed >>> 16) & 0xff;
+        }
+        mem.set(data, SRC_DATA);
+        const open = (): number => {
+            expect(call("acmStreamOpen", HAS_PTR, 0, SRC_FMT, DST_FMT, 0, 0, 0, 0)).toBe(MMSYSERR_NOERROR);
+            const has = view.getUint32(HAS_PTR, true);
+            mem.fill(0, HDR, HDR + ACMSTREAMHEADER_SIZE);
+            view.setUint32(HDR, ACMSTREAMHEADER_SIZE, true);
+            view.setUint32(HDR + 28, DST_DATA, true);
+            view.setUint32(HDR + 32, PCM_BLOCK_BYTES, true);
+            expect(call("acmStreamPrepareHeader", has, HDR, 0)).toBe(MMSYSERR_NOERROR);
+            return has;
+        };
+        const convert = (has: number, block: number, flags: number): Int16Array => {
+            view.setUint32(HDR + 12, SRC_DATA + block * GSM_BLOCK_BYTES, true);
+            view.setUint32(HDR + 16, GSM_BLOCK_BYTES, true);
+            expect(call("acmStreamConvert", has, HDR, flags)).toBe(MMSYSERR_NOERROR);
+            expect(view.getUint32(HDR + 36, true)).toBe(PCM_BLOCK_BYTES);
+            return new Int16Array(mem.slice(DST_DATA, DST_DATA + PCM_BLOCK_BYTES).buffer);
+        };
+
+        const fresh = open();
+        const expected = convert(fresh, 1, 0);
+        expect(call("acmStreamClose", fresh, 0)).toBe(MMSYSERR_NOERROR);
+
+        const continued = open();
+        convert(continued, 0, 0);
+        expect(convert(continued, 1, 0)).not.toEqual(expected);
+        expect(call("acmStreamClose", continued, 0)).toBe(MMSYSERR_NOERROR);
+
+        const reused = open();
+        convert(reused, 0, 0);
+        expect(convert(reused, 1, ACM_STREAMCONVERTF_START)).toEqual(expected);
+        expect(call("acmStreamClose", reused, 0)).toBe(MMSYSERR_NOERROR);
+    });
+
+    test("PCM to GSM is refused", () => {
+        writeGsmFormat();
+        writePcmFormat(DST_FMT, 1, 8000);
+        view.setUint32(HAS_PTR, 0xdeadbeef, true);
+        expect(call("acmStreamOpen", HAS_PTR, 0, DST_FMT, SRC_FMT, 0, 0, 0, 0)).toBe(ACMERR_NOTPOSSIBLE);
+        expect(view.getUint32(HAS_PTR, true)).toBe(0);
     });
 });
 
