@@ -303,3 +303,31 @@ test('redundant ShowWindow leaves allocator untouched',()=>{
     windows.set(HWND,makeWindow(true));showWindow(SW_SHOW);
     expect(received()).toEqual([]);
 });
+
+test('ShowWindow keeps the Z order when WINDOWPOSCHANGING sets SWP_NOZORDER, with a second window above', () => {
+    const OTHER = 0x44450;
+    const zOrder: number[][] = [];
+    (System.getInstance().windowManager as unknown as Record<string, unknown>).setWindowZOrder =
+        (hwnd: number, after: number) => { zOrder.push([hwnd, after]); };
+    windows.set(OTHER, { ...makeWindow(true), handle: OTHER } as WindowInfo);
+    try {
+        for (const [patch, expected] of [
+            [(flags: number) => Mem.writeUint32(SCRATCH + 24, flags | SWP_NOZORDER), []],
+            [(flags: number) => { Mem.writeUint32(SCRATCH + 4, OTHER); Mem.writeUint32(SCRATCH + 24, flags); }, [[HWND, OTHER]]],
+            [(flags: number) => Mem.writeUint32(SCRATCH + 24, flags), [[HWND, 0]]],
+        ] as const) {
+            invoked = []; posted = []; zOrder.length = 0;
+            windows.set(HWND, makeWindow(false));
+            showWindow(SW_SHOW);
+            invoked[0].complete?.(0);
+            expect(received()).toEqual([WM_SHOWWINDOW, WM_WINDOWPOSCHANGING]);
+            expect(Mem.readUint32(SCRATCH + 24)! & SWP_NOZORDER).toBe(0);
+            patch(Mem.readUint32(SCRATCH + 24)!);
+            for (let i = 1; i < invoked.length; i++) invoked[i].complete?.(0);
+            expect(windows.get(HWND)!.visible).toBe(true);
+            expect(zOrder.filter(([hwnd]) => hwnd === HWND)).toEqual(expected as unknown as number[][]);
+        }
+    } finally {
+        windows.delete(OTHER);
+    }
+});

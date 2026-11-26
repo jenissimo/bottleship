@@ -1973,6 +1973,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             return resultValue;
         }
 
+        let skipZOrder = noZOrder;
+        let insertAfter = 0;
         let activationPlan: SyncActivationPlan | undefined;
         const applyShowState = (): number => {
             const live = windows.get(hWnd);
@@ -2021,7 +2023,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                         }
                     }
                 } else if (isEffectivelyVisible(live)) {
-                    if (!noZOrder && !isChild) wm.setWindowZOrder(hWnd, 0 /* HWND_TOP */);
+                    if (!skipZOrder && !isChild) wm.setWindowZOrder(hWnd, insertAfter | 0);
                     noteDialogOverlayCandidate(live);
                     invalidateWindow(hWnd, null, true);
                     if (live.isSystemControl && live.parent) {
@@ -2115,6 +2117,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             if (windows.get(hWnd) !== window || window.pendingDestroy) return finishPosition();
             if (windowPosPtr) {
                 const flags = Mem.readUint32(windowPosPtr + 24) ?? 3;
+                insertAfter = Mem.readUint32(windowPosPtr + 4) ?? 0;
+                skipZOrder = (flags & 0x0004) !== 0 || !isWindowPosZOrderRequestValid(window, insertAfter, flags);
                 const pos = clientRectFromWindowPos(window,
                     Mem.readInt32(windowPosPtr + 8) ?? window.x,
                     Mem.readInt32(windowPosPtr + 12) ?? window.y,
