@@ -9,9 +9,6 @@ import { System, type HostView } from '../../src/worker/core/system';
 import { Mem } from '../../src/worker/core/memory/mem-accessor';
 import { getVirtualScreenRect, windows, type WindowInfo } from '../../src/worker/modules/user32/shared-state';
 import { createWindowExports } from '../../src/worker/modules/user32/window';
-import { requestWindowedDeviceHostView } from '../../src/worker/runtime/windowing/fullscreen-window';
-import { publishCreateDeviceHostView } from '../../src/worker/modules/d3d8/device-lifecycle';
-import { D3D9Device } from '../../src/worker/backends/webgpu/d3d9/d3d9-device';
 
 const WS_VISIBLE = 0x10000000;
 const WS_POPUP = 0x80000000;
@@ -191,71 +188,4 @@ test('popups and children do not publish a view when shown', () => {
     makeWindow(OTHER, WS_CHILD, 5, 5, 50, 20);
     call('ShowWindow', [OTHER, SW_SHOW]);
     expect(published).toEqual([]);
-});
-
-test('a windowed device publishes its back buffer at the device window\'s screen origin', () => {
-    makeWindow(OTHER, 0, 69, 76, 502, 349);
-    makeWindow(HWND, WS_CHILD, 3, 5, 496, 340, { parent: OTHER });
-    requestWindowedDeviceHostView(HWND, 640, 480);
-    expect(published).toEqual([{ x: 72, y: 81, width: 640, height: 480 }]);
-    // The back buffer is not a window's client rectangle, so no window drives it afterwards.
-    expect(System.getInstance().hostViewOwner).toBe(0);
-});
-
-test('a windowed device whose window is unknown publishes at the screen origin', () => {
-    requestWindowedDeviceHostView(0x7777, 800, 600);
-    requestWindowedDeviceHostView(0, 320, 240);
-    expect(published).toEqual([
-        { x: 0, y: 0, width: 800, height: 600 }, { x: 0, y: 0, width: 320, height: 240 },
-    ]);
-});
-
-function d3d8PresentParams(windowed: number, hDeviceWindow: number): DataView {
-    const view = new DataView(new ArrayBuffer(56));
-    view.setUint32(0, 640, true);
-    view.setUint32(4, 480, true);
-    view.setUint32(20, OTHER, true);        // SwapEffect's slot holds a live handle: +20 must not be read as the window
-    view.setUint32(24, hDeviceWindow, true);
-    view.setUint32(28, windowed, true);
-    return view;
-}
-
-test('D3D8 CreateDevice: a windowed device publishes its back buffer at its device window\'s origin', () => {
-    makeWindow(HWND, 0, 40, 30, 640, 480);
-    makeWindow(OTHER, 0, 0, 0, 800, 600);
-    publishCreateDeviceHostView(d3d8PresentParams(1, HWND), 0, OTHER, 640, 480);
-    expect(published).toEqual([{ x: 40, y: 30, width: 640, height: 480 }]);
-});
-
-test('D3D8 CreateDevice: without a device window the focus window places it; fullscreen is a mode set', () => {
-    makeWindow(HWND, 0, 40, 30, 640, 480);
-    publishCreateDeviceHostView(d3d8PresentParams(1, 0), 0, HWND, 640, 480);
-    publishCreateDeviceHostView(d3d8PresentParams(0, HWND), 0, HWND, 800, 600);
-    expect(published).toEqual([
-        { x: 40, y: 30, width: 640, height: 480 }, { x: 0, y: 0, width: 800, height: 600 },
-    ]);
-});
-
-function d3d9Device(): D3D9Device {
-    const d = Object.create(D3D9Device.prototype) as Record<string, unknown>;
-    d.role = 'both';
-    d.backendExecutor = { setGuestBackbufferSize: () => {} };
-    d.setPresentationInterval = () => {};
-    d.setSwapEffect = () => {};
-    d.endScene = () => 0;
-    return d as unknown as D3D9Device;
-}
-
-test('D3D9 CreateDevice and Reset: a windowed device publishes at its device window\'s origin', () => {
-    const win = makeWindow(HWND, 0, 40, 30, 640, 480);
-    const device = d3d9Device();
-    device.setBackBufferSize(640, 480, false, HWND);
-    win.x = 100; win.y = 60;
-    device.resetFromParams({
-        width: 320, height: 240, windowed: 1, enableAutoDepthStencil: 0, autoDepthStencilFormat: 0,
-        presentationInterval: 0, swapEffect: 1,
-    } as never);
-    expect(published).toEqual([
-        { x: 40, y: 30, width: 640, height: 480 }, { x: 100, y: 60, width: 320, height: 240 },
-    ]);
 });

@@ -38,6 +38,58 @@ export interface PresentOptions {
     outputHeight?: number;
     /** Show only this part of the source: a UV rectangle, [u0, v0, u1, v1]. */
     sourceUv?: readonly [number, number, number, number];
+    /** Draw the source into this part of the picture only, [x0, y0, x1, y1] fractions from the top left; the rest is the clear colour. */
+    destPlace?: readonly [number, number, number, number];
+}
+
+const WHOLE: readonly [number, number, number, number] = [0, 0, 1, 1];
+
+/**
+ * Two triangles (x, y, u, v) that draw the `uv` part of a source into the `place` part of
+ * the target; both are [x0, y0, x1, y1] fractions from the top left. WHOLE, WHOLE is the
+ * full-target quad.
+ */
+export function writePlacedQuad(
+    q: Float32Array, uv: readonly [number, number, number, number], place: readonly [number, number, number, number],
+): void {
+    const [u0, v0, u1, v1] = uv;
+    const xl = place[0] * 2 - 1, xr = place[2] * 2 - 1;
+    const yt = 1 - place[1] * 2, yb = 1 - place[3] * 2;
+    q[0] = xl; q[1] = yb; q[2] = u0; q[3] = v1;
+    q[4] = xr; q[5] = yb; q[6] = u1; q[7] = v1;
+    q[8] = xr; q[9] = yt; q[10] = u1; q[11] = v0;
+    q[12] = xl; q[13] = yb; q[14] = u0; q[15] = v1;
+    q[16] = xr; q[17] = yt; q[18] = u1; q[19] = v0;
+    q[20] = xl; q[21] = yt; q[22] = u0; q[23] = v0;
+}
+
+/**
+ * One vertex buffer holding a placed quad; rewritten only when its UV or place rectangle
+ * changes. It lives as long as the chain, like the full-target quad. Two passes of one frame
+ * that need different quads use two of these: a buffer written twice before the submit
+ * would give both passes the second quad.
+ */
+class PlacedQuad {
+    private buffer: GPUBuffer | null = null;
+    private readonly uv = [0, 0, 1, 1];
+    private readonly place = [0, 0, 1, 1];
+    private readonly scratch = new Float32Array(24);
+
+    get(device: GPUDevice, uv: readonly [number, number, number, number], place: readonly [number, number, number, number]): GPUBuffer {
+        const c = this.uv, d = this.place;
+        if (this.buffer && c[0] === uv[0] && c[1] === uv[1] && c[2] === uv[2] && c[3] === uv[3]
+            && d[0] === place[0] && d[1] === place[1] && d[2] === place[2] && d[3] === place[3]) {
+            return this.buffer;
+        }
+        writePlacedQuad(this.scratch, uv, place);
+        if (!this.buffer) {
+            this.buffer = device.createBuffer({ size: this.scratch.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+        }
+        device.queue.writeBuffer(this.buffer, 0, this.scratch);
+        c[0] = uv[0]; c[1] = uv[1]; c[2] = uv[2]; c[3] = uv[3];
+        d[0] = place[0]; d[1] = place[1]; d[2] = place[2]; d[3] = place[3];
+        return this.buffer;
+    }
 }
 
 interface PipelineEntry { pipeline: GPURenderPipeline | null; valid: boolean; }
@@ -65,11 +117,9 @@ export class PostFxChain {
 
     // Lazily-created shared resources.
     private vertexBuffer: GPUBuffer | null = null;
-    /** A full-target quad sampling a UV sub-rectangle; rewritten only when that changes. */
-    private cropVertexBuffer: GPUBuffer | null = null;
-    private readonly cropUv = [0, 0, 1, 1];
-    private readonly cropScratch = new Float32Array(24);
-    /** Set by present() for the one pass that samples the SOURCE; drawPass consumes it. */
+    /** The one pass that samples the source: through the crop, into the place. */
+    private readonly cropQuad = new PlacedQuad();
+    /** The quad the next drawPass uses instead of the full-target one; drawPass consumes it. */
     private sourceQuad: GPUBuffer | null = null;
     private samplerLinear: GPUSampler | null = null;
     private samplerNearest: GPUSampler | null = null;
@@ -264,33 +314,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
      *   - output-res chain (CRT/    → upscale source → content-res buffer, run the chain there so
      *     scanlines/FXAA active)       scanlines/aperture/edge-AA land on real display pixels.
      */
-    private getCropVertexBuffer(uv: readonly [number, number, number, number]): GPUBuffer {
-        const c = this.cropUv;
-        if (this.cropVertexBuffer && c[0] === uv[0] && c[1] === uv[1] && c[2] === uv[2] && c[3] === uv[3]) {
-            return this.cropVertexBuffer;
-        }
-        const [u0, v0, u1, v1] = uv;
-        const q = this.cropScratch;
-        q[0] = -1; q[1] = -1; q[2] = u0; q[3] = v1;
-        q[4] = 1; q[5] = -1; q[6] = u1; q[7] = v1;
-        q[8] = 1; q[9] = 1; q[10] = u1; q[11] = v0;
-        q[12] = -1; q[13] = -1; q[14] = u0; q[15] = v1;
-        q[16] = 1; q[17] = 1; q[18] = u1; q[19] = v0;
-        q[20] = -1; q[21] = 1; q[22] = u0; q[23] = v0;
-        if (!this.cropVertexBuffer) {
-            this.cropVertexBuffer = this.device.createBuffer({
-                size: q.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-            });
-        }
-        this.device.queue.writeBuffer(this.cropVertexBuffer, 0, q);
-        c[0] = u0; c[1] = v0; c[2] = u1; c[3] = v1;
-        return this.cropVertexBuffer;
-    }
-
     present(srcView: GPUTextureView, target: GPUTextureView, encoder: GPUCommandEncoder, opts: PresentOptions): void {
         if (!this.format) return;
         this.ensureResources();
-        this.sourceQuad = opts.sourceUv ? this.getCropVertexBuffer(opts.sourceUv) : null;
         this.frame++;
         // Monotonic wall-clock seconds for animated effects. performance.now() is the worker's
         // standard monotonic clock (not the banned Date.now()/Math.random()).
@@ -306,7 +332,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
 
         const effects = getActiveEffects(q, this.hasGamma());
         const finalGeom = {
-            clearColor: opts.clearColor ?? (destRect ? { r: 0, g: 0, b: 0, a: 1 } as GPUColor : undefined),
+            clearColor: opts.clearColor ?? (destRect || opts.destPlace ? { r: 0, g: 0, b: 0, a: 1 } as GPUColor : undefined),
             destRect,
             viewport: opts.viewport,
         };
@@ -315,6 +341,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
             // Fast path: single passthrough blit. Byte-identical to the legacy opaque present.
             this.writeCommonSlot(0, srcW || outW || 1, srcH || outH || 1, outW, outH, outAspect, time, q, null);
             const bg = this.buildBindGroup(srcView, !!opts.nearest, 0, null);
+            if (opts.sourceUv || opts.destPlace) this.sourceQuad = this.cropQuad.get(this.device, opts.sourceUv ?? WHOLE, opts.destPlace ?? WHOLE);
             this.drawPass(encoder, this.getPassthrough(this.format!), bg, target, finalGeom);
             return;
         }
@@ -327,11 +354,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
             effects.some((e) => (e.needsOutputRes ? e.needsOutputRes(q) : false));
         const workW = wantOutputRes ? contentW : (srcW || contentW || 1);
         const workH = wantOutputRes ? contentH : (srcH || contentH || 1);
-        // A cropped source is resampled once, by the passthrough, into a [0,1] intermediate of
-        // the work size: an effect that sampled the plane through the crop UVs would centre its
-        // vignette/curvature on the plane, let pixels outside the crop in and step its texels
-        // in plane units while its resolution says the crop's.
-        const needUpscale = !!opts.sourceUv || (wantOutputRes && (workW !== srcW || workH !== srcH));
+        // A cropped or placed source is resampled once, by the passthrough, into a cleared
+        // intermediate of the work size that holds the picture as shown (crop in its place, the
+        // rest the clear colour). Effects then run over that whole picture with [0,1] UVs and
+        // their own resolution: a vignette or CRT curve sits on the view, not on the plane or
+        // on the window's part of it.
+        const needUpscale = !!opts.sourceUv || !!opts.destPlace || (wantOutputRes && (workW !== srcW || workH !== srcH));
 
         const ctx: PostFrameContext = {
             resolution: { width: workW, height: workH },
@@ -363,6 +391,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
         if (needUpscale) {
             const up = this.getIntermediate(0, workW, workH);
             const bg = this.buildBindGroup(readView, !!opts.nearest, slot, null);
+            if (opts.sourceUv || opts.destPlace) this.sourceQuad = this.cropQuad.get(this.device, opts.sourceUv ?? WHOLE, opts.destPlace ?? WHOLE);
             this.drawPass(encoder, this.getPassthrough(INTERMEDIATE_FORMAT), bg, up.view, { clearColor: { r: 0, g: 0, b: 0, a: 1 } });
             readView = up.view;
             slot++;
