@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import { WinMM } from "../../src/worker/modules/winmm";
 
+const WAVECAPS_PITCH = 0x0001;
+const WAVECAPS_PLAYBACKRATE = 0x0002;
 const WAVECAPS_VOLUME = 0x0004;
 const WAVECAPS_SYNC = 0x0010;
 const WAVECAPS_SAMPLEACCURATE = 0x0020;
@@ -16,7 +18,8 @@ for (const [suffix, size] of [["A", 52], ["W", 84]] as const) {
         expect(result).toBe(0);
         const support = new DataView(mem.buffer).getUint32(ptr + size - 4, true);
         expect(support & WAVECAPS_SYNC).toBe(0);
-        expect(support).toBe(WAVECAPS_VOLUME | WAVECAPS_SAMPLEACCURATE);
+        expect(support & (WAVECAPS_PITCH | WAVECAPS_PLAYBACKRATE | WAVECAPS_VOLUME)).toBe(0);
+        expect(support).toBe(WAVECAPS_SAMPLEACCURATE);
         expect(mem[ptr + size]).toBe(0xa5);
     });
 }
