@@ -170,6 +170,61 @@ export function wholePlaneView(planeW: number, planeH: number): PlaneView {
 }
 
 /**
+ * A windowed device's frame is an image of its device window's client area, not of the
+ * screen: it is shown where that client area lies inside V. `uv` is the part of the frame
+ * that falls inside V and `place` where that part lands, both as [x0, y0, x1, y1] fractions
+ * (of the frame, of V). `whole` when the client area is V itself (the frame fills the
+ * picture as it always did), `empty` when nothing of it is inside V (an empty client area
+ * included). One reused record.
+ */
+export interface ClientPlacement {
+    whole: boolean;
+    empty: boolean;
+    viewW: number;
+    viewH: number;
+    readonly uv: [number, number, number, number];
+    readonly place: [number, number, number, number];
+}
+
+// @transient(set by the presenting windowed device on every Present from its live window geometry)
+let clientSet = false, clientX = 0, clientY = 0, clientW = 0, clientH = 0;
+const clientPlacement: ClientPlacement = {
+    whole: true, empty: false, viewW: 0, viewH: 0, uv: [0, 0, 1, 1], place: [0, 0, 1, 1],
+};
+
+/** The screen rectangle of the client area a windowed device presents into. */
+export function setPresentedClientRect(x: number, y: number, width: number, height: number): void {
+    clientSet = true;
+    clientX = x; clientY = y; clientW = width; clientH = height;
+}
+
+/** A fullscreen device (or none) presents: its frame is the picture. */
+export function clearPresentedClientRect(): void {
+    clientSet = false;
+}
+
+/** Where the presented frame goes inside V. Callers must not retain the record. */
+export function presentedClientPlacement(): ClientPlacement {
+    const p = clientPlacement;
+    p.viewW = viewW; p.viewH = viewH;
+    if (!clientSet || viewW <= 0 || viewH <= 0
+        || (clientX === viewX && clientY === viewY && clientW === viewW && clientH === viewH)) {
+        p.whole = true; p.empty = false;
+        return p;
+    }
+    p.whole = false;
+    const x0 = Math.max(viewX, clientX), y0 = Math.max(viewY, clientY);
+    const x1 = Math.min(viewX + viewW, clientX + clientW), y1 = Math.min(viewY + viewH, clientY + clientH);
+    p.empty = clientW <= 0 || clientH <= 0 || x1 <= x0 || y1 <= y0;
+    if (p.empty) return p;
+    p.uv[0] = (x0 - clientX) / clientW; p.uv[1] = (y0 - clientY) / clientH;
+    p.uv[2] = (x1 - clientX) / clientW; p.uv[3] = (y1 - clientY) / clientH;
+    p.place[0] = (x0 - viewX) / viewW; p.place[1] = (y0 - viewY) / viewH;
+    p.place[2] = (x1 - viewX) / viewW; p.place[3] = (y1 - viewY) / viewH;
+    return p;
+}
+
+/**
  * One quad (6 vertices of x, y, u, v) per rect of a screen plane, appended to `verts`.
  * The rects are in guest screen coordinates, which is the plane's own space; `dest` is the
  * content rect, which shows `view`. A rect is clipped to the view and lands over the pixels
