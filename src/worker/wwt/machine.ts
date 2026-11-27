@@ -1,7 +1,7 @@
 import type { WwtMachine, WwtModule, WwtPeImageBounds } from "./cpu-provider";
 import { WwtCompiler, WwtTranslationStackOverflow } from "./translator";
-import { getOrBuild } from "./pe-aot-cache";
-import { compileAbi11Pe } from "./pe-aot-compiler";
+import { notePeAotLookup, peAotCacheKey, planPeAot, readPeAot, writePeAot } from "./pe-aot-cache";
+import { PeAotCompiler } from "./pe-aot-compiler";
 import type { PeAotStatus } from "./pe-aot-progress";
 import { WwtWallClock } from "./wall-clock";
 import { trapAddress, WwtTrapMap } from "./traps";
@@ -75,6 +75,14 @@ export class BottleShipMachine implements WwtMachine {
     private readonly entriesByPage = new Map<number, Set<number>>();
     private readonly recycledCpus: number[] = [];
     readonly translationStats = { compiled: 0, compilerMs: 0, installMs: 0, wasmBytes: 0 };
+    private readonly peCompiler = new PeAotCompiler();
+    private peAotWrites: Promise<unknown>[] = [];
+
+    settlePeAotWrites(): Promise<unknown[]> {
+        const pending = this.peAotWrites;
+        this.peAotWrites = [];
+        return Promise.all(pending);
+    }
     private cursor: number;
     private guestMmio = false;
     private kernelRun!: WasmFn;
@@ -408,28 +416,42 @@ export class BottleShipMachine implements WwtMachine {
         const started = performance.now();
         let translateMs = 0;
         let translated = false;
-        const profileKey = profile.length ? modeKey + "/seeds/" + profile.join(",") : modeKey;
-        const bytes = await getOrBuild(file, profileKey, async () => {
+        const key = await peAotCacheKey(file, modeKey);
+        const cached = await readPeAot(key);
+        const background = !!this.wallClock && typeof Worker !== "undefined";
+        const plan = planPeAot(cached?.seeds ?? null, profile, background);
+        notePeAotLookup(plan === "rebuild" ? null : cached!.bytes);
+        const request = { module: this.compiler.module, cacheId: this.compiler.cacheId, file, profile, guestLimit: this.guestLimit };
+        const store = (wasm: Uint8Array<ArrayBuffer>) => writePeAot(key, wasm, profile);
+        let bytes: Uint8Array<ArrayBuffer>;
+        if (plan !== "rebuild") {
+            bytes = cached!.bytes;
+            if (plan === "use-and-refresh") {
+                const refresh = this.peCompiler.refresh(request, key, store);
+                if (refresh) this.peAotWrites.push(refresh);
+            }
+        } else {
             const start = performance.now();
-            let wasm: Uint8Array<ArrayBuffer>;
             if (this.wallClock && typeof Worker !== "undefined") {
                 onStatus?.({ phase: "starting" });
-                wasm = await compileAbi11Pe({
-                    module: this.compiler.module,
-                    cacheId: this.compiler.cacheId,
-                    file,
-                    profile,
-                    guestLimit: this.guestLimit,
-                }, ({ startedAt, work }) => onStatus?.({ phase: "compiling", startedAt, work }));
+                bytes = await this.peCompiler.compile(request, ({ startedAt, work }) => onStatus?.({ phase: "compiling", startedAt, work }), {
+                    key,
+                    publish: wasm => {
+                        const write = store(wasm);
+                        this.peAotWrites.push(write);
+                        return write;
+                    },
+                    trackBackground: task => this.peAotWrites.push(task),
+                });
             } else {
                 onStatus?.({ phase: "compiling", startedAt: performance.timeOrigin + performance.now() });
-                wasm = this.compiler.translatePe(file, profile, this.guestLimit, guestMmio, !fullImage);
+                bytes = this.compiler.translatePe(file, profile, this.guestLimit, guestMmio, !fullImage);
             }
             translateMs = performance.now() - start;
             translated = true;
             onStatus?.({ phase: "output" });
-            return wasm;
-        });
+            if (!background) await store(bytes);
+        }
         const source = translated ? "compiler" : "cache";
         onStatus?.({ phase: "finalizing", source });
         const compiling = performance.now();

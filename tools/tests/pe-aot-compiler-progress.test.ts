@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import {
-    compileAbi11Pe, PeAotCompileTimeoutError, type PeAotCompileMessage, type PeAotCompileRequest, type PeAotCompileUpdate,
+    PeAotCompiler, PeAotCompileTimeoutError, type PeAotCompileMessage, type PeAotCompileRequest, type PeAotCompileUpdate,
 } from "../../src/worker/wwt/pe-aot-compiler";
 
 class CompileWorker {
@@ -32,7 +32,7 @@ afterEach(() => { globalThis.Worker = worker; });
 
 test("compiler progress reaches the parent without resolving the worker result", async () => {
     const updates: PeAotCompileUpdate[] = [];
-    const pending = compileAbi11Pe(request, update => updates.push(update));
+    const pending = new PeAotCompiler().compile(request, update => updates.push(update));
     const start = { type: "compiling", startedAt: 1234 } as const;
     const count = { ...start, work: { stage: "optimize", completed: 64, total: 200 } } as const;
     CompileWorker.current.emit(start);
@@ -56,7 +56,7 @@ test("a cold compile is bounded at 30 seconds even after progress", async () => 
         return realSetTimeout(() => {}, 60_000);
     });
     try {
-        const pending = compileAbi11Pe(request);
+        const pending = new PeAotCompiler().compile(request);
         CompileWorker.current.emit({ type: "compiling", startedAt: 1234, work: { stage: "lift", completed: 128 } });
         expect(delay).toBe(30_000);
         expect(CompileWorker.current.terminated).toBe(false);

@@ -303,7 +303,7 @@ test.each(["default", "explicit auto", "off", "no OPFS", "fast default", "fast o
             core.registerCodeRange(entry, base + 0x3000, !fast);
             await core.registerPeImage("demo.exe", base, 0x3000, file);
             expect(host.lookup(entry) > 0).toBe((fast && !off) || (training && run > 0));
-            expect(host.lookup(dynamicEntry) > 0).toBe(training && run > 0);
+            expect(host.lookup(dynamicEntry) > 0).toBe(training && run > (fast ? 1 : 0));
             core.instruction_pointer[0] = dynamicEntry;
             core.reg32[2] = 0x1234;
             core.reg32[4] = stack;
@@ -312,12 +312,12 @@ test.each(["default", "explicit auto", "off", "no OPFS", "fast default", "fast o
             const profileFlush = core.flushPeProfile();
             if (training) await profileFlush;
             else expect(profileFlush).toBeUndefined();
+            await host.settlePeAotWrites();
         }
         const after = core.getTranslationStats().peAotCache;
-        const compiled = training ? (fast ? 2 : 1) : 0;
-        expect(after.writes - before.writes).toBe(compiled);
-        expect(after.hits - before.hits).toBe(Number(training));
-        expect(after.misses - before.misses).toBe(compiled);
+        expect(after.writes - before.writes).toBe(training ? (fast ? 2 : 1) : 0);
+        expect(after.hits - before.hits).toBe(training ? (fast ? 2 : 1) : 0);
+        expect(after.misses - before.misses).toBe(training ? 1 : 0);
     } finally {
         if (oldMode === undefined) delete globalOptions.__wwtPeAot;
         else globalOptions.__wwtPeAot = oldMode;
