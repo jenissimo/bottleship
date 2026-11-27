@@ -11,6 +11,7 @@
  */
 
 export interface DeploymentConfig {
+    keyMap?: "physical";
     /** Browser names (as detectBrowserName reports them) allowed to run games here. */
     allowedBrowsers?: string[];
     /** Shown instead of the app when the browser is not on the list. */

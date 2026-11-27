@@ -8,7 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { hardwareKeyText, hardwareKeyVk } from "../../src/app/hardware-key-vk";
 import { INPUT_BUFFER_SIZE, KEY_TEXT_NONE, KEY_TEXT_UNKNOWN } from "../../src/input/sab-layout";
 import { VirtualInputDevice } from "../../src/input/virtual-device";
-import { InputManager } from "../../src/worker/runtime/input/input-manager";
+import { InputManager, vkToScanCode } from "../../src/worker/runtime/input/input-manager";
 import { keyDownChar, translateKeyMessage } from "../../src/worker/modules/user32/translate-message";
 import { createSystemExports } from "../../src/worker/modules/user32/system";
 import { System } from "../../src/worker/core/system";
@@ -24,14 +24,14 @@ const event = (p: Press) => ({
 
 const noWindows = { getKeyboardTargetWindow: () => undefined } as never;
 
-function rig() {
+function rig(physical = false) {
     const sab = new SharedArrayBuffer(INPUT_BUFFER_SIZE);
     const device = new VirtualInputDevice();
     device.attach(new Int32Array(sab), () => { });
     const im = new InputManager(noWindows);
     im.setInputBuffer(sab);
     const press = (p: Press): number => {
-        const vk = hardwareKeyVk(p.code, p.keyCode);
+        const vk = hardwareKeyVk(p.code, p.keyCode, physical);
         device.setKey(vk, true, "hw-key", hardwareKeyText(event(p)));
         device.commitNow();
         im.poll();
@@ -111,6 +111,30 @@ describe("TranslateMessage posts the host character", () => {
         system.windowManager = { postMessage: (h: number, m: number, w: number, l: number) => { posted.push([h, m, w, l]); } };
         return { posted, restore: () => { Object.assign(system, saved); } };
     }
+
+    test("QWERTZ physical KeyZ uses VK_Z and its scan code but posts 'y'", () => {
+        const press = { code: "KeyZ", key: "y", keyCode: 0x59 };
+        const r = rig(true);
+        const t = translating(r);
+        try {
+            const vk = r.press(press);
+            expect(vk).toBe(0x5a);
+            expect(vkToScanCode(vk)).toBe(0x2c);
+            expect(translateKeyMessage(HWND, WM_KEYDOWN, vk, 0x002c0001)).toBe(true);
+            expect(t.posted).toEqual([[HWND, WM_CHAR, 0x79, 0x002c0001]]);
+            r.release(vk);
+            expect(r.press({ code: "KeyY", key: "z", keyCode: 0x5a })).toBe(0x59);
+            expect(rig().press(press)).toBe(0x59);
+        } finally { t.restore(); }
+    });
+
+    test("physical mapping covers digits, punctuation and the numpad with a fallback", () => {
+        expect(hardwareKeyVk("Digit2", 0, true)).toBe(0x32);
+        expect(hardwareKeyVk("BracketLeft", 0xba, true)).toBe(0xdb);
+        expect(hardwareKeyVk("Numpad1", 0x23, true)).toBe(0x61);
+        expect(hardwareKeyVk("ControlRight", 0x11, true)).toBe(0xa3);
+        expect(hardwareKeyVk("Unidentified", 0x41, true)).toBe(0x41);
+    });
 
     test("WM_KEYDOWN of AltGr+Q posts WM_CHAR '@' to the same window with the key's lParam", () => {
         const r = rig();
