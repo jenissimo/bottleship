@@ -42,8 +42,8 @@ def main():
         shutil.copyfile(ROOT / "Cargo.lock", workspace / "Cargo.lock")
         crate = workspace / "crates/wwt/Cargo.toml"
         crate.write_text(crate.read_text().split("[dev-dependencies]")[0], encoding="utf-8")
-        subprocess.run(["git", "apply", "--whitespace=nowarn", str(ROOT / "bottleship.patch")],
-                       cwd=workspace, check=True)
+        for patch in ("bottleship.patch", "protected-x87-int64.patch"):
+            subprocess.run(["git", "apply", "--whitespace=nowarn", str(ROOT / patch)], cwd=workspace, check=True)
         target = Path(os.environ.get("CARGO_TARGET_DIR", workspace / "target")).resolve()
         command = ["cargo", "build", "--locked", "-p", "wwt-wasm", "--target", "wasm32-unknown-unknown",
                    "--profile", "release-wasm", "--target-dir", str(target)]

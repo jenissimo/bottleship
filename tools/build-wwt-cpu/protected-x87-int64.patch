@@ -1,0 +1,376 @@
+diff --git a/crates/wwt/src/abi.rs b/crates/wwt/src/abi.rs
+index 27e9d4e..93ecba7 100644
+--- a/crates/wwt/src/abi.rs
++++ b/crates/wwt/src/abi.rs
+@@ -80,7 +80,9 @@ pub mod cpu {
+     /// A zero end page means the range is empty.
+     pub const SMC_FIRST_PAGE: u32 = 456;
+     pub const SMC_END_PAGE: u32 = 460;
+-    pub const SIZE: u32 = 512;
++    pub const FPU_I64: u32 = 512;
++    pub const FPU_I64_VALID: u32 = 576;
++    pub const SIZE: u32 = 640;
+ 
+     pub const fn gpr(i: u32) -> u32 {
+         GPR + i * 4
+@@ -400,6 +402,8 @@ pub fn abi_json() -> String {
+         ("SMC_FIRST_PAGE", SMC_FIRST_PAGE),
+         ("SMC_END_PAGE", SMC_END_PAGE),
+         ("PAGE_TLB_SLOTS", page_tlb::ALLOCATION_SLOTS),
++        ("FPU_I64", FPU_I64),
++        ("FPU_I64_VALID", FPU_I64_VALID),
+         ("SIZE", SIZE),
+     ]
+     .into_iter()
+diff --git a/crates/wwt/src/lift/fpu.rs b/crates/wwt/src/lift/fpu.rs
+index 456b01d..6b9f48b 100644
+--- a/crates/wwt/src/lift/fpu.rs
++++ b/crates/wwt/src/lift/fpu.rs
+@@ -74,6 +74,7 @@ impl<'a> Lifter<'a> {
+             val: v,
+             mem: Mem::native(8, cpu::FPU_ST),
+         });
++        self.set_i64_valid(i, false);
+     }
+ 
+     fn tag_update(&mut self, set: bool) {
+@@ -89,6 +90,59 @@ impl<'a> Lifter<'a> {
+         self.store_native(n, 1, cpu::FPU_TAG);
+     }
+ 
++    fn phys_bit(&mut self, i: u32) -> V {
++        let t = if i == 0 {
++            self.copy(FPU_TOP)
++        } else {
++            let a = self.bini(BinOp::I32Add, FPU_TOP, i);
++            self.bini(BinOp::I32And, a, 7)
++        };
++        let one = self.c32(1);
++        self.bin(BinOp::I32Shl, one, t)
++    }
++
++    fn i64_shadow(&mut self, i: u32) -> V {
++        let a = self.st_addr(i);
++        self.emit(Ty::I64, Op::Load { addr: a, mem: Mem::native(8, cpu::FPU_I64) })
++    }
++
++    fn set_i64_shadow(&mut self, i: u32, v: V) {
++        let a = self.st_addr(i);
++        self.effect(Op::Store { addr: a, val: v, mem: Mem::native(8, cpu::FPU_I64) });
++    }
++
++    fn i64_valid_mask(&mut self) -> V {
++        self.load_native(Ty::I32, 1, cpu::FPU_I64_VALID)
++    }
++
++    fn set_i64_valid(&mut self, i: u32, set: bool) {
++        let valid = self.c32(u32::from(set));
++        self.update_i64_valid(i, valid);
++    }
++
++    fn update_i64_valid(&mut self, i: u32, valid: V) {
++        let bit = self.phys_bit(i);
++        let mask = self.i64_valid_mask();
++        let inv = self.bini(BinOp::I32Xor, bit, 0xff);
++        let cleared = self.bin(BinOp::I32And, mask, inv);
++        let set = self.bin(BinOp::I32Or, mask, bit);
++        let next = self.select(valid, set, cleared);
++        self.store_native(next, 1, cpu::FPU_I64_VALID);
++    }
++
++    fn read_i64_slot(&mut self, i: u32) -> (V, V) {
++        let exact = self.i64_shadow(i);
++        let mask = self.i64_valid_mask();
++        let bit = self.phys_bit(i);
++        let valid = self.bin(BinOp::I32And, mask, bit);
++        (exact, valid)
++    }
++
++    fn write_i64_slot(&mut self, i: u32, exact: V, valid: V) {
++        self.set_i64_shadow(i, exact);
++        self.update_i64_valid(i, valid);
++    }
++
+     fn fpush(&mut self, v: V) {
+         let t = self.bini(BinOp::I32Sub, FPU_TOP, 1);
+         let t = self.bini(BinOp::I32And, t, 7);
+@@ -99,6 +153,7 @@ impl<'a> Lifter<'a> {
+ 
+     fn fpop(&mut self) {
+         self.tag_update(false);
++        self.set_i64_valid(0, false);
+         let t = self.bini(BinOp::I32Add, FPU_TOP, 1);
+         let t = self.bini(BinOp::I32And, t, 7);
+         self.emit_to(FPU_TOP, Op::Copy(t));
+@@ -206,6 +261,112 @@ impl<'a> Lifter<'a> {
+     }
+ 
+     /// Stores st(0) to memory as float, double, extended or integer.
++    fn fbstp_mem(&mut self, i: &Instruction, v: V) {
++        let (a, space) = self.ea(i);
++        let r = self.fround(v);
++        let mag = self.un(UnOp::F64Abs, r);
++        let lim = self.f64c(1e18);
++        let ok = self.fbin(BinOp::F64Lt, mag, lim);
++        let zero = self.f64c(0.0);
++        let neg = self.fbin(BinOp::F64Lt, r, zero);
++        let n = self.un(UnOp::I64TruncSatF64S, mag);
++        let shadow = self.i64_shadow(0);
++        let mask = self.i64_valid_mask();
++        let bit = self.phys_bit(0);
++        let valid = self.bin(BinOp::I32And, mask, bit);
++        let valid = self.bini(BinOp::I32Ne, valid, 0);
++        let back = self.un(UnOp::F64ConvertI64S, shadow);
++        let same = self.fbin(BinOp::F64Eq, back, v);
++        let use_shadow = self.bin(BinOp::I32And, valid, same);
++        let z64 = self.c64(0);
++        let sneg = self.bin(BinOp::I64LtS, shadow, z64);
++        let nshadow = self.bin(BinOp::I64Sub, z64, shadow);
++        let sabs = self.select(sneg, nshadow, shadow);
++        let slim = self.c64(1_000_000_000_000_000_000);
++        let sok = self.bin(BinOp::I64LtU, sabs, slim);
++        let ok = self.select(use_shadow, sok, ok);
++        let neg = self.select(use_shadow, sneg, neg);
++        let mut n = self.select(use_shadow, sabs, n);
++        let ten = self.c64(10);
++        let hundred = self.c64(100);
++        let mut lo = self.c64(0);
++        for k in 0..9u64 {
++            let d0 = self.bin(BinOp::I64RemU, n, ten);
++            let q = self.bin(BinOp::I64DivU, n, ten);
++            let d1 = self.bin(BinOp::I64RemU, q, ten);
++            n = self.bin(BinOp::I64DivU, n, hundred);
++            let four = self.c64(4);
++            let d1 = self.bin(BinOp::I64Shl, d1, four);
++            let byte = self.bin(BinOp::I64Or, d1, d0);
++            if k < 8 {
++                let sh = self.c64(8 * k);
++                let byte = self.bin(BinOp::I64Shl, byte, sh);
++                lo = self.bin(BinOp::I64Or, lo, byte);
++            } else {
++                let b8 = self.un(UnOp::I32WrapI64, byte);
++                let sign = self.c32(0x8000);
++                let zero32 = self.c32(0);
++                let sign = self.select(neg, sign, zero32);
++                let hi = self.bin(BinOp::I32Or, b8, sign);
++                let ind_lo = self.c64(0xC000_0000_0000_0000);
++                let ind_hi = self.c32(0xFFFF);
++                let lo_v = self.select(ok, lo, ind_lo);
++                let hi_v = self.select(ok, hi, ind_hi);
++                let mm = self.mem(8, space);
++                self.effect(Op::Store { addr: a, val: lo_v, mem: mm });
++                let a8 = self.addr_add(a, 8);
++                let mm = self.mem(2, space);
++                self.effect(Op::Store { addr: a8, val: hi_v, mem: mm });
++                return;
++            }
++        }
++    }
++
++    fn fbld_mem(&mut self, i: &Instruction) -> (V, V, V) {
++        let (a, space) = self.ea(i);
++        let lo = self.emit(Ty::I64, Op::Load { addr: a, mem: self.mem(8, space) });
++        let a8 = self.addr_add(a, 8);
++        let hi = self.emit(Ty::I32, Op::Load { addr: a8, mem: self.mem(2, space) });
++        let mut acc = self.c64(0);
++        let ten = self.c64(10);
++        let mask = self.c64(15);
++        let b8 = self.bini(BinOp::I32And, hi, 0xff);
++        let b8 = self.un(UnOp::I64ExtendI32U, b8);
++        let mut valid = self.c32(1);
++        let digit_limit = self.c64(10);
++        for k in (0..9u64).rev() {
++            let byte = if k == 8 {
++                b8
++            } else {
++                let sh = self.c64(8 * k);
++                let s = self.bin(BinOp::I64ShrU, lo, sh);
++                let ff = self.c64(0xff);
++                self.bin(BinOp::I64And, s, ff)
++            };
++            let four = self.c64(4);
++            let d1 = self.bin(BinOp::I64ShrU, byte, four);
++            let d1 = self.bin(BinOp::I64And, d1, mask);
++            let d0 = self.bin(BinOp::I64And, byte, mask);
++            let hi_valid = self.bin(BinOp::I64LtU, d1, digit_limit);
++            let lo_valid = self.bin(BinOp::I64LtU, d0, digit_limit);
++            let pair_valid = self.bin(BinOp::I32And, hi_valid, lo_valid);
++            valid = self.bin(BinOp::I32And, valid, pair_valid);
++            acc = self.bin(BinOp::I64Mul, acc, ten);
++            acc = self.bin(BinOp::I64Add, acc, d1);
++            acc = self.bin(BinOp::I64Mul, acc, ten);
++            acc = self.bin(BinOp::I64Add, acc, d0);
++        }
++        let f = self.un(UnOp::F64ConvertI64S, acc);
++        let s = self.bini(BinOp::I32And, hi, 0x8000);
++        let s = self.bini(BinOp::I32Ne, s, 0);
++        let nf = self.un(UnOp::F64Neg, f);
++        let v = self.select(s, nf, f);
++        let zero = self.c64(0);
++        let neg = self.bin(BinOp::I64Sub, zero, acc);
++        let exact = self.select(s, neg, acc);
++        (v, exact, valid)
++    }
++
+     fn fstore_mem(&mut self, i: &Instruction, v: V) -> bool {
+         let (a, space) = self.ea(i);
+         let mem = |l: &Self, size| l.mem(size, space);
+@@ -272,6 +433,15 @@ impl<'a> Lifter<'a> {
+                     let x = self.un(UnOp::I64TruncSatF64S, r);
+                     let ind = self.c64(1u64 << 63);
+                     let x = self.select(ok, x, ind);
++                    let shadow = self.i64_shadow(0);
++                    let mask = self.i64_valid_mask();
++                    let bit = self.phys_bit(0);
++                    let valid = self.bin(BinOp::I32And, mask, bit);
++                    let valid = self.bini(BinOp::I32Ne, valid, 0);
++                    let back = self.un(UnOp::F64ConvertI64S, shadow);
++                    let same = self.fbin(BinOp::F64Eq, back, v);
++                    let use_shadow = self.bin(BinOp::I32And, valid, same);
++                    let x = self.select(use_shadow, shadow, x);
+                     let mm = mem(self, 8);
+                     self.effect(Op::Store {
+                         addr: a,
+@@ -335,6 +505,7 @@ impl<'a> Lifter<'a> {
+                 self.emit_to(FPU_TOP, Op::Const(0));
+                 let z = self.c32(0);
+                 self.store_native(z, 1, cpu::FPU_TAG);
++                self.store_native(z, 1, cpu::FPU_I64_VALID);
+             }
+             M::Fnclex => {
+                 let k = self.bini(BinOp::I32And, FPU_SW, 0x7f00);
+@@ -366,14 +537,29 @@ impl<'a> Lifter<'a> {
+                     Some(v) => v,
+                     None => bail!(),
+                 };
+-                self.fpush(v);
++                if i.op_kind(i.op_count() - 1) == OpKind::Register {
++                    let (exact, valid) = self.read_i64_slot(sti(i.op_register(i.op_count() - 1)));
++                    self.fpush(v);
++                    self.write_i64_slot(0, exact, valid);
++                } else {
++                    self.fpush(v);
++                }
+             }
+             M::Fild => {
+-                let v = match self.fload_mem(i) {
+-                    Some(v) => v,
+-                    None => bail!(),
+-                };
+-                self.fpush(v);
++                if i.memory_size() == MemorySize::Int64 {
++                    let (addr, space) = self.ea(i);
++                    let exact = self.emit(Ty::I64, Op::Load { addr, mem: self.mem(8, space) });
++                    let v = self.un(UnOp::F64ConvertI64S, exact);
++                    self.fpush(v);
++                    self.set_i64_shadow(0, exact);
++                    self.set_i64_valid(0, true);
++                } else {
++                    let v = match self.fload_mem(i) {
++                        Some(v) => v,
++                        None => bail!(),
++                    };
++                    self.fpush(v);
++                }
+             }
+             M::Fld1 | M::Fldz | M::Fldpi | M::Fldl2e | M::Fldl2t | M::Fldlg2 | M::Fldln2 => {
+                 let c = match m {
+@@ -388,12 +574,30 @@ impl<'a> Lifter<'a> {
+                 let v = self.f64c(c);
+                 self.fpush(v);
+             }
++            M::Fbstp => {
++                if i.op0_kind() != OpKind::Memory {
++                    bail!();
++                }
++                let v = self.st(0);
++                self.fbstp_mem(i, v);
++                self.fpop();
++            }
++            M::Fbld => {
++                if i.op0_kind() != OpKind::Memory {
++                    bail!();
++                }
++                let (v, exact, valid) = self.fbld_mem(i);
++                self.fpush(v);
++                self.write_i64_slot(0, exact, valid);
++            }
+             M::Fst | M::Fstp | M::Fist | M::Fistp | M::Fisttp => {
+                 let v = self.st(0);
+                 match i.op0_kind() {
+                     OpKind::Register => {
+                         let d = sti(i.op0_register());
++                        let (exact, valid) = self.read_i64_slot(0);
+                         self.set_st(d, v);
++                        self.write_i64_slot(d, exact, valid);
+                         if d != 0 || m == M::Fstp {
+                             // fst st(i) marks the target valid.
+                             let tag = self.load_native(Ty::I32, 1, cpu::FPU_TAG);
+@@ -424,8 +628,28 @@ impl<'a> Lifter<'a> {
+                 };
+                 let a = self.st(0);
+                 let b = self.st(j);
++                let xa = self.i64_shadow(0);
++                let xb = self.i64_shadow(j);
++                let mask = self.i64_valid_mask();
++                let ba = self.phys_bit(0);
++                let bb = self.phys_bit(j);
++                let both = self.bin(BinOp::I32Or, ba, bb);
++                let va = self.bin(BinOp::I32And, mask, ba);
++                let va = self.bini(BinOp::I32Ne, va, 0);
++                let vb = self.bin(BinOp::I32And, mask, bb);
++                let vb = self.bini(BinOp::I32Ne, vb, 0);
++                let zero = self.c32(0);
++                let na = self.select(vb, ba, zero);
++                let nb = self.select(va, bb, zero);
++                let keep = self.bini(BinOp::I32Xor, both, 0xff);
++                let rest = self.bin(BinOp::I32And, mask, keep);
++                let rest = self.bin(BinOp::I32Or, rest, na);
++                let rest = self.bin(BinOp::I32Or, rest, nb);
+                 self.set_st(0, b);
+                 self.set_st(j, a);
++                self.set_i64_shadow(0, xb);
++                self.set_i64_shadow(j, xa);
++                self.store_native(rest, 1, cpu::FPU_I64_VALID);
+                 // Both registers become valid (exchanging with an empty
+                 // register would raise a stack fault).
+                 let z = self.c32(0);
+@@ -566,7 +790,12 @@ impl<'a> Lifter<'a> {
+                 let a = self.st(0);
+                 let b = self.st(sti(i.op1_register()));
+                 let v = self.select(c, b, a);
++                let (dst_exact, dst_valid) = self.read_i64_slot(0);
++                let (src_exact, src_valid) = self.read_i64_slot(sti(i.op_register(i.op_count() - 1)));
++                let exact = self.select(c, src_exact, dst_exact);
++                let valid = self.select(c, src_valid, dst_valid);
+                 self.set_st(0, v);
++                self.write_i64_slot(0, exact, valid);
+             }
+             M::Fxam => {
+                 let v = self.st(0);
+@@ -601,6 +830,7 @@ impl<'a> Lifter<'a> {
+             }
+             M::Ffree => {
+                 let j = sti(i.op0_register());
++                self.set_i64_valid(j, false);
+                 let tag = self.load_native(Ty::I32, 1, cpu::FPU_TAG);
+                 let t = self.bini(BinOp::I32Add, FPU_TOP, j);
+                 let t = self.bini(BinOp::I32And, t, 7);
+@@ -808,6 +1038,7 @@ impl<'a> Lifter<'a> {
+                 self.emit_to(FPU_TOP, Op::Const(0));
+                 let z = self.c32(0);
+                 self.store_native(z, 1, cpu::FPU_TAG);
++                self.store_native(z, 1, cpu::FPU_I64_VALID);
+             }
+         } else {
+             let cw = self.load(a, 2, sp);
+@@ -830,6 +1061,9 @@ impl<'a> Lifter<'a> {
+                 tag = self.bin(BinOp::I32Or, tag, s);
+             }
+             self.store_native(tag, 1, cpu::FPU_TAG);
++            let valid = self.i64_valid_mask();
++            let valid = self.bin(BinOp::I32And, valid, tag);
++            self.store_native(valid, 1, cpu::FPU_I64_VALID);
+             if i.mnemonic() == M::Frstor {
+                 for r in 0..8u32 {
+                     let p = at(self, 28 + r * 10);

@@ -19,7 +19,7 @@ RUSTUP_TOOLCHAIN=1.99.0 python3 tools/build-wwt-cpu/build-fast.py WebWindows-5c8
 sha256sum public/wwt-provider/wwt_abi11.wasm
 ```
 
-The shipped fast compiler SHA-256 is `40d94930bdfd9bc752447de17001a5e57597a817bf9b9a53947fcbafc58cbc6b`.
+The shipped fast compiler SHA-256 is `4baeba541b14627aaed6359d14f9c2c65a2237703ba95816d7bff09784ad718c`.
 
 Use `--offline` for a populated Cargo cache, or `--vendor DIRECTORY` for a cargo-vendor tree. Set `TMPDIR` and `CARGO_TARGET_DIR` to place the build outside the checkout. Set `VITE_CPU_BACKEND=v86` to build the legacy comparison app from the optional submodule.
 
@@ -42,4 +42,4 @@ A training session with `wwtAot=learn` records dynamically reached addresses in 
 
 Page-local AOT limits functions and links to one page. Adding `wwtLinkage=full` allows inter-function links across a PE. The protected compiler records source pages, including jump tables, so writes can evict dependent code and resume the guest. The upstream ABI 11 host watches writable pages with installed translation entries. It also drops linked PE translations when their executable sections become writable.
 
-Fast mode uses a flat guest RAM window. Programs that depend on trapping per-page access violations or external MMIO can select the protected compiler. Add `"wwtMode": "protected"` under `emulator` in the WGB manifest to keep this choice specific to the game. A URL selection takes precedence, so you can run the same scene in both modes with the same WGB. The protected compiler defaults to paged access. The current x87 arithmetic uses binary64. In a straight-line sequence of `FILD`, `FXCH` and integer `FISTP` stores, the compiler preserves all 64 bits of the original integer until it leaves the block or encounters another instruction.
+Fast mode uses a flat guest RAM window. Programs that depend on trapping per-page access violations or external MMIO can select the protected compiler. Add `"wwtMode": "protected"` under `emulator` in the WGB manifest to keep this choice specific to the game. A URL selection takes precedence, so you can run the same scene in both modes with the same WGB. The protected compiler defaults to paged access. The current x87 arithmetic uses binary64. The [x87 int64 patch](abi11-x87-int64.patch) (and [its protected counterpart](protected-x87-int64.patch)) keeps an exact 64-bit integer beside each x87 register that `FILD m64` loaded. `FIST`, `FISTP`, `FISTTP` and `FBSTP` store that exact value until the register is written, across instructions and block boundaries. `FBSTP` and `FBLD` are implemented. The shadow and its validity mask live at the CPU state offsets `FPU_I64` and `FPU_I64_VALID`.
