@@ -1,5 +1,5 @@
 import { enterIoReadPolicy, restoreIoReadPolicy, type IoReadPolicy } from "./io-read-policy";
-import { isRangeReadableEntry, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
+import { audioUnitEnd, isRangeReadableEntry, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
 import { LruCache } from "../../core/collections/lru-cache";
 import { Logger, LogCategory } from "../../core/logger";
 import { harnessBus } from "../../harness/event-bus";
@@ -70,6 +70,7 @@ interface RomDirNode {
 }
 
 function syncWidenTarget(entry: ZipEntry, position: number, length: number): number {
+    if (entry.audio) return audioUnitEnd(entry.audio, position, length) - position;
     if (!entry.blocks) return VirtualFileSystem.SYNC_WIDEN_BYTES;
     const blockSize = 2 ** entry.blocks.shift;
     const blockEnd = (Math.floor((position + Math.max(1, length) - 1) / blockSize) + 1) * blockSize;
@@ -448,8 +449,8 @@ export class VirtualFileSystem {
                 `Invalid WGB archive: found ${compressedEntries} compressed ZIP entr` +
                 `${compressedEntries === 1 ? "y" : "ies"} ` +
                 `(first="${firstCompressedName ?? "n/a"}", method=${firstCompressedMethod ?? -1}). ` +
-                `BottleShip expects WGB entries STORED (method=0) or block-indexed DEFLATE (see docs/bundles.md). ` +
-                `Compressed entries without a block index force full decompression and break deterministic range reads. ` +
+                `BottleShip expects WGB entries STORED (method=0), block-indexed DEFLATE or indexed audio (see docs/bundles.md). ` +
+                `Compressed entries without a block index or audio index force full decompression and break deterministic range reads. ` +
                 `Repack archive with STORE-only entries, or block-compress it with tools/wgb-compress.ts, and retry.`;
             Logger.error(LogCategory.SYSTEM, `VFS: ${message}`);
             throw new Error(message);
@@ -2053,7 +2054,7 @@ export class VirtualFileSystem {
         if (!data) {
             // For uncompressed (STORED) large entries we read only requested range.
             // This avoids loading huge assets (e.g. videos) fully into memory.
-            if (isRangeReadableEntry(entry) && entry.uncompressedSize > this.MAX_CACHE_ENTRY_SIZE) {
+            if (isRangeReadableEntry(entry) && (entry.uncompressedSize > this.MAX_CACHE_ENTRY_SIZE || entry.audio)) {
                 return this.romArchive.readEntryRange(entry, offset, length);
             }
 
@@ -2235,7 +2236,7 @@ export class VirtualFileSystem {
         if (!archive) return;
         // Sort by size ascending so small files fill cache quickly
         const all = Array.from(this.romIndex.entries())
-            .filter(([, e]) => !e.isDirectory && e.uncompressedSize <= this.MAX_CACHE_ENTRY_SIZE);
+            .filter(([, e]) => !e.isDirectory && !e.audio && e.uncompressedSize <= this.MAX_CACHE_ENTRY_SIZE);
         // `__legacyRomPrefetch2` restores the pull-everything policy this replaced, so a
         // title that changes behaviour can be A/B'd against it without a rebuild.
         const legacy = (globalThis as { __legacyRomPrefetch2?: unknown }).__legacyRomPrefetch2 === true;

@@ -38,6 +38,16 @@ upstream projects referenced here.
   release pinned in `tools/build-ffmpeg-decoder/build.sh`, plus the build script
   and `decoder_api.c` in this repository.
 
+### stb_vorbis (`packages/formats/src/audio/vorbis-wasm.generated.ts`)
+- Ogg Vorbis decoder by Sean Barrett, compiled to WebAssembly together with
+  `vorbis_api.c` by `tools/build-vorbis-decoder/build.sh` (source pinned by
+  commit and SHA-256 there) and embedded as base64.
+- **License:** public domain or MIT, at the user's choice (see the end of
+  `stb_vorbis.c`). Source: <https://github.com/nothings/stb>.
+- Linked against the WASI libc bundled with Zig (musl-derived parts MIT;
+  wasi-libc's own parts Apache-2.0 WITH LLVM-exception, Apache-2.0 or MIT;
+  dlmalloc CC0). Source: <https://github.com/WebAssembly/wasi-libc>.
+
 ### unpack-buffered (`tools/build-unpack-buffered`, ships as `public/unpack-buffered.wasm`)
 - First-party BottleShip Rust crate (7z/deflate/LZMA decode for game ingestion).
   Statically links the following Rust crates:

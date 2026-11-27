@@ -120,6 +120,19 @@ bun tools/wgb-compress.ts game.wgb game.packed.wgb --block-kib 64
 
 `wgb.ts` edits store-only bundles; edit the store-only source and compress again.
 
+### Indexed Vorbis audio
+
+WGB readers also support ZIP method 22337 (`0x5741`) for 16-bit PCM WAV
+members stored as Vorbis. Reads return the original WAV header and trailer and
+the decoded PCM samples. The decoded file keeps the original size, and the ZIP
+CRC-32 describes the reconstructed bytes. Vorbis encoding is lossy.
+
+A STORED `wgb-audio.idx` member holds the versioned, CRC-checked audio index.
+Each row binds a member's name, local header offset, sizes and CRC-32 to its
+WAV layout and Vorbis chunk offsets. Each chunk starts with a preroll packet so
+range reads can decode it independently. A manifest can require the index with
+`"audioIndex": { "member": "wgb-audio.idx", "version": 1 }`.
+
 ## Inspecting & patching: `wgb.ts`
 
 A unified archive tool for existing bundles:

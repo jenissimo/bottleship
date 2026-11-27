@@ -63,6 +63,7 @@ tools/build-unpack-buffered/target/
 
 # Build artifacts
 .build-ffmpeg/
+.build-vorbis/
 /bottleship-deploy.zip
 /public/_hp-saves.zip
 
