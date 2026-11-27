@@ -54,6 +54,28 @@ for (const [compilerFile, flat] of [["wwt_abi11.wasm", true], ["wwt_wasm.wasm", 
             expect(memory[dst + size]).toBe(0xee);
         });
 
+        for (const [segment, prefix] of [["FS", 0x64], ["GS", 0x65]] as const) {
+            for (const address16 of [false, true]) {
+                test(`${compilerFile}: ${name} uses ${segment}:${address16 ? "DI" : "EDI"}`, async () => {
+                    const { cpu, memory, words, A, data, faults, run } = await fixture();
+                    const segmentBase = 0x60000;
+                    const target = segmentBase + (address16 ? dst & 0xffff : dst);
+                    const otherWidth = segmentBase + (address16 ? dst : dst & 0xffff);
+                    words[(cpu + (segment === "FS" ? A.FS_BASE : A.GS_BASE)) >>> 2] = segmentBase;
+                    memory.set(address16 ? [0x67, prefix, ...code] : [prefix, ...code], pc);
+                    for (const address of [dst, target, otherWidth]) memory.fill(0xee, address, address + size);
+                    const mask = data.map((_, lane) => lane % 2 ? 0 : 0x80);
+                    run(pc, dst, mask);
+                    expect(faults).toEqual([]);
+                    expect(memory.slice(target, target + size)).toEqual(Uint8Array.from(data, (byte, lane) => mask[lane] ? byte : 0xee));
+                    for (const address of [dst, otherWidth]) {
+                        expect(memory.slice(address, address + size)).toEqual(new Uint8Array(size).fill(0xee));
+                    }
+                    expect(words[(cpu + A.GPR + 28) >>> 2]).toBe(dst);
+                });
+            }
+        }
+
         test(`${compilerFile}: ${name} skips inaccessible bytes past a page boundary`, async () => {
             const { machine, cpu, memory, words, A, data, faults, run } = await fixture();
             const boundary = flat ? machine.abi.null_limit : protectedBoundary;

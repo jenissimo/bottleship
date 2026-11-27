@@ -4,7 +4,7 @@ import { WwtCompiler } from "./translator";
 import type { WwtMode } from "./mode";
 import type { WwtWallClock } from "./wall-clock";
 
-export const WWT_ABI11_SHA256 = "224b327370c7d5cf30d6b7d77046d7f68e0ea2a8c0e2808d9163faa79fddcb3f";
+export const WWT_ABI11_SHA256 = "d207f6386f79b39490b11ce7ced2f190566c3e21562216efe95f88c350e886eb";
 
 export interface WwtAbi {
     version: number;

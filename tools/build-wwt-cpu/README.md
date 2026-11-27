@@ -19,7 +19,7 @@ RUSTUP_TOOLCHAIN=1.99.0 python3 tools/build-wwt-cpu/build-fast.py WebWindows-5c8
 sha256sum public/wwt-provider/wwt_abi11.wasm
 ```
 
-The shipped fast compiler SHA-256 is `224b327370c7d5cf30d6b7d77046d7f68e0ea2a8c0e2808d9163faa79fddcb3f`.
+The shipped fast compiler SHA-256 is `d207f6386f79b39490b11ce7ced2f190566c3e21562216efe95f88c350e886eb`.
 
 Use `--offline` for a populated Cargo cache, or `--vendor DIRECTORY` for a cargo-vendor tree. Set `TMPDIR` and `CARGO_TARGET_DIR` to place the build outside the checkout. Set `VITE_CPU_BACKEND=v86` to build the legacy comparison app from the optional submodule.
 
