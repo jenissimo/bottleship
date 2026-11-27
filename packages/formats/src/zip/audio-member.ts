@@ -1,5 +1,8 @@
 import { VorbisPacketDecoder } from "../audio/vorbis-decoder";
-import { audioBlockAlign, audioChunkAt, audioChunkRange, audioHeadBytes, type ZipAudioMap } from "./audio-index";
+import {
+    audioBlockAlign, audioChunkAt, audioChunkRange, audioHeadBytes,
+    WGB_AUDIO_CHUNK_MAX_BYTES, WGB_AUDIO_CHUNK_MAX_FRAMES, type ZipAudioMap,
+} from "./audio-index";
 
 export interface AudioPlan {
     from: number;
@@ -54,6 +57,9 @@ export class AudioMemberDecoder {
         const map = this.map;
         const rawFrames = map.rawStart[c + 1] - map.rawStart[c];
         const ch = map.channels;
+        if (bytes.length > WGB_AUDIO_CHUNK_MAX_BYTES || rawFrames > WGB_AUDIO_CHUNK_MAX_FRAMES) {
+            throw new Error(`audio chunk ${c}: exceeds chunk size limits`);
+        }
         if (rawFrames > Math.floor(bytes.length / 3) * 4096) {
             throw new Error(`audio chunk ${c}: frame count exceeds the packet capacity`);
         }

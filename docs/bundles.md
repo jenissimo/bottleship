@@ -130,7 +130,9 @@ CRC-32 describes the reconstructed bytes. Vorbis encoding is lossy.
 A STORED `wgb-audio.idx` member holds the versioned, CRC-checked audio index.
 Each row binds a member's name, local header offset, sizes and CRC-32 to its
 WAV layout and Vorbis chunk offsets. Each chunk starts with a preroll packet so
-range reads can decode it independently. A manifest can require the index with
+range reads can decode it independently. A chunk is limited to 1 MiB of encoded
+data, including packet framing, and 24,576 decoded sample frames before
+trimming. A manifest can require the index with
 `"audioIndex": { "member": "wgb-audio.idx", "version": 1 }`.
 
 ## Inspecting & patching: `wgb.ts`

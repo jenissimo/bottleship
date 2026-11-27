@@ -4,6 +4,8 @@ export const WGB_AUDIO_INDEX_ENTRY = "wgb-audio.idx";
 export const WGB_AUDIO_INDEX_VERSION = 1;
 export const WGB_AUDIO_METHOD = 0x5741;
 export const WGB_AUDIO_CODEC_VORBIS = 1;
+export const WGB_AUDIO_CHUNK_MAX_BYTES = 1024 * 1024;
+export const WGB_AUDIO_CHUNK_MAX_FRAMES = 16384 + 2 * 4096;
 
 const MAGIC = 0x41424757;
 const HEADER_BYTES = 16;
@@ -122,6 +124,8 @@ function validAudioRow(r: AudioIndexRow): boolean {
     if (r.rawStart[0] !== 0 || r.rawStart[n] - r.lead < r.totalFrames) return false;
     for (let c = 0; c < n; c++) {
         if (r.chunkEnd[c] <= r.chunkStart[c] || r.rawStart[c + 1] < r.rawStart[c]) return false;
+        if (r.chunkEnd[c] - r.chunkStart[c] > WGB_AUDIO_CHUNK_MAX_BYTES ||
+            r.rawStart[c + 1] - r.rawStart[c] > WGB_AUDIO_CHUNK_MAX_FRAMES) return false;
         if (c > 0 && (r.chunkStart[c] <= r.chunkStart[c - 1] || r.chunkStart[c] >= r.chunkEnd[c - 1] || r.chunkEnd[c] <= r.chunkEnd[c - 1])) return false;
     }
     return true;

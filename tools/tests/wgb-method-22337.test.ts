@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildRomIndex, WgbLoader } from "../../src/worker/runtime/filesystem/wgb-loader";
 import { VirtualFileSystem } from "../../src/worker/runtime/filesystem/vfs";
+import { applyAudioIndex, audioBlockAlign, audioHeadBytes } from "../../packages/formats/src/zip/audio-index";
 
 const fixtures = join(import.meta.dir, "fixtures/wgb-method-22337");
 const name = "rom/sample.wav";
@@ -44,4 +45,31 @@ test("the loader rejects a damaged audio index", async () => {
     expect(index).toBeGreaterThan(0);
     packed[index + 16] ^= 1;
     await expect(WgbLoader.fromBuffer(packed)).rejects.toThrow(/audio-index.*damaged.*CRC mismatch/);
+});
+
+test.each([
+    [1024 * 1024, 24576, 1],
+    [1024 * 1024 + 1, 24576, 0],
+    [8192, 24577, 0],
+])("validates an indexed chunk with %i encoded bytes and %i sample frames", async (encodedBytes, frames, accepted) => {
+    const packed = await load("vorbis.wgb");
+    const entry = packed.archive.getEntry(name)!;
+    const map = entry.audio!;
+    const head = audioHeadBytes(map);
+    const row = {
+        ...map,
+        name,
+        localHeaderOffset: entry.localHeaderOffset,
+        crc32: entry.crc32!,
+        compressedSize: head + encodedBytes,
+        uncompressedSize: map.prefixLen + frames * audioBlockAlign(map) + map.suffixLen,
+        totalFrames: frames,
+        lead: 0,
+        chunkStart: [head],
+        chunkEnd: [head + encodedBytes],
+        rawStart: [0, frames],
+    };
+    const target = { ...entry, compressedSize: row.compressedSize, uncompressedSize: row.uncompressedSize, audio: undefined };
+    expect(applyAudioIndex([row], () => target)).toBe(accepted);
+    expect(!!target.audio).toBe(accepted === 1);
 });
