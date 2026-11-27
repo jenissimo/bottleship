@@ -53,16 +53,25 @@ type IncRefDispatcher = {
     consumeIncRefPrediction?: (dll: string, fn: string) => { value: number; valid: boolean } | null;
 };
 
+// @transient(rebound by the stub registration at init)
 let boundDispatcher: IncRefDispatcher | null = null;
+// @transient(chosen by the stub registration at init)
 let mode: 'off' | 'live' | 'verify' = 'off';
+// @participant(d3d9)
 let pendingVtable = 0;
 
+// @transient(diagnostic counter; a load restarts it)
 let checked = 0;
+// @transient(diagnostic counter; a load restarts it)
 let mismatch = 0;
+// @transient(diagnostic counter; a load restarts it)
 let unpredicted = 0;
 /** Predictions the oracle's OWN trap invalidated — see noteGuestAddRefOracle. */
+// @transient(diagnostic counter; a load restarts it)
 let displaced = 0;
+// @transient(diagnostic counter; a load restarts it)
 let firstMismatch: string | null = null;
+// @transient(diagnostic counter; a load restarts it)
 let firstDisplaced: string | null = null;
 
 /**

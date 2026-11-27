@@ -40,6 +40,7 @@ import { writeDeviceCaps9 } from './caps';
 import { d3d9NoteResetRefusal } from './d3d9-perf';
 
 /** Per-reason log budget for refused Resets — see the `refuse` helper below. */
+// @transient(log throttle)
 const resetRefusalLogged = new Map<string, number>();
 import {
     addComRef, getVTables, devices, createComObject, registerComFinalizer,
@@ -319,7 +320,10 @@ function bgraToRgba(src: Uint8Array, width: number, height: number, pitch: numbe
 
 /** Per-device GPU-resource generation the redundant-SetRenderTarget fast path was validated
  *  against. Keyed by device COM pointer, cleared with the rest of the device state. */
+// @transient(cache validated against the device generation, which a restore replaces)
 const rtFastPathGeneration = new Map<number, number>();
+
+export const forgetRtFastPaths = (): void => { rtFastPathGeneration.clear(); };
 
 
 /**
@@ -366,6 +370,69 @@ function resolvePresentBackBufferExtent(
         `${source}: windowed 0x0 back buffer resolved to the client area of `
         + `hwnd=0x${hwnd.toString(16)} -> ${width}x${height}`);
     return { width, height };
+}
+
+export function registerDeviceFinalizer(devicePtr: number, device: D3D9Device, d3d9Ptr: number, implicitSwapChain: number): void {
+    registerComFinalizer(devicePtr, () => {
+        device.releaseComBindings();
+        releaseDeviceSurfaceRefs(devicePtr);
+        if (implicitSwapChain) releaseComRef(implicitSwapChain);
+        devices.delete(devicePtr);
+        forgetLossTrackedDevice(devicePtr);
+        releaseComRef(d3d9Ptr);
+        deviceToD3D9.delete(devicePtr);
+        deviceBoundDepthStencil.delete(devicePtr);
+        clearDeviceRenderTargets(devicePtr);
+        deviceCreationParams.delete(devicePtr);
+        deviceBackBufferInfo.delete(devicePtr);
+        releaseDeviceCursor(devicePtr);
+    });
+}
+
+export async function newD3D9Device(backend: WebGPUBackend, isExtended: boolean, dispatcher: unknown): Promise<D3D9Device> {
+    const device = new D3D9Device(backend, getD3D9MsaaCapabilityContract());
+    device.isExtended = isExtended;
+    if (d3d9SplitWanted() && dispatcher) {
+        const source = dispatcher as Parameters<typeof attachD3D9Split>[2] & RenderHandlerSource;
+        const remote = d3d9SplitWorkerWanted() ? await acquireD3D9RenderClient(source) : null;
+        if (remote) {
+            d3d9WasmArena.suspend();
+            attachD3D9Split(device, null, source, remote);
+        } else if (!d3d9SplitWorkerWanted()) {
+            d3d9WasmArena.suspend();
+            const twin = new D3D9Device(backend, getD3D9MsaaCapabilityContract());
+            twin.isExtended = isExtended;
+            attachD3D9Split(device, twin, source, null);
+        }
+    }
+    return device;
+}
+
+export function bindD3D9DevicePointer(device: D3D9Device, devicePtr: number): void {
+    splitBindDevicePointer(device, devicePtr);
+    registerLossTrackedDevice(devicePtr, device.getSplitLossSource() ?? undefined);
+}
+
+export function ownSetterShadows(devicePtr: number): void {
+    try {
+        const disp = System.getInstance().process?.dispatcher as { setShadowOwner?: (p: number) => void } | undefined;
+        disp?.setShadowOwner?.(devicePtr);
+        sentinelSetterShadows();
+    } catch { /* non-fatal */ }
+}
+
+export function resetSetterShadows(): void {
+    try { sentinelSetterShadows(); } catch { /* non-fatal */ }
+}
+
+function sentinelSetterShadows(): void {
+    const disp = System.getInstance().process?.dispatcher as { resetShadow?: (dll: string, fn: string) => void } | undefined;
+    // Base and IDirect3DDevice9Ex tables alike (the Ex ones exist once an Ex
+    // device was created; resetShadow is a no-op for a table that does not).
+    for (const [fn, exFn] of Object.entries(D3D9EX_SHADOWED_SETTERS)) {
+        disp?.resetShadow?.('d3d9', fn);
+        disp?.resetShadow?.('d3d9', exFn);
+    }
 }
 
 export function createDeviceExports(): Record<string, ThunkImplementation> {
@@ -589,24 +656,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
                 system.services.render.setBackend(backend);
             }
 
-            // Create D3D9Device instance
-            const device = new D3D9Device(backend, getD3D9MsaaCapabilityContract());
-            device.isExtended = isExtended;
-            // Split D3D9: a render twin replays everything this device is asked, from here on —
-            // in this worker (built second, so it is the active presenter) or in the render worker.
-            if (d3d9SplitWanted() && process.dispatcher) {
-                const dispatcher = process.dispatcher as unknown as Parameters<typeof attachD3D9Split>[2] & RenderHandlerSource;
-                const remote = d3d9SplitWorkerWanted() ? await acquireD3D9RenderClient(dispatcher) : null;
-                if (remote) {
-                    d3d9WasmArena.suspend();
-                    attachD3D9Split(device, null, dispatcher, remote);
-                } else if (!d3d9SplitWorkerWanted()) {
-                    d3d9WasmArena.suspend();
-                    const twin = new D3D9Device(backend, getD3D9MsaaCapabilityContract());
-                    twin.isExtended = isExtended;
-                    attachD3D9Split(device, twin, dispatcher, null);
-                }
-            }
+            const device = await newD3D9Device(backend, isExtended, process.dispatcher);
             // D3DCREATE_SOFTWARE_VERTEXPROCESSING selects the initial VP mode. Mixed VP starts
             // in hardware mode and can be switched explicitly with SetSoftwareVertexProcessing.
             device.setSoftwareVertexProcessing((BehaviorFlags & D3DCREATE_SOFTWARE_VERTEXPROCESSING) !== 0);
@@ -673,8 +723,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             
             // Store device instance mapped to COM object pointer
             devices.set(devicePtr, device);
-            splitBindDevicePointer(device, devicePtr);
-            registerLossTrackedDevice(devicePtr, device.getSplitLossSource() ?? undefined);
+            bindD3D9DevicePointer(device, devicePtr);
             deviceToD3D9.set(devicePtr, pD3D9);
             deviceCreationParams.set(devicePtr, {
                 adapter: Adapter >>> 0,
@@ -690,38 +739,9 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             // are also the objects returned by GetRenderTarget/GetBackBuffer.
             const implicitSwapChain = registerImplicitSwapChain(devicePtr, mem, pPresentationParameters, isExtended);
             addComRef(pD3D9);
-            registerComFinalizer(devicePtr, () => {
-                device.releaseComBindings();
-                releaseDeviceSurfaceRefs(devicePtr);
-                if (implicitSwapChain) releaseComRef(implicitSwapChain);
-                devices.delete(devicePtr);
-                forgetLossTrackedDevice(devicePtr);
-                releaseComRef(pD3D9);
-                deviceToD3D9.delete(devicePtr);
-                deviceBoundDepthStencil.delete(devicePtr);
-                clearDeviceRenderTargets(devicePtr);
-                deviceCreationParams.delete(devicePtr);
-                deviceBackBufferInfo.delete(devicePtr);
-                releaseDeviceCursor(devicePtr);
-            });
+            registerDeviceFinalizer(devicePtr, device, pD3D9, implicitSwapChain);
 
-            // Bind this device as the active owner of the guest-side setter-shadow trampolines and
-            // re-sentinel their shadow tables: a fresh device has a fresh JS state-of-record, so a
-            // stale shadow left over from a prior device would wrongly skip a needed set. (Coherence
-            // invariant for dispatcher.registerShadowedWriteBufferFunction / writeShadowTrampoline.)
-            try {
-                const disp = System.getInstance().process?.dispatcher as {
-                    setShadowOwner?: (p: number) => void;
-                    resetShadow?: (dll: string, fn: string) => void;
-                } | undefined;
-                disp?.setShadowOwner?.(devicePtr);
-                // Base and IDirect3DDevice9Ex tables alike (the Ex ones exist once an Ex
-                // device was created; resetShadow is a no-op for a table that does not).
-                for (const [fn, exFn] of Object.entries(D3D9EX_SHADOWED_SETTERS)) {
-                    disp?.resetShadow?.('d3d9', fn);
-                    disp?.resetShadow?.('d3d9', exFn);
-                }
-            } catch { /* non-fatal */ }
+            ownSetterShadows(devicePtr);
 
             // Return device interface pointer
             if (!Mem.writeUint32(ppReturnedDeviceInterface, devicePtr)) {
@@ -1086,6 +1106,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
     // StretchRect(pSourceSurface, pSourceRect, pDestSurface, pDestRect, Filter).
     // The usual shape is an offscreen render target moved into the backbuffer, so a
     // success-only stub silently drops the whole world layer and leaves just the HUD.
+    // @transient(diagnostic counter; a load restarts it)
     let stretchRectFailures = 0;
     exports['IDirect3DDevice9_StretchRect'] = (_ctx, _mem, args) => {
         const device = devices.get(args[0]);
@@ -1158,6 +1179,7 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
     //    dropping it makes every frame's UI accumulate on top of the last.
     // Both implicit-backbuffer and single-sample render-target sub-rects use the executor's
     // load/scissor solid-fill pass; unsupported targets are still reported, not swallowed.
+    // @transient(diagnostic counter; a load restarts it)
     let colorFillDropped = 0;
     exports['IDirect3DDevice9_ColorFill'] = (_ctx, _mem, args) => {
         const device = devices.get(args[0]);

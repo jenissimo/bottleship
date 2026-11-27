@@ -43,8 +43,11 @@ function hexToBytes(hex: string): Uint8Array {
 }
 
 const REAL_CAPS9 = hexToBytes(REAL_CAPS9_HEX);
+// @transient(constant table, identical in every session)
 const BASE_CAPS9_MAX_TEXTURE_WIDTH = new DataView(REAL_CAPS9.buffer).getUint32(88, true);
+// @transient(constant table, identical in every session)
 const BASE_CAPS9_MAX_TEXTURE_HEIGHT = new DataView(REAL_CAPS9.buffer).getUint32(92, true);
+// @transient(constant table, identical in every session)
 const BASE_CAPS9_MAX_TEXTURE_ASPECT_RATIO = new DataView(REAL_CAPS9.buffer).getUint32(104, true);
 
 const VS_FLOAT_REGISTER_COUNT = 256;

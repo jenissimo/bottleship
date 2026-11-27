@@ -70,9 +70,38 @@ const D3DDISPLAYMODEEX_SIZE = 24;
 const D3DSCANLINEORDERING_PROGRESSIVE = 1;
 const D3DSCANLINEORDERING_INTERLACED = 2;
 
+// @participant(d3d9)
 const maxFrameLatencies = new Map<number, number>();
+// @participant(d3d9)
 const extendedD3D9Objects = new Set<number>();
+// @participant(d3d9)
 const extendedDevices = new Set<number>();
+
+export interface SavedExState {
+    maxFrameLatencies: Array<[number, number]>;
+    objects: number[];
+    devices: number[];
+}
+
+export function captureExState(): SavedExState {
+    return {
+        maxFrameLatencies: [...maxFrameLatencies].sort((a, b) => a[0] - b[0]),
+        objects: [...extendedD3D9Objects].sort((a, b) => a - b),
+        devices: [...extendedDevices].sort((a, b) => a - b),
+    };
+}
+
+export function restoreExState(state: SavedExState): void {
+    maxFrameLatencies.clear();
+    extendedD3D9Objects.clear();
+    extendedDevices.clear();
+    for (const [ptr, n] of state.maxFrameLatencies) maxFrameLatencies.set(ptr, n);
+    for (const ptr of state.objects) extendedD3D9Objects.add(ptr);
+    for (const ptr of state.devices) extendedDevices.add(ptr);
+    if (state.devices.length > 0 || state.objects.length > 0) {
+        registerD3D9ExInheritedFastPaths(System.getInstance().process?.dispatcher);
+    }
+}
 
 /** Parent-derived Ex identity used by resource/device handlers and tests. */
 export function isD3D9ExDevice(devicePtr: number): boolean {

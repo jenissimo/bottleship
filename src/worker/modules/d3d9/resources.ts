@@ -116,6 +116,7 @@ const D3DUSAGE_WRITEONLY = 0x00000008;
 const E_NOINTERFACE = 0x80004002;
 
 /** The formats GDI can describe: R8G8B8, A8R8G8B8, X8R8G8B8, R5G6B5, X1R5G5B5, A1R5G5B5. */
+// @transient(constant table, identical in every session)
 const GETDC_COMPATIBLE_FORMATS: ReadonlySet<number> = new Set([20, 21, 22, 23, 24, 25]);
 const isGetDCCompatibleFormat = (format: number | undefined): boolean =>
     format !== undefined && GETDC_COMPATIBLE_FORMATS.has(format >>> 0);
@@ -178,13 +179,24 @@ const lockFlagsHonoured = (): boolean =>
  * (texture, level) pair the lock is: a surface lock and its parent texture's lock are the
  * same subresource and must not each remember a different promise.
  */
+// @refuse(a lock promise exists only between LockRect and UnlockRect, and capture refuses while one is open)
 const activeLockReadOnly = new Map<string, { readOnly: boolean; noDirtyUpdate: boolean }>();
 
 /** Cube locks are not routed through the 2-D lock helper, so retain their
  * per-face state here as well.  This also prevents the backend's compatibility
  * path from handing a second LockRect the first call's scratch pointer. */
+// @refuse(a lock promise exists only between LockRect and UnlockRect, and capture refuses while one is open)
 const activeCubeLocks = new Map<string, { readOnly: boolean; noDirtyUpdate: boolean }>();
+// @refuse(a lock promise exists only between Lock and Unlock, and capture refuses while one is open)
 const activeBufferLocks = new Map<number, 'vertex' | 'index'>();
+
+export const openResourceLocks = (): number => activeLockReadOnly.size + activeCubeLocks.size + activeBufferLocks.size;
+
+export const clearResourceLockPromises = (): void => {
+    activeLockReadOnly.clear();
+    activeCubeLocks.clear();
+    activeBufferLocks.clear();
+};
 
 function clearActiveTextureLocks(texturePtr: number): void {
     const prefix = `${texturePtr >>> 0}:`;
@@ -377,6 +389,7 @@ type CubeTextureFactory = (
     devicePtr: number, edge: number, levels: number, usage: number,
     format: number, pool: number, ppCubeTexture: number,
 ) => number;
+// @transient(bound again when the exports are built at init)
 let cubeTextureFactory: CubeTextureFactory | null = null;
 
 export function createGuestCubeTexture(
@@ -388,33 +401,97 @@ export function createGuestCubeTexture(
         : D3DERR_INVALIDCALL_HR;
 }
 
+const D3DTEXF_LINEAR = 2;
+
+/** State which belongs to IDirect3DBaseTexture9 rather than the GPU texture store.
+ * Keeping this beside the COM handlers makes SetLOD/GetLOD deterministic even when
+ * the backend has only a one-level native image (the D3D9 API still exposes the full
+ * declared mip chain). */
+// @participant(d3d9)
+const baseTextureState = new Map<number, { lod: number; autoGenFilterType: number }>();
+
+export const captureBaseTextureState = (): Array<[number, number, number]> =>
+    [...baseTextureState].map(([ptr, st]) => [ptr, st.lod, st.autoGenFilterType] as [number, number, number]);
+
+export const restoreBaseTextureState = (list: Array<[number, number, number]>): void => {
+    baseTextureState.clear();
+    for (const [ptr, lod, autoGenFilterType] of list) baseTextureState.set(ptr, { lod, autoGenFilterType });
+};
+
+export const dropBaseTextureState = (ptr: number): void => { baseTextureState.delete(ptr >>> 0); };
+
+export const ensureBaseTextureState = (ptr: number, levels: number, usage: number): { lod: number; autoGenFilterType: number } => {
+    const key = ptr >>> 0;
+    let state = baseTextureState.get(key);
+    if (!state) {
+        state = { lod: 0, autoGenFilterType: D3DTEXF_LINEAR };
+        baseTextureState.set(key, state);
+    }
+    // SetLOD is clamped to the last declared mip level by the native runtime.
+    state.lod = Math.min(state.lod >>> 0, Math.max(0, (levels >>> 0) - 1));
+    void usage;
+    return state;
+};
+
+
+export const registerBufferFinalizer = (ptr: number, devicePtr: number, kind: 'vertex' | 'index'): void => {
+    registerDeviceChildFinalizer(ptr, devicePtr, () => {
+        // The REGISTRY drop is in a finally: a throw anywhere in the backend teardown used
+        // to strand the metadata, and a stranded DEFAULT-pool entry makes Reset refuse
+        // forever — which an app reads as a permanently lost device, not as a leak.
+        defaultPoolBufferTally.entered++;
+        const pool = (kind === 'vertex' ? vertexBufferMeta : indexBufferMeta).get(ptr)?.pool;
+        try {
+            clearResourceContract(ptr);
+            clearActiveBufferLock(ptr);
+            const device = resourceToDevice.get(ptr);
+            if (kind === 'vertex') device?.releaseVertexBuffer(ptr);
+            else device?.releaseIndexBuffer(ptr);
+        } catch (e) {
+            Logger.error(LogCategory.D3D9,
+                `${kind} buffer 0x${ptr.toString(16)} teardown threw, dropping it anyway: ${e}`);
+        } finally {
+            if (pool === 0) defaultPoolBufferTally.finalized++;
+            if (kind === 'vertex') vertexBufferMeta.delete(ptr);
+            else indexBufferMeta.delete(ptr);
+            resourceToDevice.delete(ptr);
+        }
+    });
+};
+
+export const registerTextureFinalizer = (ptr: number, devicePtr: number): void => {
+    registerDeviceChildFinalizer(ptr, devicePtr, () => {
+        clearResourceContract(ptr);
+        baseTextureState.delete(ptr >>> 0);
+        // Reset/release drains child finalizers before the global resource
+        // registries are cleared.  Drop lock promises at the same boundary
+        // so a reused COM pointer cannot inherit an old UnlockRect state.
+        clearActiveTextureLocks(ptr);
+        const device = resourceToDevice.get(ptr);
+        clearTextureSubresourceSurfaces(ptr);
+        device?.releaseTexture(ptr);
+        textureMeta.delete(ptr);
+        resourceToDevice.delete(ptr);
+    });
+};
+
+export const registerStandaloneSurfaceFinalizer = (ptr: number, devicePtr: number): void => {
+    registerDeviceChildFinalizer(ptr, devicePtr, () => {
+        clearResourceContract(ptr);
+        resourceToDevice.get(ptr)?.releaseStandaloneDepthSurface?.(ptr);
+        releaseSurfaceMetadata(ptr);
+    });
+};
+
+
 export function createResourcesExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
+    baseTextureState.clear();
 
     const D3D_OK = 0;
     const D3DERR_INVALIDCALL = 0x8876086c;
     const D3DERR_NOTAVAILABLE = 0x8876086a;
     const D3DUSAGE_AUTOGENMIPMAP = 0x00000400;
-    const D3DTEXF_LINEAR = 2;
-
-    /** State which belongs to IDirect3DBaseTexture9 rather than the GPU texture store.
-     * Keeping this beside the COM handlers makes SetLOD/GetLOD deterministic even when
-     * the backend has only a one-level native image (the D3D9 API still exposes the full
-     * declared mip chain). */
-    const baseTextureState = new Map<number, { lod: number; autoGenFilterType: number }>();
-
-    const ensureBaseTextureState = (ptr: number, levels: number, usage: number): { lod: number; autoGenFilterType: number } => {
-        const key = ptr >>> 0;
-        let state = baseTextureState.get(key);
-        if (!state) {
-            state = { lod: 0, autoGenFilterType: D3DTEXF_LINEAR };
-            baseTextureState.set(key, state);
-        }
-        // SetLOD is clamped to the last declared mip level by the native runtime.
-        state.lod = Math.min(state.lod >>> 0, Math.max(0, (levels >>> 0) - 1));
-        void usage;
-        return state;
-    };
 
     const validAutoGenFilter = (filter: number): boolean =>
         filter === 1 || filter === 2 || filter === 3 || filter === 6 || filter === 7 || filter === 8;
@@ -422,6 +499,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
     /** Formats whose bytes are independent UNORM channels, so POINT/LINEAR
      * filtering can operate directly on the CPU shadow without decoding a
      * packed word or compressed block. */
+    // @transient(constant table, identical in every session)
     const AUTOGEN_BYTE_FORMAT_BPP = new Map<number, number>([
         [20, 3], // R8G8B8 (B,G,R in memory)
         [21, 4], // A8R8G8B8
@@ -476,55 +554,6 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             }
         }
         return D3D_OK;
-    };
-
-    const registerBufferFinalizer = (ptr: number, devicePtr: number, kind: 'vertex' | 'index'): void => {
-        registerDeviceChildFinalizer(ptr, devicePtr, () => {
-            // The REGISTRY drop is in a finally: a throw anywhere in the backend teardown used
-            // to strand the metadata, and a stranded DEFAULT-pool entry makes Reset refuse
-            // forever — which an app reads as a permanently lost device, not as a leak.
-            defaultPoolBufferTally.entered++;
-            const pool = (kind === 'vertex' ? vertexBufferMeta : indexBufferMeta).get(ptr)?.pool;
-            try {
-                clearResourceContract(ptr);
-                clearActiveBufferLock(ptr);
-                const device = resourceToDevice.get(ptr);
-                if (kind === 'vertex') device?.releaseVertexBuffer(ptr);
-                else device?.releaseIndexBuffer(ptr);
-            } catch (e) {
-                Logger.error(LogCategory.D3D9,
-                    `${kind} buffer 0x${ptr.toString(16)} teardown threw, dropping it anyway: ${e}`);
-            } finally {
-                if (pool === 0) defaultPoolBufferTally.finalized++;
-                if (kind === 'vertex') vertexBufferMeta.delete(ptr);
-                else indexBufferMeta.delete(ptr);
-                resourceToDevice.delete(ptr);
-            }
-        });
-    };
-
-    const registerTextureFinalizer = (ptr: number, devicePtr: number): void => {
-        registerDeviceChildFinalizer(ptr, devicePtr, () => {
-            clearResourceContract(ptr);
-            baseTextureState.delete(ptr >>> 0);
-            // Reset/release drains child finalizers before the global resource
-            // registries are cleared.  Drop lock promises at the same boundary
-            // so a reused COM pointer cannot inherit an old UnlockRect state.
-            clearActiveTextureLocks(ptr);
-            const device = resourceToDevice.get(ptr);
-            clearTextureSubresourceSurfaces(ptr);
-            device?.releaseTexture(ptr);
-            textureMeta.delete(ptr);
-            resourceToDevice.delete(ptr);
-        });
-    };
-
-    const registerStandaloneSurfaceFinalizer = (ptr: number, devicePtr: number): void => {
-        registerDeviceChildFinalizer(ptr, devicePtr, () => {
-            clearResourceContract(ptr);
-            resourceToDevice.get(ptr)?.releaseStandaloneDepthSurface?.(ptr);
-            releaseSurfaceMetadata(ptr);
-        });
     };
 
     exports['IDirect3DDevice9_CreateVertexBuffer'] = (ctx, mem, args) => {

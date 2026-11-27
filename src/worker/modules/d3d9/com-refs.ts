@@ -46,9 +46,12 @@ import { invalidateResourceId, resetResourceIds } from './resource-ids';
  */
 export const D3D9_COM_REFCOUNT_OFFSET = 4;
 
+// @participant(d3d9)
 const comRefCounts: Map<number, number> = new Map();
+// @transient(closures; each object is rebuilt with its own on restore)
 const comFinalizers: Map<number, () => void> = new Map();
 /** Frees the object's guest allocation; owned by whoever allocated it. */
+// @transient(closures; each object is rebuilt with its own on restore)
 const comDisposers: Map<number, () => void> = new Map();
 
 interface RefcountFlags {
@@ -62,12 +65,16 @@ interface RefcountFlags {
 const flags = globalThis as RefcountFlags;
 
 /** Binding references per object. Populated only under `__d3d9InternalBindingRefs`. */
+// @participant(d3d9)
 const comBindingRefs: Map<number, number> = new Map();
 /** Sum of comBindingRefs, so the default mode's binding release costs no Map lookup. */
+// @participant(d3d9)
 let bindingRefsHeld = 0;
 /** Device child -> the device its creation reference retains (registerDeviceChildFinalizer). */
+// @participant(d3d9)
 const comParents: Map<number, number> = new Map();
 /** Children that reached public zero while bound: their device reference is already dropped. */
+// @participant(d3d9)
 const parentDetached: Set<number> = new Set();
 
 /**
@@ -90,6 +97,7 @@ function guestRefcountWanted(): boolean {
     return !flags.__d3d9MirrorRefcount;
 }
 
+// @transient(follows the flags and is reseeded by syncStorageMode)
 let guestStoreLive = false;
 /**
  * Latched by the guest-side AddRef stub. Once guest code is
@@ -98,11 +106,16 @@ let guestStoreLive = false;
  * not be allowed to hand authority back to a mirror that missed increments, and the mirror
  * comparison stops being an oracle and would only manufacture "disagreements".
  */
+// @transient(latched again by the guest AddRef stub registration at init)
 let guestStorePinned = false;
+// @transient(diagnostic counter; a load restarts it)
 let oracleChecked = 0;
+// @transient(diagnostic counter; a load restarts it)
 let oracleMismatch = 0;
+// @transient(diagnostic counter; a load restarts it)
 let oracleFirst: string | null = null;
 /** Objects whose guest block could not be read — see currentCount. */
+// @transient(diagnostic counter; a load restarts it)
 let guestUnreadable = 0;
 
 /**
@@ -435,6 +448,73 @@ export function registerDeviceChildFinalizer(
             if (retainedDevice && !detached) releaseComRef(devicePtr);
         }
     });
+}
+
+export interface ComRefsState {
+    counts: Array<[number, number]>;
+    bindings: Array<[number, number]>;
+    parents: Array<[number, number]>;
+    detached: number[];
+}
+
+function effectiveCount(key: number, mirrored: number): number {
+    if (!guestStoreLive || !(guestStorePinned || guestRefcountWanted())) return mirrored;
+    return readGuestCount(key) ?? mirrored;
+}
+
+export function captureComRefs(): ComRefsState {
+    syncStorageMode();
+    return {
+        counts: [...comRefCounts].map(([k, n]) => [k, effectiveCount(k, n)] as [number, number]).sort((a, b) => a[0] - b[0]),
+        bindings: [...comBindingRefs].sort((a, b) => a[0] - b[0]),
+        parents: [...comParents].sort((a, b) => a[0] - b[0]),
+        detached: [...parentDetached].sort((a, b) => a - b),
+    };
+}
+
+export function restoreComRefs(state: ComRefsState): void {
+    syncStorageMode();
+    comRefCounts.clear();
+    comBindingRefs.clear();
+    comParents.clear();
+    parentDetached.clear();
+    bindingRefsHeld = 0;
+    for (const [key, n] of state.counts) storeCount(key, n);
+    for (const [key, n] of state.bindings) {
+        comBindingRefs.set(key, n);
+        bindingRefsHeld += n;
+    }
+    for (const [child, parent] of state.parents) comParents.set(child, parent);
+    for (const key of state.detached) parentDetached.add(key);
+}
+
+export function liveComObjects(): number[] {
+    return [...comRefCounts.keys()].sort((a, b) => a - b);
+}
+
+export function hasComFinalizer(ptr: number): boolean {
+    return comFinalizers.has(ptr >>> 0);
+}
+
+export function comRefTableSizes(): { counts: number; finalizers: number; disposers: number; bindings: number; parents: number } {
+    return {
+        counts: comRefCounts.size,
+        finalizers: comFinalizers.size,
+        disposers: comDisposers.size,
+        bindings: comBindingRefs.size,
+        parents: comParents.size,
+    };
+}
+
+export function dropComRefsForRestore(): void {
+    comRefCounts.clear();
+    comFinalizers.clear();
+    comDisposers.clear();
+    comBindingRefs.clear();
+    bindingRefsHeld = 0;
+    comParents.clear();
+    parentDetached.clear();
+    resetResourceIds();
 }
 
 /** Drop an object outright (an implicit subresource dying with its owner). */

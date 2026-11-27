@@ -67,6 +67,7 @@ const D3DLOCK_NOOVERWRITE = 0x1000;
 const D3DLOCK_DISCARD = 0x2000;
 const D3DLOCK_NO_DIRTY_UPDATE = 0x8000;
 
+// @refuse(a lock promise exists only between LockBox and UnlockBox, and capture refuses while one is open)
 const volumeLockFlags = new Map<string, { readOnly: boolean; noDirtyUpdate: boolean }>();
 
 function clearVolumeLockFlags(texturePtr: number): void {
@@ -172,6 +173,7 @@ type VolumeTextureFactory = (
 ) => number;
 
 /** Bound when the d3d9 volume exports are built; D3DX's loader goes through it. */
+// @transient(bound again when the exports are built at init)
 let volumeTextureFactory: VolumeTextureFactory | null = null;
 
 /**
@@ -187,9 +189,57 @@ export function createGuestVolumeTexture(
         : 0x8876086c;
 }
 
+// @participant(d3d9)
+const baseTextureState = new Map<number, { lod: number; autoGenFilterType: number }>();
+
+export const captureVolumeBaseState = (): Array<[number, number, number]> =>
+    [...baseTextureState].map(([ptr, st]) => [ptr, st.lod, st.autoGenFilterType] as [number, number, number]);
+
+export const restoreVolumeBaseState = (list: Array<[number, number, number]>): void => {
+    baseTextureState.clear();
+    for (const [ptr, lod, autoGenFilterType] of list) baseTextureState.set(ptr, { lod, autoGenFilterType });
+};
+
+export const volumeLocksOpen = (): number => volumeLockFlags.size;
+
+export function registerVolumeTextureFinalizer(texturePtr: number, devicePtr: number, ownerDevice: D3D9Device): void {
+    registerDeviceChildFinalizer(texturePtr, devicePtr, () => {
+        baseTextureState.delete(texturePtr >>> 0);
+        // Reset/release drains finalizers before the volume registry is
+        // cleared.  Forget any lock promise at that boundary so a reused
+        // pointer cannot make a later UnlockBox publish with stale flags.
+        clearVolumeLockFlags(texturePtr);
+        // The texture holds the one reference each cached level object was created
+        // with (AddRef/Release through a Volume9 land on the parent, so nothing else
+        // ever drops it). Releasing it here is what runs each child's finalizer.
+        const children = volumeLevelObjects.get(texturePtr);
+        if (children) {
+            for (const child of Array.from(children.values())) {
+                releaseComRef(child);
+                volumeLevelParents.delete(child);
+                resourceToDevice.delete(child);
+            }
+        }
+        ownerDevice.releaseVolumeTexture(texturePtr);
+        releaseVolumeTextureResource(texturePtr);
+        clearResourceContract(texturePtr);
+        resourceToDevice.delete(texturePtr);
+    });
+}
+
+export function registerVolumeLevelFinalizer(volumePtr: number, devicePtr: number, texturePtr: number, level: number): void {
+    registerDeviceChildFinalizer(volumePtr, devicePtr, () => {
+        volumeLevelParents.delete(volumePtr);
+        resourceToDevice.delete(volumePtr);
+        const map = volumeLevelObjects.get(texturePtr);
+        if (map?.get(level) === volumePtr) map!.delete(level);
+        if (map && map.size === 0) volumeLevelObjects.delete(texturePtr);
+        clearResourceContract(volumePtr);
+    });
+}
+
 export function createVolumeExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
-    const baseTextureState = new Map<number, { lod: number; autoGenFilterType: number }>();
 
     const validAutoGenFilter = (filter: number): boolean =>
         filter === 1 || filter === 2 || filter === 3 || filter === 6 || filter === 7 || filter === 8;
@@ -341,28 +391,7 @@ export function createVolumeExports(): Record<string, ThunkImplementation> {
         volumeTextureResources.set(texturePtr, resource);
         resourceToDevice.set(texturePtr, ownerDevice);
         (ownerDevice as D3D9Device).registerVolumeTexture(texturePtr);
-        registerDeviceChildFinalizer(texturePtr, pDevice, () => {
-            baseTextureState.delete(texturePtr >>> 0);
-            // Reset/release drains finalizers before the volume registry is
-            // cleared.  Forget any lock promise at that boundary so a reused
-            // pointer cannot make a later UnlockBox publish with stale flags.
-            clearVolumeLockFlags(texturePtr);
-            // The texture holds the one reference each cached level object was created
-            // with (AddRef/Release through a Volume9 land on the parent, so nothing else
-            // ever drops it). Releasing it here is what runs each child's finalizer.
-            const children = volumeLevelObjects.get(texturePtr);
-            if (children) {
-                for (const child of Array.from(children.values())) {
-                    releaseComRef(child);
-                    volumeLevelParents.delete(child);
-                    resourceToDevice.delete(child);
-                }
-            }
-            (ownerDevice as D3D9Device).releaseVolumeTexture(texturePtr);
-            releaseVolumeTextureResource(texturePtr);
-            clearResourceContract(texturePtr);
-            resourceToDevice.delete(texturePtr);
-        });
+        registerVolumeTextureFinalizer(texturePtr, pDevice, ownerDevice as D3D9Device);
         Logger.log(LogCategory.D3D9,
             `CreateVolumeTexture(${width}x${height}x${depth}, Levels=${resource.levels}, Format=${format}) -> 0x${texturePtr.toString(16)}`);
         if (!Mem.writeUint32(ppTexture, texturePtr)) {
@@ -467,14 +496,7 @@ export function createVolumeExports(): Record<string, ThunkImplementation> {
             volumePtr = createComObject(vtableAddr);
             resourceToDevice.set(volumePtr, ownerDevice);
             volumeLevelParents.set(volumePtr, { texturePtr, level });
-            registerDeviceChildFinalizer(volumePtr, devicePtr, () => {
-                volumeLevelParents.delete(volumePtr!);
-                resourceToDevice.delete(volumePtr!);
-                const map = volumeLevelObjects.get(texturePtr);
-                if (map?.get(level) === volumePtr) map!.delete(level);
-                if (map && map.size === 0) volumeLevelObjects.delete(texturePtr);
-                clearResourceContract(volumePtr!);
-            });
+            registerVolumeLevelFinalizer(volumePtr, devicePtr, texturePtr, level);
             levels.set(level, volumePtr);
         }
         // Volume9 is an alias of its parent resource for COM lifetime, so the

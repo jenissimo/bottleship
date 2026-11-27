@@ -306,6 +306,12 @@ async function answer(msg: RequestMessage): Promise<void> {
                 // Harness: the real loss path of this worker's device (WebGPUBackend.forceDeviceLoss).
                 value = renderBackend ? await renderBackend.forceDeviceLoss() : null;
                 break;
+            case "savestateBackbuffer": {
+                const twin = replayer?.twins.get(msg.slot ?? 0);
+                if (!twin) throw new Error("the render twin is unavailable");
+                value = { backbuffer: await twin.readSavestateBackbuffer() };
+                break;
+            }
             case "presentedRgba": {
                 const twin = replayer?.twins.get(msg.slot ?? 0);
                 value = twin ? await twin.readPresentedRgba() : null;

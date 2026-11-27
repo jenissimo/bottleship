@@ -86,6 +86,20 @@ class GammaService {
         this.push();
     }
 
+    captureRamp(): GammaRampData | null {
+        const last = this.last;
+        return last
+            ? { red: last.red.slice(), green: last.green.slice(), blue: last.blue.slice(), isIdentity: last.isIdentity }
+            : null;
+    }
+
+    restoreRamp(ramp: GammaRampData | null): void {
+        this.last = ramp
+            ? { red: ramp.red.slice(), green: ramp.green.slice(), blue: ramp.blue.slice(), isIdentity: ramp.isIdentity }
+            : null;
+        this.push();
+    }
+
     private push(): void {
         if (!this.last) return;
         const backend = System.getInstance().services.render.getBackend() as RenderBackend | null;

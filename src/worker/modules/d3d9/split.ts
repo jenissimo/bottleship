@@ -58,6 +58,7 @@ export interface RemoteTwinScreen {
     repaintLastFrame(): void;
     getLastPresentDrawCount(): number | null;
     capturePresentedLayer(): Promise<Blob | null>;
+    readSavestateBackbuffer(): Promise<{ rgba: Uint8Array; width: number; height: number } | null>;
     /** GetFrontBufferData: the presented image, read where it was rendered. */
     readPresentedRgba(): Promise<{ rgba: Uint8Array; width: number; height: number } | null>;
 }
@@ -99,6 +100,9 @@ const RECORDED = [
     "setVertexShaderConstantBFromArray", "setVertexShaderConstantF", "setVertexShaderConstantFFromArray",
     "setVertexShaderConstantI", "setVertexShaderConstantIFromArray", "setViewport", "setViewportValues",
     "restoreViewportSnapshot",
+    "createVertexShaderFromTokens", "createPixelShaderFromTokens", "setPaletteEntriesFromBytes",
+    "writeVertexBufferContents", "writeIndexBufferContents", "seedRenderTargetContents", "seedBackbufferImage",
+    "restoreTransform", "restoreDeviceWindow", "restoreRecordingEntries", "restoreShaderBooleanMasks",
     "stretchRect", "unlockCubeFace", "unlockIndexBuffer", "unlockTexture",
     "unlockVertexBuffer",
 ] as const;
@@ -116,11 +120,13 @@ const DELEGATED = [
 ] as const;
 
 /** Calls after which the twin must be current (the front's answer or the screen needs it). */
+// @transient(constant table, identical in every session)
 const FENCES = new Set<string>(["present", "presentEx"]);
 
 /** GPU readbacks: the front asks the twin for the result right after (adoptTwinReadback), so the
  *  call must reach it now — but only when it started one (a Promise): LockRect asks
  *  textureReadbackForLock of every texture and gets null for all but render targets. */
+// @transient(constant table, identical in every session)
 const READBACK_FENCES = new Set<string>([
     "readTextureIntoGuestTexture", "readBackbufferIntoGuestTexture", "textureReadbackForLock", "stretchRect",
 ]);
@@ -202,6 +208,7 @@ function lastViewBytes(args: Args): number {
     return ArrayBuffer.isView(last) ? last.byteLength : 0;
 }
 
+// @transient(split only; capture refuses a split device)
 const blockPointers = new WeakMap<object, number>();
 function blockByPointer(name: string, data: unknown): [string, Args] | null {
     const sbPtr = typeof data === "object" && data !== null ? blockPointers.get(data) : undefined;
@@ -209,6 +216,7 @@ function blockByPointer(name: string, data: unknown): [string, Args] | null {
 }
 
 /** Recorded calls the twin cannot perform yet: counted and named instead of desynchronizing. */
+// @transient(constant table, identical in every session)
 const UNSUPPORTED = new Set<string>();
 
 interface SplitRecordStats {
@@ -281,6 +289,11 @@ class SplitStream {
             twin.role = "render";
             front.renderTwin = twin;
             this.replayer.twins.set(slot, twin);
+            front.splitReadSavestateBackbuffer = async () => {
+                this.flush();
+                await this.replayer.settled();
+                return twin.readSavestateBackbuffer();
+            };
             front.splitFetchTexture = async (texPtr, method) => {
                 this.flush();
                 await this.replayer.settled();
@@ -296,6 +309,10 @@ class SplitStream {
             f.getLastPresentDrawCount = () => screen.getLastPresentDrawCount();
             f.capturePresentedLayer = () => screen.capturePresentedLayer();
             f.readPresentedRgba = () => { this.flush(); return screen.readPresentedRgba(); };
+            front.splitReadSavestateBackbuffer = () => {
+                this.flush();
+                return screen.readSavestateBackbuffer();
+            };
             const remote = this.remote;
             const depth = splitPresentDepth();
             front.splitPresentGate = () => remote.waitForBacklog(depth);
@@ -530,6 +547,7 @@ interface RecordSite {
     readonly readbackFence: boolean;
 }
 
+// @transient(split only; capture refuses a split device)
 let stream: SplitStream | null = null;
 
 /** Split a device the modules just created: an in-process twin, or (remote) the render worker's. */

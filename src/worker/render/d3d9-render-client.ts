@@ -191,6 +191,14 @@ export class D3D9RenderClient implements SplitRemote {
                 const png = await this.request("capture", { slot }) as Uint8Array | null;
                 return png && png.length ? new Blob([png.slice()], { type: "image/png" }) : null;
             },
+            readSavestateBackbuffer: async () => {
+                const reply = await this.request("savestateBackbuffer", { slot }) as {
+                    backbuffer?: { rgba: Uint8Array; width: number; height: number } | null;
+                    error?: string;
+                } | null;
+                if (reply?.backbuffer === undefined) throw new Error(reply?.error ?? "the render twin did not respond");
+                return reply.backbuffer;
+            },
             readPresentedRgba: async () =>
                 await this.request("presentedRgba", { slot }) as { rgba: Uint8Array; width: number; height: number } | null,
         };

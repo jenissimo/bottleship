@@ -161,6 +161,11 @@ class OwnerBlockPool {
         return addr;
     }
 
+    remove(addr: number): void {
+        const at = this.blocks.indexOf(addr >>> 0, this.head);
+        if (at >= 0) this.blocks.splice(at, 1);
+    }
+
     get size(): number { return this.blocks.length - this.head; }
 }
 
@@ -192,6 +197,13 @@ function poolFor(owner: string): OwnerBlockPool {
     let p = ownerPools.get(owner);
     if (!p) { p = new OwnerBlockPool(); ownerPools.set(owner, p); }
     return p;
+}
+
+export function claimRestoredComBlock(objAddr: number): void {
+    const blockAddr = (objAddr - COM_GUARD_SIZE) >>> 0;
+    freeBlocks.delete(blockAddr);
+    for (const pool of ownerPools.values()) pool.remove(blockAddr);
+    releasedBlocks.delete(objAddr >>> 0);
 }
 
 /** Diagnostics: free-block count per owning module. */

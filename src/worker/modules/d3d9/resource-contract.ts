@@ -36,7 +36,9 @@ type PrivateData = {
     retainedUnknown: boolean;
 };
 
+// @participant(d3d9)
 const privateData = new Map<number, Map<string, PrivateData>>();
+// @participant(d3d9)
 const priorities = new Map<number, number>();
 /**
  * References to guest IUnknowns which are not one of our COM allocations.
@@ -44,7 +46,40 @@ const priorities = new Map<number, number>();
  * still retain the ownership edge so replacing/clearing private data balances
  * the reference we accepted and tests can observe the contract.
  */
+// @participant(d3d9)
 const opaqueUnknownRefs = new Map<number, number>();
+
+export interface SavedContract {
+    privateData: Array<[number, Array<[string, { bytes: Uint8Array; flags: number; unknownPtr: number; retainedUnknown: boolean }]>]>;
+    priorities: Array<[number, number]>;
+    opaqueUnknownRefs: Array<[number, number]>;
+}
+
+export function captureResourceContract(): SavedContract {
+    return {
+        privateData: [...privateData].sort((a, b) => a[0] - b[0]).map(([ptr, map]) => [
+            ptr,
+            [...map].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([guid, e]) => [guid, {
+                bytes: e.bytes.slice(), flags: e.flags, unknownPtr: e.unknownPtr, retainedUnknown: e.retainedUnknown,
+            }] as [string, PrivateData]),
+        ] as [number, Array<[string, PrivateData]>]),
+        priorities: [...priorities].sort((a, b) => a[0] - b[0]),
+        opaqueUnknownRefs: [...opaqueUnknownRefs].sort((a, b) => a[0] - b[0]),
+    };
+}
+
+export function restoreResourceContract(saved: SavedContract): void {
+    privateData.clear();
+    priorities.clear();
+    opaqueUnknownRefs.clear();
+    for (const [ptr, entries] of saved.privateData) {
+        const map = new Map<string, PrivateData>();
+        for (const [guid, e] of entries) map.set(guid, { bytes: e.bytes.slice(), flags: e.flags, unknownPtr: e.unknownPtr, retainedUnknown: e.retainedUnknown });
+        privateData.set(ptr, map);
+    }
+    for (const [ptr, n] of saved.priorities) priorities.set(ptr, n);
+    for (const [ptr, n] of saved.opaqueUnknownRefs) opaqueUnknownRefs.set(ptr, n);
+}
 
 function guidKey(mem: Uint8Array, ptr: number): string | null {
     if (!ptr || ptr < 0 || ptr + 16 > mem.length) return null;

@@ -70,27 +70,45 @@ interface ResourceIdFlags {
 const flags = globalThis as ResourceIdFlags;
 
 const INITIAL_BITS = 10; // 1024 slots
+// @transient(pointer to id table minted lazily on first sighting; no reader keeps an id across calls, so it starts empty)
 let bits = INITIAL_BITS;
+// @transient(pointer to id table minted lazily on first sighting; no reader keeps an id across calls, so it starts empty)
 let mask = (1 << bits) - 1;
+// @transient(pointer to id table minted lazily on first sighting; no reader keeps an id across calls, so it starts empty)
 let keys = new Int32Array(1 << bits);
+// @transient(pointer to id table minted lazily on first sighting; no reader keeps an id across calls, so it starts empty)
 let vals = new Int32Array(1 << bits);
+// @transient(pointer to id table minted lazily on first sighting; no reader keeps an id across calls, so it starts empty)
 let used = 0;
 
+// @transient(pointer to id table minted lazily on first sighting; no reader keeps an id across calls, so it starts empty)
 let idCapacity = 1024;
 /** Guest pointer behind each id, 0 once the id is dead. Index 0 is never a live id. */
+// @transient(pointer to id table minted lazily on first sighting; no reader keeps an id across calls, so it starts empty)
 let idPtr = new Int32Array(idCapacity);
+// @transient(pointer to id table minted lazily on first sighting; no reader keeps an id across calls, so it starts empty)
 let idKind = new Uint8Array(idCapacity);
+// @transient(pointer to id table minted lazily on first sighting; no reader keeps an id across calls, so it starts empty)
 let nextId = 1;
 
+// @transient(probes installed again at init)
 const probes: (LiveProbe | null)[] = new Array(KIND_COUNT).fill(null);
 
+// @transient(diagnostic counter; a load restarts it)
 let hits = 0;
+// @transient(diagnostic counter; a load restarts it)
 let minted = 0;
+// @transient(diagnostic counter; a load restarts it)
 let misses = 0;
+// @transient(diagnostic counter; a load restarts it)
 let kindMismatch = 0;
+// @transient(diagnostic counter; a load restarts it)
 let staleHits = 0;
+// @transient(diagnostic counter; a load restarts it)
 let invalidated = 0;
+// @transient(diagnostic counter; a load restarts it)
 let probeMissing = 0;
+// @transient(diagnostic counter; a load restarts it)
 let rehashes = 0;
 
 function slotOf(key: number): number {

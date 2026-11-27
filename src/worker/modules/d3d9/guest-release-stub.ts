@@ -55,6 +55,7 @@ const DEFAULT_IFACE = 'IDirect3DTexture9';
  * for one of these would let a bound buffer be destroyed while a SetStreamSource/SetIndices
  * naming it is still sitting in the ring.
  */
+// @transient(constant table, identical in every session)
 const RING_BARRIER_INTERFACES = new Set(['IDirect3DVertexBuffer9', 'IDirect3DIndexBuffer9']);
 
 interface ReleaseStubFlags {
@@ -76,20 +77,32 @@ type DecRefDispatcher = {
     consumeIncRefPrediction?: (dll: string, fn: string) => { value: number; valid: boolean; code: number } | null;
 };
 
+// @transient(rebound by the stub registration at init)
 let boundDispatcher: DecRefDispatcher | null = null;
+// @transient(chosen by the stub registration at init)
 let mode: 'off' | 'live' | 'verify' = 'off';
+// @transient(chosen by the stub registration at init)
 let installedIface = DEFAULT_IFACE;
+// @participant(d3d9)
 let pendingVtable = 0;
 
+// @transient(diagnostic counter; a load restarts it)
 let checked = 0;
+// @transient(diagnostic counter; a load restarts it)
 let mismatch = 0;
+// @transient(diagnostic counter; a load restarts it)
 let unpredicted = 0;
 /** Predictions the oracle's OWN trap invalidated — see noteGuestReleaseOracle. */
+// @transient(diagnostic counter; a load restarts it)
 let displaced = 0;
+// @transient(diagnostic counter; a load restarts it)
 let firstDisplaced: string | null = null;
 /** Calls the stub deliberately handed to JS — the 1→0 transition and the bogus-count guard. */
+// @transient(diagnostic counter; a load restarts it)
 let zeroChecked = 0;
+// @transient(diagnostic counter; a load restarts it)
 let zeroMismatch = 0;
+// @transient(diagnostic counter; a load restarts it)
 let firstMismatch: string | null = null;
 
 const funcName = (): string => `${installedIface}_Release`;

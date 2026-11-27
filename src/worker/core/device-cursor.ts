@@ -145,6 +145,45 @@ export function releaseDeviceCursor(devicePtr: number): void {
     syncHostCursorToGuestState();
 }
 
+export interface DeviceCursorState {
+    devicePtr: number;
+    image: HostCursorImage | null;
+    visible: boolean;
+    hardware: boolean;
+    x: number;
+    y: number;
+}
+
+export function captureDeviceCursors(): { cursors: DeviceCursorState[]; activeDevice: number } {
+    return {
+        cursors: [...cursors].map(([devicePtr, c]) => ({
+            devicePtr,
+            image: c.image ? { ...c.image, pixels: c.image.pixels.slice() } : null,
+            visible: c.visible,
+            hardware: c.hardware,
+            x: c.x,
+            y: c.y,
+        })),
+        activeDevice,
+    };
+}
+
+export function restoreDeviceCursors(state: { cursors: DeviceCursorState[]; activeDevice: number }): void {
+    cursors.clear();
+    for (const c of state.cursors) {
+        cursors.set(c.devicePtr, {
+            image: c.image ? { ...c.image, pixels: c.image.pixels.slice() } : null,
+            visible: c.visible,
+            hardware: c.hardware,
+            x: c.x,
+            y: c.y,
+        });
+    }
+    activeDevice = state.activeDevice;
+    publishSpritePosition();
+    syncHostCursorToGuestState();
+}
+
 /** Process teardown. */
 export function resetDeviceCursor(): void {
     cursors.clear();

@@ -692,6 +692,7 @@ export class D3D9Device {
     splitPresentGate: (() => Promise<void>) | null = null;
     /** A split front whose frames come from the render worker: the canvas edge arrives with them. */
     splitFramesRemote = false;
+    splitReadSavestateBackbuffer: (() => Promise<{ rgba: Uint8Array; width: number; height: number } | null>) | null = null;
     /** On a split front: the twin's level-0 shadow of a texture after its GPU readbacks settled,
      *  with the answer the twin's `method` gave (see adoptTwinReadback). */
     splitFetchTexture: ((texPtr: number, method: string) => Promise<{ data: Uint8Array | null; answer: unknown }>) | null = null;
@@ -3946,14 +3947,14 @@ export class D3D9Device {
         }
     }
 
-    createVertexBuffer(vbPtr: number, size: number, fvf: number, pool = 0): number {
+    createVertexBuffer(vbPtr: number, size: number, fvf: number, pool = 0, adoptGuestPtr = 0): number {
         if (this.role !== "render" && !System.getInstance().process) return 0;
         try {
             // +16: tail canary (see BUF_CANARY) — kept outside the size the store/game sees.
-            const guestPtr = this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES, d3d9BufferAlignment());
+            const guestPtr = adoptGuestPtr || this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES, d3d9BufferAlignment());
             const index = this.vertexBuffers.create(vbPtr, size, fvf, guestPtr, pool);
             this.dropBufferVersions(index, "vb");
-            if (this.role !== "render") this.writeCanary(null, guestPtr, size);
+            if (this.role !== "render" && !adoptGuestPtr) this.writeCanary(null, guestPtr, size);
             return guestPtr;
         } catch (e) {
             Logger.error(LogCategory.D3D9, `createVertexBuffer: HEAP alloc failed size=${size}: ${e}`);
@@ -4338,14 +4339,14 @@ export class D3D9Device {
         return 0;
     }
 
-    createIndexBuffer(ibPtr: number, size: number, format: number, pool = 0): number {
+    createIndexBuffer(ibPtr: number, size: number, format: number, pool = 0, adoptGuestPtr = 0): number {
         if (this.role !== "render" && !System.getInstance().process) return 0;
         try {
             // +16: tail canary, same scheme as createVertexBuffer.
-            const guestPtr = this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES, d3d9BufferAlignment());
+            const guestPtr = adoptGuestPtr || this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES, d3d9BufferAlignment());
             const index = this.indexBuffers.create(ibPtr, size, format, guestPtr, pool);
             this.dropBufferVersions(index, "ib");
-            if (this.role !== "render") this.writeCanary(null, guestPtr, size);
+            if (this.role !== "render" && !adoptGuestPtr) this.writeCanary(null, guestPtr, size);
             return guestPtr;
         } catch (e) {
             Logger.error(LogCategory.D3D9, `createIndexBuffer: HEAP alloc failed size=${size}: ${e}`);
@@ -4497,6 +4498,83 @@ export class D3D9Device {
         if (index === null || !data || !bytes) return;
         data.set(bytes.subarray(0, data.length));
         this.vertexBuffers.setDirty(index, true);
+    }
+
+    writeVertexBufferContents(vbPtr: number, bytes: Uint8Array): boolean {
+        const index = this.vertexBuffers.getIndex(vbPtr >>> 0);
+        const data = index === null ? null : this.vertexBuffers.getData(index);
+        if (index === null || !data || bytes.length !== data.length) return false;
+        data.set(bytes);
+        this.vertexBuffers.setDirty(index, true);
+        return true;
+    }
+
+    writeIndexBufferContents(ibPtr: number, bytes: Uint8Array): boolean {
+        const index = this.indexBuffers.getIndex(ibPtr >>> 0);
+        const data = index === null ? null : this.indexBuffers.getData(index);
+        if (index === null || !data || bytes.length !== data.length) return false;
+        data.set(bytes);
+        this.indexBuffers.setDirty(index, true);
+        return true;
+    }
+
+    seedRenderTargetContents(texPtr: number, bytes: Uint8Array): boolean {
+        const index = this.textures.getIndex(texPtr >>> 0);
+        const data = index === null ? null : this.textures.getData(index);
+        if (index === null || !data || bytes.length !== data.length || !this.textures.isRenderTarget(index)) return false;
+        data.set(bytes);
+        if (this.role === "front") return true;
+        const gpu = this.textures.getGpuTexture(index);
+        const queue = this.backend.getQueue?.();
+        if (!gpu || !queue || this.textures.isCubeMap(index)) return false;
+        const width = this.textures.getWidth(index);
+        const height = this.textures.getHeight(index);
+        const rgba = new Uint8Array(width * height * 4);
+        decodeD3DTextureToRgba8(data, 0, width, height, this.textures.getFormat(index), { pitch: this.textures.getPitch(index), out: rgba });
+        if (gpu.format.startsWith("bgra")) {
+            for (let i = 0; i < rgba.length; i += 4) {
+                const r = rgba[i]!;
+                rgba[i] = rgba[i + 2]!;
+                rgba[i + 2] = r;
+            }
+        }
+        const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+        let upload = rgba;
+        if (bytesPerRow !== width * 4) {
+            upload = new Uint8Array(bytesPerRow * height);
+            for (let y = 0; y < height; y++) upload.set(rgba.subarray(y * width * 4, (y + 1) * width * 4), y * bytesPerRow);
+        }
+        queue.writeTexture({ texture: gpu }, upload as Uint8Array<ArrayBuffer>, { bytesPerRow, rowsPerImage: height }, { width, height, depthOrArrayLayers: 1 });
+        return true;
+    }
+
+    seedBackbufferImage(rgba: Uint8Array, width: number, height: number): boolean {
+        if (this.role === "front") return true;
+        return this.backendExecutor.seedBackbuffer(rgba, width, height);
+    }
+
+    restoreTransform(state: number, matrix: Float32Array): boolean {
+        if (!isTransformState(state) || matrix.length !== 16) return false;
+        this.stateTracker.setTransform(state, matrix);
+        return true;
+    }
+
+    restoreShaderBooleanMasks(vsMask: number, psMask: number): void {
+        this.vsBooleanMask = vsMask >>> 0;
+        this.psBooleanMask = psMask >>> 0;
+        this.vsConstantsVersion++;
+        this.psConstantsVersion++;
+    }
+
+    restoreDeviceWindow(hwnd: number, windowed: boolean): void {
+        this.deviceWindowHwnd = hwnd >>> 0;
+        this.deviceIsWindowed = windowed;
+    }
+
+    restoreRecordingEntries(entries: StateBlockEntry[]): boolean {
+        if (!this.stateBlockRecorder.isRecording()) return false;
+        for (const entry of entries) this.stateBlockRecorder.record(entry);
+        return true;
     }
 
     /** DrawIndexedPrimitiveUP's index span and vertex span [0, (MinVertexIndex+NumVertices)×stride),
@@ -4791,12 +4869,12 @@ export class D3D9Device {
         return this.volumeEntry(index)?.view ?? null;
     }
 
-    createTexture(texPtr: number, width: number, height: number, levels: number, format: number, usage: number = 0, pool = 0, borrowedPtr = 0): number {
+    createTexture(texPtr: number, width: number, height: number, levels: number, format: number, usage: number = 0, pool = 0, borrowedPtr = 0, adoptGuestPtr = 0): number {
         if (this.role !== "render" && !System.getInstance().process) return 0;
         const bytes = getD3DTextureLayout(format, width, height).bytes;
         try {
             const borrowed = this.role !== "render" && borrowedPtr !== 0;
-            const guestPtr = borrowed ? borrowedPtr : this.guestAlloc(bytes);
+            const guestPtr = borrowed ? borrowedPtr : (adoptGuestPtr || this.guestAlloc(bytes));
             const index = this.textures.create(texPtr, width, height, levels, format, guestPtr, pool);
             if (borrowed) {
                 (this.borrowedTextureMemory ??= new Map()).set(texPtr, { ptr: borrowedPtr, bytes });
@@ -4857,14 +4935,14 @@ export class D3D9Device {
      * reflection probes) render each face via a per-face 2D view (getCubeFaceRenderView);
      * static cubes upload LockRect'd face pixels via ensureCubeTexture.
      */
-    createCubeTexture(cubePtr: number, edge: number, levels: number, format: number, usage: number = 0, pool = 0): number {
+    createCubeTexture(cubePtr: number, edge: number, levels: number, format: number, usage: number = 0, pool = 0, adoptGuestPtr = 0): number {
         if (this.role !== "render" && !System.getInstance().process) return 0;
         const e = Math.max(1, edge >>> 0);
         const levelCount = Math.max(1, levels >>> 0);
         try {
             // Scratch HEAP backing keeps TextureStore.create's bookkeeping uniform with 2D
             // textures; cube faces are locked into per-face scratch on demand (lockCubeFace).
-            const guestPtr = this.guestAlloc(getD3DTextureLayout(format, e, e).bytes);
+            const guestPtr = adoptGuestPtr || this.guestAlloc(getD3DTextureLayout(format, e, e).bytes);
             const index = this.textures.create(cubePtr, e, e, levelCount, format, guestPtr, pool);
             this.textures.markCube(index);
             // Arena texture ids reserve zero for "unbound"; the resource store starts at
@@ -9348,6 +9426,15 @@ export class D3D9Device {
     async capturePresentedLayer(): Promise<Blob | null> {
         this.submitFrame(false);
         return this.backendExecutor.captureFrame();
+    }
+
+    async readSavestateBackbuffer(): Promise<{ rgba: Uint8Array; width: number; height: number } | null> {
+        if (this.role === "front") {
+            if (!this.splitReadSavestateBackbuffer) throw new Error("the render twin is unavailable");
+            return this.splitReadSavestateBackbuffer();
+        }
+        if (this.hasPendingWork()) this.submitFrame(false);
+        return this.backendExecutor.readSavestateBackbuffer();
     }
 
     /** Raw RGBA8 readback for GetFrontBufferData when image codecs are unavailable. */

@@ -429,7 +429,9 @@ export function d3d9PerfApproximation(feature: string): void {
  * draw; the names exist only in the snapshot.
  */
 const FFP_OP_SLOTS = 32;
+// @transient(diagnostic counter; a load restarts it)
 const ffpColorOps = new Int32Array(FFP_OP_SLOTS);
+// @transient(diagnostic counter; a load restarts it)
 const ffpAlphaOps = new Int32Array(FFP_OP_SLOTS);
 
 export function d3d9PerfFfpOp(kind: "color" | "alpha", op: number): void {
@@ -449,6 +451,7 @@ function ffpOpsSnapshot(): Record<string, number> {
 
 /** Whether the guest has ever called SetMaterial. False means every lit draw so far used the
  *  device's initial material, which makes its value load-bearing rather than incidental. */
+// @transient(diagnostic counter; a load restarts it)
 let materialEverSet = false;
 export function d3d9PerfMaterialSet(): void { materialEverSet = true; }
 
@@ -502,7 +505,9 @@ const stateBlock = {
     maxVsConstRanges: 0,
     maxPsConstRanges: 0,
 };
+// @transient(diagnostic counter; a load restarts it)
 let stateBlockByType: Record<string, number> = {};
+// @transient(diagnostic counter; a load restarts it)
 let stateBlockOps: Record<string, number> = {};
 
 export function d3d9PerfStateBlockCreated(
@@ -546,6 +551,7 @@ export function d3d9PerfStateBlockWasmCapture(): void {
 }
 
 /** Split D3D9: the render twin replays every API call the front already counted. */
+// @transient(diagnostic counter; a load restarts it)
 let apiMuted = false;
 export function d3d9PerfMuteApi(on: boolean): void { apiMuted = on; }
 
@@ -599,10 +605,12 @@ export function d3d9NoteResetRefusal(reason: string): void {
  *  FIRST drop of each new reason in a frame is announced. One line per reason per frame
  *  keeps a per-draw failure out of the log firehose while still naming it every frame it
  *  happens. */
+// @transient(diagnostic counter; a load restarts it)
 const warnedDropReasons = new Set<string>();
 
 /** Total drops, in any reason. Lets a caller ask "did a drop happen inside this call?" without
  *  re-summing the reason map or teaching every early-out site about a second counter. */
+// @transient(diagnostic counter; a load restarts it)
 let droppedDrawTotal = 0;
 export function d3d9DroppedDrawTotal(): number { return droppedDrawTotal; }
 
@@ -741,25 +749,39 @@ RENDER_FENCE_KINDS.forEach((k, i) => { rbFenceIdx[k] = i; });
 const rbByteIdx: Record<string, number> = {};
 STAGED_BYTE_KINDS.forEach((k, i) => { rbByteIdx[k] = RB_F + i; });
 
+// @transient(diagnostic counter; a load restarts it)
 const rbRing = new Float64Array(RB_RING * RB_STRIDE);
+// @transient(diagnostic counter; a load restarts it)
 const rbRingSerial = new Float64Array(RB_RING);
+// @transient(diagnostic counter; a load restarts it)
 const rbTotals = new Float64Array(RB_STRIDE);
 /** Slot accumulating the frame that has not reached its present boundary yet. */
+// @transient(diagnostic counter; a load restarts it)
 let rbSlot = 0;
 /** Present boundaries seen since the last reset. Frames older than RB_RING are gone from the
  *  ring but still in rbTotals, which is what lets the report say a distribution is partial
  *  instead of quietly describing the tail as the whole window. */
+// @transient(diagnostic counter; a load restarts it)
 let rbFrames = 0;
+// @transient(diagnostic counter; a load restarts it)
 let rbQueriesServed = 0;
+// @transient(diagnostic counter; a load restarts it)
 let rbEpoch = 0;
+// @transient(diagnostic counter; a load restarts it)
 let rbLedgerBytes = 0;
+// @transient(diagnostic counter; a load restarts it)
 let rbLedgerWrites = 0;
+// @transient(diagnostic counter; a load restarts it)
 let rbQueueBytes = 0;
+// @transient(diagnostic counter; a load restarts it)
 let rbQueueWrites = 0;
+// @transient(diagnostic counter; a load restarts it)
 let rbAuditArmed = false;
 
 type QueueWriteFn = (...args: never[]) => unknown;
+// @transient(diagnostic counter; a load restarts it)
 let rbPatchedWriteBuffer: QueueWriteFn | null = null;
+// @transient(diagnostic counter; a load restarts it)
 let rbPatchedWriteTexture: QueueWriteFn | null = null;
 
 /** The bypass that proves the byte census can fail: when set to a kind name, notes of that

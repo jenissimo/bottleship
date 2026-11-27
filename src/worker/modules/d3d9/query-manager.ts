@@ -206,6 +206,7 @@ const SPARE_BUFFERS_PER_SIZE = 64;
 
 /** Demotions caused by slot pressure rather than by a missing capability: a later re-arm
  *  may put the query back on the GPU path once its pool has free slots again. */
+// @transient(constant table, identical in every session)
 const TRANSIENT_FALLBACK_REASONS = new Set([
     'query-pool-exhausted-in-pass',
     'occlusion-pass-pool-split',
