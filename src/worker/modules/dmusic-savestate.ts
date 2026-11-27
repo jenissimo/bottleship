@@ -92,7 +92,8 @@ export interface SavedAudioPath extends SavedDMusicBase {
 
 export const AUDIO_PATH_FIELDS = {
     ...DMUSIC_OBJECT_FIELDS, primaryVtable: 'derive', interfaces: 'derive', pathType: 'save', performance: 'save',
-    buffer: 'save', sink: 'save', channels: 'save', volume: 'save', volumeFrom: 'save', volumeTarget: 'save', volumeStarted: 'save', volumeDuration: 'save',
+    // A path with a graph refuses capture below; the only restorable graph value is null.
+    buffer: 'save', sink: 'save', channels: 'save', volume: 'save', volumeFrom: 'save', volumeTarget: 'save', volumeStarted: 'save', volumeDuration: 'save', graph: 'derive',
 } as const satisfies Record<string, FieldPolicy>;
 
 export interface SavedPort extends SavedDMusicBase {
@@ -396,11 +397,14 @@ export function registerDMusicCodecs(host: DMusicHost): void {
     objectCodecs.add<AudioPathObject>({
         tag: 'dmusic-audiopath',
         matches: (o): o is AudioPathObject => o instanceof AudioPathObject,
-        capture: (o, ref): SavedAudioPath => ({
-            ...base(o), pathType: o.pathType, volume: o.volume, volumeFrom: o.volumeFrom, volumeTarget: o.volumeTarget,
-            volumeStarted: o.volumeStarted, volumeDuration: o.volumeDuration, performance: optional(o.performance, ref, 'performance'), buffer: o.buffer,
-            channels: o.channels, sink: o.sink?.captureState() ?? null,
-        }),
+        capture: (o, ref): SavedAudioPath => {
+            if (o.graph) throw new CaptureRefusal("dmusic audio path has a tool graph that is not yet saveable");
+            return {
+                ...base(o), pathType: o.pathType, volume: o.volume, volumeFrom: o.volumeFrom, volumeTarget: o.volumeTarget,
+                volumeStarted: o.volumeStarted, volumeDuration: o.volumeDuration, performance: optional(o.performance, ref, 'performance'), buffer: o.buffer,
+                channels: o.channels, sink: o.sink?.captureState() ?? null,
+            };
+        },
         restore: (d: SavedAudioPath) => {
             const path = rebuild(() => new AudioPathObject(), d);
             path.pathType = d.pathType;
@@ -640,7 +644,7 @@ export function registerDMusicCodecs(host: DMusicHost): void {
 export function registerDMusicParticipant(host: DMusicHost): () => void {
     registerDMusicCodecs(host);
     return savestateParticipants.add({
-        id: 'dmusic', version: 7, order: 64, covers: ['dmusic'], schema: DMUSIC_SCHEMA as unknown as SaveValue,
+        id: 'dmusic', version: 8, order: 64, covers: ['dmusic'], schema: DMUSIC_SCHEMA as unknown as SaveValue,
         capture: (ctx): SaveValue => {
             const refusal = host.idleRefusal();
             if (refusal) throw new CaptureRefusal(refusal);
