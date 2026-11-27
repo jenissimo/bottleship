@@ -1,0 +1,179 @@
+diff --git a/crates/wwt/src/codegen.rs b/crates/wwt/src/codegen.rs
+index 7090cec..4d69657 100644
+--- a/crates/wwt/src/codegen.rs
++++ b/crates/wwt/src/codegen.rs
+@@ -3276,6 +3276,20 @@ impl<'g, 'a> FnGen<'g, 'a> {
+             Op::CheckFetch { size } => {
+                 self.check_paged_range(None, 0, *size, None, fault::ACCESS_VIOLATION_EXECUTE, false, dirty, inst.eip);
+             }
++            Op::StoreIf { cond, addr, val, mem } => {
++                let local_facts = self.facts_local.len();
++                let tree_facts = self.facts_tree.len();
++                self.get(*cond);
++                self.emit(W::If(BlockType::Empty));
++                self.inst_value(&Inst {
++                    dst: None,
++                    op: Op::Store { addr: *addr, val: *val, mem: *mem },
++                    eip: inst.eip,
++                }, dirty, false);
++                self.emit(W::End);
++                self.facts_local.truncate(local_facts);
++                self.facts_tree.truncate(tree_facts);
++            }
+             Op::FaultIf { cond, code, info } => {
+                 self.get(*cond);
+                 self.emit(W::If(BlockType::Empty));
+diff --git a/crates/wwt/src/ir.rs b/crates/wwt/src/ir.rs
+index 3d07741..155e023 100644
+--- a/crates/wwt/src/ir.rs
++++ b/crates/wwt/src/ir.rs
+@@ -725,6 +725,12 @@ pub enum Op {
+         val: V,
+         mem: Mem,
+     },
++    StoreIf {
++        cond: V,
++        addr: V,
++        val: V,
++        mem: Mem,
++    },
+     /// Atomic read-modify-write; produces the old value.
+     AtomicRmw {
+         op: RmwOp,
+@@ -788,6 +794,7 @@ impl Op {
+             Op::Select { cond, t, f } => vec![*cond, *t, *f],
+             Op::Load { addr, .. } => vec![*addr],
+             Op::Store { addr, val, .. } => vec![*addr, *val],
++            Op::StoreIf { cond, addr, val, .. } => vec![*cond, *addr, *val],
+             Op::AtomicRmw { addr, val, .. } => vec![*addr, *val],
+             Op::AtomicCmpxchg {
+                 addr,
+@@ -812,6 +819,7 @@ impl Op {
+             Op::Select { cond, t, f } => vec![cond, t, f],
+             Op::Load { addr, .. } => vec![addr],
+             Op::Store { addr, val, .. } => vec![addr, val],
++            Op::StoreIf { cond, addr, val, .. } => vec![cond, addr, val],
+             Op::AtomicRmw { addr, val, .. } => vec![addr, val],
+             Op::AtomicCmpxchg {
+                 addr,
+@@ -832,6 +840,7 @@ impl Op {
+     pub fn has_side_effects(&self) -> bool {
+         match self {
+             Op::Store { .. }
++            | Op::StoreIf { .. }
+             | Op::AtomicRmw { .. }
+             | Op::AtomicCmpxchg { .. }
+             | Op::MemCopy { .. }
+@@ -852,6 +861,7 @@ impl Op {
+             Op::FaultIf { .. } | Op::CheckFetch { .. } | Op::SmcBarrier(_) => true,
+             Op::Load { mem, .. }
+             | Op::Store { mem, .. }
++            | Op::StoreIf { mem, .. }
+             | Op::AtomicRmw { mem, .. }
+             | Op::AtomicCmpxchg { mem, .. } => matches!(mem.space, Space::Guest | Space::GuardedTrusted),
+             Op::MemCopy { .. } | Op::MemFill { .. } => true,
+@@ -1348,7 +1358,10 @@ impl fmt::Display for Op {
+             }
+             Op::SmcBarrier(next) => write!(f, "smc_barrier v{next}"),
+             Op::CheckFetch { size } => write!(f, "check_fetch {size}"),
+-        Op::FaultIf { cond, code, info } => {
++            Op::StoreIf { cond, addr, val, mem } => write!(
++                f, "store_if {} {:?}[{}] = {}", VName(*cond), mem.space, VName(*addr), VName(*val),
++            ),
++            Op::FaultIf { cond, code, info } => {
+                 write!(
+                     f,
+                     "fault_if {} code={code:#x} info={}",
+diff --git a/crates/wwt/src/lift.rs b/crates/wwt/src/lift.rs
+index fa437e7..89f091a 100644
+--- a/crates/wwt/src/lift.rs
++++ b/crates/wwt/src/lift.rs
+@@ -1143,7 +1143,7 @@ impl<'a> Lifter<'a> {
+             let continues = self.lift_inst(i);
+             if continues && self.smc_deopt() {
+                 let writes = |inst: &Inst| match inst.op {
+-                    Op::Store { mem, .. } | Op::AtomicRmw { mem, .. }
++                    Op::Store { mem, .. } | Op::StoreIf { mem, .. } | Op::AtomicRmw { mem, .. }
+                     | Op::AtomicCmpxchg { mem, .. } => mem.space != Space::Native,
+                     Op::MemCopy { .. } | Op::MemFill { .. } => true,
+                     _ => false,
+@@ -3460,6 +3460,18 @@ impl<'a> Lifter<'a> {
+         true
+     }
+ 
++    fn implicit_addr(&mut self, reg: Register, segment: Register) -> V {
++        let mut addr = self.read_reg(reg);
++        if self.x64() {
++            addr = self.zext64(addr);
++        }
++        match segment {
++            Register::FS => self.aop(BinOp::I32Add, addr, FS_BASE),
++            Register::GS => self.aop(BinOp::I32Add, addr, GS_BASE),
++            _ => addr,
++        }
++    }
++
+     /// One iteration of a string instruction, updating esi/edi by ±size.
+     /// `a32`: 32-bit addressing in 64-bit code (esi/edi, zero-extended).
+     fn string_iter(&mut self, m: Mnemonic, size: u32, src_seg: Register, a32: bool) {
+@@ -3481,19 +3493,8 @@ impl<'a> Lifter<'a> {
+             }
+         };
+         let src_addr = |l: &mut Self| -> V {
+-            match src_seg {
+-                Register::FS if a32 => {
+-                    let s = ptr(l, ESI);
+-                    l.aop(BinOp::I32Add, s, FS_BASE)
+-                }
+-                Register::GS if a32 => {
+-                    let s = ptr(l, ESI);
+-                    l.aop(BinOp::I32Add, s, GS_BASE)
+-                }
+-                Register::FS => l.aop(BinOp::I32Add, ESI, FS_BASE),
+-                Register::GS => l.aop(BinOp::I32Add, ESI, GS_BASE),
+-                _ => ptr(l, ESI),
+-            }
++            let reg = if l.x64() && !a32 { Register::RSI } else { Register::ESI };
++            l.implicit_addr(reg, src_seg)
+         };
+         // esi/edi += step (a 32-bit register write with 0x67).
+         let advance = |l: &mut Self, r: V| {
+diff --git a/crates/wwt/src/lift/simd.rs b/crates/wwt/src/lift/simd.rs
+index 327b7a2..6e07ea2 100644
+--- a/crates/wwt/src/lift/simd.rs
++++ b/crates/wwt/src/lift/simd.rs
+@@ -1053,7 +1053,33 @@ impl<'a> Lifter<'a> {
+             }
+             M::Fxsave | M::Fxsave64 => self.lift_fxsave(i, true),
+             M::Fxrstor | M::Fxrstor64 => self.lift_fxsave(i, false),
+-            M::Maskmovq | M::Maskmovdqu => bail!("masked stores"),
++            M::Maskmovq | M::Maskmovdqu => {
++                let size = if m == M::Maskmovdqu { 16 } else { 8 };
++                let regs: Vec<u32> = (0..i.op_count())
++                    .filter(|&n| i.op_kind(n) == OpKind::Register)
++                    .collect();
++                if regs.len() != 2 {
++                    bail!("masked store form");
++                }
++                let data = src!(regs[0]);
++                let mask = src!(regs[1]);
++                let sign_bit = self.c32(0x80);
++                let index = match i.op_kind(0) {
++                    OpKind::MemorySegDI => Register::DI,
++                    OpKind::MemorySegEDI => Register::EDI,
++                    OpKind::MemorySegRDI => Register::RDI,
++                    _ => bail!("masked store address"),
++                };
++                let base = self.implicit_addr(index, i.memory_segment());
++                for lane in 0..size {
++                    let selector = self.vop(VecOp::Extract(Lane::I8, lane), &[mask]);
++                    let cond = self.emit(Ty::I32, Op::Bin(BinOp::I32And, selector, sign_bit));
++                    let val = self.vop(VecOp::Extract(Lane::I8, lane), &[data]);
++                    let addr = self.addr_add(base, lane as u32);
++                    let mem = self.mem(1, Space::Guest);
++                    self.effect(Op::StoreIf { cond, addr, val, mem });
++                }
++            }
+             _ => bail!("SIMD instruction not supported"),
+         }
+         let _ = (fault::UNSUPPORTED, MemorySize::Unknown);
