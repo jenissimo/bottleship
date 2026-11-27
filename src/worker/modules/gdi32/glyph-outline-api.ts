@@ -1,6 +1,6 @@
 import type { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { System } from '../../core/system';
-import { decodeAnsiString, EmulatorConfig, getCodePageDecoder } from '../../core/emulator-config-manager';
+import { decodeAnsiString, EmulatorConfig, getCodePageDecoder, isSingleByteCodePage } from '../../core/emulator-config-manager';
 import { decodeAnsiCharCode } from './font-charset';
 import { Mem } from '../../core/memory/mem-accessor';
 import { MemoryGuard } from '../../core/memory/mem-guard';
@@ -97,7 +97,8 @@ export function registerGlyphOutlineExports(exports: Record<string, ThunkImpleme
         if (!state || (count && (!str || !isValidAddress(mem, str, count, 'r')))) return 0;
         if (results && !isValidAddress(mem, results, 36, 'rw')) return 0;
         const bytes = mem.slice(str, str + count);
-        const text = decodeAnsiString(bytes, 0, count, EmulatorConfig.getInstance().ansiCodePage);
+        const codePage = EmulatorConfig.getInstance().ansiCodePage;
+        const text = decodeAnsiString(bytes, 0, count, codePage);
         const c = new OffscreenCanvas(1, 1).getContext('2d');
         if (!c) return 0;
         c.font = state.font;
@@ -108,9 +109,10 @@ export function registerGlyphOutlineExports(exports: Record<string, ThunkImpleme
         const height = Math.ceil((m.fontBoundingBoxAscent ?? 12) + (m.fontBoundingBoxDescent ?? 4));
         if (results) {
             const v = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const n = Math.min(text.length, v.getUint32(results + 28, true) || text.length);
+            const n = Math.min(text.length, v.getUint32(results + 28, true));
             const outStr = v.getUint32(results + 4, true), order = v.getUint32(results + 8, true), dx = v.getUint32(results + 12, true);
             const caret = v.getUint32(results + 16, true), cls = v.getUint32(results + 20, true), glyphs = v.getUint32(results + 24, true);
+            if (n && outStr && !isSingleByteCodePage(codePage)) return 0;
             let x = 0;
             for (let i = 0; i < n; i++) {
                 if (outStr && !Mem.writeUint8(outStr + i, bytes[i])) return 0;

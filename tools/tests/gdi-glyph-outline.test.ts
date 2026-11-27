@@ -355,6 +355,34 @@ test("GetGlyphOutlineA rasterizes the index returned by GetCharacterPlacementA",
     }
 });
 
+test.each([
+    [1252, [0x41], 0, true],
+    [932, [0x82, 0xa0], 1, false],
+] as const)("GetCharacterPlacementA protects its output arrays on code page %i", (codePage, input, capacity, succeeds) => {
+    const restore = installFakeOffscreenCanvas();
+    const config = EmulatorConfig.getInstance();
+    const savedCodePage = config.ansiCodePage;
+    const { mem, gdi, exports } = setupThunks();
+    try {
+        config.ansiCodePage = codePage;
+        Mem.bind(() => mem);
+        const hdc = gdi.createCompatibleDC(0);
+        const view = new DataView(mem.buffer);
+        mem.set(input, 0x100);
+        mem.fill(0xdd, 0x300, 0x330);
+        for (let i = 0; i < 6; i++) view.setUint32(0x204 + i * 4, 0x300 + i * 8, true);
+        view.setUint32(0x21c, capacity, true);
+        const size = exports.GetCharacterPlacementA!({}, mem, [hdc, 0x100, input.length, 0, 0x200, 0]);
+        expect(size > 0).toBe(succeeds);
+        expect(view.getUint32(0x21c, true)).toBe(capacity);
+        expect(mem.slice(0x300, 0x330)).toEqual(new Uint8Array(0x30).fill(0xdd));
+    } finally {
+        config.ansiCodePage = savedCodePage;
+        Mem.bind(() => new Uint8Array(0));
+        restore();
+    }
+});
+
 test("GetGlyphOutlineA measures and rasterizes the selected font in device units", () => {
     const restore = installFakeOffscreenCanvas();
     const { mem, gdi, exports } = setupThunks();
