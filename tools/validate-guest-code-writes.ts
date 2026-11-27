@@ -26,6 +26,7 @@ const ROOT = join(import.meta.dir, "..");
 const SRC = join(ROOT, "src");
 const JIT_RS = join(ROOT, "vendor", "v86", "src", "rust", "jit.rs");
 const OWNER = join("src", "worker", "core", "memory", "guest-code.ts");
+const WWT_BACKEND = join("src", "worker", "wwt", "cpu.ts");
 
 /** The only wasm export that clears EVERYTHING; the rest of the family is ranged/per-page. */
 const GLOBAL_CLEAR = "jit_clear_cache_js";
@@ -83,6 +84,8 @@ for (const file of walk(SRC)) {
     lines.forEach((line, i) => {
         if (!PATTERN.test(line)) return;
         if (/^\s*(\/\/|\*|\/\*)/.test(line)) return; // comments may name it
+        // The WWT CPU defines its own implementations of the invalidation exports.
+        if (rel === WWT_BACKEND && /^\s*(jit_dirty_cache|jit_clear_cache_js): .*=> this\.invalidateCode\(/.test(line)) return;
         // The global clear is a legitimate knob in its owners; a ranged/per-page dirty never is.
         if (GLOBAL_CLEAR_OWNERS.has(rel) && !RANGED.test(line)) return;
         violations.push(`${rel}:${i + 1}: ${line.trim()}`);

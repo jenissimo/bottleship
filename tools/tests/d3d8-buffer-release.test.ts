@@ -247,6 +247,64 @@ for (const kind of ["vb", "ib"] as const) {
     });
 }
 
+for (const kind of ["vb", "ib"] as const) {
+    test(`${kind}: write locks invalidate retained geometry through both dispatcher paths`, () => {
+        const ptr = buffer(kind);
+        const resource = adapter[kind + "Data"].get(ptr);
+        const resourceName = kind === "vb" ? "Vertex" : "Index";
+        const name = `IDirect3D${resourceName}Buffer8_Lock`;
+        const fast = new Map<string, Function>();
+        registerFastPathD3D8Functions({
+            registerFastPath: (_dll: string, key: string, fn: Function) => fast.set(key, fn),
+            registerWriteBufferFunction() {},
+        } as never);
+        const version = () => adapter.geometryVersion(resource);
+        const initial = version();
+        expect(api[name]!({} as never, mem, [ptr, 4, 8, 0x300, 0x10])).toBe(0);
+        expect(version()).toBe(initial);
+        expect(api[name]!({} as never, mem, [ptr, 4, 8, 0x300, 0])).toBe(0);
+        const afterSlow = version();
+        expect(afterSlow).not.toBe(initial);
+        expect(Mem.readUint32(0x300)).toBe(resource.guestPtr + 4);
+        const fastArgs = [ptr, 16, 8, 0x304, 0x1000];
+        fastArgs.forEach((arg, i) => Mem.writeUint32(0x204 + i * 4, arg));
+        expect(fast.get(name)!(0x200, new DataView(mem.buffer), mem)).toBe(0);
+        expect(version()).not.toBe(afterSlow);
+        expect(Mem.readUint32(0x304)).toBe(resource.guestPtr + 16);
+        expect(adapter.geometryBufferVersion(resource)).toBeUndefined();
+        expect(api[`IDirect3D${resourceName}Buffer8_Unlock`]!({} as never, mem, [ptr])).toBe(0);
+        expect(adapter.geometryBufferVersion(resource)).toBeUndefined(); // nested write still open
+        expect(fast.get(`IDirect3D${resourceName}Buffer8_Unlock`)!(0x200, new DataView(mem.buffer))).toBe(0);
+        expect(typeof adapter.geometryBufferVersion(resource)).toBe("number");
+        expect(adapter.geometryVersion({ ...resource })).not.toBe(version());
+    });
+}
+
+test("index cache keys observe readonly locks, write locks and resource-slot recycling", () => {
+    const options = globalThis as { __ffpRetainedVertices?: boolean };
+    const oldMode = options.__ffpRetainedVertices;
+    options.__ffpRetainedVertices = true;
+    try {
+        const ptr = buffer("ib");
+        const resource = adapter.ibData.get(ptr);
+        const token = () => adapter.retainedIndexKey(adapter.ibData.get(ptr), 4, 3, true);
+        const initial = token();
+        expect(typeof initial).toBe("string");
+        expect(api.IDirect3DIndexBuffer8_Lock!({} as never, mem, [ptr, 4, 12, 0x300, 0x10])).toBe(0);
+        expect(token()).toBe(initial);
+        expect(api.IDirect3DIndexBuffer8_Lock!({} as never, mem, [ptr, 4, 12, 0x300, 0])).toBe(0);
+        expect(token()).toBeUndefined();
+        expect(api.IDirect3DIndexBuffer8_Unlock!({} as never, mem, [ptr])).toBe(0);
+        const updated = token();
+        expect(typeof updated).toBe("string");
+        expect(updated).not.toBe(initial);
+        adapter.ibData.set(ptr, { ...resource });
+        expect(token()).not.toBe(updated);
+    } finally {
+        options.__ffpRetainedVertices = oldMode;
+    }
+});
+
 test("final device Release through the thunk retires app-released bound buffers", () => {
     const device = createComObject(0x10000); created.push(device);
     devices.set(device, adapter);

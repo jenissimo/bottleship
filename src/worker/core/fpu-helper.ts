@@ -29,7 +29,7 @@ const _cvtU32 = new Uint32Array(_cvtBuf);
  * Get CPU from v86 instance
  */
 function getCPU(v86: any): any {
-    return v86?.cpu ?? v86?.v86?.cpu ?? null;
+    return v86?.wasm_memory ? v86 : (v86?.cpu ?? v86?.v86?.cpu ?? null);
 }
 
 // The x87/SSE state lives at fixed offsets in WASM linear memory, and save/restore runs on
@@ -38,6 +38,8 @@ function getCPU(v86: any): any {
 // a grow replaces that identity. Re-checked on every hand-out, so these can never become
 // the stale-view hazard a cached GUEST-RAM view is.
 let wasmViewBuffer: ArrayBufferLike | null = null;
+// @transient(offset is part of the FPU view cache key, not guest state)
+let wasmViewOffset = 0;
 let wasmViewDv: DataView | null = null;
 let wasmViewBytes: Uint8Array | null = null;
 
@@ -47,11 +49,13 @@ const wasmViewPair: { dv: DataView; bytes: Uint8Array } = { dv: null!, bytes: nu
 function wasmViews(cpu: any): { dv: DataView; bytes: Uint8Array } | null {
     const buffer = cpu?.wasm_memory?.buffer;
     if (!buffer) return null;
-    if (wasmViewBuffer !== buffer || wasmViewDv === null || wasmViewBytes === null) {
-        if (buffer.byteLength === 0) return null;
+    const offset: number = cpu?.cpuStateBase ?? 0;
+    if (wasmViewBuffer !== buffer || wasmViewOffset !== offset || wasmViewDv === null || wasmViewBytes === null) {
+        if (buffer.byteLength <= offset) return null;
         wasmViewBuffer = buffer;
-        wasmViewDv = new DataView(buffer);
-        wasmViewBytes = new Uint8Array(buffer);
+        wasmViewOffset = offset;
+        wasmViewDv = new DataView(buffer, offset);
+        wasmViewBytes = new Uint8Array(buffer, offset);
         wasmViewPair.dv = wasmViewDv;
         wasmViewPair.bytes = wasmViewBytes;
     }
@@ -119,9 +123,7 @@ export function clearFpuSimdDirty(v86: any): void {
 }
 
 /**
- * Get a DataView over WASM linear memory.
- *
- * Spans the WHOLE buffer, so absolute `global_pointers.rs` offsets address it directly.
+ * Get a DataView rooted at the CPU compatibility state block.
  */
 export function getWasmView(v86OrCpu: any): DataView | null {
     // Accepts either the v86 instance or a bare CPU — callers on the harness side
@@ -598,15 +600,17 @@ export function createDefaultSimdSnapshot(): Uint8Array {
     return out;
 }
 
-/** Copy MXCSR + all 8 XMM registers (XMM0-7) out of WASM memory. Returns null when the
- *  CPU has no WASM memory (e.g. unit-test fakes) — callers treat that as "no SSE
- *  state to carry", identical to fpuSnapshot. */
+/** Copy MXCSR, XMM0–7 and any independent MMX register file into a thread snapshot. */
 export function simdSnapshot(v86: any, target?: Uint8Array): Uint8Array | null {
-    const views = wasmViews(getCPU(v86));
+    const cpu = getCPU(v86);
+    const views = wasmViews(cpu);
     if (!views) return null;
     const src = views.bytes;
     if (src.length < REG_XMM_OFFSET + REG_XMM_BYTES) return null;
-    const out = target && target.length >= SIMD_SNAPSHOT_BYTES ? target : new Uint8Array(SIMD_SNAPSHOT_BYTES);
+    const mmx: Uint8Array | undefined = cpu?.independentMmxRegisters;
+    const bytes = SIMD_SNAPSHOT_BYTES + (mmx?.byteLength ?? 0);
+    const out = target && target.length >= bytes ? target : new Uint8Array(bytes);
+    if (mmx) out.set(mmx, SIMD_SNAPSHOT_BYTES);
     out[0] = src[MXCSR_OFFSET];
     out[1] = src[MXCSR_OFFSET + 1];
     out[2] = src[MXCSR_OFFSET + 2];
@@ -641,9 +645,10 @@ export function xmmSetLowDouble(v86: any, index: number, value: number): boolean
     return true;
 }
 
-/** Write a previously captured SSE snapshot back into WASM memory. */
+/** Write a previously captured SIMD snapshot back into WASM memory. */
 export function simdRestore(v86: any, snap: Uint8Array): boolean {
-    const views = wasmViews(getCPU(v86));
+    const cpu = getCPU(v86);
+    const views = wasmViews(cpu);
     if (!views || snap.length < SIMD_SNAPSHOT_BYTES) return false;
     const dst = views.bytes;
     if (dst.length < REG_XMM_OFFSET + REG_XMM_BYTES) return false;
@@ -651,7 +656,15 @@ export function simdRestore(v86: any, snap: Uint8Array): boolean {
     dst[MXCSR_OFFSET + 1] = snap[1];
     dst[MXCSR_OFFSET + 2] = snap[2];
     dst[MXCSR_OFFSET + 3] = snap[3];
-    dst.set(snap.subarray(4, 4 + REG_XMM_BYTES), REG_XMM_OFFSET);
+    dst.set(snap.subarray(4, SIMD_SNAPSHOT_BYTES), REG_XMM_OFFSET);
+    const mmx: Uint8Array | undefined = cpu?.independentMmxRegisters;
+    if (mmx) {
+        if (snap.length >= SIMD_SNAPSHOT_BYTES + mmx.byteLength) {
+            mmx.set(snap.subarray(SIMD_SNAPSHOT_BYTES, SIMD_SNAPSHOT_BYTES + mmx.byteLength));
+        } else {
+            mmx.fill(0);
+        }
+    }
     return true;
 }
 

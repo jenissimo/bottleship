@@ -129,6 +129,7 @@ describe("D3DCAPS8 capability limits", () => {
         setD3D9WebGpuCapabilityLimits({ maxTextureDimension2D: 1024, maxTextureDimension3D: 256 });
         expect(writeDeviceCaps8(CAPS_PTR, memory)).toBe(true);
         const caps = new DataView(memory.buffer, CAPS_PTR, 212);
+        expect(caps.getUint32(36, true) & 0x00004000).toBe(0x00004000); // D3DPRASTERCAPS_ZBIAS
         expect(caps.getUint32(88, true)).toBe(1024);
         expect(caps.getUint32(92, true)).toBe(1024);
         // 104 is MaxTextureAspectRatio — a RATIO, not a dimension, so no WebGPU texture

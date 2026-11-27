@@ -116,6 +116,8 @@ export interface WgbManifest {
     rom?: string;
     registry?: string;
     emulator?: {
+        /** Per-game Windows x86 execution compatibility mode. */
+        wwtMode?: import("../../wwt/mode").WwtMode;
         /** Virtual adapter identity used by legacy driver databases. */
         graphicsAdapter?: GraphicsAdapterConfig;
         osVersion?: {

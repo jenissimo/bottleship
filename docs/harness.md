@@ -38,6 +38,48 @@ bun tools/harness.ts up
 An already-running browser keeps its existing profile; crash inspection uses
 `BS_CHROME_PROFILE` too.
 
+## Smokes during the WWT migration
+
+For a manual pass, start the dev server with `BS_WGB_ROOTS` pointing to the folder
+of local games. Open `/?smoke`, launch a title and record the last screen or action
+you verified. The in-game panel carries the verdict and note into the Markdown and
+JSON exports. A verdict recorded in the running game includes its observed CPU mode.
+Use `/?smoke&wwtMode=protected` to repeat a failure with the protected translator.
+
+To compare with v86, use the same checkout, WGB and browser version. Initialize
+`vendor/v86` at the revision pinned by the checkout. Run these commands in separate
+PowerShell terminals, each with the same `BS_WGB_ROOTS`:
+
+```powershell
+# Terminal 1, default WWT
+$env:BS_WGB_ROOTS = 'G:/WGB/running'
+bun run dev --host 127.0.0.1 --port 5186 --strictPort
+
+# Terminal 2, v86 control
+$env:BS_WGB_ROOTS = 'G:/WGB/running'
+$env:VITE_CPU_BACKEND = 'v86'
+bunx --bun vite --host 127.0.0.1 --port 5187 --strictPort
+```
+
+The automated set covers NFS Underground, Blackwell Legacy, Quake II, Alice
+Greenfingers and Montezuma. Run one backend at a time. The runner opens a separate
+browser context, selects offline play when prompted, writes sample logs and a
+screenshot per game, and exits with a failure if any checkpoint is missed. The
+NFSU check matches two title frames against the reference crop. Blackwell must
+show the title logo and four menu items on two frames. The other three check
+the expected graphics API and advancing frames. Use the screenshots and
+manual input to verify menus, gameplay and saves before updating compatibility
+ratings.
+
+```powershell
+$env:BS_CDP_PORT = '19905'
+$env:BS_CHROME_PROFILE = 'G:/WGB/tmp/chrome-compat'
+bun tools/harness/regression/wwt-smoke.ts wwt http://127.0.0.1:5186 G:/WGB/tmp/smoke
+bun tools/harness/regression/wwt-smoke.ts v86 http://127.0.0.1:5187 G:/WGB/tmp/smoke
+# Append one or more IDs to select individual titles.
+bun tools/harness/regression/wwt-smoke.ts protected http://127.0.0.1:5186 G:/WGB/tmp/smoke nfs-underground
+```
+
 ## Several games at once
 
 Bringing a game up is mostly *waiting* — a bundle is gigabytes, a boot is minutes — so the harness

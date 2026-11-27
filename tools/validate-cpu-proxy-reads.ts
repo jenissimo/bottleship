@@ -57,16 +57,11 @@ const ACCESS = new RegExp(
     "g",
 );
 
-/**
- * Files allowed to index a CPU-state Proxy freely, with why.
- *
- * Empty on purpose. `core/cpu/cpu-views.ts` reads `cpu.reg32` to build its fallback views
- * but never INDEXES one, so it needs no exemption — and an exemption nothing uses reads as
- * evidence that the file still pays the trap. The mechanism stays for a future owner that
- * genuinely needs the growth-transparent Proxy; the STALE OWNER check below is what keeps
- * an entry from outliving its reason.
- */
-const OWNERS: Record<string, string> = {};
+/** Backend-local files that index fixed typed-array CPU views directly. */
+const OWNERS: Record<string, string> = {
+    "wwt/cpu-protected.ts": "WWT protected-mode instruction handlers use fixed typed arrays.",
+    "wwt/port-io.ts": "WWT scalar port I/O uses fixed typed arrays.",
+};
 
 /**
  * Sites that predate the rule, pinned EXACTLY per file. Lowering a number is a reviewable
@@ -217,7 +212,7 @@ const staleOwners = Object.keys(OWNERS).filter(rel => {
     ACCESS.lastIndex = 0;
     return !ACCESS.test(stripNonCode(readFileSync(join(ROOT, rel), "utf8")));
 });
-for (const rel of staleOwners) problems.push(`  STALE OWNER: ${rel} — no longer indexes a CPU-state Proxy; delete the OWNERS entry`);
+for (const rel of staleOwners) problems.push(`  STALE OWNER: ${rel} — no longer indexes a CPU-state view; delete the OWNERS entry`);
 
 if (problems.length > 0) {
     console.error(

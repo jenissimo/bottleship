@@ -409,5 +409,5 @@ export function readWideString(mem: Uint8Array, ptr: number): string {
     while (end < stop && view.getUint16(end, true) !== 0) {
         end += 2;
     }
-    return new TextDecoder("utf-16le").decode(mem.subarray(ptr, end));
+    return new TextDecoder("utf-16le").decode(asBufferSource(mem.subarray(ptr, end)));
 }

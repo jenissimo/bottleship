@@ -25,6 +25,7 @@ import type { HleDispatcher } from '../../core/thunking/thunk-dispatcher';
 import { sanitizeViewport } from '../../backends/webgpu/ddraw/types';
 import { devices, resourceToDevice } from './shared-state';
 import { validateLockRange } from './resources';
+import { D3DLOCK_READONLY } from './lock-flags';
 import { readD3DLight8 } from './state';
 import { D3D8_MAX_STREAMS } from '../../backends/webgpu/d3d8/vsd-constants';
 import {
@@ -228,9 +229,8 @@ export function registerFastPathD3D8Functions(dispatcher: HleDispatcher): void {
         });
 
     // ── per-DRAW buffer traffic ────────────────────────────────────────────────
-    // Lock/Unlock of a VB/IB is a per-draw call on every FVF title; both Unlocks are
-    // literally `return D3D_OK` thunks that were still paying the whole OUT-trap prologue.
-    // These are FastPath-only (no WBUF): Lock has an out-param the guest reads immediately.
+    // FastPath-only (no WBUF): Lock has an out-param the guest reads immediately.
+    // Finish the same write generation at Unlock on both dispatcher paths.
 
     // IDirect3DVertexBuffer8_Lock(this, Offset, Size, ppData, Flags)
     dispatcher.registerFastPath('d3d8', 'IDirect3DVertexBuffer8_Lock',
@@ -253,7 +253,9 @@ export function registerFastPathD3D8Functions(dispatcher: HleDispatcher): void {
             view.setUint32(ppData, (vb.guestPtr + offset) >>> 0, true);
             // The upload path keys on this mark, so a fast path that skipped it would leave
             // the buffer's new vertices on the CPU side and draw the previous frame's.
-            device.markBufferDirty("vb", pVB, offset, vbLock, vb.size);
+            if ((view.getUint32(esp + 20, true) & D3DLOCK_READONLY) === 0) {
+                device.markBufferDirty("vb", pVB, offset, vbLock, vb.size);
+            }
             return D3D_OK;
         }, { trivial: true });
 
@@ -273,16 +275,24 @@ export function registerFastPathD3D8Functions(dispatcher: HleDispatcher): void {
             if (ibLock === null) return null;
             if (ppData + 4 > mem.length) return null;
             view.setUint32(ppData, (ib.guestPtr + offset) >>> 0, true);
-            device.markBufferDirty("ib", pIB, offset, ibLock, ib.size);
+            if ((view.getUint32(esp + 20, true) & D3DLOCK_READONLY) === 0) {
+                device.markBufferDirty("ib", pIB, offset, ibLock, ib.size);
+            }
             return D3D_OK;
         }, { trivial: true });
 
-    // Both Unlocks are no-ops in this implementation (the guest wrote straight into the
-    // buffer's own guest memory), so the fast path IS the whole contract.
     dispatcher.registerFastPath('d3d8', 'IDirect3DVertexBuffer8_Unlock',
-        (): number | null => D3D_OK, { trivial: true });
+        (esp: number, view: DataView): number => {
+            const ptr = view.getUint32(esp + 4, true);
+            resourceToDevice.get(ptr)?.unlockGeometryBuffer("vb", ptr);
+            return D3D_OK;
+        }, { trivial: true });
     dispatcher.registerFastPath('d3d8', 'IDirect3DIndexBuffer8_Unlock',
-        (): number | null => D3D_OK, { trivial: true });
+        (esp: number, view: DataView): number => {
+            const ptr = view.getUint32(esp + 4, true);
+            resourceToDevice.get(ptr)?.unlockGeometryBuffer("ib", ptr);
+            return D3D_OK;
+        }, { trivial: true });
 
     // IDirect3DDevice8_SetLight(this, Index, pLight) — reads the guest D3DLIGHT8 through
     // the same reader the thunk uses (state.ts readD3DLight8), so the two cannot drift.

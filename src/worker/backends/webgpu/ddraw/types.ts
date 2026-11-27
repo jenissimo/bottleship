@@ -405,6 +405,7 @@ export interface PipelineKeyConfig {
     zFunc: number;
     zWrite: number;
     zBias: number; // D3DRENDERSTATE_ZBIAS (0-16) for z-fighting prevention
+    d3d8DepthBias: boolean;
     // The draw asked for EQUAL with depth writes off — a coplanar second pass. zFunc is
     // rewritten to LESSEQUAL for it, so the request is not recoverable from the other
     // fields, and it selects a depth bias: it must be part of the key.
@@ -449,7 +450,7 @@ export interface PipelineKeyConfig {
 export function makeEmptyPipelineKeyConfig(): PipelineKeyConfig {
     return {
         vertexType: 0, primitiveType: 0, sampledMask: 0, stageCount: 0,
-        missingTexture: false, cullMode: 0, zEnable: 0, zFunc: 0, zWrite: 0, zBias: 0,
+        missingTexture: false, cullMode: 0, zEnable: 0, zFunc: 0, zWrite: 0, zBias: 0, d3d8DepthBias: false,
         coplanarPass: 0,
         alphaBlend: 0, alphaTest: 0, srcBlend: 0, dstBlend: 0, blendOp: 0, alphaFunc: 0,
         colorWriteMask: 0xf, colorKeyEnabled: 0,
@@ -474,7 +475,7 @@ export function generatePipelineKey(config: PipelineKeyConfig): string {
         `z:${config.zEnable}`,
         `zf:${config.zFunc}`,
         `zw:${config.zWrite}`,
-        `zb:${config.zBias}`,
+        `zb:${config.zBias}:${Number(config.d3d8DepthBias)}`,
         `cop:${config.coplanarPass}`,
         `abl:${config.alphaBlend}`,
         `at:${config.alphaTest}`,
@@ -518,7 +519,7 @@ export function generateMegaBatchPipelineKey(config: PipelineKeyConfig): string 
         `z:${config.zEnable}`,
         `zf:${config.zFunc}`,
         `zw:${config.zWrite}`,
-        `zb:${config.zBias}`,
+        `zb:${config.zBias}:${Number(config.d3d8DepthBias)}`,
         `cop:${config.coplanarPass}`,
         `abl:${config.alphaBlend}`,
         // NOTE: alphaTest (at) and alphaFunc (af) are EXCLUDED - they're dynamic uniforms now
@@ -560,6 +561,7 @@ export function pipelineKeyConfigsEqual(a: PipelineKeyConfig, b: PipelineKeyConf
         a.zFunc === b.zFunc &&
         a.zWrite === b.zWrite &&
         a.zBias === b.zBias &&
+        a.d3d8DepthBias === b.d3d8DepthBias &&
         a.coplanarPass === b.coplanarPass &&
         a.alphaBlend === b.alphaBlend &&
         a.alphaTest === b.alphaTest &&
@@ -600,6 +602,7 @@ export function megaBatchPipelineKeyConfigsEqual(a: PipelineKeyConfig, b: Pipeli
         a.zFunc === b.zFunc &&
         a.zWrite === b.zWrite &&
         a.zBias === b.zBias &&
+        a.d3d8DepthBias === b.d3d8DepthBias &&
         a.coplanarPass === b.coplanarPass &&
         a.alphaBlend === b.alphaBlend &&
         a.srcBlend === b.srcBlend &&

@@ -378,7 +378,7 @@ const syncModule = (() => {
         for (; end + 1 < bytes.length; end += 2) {
             if (bytes[end] === 0 && bytes[end + 1] === 0) break;
         }
-        return new TextDecoder('utf-16le').decode(bytes.subarray(0, end));
+        return new TextDecoder('utf-16le').decode(asBufferSource(bytes.subarray(0, end)));
     };
 
     const CS_SIZE = 24;

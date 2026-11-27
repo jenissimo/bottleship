@@ -12,7 +12,6 @@
         "react": "19.2.7",
         "react-dom": "19.2.7",
         "socket.io-client": "^4.8.1",
-        "v86": "file:vendor/v86",
       },
       "devDependencies": {
         "@eslint/js": "^10.0.1",
@@ -910,7 +909,6 @@
 
     "util-deprecate": ["util-deprecate@1.0.2", "", {}, "sha512-EPD5q1uXyFxJpCrLnCc1nHnq3gOa6DZBocAIiI2TaSCA7VCJ1UJDMagCzIkXNsUYfD1daK//LTEQ8xiIbrHtcw=="],
 
-    "v86": ["v86@file:vendor/v86", {}],
 
     "vary": ["vary@1.1.2", "", {}, "sha512-BNGbWLfd0eUPabhkXUVm0j8uuvREyTh5ovRa/dyow/BqAbZJyC+5fU+IzQOzmAKzYqYRAISoRhdQr3eIZ/PXqg=="],
 

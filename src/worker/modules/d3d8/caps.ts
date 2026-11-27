@@ -42,6 +42,7 @@ import { D3DPRASTERCAPS_FOGTABLE, D3DPRASTERCAPS_FOGVERTEX } from '../../core/cp
 // ============================================================================
 
 const D3DCAPS8_SIZE = 212;
+const D3DPRASTERCAPS_ZBIAS = 0x00004000;
 const CONSERVATIVE_MAX_TEXTURE_DIMENSION_2D = 4096;
 
 /**
@@ -129,11 +130,9 @@ export function writeDeviceCaps8(pCaps: number, mem: Uint8Array): boolean {
     // combiner D3D8 uses), CLIPPLANESCALEDPOINTS (MaxUserClipPlanes is 0), NULLREFERENCE —
     // plus 0xCF's two reserved bits, which real hardware leaves clear.
     u32(32, 0x00000AF2);
-    // RasterCaps: the shared FFP (ffp-fog.ts) evaluates both D3DRS_FOGVERTEXMODE and
-    // D3DRS_FOGTABLEMODE for D3D8 draws, so FOGVERTEX and FOGTABLE are advertised next to the
-    // FOGRANGE/WFOG/ZFOG bits that already depend on them. Without them a fog-using material
-    // reads as unsupported and a pure-device engine refuses to create the scene.
-    u32(36, 0x00770077 | D3DPRASTERCAPS_FOGVERTEX | D3DPRASTERCAPS_FOGTABLE);
+    // Both draw paths implement integer ZBIAS for depth-tested triangles.
+    // The shared FFP evaluates both vertex and table fog.
+    u32(36, 0x00770077 | D3DPRASTERCAPS_ZBIAS | D3DPRASTERCAPS_FOGVERTEX | D3DPRASTERCAPS_FOGTABLE);
     u32(40, 0x000000FF);    // ZCmpCaps: all compare funcs
     u32(44, 0x00001FFF);    // SrcBlendCaps: all D3D8 blend factors
     u32(48, 0x00001FFF);    // DestBlendCaps

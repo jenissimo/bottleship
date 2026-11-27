@@ -136,7 +136,7 @@ function image(): Uint8Array {
     return bytes;
 }
 
-describe.skipIf(!existsSync(lib) || !existsSync(wasm))('the call chain, executed in v86', () => {
+describe.skipIf(process.env.BS_RUN_LEGACY_TESTS === "0" || !existsSync(lib) || !existsSync(wasm))('the call chain, executed in v86', () => {
     for (const jit of [false, true]) {
         test(`attach reaches the start routine with its frame; detach in reverse comes back with the exit code on top (JIT=${jit})`, async () => {
             const g = globalThis as { window?: unknown };

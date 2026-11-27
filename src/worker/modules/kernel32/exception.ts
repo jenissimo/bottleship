@@ -596,13 +596,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         const system = System.getInstance();
 
-        // RtlUnwind means a handler has decided to catch — notify dispatcher so it can
-        // pop the active SEH dispatch context and stop SWITCH_DEFERRED_SEH_RUNTIME.
-        const dispatcher = system.process?.dispatcher;
-        if (dispatcher && dispatcher.getSehDispatchDepth() > 0) {
-            dispatcher.notifySehHandlerCaught(targetFrame);
-        }
-
+        // The handler can return to the dispatcher after unwinding a nested frame.
+        // The SEH result marker or the observed non-local transfer releases its context.
         const cpu = getCPU(system.process!.v86);
         if (!cpu) {
             Logger.error(LogCategory.KERNEL32, `RtlUnwind: no CPU`);

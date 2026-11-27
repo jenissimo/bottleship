@@ -13,6 +13,7 @@ const OFF_CYCLE_LIMIT = 0x000;
 
 export class PreemptionManager {
     private hpBase = 0;
+    private cycleBudgetBase = 0;
     private wasmMemory: ArrayBuffer | null = null;
     private view: DataView | null = null;
     /** WebAssembly.Memory — .buffer changes on grow, but the object itself is stable. */
@@ -265,10 +266,16 @@ export class PreemptionManager {
 
     initialize(cpu: any): void {
         this.wasmExports = cpu.wm?.exports;
-        if (!this.wasmExports?.get_hypercall_page_ptr) {
+        this.initialized = false;
+        this.hpBase = this.wasmExports?.get_hypercall_page_ptr?.() ?? 0;
+        this.cycleBudgetBase = this.hpBase || this.wasmExports?.get_cycle_budget_ptr?.() || 0;
+        if (this.cycleBudgetBase === 0) return;
+        if (this.hpBase === 0) {
+            this.refreshViews(cpu);
+            this.setCycleLimit(PreemptionManager.SINGLE_THREAD_LIMIT);
+            this.initialized = true;
             return;
         }
-        this.hpBase = this.wasmExports.get_hypercall_page_ptr();
         this.refreshViews(cpu);
         this.setCycleLimit(PreemptionManager.SINGLE_THREAD_LIMIT);
 
@@ -416,10 +423,10 @@ export class PreemptionManager {
             if (!this.view) return;
         }
         try {
-            this.view.setUint32(this.hpBase + OFF_CYCLE_LIMIT, limit, true);
+            this.view.setUint32(this.cycleBudgetBase + OFF_CYCLE_LIMIT, limit, true);
         } catch {
             this.refreshViews();
-            this.view?.setUint32(this.hpBase + OFF_CYCLE_LIMIT, limit, true);
+            this.view?.setUint32(this.cycleBudgetBase + OFF_CYCLE_LIMIT, limit, true);
         }
     }
 
@@ -510,13 +517,13 @@ export class PreemptionManager {
      *  was missed after an async-park requestImmediateExit → v86 retires 0 instructions
      *  while is_running() stays true (silent freeze). */
     getCycleLimit(): number {
-        if (this.hpBase === 0) return -1;
+        if (this.cycleBudgetBase === 0) return -1;
         if (!this.view || !this.wasmMemory || this.wasmMemory.byteLength === 0) {
             this.refreshViews();
             if (!this.view) return -1;
         }
         try {
-            return this.view.getUint32(this.hpBase + OFF_CYCLE_LIMIT, true) >>> 0;
+            return this.view.getUint32(this.cycleBudgetBase + OFF_CYCLE_LIMIT, true) >>> 0;
         } catch {
             return -1;
         }

@@ -1,6 +1,9 @@
 import { ArrowLeft, ArrowRight, ArrowsIn, ArrowsOut, DotsThree, Pause, Play } from "@phosphor-icons/react";
 import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SessionWorker } from './session-worker';
+import { PeAotLoading } from "./PeAotLoading";
+import { updatePeAotLoadingStatus, type PeAotLoadingStatus } from "./pe-aot-loading";
+import type { PeAotProgress } from "../worker/wwt/pe-aot-progress";
 import { AudioPauseSync } from "../audio/pause-sync";
 import { ChildSessionSurface } from './child-session-surface';
 import { hardwareKeyText, hardwareKeyVk } from "./hardware-key-vk";
@@ -329,6 +332,7 @@ export default function App() {
   // `fadingOut` triggers the crossfade-out once the guest composites its first frame.
   const [loadingProgress, setLoadingProgress] = useState<{
     phase: string; percent: number; label?: string; indeterminate?: boolean; fadingOut?: boolean;
+    peAot?: PeAotLoadingStatus;
   } | null>(null);
   /** Display name from the loaded WGB manifest (title || name). Used so ?game=dev&load=…
    *  doesn't keep saying "Dev" / "Starting Dev" once the bundle is known. */
@@ -809,10 +813,8 @@ export default function App() {
     // saw a blocked launch would also be the last, and the game would never start.
   }, [launchBlocked, selectedGame, workerStatus]);
 
-  // Cover the worker/v86 boot phase too: before the worker posts "ready" there is no
-  // load_bundle progress yet, so without this the user stares at a bare canvas while
-  // v86.wasm + BIOS download and instantiate (often the slowest part of a cold start).
-  // Show an indeterminate "Booting emulator" overlay for any game that will auto-launch.
+  // Show an indeterminate "Booting emulator" overlay for games that auto-launch
+  // while the worker initializes the CPU backend. Bundle progress starts once the worker is ready.
   useEffect(() => {
     if (!browserSupport.supported || !displayGame) return;
     const params = new URLSearchParams(window.location.search);
@@ -1232,6 +1234,15 @@ export default function App() {
         { type: "module" }
       ));
 
+      const cpuQuery = new URLSearchParams(window.location.search);
+      if (cpuQuery.get("engine") === "wwt-hle" || cpuQuery.has("wwtMode") ||
+          cpuQuery.has("wwtMemory") || cpuQuery.has("wwtLinkage")) {
+        globalWorker.postMessage({
+          type: "set_cpu_backend", backend: "wwt", mode: cpuQuery.get("wwtMode"),
+          memory: cpuQuery.get("wwtMemory"), linkage: cpuQuery.get("wwtLinkage"),
+        });
+      }
+
       // Expose worker to console for debugging
       (window as any).worker = globalWorker;
 
@@ -1289,6 +1300,18 @@ export default function App() {
         }
         if (Object.keys(merged).length) console.info("[bs] replayed debug flags:", merged);
       } catch { /* corrupt/no flags */ }
+      const linkage = cpuQuery.get("wwtLinkage");
+      if (linkage === "full" || linkage === "page-local") {
+        globalWorker.postMessage({type: "set_debug_flag", key: "__wwtPeAotLinkage", value: linkage});
+      }
+      const aot = cpuQuery.get("wwtAot")?.trim().toLowerCase();
+      if (aot) {
+        const modules = aot.split(",").map(name => name.trim()).filter(Boolean);
+        globalWorker.postMessage({
+          type: "set_debug_flag", key: "__wwtPeAot",
+          value: aot === "learn" || aot === "auto" ? aot : aot === "on" ? true : aot === "off" ? false : modules,
+        });
+      }
       (window as any).dbgFlag = (key: string, value: unknown, opts?: { scope?: "session" | "global" }) => {
         if (key === "__hostTools" && !session) {
           throw new Error("dbgFlag('__hostTools', ...): a ?bs=<session> URL is required");
@@ -1532,6 +1555,7 @@ export default function App() {
       }
       if (event.data?.type === 'child_session_reset') {
         childSurface.clear();
+        if (event.data.freshLaunch) setLoadingProgress(prev => prev?.peAot ? { ...prev, peAot: undefined } : prev);
         if (event.data.resumeParent) {
           audioEngine?.stopAll();
           setExitInfo(null); exitInfoRef.current = null;
@@ -1671,6 +1695,15 @@ export default function App() {
         setGameId(typeof event.data.gameId === "string" ? event.data.gameId : null);
         setManifestTouch((event.data.touch as ManifestTouch | null) ?? null);
       }
+      if (event.data?.type === "pe_aot_progress") {
+        if (exitInfoRef.current) return;
+        const progress = event.data as PeAotProgress;
+        setLoadingProgress(prev => {
+          if (!prev || prev.fadingOut) return prev;
+          return { ...prev, peAot: updatePeAotLoadingStatus(prev.peAot, progress) };
+        });
+        return;
+      }
       if (event.data?.type === "loading_progress") {
         const { phase, percent, label } = event.data;
         // Progress belonging to a load that already died is stale — a fresh load clears
@@ -1683,7 +1716,7 @@ export default function App() {
           // signals `first_present` (the real first flip). Hiding now exposes a black canvas
           // through CRT/DirectX/asset init.
           setIsLoadingApp(false);
-          setLoadingProgress({ phase: "booting", percent: 100, indeterminate: true });
+          setLoadingProgress(prev => ({ phase: "booting", percent: 0, indeterminate: true, peAot: prev?.peAot }));
           // Present mode resets with the presenter on each load — re-apply the saved preference.
           if (presentModeRef.current !== "off") {
             globalWorker?.postMessage({ type: "set_present_mode", mode: presentModeRef.current });
@@ -1695,7 +1728,7 @@ export default function App() {
           // Byte-counted phases (downloading/caching/installing) show a real bar; the rest
           // (loading/starting) have no measurable progress → indeterminate shimmer.
           const determinate = phase === "downloading" || phase === "caching" || phase === "installing" || phase === "prefetch";
-          setLoadingProgress({ phase, percent: percent ?? 0, label, indeterminate: !determinate });
+          setLoadingProgress(prev => ({ phase, percent: percent ?? 0, label, indeterminate: !determinate, peAot: prev?.peAot }));
         }
       }
       if (event.data?.type === "perf_hint") {
@@ -3633,6 +3666,7 @@ export default function App() {
         <VirtualKeyboardSheet open={oskOpen} onClose={() => setOskOpen(false)} />
         {loadingProgress && !errorMessage && !exitInfo && (() => {
           const activeStage = loadPhaseStageIndex(loadingProgress.phase);
+          const { peAot, indeterminate } = loadingProgress;
           const status = loadPhaseStatus(loadingProgress.phase, gameDisplayName);
           return (
             <div className={cx(s, "loading-overlay", loadingProgress.fadingOut && "loading-overlay--done")}>
@@ -3654,17 +3688,25 @@ export default function App() {
                   ))}
                 </ol>
 
-                <div className={cx(s, "loading-overlay__bar-wrap", loadingProgress.indeterminate && "is-indeterminate")}>
+                {!peAot?.pending.length && (
                   <div
-                    className={s["loading-overlay__bar"]}
-                    style={loadingProgress.indeterminate ? undefined : { width: `${loadingProgress.percent}%` }}
-                  />
-                </div>
+                    className={cx(s, "loading-overlay__bar-wrap", indeterminate && "is-indeterminate")}
+                    role="progressbar"
+                    aria-label={status}
+                    aria-valuenow={indeterminate ? undefined : loadingProgress.percent}
+                  >
+                    <div
+                      className={s["loading-overlay__bar"]}
+                      style={indeterminate ? undefined : { width: `${loadingProgress.percent}%` }}
+                    />
+                  </div>
+                )}
 
-                <div className={s["loading-overlay__label"]}>
+                <div className={s["loading-overlay__label"]} role="status">
                   {status}
                   {loadingProgress.label ? ` · ${loadingProgress.label}` : ""}
                 </div>
+                {peAot && <PeAotLoading {...peAot} />}
               </div>
             </div>
           );

@@ -10,6 +10,7 @@
 
 import { Logger, LogCategory } from "../../../../core/logger";
 import { profiler } from "../../../../core/profiler";
+import { dispatchVertexConversion, endVertexPrepass } from "./vertex-prepass";
 import {
     D3DFVF_XYZ,
     D3DFVF_XYZRHW,
@@ -444,6 +445,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
 
 /** Kill switch: setWorkerFlag('__noVertexScratchPool', true) restores the per-draw
  *  allocation path for a live A/B. */
+const SOURCE_UPLOAD_CHUNK_BYTES = 256 * 1024;
+export const ffpVertexSourceUploadStats = { writes: 0, bytes: 0, snapshots: 0, unflushed: 0 };
+
 function scratchPoolEnabled(): boolean {
     return (globalThis as { __noVertexScratchPool?: boolean }).__noVertexScratchPool !== true;
 }
@@ -499,6 +503,9 @@ export class VertexConverter {
     private scratchSrcSize = 0;
     private scratchSrcOffset = 0;
     private readonly maxScratchSrcSize: number;
+    private sourceUploadChunk: Uint8Array | null = null;
+    private sourceUploadBase = 0;
+    private sourceUploadLength = 0;
 
     // Params ring: one dynamic-offset uniform slot per conversion, staged CPU-side and
     // uploaded once per submit by flushParams().
@@ -635,6 +642,11 @@ export class VertexConverter {
                     `were never flushed before submit (missing flushParams() on a submit path)`
             );
         }
+        if (this.sourceUploadLength !== 0) {
+            ffpVertexSourceUploadStats.unflushed++;
+            Logger.error(LogCategory.SYSTEM, "VertexConverter: pooled source upload was not flushed before submit");
+            this.sourceUploadLength = 0;
+        }
         this.scratchSrcOffset = 0;
         this.paramsRingOffset = 0;
         this.paramsDirtyOffset = 0;
@@ -646,6 +658,7 @@ export class VertexConverter {
      * issued after the submit lands too late for the dispatch that reads it.
      */
     flushParams(): void {
+        this.flushScratchSource();
         if (!this.paramsRingBuffer || !this.paramsStaging) return;
         if (this.paramsRingOffset <= this.paramsDirtyOffset) return;
         this.queue.writeBuffer(
@@ -656,6 +669,39 @@ export class VertexConverter {
             this.paramsRingOffset - this.paramsDirtyOffset
         );
         this.paramsDirtyOffset = this.paramsRingOffset;
+    }
+
+    private flushScratchSource(): void {
+        if (this.sourceUploadLength === 0) return;
+        this.queue.writeBuffer(this.scratchSrcBuffer!, this.sourceUploadBase, this.sourceUploadChunk!.buffer, 0, this.sourceUploadLength);
+        ffpVertexSourceUploadStats.writes++;
+        ffpVertexSourceUploadStats.bytes += this.sourceUploadLength;
+        this.sourceUploadLength = 0;
+    }
+
+    private captureScratchSource(memory: Uint8Array, address: number, size: number, destination: number): void {
+        const enabled = (globalThis as { __ffpVertexSourceBatch?: boolean }).__ffpVertexSourceBatch !== false;
+        // Keep larger draws on the existing direct upload and retain writeBuffer's
+        // alignment semantics when an unusual source format supplies odd-sized data.
+        if (!enabled || size > SOURCE_UPLOAD_CHUNK_BYTES || (size & 3) !== 0) {
+            this.flushScratchSource();
+            this.queue.writeBuffer(this.scratchSrcBuffer!, destination, memory.buffer, memory.byteOffset + address, size);
+            ffpVertexSourceUploadStats.writes++;
+            ffpVertexSourceUploadStats.bytes += size;
+            return;
+        }
+        if (this.sourceUploadLength !== 0 && destination + size - this.sourceUploadBase > SOURCE_UPLOAD_CHUNK_BYTES) {
+            this.flushScratchSource();
+        }
+        if (this.sourceUploadLength === 0) this.sourceUploadBase = destination;
+        const offset = destination - this.sourceUploadBase;
+        const chunk = (this.sourceUploadChunk ??= new Uint8Array(SOURCE_UPLOAD_CHUNK_BYTES));
+        chunk.fill(0, this.sourceUploadLength, offset); // Scratch allocator aligns draws to 16 bytes.
+        // Take the snapshot here. The guest may rewrite a dynamic VB, or D3D8 may
+        // reuse its temporary declaration-interleave buffer, before submit.
+        chunk.set(memory.subarray(address, address + size), offset);
+        this.sourceUploadLength = offset + size;
+        ffpVertexSourceUploadStats.snapshots++;
     }
 
     /**
@@ -684,11 +730,13 @@ export class VertexConverter {
             Math.max(aligned, this.scratchSrcSize * 2, VertexConverter.MIN_SCRATCH_SRC_SIZE)
         );
         if (newSize < aligned) return -1;
-        if (this.scratchSrcBuffer) this.pendingDestroyBuffers.push(this.scratchSrcBuffer);
-        this.scratchSrcBuffer = this.device.createBuffer({
+        this.flushScratchSource();
+        const replacement = this.device.createBuffer({
             size: newSize,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
         });
+        if (this.scratchSrcBuffer) this.pendingDestroyBuffers.push(this.scratchSrcBuffer);
+        this.scratchSrcBuffer = replacement;
         this.stats.gpuObjects++;
         this.stats.srcGrows++;
         this.scratchSrcSize = newSize;
@@ -712,18 +760,21 @@ export class VertexConverter {
             this.paramsRingSize * 2,
             this.paramsAlignment * VertexConverter.PARAMS_RING_SLOTS
         );
+        const staging = new Uint8Array(newSize);
+        const stagingView = new DataView(staging.buffer);
+        const replacement = this.device.createBuffer({
+            size: newSize,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
         if (this.paramsRingBuffer) {
             this.pendingDestroyBuffers.push(this.paramsRingBuffer);
             this.stats.paramsGrows++;
         }
-        this.paramsRingBuffer = this.device.createBuffer({
-            size: newSize,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
+        this.paramsRingBuffer = replacement;
         this.stats.gpuObjects++;
         this.paramsRingSize = newSize;
-        this.paramsStaging = new Uint8Array(newSize);
-        this.paramsStagingView = new DataView(this.paramsStaging.buffer);
+        this.paramsStaging = staging;
+        this.paramsStagingView = stagingView;
         this.paramsRingOffset = this.paramsAlignment;
         this.paramsDirtyOffset = 0;
         this.scratchBindGroup = null;
@@ -1143,13 +1194,7 @@ export class VertexConverter {
             const paramsOffset = srcBase >= 0 ? this.allocParamsSlot() : -1;
 
             if (paramsOffset >= 0) {
-                this.queue.writeBuffer(
-                    this.scratchSrcBuffer!,
-                    srcBase,
-                    memory.buffer,
-                    memory.byteOffset + srcAddr,
-                    srcSize
-                );
+                this.captureScratchSource(memory, srcAddr, srcSize, srcBase);
 
                 const pv = this.paramsStagingView!;
                 pv.setUint32(paramsOffset + 0, vertexCount, true);
@@ -1161,11 +1206,8 @@ export class VertexConverter {
                 pv.setUint32(paramsOffset + 24, srcBase, true);
                 pv.setUint32(paramsOffset + 28, this.globalOffset / 4, true);
 
-                const pass = encoder.beginComputePass();
-                pass.setPipeline(pipeline);
-                pass.setBindGroup(0, this.getScratchBindGroup(), [paramsOffset]);
-                pass.dispatchWorkgroups(Math.ceil(vertexCount / WORKGROUP_SIZE));
-                pass.end();
+                dispatchVertexConversion(encoder, pipeline, this.getScratchBindGroup(), paramsOffset,
+                    Math.ceil(vertexCount / WORKGROUP_SIZE));
                 this.stats.pooled++;
             } else {
                 // Per-draw path: a fresh buffer per binding satisfies the ordering invariant by
@@ -1188,6 +1230,8 @@ export class VertexConverter {
                     memory.byteOffset + srcAddr,
                     srcSize
                 );
+                ffpVertexSourceUploadStats.writes++;
+                ffpVertexSourceUploadStats.bytes += srcSize;
 
                 const tempParamsBuffer = this.device.createBuffer({
                     size: VertexConverter.PARAMS_BYTES,
@@ -1217,11 +1261,8 @@ export class VertexConverter {
                 });
                 this.stats.gpuObjects++;
 
-                const pass = encoder.beginComputePass();
-                pass.setPipeline(pipeline);
-                pass.setBindGroup(0, bindGroup, [0]);
-                pass.dispatchWorkgroups(Math.ceil(vertexCount / WORKGROUP_SIZE));
-                pass.end();
+                dispatchVertexConversion(encoder, pipeline, bindGroup, 0, Math.ceil(vertexCount / WORKGROUP_SIZE));
+                endVertexPrepass(encoder);
 
                 encoder.copyBufferToBuffer(
                     tempDst,
@@ -1700,6 +1741,9 @@ export class VertexConverter {
         if (this.scratchSrcBuffer) this.scratchSrcBuffer.destroy();
         if (this.paramsRingBuffer) this.paramsRingBuffer.destroy();
         this.scratchSrcBuffer = null;
+        this.sourceUploadChunk = null;
+        this.sourceUploadBase = 0;
+        this.sourceUploadLength = 0;
         this.paramsRingBuffer = null;
         this.scratchBindGroup = null;
         for (const buffer of this.pendingDestroyBuffers) {

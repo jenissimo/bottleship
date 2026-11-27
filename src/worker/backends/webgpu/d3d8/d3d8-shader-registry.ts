@@ -11,6 +11,7 @@ import {
     RawVertexElement,
 } from "../d3d9/shader";
 import { parseVsdDeclaration } from "./vsd-parser";
+import { legacyZBias } from "../ddraw/depth-bias";
 import {
     D3D8_MAX_PS_CONST,
     D3D8_MAX_VS_CONST,
@@ -25,6 +26,8 @@ const D3DERR_INVALIDCALL = 0x8876086c;
 const RS_CULLMODE = 22;
 const RS_ZENABLE = 7;
 const RS_ZWRITEENABLE = 14;
+const RS_ZFUNC = 23;
+const RS_ZBIAS = 47;
 
 export interface D3D8VsObject {
     guestHandle: number;
@@ -328,7 +331,11 @@ export function buildD3D8PipelineKey(
     const cullMode = renderStates[RS_CULLMODE] ?? 0;
     const zEnable = renderStates[RS_ZENABLE] ?? 1;
     const zWrite = renderStates[RS_ZWRITEENABLE] ?? 1;
+    const zFunc = renderStates[RS_ZFUNC];
+    const depthCompare = zEnable === 0 ? 0 : zFunc >= 1 && zFunc <= 8 ? zFunc : 4;
+    const zBias = zEnable === 0 ? 0 : legacyZBias(renderStates[RS_ZBIAS]);
     const stateBits = (
+        depthCompare | (zBias << 4) |
         ((cullMode & 0xff) << 16) |
         ((zEnable !== 0 ? 1 : 0) << 25) |
         ((zWrite !== 0 ? 1 : 0) << 26)

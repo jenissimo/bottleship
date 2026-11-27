@@ -213,6 +213,8 @@ describe("sources", () => {
   test("launch URLs and matching the open page", () => {
     const cat = items("revolt")[0];
     expect(launchUrl(cat, null)).toBe("?game=revolt");
+    expect(launchUrl(cat, null, "protected")).toBe("?game=revolt&wwtMode=protected");
+    expect(launchUrl(cat, null, "invalid")).toBe("?game=revolt");
     expect(itemMatchesLocation(cat, "?game=revolt")).toBe(true);
     expect(itemMatchesLocation(cat, "?game=homm3")).toBe(false);
 
@@ -221,7 +223,8 @@ describe("sources", () => {
       `/__wgb/?path=${encodeURIComponent(disk.key)}`,
       `http://localhost:3001/wgb?path=${encodeURIComponent(disk.key)}`,
     ]) {
-      const url = launchUrl(disk, bundle);
+      const url = launchUrl(disk, bundle, "fast");
+      expect(new URLSearchParams(url).get("wwtMode")).toBe("fast");
       expect(itemMatchesLocation(disk, url)).toBe(true);
     }
     expect(itemMatchesLocation(disk, launchUrl(disk, `/__wgb/?path=${encodeURIComponent("G:\\other.wgb")}`))).toBe(false);
@@ -262,6 +265,14 @@ describe("export", () => {
     expect(md).toContain("| # | Game | Status | Note |");
     expect(md).toContain("| 1 | A | Skipped |  |");
     expect(md).not.toContain("Compared with");
+  });
+
+  test("a verdict records the observed CPU, and notes preserve it", () => {
+    let r = setStatus(run(["a"]), "a", "ok", T0, "WWT protected");
+    r = setNote(r, "a", "Title menu", T0);
+    expect(toJsonExport(r, null, T0).run.items[0].cpu).toBe("WWT protected");
+    expect(toMarkdown(r, null, T0)).toContain("| WWT protected | Title menu |");
+    expect(setStatus(r, "a", "skip", T0).results.a.cpu).toBeUndefined();
   });
 
   test("json export carries statuses, previous and diff", () => {

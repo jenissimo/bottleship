@@ -16,7 +16,7 @@ import {
     writeDecRefStubTrampoline,
 } from '../../modules/d3d9/capture-trampolines';
 import type { ShadowTrampolineSpec } from '../../modules/d3d9/capture-trampolines';
-import { sehOnCatchCompletion, dispatchCxxException } from '../seh-dispatch';
+import { sehOnCatchCompletion, dispatchCxxException, recordSehUnwindTrace } from '../seh-dispatch';
 import { JMP_REL8, JMP_LOOP, HLT } from './thunk-constants';
 import { parseStdcallCleanup, normalizeApiName } from './thunk-utils';
 import { BusyWaitDetector } from './busy-wait-detector';
@@ -888,7 +888,8 @@ export class ThunkDispatcher {
      * identity compare; what it must not keep is its own idea of where they live.
      */
     private bindCpuStateViews(buffer: ArrayBufferLike): void {
-        const v = cpuViewsForBuffer(buffer);
+        const cpu = this.cachedCpu ?? this.v86?.cpu ?? this.v86?.v86?.cpu;
+        const v = cpuViewsForBuffer(buffer, cpu?.cpuStateBase ?? 0);
         this.cachedReg32Raw      = v.reg32;
         this.cachedFlagsRaw      = v.flags;
         this.cachedIpRaw         = v.instructionPointer;
@@ -2249,16 +2250,16 @@ export class ThunkDispatcher {
             read8: () => 0
         };
 
-        if (ioBus.ports && Array.isArray(ioBus.ports)) {
+        if (Array.isArray(ioBus.ports)) {
             ioBus.ports[0xB077] = thunkDevice;
-            Logger.log(LogCategory.SYSTEM, 'I/O hook installed on port 0xB077');
+        } else if (typeof ioBus.register_write === 'function') {
+            ioBus.register_write(0xB077, thunkDevice, thunkDevice.write8, thunkDevice.write16, thunkDevice.write32);
+            ioBus.register_read?.(0xB077, thunkDevice, thunkDevice.read8, thunkDevice.read16, thunkDevice.read32);
         } else {
-            Logger.error(LogCategory.SYSTEM, 'ioBus.ports is missing or not an array!');
-
-            if (typeof ioBus.register_write === 'function') {
-                ioBus.register_write(0xB077, thunkDevice, undefined, undefined, 4);
-            }
+            Logger.error(LogCategory.SYSTEM, 'Cannot register I/O hook on port 0xB077');
+            return;
         }
+        Logger.log(LogCategory.SYSTEM, 'I/O hook installed on port 0xB077');
     }
 
     /** Traps that arrived while paused (completed, then the slice was ended). */
@@ -6085,21 +6086,6 @@ export class ThunkDispatcher {
         return this.sehDispatchStack.length;
     }
 
-    /**
-     * Called from RtlUnwind when a handler catches during active SEH dispatch.
-     * RtlUnwind only fires when a handler decided to catch (second pass).
-     * Pop the dispatch context so SWITCH_DEFERRED stops for the handler's remaining funclet calls.
-     */
-    notifySehHandlerCaught(targetFrame: number): void {
-        if (this.sehDispatchStack.length === 0) return;
-        const top = this.sehDispatchStack[this.sehDispatchStack.length - 1];
-        Logger.warn(LogCategory.SYSTEM,
-            `SEH dispatch: RtlUnwind(targetFrame=0x${targetFrame.toString(16)}) during active dispatch ` +
-            `(gen=${top.generation}) — handler caught, popping context`);
-        this.sehDispatchStack.pop();
-        this._leaveSehCriticalRuntime('rtlunwind_caught', top.generation);
-    }
-
     /** Update cached SEH scratch area address (called after THUNK_DATA allocation). */
     updateSehScratchAddr(addr: number): void {
         this.sehScratchAddr = addr >>> 0;
@@ -6745,6 +6731,15 @@ export class ThunkDispatcher {
         const lastHandlerFrame = view.getUint32(scratchAddr + SEH_SCRATCH_LAYOUT.LAST_HANDLER_FRAME, true) >>> 0;
         const lastHandlerAddr = view.getUint32(scratchAddr + SEH_SCRATCH_LAYOUT.LAST_HANDLER_ADDR, true) >>> 0;
         const esp = cpu.reg32[4] >>> 0;
+        const ctxBase = scratchAddr + SEH_SCRATCH_LAYOUT.CONTEXT;
+        const code = view.getUint32(scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD, true);
+        recordSehUnwindTrace(
+            `result=${result} kind=${ctx?.kind ?? 'orphan'} gen=${ctx?.generation ?? 0} `
+            + `exception=0x${code.toString(16)} at 0x${faultingEip.toString(16)} `
+            + `disposition=0x${lastHandlerResult.toString(16)} handler=0x${lastHandlerAddr.toString(16)} `
+            + `frame=0x${lastHandlerFrame.toString(16)} CONTEXT eip=0x${view.getUint32(ctxBase + 0xb8, true).toString(16)} `
+            + `esp=0x${view.getUint32(ctxBase + 0xc4, true).toString(16)}`,
+        );
 
         if (result === 0) {
             finishDispatch();
@@ -6752,7 +6747,6 @@ export class ThunkDispatcher {
             // Restore full register state from CONTEXT — the handler/filter may have
             // modified registers (e.g., fixing the faulting pointer). On real Windows,
             // NtContinue restores the full CONTEXT including any modifications.
-            const ctxBase = scratchAddr + SEH_SCRATCH_LAYOUT.CONTEXT;
             if (view.getUint32(ctxBase, true) & 1) {
                 // A user-mode CONTEXT cannot raise privilege: drop IOPL, NT and RF (Intel SDM
                 // vol. 1 §3.4.3 system flags), keep the status/control flags, force IF and

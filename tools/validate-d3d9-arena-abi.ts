@@ -2,20 +2,20 @@
 /**
  * Parent-side D3D9 arena ABI gate.
  *
- * This intentionally reads the vendor source and the shipped parent artifact, but never
- * rewrites either one.  A missing, unreadable, or unparsable wasm artifact is a failure:
- * this check must not turn an unavailable binary into a green result.
+ * Validate the shipped WWT arena and its owned Rust layout. The optional legacy
+ * invocation checks that backend's independent source and artifact.
  *
- * Usage: bun tools/validate-d3d9-arena-abi.ts
+ * Usage: bun tools/validate-d3d9-arena-abi.ts [--legacy]
  */
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const ROOT = join(import.meta.dir, "..");
-const ARENA_RS = join(ROOT, "vendor", "v86", "crates", "d3d9-webgpu", "src", "arena.rs");
+const LEGACY = process.argv.includes("--legacy");
+const ARENA_RS = join(ROOT, LEGACY ? "vendor/v86/crates/d3d9-webgpu/src/arena.rs" : "tools/build-wwt-hypercall/reused/arena.rs");
 const ARENA_TS = join(ROOT, "src", "worker", "backends", "webgpu", "d3d9", "d3d9-wasm-arena.ts");
-const WASM = join(ROOT, "public", "v86.wasm");
+const WASM = join(ROOT, "public", LEGACY ? "v86.wasm" : "wwt-d3d9-arena.wasm");
 
 class AbiFailure extends Error {}
 
@@ -253,15 +253,15 @@ function checkLayout(tsText: string, rustText: string): string[] {
 
 function checkWasmExports(sourceText: string, wasmBytes: Uint8Array): string[] {
     const expected = parseSourceExports(sourceText);
-    let actual: Set<string>;
+    let module: WebAssembly.Module;
     try {
-        const module = new WebAssembly.Module(wasmBytes);
-        actual = new Set(WebAssembly.Module.exports(module).map((entry) => entry.name));
+        module = new WebAssembly.Module(wasmBytes);
     } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
-        throw new AbiFailure(`public/v86.wasm cannot be parsed as WebAssembly; refusing to pass\n  ${detail}`);
+        throw new AbiFailure(`${WASM} cannot be parsed as WebAssembly; refusing to pass\n  ${detail}`);
     }
 
+    const actual = new Set(WebAssembly.Module.exports(module).map((entry) => entry.name));
     // Include all D3D9-shaped exports so stale extras fail too, not just missing source names.
     const arenaActual = new Set(
         [...actual].filter((name) =>
@@ -270,8 +270,31 @@ function checkWasmExports(sourceText: string, wasmBytes: Uint8Array): string[] {
     const failures: string[] = [];
     const missing = difference(expected, actual);
     const extra = difference(arenaActual, expected);
-    if (missing.length) failures.push(`public/v86.wasm is missing arena exports: ${missing.join(", ")}`);
-    if (extra.length) failures.push(`public/v86.wasm has stale/unexpected arena exports: ${extra.join(", ")}`);
+    if (missing.length) failures.push(`${WASM} is missing arena exports: ${missing.join(", ")}`);
+    if (extra.length) failures.push(`${WASM} has stale/unexpected arena exports: ${extra.join(", ")}`);
+    if (!LEGACY && failures.length === 0) {
+        const imports = WebAssembly.Module.imports(module);
+        if (imports.length !== 1 || imports[0]?.module !== "env" ||
+            imports[0]?.name !== "read_guest" || imports[0]?.kind !== "function") {
+            failures.push("WWT arena must only import the checked guest reader");
+        } else {
+            const { exports } = new WebAssembly.Instance(module, { env: { read_guest: () => 0 } });
+            const memory = exports.memory as WebAssembly.Memory | undefined;
+            if (!memory || typeof exports.initialize_guest_reader !== "function") {
+                failures.push("WWT arena must provide private memory and initialize_guest_reader");
+            } else {
+                exports.initialize_guest_reader();
+                const pointer = (exports.get_d3d9_arena_layout_ptr as () => number)() >>> 0;
+                const length = parseRustLayout(sourceText).declaredLength;
+                const layout = new Uint32Array(memory.buffer, pointer, length);
+                const arena = (exports.get_d3d9_arena_ptr as () => number)() >>> 0;
+                if (length <= 32 || layout[32] === 0 || arena + layout[32]! > memory.buffer.byteLength ||
+                    layout.some(offset => offset > layout[32]!)) {
+                    failures.push("WWT arena layout returned by the shipped module exceeds its memory");
+                }
+            }
+        }
+    }
     return failures;
 }
 

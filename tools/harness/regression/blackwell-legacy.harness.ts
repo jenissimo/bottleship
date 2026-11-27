@@ -7,14 +7,16 @@
  * Prereqs: `bun tools/harness.ts up`. Bundle path from WGB env var, default
  * matches the drop-folder copy /apps/external-wgb/blackwell-legacy.wgb.
  * Expected end state: the title screen renders (title art + menu), presenter=d3d9,
- * presentSerial climbing, all 5 threads alive.
+ * presentSerial climbing, and no terminated threads.
  */
 import { harness } from "../../harness";
+import { readBlackwellTitle } from "./blackwell-title";
 
 const result = await harness()
     .openWgb(process.env.WGB ?? "/apps/external-wgb/blackwell-legacy.wgb")
-    .tickFrames(240, { timeoutMs: 120_000 })
+    .tickFrames(840, { timeoutMs: 170_000 })
     .state(["threads", "screen"])
+    .evalPage(readBlackwellTitle, 6000)
     .shot({ save: "blackwell-title.png" })
     .run();
 
@@ -22,8 +24,11 @@ const r: any = result;
 const screen = r.named?.state?.screen;
 const threads = r.named?.state?.threads?.threads ?? [];
 const terminated = threads.filter((t: any) => t.stateName === "TERMINATED").length;
-console.log(`presenter=${screen?.presenter} presentSerial=${screen?.presentSerial} threads=${threads.length} terminated=${terminated}`);
-if (screen?.presenter !== "d3d9" || (screen?.presentSerial ?? 0) < 100 || terminated > 0) {
-    console.log("REGRESSION: expected d3d9 presenter, >100 presents, 0 terminated threads");
+const title = r.named?.evalPage;
+console.log({ presenter: screen?.presenter, presentSerial: screen?.presentSerial,
+    threads: threads.length, terminated, title });
+if (!result.ok || screen?.presenter !== "d3d9" || (screen?.presentSerial ?? 0) < 240 ||
+    threads.length === 0 || terminated > 0 || title?.matches !== true) {
+    console.error("Expected the Blackwell menu, 240 or more D3D9 presents, and live threads");
     process.exitCode = 1;
 }

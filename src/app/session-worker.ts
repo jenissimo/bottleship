@@ -8,6 +8,7 @@ export class SessionWorker extends EventTarget implements Worker {
     private requests = new Map<unknown, MessagePort | null>();
     private settings = new Map<string, any>();
     private rootExited = false;
+    private launchId = 0;
     private rootPresentation = new Map<string, any>();
     private sources = new WeakMap<MessageEvent, Worker | MessagePort>();
     replyTarget(event: MessageEvent): Worker | MessagePort { return this.sources.get(event) ?? this.root; }
@@ -22,6 +23,7 @@ export class SessionWorker extends EventTarget implements Worker {
 
     private receive(event: MessageEvent, source: MessagePort | null): void {
         const data = event.data;
+        if (data?.type === "pe_aot_progress" && (source !== null || data.launchId !== this.launchId)) return;
         const roomUpdate = data?.type === "room_comms_update";
         // The root owns relay admission, even when a child holds the display.
         if (roomUpdate && source !== null) return;
@@ -115,7 +117,8 @@ export class SessionWorker extends EventTarget implements Worker {
             this.foreground = null;
             this.rootExited = false;
             this.rootPresentation.clear();
-            const reset = new MessageEvent('message', { data: { type: 'child_session_reset' } });
+            message = { ...message, launchId: ++this.launchId };
+            const reset = new MessageEvent('message', { data: { type: 'child_session_reset', freshLaunch: true } });
             this.dispatchEvent(reset);
         }
         if (['set_session', 'set_quality', 'set_network', 'set_network_consent', 'set_debug_flag', 'logging_global_enable'].includes(message?.type)) {

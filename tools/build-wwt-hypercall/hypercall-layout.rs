@@ -1,0 +1,100 @@
+//! BottleShip WWT hypercall-page layout. The worker owns this memory and shares the offsets
+//! with typed views and native leaves. Field extents are used by the ABI validator.
+//!   0x0: CYCLE_LIMIT u32
+//!   0x8: ENABLED u32
+//!   0xc: CALL_COUNT u32
+//!   0x10: TICK_COUNT u32
+//!   0x14: PERF_COUNTER_LO u32
+//!   0x18: PERF_COUNTER_HI u32
+//!   0x1c: PERF_FREQ_LO u32
+//!   0x20: PERF_FREQ_HI u32
+//!   0x24: LAST_ERROR u32
+//!   0x28: TEB_BASE u32
+//!   0x2c: INSN_AT_TIME_UPDATE u32
+//!   0x30: MIPS_ESTIMATE u32
+//!   0x34: CURRENT_THREAD_ID u32
+//!   0x80: CURSOR_X u32
+//!   0x84: CURSOR_Y u32
+//!   0x88: WINDOW_X u32
+//!   0x8c: WINDOW_Y u32
+//!   0x90: MSG_QUEUE_FLAG u32
+//!   0x94: PEEK_STARVATION_COUNTER u32
+//!   0x98: PEEK_STARVATION_LIMIT u32
+//!   0x9c: HAS_RUNNABLE_PEERS u32
+//!   0xa0: SLEEP_STARVATION_COUNTER u32
+//!   0xa4: SLEEP_STARVATION_LIMIT u32
+//!   0xb0: RAND_SEED u32
+//!   0xb4: CAPTURE_HWND u32
+//!   0xb8: TLS_ALLOCATED [u8; 64]
+//!   0x100: DISPATCH_TABLE [u8; 4096]
+//!   0x1100: FLS_ALLOCATED [u8; 129]
+//!   0x1184: FLS_VALUES [u8; 516]
+//!   0x1400: SLAB_BASE u32
+//!   0x1404: SLAB_END u32
+//!   0x1408: SLAB_BUMP u32
+//!   0x140c: SLAB_GENERATION u32
+//!   0x1410: SLAB_ALLOC_COUNT u32
+//!   0x1414: SLAB_FREE_COUNT u32
+//!   0x1418: SLAB_FALLBACK_COUNT u32
+//!   0x1420: SLAB_FREELIST [u8; 36]
+//!   0x1444: SLAB_CTL_PTR u32
+//!   0x1448: EVENT_TABLE [u8; 2048]
+//!   0x1c48: EVENT_STARVATION_COUNTER u32
+//!   0x1c4c: EVENT_STARVATION_LIMIT u32
+//!   0x1c50: MUTEX_MIRROR_PTR u32
+//!   0x1c54: EAGL_TOKEN_CFG_PTR u32
+//!   0x2000: HANDLER_CALLS [u8; 1024]
+//!   0x2400: HANDLER_FALLBACKS [u8; 1024]
+//!   0x2800: THREAD_SUSPEND [u8; 256]
+//!   0x4000: DISPATCH_TABLE_EXT [u8; 61440]
+
+pub const HYPERCALL_PAGE_SIZE: u32 = 81920;
+pub const HC_DISPATCH_LIMIT: u32 = 65536;
+pub const HC_DISPATCH_BASE_COUNT: u32 = 4096;
+pub const OFF_CYCLE_LIMIT: u32 = 0x0;
+pub const OFF_HC_ENABLED: u32 = 0x8;
+pub const OFF_HC_CALL_COUNT: u32 = 0xc;
+pub const OFF_HC_TICK_COUNT: u32 = 0x10;
+pub const OFF_HC_PERF_COUNTER_LO: u32 = 0x14;
+pub const OFF_HC_PERF_COUNTER_HI: u32 = 0x18;
+pub const OFF_HC_PERF_FREQ_LO: u32 = 0x1c;
+pub const OFF_HC_PERF_FREQ_HI: u32 = 0x20;
+pub const OFF_HC_LAST_ERROR: u32 = 0x24;
+pub const OFF_HC_TEB_BASE: u32 = 0x28;
+pub const OFF_HC_INSN_AT_TIME_UPDATE: u32 = 0x2c;
+pub const OFF_HC_MIPS_ESTIMATE: u32 = 0x30;
+pub const OFF_HC_CURRENT_THREAD_ID: u32 = 0x34;
+pub const OFF_HC_CURSOR_X: u32 = 0x80;
+pub const OFF_HC_CURSOR_Y: u32 = 0x84;
+pub const OFF_HC_WINDOW_X: u32 = 0x88;
+pub const OFF_HC_WINDOW_Y: u32 = 0x8c;
+pub const OFF_HC_MSG_QUEUE_FLAG: u32 = 0x90;
+pub const OFF_HC_PEEK_STARVATION_COUNTER: u32 = 0x94;
+pub const OFF_HC_PEEK_STARVATION_LIMIT: u32 = 0x98;
+pub const OFF_HC_HAS_RUNNABLE_PEERS: u32 = 0x9c;
+pub const OFF_HC_SLEEP_STARVATION_COUNTER: u32 = 0xa0;
+pub const OFF_HC_SLEEP_STARVATION_LIMIT: u32 = 0xa4;
+pub const OFF_HC_RAND_SEED: u32 = 0xb0;
+pub const OFF_HC_CAPTURE_HWND: u32 = 0xb4;
+pub const OFF_HC_TLS_ALLOCATED: u32 = 0xb8;
+pub const OFF_HC_DISPATCH_TABLE: u32 = 0x100;
+pub const OFF_HC_FLS_ALLOCATED: u32 = 0x1100;
+pub const OFF_HC_FLS_VALUES: u32 = 0x1184;
+pub const OFF_HC_SLAB_BASE: u32 = 0x1400;
+pub const OFF_HC_SLAB_END: u32 = 0x1404;
+pub const OFF_HC_SLAB_BUMP: u32 = 0x1408;
+pub const OFF_HC_SLAB_GENERATION: u32 = 0x140c;
+pub const OFF_HC_SLAB_ALLOC_COUNT: u32 = 0x1410;
+pub const OFF_HC_SLAB_FREE_COUNT: u32 = 0x1414;
+pub const OFF_HC_SLAB_FALLBACK_COUNT: u32 = 0x1418;
+pub const OFF_HC_SLAB_FREELIST: u32 = 0x1420;
+pub const OFF_HC_SLAB_CTL_PTR: u32 = 0x1444;
+pub const OFF_HC_EVENT_TABLE: u32 = 0x1448;
+pub const OFF_HC_EVENT_STARVATION_COUNTER: u32 = 0x1c48;
+pub const OFF_HC_EVENT_STARVATION_LIMIT: u32 = 0x1c4c;
+pub const OFF_HC_MUTEX_MIRROR_PTR: u32 = 0x1c50;
+pub const OFF_HC_EAGL_TOKEN_CFG_PTR: u32 = 0x1c54;
+pub const OFF_HC_HANDLER_CALLS: u32 = 0x2000;
+pub const OFF_HC_HANDLER_FALLBACKS: u32 = 0x2400;
+pub const OFF_HC_THREAD_SUSPEND: u32 = 0x2800;
+pub const OFF_HC_DISPATCH_TABLE_EXT: u32 = 0x4000;

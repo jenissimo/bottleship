@@ -141,6 +141,8 @@ export class PageTableManager {
         // Set CR3 = page directory physical address
         cpu.cr[3] = PAGE_DIR_ADDR;
 
+        cpu.setIdentityPageTableDirectory?.(PAGE_DIR_ADDR);
+
         // Set CR0.PG (paging) + CR0.WP (write protect for ring 0)
         cpu.cr[0] = (cpu.cr[0] | CR0_PG | CR0_WP) >>> 0;
 

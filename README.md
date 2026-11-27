@@ -47,12 +47,12 @@ other redistributable releases; you import your own legally-owned files locally.
 ## How it works
 
 BottleShip doesn't boot Windows. It loads the game's PE executable into a 4 GB guest address
-space, runs its x86 code through a fork of [v86](https://github.com/copy/v86), and intercepts
-every imported Win32 and DirectX call.
+space and translates x86 to WebAssembly with the WebWindows i386 compiler. BottleShip
+links the PE, runs the translated code and handles imported Win32 and DirectX calls.
 
 ```mermaid
 flowchart LR
-    GAME["Windows game<br/>x86 PE"] --> CPU["v86 CPU<br/>(WASM)"]
+    GAME["Windows game<br/>x86 PE"] --> CPU["x86 → WebAssembly<br/>BottleShip CPU host"]
     CPU --> HLE["Win32 / DirectX HLE<br/>TypeScript + WASM"]
     HLE --> WEB["WebGPU · WebAudio<br/>OPFS · input"]
 ```
@@ -63,6 +63,8 @@ flowchart LR
 - Game files, saves and registry live in an OPFS virtual filesystem (read-only ROM plus a
   copy-on-write overlay).
 - Hot guest/host calls stay entirely inside WASM for speed.
+
+Games use the fast WebWindows ABI 11 compiler by default, with BottleShip’s fix for preemption in OSR loops. BottleShip supplies Win32 and DirectX in both CPU modes. If a game needs page permissions or external memory-mapped I/O, set `"wwtMode": "protected"` in the `emulator` object of its WGB manifest. To try either mode without repacking, add `wwtMode=protected` or `wwtMode=fast` to the game URL. The URL overrides the bundle for that launch.
 
 [Read the architecture guide →](docs/architecture.md)
 
@@ -148,9 +150,10 @@ BottleShip is free and open source. If it brought a game back to life for you, y
 
 ## License & acknowledgements
 
-BottleShip is licensed under [Apache-2.0](LICENSE). It builds on a fork of
-[v86](https://github.com/copy/v86) (BSD-2) and bundles other open-source components
-(SeaBIOS / VGA BIOS, an FFmpeg-based decoder, fonts) — their licenses and notices are in
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+BottleShip is licensed under [Apache-2.0](LICENSE). The default CPU backend uses the
+WebWindows compiler (MIT OR Apache-2.0) and includes BSD-licensed code from BottleShip's
+v86 fork for its native HLE routines. A separate legacy build supports comparisons with v86.
+See [the compiler build instructions](tools/build-wwt-cpu/README.md) and
+[third-party notices](THIRD-PARTY-NOTICES.md).
 
 **BottleShip does not distribute commercial game files.** Bring your own legally-owned copies.

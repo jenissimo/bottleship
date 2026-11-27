@@ -112,6 +112,9 @@ export interface ChildBoot extends ChildProcessRequest {
     namedObjects?: NamedObjectSpec[];
     /** The parent's host JIT mode: the page that decided it is not this worker's. */
     jitMode?: HostJitMode;
+    cpuBackend?: 'v86' | 'wwt';
+    wwtFlatRam?: boolean;
+    wwtMode?: import("../wwt/mode").WwtMode;
     /** Why the page chose it, so the child labels its own JIT mode the same way. */
     jitReason?: 'default' | 'query' | 'ios-webkit-27' | 'mobile';
 }
@@ -189,7 +192,7 @@ let nextChildBootId = 1;
 const unfinished = new Set<ChildProcessRecord>();
 let publishSession: ((port: MessagePort, record: ChildProcessRecord) => void) | undefined;
 let sessionFinished: (() => void) | undefined;
-let bootContext: (() => Pick<ChildBoot, 'config' | 'registry' | 'namedObjects' | 'jitMode' | 'jitReason'>) | undefined;
+let bootContext: (() => Pick<ChildBoot, 'config' | 'registry' | 'namedObjects' | 'jitMode' | 'jitReason' | 'cpuBackend' | 'wwtFlatRam' | 'wwtMode'>) | undefined;
 export function setChildBootContext(provider: typeof bootContext): void { bootContext = provider; }
 
 /** Applies a child's registry write to THIS process's store — the registry is system-wide,

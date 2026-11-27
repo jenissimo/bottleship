@@ -153,7 +153,8 @@ export async function restoreSession(
     const blob = restoreObjectGraph([], blobs).blob;
     for (const p of participants.all()) {
         const value = state.sections.get(p.id);
-        if (value !== undefined) await p.verify?.(value, blob);
+        if (value === undefined) throw new Error(`savestate: no section for participant ${p.id}`);
+        await p.verify?.(value, blob);
     }
     try {
         await restoreWritten(target, state, store, participants, blobs);

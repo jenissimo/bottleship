@@ -24,8 +24,9 @@ export const TRAP_MARKER_VECTOR: Record<number, number> = {
 export function createBootloader(
     peEntryPoint: number,
     stackPointer: number,
-    dllInits: DllInitEntry[] = []
-): { code: Uint8Array; loadAddress: number; startAddress: number } {
+    dllInits: DllInitEntry[] = [],
+    protectedModeDllTableAddress?: number,
+): { code: Uint8Array; loadAddress: number; startAddress: number; protectedEntry: number; gdtAddress: number; idtAddress: number; externalDllTable?: Uint8Array } {
     const loadAddress = 0x7c00;
     const gdtAddress = GDT_ADDRESS;
     // IDT immediately after GDT (32 bytes for 4 entries)
@@ -90,6 +91,8 @@ export function createBootloader(
     const lidtDispPos = code.length;
     code.push(0x00, 0x00, 0x00, 0x00);
 
+    // A CPU backend that installs protected-mode state directly enters here.
+    const protectedEntry = loadAddress + code.length;
     // (D) DEBUG: OUT 0xB077, 0xDEAD0003 "PM + IDT OK"
     code.push(0xb8, 0x03, 0x00, 0xad, 0xde);
     code.push(0xba, 0x77, 0xb0, 0x00, 0x00);
@@ -100,18 +103,20 @@ export function createBootloader(
     // We just ensure EM is clear, and MP/NE are set in CR0.
     code.push(0xfc); // CLD
 
-    // MOV EAX, CR0
-    code.push(0x0f, 0x20, 0xc0);
-    // AND EAX, 0xFFFFFFFB (Clear EM - Bit 2)
-    code.push(0x25, 0xfb, 0xff, 0xff, 0xff);
-    // OR EAX, 0x22 (Set MP - Bit 1, Set NE - Bit 5)
-    // NE is crucial for 32-bit FPU exception handling.
-    code.push(0x83, 0xc8, 0x22);
-    // MOV CR0, EAX
-    code.push(0x0f, 0x22, 0xc0);
+    if (protectedModeDllTableAddress === undefined) {
+        // MOV EAX, CR0
+        code.push(0x0f, 0x20, 0xc0);
+        // AND EAX, 0xFFFFFFFB (Clear EM - Bit 2)
+        code.push(0x25, 0xfb, 0xff, 0xff, 0xff);
+        // OR EAX, 0x22 (Set MP - Bit 1, Set NE - Bit 5)
+        // NE is crucial for 32-bit FPU exception handling.
+        code.push(0x83, 0xc8, 0x22);
+        // MOV CR0, EAX
+        code.push(0x0f, 0x22, 0xc0);
 
-    // FNINIT - Initialize FPU
-    code.push(0xdb, 0xe3);
+        // FNINIT - Initialize FPU
+        code.push(0xdb, 0xe3);
+    }
 
     // (F) DllMain Init Trampoline
     // Call DllMain(hModule, DLL_PROCESS_ATTACH=1, lpReserved=1) for each real DLL, walking a
@@ -222,15 +227,18 @@ export function createBootloader(
 
     if (code.length > 510) throw new Error(`Bootloader code is ${code.length} bytes; it must end before the boot signature`);
     const dllTableOff = hOfOff + handlerSize;
-    if (dllTableOff + (dllInits.length + 1) * 8 > totalSize) {
+    const externalDllTable = protectedModeDllTableAddress === undefined ? undefined : new Uint8Array((dllInits.length + 1) * 8);
+    if (!externalDllTable && dllTableOff + (dllInits.length + 1) * 8 > totalSize) {
         throw new Error(`Bootloader: ${dllInits.length} DllMain entries overflow the boot image`);
     }
-    const dllTableLinear = loadAddress + dllTableOff;
+    const dllTableLinear = protectedModeDllTableAddress ?? (loadAddress + dllTableOff);
     code[dllTablePos] = dllTableLinear & 0xff;
     code[dllTablePos + 1] = (dllTableLinear >> 8) & 0xff;
     code[dllTablePos + 2] = (dllTableLinear >> 16) & 0xff;
     code[dllTablePos + 3] = (dllTableLinear >> 24) & 0xff;
-    const tableView = new DataView(finalBuffer.buffer, dllTableOff, (dllInits.length + 1) * 8);
+    const tableView = externalDllTable
+        ? new DataView(externalDllTable.buffer)
+        : new DataView(finalBuffer.buffer, dllTableOff, (dllInits.length + 1) * 8);
     dllInits.forEach((dll, i) => {
         tableView.setUint32(i * 8, dll.baseAddress >>> 0, true);
         tableView.setUint32(i * 8 + 4, dll.entryPoint >>> 0, true);
@@ -289,6 +297,10 @@ export function createBootloader(
         code: finalBuffer,
         loadAddress,
         startAddress: loadAddress,
+        protectedEntry,
+        gdtAddress,
+        idtAddress,
+        externalDllTable,
     };
 }
 

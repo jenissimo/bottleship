@@ -52,6 +52,30 @@ describe("bootloader DllMain table", () => {
         expect(done + ((code[done - 1]! << 24) >> 24)).toBe(loop);
     });
 
+    test("a protected-mode entry reaches the DllMain loop with the external table", () => {
+        const list = dlls(200);
+        const tableAddress = 0x22001000;
+        const { code, protectedEntry, gdtAddress, idtAddress, externalDllTable } =
+            createBootloader(0x401000, 0x4108cc8, list, tableAddress);
+        const entry = protectedEntry - LOAD;
+        expect([...code.subarray(entry, entry + 12)]).toEqual([
+            0xb8, 0x03, 0x00, 0xad, 0xde, // MOV EAX, 0xDEAD0003
+            0xba, 0x77, 0xb0, 0x00, 0x00, // MOV EDX, 0xB077
+            0xef, 0xfc,                   // OUT DX, EAX; CLD
+        ]);
+        expect(code[entry + 12]).toBe(0xbe); // MOV ESI, tableAddress
+        expect(new DataView(code.buffer).getUint32(entry + 13, true)).toBe(tableAddress);
+        expect(gdtAddress).toBe(0x7e00);
+        expect(idtAddress).toBe(0x7e20);
+        const table = new DataView(externalDllTable!.buffer);
+        expect(table.byteLength).toBe((list.length + 1) * 8);
+        for (const [index, dll] of list.entries()) {
+            expect(table.getUint32(index * 8, true)).toBe(dll.baseAddress);
+            expect(table.getUint32(index * 8 + 4, true)).toBe(dll.entryPoint);
+        }
+        expect(table.getBigUint64(list.length * 8, true)).toBe(0n);
+    });
+
     test("more DLLs than the image can list is an error, not a corrupt boot", () => {
         expect(() => createBootloader(0x401000, 0x4108cc8, dlls(200))).toThrow();
     });

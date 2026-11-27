@@ -62,6 +62,10 @@ export class TimeService {
      * Enable instruction-based virtual time.
      * Initializes virtual clock to current wall-clock to avoid discontinuity.
      */
+    useWallTime(): void {
+        this.virtualTimeActive = false;
+    }
+
     enableVirtualTime(): void {
         if (this.virtualTimeActive) return;
         this.virtualTimeActive = true;

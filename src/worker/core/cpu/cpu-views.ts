@@ -130,30 +130,30 @@ function fallbackViews(cpu: any): CpuViews {
     };
 }
 
-function buildViews(buffer: ArrayBufferLike): CpuViews {
+function buildViews(buffer: ArrayBufferLike, byteOffset: number): CpuViews {
     return {
         buffer,
-        reg32: new Int32Array(buffer, CPU_VIEW_OFFSETS.reg32, 8),
-        instructionPointer: new Int32Array(buffer, CPU_VIEW_OFFSETS.instructionPointer, 1),
-        previousIp: new Int32Array(buffer, CPU_VIEW_OFFSETS.previousIp, 1),
-        instructionCounter: new Uint32Array(buffer, CPU_VIEW_OFFSETS.instructionCounter, 1),
-        flags: new Int32Array(buffer, CPU_VIEW_OFFSETS.flags, 1),
-        flagsChanged: new Int32Array(buffer, CPU_VIEW_OFFSETS.flagsChanged, 1),
-        lastOp1: new Int32Array(buffer, CPU_VIEW_OFFSETS.lastOp1, 1),
-        lastOpSize: new Int32Array(buffer, CPU_VIEW_OFFSETS.lastOpSize, 1),
-        lastResult: new Int32Array(buffer, CPU_VIEW_OFFSETS.lastResult, 1),
-        segmentOffsets: new Int32Array(buffer, CPU_VIEW_OFFSETS.segmentOffsets, 8),
-        segmentIsNull: new Uint8Array(buffer, CPU_VIEW_OFFSETS.segmentIsNull, 8),
-        segmentLimits: new Uint32Array(buffer, CPU_VIEW_OFFSETS.segmentLimits, 8),
-        sreg: new Uint16Array(buffer, CPU_VIEW_OFFSETS.sreg, 8),
-        cr: new Int32Array(buffer, CPU_VIEW_OFFSETS.cr, 8),
-        cpl: new Uint8Array(buffer, CPU_VIEW_OFFSETS.cpl, 1),
-        prefixes: new Uint8Array(buffer, CPU_VIEW_OFFSETS.prefixes, 1),
-        protectedMode: new Int32Array(buffer, CPU_VIEW_OFFSETS.protectedMode, 1),
-        is32: new Int32Array(buffer, CPU_VIEW_OFFSETS.is32, 1),
-        memorySize: new Uint32Array(buffer, CPU_VIEW_OFFSETS.memorySize, 1),
-        mxcsr: new Int32Array(buffer, CPU_VIEW_OFFSETS.mxcsr, 1),
-        fpuSimdDirty: new Uint8Array(buffer, CPU_VIEW_OFFSETS.fpuSimdDirty, 1),
+        reg32: new Int32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.reg32, 8),
+        instructionPointer: new Int32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.instructionPointer, 1),
+        previousIp: new Int32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.previousIp, 1),
+        instructionCounter: new Uint32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.instructionCounter, 1),
+        flags: new Int32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.flags, 1),
+        flagsChanged: new Int32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.flagsChanged, 1),
+        lastOp1: new Int32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.lastOp1, 1),
+        lastOpSize: new Int32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.lastOpSize, 1),
+        lastResult: new Int32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.lastResult, 1),
+        segmentOffsets: new Int32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.segmentOffsets, 8),
+        segmentIsNull: new Uint8Array(buffer, byteOffset + CPU_VIEW_OFFSETS.segmentIsNull, 8),
+        segmentLimits: new Uint32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.segmentLimits, 8),
+        sreg: new Uint16Array(buffer, byteOffset + CPU_VIEW_OFFSETS.sreg, 8),
+        cr: new Int32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.cr, 8),
+        cpl: new Uint8Array(buffer, byteOffset + CPU_VIEW_OFFSETS.cpl, 1),
+        prefixes: new Uint8Array(buffer, byteOffset + CPU_VIEW_OFFSETS.prefixes, 1),
+        protectedMode: new Int32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.protectedMode, 1),
+        is32: new Int32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.is32, 1),
+        memorySize: new Uint32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.memorySize, 1),
+        mxcsr: new Int32Array(buffer, byteOffset + CPU_VIEW_OFFSETS.mxcsr, 1),
+        fpuSimdDirty: new Uint8Array(buffer, byteOffset + CPU_VIEW_OFFSETS.fpuSimdDirty, 1),
         flat: true,
     };
 }
@@ -161,17 +161,20 @@ function buildViews(buffer: ArrayBufferLike): CpuViews {
 // One live WASM buffer per worker; keyed on its identity so a grow is the only rebuild.
 let cachedBuffer: ArrayBufferLike | null = null;
 let cachedViews: CpuViews | null = null;
+// @transient(offset is part of the CPU view cache key, not guest state)
+let cachedOffset = 0;
 
 /**
  * Plain views over the CPU-state block at the head of `buffer` (v86 maps the CPU state at
  * the base of the same WASM linear memory that backs guest RAM, so `mem8.buffer` is this
  * buffer). For callers that hold the memory but not the CPU object.
  */
-export function cpuViewsForBuffer(buffer: ArrayBufferLike): CpuViews {
-    if (cachedViews !== null && cachedBuffer === buffer) return cachedViews;
-    const views = buildViews(buffer);
+export function cpuViewsForBuffer(buffer: ArrayBufferLike, byteOffset = 0): CpuViews {
+    if (cachedViews !== null && cachedBuffer === buffer && cachedOffset === byteOffset) return cachedViews;
+    const views = buildViews(buffer, byteOffset);
     noteWasmBuffer(buffer, views.instructionPointer[0] >>> 0);
     cachedBuffer = buffer;
+    cachedOffset = byteOffset;
     cachedViews = views;
     return views;
 }
@@ -184,8 +187,9 @@ export function cpuViewsForBuffer(buffer: ArrayBufferLike): CpuViews {
  */
 export function cpuViews(cpu: any): CpuViews {
     const buffer: ArrayBufferLike | undefined = cpu?.wasm_memory?.buffer;
-    if (!buffer || buffer.byteLength < MIN_BUFFER_BYTES) return fallbackViews(cpu);
-    return cpuViewsForBuffer(buffer);
+    const byteOffset: number = cpu?.cpuStateBase ?? 0;
+    if (!buffer || buffer.byteLength < byteOffset + MIN_BUFFER_BYTES) return fallbackViews(cpu);
+    return cpuViewsForBuffer(buffer, byteOffset);
 }
 
 /** Live guest EIP, unsigned. The single most-read CPU scalar in the worker. */

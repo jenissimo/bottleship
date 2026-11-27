@@ -12,7 +12,10 @@ if (!root) {
   throw new Error("Missing #root element");
 }
 
-createRoot(root).render(
+const query = new URLSearchParams(location.search);
+if (query.get("engine") === "wwt" && (import.meta.env.DEV || import.meta.env.VITE_WWT_EXPERIMENT === "1")) {
+  import("./experimental/wwt-player").then(m => m.openWwtPlayer(root, query.get("load"))).catch(e => { root.textContent = String(e); });
+} else createRoot(root).render(
   <React.StrictMode>
     <App />
   </React.StrictMode>

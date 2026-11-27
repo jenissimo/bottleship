@@ -169,7 +169,11 @@ import { ClearPipeline, clipClearRectsToViewport } from "./clear-pipeline";
 import { MsaaColorManager } from "./msaa-color-manager";
 import { ColorKeyBlitPipeline } from "./colorkey-blit-pipeline";
 import { VertexConverter, GPU_VERTEX_THRESHOLD, GpuVertexConversionResult, computeFvfStride, OUTPUT_VERTEX_BYTES, OUTPUT_VERTEX_U32S } from "./compute/vertex-converter";
+import { RetainedIndexRanges, RetainedVertexConversions,
+    type RetainedGeometryKey } from "./retained-geometry";
+import { directVertexBytes, ffpDirectVertexStats, type DirectVertexLayout, type DirectVertexStreams } from "./direct-vertex-input";
 import type { VertexBlendInput } from "./compute/vertex-converter";
+import { endVertexPrepass, finishDrawCommands, prepassEnabledForDraw, vertexPrepassEncoder } from "./compute/vertex-prepass";
 import { TextureConverter, applyTextureConverterDebugPaintCPU } from "../shared/texture-converter";
 import { FFPLightingState } from "../../../modules/ddraw/d3d/ffp-lighting";
 import { createDefaultMaterial } from "../../../modules/ddraw/d3d/types";
@@ -214,6 +218,8 @@ const D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR = 0x30000;
 
 /** Lanes per stage in the sampler-identity scratch below. */
 export const STAGE_SAMPLER_KEY_LANES = 4;
+// Successful end-of-frame or mid-frame submits that carry the FFP encoder.
+export const ffpEncoderSubmitStats = { count: 0 };
 
 /**
  * Write one stage's sampler identity for the bind-group fast paths. EVERY field
@@ -605,6 +611,9 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
      */
     private onDeviceLost(): void {
         this.deviceLost = true;
+        this.retainedVertexConversions?.reset(false);
+        this.retainedDirectStreams?.reset(false);
+        this.retainedIndexRanges?.reset();
         this.currentEncoder = null;
         this.currentRenderPass = null;
         this.currentBatch = null;
@@ -818,6 +827,9 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         unregisterQueueWriteGuard(this);
         this.currentRenderTarget = null;
 
+        this.retainedVertexConversions.reset(true);
+        this.retainedDirectStreams.reset(true);
+        this.retainedIndexRanges.reset();
         this.vertexConverter.destroy();
         this.textureConverter.destroy();
         this.ringBufferManager.destroy();
@@ -2374,10 +2386,22 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         return false;
     }
 
-    /**
-     * Ensure GPU vertex conversion has room in the global conversion buffer.
-     * If not, submit pending work first so converter can safely reuse offset 0.
-     */
+    private encoderForVertexConversion(fromD3D8: boolean): GPUCommandEncoder {
+        this.currentEncoder ??= this.device.createCommandEncoder();
+        if (prepassEnabledForDraw(fromD3D8)) {
+            return vertexPrepassEncoder(this.device, this.currentEncoder);
+        }
+        if (this.currentBatch) this.flushBatch();
+        if (this.currentRenderPass) {
+            this.currentRenderPass.end();
+            this.currentRenderPass = null;
+            this.currentRenderTarget = null;
+            this.resetBindFastPath();
+        }
+        return this.currentEncoder;
+    }
+
+    /** Submit before the global output buffer rewinds over unsubmitted draws. */
     private ensureGpuVertexConversionBudget(requiredBytes: number): void {
         if (!this.vertexConverter.needsSubmitForBytes(requiredBytes)) return;
 
@@ -2457,7 +2481,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         /** Fixed-function vertex blend (GPU skinning). When present, this draw is forced onto
          *  the CPU converter path so positions/normals are blended against the world-matrix
          *  palette (mvpMatrix/worldViewMatrix must already exclude world — see VertexBlendInput). */
-        vertexBlend?: VertexBlendInput | null
+        vertexBlend?: VertexBlendInput | null,
+        fromD3D8 = false
     ): void {
         this.lastDrawDiagnostics.valid = false;
         if (this.DEBUG_SKIP_RENDERING) return;
@@ -2562,7 +2587,9 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
             stageTextures ?? null,
             isBatchableHint,
             texMatrices,
-            lighting
+            lighting,
+            undefined,
+            fromD3D8,
         );
         maybeClampContainedUv(this, prepareResult, memory, verticesAddr, count, stride, vertexType);
         drawCostProfiler.add(DC.prepare, _tPrep);
@@ -2651,26 +2678,11 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
             // to prevent; count it whatever put it here, kill switch included.
             if (rhwPosition) this.rhwGpuConversions++;
             this.ensureGpuVertexConversionBudget(count * OUTPUT_VERTEX_BYTES);
-            // The compute converter cannot run inside a render pass, so the pass has to end
-            // here — and a batch must not outlive the pass it was opened for. Its draws are
-            // still unencoded; leaving them pending puts them in a pass opened LATER, after
-            // work the guest issued after them. Flush first, then close: same draw-order rule
-            // the texture-sync path already follows. The bind fast-path describes bindings
-            // that lived in the closed pass, so it goes too.
-            if (this.currentBatch) this.flushBatch();
-            if (this.currentRenderPass) {
-                this.currentRenderPass.end();
-                this.currentRenderPass = null;
-                this.currentRenderTarget = null;
-                this.resetBindFastPath();
-            }
-            if (!this.currentEncoder) {
-                this.currentEncoder = this.device.createCommandEncoder();
-            }
+            const conversionEncoder = this.encoderForVertexConversion(fromD3D8);
 
             useNativeTopology = primitiveType === D3DPT_TRIANGLESTRIP && count >= 3;
             gpuConversionResult = this.vertexConverter.convertToGpuBuffer(
-                this.currentEncoder!,
+                conversionEncoder,
                 memory,
                 verticesAddr,
                 count,
@@ -2775,7 +2787,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                 this.ffpStages,
                 false,
                 renderStates,
-                texture
+                texture,
+                fromD3D8,
             )
             : null;
 
@@ -2921,6 +2934,11 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         // version for immediate draws and bumps early for batched draws.
     }
 
+    canUseDirectVertexInput(primitiveType: number, indexIsUint32: boolean): boolean {
+        return !this.drawObserver && !this.debugFlags.forceCpuVertexPath &&
+            (primitiveType === D3DPT_TRIANGLELIST || (primitiveType === D3DPT_TRIANGLESTRIP && !indexIsUint32));
+    }
+
     drawIndexedPrimitive(
         target: DirectDrawSurfaceState,
         primitiveType: number,
@@ -2945,7 +2963,11 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         /** Fixed-function vertex blend (GPU skinning). When present, this draw is forced onto
          *  the CPU converter path so positions/normals are blended against the world-matrix
          *  palette (mvpMatrix/worldViewMatrix must already exclude world — see VertexBlendInput). */
-        vertexBlend?: VertexBlendInput | null
+        vertexBlend?: VertexBlendInput | null,
+        retainedVertexKey?: string,
+        retainedIndexKey?: RetainedGeometryKey,
+        directStreams?: DirectVertexStreams,
+        fromD3D8 = false
     ): void {
         this.lastDrawDiagnostics.valid = false;
         if (this.DEBUG_SKIP_RENDERING) return;
@@ -2969,7 +2991,7 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         // flushes prior draws on a value change) only when a plane is actually enabled.
         const clipPlaneEnable = renderStates[D3DRENDERSTATE_CLIPPLANEENABLE] | 0;
         if (clipPlaneEnable !== 0) this.ensureClipPlanesUploaded();
-        const megaBatchEnabled = !this.debugFlags.disableMegaBatch && !texXformActive &&
+        const megaBatchEnabled = !directStreams && !this.debugFlags.disableMegaBatch && !texXformActive &&
             !this.hasCameraSpaceTexgen(textureStates) &&
             !(renderStates[D3DRENDERSTATE_LIGHTING] | 0) &&
             clipPlaneEnable === 0;
@@ -3026,9 +3048,10 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         // vCount vertices (e.g. 65536) when indices may only reference ~500, causing
         // 100x+ overallocation and ring buffer overflow.
         
-        let minRawIdx = Number.MAX_SAFE_INTEGER;
-        let maxRawIdx = 0;
-        if (iCount > 0 && isValidAddress(memory, indicesAddr, indexDataSize)) {
+        const indexedBounds = retainedIndexKey === undefined ? undefined : this.retainedIndexRanges.findBounds(retainedIndexKey);
+        let minRawIdx = indexedBounds?.min ?? Number.MAX_SAFE_INTEGER;
+        let maxRawIdx = indexedBounds?.max ?? 0;
+        if (!indexedBounds && iCount > 0 && isValidAddress(memory, indicesAddr, indexDataSize)) {
             // memory is a Uint8Array view into WASM linear memory with
             // byteOffset ~9.5MB. Must add memory.byteOffset when constructing
             // TypedArray views from memory.buffer.
@@ -3049,6 +3072,7 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                     if (rawIdx > maxRawIdx) maxRawIdx = rawIdx;
                 }
             }
+            if (retainedIndexKey !== undefined) this.retainedIndexRanges.rememberBounds(retainedIndexKey, minRawIdx, maxRawIdx);
         }
         if (iCount > 0 && maxRawIdx >= vCount) {
             this.renderStats.skipBadRange++;
@@ -3089,7 +3113,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         // land in globalVertexBuffer (VertexConverter), NOT the ring buffer.
         // Passing vertex bytes for GPU-path draws causes false overflow detection:
         // the ring buffer would flush and stall even though no ring-buffer space is needed.
-        const ringVertexBytes = effectiveVCount >= gpuVertexThreshold ? 0 : effectiveVertexBytes;
+        const directBytes = directStreams ? directVertexBytes(directStreams.layout, effectiveVCount) : 0;
+        const ringVertexBytes = directStreams ? directBytes : effectiveVCount >= gpuVertexThreshold ? 0 : effectiveVertexBytes;
         const storageBytes = megaBatchEnabled ? DEFAULT_STORAGE_BUFFER_CONFIG.slotSize : 0;
         this.ringBufferManager.ensureSpaceForDraw(ringVertexBytes, finalIndexSize, requiredUniformBytes, () => {
             this.renderStats.midFrameFlush++;
@@ -3123,9 +3148,11 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
             stageTextures ?? null,
             isBatchableHint,
             texMatrices,
-            lighting
+            lighting,
+            directStreams?.layout,
+            fromD3D8,
         );
-        maybeClampContainedUv(this, prepareResult, memory, sourceVerticesAddr, effectiveVCount, stride, vertexType);
+        if (!directStreams) maybeClampContainedUv(this, prepareResult, memory, sourceVerticesAddr, effectiveVCount, stride, vertexType);
         drawCostProfiler.add(DC.prepare, _tPrep);
 
         if (!target.gpuTextureView) {
@@ -3139,7 +3166,7 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         }
 
         const vertexRange = effectiveVCount * stride;
-        if (!isValidAddress(memory, sourceVerticesAddr, vertexRange)) {
+        if (!directStreams && !isValidAddress(memory, sourceVerticesAddr, vertexRange)) {
             this.renderStats.skipBadRange++;
             Logger.warn(
                 LogCategory.SYSTEM,
@@ -3156,32 +3183,66 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         const _tConv = drawCostProfiler.now();
         let convertedData: Uint8Array | null = null;
         let gpuConversionResult: GpuVertexConversionResult | null = null;
+        const directBindings: Array<{ buffer: GPUBuffer; offset: number; size: number }> | undefined = directStreams ? [] : undefined;
 
-        if (effectiveVCount >= gpuVertexThreshold) {
-            if (rhwPosition) this.rhwGpuConversions++;
-            this.ensureGpuVertexConversionBudget(effectiveVCount * OUTPUT_VERTEX_BYTES);
-            // GPU path requires ending current render pass
-            if (this.currentRenderPass) {
-                this.currentRenderPass.end();
-                this.currentRenderPass = null;
-                this.currentRenderTarget = null;
+        if (directStreams && directBindings) {
+            for (let slot = 0; slot < directStreams.layout.layouts.length; slot++) {
+                const sourceStride = directStreams.layout.layouts[slot].arrayStride;
+                const address = directStreams.addresses[slot] + appliedIndexBase * sourceStride;
+                const size = effectiveVCount * sourceStride;
+                const version = directStreams.versions?.[slot];
+                const key = version === undefined ? undefined : `${version}:${address}:${size}`;
+                const cached = key === undefined ? null : this.retainedDirectStreams.find(key, this.encoderEpoch, size);
+                if (cached) {
+                    directBindings.push(cached);
+                    continue;
+                }
+                const allocation = this.ringBufferManager.allocateVertexData(memory.subarray(address, address + size));
+                if (allocation.overflow) {
+                    this.renderStats.skipRingOverflow++;
+                    return;
+                }
+                const result = { buffer: allocation.buffer, offset: allocation.offset, size, stride: sourceStride, count: effectiveVCount };
+                directBindings.push(result);
+                ffpDirectVertexStats.stagedBytes += size;
+                if (key !== undefined) {
+                    this.currentEncoder ??= this.device.createCommandEncoder();
+                    this.retainedDirectStreams.remember(key, this.encoderEpoch, result, this.device, this.currentEncoder,
+                        (buffer, offset) => this.queue.writeBuffer(buffer, offset, memory.buffer, memory.byteOffset + address, size));
+                }
             }
-            if (!this.currentEncoder) {
-                this.currentEncoder = this.device.createCommandEncoder();
+        } else if (effectiveVCount >= gpuVertexThreshold) {
+            const retainedRange = retainedVertexKey === undefined ? undefined
+                : `${retainedVertexKey}:${sourceVerticesAddr}:${effectiveVCount}:${vertexType}:${stride}` +
+                  (rhwPosition ? `:${safeViewport.x}:${safeViewport.y}:${safeViewport.width}:${safeViewport.height}` : "");
+            if (retainedRange !== undefined) {
+                gpuConversionResult = this.retainedVertexConversions.find(retainedRange, this.encoderEpoch, vertexRange);
             }
-
-            gpuConversionResult = this.vertexConverter.convertToGpuBuffer(
-                this.currentEncoder!,
-                memory,
-                sourceVerticesAddr,
-                effectiveVCount,
-                vertexType,
-                safeViewport.width,
-                safeViewport.height,
-                stride,
-                safeViewport.x,
-                safeViewport.y
-            );
+            if (!gpuConversionResult) {
+                if (rhwPosition) this.rhwGpuConversions++;
+                this.ensureGpuVertexConversionBudget(effectiveVCount * OUTPUT_VERTEX_BYTES);
+                const conversionEncoder = this.encoderForVertexConversion(fromD3D8);
+                gpuConversionResult = this.vertexConverter.convertToGpuBuffer(
+                    conversionEncoder,
+                    memory,
+                    sourceVerticesAddr,
+                    effectiveVCount,
+                    vertexType,
+                    safeViewport.width,
+                    safeViewport.height,
+                    stride,
+                    safeViewport.x,
+                    safeViewport.y
+                );
+                if (retainedRange !== undefined && gpuConversionResult) {
+                    const converted = gpuConversionResult;
+                    this.retainedVertexConversions.remember(retainedRange, this.encoderEpoch, converted,
+                        this.device, this.currentEncoder!, (buffer, offset) => {
+                            endVertexPrepass(conversionEncoder);
+                            conversionEncoder.copyBufferToBuffer(converted.buffer, converted.offset, buffer, offset, converted.size);
+                        });
+                }
+            }
             if (!gpuConversionResult) {
                 this.renderStats.gpuConvFallback++;
                 Logger.warn(LogCategory.SYSTEM, `drawIndexedPrimitive: GPU conversion failed, falling back to CPU`);
@@ -3227,9 +3288,11 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         let vBuffer: GPUBuffer;
         let vOffset: number;
         let vSize: number;
-        if (gpuConversionResult) {
-            // GPU path: result already contains buffer and offset from global vertex buffer
-            // No need to copy again - use directly
+        if (directBindings?.length) {
+            vBuffer = directBindings[0].buffer;
+            vOffset = directBindings[0].offset;
+            vSize = directBytes;
+        } else if (gpuConversionResult) {
             vBuffer = gpuConversionResult.buffer;
             vOffset = gpuConversionResult.offset;
             vSize = gpuConversionResult.size;
@@ -3260,119 +3323,127 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         // Prepare index data
         // Handle indexed TRIANGLEFAN - expand indices to triangle-list
         const _tSIdx = drawCostProfiler.now();
-        let finalIndexCount = iCount;
+        const finalIndexCount = primitiveType === D3DPT_TRIANGLEFAN && iCount >= 3 ? (iCount - 2) * 3 : iCount;
         let indexFormat: GPUIndexFormat = "uint16";
         if (indexDataSize === iCount * 4) {
             indexFormat = "uint32";
         }
 
-        let expandedIndices: Uint8Array | null = null;
-        let expandedIndexBytes = 0;
-        if (primitiveType === D3DPT_TRIANGLEFAN && iCount >= 3) {
-            // Expand indexed triangle fan to triangle list: for each triangle (0, i+1, i+2) create 3 indices
-            finalIndexCount = (iCount - 2) * 3;
-            const expandedIndexSize = finalIndexCount * (indexFormat === "uint32" ? 4 : 2);
-            const alignedExpandedSize = (expandedIndexSize + 3) & ~3;
-            expandedIndices = this.ensureScratchBuffer(alignedExpandedSize);
-            expandedIndexBytes = alignedExpandedSize;
-            
-            // Read original indices
-            const originalIndices = memory.subarray(indicesAddr, indicesAddr + indexDataSize);
-            
-            if (indexFormat === "uint32") {
-                // 32-bit indices
-                const srcView = new Uint32Array(originalIndices.buffer, originalIndices.byteOffset, iCount);
-                const dstView = new Uint32Array(expandedIndices.buffer, expandedIndices.byteOffset, finalIndexCount);
-                
-                for (let i = 0; i < iCount - 2; i++) {
-                    const raw0 = srcView[0];      // Fan center (always first index)
-                    const raw1 = srcView[i + 1];
-                    const raw2 = srcView[i + 2];
-                    if (raw0 < appliedIndexBase || raw1 < appliedIndexBase || raw2 < appliedIndexBase) {
-                        Logger.warn(LogCategory.SYSTEM, `drawIndexedPrimitive: triangle fan index rebase underflow (base=${appliedIndexBase})`);
-                        return;
-                    }
-                    const idx0 = raw0 - appliedIndexBase;
-                    const idx1 = raw1 - appliedIndexBase;
-                    const idx2 = raw2 - appliedIndexBase;
-                    const dstBase = i * 3;
-                    dstView[dstBase] = idx0;
-                    dstView[dstBase + 1] = idx1;
-                    dstView[dstBase + 2] = idx2;
-                }
-            } else {
-                // 16-bit indices
-                const srcView = new Uint16Array(originalIndices.buffer, originalIndices.byteOffset, iCount);
-                const dstView = new Uint16Array(expandedIndices.buffer, expandedIndices.byteOffset, finalIndexCount);
-                
-                for (let i = 0; i < iCount - 2; i++) {
-                    const raw0 = srcView[0];
-                    const raw1 = srcView[i + 1];
-                    const raw2 = srcView[i + 2];
-                    if (raw0 < appliedIndexBase || raw1 < appliedIndexBase || raw2 < appliedIndexBase) {
-                        Logger.warn(LogCategory.SYSTEM, `drawIndexedPrimitive: triangle fan index rebase underflow (base=${appliedIndexBase})`);
-                        return;
-                    }
-                    const idx0 = raw0 - appliedIndexBase;
-                    const idx1 = raw1 - appliedIndexBase;
-                    const idx2 = raw2 - appliedIndexBase;
-                    if (idx0 > 0xFFFF || idx1 > 0xFFFF || idx2 > 0xFFFF) {
-                        Logger.warn(LogCategory.SYSTEM, `drawIndexedPrimitive: rebased uint16 index overflow`);
-                        return;
-                    }
-                    const dstBase = i * 3;
-                    dstView[dstBase] = idx0;
-                    dstView[dstBase + 1] = idx1;
-                    dstView[dstBase + 2] = idx2;
-                }
-            }
-        }
+        const alignedIndexSize = (finalIndexSize + 3) & ~3;
+        const indexUploadKey = retainedIndexKey === undefined ? undefined : retainedIndexKey + ':' + primitiveType;
+        const indexUpload = indexUploadKey === undefined ? undefined
+            : this.retainedIndexRanges.findUpload(indexUploadKey, this.encoderEpoch, alignedIndexSize);
+        let iBuffer: GPUBuffer;
+        let iOffset: number;
+        if (indexUpload) {
+            iBuffer = indexUpload.buffer;
+            iOffset = indexUpload.offset;
+        } else {
+            let expandedIndices: Uint8Array | null = null;
+            if (primitiveType === D3DPT_TRIANGLEFAN && iCount >= 3) {
+                // Expand indexed triangle fan to triangle list: for each triangle (0, i+1, i+2) create 3 indices
+                expandedIndices = this.ensureScratchBuffer(alignedIndexSize);
 
-        const indexScratch = expandedIndices || this.ensureScratchBuffer((indexDataSize + 3) & ~3);
-        if (!expandedIndices) {
-            if (appliedIndexBase === 0) {
-                indexScratch.set(memory.subarray(indicesAddr, indicesAddr + indexDataSize));
-            } else {
-                const srcOffset = memory.byteOffset + indicesAddr;
+                // Read original indices
+                const originalIndices = memory.subarray(indicesAddr, indicesAddr + indexDataSize);
+
                 if (indexFormat === "uint32") {
-                    const srcView = new DataView(memory.buffer, srcOffset, iCount * 4);
-                    const dstView = new DataView(indexScratch.buffer, indexScratch.byteOffset, indexScratch.byteLength);
-                    for (let i = 0; i < iCount; i++) {
-                        const raw = srcView.getUint32(i * 4, true);
-                        if (raw < appliedIndexBase) {
-                            Logger.warn(LogCategory.SYSTEM, `drawIndexedPrimitive: index rebase underflow (base=${appliedIndexBase})`);
+                    // 32-bit indices
+                    const srcView = new Uint32Array(originalIndices.buffer, originalIndices.byteOffset, iCount);
+                    const dstView = new Uint32Array(expandedIndices.buffer, expandedIndices.byteOffset, finalIndexCount);
+
+                    for (let i = 0; i < iCount - 2; i++) {
+                        const raw0 = srcView[0];      // Fan center (always first index)
+                        const raw1 = srcView[i + 1];
+                        const raw2 = srcView[i + 2];
+                        if (raw0 < appliedIndexBase || raw1 < appliedIndexBase || raw2 < appliedIndexBase) {
+                            Logger.warn(LogCategory.SYSTEM, `drawIndexedPrimitive: triangle fan index rebase underflow (base=${appliedIndexBase})`);
                             return;
                         }
-                        dstView.setUint32(i * 4, (raw - appliedIndexBase) >>> 0, true);
+                        const idx0 = raw0 - appliedIndexBase;
+                        const idx1 = raw1 - appliedIndexBase;
+                        const idx2 = raw2 - appliedIndexBase;
+                        const dstBase = i * 3;
+                        dstView[dstBase] = idx0;
+                        dstView[dstBase + 1] = idx1;
+                        dstView[dstBase + 2] = idx2;
                     }
                 } else {
-                    const srcView = new DataView(memory.buffer, srcOffset, iCount * 2);
-                    const dstView = new DataView(indexScratch.buffer, indexScratch.byteOffset, indexScratch.byteLength);
-                    for (let i = 0; i < iCount; i++) {
-                        const raw = srcView.getUint16(i * 2, true);
-                        if (raw < appliedIndexBase) {
-                            Logger.warn(LogCategory.SYSTEM, `drawIndexedPrimitive: index rebase underflow (base=${appliedIndexBase})`);
+                    // 16-bit indices
+                    const srcView = new Uint16Array(originalIndices.buffer, originalIndices.byteOffset, iCount);
+                    const dstView = new Uint16Array(expandedIndices.buffer, expandedIndices.byteOffset, finalIndexCount);
+
+                    for (let i = 0; i < iCount - 2; i++) {
+                        const raw0 = srcView[0];
+                        const raw1 = srcView[i + 1];
+                        const raw2 = srcView[i + 2];
+                        if (raw0 < appliedIndexBase || raw1 < appliedIndexBase || raw2 < appliedIndexBase) {
+                            Logger.warn(LogCategory.SYSTEM, `drawIndexedPrimitive: triangle fan index rebase underflow (base=${appliedIndexBase})`);
                             return;
                         }
-                        const rebased = raw - appliedIndexBase;
-                        if (rebased > 0xFFFF) {
+                        const idx0 = raw0 - appliedIndexBase;
+                        const idx1 = raw1 - appliedIndexBase;
+                        const idx2 = raw2 - appliedIndexBase;
+                        if (idx0 > 0xFFFF || idx1 > 0xFFFF || idx2 > 0xFFFF) {
                             Logger.warn(LogCategory.SYSTEM, `drawIndexedPrimitive: rebased uint16 index overflow`);
                             return;
                         }
-                        dstView.setUint16(i * 2, rebased, true);
+                        const dstBase = i * 3;
+                        dstView[dstBase] = idx0;
+                        dstView[dstBase + 1] = idx1;
+                        dstView[dstBase + 2] = idx2;
                     }
                 }
             }
-        }
-        const alignedIndexSize = expandedIndices ? expandedIndexBytes : ((indexDataSize + 3) & ~3);
-        const indexAlloc = this.ringBufferManager.allocateIndexData(
-            indexScratch.subarray(0, alignedIndexSize)
-        );
-        if (indexAlloc.overflow) {
 
-            return; // Skip draw — index ring buffer full
+            const indexScratch = expandedIndices || this.ensureScratchBuffer((indexDataSize + 3) & ~3);
+            if (!expandedIndices) {
+                if (appliedIndexBase === 0) {
+                    indexScratch.set(memory.subarray(indicesAddr, indicesAddr + indexDataSize));
+                } else {
+                    const srcOffset = memory.byteOffset + indicesAddr;
+                    if (indexFormat === "uint32") {
+                        const srcView = new DataView(memory.buffer, srcOffset, iCount * 4);
+                        const dstView = new DataView(indexScratch.buffer, indexScratch.byteOffset, indexScratch.byteLength);
+                        for (let i = 0; i < iCount; i++) {
+                            const raw = srcView.getUint32(i * 4, true);
+                            if (raw < appliedIndexBase) {
+                                Logger.warn(LogCategory.SYSTEM, `drawIndexedPrimitive: index rebase underflow (base=${appliedIndexBase})`);
+                                return;
+                            }
+                            dstView.setUint32(i * 4, (raw - appliedIndexBase) >>> 0, true);
+                        }
+                    } else {
+                        const srcView = new DataView(memory.buffer, srcOffset, iCount * 2);
+                        const dstView = new DataView(indexScratch.buffer, indexScratch.byteOffset, indexScratch.byteLength);
+                        for (let i = 0; i < iCount; i++) {
+                            const raw = srcView.getUint16(i * 2, true);
+                            if (raw < appliedIndexBase) {
+                                Logger.warn(LogCategory.SYSTEM, `drawIndexedPrimitive: index rebase underflow (base=${appliedIndexBase})`);
+                                return;
+                            }
+                            const rebased = raw - appliedIndexBase;
+                            if (rebased > 0xFFFF) {
+                                Logger.warn(LogCategory.SYSTEM, `drawIndexedPrimitive: rebased uint16 index overflow`);
+                                return;
+                            }
+                            dstView.setUint16(i * 2, rebased, true);
+                        }
+                    }
+                }
+            }
+            const indexData = indexScratch.subarray(0, alignedIndexSize);
+            const indexAlloc = this.ringBufferManager.allocateIndexData(indexData);
+            if (indexAlloc.overflow) {
+
+                return; // Skip draw — index ring buffer full
+            }
+            iBuffer = indexAlloc.buffer;
+            iOffset = indexAlloc.offset;
+            if (indexUploadKey !== undefined) {
+                this.retainedIndexRanges.rememberUpload(indexUploadKey, this.encoderEpoch, iBuffer, iOffset);
+            }
         }
-        const { buffer: iBuffer, offset: iOffset } = indexAlloc;
         drawCostProfiler.add(DC.s_idx, _tSIdx);
 
         // MegaBatch for indexed draws: same as drawPrimitive — per-draw uniforms in storage buffer,
@@ -3389,7 +3460,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                 this.ffpStages,
                 false,
                 renderStates,
-                texture
+                texture,
+                fromD3D8,
             )
             : null;
         drawCostProfiler.add(DC.s_pipe, _tSPipe);
@@ -3518,8 +3590,16 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                 this.ensureRenderPass(target, viewport);
                 this.setupPipelineAndBindings(prepareResult);
 
-                // Pass size to setVertexBuffer to prevent reading beyond vertex data in ring buffer
-                this.currentRenderPass!.setVertexBuffer(0, vBuffer, vOffset, vSize);
+                if (directBindings?.length) {
+                    for (let slot = 0; slot < directBindings.length; slot++) {
+                        const binding = directBindings[slot];
+                        this.currentRenderPass!.setVertexBuffer(slot, binding.buffer, binding.offset, binding.size);
+                    }
+                    ffpDirectVertexStats.draws++;
+                    ffpDirectVertexStats.streamBytes += directBytes;
+                } else {
+                    this.currentRenderPass!.setVertexBuffer(0, vBuffer, vOffset, vSize);
+                }
                 this.currentRenderPass!.setIndexBuffer(iBuffer, indexFormat, iOffset);
                 // Use finalIndexCount (expanded for triangle fan) instead of original iCount
                 this.currentRenderPass!.drawIndexed(finalIndexCount);
@@ -3565,20 +3645,18 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         try {
             this.renderStats.flushes++;
             this.flushBatch();
-            // These publish this frame's staged uploads. A throw here — an oversize or
-            // misaligned writeBuffer — would otherwise skip the submit AND its teardown
-            // below, leaving currentEncoder alive with an open pass for every later frame
-            // to append to: one bad frame becomes every frame after it. Losing this frame's
-            // uploads is recoverable; losing the encoder is not.
+            // An encoder whose uploads failed must be discarded and reset before the next frame.
+            let uploadsReady = false;
             try {
                 this.vertexConverter.flushParams();
                 this.ringBufferManager.flushGeometry();
                 this.ringBufferManager.flushUniforms();
                 this.ringBufferManager.flushLights();
                 this.ringBufferManager.flushStorageBuffer();
+                uploadsReady = true;
             } catch (e) {
                 recordGpuError("throw", "ddrawExecutor.flushUploads", String(e));
-                Logger.error(LogCategory.DDRAW, `[WEBGPU] flush() upload publish failed — frame's uploads dropped: ${e}`);
+                Logger.error(LogCategory.DDRAW, `[WEBGPU] flush() upload publish failed; encoder discarded: ${e}`);
             }
 
             if (drainDeferredClears && this.surfacesNeedingClear.size > 0) {
@@ -3632,8 +3710,13 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
             if (this.currentEncoder) {
                 const submittedEncoder = this.currentEncoder;
                 const submitStart = frameProfiler.startTimer();
+                let submitted = false;
                 try {
-                    this.queue.submit([this.currentEncoder.finish()]);
+                    if (uploadsReady) {
+                        this.queue.submit(finishDrawCommands(submittedEncoder));
+                        submitted = true;
+                        ffpEncoderSubmitStats.count++;
+                    }
                 } catch (e) {
                     // The teardown below must run even on a throw. A finish()/submit() that throws
                     // leaves the encoder already finished, so keeping it would hand every later
@@ -3642,6 +3725,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                     Logger.error(LogCategory.DDRAW, `[WEBGPU] flush() submit failed — frame discarded: ${e}`);
                 } finally {
                     // Queue submission or permanent abandonment releases this encoder only.
+                    this.retainedVertexConversions?.retire(submittedEncoder, submitted);
+                    this.retainedDirectStreams?.retire(submittedEncoder, submitted);
                     this.clearPipeline.destroyPendingAfterSubmit(submittedEncoder);
                 }
                 frameProfiler.endTimer("gpu", submitStart);
@@ -3668,6 +3753,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
 
     /** Retire clear uniforms when an external caller abandons a detached encoder. */
     discardPendingDraws(encoder: GPUCommandEncoder): void {
+        this.retainedVertexConversions?.retire(encoder, false);
+        this.retainedDirectStreams?.retire(encoder, false);
         this.clearPipeline.destroyPendingAfterSubmit(encoder);
     }
 
@@ -3676,6 +3763,8 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
      * Call after queue.submit() when using finalizePendingDraws().
      */
     postSubmitCleanup(submittedEncoder: GPUCommandEncoder): void {
+        this.retainedVertexConversions?.retire(submittedEncoder, true);
+        this.retainedDirectStreams?.retire(submittedEncoder, true);
         this.clearPipeline.destroyPendingAfterSubmit(submittedEncoder);
         this.depthManager.flushGarbage();
         this.msaaColorManager.flushGarbage();
@@ -4017,6 +4106,9 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
      *  is the whole copy→draw→copy→draw hazard, and comparing this to a surface's
      *  sampledEncoderEpoch is how we detect it. */
     private encoderEpoch = 1;
+    private readonly retainedVertexConversions = new RetainedVertexConversions();
+    private readonly retainedDirectStreams = new RetainedVertexConversions(ffpDirectVertexStats, "persistent");
+    private readonly retainedIndexRanges = new RetainedIndexRanges();
 
     /** The encoder epoch in which recorded (unsubmitted) work last read or wrote a texture.
      *  Keyed by GPUTexture, not by surface, so a flip chain that rotates textures between
@@ -4550,7 +4642,9 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
         stageTextures: readonly (DirectDrawSurfaceState | null)[] | null,
         skipLegacyUniform?: boolean,
         texMatrices?: readonly (Float32Array | null)[] | null,
-        lighting?: FFPLightingState
+        lighting?: FFPLightingState,
+        directVertex?: DirectVertexLayout,
+        fromD3D8 = false,
     ): PrepareDrawResult {
         this.ensureSurfaceGPUResources(target);
 
@@ -4632,7 +4726,9 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
                 this.ffpStages,
                 false,
                 renderStates,
-                null
+                null,
+                undefined,
+                fromD3D8,
             );
             pr.sampledMask = 0;
             pr.stageCount = this.ffpStages.stageCount;
@@ -5202,7 +5298,9 @@ export class DDrawWebGPUExecutor implements QueueWriteGuard {
             stages,
             stages.missingMask !== 0,
             renderStates,
-            texture
+            texture,
+            directVertex,
+            fromD3D8,
         );
         drawCostProfiler.add(DC.p_pipe, _tPPipe);
 

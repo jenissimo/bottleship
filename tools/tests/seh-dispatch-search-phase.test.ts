@@ -15,6 +15,10 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { System } from "../../src/worker/core/system";
+import { SEH_SCRATCH_LAYOUT } from "../../src/worker/core/thunking/seh-layout";
+import { ThunkDispatcher } from "../../src/worker/core/thunking/thunk-dispatcher";
+import { exports as exceptions } from "../../src/worker/modules/kernel32/exception";
 import {
     classifyCxxFrame,
     dispatchCxxException,
@@ -73,6 +77,56 @@ function writeFuncInfo(
     dv.setInt32(handlerArray + 8, 0, true);           // dispCatchObj
     dv.setUint32(handlerArray + 12, catchAddr, true);
 }
+
+test("an unwind that returns to the SEH result stub retains its active CONTEXT", () => {
+    const { mem, dv } = mkMem();
+    const cpu = {
+        reg32: new Int32Array(8),
+        flags: new Int32Array(1),
+        flags_changed: new Int32Array(1),
+        segment_offsets: new Int32Array(8),
+    };
+    cpu.segment_offsets[4] = TEB;
+    cpu.reg32[4] = 0x28000;
+    const frame = 0x29000;
+    dv.setUint32(TEB, frame, true);
+    const scratchAddr = 0x33000;
+    const context = scratchAddr + SEH_SCRATCH_LAYOUT.CONTEXT;
+    const resumeEip = 0x20000;
+    const resumeEsp = 0x2a000;
+    dv.setUint32(scratchAddr + SEH_SCRATCH_LAYOUT.DISPATCH_RESULT, 0, true);
+    dv.setUint32(context + 0xb0, 42, true); // EAX
+    dv.setUint32(context + 0xb8, resumeEip, true);
+    dv.setUint32(context + 0xc4, resumeEsp, true);
+    const completed: number[] = [];
+    const dispatcher = Object.assign(Object.create(ThunkDispatcher.prototype), {
+        sehDispatchStack: [{ generation: 3, scratchAddr, startEsp: 0x28000 }],
+        sehScratchAddr: 0x30000,
+        cachedDataView: dv,
+        memLength: mem.length,
+        _leaveSehCriticalRuntime: (_reason: string, generation: number) => completed.push(generation),
+    });
+    const system = System.getInstance();
+    const savedProcess = system.process;
+    system.process = { v86: { cpu }, dispatcher } as unknown as NonNullable<typeof system.process>;
+    try {
+        const result = exceptions.RtlUnwind(
+            { eax: 0, ecx: 0, edx: 0, ebx: 0, esp: cpu.reg32[4], ebp: 0, esi: 0, edi: 0, eip: 0, eflags: 2 },
+            mem, [frame, 0, 0, 0],
+        );
+        expect(result).toEqual({ value: 0, stackCleanup: 16 });
+        expect(dispatcher.getSehDispatchDepth()).toBe(1);
+
+        dispatcher._handleSehDispatchResult(cpu);
+        expect(dispatcher.getSehDispatchDepth()).toBe(0);
+        expect(completed).toEqual([3]);
+        expect(cpu.reg32[0]).toBe(42);
+        expect(cpu.reg32[4]).toBe(resumeEsp - 4);
+        expect(dv.getUint32(resumeEsp - 4, true)).toBe(resumeEip);
+    } finally {
+        system.process = savedProcess;
+    }
+});
 
 describe("classifyCxxFrame", () => {
     test("recognizes the VC5/6 layout (FuncInfo at +8, try-level at +12)", () => {

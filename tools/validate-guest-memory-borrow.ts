@@ -71,6 +71,13 @@ const LEGACY = new Map<string, number>([
     ["modules/user32/window.ts", 1],
 ]);
 
+/** Fixed Uint8Array access in WWT's own lifecycle, I/O and protected-mode leaves. */
+const WWT_VIEWS = new Map([
+    ["wwt/port-io.ts", 1],
+    ["wwt/cpu-protected.ts", 16],
+    ["wwt/emulator.ts", 1],
+]);
+
 /** Receiver spellings that are NOT v86's raw view — see the header. */
 const SAFE_RECEIVERS = new Set(["this"]);
 
@@ -96,6 +103,7 @@ const offenders: { file: string; line: number; text: string }[] = [];
 /** Every file that names mem8 at all — the stale-OWNERS check reads this. */
 const namesMem8 = new Set<string>();
 const legacySeen = new Map<string, number>();
+const wwtSeen = new Map<string, number>();
 
 for (const file of walk(ROOT)) {
     const rel = relative(ROOT, file).split(sep).join("/");
@@ -110,6 +118,7 @@ for (const file of walk(ROOT)) {
         // A must-normalize owner may name mem8 only inside toPlainGuestMemory(...).
         if (mustNormalize && code.includes("toPlainGuestMemory(")) return;
         if (LEGACY.has(rel)) { legacySeen.set(rel, (legacySeen.get(rel) ?? 0) + 1); return; }
+        if (WWT_VIEWS.has(rel)) { wwtSeen.set(rel, (wwtSeen.get(rel) ?? 0) + 1); return; }
         offenders.push({ file: rel, line: i + 1, text: text.trim() });
     });
 }
@@ -122,13 +131,19 @@ for (const [rel, expected] of LEGACY) {
     if (found !== expected) drifted.push(`  ${rel}: ${found} raw site(s), pinned at ${expected}`);
 }
 
+// WWT's three private leaves receive the plain view, not a v86-compatible proxy.
+for (const [rel, expected] of WWT_VIEWS) {
+    const found = wwtSeen.get(rel) ?? 0;
+    if (found !== expected) drifted.push(`  ${rel}: ${found} fixed guest-view site(s), pinned at ${expected}`);
+}
+
 // A stale OWNERS entry grants an exemption nothing needs — and reads as evidence that the
 // file still takes the proxy when it no longer does.
 const staleOwners = Object.keys(OWNERS).filter(rel => !namesMem8.has(rel));
 
 if (drifted.length > 0 || staleOwners.length > 0) {
     if (drifted.length > 0) {
-        console.error("The pinned legacy raw-proxy count changed:\n");
+        console.error("The pinned guest-memory view count changed:\n");
         for (const d of drifted) console.error(d);
         console.error("\nFixed one? Lower the number. Added one? Take memory from process.getCurrentMemory().\n");
     }

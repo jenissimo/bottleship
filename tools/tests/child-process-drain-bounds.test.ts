@@ -17,7 +17,7 @@
  */
 import { describe, expect, test, afterEach } from "bun:test";
 import {
-    startChildExecution, setChildDrainBudgetForTests, type ChildProcessRecord,
+    startChildExecution, stopChildProcesses, setChildDrainBudgetForTests, type ChildProcessRecord,
 } from "../../src/worker/core/child-process";
 import {
     createChildVfsServer, setChildVfsCloseBudgetForTests, CHILD_IO_BYTES,
@@ -26,7 +26,8 @@ import type { VirtualFileSystem } from "../../src/worker/runtime/filesystem/vfs"
 
 const TEST_BUDGET_MS = 60;
 
-afterEach(() => {
+afterEach(async () => {
+    await stopChildProcesses();
     setChildDrainBudgetForTests(30_000);
     setChildVfsCloseBudgetForTests(30_000);
 });

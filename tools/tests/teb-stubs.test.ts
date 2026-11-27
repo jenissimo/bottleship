@@ -293,7 +293,7 @@ async function runArm(viaStubs: boolean, hcRouting = false): Promise<Arm> {
     }
 }
 
-describe.skipIf(!existsSync(lib) || !existsSync(wasm))('kernel32 TEB stubs, executed', () => {
+describe.skipIf(process.env.BS_RUN_LEGACY_TESTS === "0" || !existsSync(lib) || !existsSync(wasm))('kernel32 TEB stubs, executed', () => {
     test('FLS preserves native LastError and missing-thread-block semantics with stubs disabled or bound', async () => {
         const off=await runArm(false,true), on=await runArm(true,true);
         for(const arm of [off,on]) {

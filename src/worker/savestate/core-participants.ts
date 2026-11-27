@@ -14,6 +14,7 @@ import type { MemoryManagerState } from '../core/process';
 import type { ThunkGeneratorState, ThunkStub } from '../core/thunking/thunk-generator';
 import { captureKernel32Memory, restoreKernel32Memory, type Kernel32MemoryState } from '../modules/kernel32/memory';
 import { pickSaved, savestateParticipants, stateKeys, type CaptureContext, type FieldPolicy } from './participant';
+import { WwtEmulator } from '../wwt/emulator';
 import { CPU_FIELDS, captureCpu, restoreCpu, type V86Cpu } from './participants/cpu';
 import { MODULE_IMAGES_SCHEMA, moduleImagesHooks } from './participants/module-images';
 import { CaptureRefusal, objectCodecs } from './object-codecs';
@@ -252,11 +253,21 @@ export function registerCoreParticipants(): void {
         capture: () => touchedModules().sort(),
         restore: (s) => checkLoadedModules(s as string[], touchedModules()),
     });
-    savestateParticipants.add({
-        id: 'cpu', version: 1, order: 99, schema: schema(SCHEMAS.cpu),
-        capture: (ctx) => captureCpu(v86Cpu(), ctx.cpuOverride()),
-        restore: (s) => restoreCpu(v86Cpu(), s),
-    });
+    const engine = System.getInstance().process?.v86;
+    if (engine instanceof WwtEmulator) {
+        savestateParticipants.add({
+            id: 'cpu', version: 2, order: 99, schema: { logical: ['format', 'memorySize', 'registers'] },
+            capture: (ctx) => engine.cpu.saveRegisters(ctx.cpuOverride()),
+            verify: (s) => { engine.cpu.validateRegisterSnapshot(s); },
+            restore: (s) => engine.cpu.restoreRegisters(s),
+        });
+    } else {
+        savestateParticipants.add({
+            id: 'cpu', version: 1, order: 99, schema: schema(SCHEMAS.cpu),
+            capture: (ctx) => captureCpu(v86Cpu(), ctx.cpuOverride()),
+            restore: (s) => restoreCpu(v86Cpu(), s),
+        });
+    }
 }
 
 export function checkLoadedModules(saved: readonly string[], now: readonly string[]): void {

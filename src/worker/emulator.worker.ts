@@ -1,5 +1,6 @@
 import { parseIoProfile, profileChunkOrder, type WgbIoPolicy } from "@bottleship/formats/wgb/io-profile";
-import { V86 } from "v86";
+import { WwtEmulator } from "./wwt/emulator";
+import type { PeAotProgress } from "./wwt/pe-aot-progress";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { adoptFreshGuestMemory } from "./core/memory/guest-page-dirty";
 import { noteBootError, noteBootIdentity, restorePendingAtEntry, savestatesEnabled, type BundleEntryKey } from "./savestate/host";
@@ -40,10 +41,27 @@ setChildSessionPublisher((port, record) => {
 /** Set by the page (set_jit_policy) or inherited by a child; applied at every v86 init. */
 // @transient(host JIT policy from the page, applies to every session in this worker by design)
 let hostJitMode: HostJitMode = "on";
+const wwtOnly = import.meta.env.VITE_CPU_BACKEND !== "v86";
+// @transient(worker CPU backend applies to all guest sessions in this worker)
+let cpuBackend: "v86" | "wwt" = wwtOnly ? "wwt" : "v86";
+// @transient(a worker cannot replace its initialized CPU backend in place)
+let cpuBackendLocked = false;
+// @transient(explicit page CPU mode; manifests are resolved independently on each boot)
+let requestedWwtMode: WwtMode | undefined;
+// @transient(explicit page or deployment compatibility override across game switches)
+let requestedWwtMemory: unknown = import.meta.env.VITE_WWT_MEMORY;
+// @transient(explicit page AOT layout carried into the CPU mode choice)
+let requestedWwtLinkage: unknown;
+// @transient(mode of the live CPU instance, updated when that runtime is replaced)
+let activeWwtMode: WwtMode = "fast";
+const wwtModeFor = (manifest?: WgbManifest): WwtMode =>
+  resolveWwtMode(requestedWwtMode, manifest?.emulator?.wwtMode, requestedWwtMemory, requestedWwtLinkage);
 execHealth.setSinks((hint) => self.postMessage(hint), (snapshot) => statsOverlay.setExecHealth(snapshot));
 setChildBootContext(() => ({
   jitMode: hostJitMode,
   jitReason: execHealth.getPolicyReason(),
+  cpuBackend,
+  wwtMode: activeWwtMode,
   config: EmulatorConfig.getInstance().snapshotForChild(),
   registry: System.getInstance().registry.serialize(),
   namedObjects: namedObjects.snapshot(),
@@ -155,6 +173,7 @@ import {
   EMU_NATIVE_VIDEO_DLLS
 } from "./core/cpu/emulator-config";
 import { WgbLoader, buildRomIndex, readEntrypointBytes, type WgbManifest, type WgbWriteFileSpec } from "./runtime/filesystem/wgb-loader";
+import { parseWwtMode, resolveWwtMode, type WwtMode } from "./wwt/mode";
 import { WgbCache } from "./runtime/filesystem/wgb-cache";
 import { shouldPersistBundleUrl } from "./runtime/filesystem/wgb-cache-policy";
 import { detectSourceFormat, sniffBlobHead } from "@bottleship/repack/detect";
@@ -191,7 +210,7 @@ import { writeGuestCode } from "./core/memory/guest-code";
 import { statsOverlay } from "./core/stats-overlay";
 import { execHealth, type JitReason } from "./core/execution-health";
 import { workerTime } from "./core/worker-time-accounting";
-import { readRetiredInsns } from "./core/cpu/cpu-views";
+import { readEip, readRetiredInsns } from "./core/cpu/cpu-views";
 import { hypercallDataManager } from "./core/cpu/hypercall-data";
 import { d3d9WasmArena } from "./backends/webgpu/d3d9/d3d9-wasm-arena";
 import { bootMark, dumpBootTimeline } from "./core/boot-timer";
@@ -367,9 +386,16 @@ const resetHleReady = (): void => {
   hleReady = new Promise<void>((resolve) => { resolveHleReady = resolve; });
 };
 
-let pendingPeData: Uint8Array | null = null;
-let pendingBundle: { data?: Uint8Array; url?: string; blob?: Blob; preload?: boolean; io?: WgbIoPolicy } | null = null;
-let preparedPendingBundle: { payload: { data?: Uint8Array; url?: string; blob?: Blob; preload?: boolean; io?: WgbIoPolicy }; bundle: import("./runtime/filesystem/wgb-loader").WgbBundle } | null = null;
+type BundleLoadPayload = {
+  data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean; io?: WgbIoPolicy; launchId?: number;
+};
+let pendingPeData: { bytes: Uint8Array; launchId: number } | null = null;
+let pendingBundle: BundleLoadPayload | null = null;
+/** @transient(host launch token replaced whenever a different load starts) */
+let peAotLaunchId = 0;
+/** @transient(monotonic AOT progress identifier scoped to the host worker lifetime) */
+let peAotAttempt = 0;
+let preparedPendingBundle: { payload: BundleLoadPayload; bundle: import("./runtime/filesystem/wgb-loader").WgbBundle } | null = null;
 let heartbeatInterval: number | null = null;
 let schedulerInterval: number | null = null;
 let registryFlushInterval: number | null = null;
@@ -458,7 +484,7 @@ networkConsent.onWaitingChange(waiting => {
 /** True once a PE has been booted in this worker session (loadApp / load_bundle without page reload). */
 let gameSessionActive = false;
 /** The payload that booted the current game — replayed verbatim by a self re-exec. */
-let lastBundlePayload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean; io?: WgbIoPolicy } | null = null;
+let lastBundlePayload: BundleLoadPayload | null = null;
 /** Command line the next boot must use instead of the manifest's `args` (self re-exec). */
 let pendingReExecArgs: string | null = null;
 /** Harness boot-args override (load_bundle `args`): replaces the manifest's args for one
@@ -1199,11 +1225,11 @@ const drawPlaceholder = () => {
  *  or the host is told the load succeeded and keeps its launch overlay up over the crash. */
 type PeLoadResult = "ok" | "queued" | "failed";
 
-const loadPeData = async (peData: Uint8Array, skipReset: boolean = false): Promise<PeLoadResult> => {
+const loadPeData = async (peData: Uint8Array, skipReset: boolean = false, launchId = peAotLaunchId): Promise<PeLoadResult> => {
   const system = System.getInstance();
   if (!system.process) {
     Logger.log(LogCategory.SYSTEM, "System not ready, queuing PE data");
-    pendingPeData = peData;
+    pendingPeData = { bytes: peData, launchId };
     return "queued";
   }
   // The Process exists but the dispatch table may still be empty (see hleReady).
@@ -1212,6 +1238,8 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false): Promi
   // Reset system state before loading new application
   if (!skipReset) {
     await prepareFullGameSwitch();
+    peAotLaunchId = launchId;
+    if (await switchWwtRuntime(wwtModeFor(), () => { pendingPeData = { bytes: peData, launchId }; })) return "queued";
   }
 
   await finishProcessNetworkLifetime();
@@ -1413,7 +1441,13 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false): Promi
       stackPointer = 0x90000;
       Logger.warn(LogCategory.SYSTEM, `Main thread stack: fallback to 0x${stackPointer.toString(16)} (HEAP not available)`);
     }
-    const { code: bootCode, loadAddress, startAddress } = createBootloader(module.entryPoint, stackPointer, pendingDllInits);
+    const wwt = system.process.v86 instanceof WwtEmulator;
+    // WWT guards data accesses to the first 64 KiB. Keep the DllMain table in
+    // ordinary allocated RAM while continuing to share the low-memory GDT/IDT.
+    const dllTableAddress = wwt ? system.process.memory.alloc((pendingDllInits.length + 1) * 8, 'THUNK_DATA') : undefined;
+    const { code: bootCode, loadAddress, startAddress, protectedEntry, gdtAddress, idtAddress, externalDllTable } =
+      createBootloader(module.entryPoint, stackPointer, pendingDllInits, dllTableAddress);
+    if (externalDllTable && dllTableAddress !== undefined) mem8.set(externalDllTable, dllTableAddress);
 
     // Write bootloader at 0x7C00 (includes code + boot sig + GDT at 0x7E00)
     writeGuestCode(mem8, bootCode, loadAddress);
@@ -1431,27 +1465,25 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false): Promi
     const win9x = EmulatorConfig.getInstance().osVersion.platformId === VER_PLATFORM_WIN32_WINDOWS;
     ptm.initialize(mem8.length, win9x);
     system.process!.pageTableManager = ptm;
-    system.process!.addressSpace.onAccessChange = (base, size) => system.scheduler.forgetPriorityMirrorsOverlapping(base, size);
+    system.process!.addressSpace.onAccessChange = (base, size) => {
+      system.scheduler.forgetPriorityMirrorsOverlapping(base, size);
+      if (system.process?.v86 instanceof WwtEmulator) system.process.v86.cpu.updateCodePermissions(base, size);
+    };
 
     // Provide stack bounds to scheduler for main thread TEB allocation
     system.scheduler.setMainStackInfo(stackPointer, mainStackSize);
 
-    // Set CPU to start executing the bootloader in real mode
-    // After system.reset() -> v86.restart(), the CPU is already in Real Mode.
-    // We just need to point CS:IP to our bootloader.
-    if (cpu.sreg) {
-      cpu.sreg[1] = 0x0000; // CS = 0
-    }
-    cpu.instruction_pointer[0] = startAddress;
-
-    // Ensure segment offsets are 0 for the bootloader (Real Mode)
-    if (cpu.segment_offsets) {
-      for (let i = 0; i < 6; i++) {
-        cpu.segment_offsets[i] = 0;
+    if (wwt) {
+      cpu.enterProtectedMode({ eip: protectedEntry, esp: stackPointer, gdtBase: gdtAddress, idtBase: idtAddress });
+    } else {
+      // v86.restart() leaves the CPU in real mode. Point CS:IP at the startup image.
+      if (cpu.sreg) cpu.sreg[1] = 0x0000;
+      cpu.instruction_pointer[0] = startAddress;
+      if (cpu.segment_offsets) {
+        for (let i = 0; i < 6; i++) cpu.segment_offsets[i] = 0;
       }
     }
-
-    Logger.log(LogCategory.SYSTEM, `Starting bootloader execution at CS:IP = 0:0x${startAddress.toString(16)}`);
+    Logger.log(LogCategory.SYSTEM, `Starting bootloader execution at 0x${(wwt ? protectedEntry : startAddress).toString(16)}`);
 
     const startLoadedImage = (): void => {
       resumeEmulator();
@@ -1629,9 +1661,20 @@ const prepareFullGameSwitch = async (preserveBundleSource = false): Promise<void
   bootMark("system-reset-done");
 };
 
+/** Replace the WWT runtime at a clean game switch, reusing the worker's canvas. */
+async function switchWwtRuntime(mode: WwtMode, queueBoot: () => void): Promise<boolean> {
+  const current = System.getInstance().process?.v86;
+  if (!(current instanceof WwtEmulator) || activeWwtMode === mode) return false;
+  const canvas = state.canvas;
+  if (!canvas) throw new Error("No canvas for WWT mode switch");
+  queueBoot();
+  await initEmulator(canvas, current);
+  return true;
+}
+
 /**
  * The single host-facing "what bundle is this" post. Both load paths (load_bundle and
- * the pendingBundle path inside initV86) go through here — the host keys per-game touch
+ * the pendingBundle path inside initEmulator) go through here — the host keys per-game touch
  * layouts on `gameId` and reads the authored `emulator.touch` tier from this message, so
  * a site that posts one field and not the other silently substitutes auto-detect for an
  * authored layout on that path.
@@ -1650,7 +1693,7 @@ const postBundleMeta = (manifest: WgbManifest, gameId: string): void => {
 /** @transient(boots this worker has run; a savestate loads only on the first, into untouched module state) */
 let bootsInThisWorker = 0;
 
-const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean; io?: WgbIoPolicy }) => {
+const loadBundleImpl = async (payload: BundleLoadPayload) => {
   const system = System.getInstance();
   if (!system.process) {
     pendingBundle = payload;
@@ -1670,6 +1713,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
   const prepared = preparedPendingBundle && preparedPendingBundle.payload === payload ? preparedPendingBundle.bundle : null;
   preparedPendingBundle = null;
   await prepareFullGameSwitch(prepared !== null);
+  peAotLaunchId = payload.launchId ?? 0;
 
   // Restart placeholder drawing
   placeholderActive = true;
@@ -1900,6 +1944,12 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         }
       }
     }
+
+    if (await switchWwtRuntime(wwtModeFor(bundle.manifest), () => {
+      bootsInThisWorker--;
+      pendingBundle = payload;
+      preparedPendingBundle = { payload, bundle };
+    })) return;
 
     // Resolve the per-game container key (WGB v2 gameId, namespaced) and open this game's writable
     // overlay (bottleship/games/<containerDir>/overlay/). On a game switch the previous overlay is
@@ -2144,7 +2194,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     // under one would have been loaded by nothing — the capture would look successful and
     // never be used. `prepare` refuses on a version/engine mismatch anyway, so presence is
     // the honest condition; `__aotNoAutoLoad` remains as the off switch for an A/B arm.
-    aotPrepared = (globalThis as Record<string, unknown>).__aotNoAutoLoad
+    aotPrepared = cpuBackend === "wwt" || (globalThis as Record<string, unknown>).__aotNoAutoLoad
       ? null
       : aotCache.prepare(gameId).catch((e) => ({ error: String(e) }));
 
@@ -2377,7 +2427,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
   }
 };
 
-const loadBundle = (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean; io?: WgbIoPolicy }) => {
+const loadBundle = (payload: BundleLoadPayload) => {
   lastBundlePayload = payload;
   loadBundleChain = loadBundleChain
     .then(() => loadBundleImpl(payload))
@@ -2494,49 +2544,8 @@ const requestSelfReExec = (commandLine: string, imagePath?: string, imagePatches
   return true;
 };
 
-const initV86 = async (canvas: OffscreenCanvas) => {
-  // Install the shared port registry before any guest can bind, including offline boots.
-  getProcessNetworkNamespace();
-  // Arm the HLE gate for THIS emulator instance before anything can await it.
-  resetHleReady();
-  // Try to apply RAM configuration from pending bundle if available
-  let ramSize = EMU_MEMORY_SIZE;
-  if (childBoot?.config) ramSize = EmulatorConfig.getInstance().memory.ram;
-  if (pendingBundle) {
-    try {
-      let bundle;
-      if (pendingBundle.url) {
-        bundle = await WgbLoader.fromUrl(pendingBundle.url, pendingBundle);
-      } else if (pendingBundle.blob) {
-        bundle = await WgbLoader.fromBlob(pendingBundle.blob, (done, total) => {
-          const doneMb = (done / 1024 / 1024).toFixed(0);
-          const totalMb = (total / 1024 / 1024).toFixed(0);
-          const percent = total > 0 ? Math.round(done / total * 100) : 0;
-          self.postMessage({ type: "loading_progress", phase: "caching", percent, label: `${doneMb} / ${totalMb} MB` });
-        });
-      } else {
-        bundle = await WgbLoader.fromBuffer(pendingBundle.data as Uint8Array);
-      }
-
-      preparedPendingBundle = { payload: pendingBundle, bundle };
-      // Apply emulator configuration from manifest for RAM (and reset stale prior-game overrides)
-      const emulatorConfig = EmulatorConfig.getInstance();
-      emulatorConfig.reset();
-      emulatorConfig.applyFromManifest(bundle.manifest);
-      postBundleMeta(bundle.manifest, resolveGameId(bundle.manifest));
-      if (bundle.manifest.emulator?.memory?.ram !== undefined) {
-        ramSize = emulatorConfig.memory.ram;
-        Logger.log(
-          LogCategory.SYSTEM,
-          `EmulatorConfig: RAM from manifest applied at v86 initialization: ${(ramSize / 1024 / 1024).toFixed(0)} MB`
-        );
-      }
-    } catch (err) {
-      // If manifest parsing fails, use default RAM
-      Logger.warn(LogCategory.SYSTEM, `EmulatorConfig: Failed to parse manifest for RAM config, using default`);
-    }
-  }
-
+const createV86Runtime = async (canvas: OffscreenCanvas, ramSize: number) => {
+  const { V86 } = await import("v86");
   // Streaming instantiation of the core module so V8's implicit wasm code cache can engage
   // across cold starts (it is keyed by URL and only fires for the *Streaming entry points —
   // v86's own loader uses the buffer form and therefore always recompiles). Falls back to the
@@ -2567,7 +2576,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
 
   // v86 settings
   const settings = {
-    canvas: canvas,
+    canvas,
     wasm_fn: wasmLoader.wasmFn,
     // DEV cache-bust: the worker's wasm fetch is NOT covered by a hard-reload's cache bypass,
     // so a rebuilt /v86.wasm would otherwise keep loading from the browser cache. Unique URL per
@@ -2583,23 +2592,106 @@ const initV86 = async (canvas: OffscreenCanvas) => {
     log_level: 0, // Disable v86 debug logging for performance
   };
 
+  const v86 = new V86(settings);
+  // v86 sets `wasm_source` itself only on its own loading path; with a custom wasm_fn it
+  // stays undefined. Restore it so the zstd helper-worker path keeps working.
+  wasmLoader.sourceBytes.then(bytes => { if (bytes) (v86 as unknown as { wasm_source?: ArrayBuffer }).wasm_source = bytes; });
+  return v86;
+};
+
+const initEmulator = async (canvas: OffscreenCanvas, previousWwt?: WwtEmulator) => {
+  cpuBackendLocked = true;
+  // Install the shared port registry before any guest can bind, including offline boots.
+  getProcessNetworkNamespace();
+  // Arm the HLE gate for THIS emulator instance before anything can await it.
+  const previousGate = previousWwt ? { ready: hleReady, resolve: resolveHleReady, resolved: hleReadyResolved } : undefined;
+  resetHleReady();
+  // Try to apply RAM configuration from pending bundle if available
+  let ramSize = EMU_MEMORY_SIZE;
+  let wwtMode = childBoot?.wwtMode ?? (childBoot?.wwtFlatRam === false ? "protected" : wwtModeFor());
+  if (childBoot?.config) ramSize = EmulatorConfig.getInstance().memory.ram;
+  if (pendingBundle) {
+    try {
+      let bundle = preparedPendingBundle?.payload === pendingBundle ? preparedPendingBundle.bundle : undefined;
+      if (bundle) {
+        // Reuse the archive held across a WWT mode change.
+      } else if (pendingBundle.url) {
+        bundle = await WgbLoader.fromUrl(pendingBundle.url, pendingBundle);
+      } else if (pendingBundle.blob) {
+        bundle = await WgbLoader.fromBlob(pendingBundle.blob, (done, total) => {
+          const doneMb = (done / 1024 / 1024).toFixed(0);
+          const totalMb = (total / 1024 / 1024).toFixed(0);
+          const percent = total > 0 ? Math.round(done / total * 100) : 0;
+          self.postMessage({ type: "loading_progress", phase: "caching", percent, label: `${doneMb} / ${totalMb} MB` });
+        });
+      } else {
+        bundle = await WgbLoader.fromBuffer(pendingBundle.data as Uint8Array);
+      }
+
+      preparedPendingBundle = { payload: pendingBundle, bundle };
+      // Apply emulator configuration from manifest for RAM (and reset stale prior-game overrides)
+      const emulatorConfig = EmulatorConfig.getInstance();
+      emulatorConfig.reset();
+      emulatorConfig.applyFromManifest(bundle.manifest);
+      wwtMode = wwtModeFor(bundle.manifest);
+      postBundleMeta(bundle.manifest, resolveGameId(bundle.manifest));
+      if (bundle.manifest.emulator?.memory?.ram !== undefined) {
+        ramSize = emulatorConfig.memory.ram;
+        Logger.log(
+          LogCategory.SYSTEM,
+          `EmulatorConfig: RAM from manifest applied at v86 initialization: ${(ramSize / 1024 / 1024).toFixed(0)} MB`
+        );
+      }
+    } catch (err) {
+      // If manifest parsing fails, use default RAM
+      Logger.warn(LogCategory.SYSTEM, `EmulatorConfig: Failed to parse manifest for RAM config, using default`);
+    }
+  }
+
   try {
-    const v86 = new V86(settings);
+    const wwt = cpuBackend === "wwt";
+    const createWwtRuntime = async () => {
+      const { createWwtCpu } = await import("./wwt/cpu");
+      const cpu = await createWwtCpu({
+        memorySize: ramSize,
+        mode: wwtMode,
+        beginPeAot: module => {
+          const launchId = peAotLaunchId;
+          const attempt = ++peAotAttempt;
+          return status => {
+            if (!launchId || peAotLaunchId !== launchId) return;
+            const message: PeAotProgress = { type: "pe_aot_progress", launchId, attempt, module, ...status };
+            self.postMessage(message);
+          };
+        },
+      });
+      activeWwtMode = wwtMode;
+      return new WwtEmulator(cpu, error => System.getInstance().reportGuestCrash({
+        reason: `WWT execution failed: ${error instanceof Error ? error.message : String(error)}`,
+        eip: readEip(cpu),
+        threadId: System.getInstance().scheduler.getCurrentThreadId(),
+      }));
+    };
+    const v86 = await (wwtOnly || wwt ? createWwtRuntime() : createV86Runtime(canvas, ramSize));
+    if (previousWwt) {
+      previousWwt.dispose();
+      if (heartbeatInterval !== null) clearInterval(heartbeatInterval);
+      if (schedulerInterval !== null) clearInterval(schedulerInterval);
+      heartbeatInterval = schedulerInterval = null;
+    }
     const thunkGenerator = new ThunkGenerator();
 
-    // v86 sets `wasm_source` itself only on its own loading path; with a custom wasm_fn it
-    // stays undefined. Restore it so the zstd helper-worker path keeps working.
-    wasmLoader.sourceBytes.then(bytes => { if (bytes) (v86 as unknown as { wasm_source?: ArrayBuffer }).wasm_source = bytes; });
-
-    v86.add_listener("emulator-ready", async () => {
-      bootMark("v86-emulator-ready");
+    const onReady = async () => {
+      self.postMessage({ type: "cpu_backend_ready", backend: wwt ? "wwt" : "v86",
+        ...(wwt ? { wwtMode: activeWwtMode } : {}) });
+      bootMark(wwt ? "wwt-emulator-ready" : "v86-emulator-ready");
       // Fresh wasm memory reads zero. Say so before anything writes guest RAM, so zeroing
       // sites (Process.reset, VirtualAlloc commit, slab arenas) skip pages that are already
       // zero instead of making them resident — see guest-page-dirty.ts. v86 has already
       // loaded its BIOS images below 1 MB; that range stays dirty.
       {
         const freshMem = v86.mem8 || (v86.v86 && v86.v86.cpu.mem8);
-        if (freshMem) adoptFreshGuestMemory(freshMem, 0x00100000);
+        if (freshMem) adoptFreshGuestMemory(freshMem, wwt ? 0 : 0x00100000);
       }
       const apiRegistry = APIRegistry.getInstance();
 
@@ -2615,6 +2707,12 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       // Initialize System singleton
       const system = System.getInstance();
       system.initialize(process);
+      if (v86 instanceof WwtEmulator) {
+        v86.cpu.setCodePermissionReader(address => {
+          const region = process.addressSpace.getRegion(address);
+          return region?.perms.includes("w") ?? true;
+        });
+      }
 
       // Static Library HLE manager — wire before PE load so on-load hooks work.
       libHleManager.initialize({
@@ -3072,8 +3170,8 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       // NOTE: dispatch is NOT enabled yet (hc_enabled=0) — all thunks still go through JS.
       {
         const cpu = v86?.cpu || v86?.v86?.cpu;
+        if (cpu) preemptionManager.initialize(cpu);
         if (cpu?.wm?.exports?.get_hypercall_page_ptr) {
-          preemptionManager.initialize(cpu);
           // DEV-only experiment knob (VITE_BS_JIT_OFF): boot with the JIT disabled so a device
           // that dies inside JIT codegen can be bisected without racing dbg.jitOff() against
           // boot. Kept out of PreemptionManager, whose JIT slots must match the shipping config.
@@ -3103,11 +3201,15 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           // reflects reality instead of its default. Mirrors initialize()'s relaxedEffective.
           const fpuStrictNow = EmulatorConfig.getInstance().fpuStrict === true || !preemptionManager.isRelaxedFpuEnabled();
           self.postMessage({ type: "fpu_strict_state", strict: fpuStrictNow });
+        } else if (cpu?.wwtHypercall) {
+          hypercallDataManager.initialize(cpu, cpu.wwtHypercall.pageAddress, cpu.wwtHypercall.supportsHandler);
         }
         // WASM-resident D3D9 state-mirror + command arena.
         // Dual-run/shadow only by default (see d3d9-wasm-arena.ts's kill switch) — never affects
         // rendering unless explicitly enabled via dbg.d3dWasmPath(true).
-        if (cpu?.wm?.exports?.get_d3d9_arena_ptr) {
+        if (cpu?.wwtHypercall) {
+          d3d9WasmArena.initialize({ wm: { exports: cpu.wwtHypercall.d3d9ArenaExports } });
+        } else if (cpu?.wm?.exports?.get_d3d9_arena_ptr) {
           d3d9WasmArena.initialize(cpu);
         }
       }
@@ -3150,10 +3252,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       registerFastPathThreadInformation(process.dispatcher);
       registerFastPathModuleFunctions(process.dispatcher);
 
-      // Tick hooks for time data sync + onTickHook compensation
       if (hypercallDataManager.isInitialized()) {
-        const cpu = v86?.cpu || v86?.v86?.cpu;
-
         // Enable WASM dispatch for all registered handlers
         if (hypercallDataManager.getRegisteredCount() > 0) {
           hypercallDataManager.enable();
@@ -3178,7 +3277,11 @@ const initV86 = async (canvas: OffscreenCanvas) => {
 
         // Set window offset (0,0 for fullscreen HLE)
         hypercallDataManager.updateWindowData(0, 0);
+      }
 
+      // Both engines drive the same input and scheduler at instruction boundaries.
+      if (hypercallDataManager.isInitialized() || wwt) {
+        const cpu = v86?.cpu || v86?.v86?.cpu;
         const v86Inner = v86?.v86 || v86;
 
         // v86's do_tick() runs these hooks and ONLY then calls next_tick() to reschedule
@@ -3236,7 +3339,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           memWriteTrap.onTickBoundary(cpu);
           hypercallDataManager.updateTimeData();
           // After the clock advance, so the deadline is measured against this tick's now.
-          if (!urgentExit && !(globalThis as { __noTimerSliceCap?: boolean }).__noTimerSliceCap) {
+          const capTimers = !urgentExit && !(globalThis as { __noTimerSliceCap?: boolean }).__noTimerSliceCap;
+          if (v86 instanceof WwtEmulator && v86.cpu.wallClockQuantumMs !== undefined) {
+            v86.cpu.setTimerSliceMs(capTimers ? system.scheduler.timerSliceBudgetMs() : 0);
+          } else if (capTimers) {
             preemptionManager.capSliceForTimerDeadline(system.scheduler.timerSliceBudgetInsns());
           }
           // Robust unified-clock activation. The one-shot enable() gates in loadPeData
@@ -3296,7 +3402,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
 
           // Lazy heap slab allocation: wait until loading pressure subsides (~500 ticks ≈ 2.5s)
           // to avoid stealing memory from MapViewOfFile during game init.
-          if (!heapSlabAllocated && ++ticksSinceStart > 500) {
+          if (hypercallDataManager.isInitialized() && !heapSlabAllocated && ++ticksSinceStart > 500) {
             heapSlabAllocated = true;
             // Slab is DEFAULT-ON (D2 corruption root-caused + fixed; see pe-loader / slab-d2-handoff).
             // __noHeapSlab forces it off (falls back to the JS process.memory + lookaside path).
@@ -3317,9 +3423,11 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           Logger.log(LogCategory.SYSTEM, "[HYPERCALL] v86 ticks queued as host tasks");
         }
 
-        Logger.log(LogCategory.SYSTEM,
-          `[HYPERCALL] Infrastructure initialized. ` +
-          `hpBase=0x${preemptionManager.getHypercallPageBase().toString(16)}`);
+        if (hypercallDataManager.isInitialized()) {
+          Logger.log(LogCategory.SYSTEM,
+            `[HYPERCALL] Infrastructure initialized. ` +
+            `hpBase=0x${preemptionManager.getHypercallPageBase().toString(16)}`);
+        }
       }
 
       // Pass backend to DDraw module if it exists
@@ -3450,20 +3558,40 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       if (pendingPeData) {
         const buffered = pendingPeData;
         pendingPeData = null;
-        loadPeData(buffered);
+        loadPeData(buffered.bytes, false, buffered.launchId);
       }
       if (pendingBundle) {
         const buffered = pendingBundle;
         pendingBundle = null;
         loadBundle(buffered);
       }
+    };
+    v86.add_listener("emulator-ready", () => {
+      void onReady().catch(error => {
+        if (v86 instanceof WwtEmulator) v86.dispose();
+        reportEmulatorInitError(error);
+      });
     });
-
   } catch (err) {
-    Logger.error(LogCategory.SYSTEM, `Failed to init v86: ${err}`);
-    self.postMessage({ type: "error", message: "v86 init failed: " + (err as Error).message });
+    if (previousGate) {
+      pendingBundle = null;
+      pendingPeData = null;
+      preparedPendingBundle = null;
+      resolveHleReady();
+      hleReady = previousGate.ready;
+      resolveHleReady = previousGate.resolve;
+      hleReadyResolved = previousGate.resolved;
+      throw err;
+    }
+    reportEmulatorInitError(err);
   }
 };
+
+function reportEmulatorInitError(error: unknown): void {
+  const message = `${cpuBackend} init failed: ${error instanceof Error ? error.message : String(error)}`;
+  Logger.error(LogCategory.SYSTEM, message);
+  self.postMessage({ type: "error", message });
+}
 
 /**
  * Canonical pause/resume — the ONLY correct way to stop/start the guest loop.
@@ -3591,12 +3719,13 @@ const handleWorkerMessage = (event: MessageEvent): void => {
     self.requestAnimationFrame = childFrameClock.request;
     self.cancelAnimationFrame = childFrameClock.cancel;
     if (isHostJitMode(childBoot.jitMode)) hostJitMode = childBoot.jitMode;
+    if (import.meta.env.VITE_WWT_EXPERIMENT === "1" && childBoot.cpuBackend === "wwt") cpuBackend = "wwt";
     execHealth.setPolicy(hostJitMode, childBoot.jitReason ?? "default");
     if (childBoot.config) EmulatorConfig.getInstance().restoreForChild(childBoot.config);
     applySessionNetwork(EmulatorConfig.getInstance().network);
     const canvas = new OffscreenCanvas(640, 480);
     state.canvas = canvas;
-    void initV86(canvas).catch(error => self.postMessage({ type: 'error', message: String(error) }));
+    void initEmulator(canvas);
     return;
   }
   if (event.data?.type === 'child_resume') {
@@ -3657,6 +3786,16 @@ const handleWorkerMessage = (event: MessageEvent): void => {
   if (message?.type === "dbg") {
     // Guest debugger bridge: window.dbg.<cmd>(...args) on the page -> here.
     handleDbgCommand(message.cmd, message.args);
+    return;
+  }
+
+  if (message?.type === "set_cpu_backend") {
+    if (!cpuBackendLocked && (wwtOnly || import.meta.env.VITE_WWT_EXPERIMENT === "1") && message.backend === "wwt") {
+      cpuBackend = "wwt";
+      requestedWwtMode = parseWwtMode(message.mode);
+      requestedWwtMemory = message.memory ?? requestedWwtMemory;
+      requestedWwtLinkage = message.linkage;
+    }
     return;
   }
 
@@ -3836,7 +3975,7 @@ const handleWorkerMessage = (event: MessageEvent): void => {
       }
 
       // Init emulator
-      initV86(canvas);
+      void initEmulator(canvas);
     }
   }
 
@@ -3871,7 +4010,7 @@ const handleWorkerMessage = (event: MessageEvent): void => {
   if (message?.type === "load_pe") {
     if (Object.hasOwn(message, "network")) applySessionNetwork(message.network);
     const peData = message.data as Uint8Array;
-    loadPeData(peData).catch(err => Logger.error(LogCategory.SYSTEM, `load_pe failed: ${err}`));
+    loadPeData(peData, false, message.launchId ?? 0).catch(err => Logger.error(LogCategory.SYSTEM, `load_pe failed: ${err}`));
   }
 
   if (message?.type === "hle_enable") {
@@ -3920,7 +4059,8 @@ const handleWorkerMessage = (event: MessageEvent): void => {
     // The launcher's own re-exec still outranks this (it is what the guest asked for);
     // this only replaces the manifest's boot args, and only for this load.
     bootArgsOverride = typeof message.args === "string" ? message.args : null;
-    loadBundle({ data: message.data, url: message.url, blob: message.blob, blobs: message.blobs, preload: message.preload, io: message.io });
+    loadBundle({ data: message.data, url: message.url, blob: message.blob, blobs: message.blobs,
+      preload: message.preload, io: message.io, launchId: message.launchId });
   }
 
   // --- WGB wizard build service (Stage 1) — additive, separate from the boot path above. -----
@@ -4035,6 +4175,10 @@ const handleWorkerMessage = (event: MessageEvent): void => {
   // Dev-mode strict-FPU toggle: strict=true → relaxed-FPU OFF (full 80-bit x87), strict=false → relaxed ON.
   // Routes through the PreemptionManager (single source of truth; applies live + clears JIT cache).
   if (message?.type === "set_fpu_strict") {
+    if (cpuBackend === "wwt") {
+      self.postMessage({ type: "fpu_strict_state", strict: false });
+      return;
+    }
     const strict = !!message.strict;
     const pm = (globalThis as any).preemption;
     if (pm?.setRelaxedFpu) {

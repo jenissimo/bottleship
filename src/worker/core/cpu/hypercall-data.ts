@@ -585,9 +585,12 @@ export class HypercallDataManager {
     /** thread handle -> slot index in the shared suspend table (packed from the front). */
     private readonly threadSuspendSlots = new Map<number, number>();
 
-    initialize(cpu: any, hpBase: number): void {
+    private backendSupportsHandler?: (id: number) => boolean;
+
+    initialize(cpu: any, hpBase: number, supportsHandler?: (id: number) => boolean): void {
         this.cpu = cpu;
         this.hpBase = hpBase;
+        this.backendSupportsHandler = supportsHandler;
         if (hpBase === 0) return;
 
         this.refreshViews();
@@ -1177,11 +1180,11 @@ export class HypercallDataManager {
 
         const key = `${dllName.toLowerCase()}.${functionName.toLowerCase()}`;
         const handlerId = HANDLER_MAP[key];
-        if (!handlerId) return;
+        if (!handlerId || this.backendSupportsHandler?.(handlerId) === false) return;
         // A v86 built before these kernels has no handler behind the id, and an unhandled
         // dispatch answers with an untouched EAX rather than declining. Registering only
         // when the engine reports the ABI keeps such a build on its JS fallbacks.
-        if (BULK_MEMORY_HANDLERS.has(handlerId) && this.bulkMemoryAbi() !== BULK_MEMORY_ABI) return;
+        if (!this.backendSupportsHandler && BULK_MEMORY_HANDLERS.has(handlerId) && this.bulkMemoryAbi() !== BULK_MEMORY_ABI) return;
 
         this.refreshViews();
         if (!this.view) return;
@@ -1216,6 +1219,7 @@ export class HypercallDataManager {
                 `[HYPERCALL] registerRawHandler: handlerId ${handlerId} not a u8`);
             return;
         }
+        if (this.backendSupportsHandler?.(handlerId) === false) return;
         this.registeredEntries.set(functionId, handlerId);
         this.refreshViews();
         if (this.view) {
@@ -1320,7 +1324,13 @@ export class HypercallDataManager {
         // (observed: vtActive=false). Then GetTickCount/QPC/timeGetTime — and now RDTSC, which reads
         // the SAME HYPERCALL_PAGE base — all fell back to raw performance.now(). enableVirtualTime()
         // is idempotent (guards on virtualTimeActive), so calling it unconditionally up-front is safe.
-        TimeService.getInstance().enableVirtualTime();
+        const machine = this.cpu?.machine;
+        if (machine?.wallClock) {
+            TimeService.getInstance().useWallTime();
+            machine.refreshWallTimers = () => this.refreshTimeAfterThunk(this.cpu);
+        } else {
+            TimeService.getInstance().enableVirtualTime();
+        }
 
         this.refreshViews();
         if (!this.view) {

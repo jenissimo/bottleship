@@ -1,6 +1,6 @@
 /**
  * Gate step: the HYPERCALL_PAGE ABI is declared TWICE — once in Rust
- * (vendor/v86/src/rust/cpu/hypercall.rs) and once in TS
+ * (the owned WWT sidecar layout, or v86 with --legacy) and once in TS
  * (src/worker/core/cpu/hypercall-data.ts) — and the only thing holding the two
  * copies together is a comment saying "must match hypercall.rs".
  *
@@ -34,18 +34,22 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const REPO = resolve(import.meta.dir, "..");
-const RUST = "vendor/v86/src/rust/cpu/hypercall.rs";
+const LEGACY = process.argv.includes("--legacy");
+const WWT_DIR = "tools/build-wwt-hypercall/";
+const RUST = LEGACY ? "vendor/v86/src/rust/cpu/hypercall.rs" : WWT_DIR + "hypercall-layout.rs";
 const TS = "src/worker/core/cpu/hypercall-data.ts";
 
-const rust = readFileSync(resolve(REPO, RUST), "utf8");
-const ts = readFileSync(resolve(REPO, TS), "utf8");
+const read = (file: string) => readFileSync(resolve(REPO, file), "utf8");
+const rust = read(RUST);
+const dispatchRust = LEGACY ? rust : read(WWT_DIR + "hypercall.rs");
+const ts = read(TS) + (LEGACY ? "" : "\n" + read("src/worker/core/cpu/hypercall-event-mirror.ts"));
 
 const num = (raw: string) => Number(raw.replaceAll("_", ""));
 
 /** `const OFF_HC_FOO: usize = 0x123;` (optionally pub / pub(crate)) */
 function rustOffsets(src: string): Map<string, number> {
     const out = new Map<string, number>();
-    const re = /^\s*(?:pub(?:\([a-z]+\))?\s+)?const\s+(OFF_HC_[A-Z0-9_]+)\s*:\s*usize\s*=\s*(0[xX][0-9a-fA-F_]+|\d[\d_]*)\s*;/gm;
+    const re = /^\s*(?:pub(?:\([a-z]+\))?\s+)?const\s+(OFF_HC_[A-Z0-9_]+)\s*:\s*(?:usize|u32)\s*=\s*(0[xX][0-9a-fA-F_]+|\d[\d_]*)\s*;/gm;
     for (const m of src.matchAll(re)) out.set(m[1]!, num(m[2]!));
     return out;
 }
@@ -83,7 +87,9 @@ function slotCounts(...sources: string[]): Map<string, number> {
     return out;
 }
 
-const pageSizeMatch = rust.match(/static\s+mut\s+HYPERCALL_PAGE\s*:\s*\[u8;\s*(\d[\d_]*)\s*\]/);
+const pageSizeMatch = LEGACY
+    ? rust.match(/static\s+mut\s+HYPERCALL_PAGE\s*:\s*\[u8;\s*(\d[\d_]*)\s*\]/)
+    : rust.match(/const\s+HYPERCALL_PAGE_SIZE\s*:\s*u32\s*=\s*(\d[\d_]*)\s*;/);
 if (!pageSizeMatch) {
     console.error(`Could not find the HYPERCALL_PAGE declaration in ${RUST}.`);
     console.error("This validator cannot check an ABI it cannot locate — fix the parser, do not delete the step.");
@@ -124,13 +130,68 @@ for (const [name, rv] of rOff) {
     }
 }
 
-// Rule 2 — every TS handler id must be dispatched in Rust.
-for (const [name, id] of tsHandlers) {
-    if (!isDispatched(id)) {
-        errors.push(
-            `${name} = ${id}: no dispatch arm in ${RUST}\n` +
-            `      try_dispatch's match falls to \`_ => false\`, so every call silently takes the JS path.`,
-        );
+// The backends have independent native capabilities. The legacy contract still requires
+// every TS handler. The WWT dispatcher exposes its own list and explicitly falls back on
+// other IDs, so validate that list against both the source dispatch and the actual Wasm.
+let checkedHandlers = tsHandlers.size;
+if (LEGACY) {
+    for (const [name, id] of tsHandlers) {
+        if (!isDispatched(id)) errors.push(`${name} = ${id}: no dispatch arm in ${RUST}`);
+    }
+} else {
+    const insertIds = (target: Set<number>, text: string) => {
+        for (const arm of text.trim().split(/\s*\|\s*/)) {
+            const range = /^(\d+)(?:\s*\.\.=\s*(\d+))?$/.exec(arm);
+            if (!range) throw new Error(`Unrecognized WWT hypercall arm: ${arm}`);
+            const first = Number(range[1]);
+            const last = Number(range[2] ?? range[1]);
+            if (first < 1 || last >= 256 || first > last) throw new Error(`Invalid WWT hypercall interval: ${arm}`);
+            for (let id = first; id <= last; id++) target.add(id);
+        }
+    };
+    const published = /fn supports_handler\([^)]*\)[^{]*\{\s*matches!\(id,\s*([0-9 |.=]+)\)/.exec(dispatchRust)?.[1];
+    if (published === undefined) throw new Error("Cannot parse WWT supports_handler source");
+    const supported = new Set<number>();
+    insertIds(supported, published);
+    const handle = dispatchRust.slice(dispatchRust.indexOf("unsafe fn handle("), dispatchRust.indexOf("pub extern \"C\" fn supports_handler"));
+    const arms = new Set<number>();
+    for (const [, arm] of handle.matchAll(/^ {8}([0-9 |.=]+) =>/gm)) insertIds(arms, arm!);
+    if (supported.size === 0 || arms.size === 0) throw new Error("WWT handler parser matched no IDs");
+    // Clock leaves may be inlined in both public entry points ahead of the shared match.
+    const ownDispatch = dispatchRust.slice(dispatchRust.indexOf('pub unsafe extern "C" fn dispatch('),
+        dispatchRust.indexOf("unsafe fn lookup_handler("));
+    const specialized = new Map<number, number>();
+    for (const [, arm] of ownDispatch.matchAll(/^ {4}if handler == (\d+) \{\s*record_success\([\s\S]*?return 1;\s*}/gm)) {
+        const id = Number(arm);
+        specialized.set(id, (specialized.get(id) ?? 0) + 1);
+    }
+    for (const [id, entries] of specialized) {
+        if (entries !== 2) errors.push(`WWT handler ${id}: specialization must appear in both entry points`);
+        arms.add(id);
+    }
+    checkedHandlers = supported.size;
+
+    const bridge = read("src/worker/wwt/hypercall.ts");
+    const pageSize = /\bconst PAGE_SIZE = (\w+);/.exec(bridge)?.[1];
+    const abiVersion = /\bconst ABI_VERSION = (\d+);/.exec(bridge)?.[1];
+    if (pageSize === undefined || num(pageSize) !== PAGE_SIZE) {
+        errors.push("WWT Rust page extent differs from the native memory allocated by the TS bridge");
+    }
+    const mod = new WebAssembly.Module(readFileSync(resolve(REPO, "public/wwt-hypercall.wasm")));
+    const memory = new WebAssembly.Memory({ initial: 1, maximum: 65536, shared: true });
+    const { exports } = new WebAssembly.Instance(mod, { env: { memory } });
+    if (abiVersion === undefined || typeof exports.abi_version !== "function" || exports.abi_version() !== Number(abiVersion)) {
+        errors.push("WWT hypercall ABI version does not match the shipped module");
+    }
+    if (typeof exports.supports_handler !== "function") throw new Error("Shipped WWT hypercall has no capability export");
+    const supports = exports.supports_handler as (id: number) => number;
+    for (let id = 0; id <= 256; id++) {
+        if (supported.has(id) !== arms.has(id) || supports(id) !== Number(supported.has(id))) {
+            errors.push(`WWT handler ${id}: source dispatch, capability declaration and Wasm disagree`);
+        }
+    }
+    for (const name of tOff.keys()) {
+        if (!rOff.has(name)) errors.push(`TS slot ${name} is missing from the owned WWT layout`);
     }
 }
 
@@ -165,6 +226,7 @@ for (const name of new Set([...rOff.keys(), ...tOff.keys()])) {
     const declared = documented ? undefined : slotCountFor(name);
     const size = documented?.size ?? (declared !== undefined ? declared * 4 : 4);
     const sized = documented ? "layout table" : declared !== undefined ? `${declared} slots x u32` : "u32";
+    if (start + size > PAGE_SIZE) errors.push(`${name}: extent exceeds the hypercall page`);
     slots.push({ name, start, end: start + size, sized });
 }
 slots.sort((a, b) => a.start - b.start || a.end - b.end);
@@ -205,7 +267,8 @@ if (errors.length > 0) {
 // freed object's first word (an idle widget still on its parent's list) gets our link —
 // zero, for an empty bin — where a real heap left its vtable.
 {
-    const rustLink = rust.match(/const\s+SLAB_LINK\s*:\s*u32\s*=\s*(\d+)\s*;/);
+    const slabRust = LEGACY ? rust : read(WWT_DIR + "heap_slab.rs");
+    const rustLink = slabRust.match(/const\s+SLAB_LINK\s*:\s*u32\s*=\s*(\d+)\s*;/);
     const memTs = readFileSync(resolve(REPO, "src/worker/modules/kernel32/memory.ts"), "utf8");
     const tsLink = memTs.match(/const\s+SLAB_LINK\s*=\s*(\d+)\s*;/);
     if (!rustLink || !tsLink) {
@@ -232,7 +295,7 @@ const rustOnly = [...rOff.keys()].filter(n => !tOff.has(n));
 const tsOnly = [...tOff.keys()].filter(n => !rOff.has(n));
 console.log(
     `Hypercall ABI OK — ${shared.length} shared offset(s) agree, ` +
-    `${tsHandlers.size} handler id(s) all dispatched, ${slots.length} slot(s) sized from ` +
+    `${checkedHandlers} backend handler id(s) all dispatched, ${slots.length} slot(s) sized from ` +
     `${doc.size} layout-table entries with no overlap, page ${PAGE_SIZE} bytes ` +
     `(${rustOnly.length} Rust-only, ${tsOnly.length} TS-only slot(s)).`,
 );
