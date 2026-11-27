@@ -4,9 +4,14 @@ import { dosDateTimeToUnix } from './dos-time';
 import { applyBlockIndex, decodeBlockIndex, WGB_BLOCK_INDEX_ENTRY } from './block-index';
 import type { BlockIndexRow, ZipBlockMap } from './block-index';
 import { inflateRawBlock } from './block-codec';
+import { applyAudioIndex, decodeAudioIndex, audioHeadBytes, WGB_AUDIO_INDEX_ENTRY } from './audio-index';
+import type { AudioIndexRow, ZipAudioMap } from './audio-index';
+import { AudioMemberDecoder, planAudio, type AudioPlan } from './audio-member';
 export { WGB_BLOCK_INDEX_ENTRY, WGB_BLOCK_INDEX_VERSION, encodeBlockIndex, decodeBlockIndex } from './block-index';
 export type { ZipBlockMap, BlockIndexRow, WgbBlockIndexRef } from './block-index';
 export { inflateRawBlock, deflateRawBlock, BLOCK_STREAM_END } from './block-codec';
+export { WGB_AUDIO_INDEX_ENTRY, WGB_AUDIO_INDEX_VERSION, WGB_AUDIO_METHOD, audioUnitEnd } from './audio-index';
+export type { WgbAudioIndexRef } from './audio-index';
 export { dosDateTimeToUnix, unixToDosDateTime, wallClockToInstant, instantToWallClock } from './dos-time';
 
 // Synchronous inflate — usable where DecompressionStream is not (guest traps).
@@ -86,6 +91,7 @@ export interface ZipEntry {
     /** Last-modified time from the DOS stamp, as wall-clock seconds (zip/dos-time.ts); absent when the entry has none. */
     modified?: number;
     blocks?: ZipBlockMap;
+    audio?: ZipAudioMap;
 }
 
 export interface ZipArchiveOptions {
@@ -95,7 +101,7 @@ export interface ZipArchiveOptions {
 const DEFAULT_BLOCK_CACHE_BYTES = 16 * 1024 * 1024;
 
 export function isRangeReadableEntry(entry: ZipEntry): boolean {
-    return entry.compression === 0 || entry.blocks !== undefined;
+    return entry.compression === 0 || entry.blocks !== undefined || entry.audio !== undefined;
 }
 
 export class BufferSource implements ZipSource {
@@ -302,6 +308,9 @@ export class ZipArchive {
     private readonly blockCacheBudget: number;
     blockIndexState: "absent" | "loaded" | "rejected" = "absent";
     blockIndexError: string | null = null;
+    audioIndexState: "absent" | "loaded" | "rejected" = "absent";
+    audioIndexError: string | null = null;
+    private readonly audioDecoders = new Map<string, AudioMemberDecoder>();
 
     constructor(source: ZipSource, options: ZipArchiveOptions = {}) {
         this.source = source;
@@ -376,6 +385,22 @@ export class ZipArchive {
         const cd = await this.source.readRange(cdStart, cdStart + cdSize);
         this.parseCentralDirectory(cd);
         await this.loadBlockIndex();
+        await this.loadAudioIndex();
+    }
+
+    private async loadAudioIndex(): Promise<void> {
+        const entry = this.entries.get(WGB_AUDIO_INDEX_ENTRY);
+        if (!entry || entry.isDirectory || entry.compression !== 0 || entry.compressedSize !== entry.uncompressedSize) return;
+        let rows: AudioIndexRow[];
+        try {
+            rows = decodeAudioIndex(await this.readEntryRange(entry, 0, entry.uncompressedSize));
+        } catch (e) {
+            this.audioIndexState = "rejected";
+            this.audioIndexError = e instanceof Error ? e.message : String(e);
+            return;
+        }
+        applyAudioIndex(rows, name => this.entries.get(name));
+        this.audioIndexState = "loaded";
     }
 
     private async loadBlockIndex(): Promise<void> {
@@ -478,7 +503,7 @@ export class ZipArchive {
     }
 
     async readEntry(entry: ZipEntry): Promise<Uint8Array> {
-        if (entry.compression === 0) {
+        if (entry.compression === 0 || entry.audio) {
             return this.readEntryRange(entry, 0, entry.uncompressedSize);
         }
 
@@ -496,6 +521,7 @@ export class ZipArchive {
      * Reads an uncompressed (STORED) entry range without loading the whole file.
      */
     async readEntryRange(entry: ZipEntry, offset: number, length: number, sequential = false): Promise<Uint8Array> {
+        if (entry.audio) return this.readAudioRange(entry, offset, length, sequential);
         if (entry.blocks) {
             const plan = this.planBlocks(entry, offset, length);
             if (!plan) return new Uint8Array();
@@ -542,6 +568,13 @@ export class ZipArchive {
      *  `sequential` is the caller's own read-pattern state (it owns the file object);
      *  this is the layer that can turn it into an entry-bounded {@link ReadHint}. */
     readEntryRangeSync(entry: ZipEntry, offset: number, length: number, sequential = false): Uint8Array | null {
+        if (entry.audio) {
+            try {
+                return this.readAudioRangeSync(entry, offset, length, sequential);
+            } catch {
+                return null;
+            }
+        }
         if (entry.blocks) {
             if (!this.source.readRangeSync) return null;
             const plan = this.planBlocks(entry, offset, length);
@@ -640,6 +673,125 @@ export class ZipArchive {
             const e = Math.min(plan.to, blockStart + block.length) - blockStart;
             out.set(block.subarray(s, e), w);
             w += e - s;
+        }
+        return out;
+    }
+
+    private async readAudioRange(entry: ZipEntry, offset: number, length: number, sequential: boolean): Promise<Uint8Array> {
+        const map = entry.audio!;
+        const plan = planAudio(map, entry.uncompressedSize, offset, length);
+        if (!plan) return new Uint8Array();
+        const dataStart = await this.getEntryDataStart(entry);
+        const headLen = audioHeadBytes(map);
+        const head = this.audioDecoderFor(entry)?.head ??
+            await this.source.readRange(dataStart, dataStart + headLen, this.blockHint(entry, dataStart, dataStart, sequential));
+        if (head.byteLength < headLen) throw new Error(`short read in ${entry.name}: ${head.byteLength} of ${headLen} header bytes`);
+        const cached = new Map<number, Uint8Array>();
+        const span = this.missingAudioSpan(map, dataStart, plan, cached);
+        let bytes: Uint8Array | null = null;
+        if (span) {
+            bytes = await this.source.readRange(span.start, span.end, this.blockHint(entry, dataStart, span.start, sequential));
+            if (bytes.byteLength < span.end - span.start) {
+                throw new Error(`short read in ${entry.name}: ${bytes.byteLength} of ${span.end - span.start} encoded bytes`);
+            }
+        }
+        const dec = this.audioDecoderFor(entry) ?? this.openAudioDecoder(entry, head);
+        return this.assembleAudio(dec, dataStart, plan, span, bytes, cached);
+    }
+
+    private readAudioRangeSync(entry: ZipEntry, offset: number, length: number, sequential: boolean): Uint8Array | null {
+        if (!this.source.readRangeSync) return null;
+        const map = entry.audio!;
+        const plan = planAudio(map, entry.uncompressedSize, offset, length);
+        if (!plan) return new Uint8Array();
+        const dataStart = this.getEntryDataStartSync(entry);
+        if (dataStart === null) return null;
+        let dec = this.audioDecoderFor(entry);
+        if (!dec) {
+            const headLen = audioHeadBytes(map);
+            const head = this.source.readRangeSync(dataStart, dataStart + headLen, this.blockHint(entry, dataStart, dataStart, sequential));
+            if (!head || head.byteLength < headLen) return null;
+            dec = this.openAudioDecoder(entry, head);
+        }
+        const cached = new Map<number, Uint8Array>();
+        const span = this.missingAudioSpan(map, dataStart, plan, cached);
+        let bytes: Uint8Array | null = null;
+        if (span) {
+            bytes = this.source.readRangeSync(span.start, span.end, this.blockHint(entry, dataStart, span.start, sequential));
+            if (!bytes || bytes.byteLength < span.end - span.start) return null;
+        }
+        return this.assembleAudio(dec, dataStart, plan, span, bytes, cached);
+    }
+
+    private audioDecoderFor(entry: ZipEntry): AudioMemberDecoder | undefined {
+        const dec = this.audioDecoders.get(entry.name);
+        if (dec) {
+            this.audioDecoders.delete(entry.name);
+            this.audioDecoders.set(entry.name, dec);
+        }
+        return dec;
+    }
+
+    private openAudioDecoder(entry: ZipEntry, head: Uint8Array): AudioMemberDecoder {
+        const dec = new AudioMemberDecoder(entry.audio!, head.slice(0, audioHeadBytes(entry.audio!)));
+        this.audioDecoders.set(entry.name, dec);
+        while (this.audioDecoders.size > ZipArchive.MAX_AUDIO_DECODERS) {
+            const oldest = this.audioDecoders.keys().next().value as string;
+            this.audioDecoders.get(oldest)!.close();
+            this.audioDecoders.delete(oldest);
+        }
+        return dec;
+    }
+
+    private static readonly MAX_AUDIO_DECODERS = 4;
+
+    private missingAudioSpan(
+        map: ZipAudioMap, dataStart: number, plan: AudioPlan, cached: Map<number, Uint8Array>,
+    ): { start: number; end: number } | null {
+        if (plan.first < 0) return null;
+        let first = -1;
+        let last = -1;
+        for (let c = plan.first; c <= plan.last; c++) {
+            const key = dataStart + map.chunkStart[c];
+            const pcm = this.blockCache.get(key);
+            if (pcm) {
+                cached.set(key, pcm);
+            } else {
+                if (first === -1) first = c;
+                last = c;
+            }
+        }
+        if (first === -1) return null;
+        return { start: dataStart + map.chunkStart[first], end: dataStart + map.chunkEnd[last] };
+    }
+
+    private assembleAudio(
+        dec: AudioMemberDecoder, dataStart: number, plan: AudioPlan,
+        span: { start: number } | null, bytes: Uint8Array | null, cached: Map<number, Uint8Array>,
+    ): Uint8Array {
+        const map = dec.map;
+        const out = new Uint8Array(plan.to - plan.from);
+        const put = (src: Uint8Array, at: number) => {
+            const s = Math.max(plan.from, at);
+            const e = Math.min(plan.to, at + src.length);
+            if (e > s) out.set(src.subarray(s - at, e - at), s - plan.from);
+        };
+        if (plan.from < plan.pcmStart) put(dec.prefix(), 0);
+        if (plan.to > plan.pcmEnd) put(dec.suffix(), plan.pcmEnd);
+        const ba = map.channels * (map.bitsPerSample >> 3);
+        for (let c = plan.first; c <= plan.last; c++) {
+            const key = dataStart + map.chunkStart[c];
+            let pcm = this.blockCache.get(key) ?? cached.get(key);
+            if (pcm) {
+                this.blockCache.delete(key);
+                this.cacheBlock(key, pcm);
+            } else {
+                if (!span || !bytes) throw new Error(`audio chunk ${c} not fetched`);
+                const rel = key - span.start;
+                pcm = dec.decodeChunk(c, bytes.subarray(rel, rel + map.chunkEnd[c] - map.chunkStart[c]));
+                this.cacheBlock(key, pcm);
+            }
+            put(pcm, plan.pcmStart + Math.max(0, map.rawStart[c] - map.lead) * ba);
         }
         return out;
     }

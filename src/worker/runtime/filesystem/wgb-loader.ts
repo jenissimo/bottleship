@@ -1,5 +1,8 @@
-import { BlobSource, BufferSource, SyncHttpRangeSource, WGB_BLOCK_INDEX_ENTRY, WGB_BLOCK_INDEX_VERSION, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
-import type { WgbBlockIndexRef } from "@bottleship/formats/zip";
+import {
+    BlobSource, BufferSource, SyncHttpRangeSource, WGB_AUDIO_INDEX_ENTRY, WGB_AUDIO_INDEX_VERSION, WGB_AUDIO_METHOD,
+    WGB_BLOCK_INDEX_ENTRY, WGB_BLOCK_INDEX_VERSION, ZipArchive, ZipEntry,
+} from "@bottleship/formats/zip";
+import type { WgbAudioIndexRef, WgbBlockIndexRef } from "@bottleship/formats/zip";
 import type { ZipSource } from "@bottleship/formats/zip";
 import type { ExeRegistryRedirect } from "@bottleship/formats/sdb";
 import { CachedSource, computeAdaptiveMaxBytes } from "./cached-source";
@@ -112,6 +115,7 @@ export interface WgbManifest {
     meta?: WgbMeta;
     entrypoint: string;
     blockIndex?: WgbBlockIndexRef;
+    audioIndex?: WgbAudioIndexRef;
     args?: string;
     rom?: string;
     registry?: string;
@@ -426,6 +430,7 @@ export class WgbLoader {
         }
 
         checkBlockIndex(manifest, archive);
+        checkAudioIndex(manifest, archive);
         onStage?.(`Loading ${manifest.entrypoint.split(/[\\/]/).pop() ?? "game"}`);
         const entrypointBytes = await readEntrypointBytes(archive, manifest.entrypoint);
 
@@ -489,6 +494,23 @@ export function checkBlockIndex(manifest: Pick<WgbManifest, "blockIndex">, archi
     }
 }
 
+export function checkAudioIndex(manifest: Pick<WgbManifest, "audioIndex">, archive: ZipArchive): void {
+    const ref = manifest.audioIndex;
+    if (!ref) return;
+    if (ref.version !== WGB_AUDIO_INDEX_VERSION) {
+        throw new Error(`This bundle needs audio-index v${ref.version}; this engine reads v${WGB_AUDIO_INDEX_VERSION}.`);
+    }
+    if (ref.member !== WGB_AUDIO_INDEX_ENTRY) {
+        throw new Error(`This bundle names audio-index member "${ref.member}"; this engine reads "${WGB_AUDIO_INDEX_ENTRY}".`);
+    }
+    if (archive.audioIndexState !== "loaded") {
+        const why = archive.audioIndexState === "rejected" ? `damaged (${archive.audioIndexError})` : "missing";
+        throw new Error(`This bundle needs audio-index v${ref.version}, but ${ref.member} is ${why}.`);
+    }
+    const orphan = archive.listEntries().find(e => e.compression === WGB_AUDIO_METHOD && !e.audio);
+    if (orphan) throw new Error(`This bundle's audio member ${orphan.name} has no valid row in ${ref.member}.`);
+}
+
 export function buildRomIndex(archive: ZipArchive, romRoot: string): Map<string, ZipEntry> {
     const normalized = normalizeZipPath(romRoot);
     const prefix = normalized.endsWith("/") ? normalized : `${normalized}/`;
@@ -500,7 +522,7 @@ export function buildRomIndex(archive: ZipArchive, romRoot: string): Map<string,
 
     for (const entry of archive.listEntries()) {
         const entryName = normalizeZipPath(entry.name);
-        if (!entryName.startsWith(prefix) || entry.isDirectory || entryName === WGB_BLOCK_INDEX_ENTRY) continue;
+        if (!entryName.startsWith(prefix) || entry.isDirectory || entryName === WGB_BLOCK_INDEX_ENTRY || entryName === WGB_AUDIO_INDEX_ENTRY) continue;
         const rel = entryName.slice(prefix.length);
         index.set(rel, entry);
     }
