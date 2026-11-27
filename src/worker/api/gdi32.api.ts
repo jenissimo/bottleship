@@ -240,6 +240,7 @@ export const gdi32Module: ModuleDescriptor = {
         // caller on to native glyph outlines (GGO_NATIVE), which GetGlyphOutline refuses.
         makeFunc("GetOutlineTextMetricsA", 3),
 
+        makeFunc("GetCharacterPlacementA", 6),
         makeFunc("GetGlyphOutlineA", 7),
         makeFunc("GetGlyphOutlineW", 7),
         makeFunc("GetKerningPairsA", 3),

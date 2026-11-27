@@ -179,6 +179,13 @@ export function applyMapMode(m: DcMapping, mode: number, res = screenRes()): boo
     return true;
 }
 
+export function dcFontScale(hdc: number): number {
+    const mapping = readMapping(hdc);
+    if (mapping.mapMode === MM_TEXT || !mapping.wndExtY) return 1;
+    const scale = Math.abs(mapping.vportExtY / mapping.wndExtY);
+    return Number.isFinite(scale) && scale > 0 ? scale : 1;
+}
+
 /** Logical → device (Wine's construct_window_to_viewport, win32u/dc.c:417). */
 export function lpToDp(m: DcMapping, x: number, y: number): { x: number; y: number } {
     const scaleX = m.vportExtX / m.wndExtX;
