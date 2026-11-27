@@ -2412,8 +2412,8 @@ export class GDIContext {
         return drawTextImpl(this, hdc, text, rect, format);
     }
 
-    getGlyphOutline(hdc: number, char: string, uFormat: number): GlyphOutlineResult | null {
-        return getGlyphOutlineImpl(this, hdc, char, uFormat);
+    getGlyphOutline(hdc: number, char: string, uFormat: number, scale = 1): GlyphOutlineResult | null {
+        return getGlyphOutlineImpl(this, hdc, char, uFormat, scale);
     }
 
     private ensureState(hdc: number): {

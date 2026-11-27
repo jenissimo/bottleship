@@ -100,7 +100,6 @@ function fillTextGdi(
 }
 
 // GetGlyphOutline's uFormat (wingdi.h GGO_*). The low nibble is one mode value (not a mask);
-// GGO_GLYPH_INDEX is rejected at the thunk boundary; GGO_UNHINTED is advisory.
 const GGO_METRICS = 0x0000;
 const GGO_BITMAP = 0x0001;
 const GGO_GRAY2_BITMAP = 0x0004;
@@ -151,12 +150,15 @@ export function getGlyphOutline(
     hdc: number,
     char: string,
     uFormat: number,
+    scale = 1,
 ): GlyphOutlineResult | null {
     const baseFormat = uFormat & GGO_MODE_MASK;
     if (!SUPPORTED_GGO_FORMATS.has(baseFormat)) return null;
 
-    const fontSize = gdi.hdcStates.get(hdc)?.fontSize ?? 16;
-    const fontString = gdi.getMeasureContext(hdc)?.font || '16px sans-serif';
+    const state = gdi.hdcStates.get(hdc);
+    const logicalFont = state?.font ?? (gdi.getMeasureContext(hdc)?.font || '16px sans-serif');
+    const fontSize = Math.max(1, Math.round((state?.fontSize ?? 16) * scale));
+    const fontString = scale === 1 ? logicalFont : logicalFont.replace(/\d+(?:\.\d+)?px/, `${fontSize}px`);
 
     const pad = 2;
     const measureScratch = ensureGlyphScratch(Math.ceil(fontSize * 2) + pad * 2, Math.ceil(fontSize * 2) + pad * 2);

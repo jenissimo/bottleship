@@ -5,6 +5,7 @@ import { EmulatorConfig, getCodePageDecoder, encodeAnsiString } from "../../src/
 import { getGlyphOutline } from "../../src/worker/modules/gdi32/gdi-text";
 import { GDIContext } from "../../src/worker/modules/gdi32/context";
 import { createPaintingExports } from "../../src/worker/modules/gdi32/painting";
+import { Mem } from "../../src/worker/core/memory/mem-accessor";
 
 const GGO_METRICS = 0, GGO_BITMAP = 1, GGO_NATIVE = 2, GGO_BEZIER = 3, GGO_GRAY8_BITMAP = 6;
 const GGO_GLYPH_INDEX = 0x0080;
@@ -23,6 +24,8 @@ function freshScenario() {
         alpha: [] as number[][],
         throwOnGetImageData: false,
         getImageDataCalls: 0,
+        measuredFont: '',
+        rasterizedFont: '',
     };
 }
 let scenario = freshScenario();
@@ -34,6 +37,7 @@ class FakeContext {
     textBaseline: CanvasTextBaseline = "alphabetic";
     textAlign: CanvasTextAlign = "left";
     measureText(_text: string) {
+        scenario.measuredFont = this.font;
         return {
             width: scenario.width,
             actualBoundingBoxLeft: scenario.abLeft,
@@ -43,7 +47,7 @@ class FakeContext {
         } as TextMetrics;
     }
     clearRect() {}
-    fillText() {}
+    fillText() { scenario.rasterizedFont = this.font; }
     getImageData(_x: number, _y: number, w: number, h: number) {
         scenario.getImageDataCalls++;
         if (scenario.throwOnGetImageData) throw new Error("readback failed");
@@ -196,8 +200,9 @@ afterEach(() => { (System as unknown as { instance: unknown }).instance = savedI
 
 function setupThunks() {
     const mem = new Uint8Array(0x1000);
-    (System as unknown as { instance: unknown }).instance = { gdiContext: new GDIContext(), process: { getCurrentMemory: () => mem } };
-    return { mem, exports: createPaintingExports() as Record<string, Thunk> };
+    const gdi = new GDIContext();
+    (System as unknown as { instance: unknown }).instance = { gdiContext: gdi, process: { getCurrentMemory: () => mem } };
+    return { mem, gdi, exports: createPaintingExports() as Record<string, Thunk> };
 }
 
 test("GetGlyphOutlineA fills GLYPHMETRICS and returns the raster size", () => {
@@ -306,7 +311,7 @@ test("GetGlyphOutlineA decodes a packed two-byte DBCS character on a multi-byte 
     } finally { restore(); }
 });
 
-test("GGO_GLYPH_INDEX is rejected: this emulator has no glyph-index table", () => {
+test("GGO_GLYPH_INDEX requires a valid DC and the ANSI entry point", () => {
     const restore = installFakeOffscreenCanvas();
     try {
         scenario = { ...freshScenario(), width: 4, abLeft: 0, abRight: 2, abAscent: 2, abDescent: 0, alpha: [[0, 0], [0, 0]] };
@@ -314,6 +319,63 @@ test("GGO_GLYPH_INDEX is rejected: this emulator has no glyph-index table", () =
         const r = exports['GetGlyphOutlineA']!({}, mem, [0, 0x41, GGO_METRICS | GGO_GLYPH_INDEX, 0x100, 0, 0, 0]);
         expect(r).toBe(GDI_ERROR);
     } finally { restore(); }
+});
+
+test("GetGlyphOutlineA rasterizes the index returned by GetCharacterPlacementA", () => {
+    const restore = installFakeOffscreenCanvas();
+    const config = EmulatorConfig.getInstance();
+    const savedCodePage = config.ansiCodePage;
+    const { mem, gdi, exports } = setupThunks();
+    try {
+        config.ansiCodePage = 1252;
+        Mem.bind(() => mem);
+        scenario = { ...freshScenario(), width: 4, abRight: 2, abAscent: 1, alpha: [[255, 0]] };
+        const hdc = gdi.createCompatibleDC(0);
+        expect(hdc).toBeGreaterThan(0);
+        const place = exports.GetCharacterPlacementA!;
+        const view = new DataView(mem.buffer);
+        mem[0x100] = 0x80;
+        view.setUint32(0x200 + 24, 0x300, true);
+        view.setUint32(0x200 + 28, 1, true);
+        expect(place({}, mem, [hdc, 0x100, 1, 0, 0x200, 0])).toBeGreaterThan(0);
+        const index = view.getUint16(0x300, true);
+        expect(index).toBe(0x20AC);
+
+        const rasterize = exports.GetGlyphOutlineA!;
+        expect(rasterize({}, mem, [hdc, index, GGO_BITMAP | GGO_GLYPH_INDEX, 0x400, 4, 0x500, 0])).toBe(4);
+        expect(rasterize({}, mem, [hdc, 0x80, GGO_BITMAP, 0x420, 4, 0x520, 0])).toBe(4);
+        expect(mem.slice(0x400, 0x414)).toEqual(mem.slice(0x420, 0x434));
+        expect(mem.slice(0x500, 0x504)).toEqual(Uint8Array.of(0x80, 0, 0, 0));
+        expect(mem.slice(0x500, 0x504)).toEqual(mem.slice(0x520, 0x524));
+        expect(exports.GetGlyphOutlineW!({}, mem, [hdc, index, GGO_BITMAP | GGO_GLYPH_INDEX, 0x400, 4, 0x500, 0])).toBe(GDI_ERROR);
+    } finally {
+        config.ansiCodePage = savedCodePage;
+        Mem.bind(() => new Uint8Array(0));
+        restore();
+    }
+});
+
+test("GetGlyphOutlineA measures and rasterizes the selected font in device units", () => {
+    const restore = installFakeOffscreenCanvas();
+    const { mem, gdi, exports } = setupThunks();
+    const hdc = gdi.createCompatibleDC(0);
+    try {
+        const state = gdi.hdcStates.get(hdc)!;
+        state.font = '700 2400px "Test Font"';
+        state.fontSize = 2400;
+        scenario = { ...freshScenario(), width: 4, abRight: 2, abAscent: 1, alpha: [[255, 0]] };
+
+        expect(exports.SetMapMode!({}, mem, [hdc, 8])).toBe(1);
+        expect(exports.SetWindowExtEx!({}, mem, [hdc, 80000, 60000, 0])).toBe(1);
+        expect(exports.SetViewportExtEx!({}, mem, [hdc, 800, 600, 0])).toBe(1);
+        expect(exports.GetGlyphOutlineA!({}, mem, [hdc, 0x41, GGO_BITMAP | GGO_GLYPH_INDEX, 0x100, 4, 0x200, 0])).toBe(4);
+        expect(scenario.measuredFont).toBe('700 24px "Test Font"');
+        expect(scenario.rasterizedFont).toBe(scenario.measuredFont);
+        expect(mem.slice(0x200, 0x204)).toEqual(Uint8Array.of(0x80, 0, 0, 0));
+    } finally {
+        gdi.deleteDC(hdc);
+        restore();
+    }
 });
 
 test("a non-identity MAT2 is rejected; the identity matrix and a NULL pointer are accepted", () => {

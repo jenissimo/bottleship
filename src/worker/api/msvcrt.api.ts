@@ -617,6 +617,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_locking", 3, { returnType: "i32", onUnimplemented: "minusOne" }),
         makeFunc("__p___argc", 0),
         makeFunc("__p___argv", 0),
+        makeFunc("__p__environ", 0),
         makeFunc("_EH_prolog", 0),
         makeFunc("_mbctype", 0),
         makeFunc("_setmbcp", 1),

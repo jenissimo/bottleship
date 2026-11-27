@@ -1,10 +1,12 @@
 import type { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { System } from '../../core/system';
-import { EmulatorConfig, getCodePageDecoder } from '../../core/emulator-config-manager';
+import { decodeAnsiString, EmulatorConfig, getCodePageDecoder } from '../../core/emulator-config-manager';
 import { decodeAnsiCharCode } from './font-charset';
+import { Mem } from '../../core/memory/mem-accessor';
 import { MemoryGuard } from '../../core/memory/mem-guard';
 import { isValidAddress } from '../../core/memory/address-guard';
 import { Logger, LogCategory } from '../../core/logger';
+import { dcFontScale } from './painting-dc-state';
 
 
 export function registerGlyphOutlineExports(exports: Record<string, ThunkImplementation>): void {
@@ -46,12 +48,8 @@ export function registerGlyphOutlineExports(exports: Record<string, ThunkImpleme
             ?? getCodePageDecoder(codePage).decode(new Uint8Array([uChar & 0xFF]));
     }
 
-    // GetGlyphOutlineA/W(hdc, uChar, uFormat, lpgm, cbBuffer, lpvBuffer, lpmat2). uChar is a
-    // raw character code (A: one ANSI byte or packed DBCS pair decoded via the guest's code
-    // page, W: a UTF-16 code unit) — GGO_GLYPH_INDEX (uChar as a real font glyph ID) and any
-    // non-identity lpmat2 (rotation/shear/scale) are rejected rather than silently answered
-    // wrong, since this emulator has no glyph-index table and applies no transform to the
-    // rasterized bitmap.
+    const GGO_GLYPH_INDEX = 0x80;
+
     const outline = (isWide: boolean): ThunkImplementation => (ctx, mem, args) => {
         const hdc = args[0]!;
         const uChar = args[1]! >>> 0;
@@ -62,19 +60,21 @@ export function registerGlyphOutlineExports(exports: Record<string, ThunkImpleme
         const lpmat2 = args[6]!;
         const GDI_ERROR = 0xFFFFFFFF;
 
-        const rasterFormat = uFormat & ~0x100; // GGO_UNHINTED is advisory for the host rasterizer.
+        const indexed = (uFormat & GGO_GLYPH_INDEX) !== 0;
+        const gdi = System.getInstance().gdiContext;
+        if (indexed && (isWide || uChar > 0xFFFF || !gdi.hdcStates.has(hdc))) return GDI_ERROR;
+        const rasterFormat = uFormat & ~(GGO_GLYPH_INDEX | 0x100);
         if ((rasterFormat & ~0x0f) !== 0) return GDI_ERROR;
         if (lpmat2) {
             if (!isValidAddress(mem, lpmat2, 16, 'r')) return GDI_ERROR;
             if (!isIdentityMat2(mem, lpmat2)) return GDI_ERROR;
         }
 
-        const char = isWide
+        const char = isWide || indexed
             ? String.fromCharCode(uChar & 0xFFFF)
             : decodeAnsiChar(uChar, EmulatorConfig.getInstance().ansiCodePage);
 
-        const gdi = System.getInstance().gdiContext;
-        const result = gdi.getGlyphOutline(hdc, char, rasterFormat);
+        const result = gdi.getGlyphOutline(hdc, char, rasterFormat, dcFontScale(hdc));
         Logger.verbose(LogCategory.GDI32, `GetGlyphOutline${isWide ? 'W' : 'A'}(hdc=0x${hdc.toString(16)}, char='${char}', uFormat=${uFormat})`);
         if (!result) return GDI_ERROR; // unsupported format or rasterization failure
 
@@ -91,6 +91,41 @@ export function registerGlyphOutlineExports(exports: Record<string, ThunkImpleme
         MemoryGuard.writeBytes(mem, lpvBuffer, result.bitmap, `GetGlyphOutline${isWide ? 'W' : 'A'}`);
         return required;
     };
+    exports['GetCharacterPlacementA'] = (_ctx, mem, args) => {
+        const [hdc, str, count, , results] = args.map(n => n >>> 0);
+        const gdi = System.getInstance().gdiContext, state = gdi.hdcStates.get(hdc);
+        if (!state || (count && (!str || !isValidAddress(mem, str, count, 'r')))) return 0;
+        if (results && !isValidAddress(mem, results, 36, 'rw')) return 0;
+        const bytes = mem.slice(str, str + count);
+        const text = decodeAnsiString(bytes, 0, count, EmulatorConfig.getInstance().ansiCodePage);
+        const c = new OffscreenCanvas(1, 1).getContext('2d');
+        if (!c) return 0;
+        c.font = state.font;
+        const widths: number[] = [];
+        let prev = 0;
+        for (let i = 1; i <= text.length; i++) { const w = Math.round(c.measureText(text.slice(0, i)).width); widths.push(w - prev); prev = w; }
+        const m = c.measureText('Hg');
+        const height = Math.ceil((m.fontBoundingBoxAscent ?? 12) + (m.fontBoundingBoxDescent ?? 4));
+        if (results) {
+            const v = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            const n = Math.min(text.length, v.getUint32(results + 28, true) || text.length);
+            const outStr = v.getUint32(results + 4, true), order = v.getUint32(results + 8, true), dx = v.getUint32(results + 12, true);
+            const caret = v.getUint32(results + 16, true), cls = v.getUint32(results + 20, true), glyphs = v.getUint32(results + 24, true);
+            let x = 0;
+            for (let i = 0; i < n; i++) {
+                if (outStr && !Mem.writeUint8(outStr + i, bytes[i])) return 0;
+                if (order && !Mem.writeUint32(order + i * 4, i)) return 0;
+                if (dx && !Mem.writeUint32(dx + i * 4, widths[i] | 0)) return 0;
+                if (caret && !Mem.writeUint32(caret + i * 4, x)) return 0;
+                if (cls && !Mem.writeUint8(cls + i, 0)) return 0;
+                if (glyphs && !Mem.writeUint16(glyphs + i * 2, text.charCodeAt(i))) return 0;
+                x += widths[i];
+            }
+            if (!Mem.writeUint32(results + 28, n) || !Mem.writeUint32(results + 32, n)) return 0;
+        }
+        return ((Math.min(height, 0xffff) << 16) | (Math.min(prev, 0xffff) & 0xffff)) >>> 0;
+    };
+
     exports['GetGlyphOutlineA'] = outline(false);
     exports['GetGlyphOutlineW'] = outline(true);
 

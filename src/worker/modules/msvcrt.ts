@@ -490,6 +490,7 @@ export class Msvcrt implements IModule {
         exports["__p___mb_cur_max"] = () => this.mbCurMaxAddr;
         exports["__p___argc"] = () => this.argcAddr;
         exports["__p___argv"] = () => this.argvPtrVarAddr;
+        exports["__p__environ"] = () => this.environVarAddr;
         exports["_mbctype"] = () => this.mbctypeAddr;
         exports["__p__fmode"] = () => this.fmodeAddr;
         exports["__p__commode"] = () => this.commodeAddr;
