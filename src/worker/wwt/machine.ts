@@ -9,6 +9,7 @@ import { trapAddress, WwtTrapMap } from "./traps";
 const PAGE = 4096;
 const PAGE_COUNT = 1 << 20;
 const MAX_INSTRUCTION_BYTES = 15;
+const ZERO_RUN = 64;
 const TRANSLATION_WINDOW = 0x4000;
 const STORE_MAP_CODE = 1;
 const STORE_MAP_CODE_NEXT = 4;
@@ -330,12 +331,27 @@ export class BottleShipMachine implements WwtMachine {
         this.table.set(slot, wrapped.exports.enter as WasmFn);
     }
 
+    private zeroRunEnd(address: number, end: number): number {
+        const words = ZERO_RUN >>> 2;
+        let run = 0;
+        for (let word = (address + 3) >>> 2, last = end >>> 2; word < last; word++) {
+            if (this.words[word] !== 0) {
+                run = 0;
+            } else if (++run === words) {
+                return Math.min(end, Math.max((word + 1 - words) << 2, address + MAX_INSTRUCTION_BYTES));
+            }
+        }
+        return end;
+    }
+
     private translateAt(cpu: number, address: number): number {
         if (address >= this.guestLimit || (this.canExecute && !this.canExecute(address))) {
             this.words[(cpu + this.abi.cpu.EIP) >>> 2] = this.resumeFault(cpu, this.abi.fault.ACCESS_VIOLATION_EXECUTE, address, address);
             return 1;
         }
-        let end = Math.min(address + this.regionWindow, this.codeEnd?.(address) ?? this.guestLimit, this.guestLimit);
+        const codeEnd = this.codeEnd?.(address) ?? this.guestLimit;
+        let end = Math.min(address + this.regionWindow, codeEnd, this.guestLimit);
+        if (codeEnd >= this.guestLimit) end = this.zeroRunEnd(address, end);
         let known: number[] = [];
         for (let page = address >>> 12; page <= (end - 1) >>> 12; page++) {
             const entries = this.entriesByPage.get(page);
