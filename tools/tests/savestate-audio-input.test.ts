@@ -317,12 +317,8 @@ describe("dsound", () => {
         });
     });
 
-    test("refuses a locked buffer and capture buffers", () => {
+    test("refuses capture buffers", () => {
         const d = dsound();
-        const b = ((d.objects as Map<number, { buffer: Record<string, unknown> }>).get(0x5100)!).buffer;
-        b.lockFirstSize = 8;
-        expect(() => d.captureSavestate()).toThrow("locked");
-        b.lockFirstSize = undefined;
         (d.objects as Map<number, unknown>).set(0x5200, { type: "capture", refCount: 1, capture: {} });
         expect(() => d.captureSavestate()).toThrow("capture buffers");
     });
