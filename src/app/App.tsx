@@ -713,10 +713,15 @@ export default function App() {
   // A deployment may admit only the browser it was rehearsed on (see deployment-config).
   // undefined = policy not loaded yet; null = allowed.
   const [policyBlock, setPolicyBlock] = useState<string | null | undefined>(undefined);
+  const physicalKeysRef = useRef(false);
   useEffect(() => {
     let cancelled = false;
     loadDeploymentConfig().then(
-      (cfg) => { if (!cancelled) setPolicyBlock(browserPolicyBlock(cfg, browserSupport.detectedBrowser)); },
+      (cfg) => {
+        if (cancelled) return;
+        physicalKeysRef.current = cfg.keyMap === "physical";
+        setPolicyBlock(browserPolicyBlock(cfg, browserSupport.detectedBrowser));
+      },
       () => { if (!cancelled) setPolicyBlock(null); },
     );
     return () => { cancelled = true; };
@@ -2283,7 +2288,7 @@ export default function App() {
         void audioEngine?.resumeIfNotPaused();
       }
 
-      const vk = hardwareKeyVk(event.code, event.keyCode);
+      const vk = hardwareKeyVk(event.code, event.keyCode, physicalKeysRef.current);
       inputDevice.setKey(vk, state === 1, "hw-key", state === 1 ? hardwareKeyText(event) : undefined);
       inputDevice.commit();
       recordSample(inputView, vk, state);

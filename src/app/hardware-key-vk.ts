@@ -9,7 +9,32 @@ const SIDE_MODIFIER_VK: Readonly<Record<string, number>> = {
     AltRight: 0xa5,
 };
 
-export function hardwareKeyVk(code: string, keyCode: number): number {
+const US_POSITION_VK: Readonly<Record<string, number>> = {
+    Backquote: 0xc0,
+    Minus: 0xbd,
+    Equal: 0xbb,
+    BracketLeft: 0xdb,
+    BracketRight: 0xdd,
+    Backslash: 0xdc,
+    Semicolon: 0xba,
+    Quote: 0xde,
+    Comma: 0xbc,
+    Period: 0xbe,
+    Slash: 0xbf,
+    NumpadMultiply: 0x6a,
+    NumpadAdd: 0x6b,
+    NumpadSubtract: 0x6d,
+    NumpadDecimal: 0x6e,
+    NumpadDivide: 0x6f,
+};
+
+export function hardwareKeyVk(code: string, keyCode: number, physical = false): number {
+    if (physical) {
+        if (/^Key[A-Z]$/.test(code)) return code.charCodeAt(3);
+        if (/^Digit[0-9]$/.test(code)) return code.charCodeAt(5);
+        if (/^Numpad[0-9]$/.test(code)) return code.charCodeAt(6) + 0x30;
+        if (Object.hasOwn(US_POSITION_VK, code)) return US_POSITION_VK[code]!;
+    }
     return SIDE_MODIFIER_VK[code] ?? (keyCode & 0xff);
 }
 
