@@ -117,9 +117,11 @@ export async function captureSession(
 
 export interface LoadCheck { ok: boolean; reasons: string[]; overlayChanged: boolean; state: Savestate }
 
-export function checkSavestate(target: SavestateTarget, bytes: Uint8Array): LoadCheck {
+export function checkSavestate(
+    target: SavestateTarget, bytes: Uint8Array, participants: ParticipantRegistry = savestateParticipants,
+): LoadCheck {
     const state = decodeSavestate(bytes);
-    const reasons = incompatibilities(state.header.key, target.compatibilityKey());
+    const reasons = incompatibilities(state.header.key, target.compatibilityKey(), (id, schema) => !!participants.migrationFor(id, schema));
     if (state.header.gameId !== target.gameId()) reasons.unshift(`snapshot is for ${state.header.gameId}`);
     return { ok: reasons.length === 0, reasons, overlayChanged: state.header.overlay !== target.overlayState(), state };
 }
@@ -151,12 +153,18 @@ export async function restoreSession(
     if (missingBlob.length > 0) throw new Error(`savestate: ${missingBlob.length} blob(s) are missing, e.g. ${missingBlob[0]}`);
     const blobs = await loadBlobs(list, store);
     const blob = restoreObjectGraph([], blobs).blob;
+    const sections = new Map(state.sections);
     for (const p of participants.all()) {
-        const value = state.sections.get(p.id);
-        if (value !== undefined) await p.verify?.(value, blob);
+        const value = sections.get(p.id);
+        if (value === undefined) continue;
+        const saved = state.header.key.participants[p.id];
+        const migration = saved && participants.migrationFor(p.id, saved);
+        const migrated = migration ? migration.migrate(value) : value;
+        sections.set(p.id, migrated);
+        await p.verify?.(migrated, blob);
     }
     try {
-        await restoreWritten(target, state, store, participants, blobs);
+        await restoreWritten(target, { ...state, sections }, store, participants, blobs);
     } catch (e) {
         throw new RestoreFailed(e instanceof Error ? e.message : String(e));
     }

@@ -218,7 +218,7 @@ async function runPendingLoadLocked(input: PendingLoadInput): Promise<PendingLoa
     const state = await store.read(name);
     if (!state) throw new Error(`savestate: slot ${name} is empty`);
     const t0 = performance.now();
-    const check = checkSavestate(input.target, state);
+    const check = checkSavestate(input.target, state, input.participants);
     if (!check.ok) throw new Error(`savestate ${name} does not fit this boot: ${check.reasons.join('; ')}`);
     if (check.overlayChanged) Logger.warn(LogCategory.SYSTEM, `[SAVESTATE] ${name}: the game's files changed since it was taken`);
     await restoreSession(input.target, check.state, store.chunkStore, input.participants);
@@ -239,7 +239,8 @@ export async function listSlots(): Promise<{ gameId: string; game: string; slots
     const game = gameDir();
     const t = target('');
     const list = await withGameLock(game, async () => (await gameStore(game)).list((state) => {
-        const reasons = incompatibilities(state.header.key, t.compatibilityKey());
+        const reasons = incompatibilities(state.header.key, t.compatibilityKey(),
+            (id, schema) => !!savestateParticipants.migrationFor(id, schema));
         if (state.header.gameId !== t.gameId()) reasons.unshift('other game');
         return reasons;
     }));

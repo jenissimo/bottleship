@@ -153,7 +153,10 @@ export function decodeSavestate(bytes: Uint8Array): Savestate {
     }
 }
 
-export function incompatibilities(saved: CompatibilityKey, current: CompatibilityKey): string[] {
+export function incompatibilities(
+    saved: CompatibilityKey, current: CompatibilityKey,
+    canMigrate: (id: string, saved: ParticipantSchema) => boolean = () => false,
+): string[] {
     const out: string[] = [];
     for (const field of ['buildSha', 'contentHash', 'configHash', 'bootLayout'] as const) {
         if (saved[field] !== current[field]) out.push(`${field} differs`);
@@ -161,8 +164,9 @@ export function incompatibilities(saved: CompatibilityKey, current: Compatibilit
     for (const [name, then] of Object.entries(saved.participants)) {
         const now = Object.prototype.hasOwnProperty.call(current.participants, name) ? current.participants[name] : undefined;
         if (now === undefined) out.push(`participant ${name} is unknown to this build`);
-        else if (now.version !== then.version) out.push(`participant ${name} is v${now.version}, snapshot has v${then.version}`);
-        else if (now.schemaHash !== then.schemaHash) out.push(`participant ${name} has a different schema`);
+        else if (now.version !== then.version) {
+            if (!canMigrate(name, then)) out.push(`participant ${name} is v${now.version}, snapshot has v${then.version}`);
+        } else if (now.schemaHash !== then.schemaHash) out.push(`participant ${name} has a different schema`);
     }
     for (const name of Object.keys(current.participants)) {
         if (!Object.prototype.hasOwnProperty.call(saved.participants, name)) out.push(`participant ${name} is missing from the snapshot`);

@@ -290,6 +290,14 @@ function apiDebugFlags(): number {
         | (g.__noCursorCatchup ? 8 : 0) | (g.__noCursorStepCap ? 16 : 0) | (g.__detAudio === true ? 32 : 0);
 }
 
+type SoundLock = {
+    offset: number;
+    firstSize: number;
+    secondSize: number;
+    flags: number;
+    requestedBytes: number;
+};
+
 type SoundBuffer = {
     id: number;
     bytes: number;
@@ -309,11 +317,7 @@ type SoundBuffer = {
     // virtual time instead of the AudioContext wall-clock. Unused in normal operation.
     playAnchorVirtualMs?: number;
     playAnchorByte?: number;
-    lockOffset?: number;
-    lockFirstSize?: number;
-    lockSecondSize?: number;
-    lockFlags?: number;
-    lockRequestedBytes?: number;
+    locks?: SoundLock[];
     /** End cursor of the last guest Unlock write = the KMixer consumption frontier
      *  (how far the app has committed PCM into the ring). */
     lastUnlockCursor?: number;
@@ -373,8 +377,7 @@ type SoundBuffer = {
 export const SOUND_BUFFER_FIELDS = {
     id: 'save', bytes: 'save', format: 'save', flags: 'save', ptr: 'save', currentPosition: 'save', volume: 'save',
     volumeDb: 'save', pan: 'save', frequency: 'save', playbackRate: 'save', isPlaying: 'save', isLooping: 'save',
-    playAnchorVirtualMs: 'derive', playAnchorByte: 'derive', lockOffset: 'transient', lockFirstSize: 'transient',
-    lockSecondSize: 'transient', lockFlags: 'transient', lockRequestedBytes: 'transient', lastUnlockCursor: 'save',
+    playAnchorVirtualMs: 'derive', playAnchorByte: 'derive', locks: 'save', lastUnlockCursor: 'save',
     cumulativeWritten: 'save', streamed: 'save', premixMs: 'host', premixStepMs: 'host', premixAdvancedAtMs: 'host',
     reportedLeadBytes: 'host', lastReportedPlayCursor: 'host', smoothRawCursor: 'host', smoothRawAtMs: 'host',
     smoothFromCursor: 'host', stepLastQueryAt: 'host', stepLastCursor: 'host', stepTypicalGapMs: 'host', stepGaps: 'host',
@@ -389,8 +392,17 @@ function pickSoundBuffer(b: SoundBuffer) {
     return pickDefined(b, SOUND_BUFFER_FIELDS);
 }
 
+type LockedRingState = {
+    pcm: Uint8Array;
+    playCursor: number;
+    writeCursor: number;
+    streaming: boolean;
+    shownCursor?: number;
+    trailCursor?: number;
+};
+
 export interface DSoundState {
-    objects: Array<{ ptr: number; type: string; refCount: number; isDs8: boolean; duplex: { ds: number; dsc: number } | null; buffer: SavedSoundBuffer | null; ring: boolean; device?: number }>;
+    objects: Array<{ ptr: number; type: string; refCount: number; isDs8: boolean; duplex: { ds: number; dsc: number } | null; buffer: SavedSoundBuffer | null; ring: boolean; lockedRing?: LockedRingState; device?: number }>;
     nextBufferId: number;
     notifyTimerId: number | null;
     primaryByDevice: Array<[number, number]>;
@@ -408,7 +420,11 @@ export const DSOUND_FIELDS = {
 export const DSOUND_SCHEMA = {
     module: DSOUND_FIELDS,
     primaryRow: ['deviceObject', 'primaryBuffer'],
-    object: stateKeys<DSoundState['objects'][number]>({ ptr: true, type: true, refCount: true, isDs8: true, duplex: true, buffer: true, ring: true, device: true }),
+    object: stateKeys<DSoundState['objects'][number]>({ ptr: true, type: true, refCount: true, isDs8: true, duplex: true, buffer: true, ring: true, lockedRing: true, device: true }),
+    lock: stateKeys<SoundLock>({ offset: true, firstSize: true, secondSize: true, flags: true, requestedBytes: true }),
+    lockedRing: stateKeys<LockedRingState>({
+        pcm: true, playCursor: true, writeCursor: true, streaming: true, shownCursor: true, trailCursor: true,
+    }),
     listener: stateKeys<DSound['listenerState']>({
         posX: true, posY: true, posZ: true, velX: true, velY: true, velZ: true, frontX: true, frontY: true, frontZ: true,
         topX: true, topY: true, topZ: true, distanceFactor: true, rolloffFactor: true, dopplerFactor: true,
@@ -521,7 +537,21 @@ export class DSound implements IModule {
 
     registerSavestate(): () => void {
         return savestateParticipants.add({
-            id: 'dsound', version: 3, order: 61, covers: ['dsound'], schema: DSOUND_SCHEMA as unknown as SaveValue,
+            id: 'dsound', version: 4, order: 61, covers: ['dsound'], schema: DSOUND_SCHEMA as unknown as SaveValue,
+            migrations: {
+                3: {
+                    schemaHash: 'd59d33450645191b',
+                    migrate: (value) => {
+                        const state = value as unknown as DSoundState;
+                        return {
+                            ...state,
+                            objects: state.objects.map(object => object.buffer
+                                ? { ...object, buffer: { ...object.buffer, locks: [] } }
+                                : object),
+                        } as unknown as SaveValue;
+                    },
+                },
+            },
             capture: () => {
                 try {
                     return this.captureSavestate() as unknown as SaveValue;
@@ -1713,9 +1743,6 @@ export class DSound implements IModule {
                 playbackRate: 1.0,
                 isPlaying: false,
                 isLooping: false,
-                lockOffset: undefined,
-                lockFirstSize: undefined,
-                lockSecondSize: undefined,
                 sab,
                 registered: false,
                 bufferRefCount: 1,
@@ -1980,11 +2007,6 @@ export class DSound implements IModule {
             const firstChunk = Math.min(targetBytes, buffer.bytes - start);
             const secondChunk = targetBytes - firstChunk;
 
-            buffer.lockOffset = start;
-            buffer.lockFirstSize = firstChunk;
-            buffer.lockSecondSize = secondChunk;
-            buffer.lockFlags = flags;
-            buffer.lockRequestedBytes = originalBytesRequested;
             if (targetBytes > 0 && (flags & DSBLOCK_ENTIREBUFFER) === 0) {
                 const ring = buffer.stepLockSizes ?? (buffer.stepLockSizes = new Float64Array(CURSOR_LOCK_WINDOW));
                 const count = buffer.stepLockCount ?? 0;
@@ -2000,6 +2022,9 @@ export class DSound implements IModule {
             }
             if (pBytes2) view.setUint32(pBytes2, secondChunk, true);
 
+            (buffer.locks ??= []).push({
+                offset: start, firstSize: firstChunk, secondSize: secondChunk, flags, requestedBytes: originalBytesRequested,
+            });
             return DS_OK;
         };
 
@@ -2013,28 +2038,35 @@ export class DSound implements IModule {
             const audioPtr2 = args[3];
             const bytes2 = args[4] >>> 0;
 
-            // The API contract identifies the locked region by the POINTERS Lock handed
-            // out, not by call order: two producers may hold interleaved Lock/Unlock
-            // sequences on one buffer (UE1-Galaxy's music mixer and its level stream do),
-            // and a state slot shared across those calls misattributes every span after
-            // the first interleave. Derive both spans from the pointers; the remembered
-            // lock state stays only as a fallback for a pointer outside the buffer.
+            const locks = buffer.locks;
+            const matchesPointers = (lock: SoundLock) =>
+                (audioPtr1 === buffer.ptr + lock.offset || (!audioPtr1 && bytes1 === 0))
+                && (!audioPtr2 || (audioPtr2 === buffer.ptr && lock.secondSize > 0));
+            let lockIndex = locks?.findIndex(lock => lock.firstSize === bytes1 && lock.secondSize === bytes2
+                && matchesPointers(lock)) ?? -1;
+            if (lockIndex < 0) {
+                lockIndex = locks?.findIndex(lock => bytes1 <= lock.firstSize && bytes2 <= lock.secondSize
+                    && matchesPointers(lock)) ?? -1;
+            }
+            const lock = locks?.[lockIndex];
             let offset: number;
             let firstSize: number;
             let secondSize: number;
-            if (audioPtr1 >= buffer.ptr && audioPtr1 < buffer.ptr + buffer.bytes) {
+            if (lock) {
+                ({ offset, firstSize, secondSize } = lock);
+            } else if (audioPtr1 >= buffer.ptr && audioPtr1 < buffer.ptr + buffer.bytes) {
                 offset = audioPtr1 - buffer.ptr;
                 firstSize = Math.min(bytes1, buffer.bytes - offset);
                 // Lock's second region starts at zero, not offset + firstSize;
                 // the two spans together never cover more than the buffer.
                 secondSize = Math.min(bytes2, buffer.bytes - firstSize);
             } else {
-                offset = buffer.lockOffset ?? 0;
-                firstSize = buffer.lockFirstSize ?? 0;
-                secondSize = buffer.lockSecondSize ?? 0;
+                offset = 0;
+                firstSize = 0;
+                secondSize = 0;
             }
-            const lockFlags = buffer.lockFlags ?? 0;
-            const requestedBytes = buffer.lockRequestedBytes ?? 0;
+            const lockFlags = lock?.flags ?? 0;
+            const requestedBytes = lock?.requestedBytes ?? 0;
 
             const copyBytes1 = Math.min(bytes1, firstSize);
             const copyBytes2 = Math.min(bytes2, secondSize);
@@ -2046,11 +2078,10 @@ export class DSound implements IModule {
                     audioPtr1 ? copyBytes1 : 0, audioPtr2 ? copyBytes2 : 0);
             }
 
-            buffer.lockOffset = undefined;
-            buffer.lockFirstSize = undefined;
-            buffer.lockSecondSize = undefined;
-            buffer.lockFlags = undefined;
-            buffer.lockRequestedBytes = undefined;
+            if (lockIndex >= 0) {
+                locks!.splice(lockIndex, 1);
+                if (locks!.length === 0) buffer.locks = undefined;
+            }
 
             const totalWritten = copyBytes1 + copyBytes2;
             if (totalWritten > 0) {
@@ -2849,10 +2880,26 @@ export class DSound implements IModule {
 
     captureSavestate(): DSoundState {
         const objects: DSoundState['objects'] = [];
+        const savedRings = new Set<SoundBuffer>();
         for (const [ptr, o] of this.objects) {
             if (o.capture) throw new Error('dsound: capture buffers are not part of a v1 savestate');
             const b = o.buffer;
-            if (b && b.lockFirstSize !== undefined) throw new Error('dsound: a sound buffer is locked');
+            let lockedRing: DSoundState['objects'][number]['lockedRing'];
+            if (b?.locks?.length && b.bytes > 0
+                && (!b.ptr || (this.process.memory.getSize(b.ptr) ?? 0) < b.bytes || b.ptr + b.bytes > this.getMemory().length)) {
+                throw new CaptureRefusal(`dsound: locked playback buffer ${b.id} has no guest backing storage`);
+            }
+            if (b?.sab && b.locks?.length && !savedRings.has(b)) {
+                lockedRing = {
+                    pcm: new Uint8Array(b.sab, CTRL_BLOCK_BYTES).slice(),
+                    playCursor: getCtrl(b.sab, CTRL_PLAY_CURSOR),
+                    writeCursor: getCtrl(b.sab, CTRL_WRITE_CURSOR),
+                    streaming: !!(getCtrl(b.sab, CTRL_FLAGS) & FLAG_STREAMING),
+                    ...(b.stepLastCursor !== undefined ? { shownCursor: b.stepLastCursor } : {}),
+                    ...(b.trailRaw !== undefined ? { trailCursor: b.trailRaw } : {}),
+                };
+                savedRings.add(b);
+            }
             let buffer: SavedSoundBuffer | null = null;
             if (b) {
                 const picked = pickSoundBuffer(b);
@@ -2860,9 +2907,10 @@ export class DSound implements IModule {
                 const playing = b.isPlaying && !finished;
                 buffer = {
                     ...picked,
+                    ...(b.locks?.length ? { locks: b.locks.map(lock => ({ ...lock })) } : {}),
                     ...(finished ? { isPlaying: false, isLooping: false } : {}),
                     format: { ...b.format },
-                    currentPosition: b.sab && playing ? getCtrl(b.sab, CTRL_PLAY_CURSOR) % Math.max(1, b.bytes) : b.currentPosition,
+                    currentPosition: b.sab && playing ? (lockedRing?.playCursor ?? getCtrl(b.sab, CTRL_PLAY_CURSOR)) % Math.max(1, b.bytes) : b.currentPosition,
                     ds3d: { ...b.ds3d },
                     deferredDs3d: b.deferredDs3d ? { ...b.deferredDs3d } : null,
                     ...(b.notifications ? { notifications: b.notifications.map(n => ({ ...n })) } : {}),
@@ -2871,6 +2919,7 @@ export class DSound implements IModule {
             objects.push({
                 ptr, type: o.type, refCount: o.refCount, isDs8: o.isDs8 ?? false, duplex: o.duplex ? { ...o.duplex } : null, buffer, ring: !!b?.sab,
                 ...(o.device !== undefined ? { device: o.device } : {}),
+                ...(lockedRing ? { lockedRing } : {}),
             });
         }
         return {
@@ -2892,6 +2941,7 @@ export class DSound implements IModule {
                 buffer = {
                     ...(b as Partial<SoundBuffer>),
                     format: { ...b.format }, ds3d: { ...b.ds3d }, deferredDs3d: b.deferredDs3d ? { ...b.deferredDs3d } : null,
+                    locks: b.locks?.length ? b.locks.map(lock => ({ ...lock })) : undefined,
                     notifications: b.notifications?.map(n => ({ ...n })),
                     isPlaying: false, sab: null, registered: false,
                 } as SoundBuffer;
@@ -2900,29 +2950,35 @@ export class DSound implements IModule {
                         channels: b.format.channels, sampleRate: b.format.sampleRate, bitsPerSample: b.format.bitsPerSample,
                     }, true);
                     setCtrl(sab, CTRL_FREQUENCY, b.frequency);
-                    const src = mem.subarray(b.ptr, b.ptr + b.bytes);
-                    // Every lap of the ring is refilled from the buffer as it is now. For a static or
-                    // looping buffer that is exact. For a streamed buffer the laps behind the cursor
-                    // get the current lap's data instead of what was played, so the first lap after
-                    // a load can glitch briefly until the game writes ahead again.
-                    for (let at = 0; at < ringBytes; at += b.bytes) writeRingData(sab, at, src, Math.min(b.bytes, ringBytes - at));
+                    if (o.lockedRing) {
+                        new Uint8Array(sab, CTRL_BLOCK_BYTES).set(o.lockedRing.pcm);
+                        setCtrl(sab, CTRL_PLAY_CURSOR, o.lockedRing.playCursor);
+                        setCtrl(sab, CTRL_WRITE_CURSOR, o.lockedRing.writeCursor);
+                        if (o.lockedRing.streaming) setCtrl(sab, CTRL_FLAGS, getCtrl(sab, CTRL_FLAGS) | FLAG_STREAMING);
+                        buffer.stepLastCursor = o.lockedRing.shownCursor;
+                        buffer.trailRaw = o.lockedRing.trailCursor;
+                    } else {
+                        const src = mem.subarray(b.ptr, b.ptr + b.bytes);
+                        for (let at = 0; at < ringBytes; at += b.bytes) writeRingData(sab, at, src, Math.min(b.bytes, ringBytes - at));
+                    }
                     buffer.sab = sab;
                     if (b.has3D) this.flushBuffer3dToSab(buffer);
-                    self.postMessage({ type: "audio_register", payload: { id: buffer.id, sab } });
-                    buffer.registered = true;
                     if (b.isPlaying) {
                         buffer.isPlaying = true;
                         buffer.playAnchorVirtualMs = TimeService.getInstance().nowMs();
                         buffer.playAnchorByte = b.currentPosition;
                         setCtrl(sab, CTRL_STOP_REQUESTED, 0);
-                        setCtrl(sab, CTRL_PLAY_CURSOR, b.currentPosition);
+                        setCtrl(sab, CTRL_PLAY_CURSOR, o.lockedRing?.playCursor ?? b.currentPosition);
                         setCtrl(sab, CTRL_LOOP_MODE, b.isLooping ? -1 : 1);
                         setCtrl(sab, CTRL_VOLUME, b.volumeDb);
                         setCtrl(sab, CTRL_PAN, b.pan);
                         setCtrl(sab, CTRL_DATA_LENGTH, b.isLooping ? this.ringSize(buffer) : b.bytes);
                         setCtrl(sab, CTRL_STATE, STATE_PLAYING);
+                        if (o.lockedRing) setCtrl(sab, CTRL_RESERVED, 1);
                         this.syncFrontierHold(buffer);
                     }
+                    self.postMessage({ type: "audio_register", payload: { id: buffer.id, sab } });
+                    buffer.registered = true;
                 }
                 rebuilt.set(b.id, buffer);
             }

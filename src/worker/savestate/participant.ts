@@ -29,12 +29,18 @@ export interface RestoreContext {
 
 export type FieldPolicy = 'save' | 'derive' | 'host' | 'transient';
 
+interface ParticipantMigration {
+    readonly schemaHash: string;
+    migrate(state: SaveValue): SaveValue;
+}
+
 export interface Participant {
     readonly id: ParticipantId;
     readonly version: number;
     readonly order?: number;
     readonly covers?: readonly string[];
     readonly schema?: SaveValue;
+    readonly migrations?: Readonly<Record<number, ParticipantMigration>>;
     prepare?(): Promise<void>;
     verify?(state: SaveValue, blob: (hash: string) => Uint8Array): void | Promise<void>;
     capture(ctx: CaptureContext): SaveValue;
@@ -126,6 +132,12 @@ export class ParticipantRegistry {
         const out = new Set<string>(this.statelessList.keys());
         for (const p of this.list) for (const m of p.covers ?? []) out.add(normalizeModuleName(m));
         return out;
+    }
+
+    migrationFor(id: string, saved: ParticipantSchema): ParticipantMigration | undefined {
+        const p = this.list.find(p => p.id === id);
+        const migration = p && saved.version < p.version ? p.migrations?.[saved.version] : undefined;
+        return migration?.schemaHash === saved.schemaHash ? migration : undefined;
     }
 
     schemas(): Record<string, ParticipantSchema> {
