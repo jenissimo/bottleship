@@ -15,7 +15,7 @@ RUST_HOST = "x86_64-unknown-linux-gnu"
 RUST_COMMIT = "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4"
 WINE_PROVIDER_SHA256 = "95f8ad6ee983acd0f7f466f25ebe71be3965da796d47befbc44b1cf56e958f42"
 CI_REGISTRY = "/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f"
-PATCHES = [ROOT / name for name in ("abi11-osr-preempt.patch", "abi11-pe-progress.patch")]
+PATCHES = [ROOT / name for name in ("abi11-osr-preempt.patch", "abi11-pe-progress.patch", "abi11-x87-int64.patch")]
 
 
 def sha256(file):

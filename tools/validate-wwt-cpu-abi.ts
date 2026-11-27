@@ -20,27 +20,33 @@ console.log("WWT fast compiler OK (ABI 11 with OSR preemption)");
 
 const cpuFields: Record<string, number> = {
     GPR: 32, EIP: 4, FS_BASE: 4, GS_BASE: 4, SEG_SEL: 12,
-    FK: 4, FR: 4, DF: 4, EFLAGS_SYS: 4, PREEMPT_AT: 4, RETIRED_INSNS: 4,
-    FPU_TOP: 4, FPU_CW: 2, FPU_SW: 2, FPU_TAG: 1, FPU_ST: 64,
+    FK: 4, FR: 4, DF: 4, EFLAGS_SYS: 4, PREEMPT_AT: 4,
+    FPU_TOP: 4, FPU_CW: 2, FPU_SW: 2, FPU_TAG: 1, FPU_ST: 64, FPU_I64: 64, FPU_I64_VALID: 1,
     MXCSR: 4, XMM: 128, MMX: 64,
-    PAGE_DIRECTORY: 4, PAGE_RAM_SIZE: 4,
 };
 
-for (const flatRam of [false, true]) {
-    const mode = flatRam ? "flat" : "paged";
-    const compiler = await WwtCompiler.fromBytes(compilerBytes, flatRam);
+for (const [mode, compiler] of [
+    ["paged", await WwtCompiler.fromBytes(compilerBytes)],
+    ["flat", await WwtCompiler.fromBytes(compilerBytes, true)],
+    ["fast", fast],
+] as const) {
+    const fields = mode === "fast" ? cpuFields : { ...cpuFields, RETIRED_INSNS: 4, PAGE_DIRECTORY: 4, PAGE_RAM_SIZE: 4 };
     const { cpu: abi } = compiler.abi;
     assert(Number.isInteger(abi.SIZE) && abi.SIZE > 0, "WWT CPU ABI omits the native state size");
-    for (const [field, width] of Object.entries(cpuFields)) {
+    for (const [field, width] of Object.entries(fields)) {
         const offset = abi[field];
         assert(Number.isInteger(offset) && offset >= 0 && offset + width <= abi.SIZE,
             `WWT CPU ABI omits or misplaces ${field}`);
     }
-    const ranges = Object.entries(cpuFields).map(([name, width]) => ({ name, offset: abi[name], end: abi[name] + width }))
+    assert.equal(abi.FPU_I64, 512, `${mode}: exact x87 integer slots moved`);
+    assert.equal(abi.FPU_I64_VALID, abi.FPU_I64 + cpuFields.FPU_I64, `${mode}: exact x87 validity must follow eight qwords`);
+    const ranges = Object.entries(fields).map(([name, width]) => ({ name, offset: abi[name], end: abi[name] + width }))
         .sort((a, b) => a.offset - b.offset);
     for (let i = 1; i < ranges.length; i++) {
         assert(ranges[i - 1].end <= ranges[i].offset, `WWT CPU fields overlap: ${ranges[i - 1].name} and ${ranges[i].name}`);
     }
+
+    if (mode === "fast") continue;
 
     const guestBytes = 4 << 20;
     const machine = new BottleShipMachine(compiler, guestBytes);
@@ -84,7 +90,7 @@ for (const flatRam of [false, true]) {
     cpu.main_loop();
     assert.equal(returned, lastError, `${mode}: wrong native GetLastError result`);
     assert.equal(views.instructionPointer[0], entry + 17, `${mode}: wrong resume EIP`);
-    assert.equal(views.instructionCounter[0], 5, `${mode}: OUT retirement mismatch`);
+    if (abi.RETIRED_INSNS !== undefined) assert.equal(views.instructionCounter[0], 5, `${mode}: OUT retirement mismatch`);
     assert.equal(raw.getUint32(pageAddress + 0x00c, true), 1, `${mode}: wrong total native hits`);
     assert.equal(raw.getUint32(pageAddress + 0x2000 + 4 * 5, true), 1, `${mode}: wrong handler hits`);
     assert.equal(cpu.mem8[0x40], 0x5c, `${mode}: native CPU state altered guest page zero`);

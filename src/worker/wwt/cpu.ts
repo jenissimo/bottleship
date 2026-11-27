@@ -619,7 +619,14 @@ export class WwtCpu {
         this.data.setUint16(cpu + A.FPU_CW, this.fpu_control_word[0], true);
         this.data.setUint16(cpu + A.FPU_SW, this.fpu_status_word[0] & ~0x3800, true);
         this.bytes[cpu + A.FPU_TAG] = ~this.fpu_stack_empty[0];
-        for (let i = 0; i < 8; i++) this.data.setFloat64(cpu + A.FPU_ST + i * 8, this.readFpuSlot(i), true);
+        let i64Valid = A.FPU_I64_VALID !== undefined ? this.bytes[cpu + A.FPU_I64_VALID] : 0;
+        for (let i = 0; i < 8; i++) {
+            const at = cpu + A.FPU_ST + i * 8;
+            const before = this.data.getBigUint64(at, true);
+            this.data.setFloat64(at, this.readFpuSlot(i), true);
+            if (this.data.getBigUint64(at, true) !== before) i64Valid &= ~(1 << i);
+        }
+        if (A.FPU_I64_VALID !== undefined) this.bytes[cpu + A.FPU_I64_VALID] = i64Valid & this.bytes[cpu + A.FPU_TAG];
         this.setCpuWord(cpu, A.MXCSR, this.mxcsr[0]);
         this.bytes.copyWithin(cpu + A.XMM, this.reg_xmm.byteOffset, this.reg_xmm.byteOffset + 128);
         this.bytes.set(this.independentMmxRegisters, cpu + A.MMX);
