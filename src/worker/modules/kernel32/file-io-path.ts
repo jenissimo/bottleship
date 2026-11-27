@@ -15,6 +15,7 @@ import { registerFileIoTempExports } from './file-io-temp';
 
 const ERROR_FILE_NOT_FOUND = 2;
 const ERROR_INVALID_PARAMETER = 87;
+const ERROR_INVALID_NAME = 123;
 
 /** A drive prefix alone is relative to that drive's current directory, not its root. */
 function qualifyDriveRelativePath(path: string): string {
@@ -180,6 +181,10 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
 
         const fileName = lpFileName ? readStringA(mem, lpFileName) : '';
         Logger.verbose(LogCategory.KERNEL32, `GetFullPathNameA("${fileName}", ${nBufferLength})`);
+        if (fileName === '') {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_NAME);
+            return 0;
+        }
 
         // Check if input ends with backslash (directory path) - we need to preserve this
         const endsWithSlash = fileName.endsWith('\\') || fileName.endsWith('/');
@@ -260,6 +265,10 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
 
         const fileName = lpFileName ? readStringW(mem, lpFileName) : '';
         Logger.verbose(LogCategory.KERNEL32, `GetFullPathNameW("${fileName}", ${nBufferLength})`);
+        if (fileName === '') {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_NAME);
+            return 0;
+        }
 
         const endsWithSlash = fileName.endsWith('\\') || fileName.endsWith('/');
 
