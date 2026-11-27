@@ -1935,6 +1935,10 @@ const fileIoModule = (() => {
             Logger.log(LogCategory.KERNEL32, `GetFileAttributesA("${filename}")`);
         }
 
+        if (filename === '') {
+            System.getInstance().scheduler.setLastError(ERROR_PATH_NOT_FOUND);
+            return INVALID_FILE_ATTRIBUTES;
+        }
         const vfs = System.getInstance().fileSystem;
         const resolved = vfs.resolvePath(filename);
         if (filename.toLowerCase().endsWith('.bmp')) {
@@ -1969,6 +1973,10 @@ const fileIoModule = (() => {
             Logger.log(LogCategory.KERNEL32, `GetFileAttributesW("${filename}")`);
         }
 
+        if (filename === '') {
+            System.getInstance().scheduler.setLastError(ERROR_PATH_NOT_FOUND);
+            return INVALID_FILE_ATTRIBUTES;
+        }
         const vfs = System.getInstance().fileSystem;
         const resolved = vfs.resolvePath(filename);
         if (filename.toLowerCase().endsWith('.bmp')) {
