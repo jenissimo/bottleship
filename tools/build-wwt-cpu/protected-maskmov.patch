@@ -85,7 +85,7 @@ index 3d07741..155e023 100644
                      f,
                      "fault_if {} code={code:#x} info={}",
 diff --git a/crates/wwt/src/lift.rs b/crates/wwt/src/lift.rs
-index fa437e7..b4f8665 100644
+index fa437e7..89f091a 100644
 --- a/crates/wwt/src/lift.rs
 +++ b/crates/wwt/src/lift.rs
 @@ -1143,7 +1143,7 @@ impl<'a> Lifter<'a> {
@@ -97,10 +97,10 @@ index fa437e7..b4f8665 100644
                      | Op::AtomicCmpxchg { mem, .. } => mem.space != Space::Native,
                      Op::MemCopy { .. } | Op::MemFill { .. } => true,
                      _ => false,
-@@ -3462,6 +3462,18 @@ impl<'a> Lifter<'a> {
+@@ -3460,6 +3460,18 @@ impl<'a> Lifter<'a> {
+         true
+     }
  
-     /// One iteration of a string instruction, updating esi/edi by ±size.
-     /// `a32`: 32-bit addressing in 64-bit code (esi/edi, zero-extended).
 +    fn implicit_addr(&mut self, reg: Register, segment: Register) -> V {
 +        let mut addr = self.read_reg(reg);
 +        if self.x64() {
@@ -113,9 +113,9 @@ index fa437e7..b4f8665 100644
 +        }
 +    }
 +
+     /// One iteration of a string instruction, updating esi/edi by ±size.
+     /// `a32`: 32-bit addressing in 64-bit code (esi/edi, zero-extended).
      fn string_iter(&mut self, m: Mnemonic, size: u32, src_seg: Register, a32: bool) {
-         use Mnemonic as M;
-         let w = size * 8;
 @@ -3481,19 +3493,8 @@ impl<'a> Lifter<'a> {
              }
          };

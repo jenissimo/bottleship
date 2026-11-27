@@ -83,13 +83,13 @@ index ad66991..87304a9 100644
                  write!(
                      f,
 diff --git a/crates/wwt/src/lift.rs b/crates/wwt/src/lift.rs
-index 1a1e8ae..5e7e7d4 100644
+index 1a1e8ae..46ddd81 100644
 --- a/crates/wwt/src/lift.rs
 +++ b/crates/wwt/src/lift.rs
-@@ -3384,6 +3384,18 @@ impl<'a> Lifter<'a> {
+@@ -3382,6 +3382,18 @@ impl<'a> Lifter<'a> {
+         true
+     }
  
-     /// One iteration of a string instruction, updating esi/edi by ±size.
-     /// `a32`: 32-bit addressing in 64-bit code (esi/edi, zero-extended).
 +    fn implicit_addr(&mut self, reg: Register, segment: Register) -> V {
 +        let mut addr = self.read_reg(reg);
 +        if self.x64() {
@@ -102,9 +102,9 @@ index 1a1e8ae..5e7e7d4 100644
 +        }
 +    }
 +
+     /// One iteration of a string instruction, updating esi/edi by ±size.
+     /// `a32`: 32-bit addressing in 64-bit code (esi/edi, zero-extended).
      fn string_iter(&mut self, m: Mnemonic, size: u32, src_seg: Register, a32: bool) {
-         use Mnemonic as M;
-         let w = size * 8;
 @@ -3403,19 +3415,8 @@ impl<'a> Lifter<'a> {
              }
          };
