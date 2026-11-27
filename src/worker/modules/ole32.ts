@@ -22,6 +22,7 @@ import { CaptureRefusal } from "../savestate/object-codecs";
 import type { SaveValue } from "../savestate/value-codec";
 import { comApartments, ComApartments, type ApartmentRow } from "../core/com/apartment";
 import { coCreateWebBrowser, liveWebBrowserInstances } from "./ole32-webbrowser";
+import { coCreateMlang, liveMlangInstances } from "./ole32-mlang-font-link";
 
 // COM error codes
 const REGDB_E_CLASSNOTREG = 0x80040154;
@@ -103,6 +104,8 @@ export class Ole32 implements IModule {
     captureSavestate(): Ole32State {
         const webBrowsers = liveWebBrowserInstances(this.process);
         if (webBrowsers) throw new CaptureRefusal(`ole32: ${webBrowsers} live WebBrowser stand-in object(s) cannot be saved`);
+        const mlang = liveMlangInstances(this.process);
+        if (mlang) throw new CaptureRefusal(`ole32: ${mlang} live MLang object(s) cannot be saved`);
         const sizes = new Uint32Array(this.taskMemSizes.size * 2);
         let i = 0;
         for (const [address, bytes] of this.taskMemSizes) { sizes[i++] = address; sizes[i++] = bytes; }
@@ -398,6 +401,7 @@ export class Ole32 implements IModule {
             }
             return S_OK;
         };
+
 
         // HRESULT CLSIDFromProgID(LPCOLESTR lpszProgID, LPCLSID lpclsid)
         // The registry IS the lookup: HKCR\<ProgID>\CLSID's default value holds the
@@ -1038,6 +1042,8 @@ export class Ole32 implements IModule {
         context: X86Context,
         iidAddress: number,
     ): number {
+        const mlang = coCreateMlang(this.process, clsidNormalized, iidNormalized, ppv);
+        if (mlang !== null) return mlang;
         const webBrowser = coCreateWebBrowser(this.process, clsidNormalized, iidNormalized, ppv);
         if (webBrowser !== null) return webBrowser;
         const registered = lookupHleComClass(this.process, clsidNormalized);
