@@ -27,6 +27,7 @@ import {
     D3DERR_INVALIDCALL,
 } from '../../backends/webgpu/d3d9/presentation';
 import {
+    adoptComObject,
     addComRef,
     createComObject,
     devices,
@@ -42,7 +43,7 @@ import {
     D3DPOOL_DEFAULT,
     D3DRTYPE_SURFACE,
 } from './swapchain-constants';
-import { releaseSurfaceMetadata, surfaceMeta } from './resource-registry';
+import { releaseSurfaceMetadata, surfaceMeta, type SurfaceMeta } from './resource-registry';
 import { readD3D9GuidKey } from './object-contracts';
 import { notifyDeviceSubmission } from './query';
 
@@ -91,9 +92,13 @@ export function validateAdditionalSwapChainParameters(params: PresentationParame
         : D3DERR_NOTAVAILABLE;
 }
 
+// @participant(d3d9)
 const records = new Map<number, SwapChainRecord>();
+// @participant(d3d9)
 const deviceChains = new Map<number, Map<number, SwapChainRecord>>();
+// @participant(d3d9)
 const surfaceChains = new Map<number, number>();
+// @participant(d3d9)
 const devicePresentation = new Map<number, D3D9PresentationState>();
 
 function stateForDevice(devicePtr: number): D3D9PresentationState {
@@ -167,11 +172,22 @@ function createBackBuffer(record: SwapChainRecord): number {
         implicitBackBuffer: (record.index >>> 0) === 0,
     });
     surfaceChains.set(surfacePtr, record.ptr);
-    registerDeviceChildFinalizer(surfacePtr, record.devicePtr, () => {
+    registerBackBufferFinalizer(surfacePtr, record.devicePtr);
+    return surfacePtr;
+}
+
+function registerBackBufferFinalizer(surfacePtr: number, devicePtr: number): void {
+    registerDeviceChildFinalizer(surfacePtr, devicePtr, () => {
         surfaceChains.delete(surfacePtr);
         releaseSurfaceMetadata(surfacePtr);
     });
-    return surfacePtr;
+}
+
+function registerSwapChainFinalizer(record: SwapChainRecord): void {
+    registerDeviceChildFinalizer(record.ptr, record.devicePtr, () => {
+        for (const surfacePtr of record.backBuffers) releaseComRef(surfacePtr);
+        removeDeviceChain(record);
+    });
 }
 
 function createSwapChain(
@@ -215,10 +231,7 @@ function createSwapChain(
         }
         record.backBuffers.push(surfacePtr);
     }
-    registerDeviceChildFinalizer(ptr, record.devicePtr, () => {
-        for (const surfacePtr of record.backBuffers) releaseComRef(surfacePtr);
-        removeDeviceChain(record);
-    });
+    registerSwapChainFinalizer(record);
     return record;
 }
 
@@ -336,6 +349,57 @@ export function resetDeviceSwapChains(devicePtr: number, params: PresentationPar
         }
     }
     return D3D_OK;
+}
+
+export interface SavedSwapChain {
+    ptr: number;
+    devicePtr: number;
+    index: number;
+    params: PresentationParameters9;
+    backBuffers: Array<{ ptr: number; meta: SurfaceMeta }>;
+}
+
+export interface SavedSwapChains {
+    chains: SavedSwapChain[];
+    presentation: Array<{ devicePtr: number; state: { serial: number; chains: unknown[] } }>;
+}
+
+export function captureSwapChains(capturePresentation: (s: D3D9PresentationState) => { serial: number; chains: unknown[] }): SavedSwapChains {
+    const chains = [...records.values()].sort((a, b) => a.ptr - b.ptr).map((r): SavedSwapChain => ({
+        ptr: r.ptr, devicePtr: r.devicePtr, index: r.index, params: { ...r.params },
+        backBuffers: r.backBuffers.map(ptr => ({ ptr, meta: { ...surfaceMeta.get(ptr)! } })),
+    }));
+    const presentation = [...devicePresentation].sort((a, b) => a[0] - b[0])
+        .map(([devicePtr, state]) => ({ devicePtr, state: capturePresentation(state) }));
+    return { chains, presentation };
+}
+
+export function restoreSwapChains(
+    saved: SavedSwapChains,
+    restorePresentation: (s: D3D9PresentationState, saved: { serial: number; chains: Array<{ index: number }> }) => void,
+): void {
+    resetSwapChainRegistry();
+    for (const entry of saved.presentation) {
+        restorePresentation(stateForDevice(entry.devicePtr), entry.state as { serial: number; chains: Array<{ index: number }> });
+    }
+    for (const chain of saved.chains) {
+        const device = devices.get(chain.devicePtr);
+        if (!device) throw new Error(`d3d9: swap chain 0x${chain.ptr.toString(16)} belongs to device 0x${chain.devicePtr.toString(16)}, which was not restored`);
+        adoptComObject(chain.ptr);
+        const record: SwapChainRecord = {
+            ptr: chain.ptr, devicePtr: chain.devicePtr, device, index: chain.index, params: { ...chain.params },
+            backBuffers: chain.backBuffers.map(b => b.ptr), presentation: stateForDevice(chain.devicePtr),
+        };
+        addDeviceChain(record);
+        for (const back of chain.backBuffers) {
+            adoptComObject(back.ptr);
+            resourceToDevice.set(back.ptr, device);
+            surfaceMeta.set(back.ptr, { ...back.meta });
+            surfaceChains.set(back.ptr, chain.ptr);
+            registerBackBufferFinalizer(back.ptr, chain.devicePtr);
+        }
+        registerSwapChainFinalizer(record);
+    }
 }
 
 export function resetSwapChainRegistry(): void {

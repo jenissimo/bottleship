@@ -28,7 +28,16 @@ type ValidatorSession = {
     phase: ValidatorPhase;
 };
 
+// @participant(d3d9)
 const validators = new Map<number, ValidatorSession>();
+
+export const captureShaderValidators = (): Array<[number, number]> =>
+    [...validators].sort((a, b) => a[0] - b[0]).map(([ptr, v]) => [ptr, v.phase] as [number, number]);
+
+export const restoreShaderValidators = (saved: Array<[number, number]>): void => {
+    validators.clear();
+    for (const [ptr, phase] of saved) validators.set(ptr, { phase });
+};
 
 export function resetShaderValidators(): void {
     validators.clear();

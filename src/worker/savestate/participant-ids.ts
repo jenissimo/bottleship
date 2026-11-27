@@ -25,6 +25,7 @@ export const PARTICIPANT_IDS = [
     'oleaut32',
     'ddraw',
     'opengl32',
+    'd3d9',
     'winmm',
     'dplayx',
     'dmusic',

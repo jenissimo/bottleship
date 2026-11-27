@@ -4674,6 +4674,11 @@ export class D3D9BackendExecutor {
         return this.readbackResolveTexture;
     }
 
+    async readSavestateBackbuffer(): Promise<{ rgba: Uint8Array; width: number; height: number } | null> {
+        if (!this.offscreenTexture) return null;
+        return this.readPresentedRgba({ live: true });
+    }
+
     /**
      * Read the last completed presented image as tightly packed RGBA8 pixels, at the GUEST's
      * own backbuffer extent.
@@ -4779,6 +4784,61 @@ export class D3D9BackendExecutor {
         } finally {
             try { readback.destroy(); } catch { /* best effort */ }
         }
+    }
+
+    seedBackbuffer(rgba: Uint8Array, width: number, height: number): boolean {
+        const device = this.backend.getDevice();
+        const queue = this.backend.getQueue();
+        const format = this.backend.getFormat();
+        if (!device || !queue || !format || width <= 0 || height <= 0 || rgba.length < width * height * 4) return false;
+        this.ensureOffscreenTarget();
+        const target = this.offscreenTexture;
+        if (!target) return false;
+        const swapRB = format === "bgra8unorm";
+        const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+        const padded = new Uint8Array(bytesPerRow * height);
+        for (let y = 0; y < height; y++) {
+            for (let x = 0, s = y * width * 4, d = y * bytesPerRow; x < width; x++, s += 4, d += 4) {
+                padded[d] = rgba[s + (swapRB ? 2 : 0)]!;
+                padded[d + 1] = rgba[s + 1]!;
+                padded[d + 2] = rgba[s + (swapRB ? 0 : 2)]!;
+                padded[d + 3] = rgba[s + 3]!;
+            }
+        }
+        const extent = { width, height, depthOrArrayLayers: 1 };
+        const layout = { bytesPerRow, rowsPerImage: height };
+        if (target.width === width && target.height === height) {
+            queue.writeTexture({ texture: target }, padded as never, layout, extent);
+            return true;
+        }
+        const scratch = device.createTexture({
+            size: extent, format,
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        queue.writeTexture({ texture: scratch }, padded as never, layout, extent);
+        this.stretchRectPipeline ??= new ColorKeyBlitPipeline(device, queue);
+        const encoder = device.createCommandEncoder();
+        const zero = { r: 0, g: 0, b: 0, a: 0 };
+        this.stretchRectPipeline.blit(encoder, {
+            srcView: scratch.createView(), srcWidth: width, srcHeight: height,
+            dstView: this.offscreenView!, dstFormat: format, dstWidth: target.width, dstHeight: target.height,
+            srcRect: { left: 0, top: 0, right: width, bottom: height },
+            dstRect: { left: 0, top: 0, right: target.width, bottom: target.height },
+            colorKeyLow: zero, colorKeyHigh: zero, enableColorKey: false,
+            filter: "linear",
+        });
+        queue.submit([encoder.finish()]);
+        this.noteQuerySubmission();
+        scratch.destroy();
+        return true;
+    }
+
+    destroyOwnedResources(): void {
+        this.offscreenTexture?.destroy();
+        this.depthTexture?.destroy();
+        this.presentedTexture?.destroy();
+        this.readbackResolveTexture?.destroy();
+        this.dropDeviceResources();
     }
 
     async captureFrame(): Promise<Blob> {

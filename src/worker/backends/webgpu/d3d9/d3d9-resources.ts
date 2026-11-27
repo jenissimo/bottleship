@@ -853,6 +853,7 @@ export class TextureStore {
     getGpuTexture(index: number): GPUTexture | null { return this.gpuTextures[index]; }
     getView(index: number): GPUTextureView | null { return this.views[index]; }
     getPitch(index: number): number { return this.pitches[index]; }
+    getGuestPtr(index: number): number { return this.guestPtrs[index]; }
     isDirty(index: number): boolean { return this.dirtyFlags[index] !== 0; }
     isLocked(index: number): boolean { return this.lockedPtrs[index] !== -1; }
     getLockedPtr(index: number): number { return this.lockedPtrs[index]; }
@@ -1041,6 +1042,7 @@ export class TextureStore {
         const data = this.data[index];
         if (data) data.set(src.subarray(0, Math.min(src.length, data.length)));
         if (!opts.noDirtyUpdate) this.setDirty(index, true);
+        else this.noteDataWritten(index);
         // The guest buffer IS what `data` was just set from, so it is in sync by construction.
         this.guestSerials[index] = this.dataSerials[index];
     }

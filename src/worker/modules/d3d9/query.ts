@@ -37,6 +37,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
 import {
+    adoptComObject,
     addComRef,
     createComObject,
     devices,
@@ -44,6 +45,7 @@ import {
     registerDeviceChildFinalizer,
     releaseComRef,
 } from './shared-state';
+import { CaptureRefusal } from '../../savestate/object-codecs';
 import { initReturnPtr } from '../../backends/webgpu/shared/dx-com-helpers';
 import { IID_IUNKNOWN, readD3D9GuidKey } from './object-contracts';
 import type { D3D9QueryManager } from './query-manager';
@@ -186,9 +188,11 @@ function noteRetired(query: QueryRecord): void {
     }
 }
 
+// @participant(d3d9)
 const queries: Map<number, QueryRecord> = new Map();
 /** Adapter-free fallback serials. A live query manager owns the only submission domain for
  * that device; this map is intentionally never consulted once a manager is attached. */
+// @transient(serials of adapter-free queries; only settled queries are saved, so a load restarts them)
 const deviceSubmissionSerial = new Map<number, number>();
 
 /** Called by the device presentation boundary after its command buffer is submitted. */
@@ -499,6 +503,7 @@ function remoteReadyOnShip(query: QueryRecord): boolean {
  * GetData on a split front, after the END. OCCLUSION and TIMESTAMP wait for the render worker's
  * measured result for THIS generation; EVENT and TIMESTAMPDISJOINT are ready once their END shipped.
  */
+// @transient(log throttle)
 const reportedRemoteQueryErrors = new Set<string>();
 function remoteGetData(query: QueryRecord, queryPtr: number, pData: number, count: number, flags: number): number {
     const remote = query.remote!;
@@ -535,6 +540,99 @@ function remoteGetData(query: QueryRecord, queryPtr: number, pData: number, coun
     }
     if (count === 0) return D3D_OK;
     return writeQueryData(pData, count, issuedQueryValue(query)) ? D3D_OK : D3DERR_INVALIDCALL;
+}
+
+function installQuery(
+    queryPtr: number, pDevice: number, type: number, dataSize: number,
+    manager: D3D9QueryManager | null, remote: SplitQueryChannel | null,
+): QueryRecord {
+    const record: QueryRecord = {
+        type, devicePtr: pDevice, dataSize, begun: false, issued: false, issueTime: 0n,
+        issueSerial: 0,
+        occlusionBeginDraws: null,
+        occlusionEndDraws: null,
+        disjointBeginTime: null,
+        disjointEndTime: null,
+        awaitingResult: false,
+        lostNoted: false,
+        gpuMode: false,
+        remoteToken: 0,
+        remoteFlushed: false,
+        remoteShipMark: 0,
+    };
+    if (manager) {
+        const handle = manager.acquire(queryPtr, record);
+        record.gpuManager = manager;
+        record.gpuMode = handle.mode === 'gpu';
+    }
+    const stale = queries.get(queryPtr);
+    if (stale) {
+        // The COM block was recycled under a still-live record: whatever that query
+        // measured can never be read, and the manager already refuses to reuse its slot.
+        ledger.lostOnRecycle++;
+        noteRetired(stale);
+    }
+    queries.set(queryPtr, record);
+    ledger.created++;
+    // Static information queries (VCACHE, TIMESTAMPFREQ) fence nothing: answered here.
+    if (remote && queryNeedsSubmission(type)) {
+        record.remote = remote;
+        remote.create(queryPtr, type);
+    }
+    registerDeviceChildFinalizer(queryPtr, pDevice, () => {
+        // A recycled COM pointer hands this finalizer the NEXT object's record; passing
+        // our own lets the manager's guard — and the identity check — keep to our generation.
+        if (!record.remote && queries.get(queryPtr) === record) queryDeviceHooks(record.devicePtr)?.releaseQueryCommands?.(queryPtr);
+        record.gpuManager?.release(queryPtr, record);
+        if (queries.get(queryPtr) !== record) return;
+        record.remote?.release(queryPtr, record.remoteToken);
+        noteRetired(record);
+        queries.delete(queryPtr);
+    });
+    return record;
+}
+
+export interface SavedQuery {
+    ptr: number;
+    devicePtr: number;
+    type: number;
+    issued: boolean;
+    occlusionBeginDraws: number | null;
+    occlusionEndDraws: number | null;
+    disjointBeginTime: string | null;
+    disjointEndTime: string | null;
+}
+
+export function captureQueries(): SavedQuery[] {
+    const out: SavedQuery[] = [];
+    for (const [ptr, q] of [...queries].sort((a, b) => a[0] - b[0])) {
+        const who = `d3d9: query 0x${ptr.toString(16)}`;
+        if (q.begun) throw new CaptureRefusal(`${who} is between Begin and End`);
+        if (q.issued && q.awaitingResult) throw new CaptureRefusal(`${who} was issued and its result has not been read`);
+        const measured = q.type === D3DQUERYTYPE_OCCLUSION || q.type === D3DQUERYTYPE_TIMESTAMP;
+        if (q.issued && (q.gpuMode || q.remote) && measured) throw new CaptureRefusal(`${who} holds a measured GPU result, which is not carried`);
+        out.push({
+            ptr, devicePtr: q.devicePtr, type: q.type, issued: q.issued,
+            occlusionBeginDraws: q.occlusionBeginDraws, occlusionEndDraws: q.occlusionEndDraws,
+            disjointBeginTime: q.disjointBeginTime === null ? null : q.disjointBeginTime.toString(),
+            disjointEndTime: q.disjointEndTime === null ? null : q.disjointEndTime.toString(),
+        });
+    }
+    return out;
+}
+
+export function restoreQuery(saved: SavedQuery): void {
+    const dataSize = QUERY_DATA_SIZE[saved.type];
+    if (dataSize === undefined) throw new Error(`d3d9: query 0x${saved.ptr.toString(16)} has type ${saved.type}, which this build does not support`);
+    adoptComObject(saved.ptr);
+    const manager = queryDeviceHooks(saved.devicePtr)?.getQueryManager?.() ?? null;
+    const remote = manager ? null : queryDeviceHooks(saved.devicePtr)?.splitQueries ?? null;
+    const record = installQuery(saved.ptr, saved.devicePtr, saved.type, dataSize, manager, remote);
+    record.issued = saved.issued;
+    record.occlusionBeginDraws = saved.occlusionBeginDraws;
+    record.occlusionEndDraws = saved.occlusionEndDraws;
+    record.disjointBeginTime = saved.disjointBeginTime === null ? null : BigInt(saved.disjointBeginTime);
+    record.disjointEndTime = saved.disjointEndTime === null ? null : BigInt(saved.disjointEndTime);
 }
 
 export function createQueryExports(): Record<string, ThunkImplementation> {
@@ -584,49 +682,7 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
         }
 
         const queryPtr = createComObject(vtableAddr);
-        const record: QueryRecord = {
-            type, devicePtr: pDevice, dataSize, begun: false, issued: false, issueTime: 0n,
-            issueSerial: 0,
-            occlusionBeginDraws: null,
-            occlusionEndDraws: null,
-            disjointBeginTime: null,
-            disjointEndTime: null,
-            awaitingResult: false,
-            lostNoted: false,
-            gpuMode: false,
-            remoteToken: 0,
-            remoteFlushed: false,
-            remoteShipMark: 0,
-        };
-        if (manager) {
-            const handle = manager.acquire(queryPtr, record);
-            record.gpuManager = manager;
-            record.gpuMode = handle.mode === 'gpu';
-        }
-        const stale = queries.get(queryPtr);
-        if (stale) {
-            // The COM block was recycled under a still-live record: whatever that query
-            // measured can never be read, and the manager already refuses to reuse its slot.
-            ledger.lostOnRecycle++;
-            noteRetired(stale);
-        }
-        queries.set(queryPtr, record);
-        ledger.created++;
-        // Static information queries (VCACHE, TIMESTAMPFREQ) fence nothing: answered here.
-        if (remote && queryNeedsSubmission(type)) {
-            record.remote = remote;
-            remote.create(queryPtr, type);
-        }
-        registerDeviceChildFinalizer(queryPtr, pDevice, () => {
-            // A recycled COM pointer hands this finalizer the NEXT object's record; passing
-            // our own lets the manager's guard — and the identity check — keep to our generation.
-            if (!record.remote && queries.get(queryPtr) === record) queryDeviceHooks(record.devicePtr)?.releaseQueryCommands?.(queryPtr);
-            record.gpuManager?.release(queryPtr, record);
-            if (queries.get(queryPtr) !== record) return;
-            record.remote?.release(queryPtr, record.remoteToken);
-            noteRetired(record);
-            queries.delete(queryPtr);
-        });
+        installQuery(queryPtr, pDevice, type, dataSize, manager, remote);
 
         if (!Mem.writeUint32(ppQuery, queryPtr)) {
             releaseComRef(queryPtr);

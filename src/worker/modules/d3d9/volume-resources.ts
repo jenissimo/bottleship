@@ -51,12 +51,15 @@ export type VolumeTextureDescriptor = Omit<VolumeTextureResource, 'allocator' | 
 };
 
 /** Stable texture metadata keyed by the guest COM pointer. */
+// @participant(d3d9)
 export const volumeTextureResources = new Map<number, VolumeTextureResource>();
 
 /** Stable IDirect3DVolume9 child pointer keyed by parent texture and mip level. */
+// @participant(d3d9)
 export const volumeLevelObjects = new Map<number, Map<number, number>>();
 
 /** Child volume pointer -> owning texture and mip level. */
+// @participant(d3d9)
 export const volumeLevelParents = new Map<number, { texturePtr: number; level: number }>();
 
 export function computeVolumeMipLevelCount(width: number, height: number, depth: number): number {
@@ -227,6 +230,12 @@ export function unlockVolumeBox(texturePtr: number, levelIndex: number): boolean
     if (!level || !level.locked) return false;
     level.locked = null;
     return true;
+}
+
+export function dropVolumeResourcesForRestore(): void {
+    volumeTextureResources.clear();
+    volumeLevelObjects.clear();
+    volumeLevelParents.clear();
 }
 
 export function clearVolumeResources(): void {

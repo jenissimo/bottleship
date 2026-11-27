@@ -28,6 +28,7 @@ import { RawVertexElement } from '../../backends/webgpu/d3d9/shader';
 import { fvfToRawElements } from '../../backends/webgpu/d3d9/swvp';
 import { D3D9_FFP_STAGE_COUNT, isD3D9TextureStage } from '../../backends/webgpu/d3d9/d3d9-state-tracker';
 import type { D3D9StateBlockData } from '../../backends/webgpu/d3d9/d3d9-state-block';
+import type { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import {
     classifyStateBlockCoverage,
     disposeStateBlockData,
@@ -79,9 +80,76 @@ export function releaseD3D9ComRef(prefix: string, ptr: number): number {
     return releaseComRef(pObject) ?? 0;
 }
 
+// @participant(d3d9)
+const recordingDevices = new Set<number>();
+
+export const captureRecordingDevices = (): number[] => [...recordingDevices].sort((a, b) => a - b);
+
+export const restoreRecordingDevices = (list: number[]): void => {
+    recordingDevices.clear();
+    for (const ptr of list) recordingDevices.add(ptr >>> 0);
+};
+
+export function registerStateBlockObject(sbPtr: number, devicePtr: number, data: D3D9StateBlockData): void {
+    data.devicePtr = devicePtr;
+    const coverage = classifyStateBlockCoverage(data.entries);
+    data.coverable = coverage.coverable;
+    tryAttachWasmBlockSlot(data); // may downgrade coverable on unrepresentable entries
+    retainStateBlockRefs(data);
+    d3d9PerfStateBlockCreated(
+        data.blockType,
+        data.entries.length,
+        coverage.coverable,
+        coverage.opCounts,
+        coverage.vsConstRanges,
+        coverage.psConstRanges,
+    );
+    stateBlocks.set(sbPtr, data);
+    const owner = devices.get(devicePtr);
+    if (owner) splitRegisterStateBlock(owner, sbPtr, data);
+    registerDeviceChildFinalizer(sbPtr, devicePtr, () => {
+        disposeStateBlockData(data);
+        stateBlocks.delete(sbPtr);
+        if (owner) splitForgetStateBlock(owner, sbPtr);
+    });
+}
+
+export function registerVertexShaderObject(
+    shaderPtr: number, devicePtr: number, device: D3D9Device, internalHandle: number, bytecode: Uint32Array,
+): void {
+    vertexShaderComObjects.set(shaderPtr, { devicePtr, internalHandle, bytecode });
+    splitRegisterComObject(device, "vs", shaderPtr, internalHandle);
+    registerDeviceChildFinalizer(shaderPtr, devicePtr, () => {
+        vertexShaderComObjects.delete(shaderPtr);
+        splitForgetComObject(device, "vs", shaderPtr);
+    });
+}
+
+export function registerPixelShaderObject(
+    shaderPtr: number, devicePtr: number, device: D3D9Device, internalHandle: number, bytecode: Uint32Array,
+): void {
+    pixelShaderComObjects.set(shaderPtr, { devicePtr, internalHandle, bytecode });
+    splitRegisterComObject(device, "ps", shaderPtr, internalHandle);
+    registerDeviceChildFinalizer(shaderPtr, devicePtr, () => {
+        pixelShaderComObjects.delete(shaderPtr);
+        splitForgetComObject(device, "ps", shaderPtr);
+    });
+}
+
+export function registerVertexDeclObject(
+    declPtr: number, devicePtr: number, device: D3D9Device, internalHandle: number, elements: RawVertexElement[],
+): void {
+    vertexDeclComObjects.set(declPtr, { devicePtr, internalHandle, elements });
+    splitRegisterComObject(device, "decl", declPtr, internalHandle);
+    registerDeviceChildFinalizer(declPtr, devicePtr, () => {
+        vertexDeclComObjects.delete(declPtr);
+        splitForgetComObject(device, "decl", declPtr);
+    });
+}
+
 export function createStateExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
-    const recordingDevices = new Set<number>();
+    recordingDevices.clear();
 
     const D3D_OK = 0;
     const D3DERR_INVALIDCALL = 0x8876086c;
@@ -109,27 +177,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             return null;
         }
         const sbPtr = createComObject(vtableAddr);
-        data.devicePtr = devicePtr;
-        const coverage = classifyStateBlockCoverage(data.entries);
-        data.coverable = coverage.coverable;
-        tryAttachWasmBlockSlot(data); // may downgrade coverable on unrepresentable entries
-        retainStateBlockRefs(data);
-        d3d9PerfStateBlockCreated(
-            data.blockType,
-            data.entries.length,
-            coverage.coverable,
-            coverage.opCounts,
-            coverage.vsConstRanges,
-            coverage.psConstRanges,
-        );
-        stateBlocks.set(sbPtr, data);
-        const owner = devices.get(devicePtr);
-        if (owner) splitRegisterStateBlock(owner, sbPtr, data);
-        registerDeviceChildFinalizer(sbPtr, devicePtr, () => {
-            disposeStateBlockData(data);
-            stateBlocks.delete(sbPtr);
-            if (owner) splitForgetStateBlock(owner, sbPtr);
-        });
+        registerStateBlockObject(sbPtr, devicePtr, data);
         return sbPtr;
     }
 
@@ -352,6 +400,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
 
     // ProcessVertices(SrcStartIndex, DestIndex, VertexCount, pDestBuffer, pVertexDecl, Flags):
     // software T&L of the bound streams into a destination vertex buffer.
+    // @transient(log throttle)
     let processVerticesWarned = false;
     exports['IDirect3DDevice9_ProcessVertices'] = (ctx, _mem, args) => {
         const device = devices.get(args[0]);
@@ -751,16 +800,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         if (!vtableAddr) return D3DERR_INVALIDCALL;
 
         const shaderPtr = createComObject(vtableAddr);
-        vertexShaderComObjects.set(shaderPtr, {
-            devicePtr: pDevice,
-            internalHandle: result.handle,
-            bytecode: result.bytecode,
-        });
-        splitRegisterComObject(device, "vs", shaderPtr, result.handle);
-        registerDeviceChildFinalizer(shaderPtr, pDevice, () => {
-            vertexShaderComObjects.delete(shaderPtr);
-            splitForgetComObject(device, "vs", shaderPtr);
-        });
+        registerVertexShaderObject(shaderPtr, pDevice, device, result.handle, result.bytecode);
 
         if (!writeComPtrOut(ppShader, shaderPtr, mem)) {
             releaseComRef(shaderPtr);
@@ -894,16 +934,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         if (!vtableAddr) return D3DERR_INVALIDCALL;
 
         const declPtr = createComObject(vtableAddr);
-        vertexDeclComObjects.set(declPtr, {
-            devicePtr: pDevice,
-            internalHandle: result.handle,
-            elements,
-        });
-        splitRegisterComObject(device, "decl", declPtr, result.handle);
-        registerDeviceChildFinalizer(declPtr, pDevice, () => {
-            vertexDeclComObjects.delete(declPtr);
-            splitForgetComObject(device, "decl", declPtr);
-        });
+        registerVertexDeclObject(declPtr, pDevice, device, result.handle, elements);
 
         if (!writeComPtrOut(ppDecl, declPtr, mem)) {
             releaseComRef(declPtr);
@@ -958,16 +989,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         if (!vtableAddr) return D3DERR_INVALIDCALL;
 
         const shaderPtr = createComObject(vtableAddr);
-        pixelShaderComObjects.set(shaderPtr, {
-            devicePtr: pDevice,
-            internalHandle: result.handle,
-            bytecode: result.bytecode,
-        });
-        splitRegisterComObject(device, "ps", shaderPtr, result.handle);
-        registerDeviceChildFinalizer(shaderPtr, pDevice, () => {
-            pixelShaderComObjects.delete(shaderPtr);
-            splitForgetComObject(device, "ps", shaderPtr);
-        });
+        registerPixelShaderObject(shaderPtr, pDevice, device, result.handle, result.bytecode);
 
         if (!writeComPtrOut(ppShader, shaderPtr, mem)) {
             releaseComRef(shaderPtr);

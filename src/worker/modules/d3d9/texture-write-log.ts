@@ -69,4 +69,5 @@ class TextureWriteLog {
     }
 }
 
+// @transient(diagnostic recorder armed by the harness)
 export const textureWriteLog = new TextureWriteLog();

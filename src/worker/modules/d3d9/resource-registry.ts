@@ -82,6 +82,7 @@ export type SurfaceMeta = {
 /** sizeof(D3DSURFACE_DESC) — eight DWORDs. */
 export const D3DSURFACE_DESC_SIZE = 32;
 
+// @transient(scratch buffer)
 const surfaceDescWords = new Uint32Array(8);
 
 /**
@@ -101,13 +102,19 @@ export function packSurfaceDesc(meta: SurfaceMeta): Uint32Array {
     return surfaceDescWords;
 }
 
+// @participant(d3d9)
 export const textureMeta: Map<number, TextureMeta> = new Map();
+// @participant(d3d9)
 export const surfaceMeta: Map<number, SurfaceMeta> = new Map();
+// @participant(d3d9)
 export const vertexBufferMeta: Map<number, BufferMeta> = new Map();
+// @participant(d3d9)
 export const indexBufferMeta: Map<number, BufferMeta> = new Map();
 /** Per-device bound depth/stencil surface COM pointer (0 = none). */
+// @participant(d3d9)
 export const deviceBoundDepthStencil: Map<number, number> = new Map();
 /** Per-device bound render-target surface COM pointers by render-target index. */
+// @participant(d3d9)
 export const deviceBoundRenderTarget: Map<number, Map<number, number>> = new Map();
 /**
  * Per-device binding slot ('ds', 'rt0'..'rt3') -> the COM ptr whose reference that
@@ -116,7 +123,12 @@ export const deviceBoundRenderTarget: Map<number, Map<number, number>> = new Map
  * release (a texture teardown clears its subresource metadata), so re-deriving it
  * at release time decrements the wrong object and leaks the texture's binding ref.
  */
+// @participant(d3d9)
 const deviceSlotRefs: Map<number, Map<string, number>> = new Map();
+
+export function captureDeviceSlotRefs(devicePtr: number): Array<[string, number]> {
+    return [...(deviceSlotRefs.get(devicePtr >>> 0) ?? [])].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+}
 
 export function setDeviceSlotRef(devicePtr: number, slot: string, heldPtr: number): void {
     const pDevice = devicePtr >>> 0;
@@ -153,6 +165,7 @@ export function takeAllDeviceSlotRefs(devicePtr: number): number[] {
  * `GetRenderTarget(0,&rt) == GetBackBuffer(0,0,&bb)` compares equal and a per-frame
  * Get/Release loop does not mint a new guest object each frame.
  */
+// @participant(d3d9)
 const deviceBackBufferSurfaces: Map<number, Map<string, number>> = new Map();
 
 /** True for the implicit swap-chain surfaces owned by the device.  They are recreated by
@@ -270,6 +283,10 @@ export function describeDefaultPoolResources(device: D3D9Device, limit = 6): str
     return out;
 }
 
+export function captureDeviceBackBufferSurfaces(devicePtr: number): Array<[string, number]> {
+    return [...(deviceBackBufferSurfaces.get(devicePtr >>> 0) ?? [])].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+}
+
 export function getDeviceBackBufferSurface(devicePtr: number, key: string): number {
     return deviceBackBufferSurfaces.get(devicePtr >>> 0)?.get(key) ?? 0;
 }
@@ -322,8 +339,10 @@ export function takeDeviceBackBufferSurfaces(devicePtr: number): number[] {
 }
 
 /** 2D texture COM ptr -> mip level -> stable IDirect3DSurface9 COM ptr. */
+// @participant(d3d9)
 export const textureLevelSurfaces: Map<number, Map<number, number>> = new Map();
 /** Cube texture COM ptr -> `${face}_${level}` -> stable IDirect3DSurface9 COM ptr. */
+// @participant(d3d9)
 export const cubeFaceSurfaces: Map<number, Map<string, number>> = new Map();
 
 const D3D_OK = 0;

@@ -265,7 +265,9 @@ const ROWS: readonly Row[] = [
     [165, "DEBUGMONITORTOKEN", U],
 ];
 
+// @transient(constant table, identical in every session)
 const CLASS = new Uint8Array(D3D9_RENDER_STATE_COUNT).fill(D3D9_RS_CONSERVATIVE);
+// @transient(constant table, identical in every session)
 const NAMES: string[] = new Array(D3D9_RENDER_STATE_COUNT).fill("");
 for (const [ordinal, name, mask] of ROWS) {
     CLASS[ordinal] = mask;
@@ -316,7 +318,9 @@ export function d3d9RenderStateName(state: number): string {
 // VISIBLE. Every effective ingest write goes through classifyD3D9RenderStateWrite, which is
 // the single place the counter lives.
 
+// @transient(diagnostic counter; a load restarts it)
 let unclassifiedTotal = 0;
+// @transient(diagnostic counter; a load restarts it)
 const unclassifiedCounts = new Map<number, number>();
 
 /**

@@ -47,6 +47,7 @@ import { createPaintingExports } from "../../src/worker/modules/gdi32/painting";
 import { registerDDrawParticipant } from "../../src/worker/modules/ddraw/savestate";
 import { WinMM } from "../../src/worker/modules/winmm";
 import { OpenGL32 } from "../../src/worker/modules/opengl32";
+import { D3D9 } from "../../src/worker/modules/d3d9";
 import { DSound } from "../../src/worker/modules/dsound/dsound";
 import { DInput } from "../../src/worker/modules/dinput/dinput";
 import { DMusic } from "../../src/worker/modules/dmusic";
@@ -343,7 +344,7 @@ describe("participant schemas", () => {
 describe("schema pin and mutation", () => {
     test("participant versions and schema hashes are pinned; a change here needs a version bump", () => {
         registerAllParticipants();
-        const undo = [new WinMM(), new DSound(), new DInput(), new DMusic(), new OpenGL32()].map(m => m.registerSavestate());
+        const undo = [new WinMM(), new DSound(), new DInput(), new DMusic(), new OpenGL32(), new D3D9()].map(m => m.registerSavestate());
         const schemas = savestateParticipants.schemas();
         for (const u of undo) u();
         expect(schemas).toEqual({
@@ -372,6 +373,7 @@ describe("schema pin and mutation", () => {
             "gdi32-palettes": { version: 1, schemaHash: "fdca280b054649f9" },
             "ddraw": { version: 1, schemaHash: "844462508bc4ae1e" },
             "opengl32": { version: 4, schemaHash: "d6f14fb250731270" },
+            "d3d9": { version: 1, schemaHash: "94431a8e8fb7ec7a" },
             "dsound": { version: 3, schemaHash: "d59d33450645191b" },
             "dinput": { version: 1, schemaHash: "d7eaf2cafce58a42" },
             "winmm": { version: 6, schemaHash: "a0ad9024170c4f7c" },

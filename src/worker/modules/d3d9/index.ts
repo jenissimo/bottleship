@@ -16,13 +16,20 @@ import { createShaderValidatorExports as shader_validator } from './shader-valid
 import { createStateExports as state } from './state';
 import { createSwapChainExports as swapchain } from './swapchain';
 import { createVolumeExports as volume } from './volume';
+import { savestatesEnabled } from '../../savestate/participant';
+import { registerD3D9Participant } from './savestate';
 import { resetD3D9SharedState } from './shared-state';
 
 export class D3D9 implements IModule {
     name = 'd3d9';
     exports: Record<string, ThunkImplementation> = {};
 
+    registerSavestate(): () => void {
+        return registerD3D9Participant();
+    }
+
     initialize(process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         // device functions
         Object.assign(this.exports, device());
         // ex functions

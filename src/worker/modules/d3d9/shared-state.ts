@@ -12,7 +12,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { clearResourceRegistry } from './resource-registry';
 import { publishTexture9Vtable } from './guest-addref-stub';
 import { publishTexture9ReleaseVtable } from './guest-release-stub';
-import { clearVolumeResources } from './volume-resources';
+import { clearVolumeResources, dropVolumeResourcesForRestore } from './volume-resources';
 import { resetResourceContract } from './resource-contract';
 import type { D3D9StateBlockData } from '../../backends/webgpu/d3d9/d3d9-state-block';
 import { clearD3D9ComObjectRegistries } from '../../backends/webgpu/d3d9/d3d9-com-objects';
@@ -21,7 +21,8 @@ import { resetQueryState } from './query';
 import { resetD3D9Perf, getD3D9PerfSnapshot, type D3D9PerfSnapshot } from './d3d9-perf';
 import { d3d9WasmArena } from '../../backends/webgpu/d3d9/d3d9-wasm-arena';
 import { allocateComObject, freeComObject } from '../../core/com/com-memory';
-import { drainComFinalizers, trackComObject } from './com-refs';
+import { drainComFinalizers, dropComRefsForRestore, trackComObject } from './com-refs';
+import { claimRestoredComBlock, registerComVtableOwner } from '../../core/com/com-memory';
 
 export {
     addComRef,
@@ -33,6 +34,7 @@ export {
 } from './com-refs';
 
 // Shared vtables - created once and reused
+// @participant(d3d9)
 let vtables: Record<string, VTableInfo> | null = null;
 
 /**
@@ -83,6 +85,7 @@ class DeviceRegistry extends Map<number, D3D9Device> {
     }
 }
 
+// @participant(d3d9)
 export const devices = new DeviceRegistry();
 
 /**
@@ -104,12 +107,14 @@ export const D3D9EX_SHADOWED_SETTERS: Readonly<Record<string, string>> = Object.
  * registries the ring handlers read answer with the twin's objects — the same handler code
  * then drives the twin. Outside a replay they are the front's, as always.
  */
+// @transient(nonzero only while a split twin replays; capture refuses a split device)
 let splitReplayDepth = 0;
 export function beginD3D9SplitReplay(): void { splitReplayDepth++; }
 export function endD3D9SplitReplay(): void { splitReplayDepth--; }
 export function isD3D9SplitReplay(): boolean { return splitReplayDepth !== 0; }
 
 /** The render twin's state blocks, by COM pointer (registered through the call stream). */
+// @transient(filled only by a split twin; capture refuses a split device)
 export const twinStateBlocks: Map<number, D3D9StateBlockData> = new Map();
 
 class StateBlockRegistry extends Map<number, D3D9StateBlockData> {
@@ -119,6 +124,7 @@ class StateBlockRegistry extends Map<number, D3D9StateBlockData> {
 }
 
 // Parent relationship for IDirect3DDevice9::GetDirect3D
+// @participant(d3d9)
 export const deviceToD3D9: Map<number, number> = new Map();
 
 /**
@@ -154,9 +160,11 @@ export const deviceBackBufferInfo: Map<number, {
 }> = new Map();
 
 // Shared resource registry - maps COM object pointer to its parent D3D9Device
+// @participant(d3d9)
 export const resourceToDevice: Map<number, D3D9Device> = new Map();
 
 // State block COM objects → captured/replayed state data
+// @participant(d3d9)
 export const stateBlocks: Map<number, D3D9StateBlockData> = new StateBlockRegistry();
 
 /**
@@ -166,6 +174,7 @@ export const stateBlocks: Map<number, D3D9StateBlockData> = new StateBlockRegist
  * Clip status is pure app-visible bookkeeping in D3D9 (it only ever reports what
  * ProcessVertices found), so store-and-return IS the faithful implementation.
  */
+// @participant(d3d9)
 export const deviceClipStatus: Map<number, { clipUnion: number; clipIntersection: number }> = new Map();
 
 /**
@@ -184,6 +193,54 @@ export function createComObject(vtableAddress: number): number {
     trackComObject(objPtr, () => freeComObject(process.memory, objPtr));
 
     return objPtr;
+}
+
+export function adoptComObject(objPtr: number): void {
+    const process = System.getInstance().process;
+    if (!process) throw new Error('Process not initialized');
+    claimRestoredComBlock(objPtr);
+    trackComObject(objPtr, () => freeComObject(process.memory, objPtr));
+}
+
+export function captureVTables(): Array<[string, number, number]> | null {
+    return vtables ? Object.entries(vtables).map(([name, v]) => [name, v.address, v.size] as [string, number, number]) : null;
+}
+
+export function restoreVTables(list: Array<[string, number, number]> | null): void {
+    if (!list) {
+        vtables = null;
+        publishTexture9Vtable(0);
+        publishTexture9ReleaseVtable(0);
+        return;
+    }
+    vtables = {};
+    for (const [name, address, size] of list) {
+        vtables[name] = { address, size };
+        registerComVtableOwner(address, d3d9Module.name, name);
+    }
+    publishTexture9Vtable(vtables['IDirect3DTexture9']?.address ?? 0);
+    publishTexture9ReleaseVtable(vtables['IDirect3DTexture9']?.address ?? 0);
+}
+
+export function dropD3D9RegistriesForRestore(): D3D9Device[] {
+    const old = new Set<D3D9Device>(devices.values());
+    for (const device of resourceToDevice.values()) old.add(device);
+    dropComRefsForRestore();
+    devices.clear();
+    deviceToD3D9.clear();
+    deviceCreationParams.clear();
+    deviceBackBufferInfo.clear();
+    resourceToDevice.clear();
+    stateBlocks.clear();
+    twinStateBlocks.clear();
+    deviceClipStatus.clear();
+    d3d9WasmArena.resetBlockSlots();
+    clearD3D9ComObjectRegistries();
+    clearResourceRegistry();
+    dropVolumeResourcesForRestore();
+    resetShaderValidators();
+    resetQueryState();
+    return [...old];
 }
 
 /**
@@ -261,6 +318,7 @@ export function resetD3D9SharedState(): void {
  * the two never coincide — but the upload itself is observable, and needs to know nothing
  * about the game.
  */
+// @transient(monotonic upload count that a video sink compares between its own reads)
 let d3d9TextureUploads = 0;
 
 export function noteD3D9TextureUpload(): void {

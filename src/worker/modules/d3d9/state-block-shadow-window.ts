@@ -39,9 +39,20 @@ function dispatcher(): ShadowDispatcher | null {
 }
 
 /** Skip counters at each open window's Begin, keyed by the recording device. */
+// @participant(d3d9)
 const openWindows = new Map<number, Record<string, number>>();
 
+export const captureOpenWindows = (): Array<[number, Record<string, number>]> =>
+    [...openWindows].sort((a, b) => a[0] - b[0]).map(([ptr, counters]) => [ptr, { ...counters }]);
+
+export const restoreOpenWindows = (saved: Array<[number, Record<string, number>]>): void => {
+    openWindows.clear();
+    for (const [ptr, counters] of saved) openWindows.set(ptr, { ...counters });
+};
+
+// @transient(diagnostic counter; a load restarts it)
 let windows = 0;
+// @transient(diagnostic counter; a load restarts it)
 let elided = 0;
 const elidedBySetter: Record<string, number> = {};
 
