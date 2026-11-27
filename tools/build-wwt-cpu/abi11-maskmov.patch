@@ -1,0 +1,117 @@
+diff --git a/crates/wwt/src/codegen.rs b/crates/wwt/src/codegen.rs
+index ab28c29..24f61f0 100644
+--- a/crates/wwt/src/codegen.rs
++++ b/crates/wwt/src/codegen.rs
+@@ -2602,6 +2602,20 @@ impl<'g, 'a> FnGen<'g, 'a> {
+                     self.emit(vec_instr(op));
+                 }
+             }
++            Op::StoreIf { cond, addr, val, mem } => {
++                let local_facts = self.facts_local.len();
++                let tree_facts = self.facts_tree.len();
++                self.get(*cond);
++                self.emit(W::If(BlockType::Empty));
++                self.inst_value(&Inst {
++                    dst: None,
++                    op: Op::Store { addr: *addr, val: *val, mem: *mem },
++                    eip: inst.eip,
++                }, dirty, false);
++                self.emit(W::End);
++                self.facts_local.truncate(local_facts);
++                self.facts_tree.truncate(tree_facts);
++            }
+             Op::FaultIf { cond, code, info } => {
+                 self.get(*cond);
+                 self.emit(W::If(BlockType::Empty));
+diff --git a/crates/wwt/src/ir.rs b/crates/wwt/src/ir.rs
+index ad66991..87304a9 100644
+--- a/crates/wwt/src/ir.rs
++++ b/crates/wwt/src/ir.rs
+@@ -720,6 +720,12 @@ pub enum Op {
+         val: V,
+         mem: Mem,
+     },
++    StoreIf {
++        cond: V,
++        addr: V,
++        val: V,
++        mem: Mem,
++    },
+     /// Atomic read-modify-write; produces the old value.
+     AtomicRmw {
+         op: RmwOp,
+@@ -779,6 +785,7 @@ impl Op {
+             Op::Select { cond, t, f } => vec![*cond, *t, *f],
+             Op::Load { addr, .. } => vec![*addr],
+             Op::Store { addr, val, .. } => vec![*addr, *val],
++            Op::StoreIf { cond, addr, val, .. } => vec![*cond, *addr, *val],
+             Op::AtomicRmw { addr, val, .. } => vec![*addr, *val],
+             Op::AtomicCmpxchg {
+                 addr,
+@@ -803,6 +810,7 @@ impl Op {
+             Op::Select { cond, t, f } => vec![cond, t, f],
+             Op::Load { addr, .. } => vec![addr],
+             Op::Store { addr, val, .. } => vec![addr, val],
++            Op::StoreIf { cond, addr, val, .. } => vec![cond, addr, val],
+             Op::AtomicRmw { addr, val, .. } => vec![addr, val],
+             Op::AtomicCmpxchg {
+                 addr,
+@@ -823,6 +831,7 @@ impl Op {
+     pub fn has_side_effects(&self) -> bool {
+         match self {
+             Op::Store { .. }
++            | Op::StoreIf { .. }
+             | Op::AtomicRmw { .. }
+             | Op::AtomicCmpxchg { .. }
+             | Op::MemCopy { .. }
+@@ -841,6 +850,7 @@ impl Op {
+             Op::FaultIf { .. } => true,
+             Op::Load { mem, .. }
+             | Op::Store { mem, .. }
++            | Op::StoreIf { mem, .. }
+             | Op::AtomicRmw { mem, .. }
+             | Op::AtomicCmpxchg { mem, .. } => mem.space == Space::Guest,
+             Op::MemCopy { .. } | Op::MemFill { .. } => true,
+@@ -1334,6 +1344,9 @@ impl fmt::Display for Op {
+                 }
+                 write!(f, ")")
+             }
++            Op::StoreIf { cond, addr, val, mem } => write!(
++                f, "store_if {} {:?}[{}] = {}", VName(*cond), mem.space, VName(*addr), VName(*val),
++            ),
+             Op::FaultIf { cond, code, info } => {
+                 write!(
+                     f,
+diff --git a/crates/wwt/src/lift/simd.rs b/crates/wwt/src/lift/simd.rs
+index 327b7a2..b7f320c 100644
+--- a/crates/wwt/src/lift/simd.rs
++++ b/crates/wwt/src/lift/simd.rs
+@@ -1053,7 +1053,27 @@ impl<'a> Lifter<'a> {
+             }
+             M::Fxsave | M::Fxsave64 => self.lift_fxsave(i, true),
+             M::Fxrstor | M::Fxrstor64 => self.lift_fxsave(i, false),
+-            M::Maskmovq | M::Maskmovdqu => bail!("masked stores"),
++            M::Maskmovq | M::Maskmovdqu => {
++                let size = if m == M::Maskmovdqu { 16 } else { 8 };
++                let regs: Vec<u32> = (0..i.op_count())
++                    .filter(|&n| i.op_kind(n) == OpKind::Register)
++                    .collect();
++                if regs.len() != 2 {
++                    bail!("masked store form");
++                }
++                let data = src!(regs[0]);
++                let mask = src!(regs[1]);
++                let sign_bit = self.c32(0x80);
++                let base = self.copy(EDI);
++                for lane in 0..size {
++                    let selector = self.vop(VecOp::Extract(Lane::I8, lane), &[mask]);
++                    let cond = self.emit(Ty::I32, Op::Bin(BinOp::I32And, selector, sign_bit));
++                    let val = self.vop(VecOp::Extract(Lane::I8, lane), &[data]);
++                    let addr = self.addr_add(base, lane as u32);
++                    let mem = self.mem(1, Space::Guest);
++                    self.effect(Op::StoreIf { cond, addr, val, mem });
++                }
++            }
+             _ => bail!("SIMD instruction not supported"),
+         }
+         let _ = (fault::UNSUPPORTED, MemorySize::Unknown);
