@@ -69,6 +69,7 @@ export const HLE_IMAGE_SLOT: Record<string, number> = {
     oledlg: 36,
     dpnet: 37,
     dpnlobby: 38,
+    mpr: 39,
 };
 
 /** Slots past the pinned block, handed to APIRegistry-only modules in sorted order. */
