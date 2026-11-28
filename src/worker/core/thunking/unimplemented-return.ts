@@ -35,6 +35,9 @@ const VALUES: Record<UnimplementedReturn, number> = {
     win32Status: ERROR_CALL_NOT_IMPLEMENTED,
     ntstatus: 0xC0000002,
     configret: 0x34,
+    win32NotConnected: 2250,
+    win32NoNetwork: 1222,
+    win32InvalidHandle: 6,
     unresolvable: 0,
 };
 

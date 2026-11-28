@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { mprModule } from "../../src/worker/api/mpr.api";
 import { STATELESS_MODULES } from "../../src/worker/savestate/stateless-modules";
 import { registerCoreParticipants } from "../../src/worker/savestate/core-participants";
 import { newObjectGraph } from "../../src/worker/savestate/object-codecs";
@@ -23,8 +24,9 @@ const MODULES: Record<string, () => Promise<object>> = {
 };
 
 describe("stateless modules", () => {
-    test("every declared module has an instance check here", () => {
-        expect(Object.keys(MODULES).sort()).toEqual(Object.keys(STATELESS_MODULES).sort());
+    test("every stateless module has an instance check or supplies only declarative failure stubs", () => {
+        expect([...Object.keys(MODULES), mprModule.name].sort()).toEqual(Object.keys(STATELESS_MODULES).sort());
+        expect(mprModule.functions.every(fn => fn.onUnimplemented !== undefined)).toBe(true);
     });
 
     test("a declared module object holds nothing but its name, exports and process", async () => {

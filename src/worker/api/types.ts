@@ -63,6 +63,9 @@ export type UnimplementedReturn =
     | "ntstatus"
     /** CR_CALL_NOT_IMPLEMENTED — Configuration Manager exports returning CONFIGRET. */
     | "configret"
+    | "win32NotConnected"
+    | "win32NoNetwork"
+    | "win32InvalidHandle"
     /**
      * No value reads as failure — every bit pattern is a legal answer (GetTickCount64).
      * Returning anything at all is a lie, so the export does not resolve: GetProcAddress
