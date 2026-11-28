@@ -21,8 +21,8 @@ import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
 import { createDirectDrawExports } from "../../src/worker/modules/ddraw/directdraw";
 import { createSurfaceExports } from "../../src/worker/modules/ddraw/surface";
-import { rasterStatusAt } from "../../src/worker/modules/ddraw/raster-status";
-import { SUPPORTED_FOURCC_CODES } from "../../src/worker/modules/ddraw/constants";
+import { nextVerticalBlankEdgeMs, rasterStatusAt } from "../../src/worker/modules/ddraw/raster-status";
+import { DDWAITVB_BLOCKBEGIN, DDWAITVB_BLOCKEND, SUPPORTED_FOURCC_CODES } from "../../src/worker/modules/ddraw/constants";
 import {
     DEFAULT_VENDOR_ID,
     DEFAULT_DEVICE_ID,
@@ -85,6 +85,41 @@ function harness() {
 }
 
 describe("synthetic raster status", () => {
+    test("blocking waits target the requested future edge of the guest raster", () => {
+        const begin = nextVerticalBlankEdgeMs(1, 60, false);
+        const end = nextVerticalBlankEdgeMs(1, 60, true);
+        expect(begin).toBeCloseTo(1000 / 60);
+        expect(end).toBeGreaterThan(1);
+        expect(end).toBeLessThan(begin);
+        expect(nextVerticalBlankEdgeMs(begin, 60, false)).toBeCloseTo(2 * begin);
+        expect(nextVerticalBlankEdgeMs(end, 60, true)).toBeCloseTo(begin + end);
+        expect(rasterStatusAt(begin + 0.001, 480, 60).inVBlank).toBe(true);
+        expect(rasterStatusAt(end + 0.001, 480, 60).inVBlank).toBe(false);
+    });
+
+    test("legacy interfaces provide a blocking wait when enabled", async () => {
+        const { dd, call } = harness();
+        const flags = globalThis as { __ddrawLegacyVBlank?: boolean };
+        const previous = flags.__ddrawLegacyVBlank;
+        try {
+            for (const version of ["IDirectDraw", "IDirectDraw2", "IDirectDraw4"]) {
+                const method = version + "_WaitForVerticalBlank";
+                flags.__ddrawLegacyVBlank = false;
+                expect(call(dd, method, 0, DDWAITVB_BLOCKBEGIN, 0)).toBe(DD_OK);
+                flags.__ddrawLegacyVBlank = true;
+                const begin = call(dd, method, 0, DDWAITVB_BLOCKBEGIN, 0);
+                const end = call(dd, method, 0, DDWAITVB_BLOCKEND, 0);
+                expect(begin).toBeInstanceOf(Promise);
+                expect(end).toBeInstanceOf(Promise);
+                expect(await begin).toBe(DD_OK);
+                expect(await end).toBe(DD_OK);
+            }
+        } finally {
+            if (previous === undefined) delete flags.__ddrawLegacyVBlank;
+            else flags.__ddrawLegacyVBlank = previous;
+        }
+    });
+
     test("the vertical-blank flag toggles within a single refresh period", () => {
         const seen = new Set<boolean>();
         for (let t = 0; t < 20; t += 0.25) seen.add(rasterStatusAt(t, 480, 60).inVBlank);

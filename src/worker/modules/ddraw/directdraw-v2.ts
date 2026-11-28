@@ -89,8 +89,7 @@ export function registerDirectDraw2Exports(
         return exports["IDirectDraw7_GetAvailableVidMem"]?.(ctx, mem, args) ?? DD_OK;
     };
 
-    // Keep WaitForVerticalBlank synchronous for v2 (see v1 comment above)
-    exports["IDirectDraw2_WaitForVerticalBlank"] = () => DD_OK;
+    exports["IDirectDraw2_WaitForVerticalBlank"] = exports["IDirectDraw_WaitForVerticalBlank"];
 
     // IDirectDraw2 stub methods - delegate to v7 where possible
     const idirectDraw2Stubs = [
@@ -115,8 +114,7 @@ export function registerDirectDraw2Exports(
         }
     }
 
-    // Keep WaitForVerticalBlank synchronous for v4 (see v1 comment above)
-    exports["IDirectDraw4_WaitForVerticalBlank"] = () => DD_OK;
+    exports["IDirectDraw4_WaitForVerticalBlank"] = exports["IDirectDraw_WaitForVerticalBlank"];
 
     // IDirectDraw4::GetDeviceIdentifier uses DDDEVICEIDENTIFIER (DX6, 1064 bytes, NO dwWHQLLevel).
     // MUST NOT delegate to IDirectDraw7_GetDeviceIdentifier which uses DDDEVICEIDENTIFIER2 (DX7, 1068 bytes)
