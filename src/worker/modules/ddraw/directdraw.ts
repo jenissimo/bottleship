@@ -99,7 +99,7 @@ import { bytesToGuid, surfaceAt } from "./helpers";
 import { resolveDDrawTearOff } from "./com-tearoff";
 import { isValidAddress, isSafeSurfaceAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { computePitch, normalizeSurfaceDesc, readSurfaceDesc, readSurfaceDescV1, writeDisplayModeDesc, writeDisplayModeDescV1, writeSurfaceDesc, writeSurfaceDescV1 } from "./structs";
-import { rasterStatusAt } from "./raster-status";
+import { nextVerticalBlankEdgeMs, rasterStatusAt } from "./raster-status";
 import { DirectDrawSurfaceObject, DirectDrawSurfaceState, DirectDrawPaletteObject } from "./com-objects";
 import { createGPUTexture, convertRGBAToSurface } from "./gpu-texture-utils";
 import { gpuDeviceUsable } from "../../core/gpu/gpu-device-lifecycle";
@@ -1401,11 +1401,24 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         return sendDisplayChange(ctx, mem, context.display, STACK_CLEANUP_SETDISPLAYMODE_V1, "IDirectDraw_SetDisplayMode", DD_OK);
     };
 
-    // v1/v2/v4: WaitForVerticalBlank returns DD_OK synchronously.
-    // Only v7 is async (games that explicitly request v7 are newer and expect real VSync).
-    // Making older versions async breaks hover/tooltip handling: during the async spin-loop
-    // wait, no x86 code runs → hover detection logic doesn't execute.
-    exports["IDirectDraw_WaitForVerticalBlank"] = () => DD_OK;
+    exports["IDirectDraw_WaitForVerticalBlank"] = (_ctx, _mem, args) => {
+        const flags = args[1];
+        if ((globalThis as { __ddrawLegacyVBlank?: boolean }).__ddrawLegacyVBlank !== true ||
+            (flags !== DDWAITVB_BLOCKBEGIN && flags !== DDWAITVB_BLOCKEND)) {
+            return DD_OK;
+        }
+        const deadline = nextVerticalBlankEdgeMs(
+            performance.now(), context.display.refresh, flags === DDWAITVB_BLOCKEND,
+        );
+        return new Promise<number>(resolve => {
+            const wait = () => {
+                const remaining = deadline - performance.now();
+                if (remaining <= 0) resolve(DD_OK);
+                else setTimeout(wait, Math.ceil(remaining));
+            };
+            wait();
+        });
+    };
 
     // IDirectDraw4 methods (DX6)
     exports["IDirectDraw4_QueryInterface"] = (ctx, mem, args) => commonQueryInterface(args[0], args[1], args[2], mem);

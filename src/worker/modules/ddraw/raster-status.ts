@@ -18,6 +18,14 @@ export interface RasterStatus {
     inVBlank: boolean;
 }
 
+export function nextVerticalBlankEdgeMs(nowMs: number, refreshHz: number, end: boolean): number {
+    const frameMs = 1000 / Math.max(1, refreshHz || 60);
+    const edge = end ? frameMs * VBLANK_FRACTION : 0;
+    const frame = Math.floor((nowMs - edge) / frameMs);
+    const nextEdge = (frame + 1) * frameMs + edge;
+    return nextEdge > nowMs ? nextEdge : nextEdge + frameMs;
+}
+
 export function rasterStatusAt(nowMs: number, height: number, refreshHz: number): RasterStatus {
     const lines = Math.max(1, Math.floor(height) || 480);
     const frameMs = 1000 / Math.max(1, refreshHz || 60);
