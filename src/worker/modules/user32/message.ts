@@ -134,6 +134,13 @@ export function invokeGuestWndProcSync(
     };
 }
 
+function finishSubclassedControlPaint(hwnd: number, mem: Uint8Array): void {
+    const control = windows.get(hwnd);
+    if (!control || control.guestValidatedPaint || !hasPendingUpdate(hwnd)) return;
+    clearWindowUpdate(hwnd);
+    handleSystemControlMessage(control, WM_PAINT, 0, 0, mem);
+}
+
 type CallbackManager = NonNullable<NonNullable<System['process']>['dispatcher']>['callbackManager'];
 
 /** The calling thunk returns into a callback stub, so its frame is already suspended. */
@@ -1682,11 +1689,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                         // Finalize a deferred-destroy window only after its wndProc has
                         // processed WM_NCDESTROY (MFC OnNcDestroy → detach).
                         if (message === WM_NCDESTROY) finalizeWindowDestroy(hwnd);
-                        if (subclassedPaint && hasPendingUpdate(hwnd)) {
-                            const control = windows.get(hwnd);
-                            clearWindowUpdate(hwnd);
-                            if (control) handleSystemControlMessage(control, WM_PAINT, 0, 0, mem);
-                        }
+                        if (subclassedPaint) finishSubclassedControlPaint(hwnd, mem);
                         return wndRet >>> 0;
                     },
                 );
@@ -1917,7 +1920,9 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                     return buttonCheckStates.get(hWnd) ?? 0;
                 default: {
                     // Listbox/Combobox/Static messages: route through handleSystemControlMessage
-                    if ((msg >= 0x0140 && msg <= 0x0160) || (msg >= 0x0170 && msg <= 0x0174) || (msg >= 0x0180 && msg <= 0x01A0)) {
+                    if ((!allowGuestDispatch || !targetWindow.wndProcSubclassed)
+                        && ((msg >= 0x0140 && msg <= 0x0160) || (msg >= 0x0170 && msg <= 0x0174)
+                            || (msg >= 0x0180 && msg <= 0x01A0))) {
                         return handleSystemControlMessage(targetWindow, msg, wParam, lParam, mem);
                     }
                     break;

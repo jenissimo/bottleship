@@ -71,6 +71,7 @@ beforeEach(() => {
         setCapture: () => 0,
         releaseCapture: () => 0,
         postMessage: (hwnd: number, msg: number) => { posted.push({ hwnd, msg }); },
+        clearPaintMessage: () => {},
         getWindow: () => undefined,
     };
     system.scheduler = { wakeMessageWaiters: () => {} };
@@ -79,6 +80,8 @@ beforeEach(() => {
 
 afterEach(() => {
     const system = System.getInstance() as any;
+    clearWindowUpdate(CHECK);
+    clearWindowUpdate(DIALOG);
     Object.assign(system, saved);
     windows.clear();
     resetControlInteractionState();
@@ -170,5 +173,21 @@ describe("the stock paint of a subclassed control is not lost", () => {
             done(0);
         });
         expect(overlayDCs).toBe(0);
+    });
+
+    test("a subclass that validates its paint can invalidate itself for another paint", () => {
+        setup(true);
+        const control = windows.get(CHECK)!;
+        control.systemControlClass = "ScrollBar";
+        control.nativeClassName = "ScrollBar";
+        invalidateWindow(CHECK, null, true);
+        dispatchPaint((done) => {
+            const api = createWindowExports();
+            api.ValidateRect!({ esp: 0 } as never, new Uint8Array(64), [CHECK, 0]);
+            invalidate(CHECK);
+            done(0);
+        });
+        expect(overlayDCs).toBe(0);
+        expect(hasPendingUpdate(CHECK)).toBe(true);
     });
 });

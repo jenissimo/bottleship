@@ -23,6 +23,8 @@ import type { SaveValue } from "../savestate/value-codec";
 import { comApartments, ComApartments, type ApartmentRow } from "../core/com/apartment";
 import { coCreateWebBrowser, liveWebBrowserInstances } from "./ole32-webbrowser";
 import { coCreateMlang, liveMlangInstances } from "./ole32-mlang-font-link";
+import { StructuredStorage } from "./ole32-storage";
+import { oleSaveToStream, oleLoadFromStream } from "./ole32-persist-stream";
 
 // COM error codes
 const REGDB_E_CLASSNOTREG = 0x80040154;
@@ -44,7 +46,7 @@ const BF_MAX_KEY_LEN = 0x38;
 export const OLE32_FIELDS = {
     name: 'transient', exports: 'host', process: 'host', iunknownStubs: 'derive', guidState: 'save', guidCounter: 'save',
     blowfishInstances: 'save', blowfishVtableAddr: 'save', mallocObjAddr: 'save', taskMemSizes: 'save', classRegistrations: 'save',
-    nextClassRegistration: 'save', messageFilter: 'save', dragDropRegistrations: 'save',
+    nextClassRegistration: 'save', messageFilter: 'save', dragDropRegistrations: 'save', structuredStorage: 'derive',
 } as const satisfies Record<string, FieldPolicy>;
 
 export interface Ole32State {
@@ -62,8 +64,9 @@ export interface Ole32State {
     comServerLoads: string[];
 }
 
+const { structuredStorage: _derivedStorage, ...OLE32_SCHEMA_FIELDS } = OLE32_FIELDS;
 export const OLE32_SCHEMA = {
-    module: OLE32_FIELDS,
+    module: OLE32_SCHEMA_FIELDS,
     classRegistrationRow: ['cookie', 'clsid', 'punk', 'flags'],
     taskMemRow: ['address', 'bytes'],
     blowfishRow: ['object', 'refCount', 'boxes'],
@@ -91,6 +94,7 @@ export class Ole32 implements IModule {
     private classRegistrations = new Map<number, { clsid: string; punk: number; flags: number }>();
     private nextClassRegistration = 0x1000;
     private messageFilter = 0;
+    private structuredStorage: StructuredStorage | null = null;
     private dragDropRegistrations = new DragDropRegistry({
         isOleInitialized: () => comApartments.isOleInitialized(System.getInstance().scheduler.getCurrentThreadId()),
         isWindowValid: (hwnd) => {
@@ -106,6 +110,7 @@ export class Ole32 implements IModule {
         if (webBrowsers) throw new CaptureRefusal(`ole32: ${webBrowsers} live WebBrowser stand-in object(s) cannot be saved`);
         const mlang = liveMlangInstances(this.process);
         if (mlang) throw new CaptureRefusal(`ole32: ${mlang} live MLang object(s) cannot be saved`);
+        if (this.structuredStorage?.hasOpenObjects) throw new CaptureRefusal('ole32: structured storage has open objects');
         const sizes = new Uint32Array(this.taskMemSizes.size * 2);
         let i = 0;
         for (const [address, bytes] of this.taskMemSizes) { sizes[i++] = address; sizes[i++] = bytes; }
@@ -126,6 +131,7 @@ export class Ole32 implements IModule {
     }
 
     restoreSavestate(s: Ole32State): void {
+        this.structuredStorage = null;
         this.mallocObjAddr = 0;
         if (s.mallocObjAddr) {
             const vtableAddr = Mem.readUint32(s.mallocObjAddr) ?? 0;
@@ -603,27 +609,8 @@ export class Ole32 implements IModule {
             return S_OK;
         };
 
-        // HRESULT StgCreateDocfile(LPCOLESTR pwcsName, DWORD grfMode, DWORD reserved, IStorage **ppstgOpen)
-        this.exports["StgCreateDocfile"] = (ctx, mem, args) => {
-            const ppstgOpen = args[3] >>> 0;
-            Logger.warn(LogCategory.COM, `StgCreateDocfile — stub, returning E_NOTIMPL`);
-            if (ppstgOpen) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setUint32(ppstgOpen, 0, true);
-            }
-            return 0x80004001; // E_NOTIMPL
-        };
-
-        // HRESULT StgOpenStorage(LPCOLESTR pwcsName, IStorage *pstgPriority, DWORD grfMode, SNB snbExclude, DWORD reserved, IStorage **ppstgOpen)
-        this.exports["StgOpenStorage"] = (ctx, mem, args) => {
-            const ppstgOpen = args[5] >>> 0;
-            Logger.warn(LogCategory.COM, `StgOpenStorage — stub, returning STG_E_FILENOTFOUND`);
-            if (ppstgOpen) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setUint32(ppstgOpen, 0, true);
-            }
-            return 0x80030002; // STG_E_FILENOTFOUND
-        };
+        this.exports.StgCreateDocfile = (_ctx, mem, args) => this.storage().open(mem, args, true);
+        this.exports.StgOpenStorage = (_ctx, mem, args) => this.storage().open(mem, args, false);
 
         // HRESULT CoFileTimeNow(FILETIME *lpFileTime)
         this.exports["CoFileTimeNow"] = (ctx, mem, args) => {
@@ -662,22 +649,10 @@ export class Ole32 implements IModule {
             return S_OK;
         };
 
-        // HRESULT OleSaveToStream(LPPERSISTSTREAM pPStm, LPSTREAM pStm)
-        this.exports["OleSaveToStream"] = (ctx, mem, args) => {
-            Logger.warn(LogCategory.COM, `OleSaveToStream — stub, returning E_NOTIMPL`);
-            return 0x80004001; // E_NOTIMPL
-        };
-
-        // HRESULT OleLoadFromStream(LPSTREAM pStm, REFIID iidInterface, LPVOID *ppvObj)
-        this.exports["OleLoadFromStream"] = (ctx, mem, args) => {
-            const ppvObj = args[2] >>> 0;
-            Logger.warn(LogCategory.COM, `OleLoadFromStream — stub, returning E_NOTIMPL`);
-            if (ppvObj) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setUint32(ppvObj, 0, true);
-            }
-            return 0x80004001; // E_NOTIMPL
-        };
+        this.exports.OleSaveToStream = (ctx, _mem, [persist, stream]) =>
+            oleSaveToStream(this.process, ctx, persist, stream);
+        this.exports.OleLoadFromStream = (ctx, mem, [stream, iid, out]) =>
+            oleLoadFromStream(this.process, ctx, mem, stream, iid, out, clsid => this.findRegisteredClassFactory(clsid));
 
         // HRESULT PropVariantClear(PROPVARIANT *pvar)
         //
@@ -779,6 +754,10 @@ export class Ole32 implements IModule {
             Logger.verbose(LogCategory.COM, `PropVariantClear(0x${pvar.toString(16)}) vt=0x${vt.toString(16)}`);
             return S_OK;
         };
+    }
+
+    private storage(): StructuredStorage {
+        return this.structuredStorage ??= new StructuredStorage(this.process, bytes => this.taskMemAlloc(bytes));
     }
 
     /** The task allocator behind both CoTaskMemAlloc and IMalloc::Alloc. */
@@ -1509,6 +1488,7 @@ export class Ole32 implements IModule {
      * THUNK_CODE. Stubs are regenerated in recreateVTables() after the new layout exists.
      */
     reset(): void {
+        this.structuredStorage = null;
         releaseHleComServerLoads(this.process, true);
         comApartments.reset();
         this.dragDropRegistrations.reset();

@@ -11,7 +11,8 @@ import { System } from '../../core/system';
 import { encodeAnsi } from '../codepage-utils';
 import { windows, buttonCheckStates, findChildByControlId } from './shared-state';
 import { applyControlSetText, applyDefaultSetText, handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
-import { sendWindowGetText, sendWindowSetText } from './message';
+import { invokeGuestWndProcSync, sendWindowGetText, sendWindowSetText } from './message';
+import { isSentinelWndProc } from './dialog';
 import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
 import { tryRichEditStreamMessage } from './rich-edit-stream';
 
@@ -263,23 +264,27 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
         return 1; // TRUE
     };
 
-    const sendDlgItemMessage = (ctx: any, mem: Uint8Array, args: number[]): number | ThunkResult => {
-        const hDlg = args[0];
-        const nIDDlgItem = args[1];
-        const Msg = args[2];
-        const wParam = args[3];
-        const lParam = args[4];
+    const sendDlgItemMessage = (
+        ctx: X86Context, mem: Uint8Array, args: number[], encoding: 'ansi' | 'wide',
+    ): number | ThunkResult => {
+        const [hDlg, nIDDlgItem, Msg, wParam, lParam] = args;
         Logger.verbose(LogCategory.USER32, `SendDlgItemMessage(0x${hDlg.toString(16)}, ${nIDDlgItem}, 0x${Msg.toString(16)}, 0x${wParam.toString(16)}, 0x${lParam.toString(16)})`);
 
         const child = findChildByControlId(hDlg, nIDDlgItem);
         if (!child) return 0;
 
-        // JS-managed system controls: handle in-process (Wine routes via SendMessage → control WndProc).
+        const api = encoding === 'wide' ? 'SendDlgItemMessageW' : 'SendDlgItemMessageA';
         if (child.isSystemControl) {
+            if (child.wndProcSubclassed && child.wndProc && !isSentinelWndProc(child.wndProc)) {
+                const dispatched = invokeGuestWndProcSync(
+                    ctx, mem, child.wndProc, child.handle, Msg, wParam, lParam,
+                    20, api, value => value >>> 0);
+                if (dispatched) return dispatched;
+            }
             const stream = tryRichEditStreamMessage(
-                ctx, mem, child, Msg, wParam, lParam, 20, 'SendDlgItemMessageA');
+                ctx, mem, child, Msg, wParam, lParam, 20, api);
             if (stream) return stream;
-            const result = handleSystemControlMessage(child, Msg, wParam, lParam, mem, 'ansi');
+            const result = handleSystemControlMessage(child, Msg, wParam, lParam, mem, encoding);
             if (isContentChangingMessage(child, Msg)) {
                 repaintDialogAfterContentChange(hDlg);
             }
@@ -292,51 +297,19 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
         const WM_GETTEXT = 0x000D;
         if (Msg === WM_SETTEXT && lParam) {
             // Prefer updating title immediately so subsequent GetDlgItemText sees it.
-            child.title = Marshaler.readString(mem, lParam);
+            child.title = encoding === 'wide' ? Marshaler.readWideString(mem, lParam) : Marshaler.readString(mem, lParam);
             repaintDialogAfterContentChange(hDlg);
             return 1;
         }
         if (Msg === WM_GETTEXT) {
-            return exports['GetDlgItemTextA'](ctx, mem, [hDlg, nIDDlgItem, lParam, wParam]) as number;
+            const getText = encoding === 'wide' ? exports['GetDlgItemTextW'] : exports['GetDlgItemTextA'];
+            return getText(ctx, mem, [hDlg, nIDDlgItem, lParam, wParam]) as number;
         }
 
         System.getInstance().windowManager.postMessage(child.handle, Msg, wParam, lParam);
         return 0;
     };
 
-    exports['SendDlgItemMessageA'] = sendDlgItemMessage;
-    exports['SendDlgItemMessageW'] = (ctx, mem, args) => {
-        const hDlg = args[0];
-        const nIDDlgItem = args[1];
-        const Msg = args[2];
-        const wParam = args[3];
-        const lParam = args[4];
-        const child = findChildByControlId(hDlg, nIDDlgItem);
-        if (!child) return 0;
-
-        const WM_SETTEXT = 0x000C;
-        const WM_GETTEXT = 0x000D;
-        if (child.isSystemControl) {
-            const stream = tryRichEditStreamMessage(
-                ctx, mem, child, Msg, wParam, lParam, 20, 'SendDlgItemMessageW');
-            if (stream) return stream;
-            // The W entry KNOWS its strings are wide — pass that rather than re-probing bytes
-            // that a 1-char ANSI string is indistinguishable from.
-            const result = handleSystemControlMessage(child, Msg, wParam, lParam, mem, 'wide');
-            if (isContentChangingMessage(child, Msg)) {
-                repaintDialogAfterContentChange(hDlg);
-            }
-            return result;
-        }
-        if (Msg === WM_SETTEXT && lParam) {
-            child.title = Marshaler.readWideString(mem, lParam);
-            repaintDialogAfterContentChange(hDlg);
-            return 1;
-        }
-        if (Msg === WM_GETTEXT) {
-            return exports['GetDlgItemTextW'](ctx, mem, [hDlg, nIDDlgItem, lParam, wParam]) as number;
-        }
-        System.getInstance().windowManager.postMessage(child.handle, Msg, wParam, lParam);
-        return 0;
-    };
+    exports['SendDlgItemMessageA'] = (ctx, mem, args) => sendDlgItemMessage(ctx, mem, args, 'ansi');
+    exports['SendDlgItemMessageW'] = (ctx, mem, args) => sendDlgItemMessage(ctx, mem, args, 'wide');
 }

@@ -102,7 +102,7 @@ export function isGameScreenOwned(renderActive?: RenderActive | null): boolean {
  * instead of its entire UI. A 3D presenter is only "active" once it renders, so its arm
  * needs no extra test.
  */
-function isGameContentOnScreen(renderActive?: RenderActive | null): boolean {
+export function isGameContentOnScreen(renderActive?: RenderActive | null): boolean {
     const ddrawCtx = getDDrawContext();
     const active = renderActive ?? System.getInstance().services.render.getActive();
     if (shouldSuppress3DGdiOverlay(active, ddrawCtx)) return true;

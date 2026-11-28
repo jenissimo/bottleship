@@ -2,7 +2,7 @@
 const END = 0xfffffffe;
 const FREE = 0xffffffff;
 
-export function readCompoundStreams(bytes: Uint8Array): Map<string, Uint8Array> {
+export function readCompoundStreams(bytes: Uint8Array, rootOnly = false): Map<string, Uint8Array> {
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     if (bytes.length < 512 || view.getUint32(0, true) !== 0xe011cfd0 || view.getUint32(4, true) !== 0xe11ab1a1) {
         throw new Error('Not a Compound File Binary document');
@@ -60,6 +60,7 @@ export function readCompoundStreams(bytes: Uint8Array): Map<string, Uint8Array> 
     const entries: Array<{name: string; type: number; first: number; size: number}> = [];
     for (let p = 0; p + 128 <= directory.length; p += 128) {
         const type = directory[p + 66]!;
+        if (rootOnly && type === 1) throw new Error('Nested CFB storage is unsupported');
         if (type !== 2 && type !== 5) continue;
         const nameSize = dv.getUint16(p + 64, true);
         if (nameSize < 2 || nameSize > 64 || nameSize % 2 || dv.getUint16(p + nameSize - 2, true) !== 0) throw new Error('Invalid CFB stream name');

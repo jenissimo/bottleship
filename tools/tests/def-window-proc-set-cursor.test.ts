@@ -61,7 +61,8 @@ const DEF_WINDOW_PROC_ADDR = 0x11000;
 const DEF_DLG_PROC_ADDR = 0x12000;
 const GUEST_PROC_ADDR = 0x401000;
 
-let savedProcess: unknown;
+let savedProcess: System["process"];
+let savedWindowManager: WindowManager;
 let wm: WindowManager;
 
 function installFakeThunkGenerator(): void {
@@ -96,13 +97,17 @@ beforeEach(() => {
     resetSystemCursorHandles();
     resetDefWindowProcCache();
     installFakeThunkGenerator();
+    const system = System.getInstance();
+    savedWindowManager = system.windowManager;
     wm = new WindowManager();
-    (System.getInstance() as any).windowManager = wm;
+    system.windowManager = wm;
     nextTestHwnd = 0x1000;
 });
 
 afterEach(() => {
-    (System.getInstance() as any).process = savedProcess;
+    const system = System.getInstance();
+    system.process = savedProcess;
+    system.windowManager = savedWindowManager;
     resetUser32SharedState();
     resetUser32Classes();
     resetSystemCursorHandles();

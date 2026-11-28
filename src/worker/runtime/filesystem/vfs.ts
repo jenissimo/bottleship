@@ -1348,9 +1348,9 @@ export class VirtualFileSystem {
         }
     }
 
-    async flushFile(path: string): Promise<void> {
+    async flushFile(path: string, requireDurable = false): Promise<void> {
         if (!this.overlay) return;
-        await this.overlay.flushFile(path);
+        await this.overlay.flushFile(path, requireDurable);
     }
 
     async flushAll(): Promise<void> {
@@ -3451,7 +3451,7 @@ class OpfsOverlay {
         }, this.WRITE_BUFFER_FLUSH_MS) as unknown as number;
     }
 
-    async flushFile(path: string): Promise<void> {
+    async flushFile(path: string, requireDurable = false): Promise<void> {
         const key = toKey(path);
         if (this.ephemeralFiles.has(key)) return;  // ephemeral — nothing to persist
         const cacheEntry = this.writerCache.get(key);
@@ -3523,7 +3523,8 @@ class OpfsOverlay {
                         const sh = await this.ensureSyncHandle(path, true, false, true);
                         if (sh) {
                             if (replace) sh.truncate(pendingOffset + pending.length);
-                            sh.write(pending, { at: pendingOffset });
+                            const written = sh.write(pending, { at: pendingOffset });
+                            if (requireDurable && written !== pending.length) throw new Error('Incomplete OPFS write');
                             sh.flush();
                         } else {
                             await this.ensureWriter(cacheEntry);
@@ -3536,6 +3537,7 @@ class OpfsOverlay {
                     }
                 } catch (e) {
                     Logger.warn(LogCategory.SYSTEM, `OPFS: flushFile("${path}") commit failed: ${e}`);
+                    if (requireDurable) throw e;
                 }
             } finally {
                 this.committingPaths.delete(key);

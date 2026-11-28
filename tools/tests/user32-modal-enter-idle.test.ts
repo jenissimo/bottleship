@@ -1,8 +1,9 @@
-import { afterAll, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { activeDialogs, resetDialogPumps } from '../../src/worker/modules/user32/modal-dialog-state';
 import { windows } from '../../src/worker/modules/user32/shared-state';
 import { createDialogExports } from '../../src/worker/modules/user32/dialog';
 import { System } from '../../src/worker/core/system';
+import { WindowManager } from '../../src/worker/runtime/windowing/window-manager';
 
 const tick = (ms = 20) => new Promise<void>(r => setTimeout(r, ms));
 const WM_INITDIALOG = 0x0110;
@@ -13,15 +14,14 @@ const OWNER_PROC = 0x405000;
 
 interface Invocation { wndProc: number; args: number[]; complete?: (ret: number) => number | null }
 
-// runOwnedDialog installs a stand-in process; later test files must not inherit it.
-const systemSlot = System.getInstance() as unknown as { process: unknown };
-const realProcess = systemSlot.process;
-afterAll(() => { systemSlot.process = realProcess; });
+const system = System.getInstance();
+let savedProcess: System['process'];
+let savedWindowManager: WindowManager;
+let savedWindows: typeof windows;
 
 function runOwnedDialog(withOwner: boolean) {
     const invocations: Invocation[] = [];
-    const system = System.getInstance();
-    (system as unknown as { process: unknown }).process = {
+    system.process = {
         getModule: () => undefined,
         dispatcher: {
             callbackManager: {
@@ -33,7 +33,7 @@ function runOwnedDialog(withOwner: boolean) {
                 },
             },
         },
-    };
+    } as unknown as System['process'];
     if (withOwner) {
         windows.set(OWNER, { handle: OWNER, wndProc: OWNER_PROC, style: 0x10000000, children: [] } as never);
     }
@@ -59,9 +59,19 @@ async function settle(inv: Invocation[]): Promise<void> {
 describe('a modal dialog loop that runs out of messages', () => {
     beforeEach(() => {
         resetDialogPumps();
-        windows.delete(OWNER);
-        const wm = System.getInstance().windowManager;
-        while (wm.getMessage()) { /* drain */ }
+        savedProcess = system.process;
+        savedWindowManager = system.windowManager;
+        savedWindows = new Map(windows);
+        system.windowManager = new WindowManager();
+        windows.clear();
+    });
+
+    afterEach(() => {
+        resetDialogPumps();
+        windows.clear();
+        for (const [hwnd, window] of savedWindows) windows.set(hwnd, window);
+        system.windowManager = savedWindowManager;
+        system.process = savedProcess;
     });
 
     test('sends WM_ENTERIDLE(MSGF_DIALOGBOX, hDlg) to the owner once per idle stretch', async () => {

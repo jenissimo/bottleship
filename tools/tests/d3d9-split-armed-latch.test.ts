@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { attachD3D9Split } from "../../src/worker/modules/d3d9/split";
+import { attachD3D9Split, resetD3D9SplitStreamForTests } from "../../src/worker/modules/d3d9/split";
 
 // The flag picks the devices' roles when they are created; a front has no GPU of its own, so
 // the stream must stay armed if the flag is flipped (or a harness resets flags) mid-run.
@@ -14,6 +14,7 @@ describe("d3d9 split: armed state is latched at attach", () => {
             executeWbufQueue: () => {},
             setWbufSplitClient: (c: { armed(): boolean } | null) => { client = c; },
         };
+        resetD3D9SplitStreamForTests();
         try {
             g.__d3d9Split = true;
             attachD3D9Split({ isExtended: false } as never, null, dispatcher, null);
@@ -22,6 +23,7 @@ describe("d3d9 split: armed state is latched at attach", () => {
             g.__d3d9Split = false;
             expect(client!.armed()).toBe(true);
         } finally {
+            resetD3D9SplitStreamForTests();
             g.__d3d9Split = prev;
         }
     });
