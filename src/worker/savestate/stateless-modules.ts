@@ -12,5 +12,5 @@ export const STATELESS_MODULES: Readonly<Record<string, string>> = {
     hid: 'HidD queries answer fixed data; no device is opened',
     oledlg: 'OleUIAddVerbMenu answers without creating or keeping a menu',
     shell32: 'folder queries answer from the fixed folder layout, file operations act on the file system (disk), launches go through kernel32 child processes, drag-accept is a window style user32 saves, and tray icons are not kept',
-    advapi32: 'state lives only in kernel handles (registry keys, service and crypto handles); those have no codec yet, so an open one is refused by name, and the registry is disk',
+    advapi32: 'registry key handles are saved by the resource table and the registry is disk; open service and crypto handles are refused by name',
 };

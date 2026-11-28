@@ -48,6 +48,8 @@ import { registerDDrawParticipant } from "../../src/worker/modules/ddraw/savesta
 import { WinMM } from "../../src/worker/modules/winmm";
 import { OpenGL32 } from "../../src/worker/modules/opengl32";
 import { D3D9 } from "../../src/worker/modules/d3d9";
+import { Imm32 } from "../../src/worker/modules/imm32";
+import { XInput1_3 } from "../../src/worker/modules/xinput1_3";
 import { DSound } from "../../src/worker/modules/dsound/dsound";
 import { DInput } from "../../src/worker/modules/dinput/dinput";
 import { DMusic } from "../../src/worker/modules/dmusic";
@@ -344,7 +346,8 @@ describe("participant schemas", () => {
 describe("schema pin and mutation", () => {
     test("participant versions and schema hashes are pinned; a change here needs a version bump", () => {
         registerAllParticipants();
-        const undo = [new WinMM(), new DSound(), new DInput(), new DMusic(), new OpenGL32(), new D3D9()].map(m => m.registerSavestate());
+        const undo = [new WinMM(), new DSound(), new DInput(), new DMusic(), new OpenGL32(), new D3D9(), new Imm32(), new XInput1_3()]
+            .map(m => m.registerSavestate());
         const schemas = savestateParticipants.schemas();
         for (const u of undo) u();
         expect(schemas).toEqual({
@@ -355,7 +358,10 @@ describe("schema pin and mutation", () => {
             "memory-manager": { version: 1, schemaHash: "4a5dbc8ebbd40e94" },
             "kernel32-memory": { version: 2, schemaHash: "4e2a2400e2517640" },
             "thunk-generator": { version: 1, schemaHash: "2673e673145253a5" },
-            "resources": { version: 1, schemaHash: "de537d8b445269ef" },
+            "resources": { version: 2, schemaHash: "1796a780e89b3c64" },
+            "imm32": { version: 1, schemaHash: "5fd012243a1898bc" },
+            "mscoree": { version: 1, schemaHash: "77074ba4e0edcef4" },
+            "xinput1_3": { version: 1, schemaHash: "78d4d081771bd1ad" },
             "hypercall-page": { version: 2, schemaHash: "89ee00cc9204cc00" },
             "scheduler": { version: 4, schemaHash: "fdd4fb1af912be88" },
             "timer-wheel": { version: 1, schemaHash: "3e2f3b81b4d37775" },
