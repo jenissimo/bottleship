@@ -172,3 +172,5 @@ export function msiFilePaths(db: MsiDatabase, installDirectory: string, sourcePa
             ...(sourcePaths ? {sourcePath: source(false), sourceShortPath: source(true), attributes: Number(row.Attributes ?? 0)} : {})}];
     });
 }
+
+export {writeCompoundStreams, compoundNameKey, isCompoundStreamName} from './compound-writer';

@@ -10,7 +10,7 @@ import { WindowInfo, windows, isEffectivelyVisible, getAbsoluteWindowPosition, g
 import { paintChildControls, repaintChildControls, restoreClientUnderStampedControls } from './controls';
 import { registerOwnedPopupRestamper } from './paint-hooks';
 import { registerFullDialogRepainter, registerOverlayRepairRepainter } from './control-interaction';
-import { getWindowVisualBounds, eraseDialogOverlay, repairOverlayWindowsOverlappingRect } from './dialog-overlay';
+import { getWindowVisualBounds, eraseDialogOverlay, isGameContentOnScreen, isScreenOwnerWindow, repairOverlayWindowsOverlappingRect } from './dialog-overlay';
 import { invalidateWindow, hasPendingUpdate, type ClientRect } from './paint-region';
 import type { GDIContext } from '../gdi32/context';
 import { paintTraceEnabled, logPaintRequest, logOverlayMutation, logChromeStamp } from './paint-trace';
@@ -65,7 +65,7 @@ function collectOwnedPopupsAbove(hwnd: number): number[] {
  */
 /** Runtime: after guest actually painted the client, ask it to repaint that client. */
 function shouldUseGuestDialogPaint(win: WindowInfo): boolean {
-    return !!win.guestCustomPaint;
+    return !!(win.guestCustomPaint || win.guestValidatedPaint);
 }
 
 /** User dlgProc — stored in win.wndProc (NOT the guest-owned DWLP extra-byte area). */
@@ -149,6 +149,11 @@ const DEFAULT_CHROME_DEADLINE_MS = 250;
 // @refuse(a dialog is waiting for its first paint)
 const chromeDeadlines = new Map<number, ReturnType<typeof setTimeout>>();
 
+function hasOnlySubclassedDialogControls(win: WindowInfo): boolean {
+    const controls = win.children.map(hwnd => windows.get(hwnd)).filter(child => child?.visible && child.isSystemControl);
+    return controls.length > 0 && controls.every(child => child?.wndProcSubclassed);
+}
+
 function stampDefaultChromeIfPaintNeverCame(hwnd: number): void {
     chromeDeadlines.delete(hwnd);
     const win = windows.get(hwnd);
@@ -160,6 +165,9 @@ function stampDefaultChromeIfPaintNeverCame(hwnd: number): void {
         : !isEffectivelyVisible(win) ? 'not-visible'
         : win.guestCustomPaint ? 'guest-painted'
         : win.paintCycleRan ? 'paint-cycle-ran'
+        : win.guestValidatedPaint ? 'guest-validated-paint'
+        : !hasPendingUpdate(hwnd) ? 'update-region-validated'
+        : win.overlayOnFlipScreen && hasOnlySubclassedDialogControls(win) ? 'subclassed-dialog-controls'
         : null;
     if (paintTraceEnabled) {
         logOverlayMutation('defaultChromeDeadline', hwnd,
@@ -206,7 +214,7 @@ export function completeDefaultDialogPaint(dialogHwnd: number): void {
     }
     const win = windows.get(dialogHwnd);
     if (!win || win.pendingDestroy || !isEffectivelyVisible(win)) return;
-    if (win.paintCycleRan || win.guestCustomPaint) return;
+    if (win.paintCycleRan || win.guestCustomPaint || win.guestValidatedPaint || !hasPendingUpdate(dialogHwnd)) return;
     if (paintTraceEnabled) {
         logOverlayMutation('updateWindow', dialogHwnd, 'default paint: the procedure drew nothing');
     }
@@ -545,6 +553,7 @@ export function repaintDialogOverlayIfVisible(dialogHwnd: number): void {
 
 /** After overlay pixels were cleared (dialog close/move), repaint any exposed dialog. */
 function repaintOverlayWindowAfterErase(dialogHwnd: number): void {
+    if (isScreenOwnerWindow(dialogHwnd) && isGameContentOnScreen()) return;
     repaintDialogOverlayIfVisible(dialogHwnd);
 }
 

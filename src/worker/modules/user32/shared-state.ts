@@ -65,6 +65,7 @@ export interface WindowInfo {
      *  means "not yet", not "never" — the guest has had no WM_PAINT to answer — so USER's
      *  default chrome must not be published ahead of it. */
     paintCycleRan?: boolean;
+    guestValidatedPaint?: boolean;
     /** A system control whose wndProc the guest replaced via SetWindowLong(GWL_WNDPROC)
      *  — i.e. it paints itself (MFC subclassing). We deliver WM_PAINT to it instead of
      *  drawing default chrome, exactly like Windows runs the control's own window proc. */
@@ -1100,6 +1101,7 @@ export const WINDOW_INFO_FIELDS = {
     wndProcSubclassed: 'save', createSyncVisibleDelivered: 'save', sizeMovePending: 'save', createSyncActivationDelivered: 'save',
     activationDelivered: 'save', dialogInitInProgress: 'transient', createInProgress: 'transient',
     pendingDestroy: 'save', overlayOnFlipScreen: 'save', lastOverlayFillBounds: 'host',
+    guestValidatedPaint: 'host',
 } as const satisfies Record<keyof WindowInfo, FieldPolicy>;
 
 export const LIST_CONTROL_FIELDS = {

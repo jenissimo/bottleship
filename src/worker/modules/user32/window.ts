@@ -2208,6 +2208,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (isWindowUpdateLocked(hWnd)) return 1;
 
         const win = windows.get(hWnd);
+        if (win && !isEffectivelyVisible(win)) return 1;
         if (win && isDialogLikeWindow(win)) {
             repaintDialogOverlayIfVisible(hWnd);
             return 1;
@@ -2501,6 +2502,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         if (isWindowUpdateLocked(hWnd)) return 1;
 
         const win = windows.get(hWnd);
+        if (win && !isEffectivelyVisible(win)) return 1;
         if (win?.isSystemControl && win.parent && requestSubclassedControlPaint(win)) {
             invalidateControlColors(hWnd);
         } else if (win?.isSystemControl && win.parent) {
@@ -3039,6 +3041,11 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         Logger.verbose(LogCategory.USER32, `ValidateRect(0x${hWnd.toString(16)}, 0x${lpRect.toString(16)})`);
         if (!hWnd) return 0;
         const rect = lpRect ? readClientRectFromMem(mem, lpRect) : null;
+        const win = windows.get(hWnd);
+        if (!lpRect && win?.wndProc && hasPendingUpdate(hWnd)
+            && ((win.overlayOnFlipScreen && isDialogLikeWindow(win)) || (win.isSystemControl && win.wndProcSubclassed))) {
+            win.guestValidatedPaint = true;
+        }
         validateWindow(hWnd, rect);
         retractPaintIfValidated(hWnd);
         return 1; // TRUE

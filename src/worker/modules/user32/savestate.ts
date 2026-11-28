@@ -56,6 +56,7 @@ export interface User32State {
 }
 
 const keys = <T>(k: Record<keyof T, true>) => stateKeys<T>(k);
+const {guestValidatedPaint: _guestValidatedPaint, ...savedWindowFieldSchema} = WINDOW_INFO_FIELDS;
 
 const SCROLL_BAR_FIELDS = {
     min: 'save', max: 'save', page: 'save', pos: 'save', enabled: 'save', visible: 'save', upEnabled: 'save', downEnabled: 'save',
@@ -73,7 +74,7 @@ export const USER32_SCHEMA = {
         clipboard: true, clipboardOpenOwner: true, clipboardSequence: true, cursorDisplayCount: true, cursorClipRect: true,
         currentCursorHandle: true, lockWindowUpdateHwnd: true, doubleClickTimeMs: true,
     }),
-    window: WINDOW_INFO_FIELDS,
+    window: savedWindowFieldSchema,
     listControl: LIST_CONTROL_FIELDS,
     trackbar: TRACKBAR_FIELDS,
     cursorClip: keys<CursorClipRect>({ left: true, top: true, right: true, bottom: true }),
