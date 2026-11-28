@@ -32,6 +32,8 @@ import { isValidAddress } from "../core/memory/address-guard";
 import { Logger, LogCategory } from "../core/logger";
 import { System } from "../core/system";
 import { GAMEPAD_BUTTONS } from "./dinput/emulated-gamepad";
+import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
+import type { SaveValue } from "../savestate/value-codec";
 
 /** Win32 status codes XInput answers with. 0 is SUCCESS — nothing may default to it. */
 const ERROR_SUCCESS = 0;
@@ -226,6 +228,32 @@ interface Keystroke {
     flags: number;
 }
 
+export const XINPUT_FIELDS = {
+    name: 'transient', exports: 'host', enabled: 'save', packetNumber: 'save', lastSnapshotKey: 'save',
+    keystrokes: 'save', keystrokeButtons: 'save', keystrokeLeftDir: 'save', keystrokeRightDir: 'save',
+    keystrokeSeeded: 'save', announced: 'transient',
+} as const satisfies Record<string, FieldPolicy>;
+
+export interface XInputState {
+    enabled: boolean;
+    packetNumber: number;
+    lastSnapshotKey: string;
+    keystrokes: Array<[number, number]>;
+    keystrokeButtons: number;
+    keystrokeLeftDir: number;
+    keystrokeRightDir: number;
+    keystrokeSeeded: boolean;
+}
+
+export const XINPUT_SCHEMA = {
+    module: XINPUT_FIELDS,
+    keystrokeRow: ['virtualKey', 'flags'],
+    state: stateKeys<XInputState>({
+        enabled: true, packetNumber: true, lastSnapshotKey: true, keystrokes: true, keystrokeButtons: true,
+        keystrokeLeftDir: true, keystrokeRightDir: true, keystrokeSeeded: true,
+    }),
+};
+
 export class XInput1_3 implements IModule {
     name = "xinput1_3";
     exports: Record<string, ThunkImplementation> = {};
@@ -264,7 +292,36 @@ export class XInput1_3 implements IModule {
      * assigned from a variable is invisible to them, so a fully working export reads as
      * "declared, no handler" in every census.
      */
+    captureSavestate(): XInputState {
+        return {
+            enabled: this.enabled, packetNumber: this.packetNumber, lastSnapshotKey: this.lastSnapshotKey,
+            keystrokes: this.keystrokes.map(k => [k.virtualKey, k.flags]),
+            keystrokeButtons: this.keystrokeButtons, keystrokeLeftDir: this.keystrokeLeftDir,
+            keystrokeRightDir: this.keystrokeRightDir, keystrokeSeeded: this.keystrokeSeeded,
+        };
+    }
+
+    restoreSavestate(s: XInputState): void {
+        this.enabled = s.enabled;
+        this.packetNumber = s.packetNumber >>> 0;
+        this.lastSnapshotKey = s.lastSnapshotKey;
+        this.keystrokes = s.keystrokes.map(([virtualKey, flags]) => ({ virtualKey, flags }));
+        this.keystrokeButtons = s.keystrokeButtons;
+        this.keystrokeLeftDir = s.keystrokeLeftDir;
+        this.keystrokeRightDir = s.keystrokeRightDir;
+        this.keystrokeSeeded = s.keystrokeSeeded;
+    }
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'xinput1_3', version: 1, order: 65, covers: ['xinput1_3'], schema: XINPUT_SCHEMA as unknown as SaveValue,
+            capture: () => this.captureSavestate() as unknown as SaveValue,
+            restore: (saved) => this.restoreSavestate(saved as unknown as XInputState),
+        });
+    }
+
     initialize(_process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         const exports = this.exports;
 
         const getState: ThunkImplementation = (_ctx, mem, args) =>

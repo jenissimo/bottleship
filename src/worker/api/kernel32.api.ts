@@ -235,6 +235,7 @@ export const kernel32Module: ModuleDescriptor = {
         makeFunc("CreateFileMappingA", 6),
         makeFunc("CreateFileMappingW", 6),
         makeFunc("OpenFileMappingA", 3),
+        makeFunc("OpenFileMappingW", 3),
         makeFunc("MapViewOfFile", 5),
         makeFunc("UnmapViewOfFile", 1),
         makeFunc("FlushProcessWriteBuffers", 0),

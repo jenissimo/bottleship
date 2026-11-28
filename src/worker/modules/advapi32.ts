@@ -10,6 +10,7 @@ import { RegistryValue } from "../runtime/filesystem/registry";
 import { Logger, LogCategory } from "../core/logger";
 import { encodeAnsi } from "./codepage-utils";
 import { tokenInformationLayout } from "./advapi32-token";
+import { objectCodecs } from "../savestate/object-codecs";
 import { Md5, Sha1 } from "@bottleship/formats/unpack";
 
 
@@ -83,6 +84,21 @@ function readableSidLength(mem: Uint8Array, address: number): number | undefined
     const length = 8 + mem[address + 1]! * 4;
     return address + length <= mem.length && isValidAddress(mem, address, length, "r") ? length : undefined;
 }
+
+interface RegistryKeyHandle {
+    kind: "reg";
+    key: string;
+}
+
+objectCodecs.add<RegistryKeyHandle>({
+    tag: "advapi32-registry-key",
+    matches: (o: unknown): o is RegistryKeyHandle => {
+        const key = o as Partial<RegistryKeyHandle> | null;
+        return key?.kind === "reg" && typeof key.key === "string";
+    },
+    capture: ({ key }) => ({ key }),
+    restore: (d: { key: string }) => ({ kind: "reg", key: d.key }),
+});
 
 export class Advapi32 implements IModule {
     name = "advapi32";

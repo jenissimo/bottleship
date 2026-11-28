@@ -17,6 +17,7 @@ import { readStringA, readStringW, encodeFileApiString, setFileApisAnsi, areFile
 import { MemoryGuard } from '../../core/memory/mem-guard';
 import { Mem } from '../../core/memory/mem-accessor';
 import { objectCodecs } from '../../savestate/object-codecs';
+import type { CaptureContext, RestoreContext } from '../../savestate/participant';
 import { System } from '../../core/system';
 import { Process } from '../../core/process';
 import { VfsFileHandle, VirtualFileSystem } from '../../runtime/filesystem/vfs';
@@ -230,6 +231,40 @@ function applyOpenFlags(handle: VfsFileHandle, dwFlagsAndAttributes: number): vo
     if ((dwFlagsAndAttributes & FILE_FLAG_SEQUENTIAL_SCAN) !== 0) handle.sequentialFlag = true;
 }
 
+interface FileMappingObject {
+    kind: 'file_mapping';
+    size: number;
+    file: VfsFileHandle | null;
+    protect: number;
+    name: string;
+}
+
+interface FileMappingView {
+    mapping: FileMappingObject;
+    size: number;
+    offset: number;
+    access: number;
+    writable: boolean;
+}
+
+export interface FileMappingState {
+    names: Array<[handle: number, mapping: number]>;
+    views: Array<[base: number, mapping: number, size: number, offset: number, access: number, writable: boolean]>;
+}
+
+objectCodecs.add<FileMappingObject>({
+    tag: 'kernel32-file-mapping',
+    matches: (o: unknown): o is FileMappingObject => (o as Partial<FileMappingObject> | null)?.kind === 'file_mapping',
+    capture: ({ file, size, protect, name }) => ({
+        file: file && { path: file.path, source: file.source, access: file.access },
+        size, protect, name,
+    }),
+    restore: (d: Omit<FileMappingObject, 'kind' | 'file'> & { file: Pick<VfsFileHandle, 'path' | 'source' | 'access'> | null }) => ({
+        kind: 'file_mapping', size: d.size, protect: d.protect, name: d.name,
+        file: d.file && { kind: 'file', position: 0, ...d.file },
+    }),
+});
+
 const fileIoModule = (() => {
     const exports: Record<string, ThunkImplementation> = {};
     const SET_FILE_POINTER_LOG_FIRST_N = 8;
@@ -271,27 +306,47 @@ const fileIoModule = (() => {
     const FILE_ATTRIBUTE_ARCHIVE = 0x20;
     const FILE_ATTRIBUTE_NORMAL = 0x80;
 
-    interface FileMappingObject {
-        kind: 'file_mapping';
-        size: number;
-        /**
-         * The section's OWN reference to the backing file, not the caller's handle.
-         * Win32 lets the guest CloseHandle its file the moment CreateFileMapping
-         * returns — the section keeps the file object alive — and handle numbers are
-         * recycled, so re-resolving a stored handle number later can land on whatever
-         * file now owns that slot and write the mapped image over it.
-         */
-        file: VfsFileHandle | null;
-        protect: number;
+    const namedFileMappings = new Map<string, { handle: number; mapping: FileMappingObject }>();
+    const fileMappingViews = new Map<number, FileMappingView>();
+
+    function mappingIsLive(mapping: FileMappingObject): boolean {
+        if (System.getInstance().resourceProvider.kernelObjectReferenceCount(mapping) > 0) return true;
+        for (const view of fileMappingViews.values()) {
+            if (view.mapping === mapping) return true;
+        }
+        return false;
     }
 
-    const namedFileMappings: Map<string, number> = new Map();
-    // Tracks live mapped views so UnmapViewOfFile/FlushViewOfFile can write dirty
-    // bytes back to the backing VFS file. offset/fileHandle/writable are required
-    // for the write-back: without them a mapped view is effectively read-only and
-    // any data the guest writes through the view is silently lost (some titles save
-    // profiles via CreateFileMapping+MapViewOfFile, no WriteFile).
-    const fileMappingViews: Map<number, { mappingHandle: number; size: number; offset: number; file: VfsFileHandle | null; writable: boolean }> = new Map();
+    function forgetUnusedMapping(mapping: FileMappingObject): void {
+        if (namedFileMappings.get(mapping.name)?.mapping === mapping && !mappingIsLive(mapping)) {
+            namedFileMappings.delete(mapping.name);
+        }
+    }
+
+    function captureFileMappings(ctx: CaptureContext): FileMappingState {
+        const names: FileMappingState['names'] = [];
+        for (const { handle, mapping } of namedFileMappings.values()) {
+            if (mappingIsLive(mapping)) names.push([handle, ctx.ref(mapping, 'named file mapping')]);
+        }
+        const views: FileMappingState['views'] = [];
+        for (const [base, { mapping, size, offset, access, writable }] of fileMappingViews) {
+            views.push([base, ctx.ref(mapping, 'mapped file view'), size, offset, access, writable]);
+        }
+        return { names, views };
+    }
+
+    function restoreFileMappings(state: FileMappingState, ctx: RestoreContext): void {
+        namedFileMappings.clear();
+        fileMappingViews.clear();
+        for (const [handle, ref] of state.names) {
+            const mapping = ctx.object(ref) as FileMappingObject;
+            namedFileMappings.set(mapping.name, { handle, mapping });
+        }
+        for (const [base, ref, size, offset, access, writable] of state.views) {
+            const mapping = ctx.object(ref) as FileMappingObject;
+            fileMappingViews.set(base, { mapping, size, offset, access, writable });
+        }
+    }
 
     // MapViewOfFile dwDesiredAccess flags
     const FILE_MAP_COPY = 0x0001;
@@ -303,15 +358,16 @@ const fileIoModule = (() => {
     // Write a mapped view's current guest-memory contents back to its backing VFS
     // file at the mapped offset. No-op for anonymous (pagefile-backed), read-only,
     // or copy-on-write views.
-    const flushMappedView = async (base: number, view: { size: number; offset: number; file: VfsFileHandle | null; writable: boolean }): Promise<void> => {
-        if (!view.writable || view.file === null) return;
+    const flushMappedView = async (base: number, view: FileMappingView): Promise<void> => {
+        const file = view.mapping.file;
+        if (!view.writable || file === null) return;
         const data = Mem.readBytes(base, view.size);
         if (!data) return;
         const vfs = System.getInstance().fileSystem;
         // Write-back runs on its OWN cursor. FlushViewOfFile does not move the file
         // pointer, and a save/restore around these awaits cannot emulate that: the guest
         // may legitimately seek during the yield, and the restore then reverts its seek.
-        const viewHandle = vfs.duplicateHandle(view.file, view.offset);
+        const viewHandle = vfs.duplicateHandle(file, view.offset);
         let off = 0;
         while (off < data.length) {
             const chunk = data.subarray(off, Math.min(off + 256 * 1024, data.length));
@@ -987,132 +1043,60 @@ const fileIoModule = (() => {
         return moveFileExImpl(srcPath, dstPath, args[2] >>> 0, 'MoveFileExW');
     };
 
-    exports['CreateFileMappingA'] = (ctx, mem, args) => {
-        const hFile = args[0];
-        const flProtect = args[2] >>> 0;
-        const dwMaxSizeHigh = args[3] >>> 0;
-        const dwMaxSizeLow = args[4] >>> 0;
-        const lpName = args[5];
-
-        const name = lpName ? readStringA(mem, lpName) : '';
-        if (name) {
-            const existing = namedFileMappings.get(name);
-            if (existing !== undefined) {
-                System.getInstance().scheduler.setLastError(ERROR_ALREADY_EXISTS);
-                return existing;
+    function createFileMapping(name: string, args: ArrayLike<number>): number {
+        const system = System.getInstance();
+        const { resourceProvider, scheduler, fileSystem } = system;
+        const existing = namedFileMappings.get(name);
+        if (existing) {
+            if (mappingIsLive(existing.mapping)) {
+                const handle = resourceProvider.getKernelObject(existing.handle) === existing.mapping
+                    ? existing.handle
+                    : resourceProvider.registerKernelObject(existing.mapping);
+                if (handle) existing.handle = handle;
+                scheduler.setLastError(handle ? ERROR_ALREADY_EXISTS : ERROR_NO_SYSTEM_RESOURCES);
+                return handle;
             }
+            namedFileMappings.delete(name);
         }
 
-        let size = dwMaxSizeHigh * 0x100000000 + dwMaxSizeLow;
-        let mappingFile: VfsFileHandle | null = null;
-        const vfs0 = System.getInstance().fileSystem;
-
-        if ((hFile >>> 0) !== (INVALID_HANDLE_VALUE >>> 0) && hFile !== 0) {
-            const resourceProvider = System.getInstance().resourceProvider;
+        const hFile = args[0] >>> 0;
+        const protect = args[2] >>> 0;
+        let size = (args[3] >>> 0) * 0x100000000 + (args[4] >>> 0);
+        let file: VfsFileHandle | null = null;
+        if (hFile !== (INVALID_HANDLE_VALUE >>> 0) && hFile !== 0) {
             const fileObj = resourceProvider.getFileHandle(hFile);
             if (!fileObj || isConsoleDeviceHandle(fileObj)) {
-                System.getInstance().scheduler.setLastError(ERROR_INVALID_HANDLE);
+                scheduler.setLastError(ERROR_INVALID_HANDLE);
                 return 0;
             }
-            mappingFile = vfs0.duplicateHandle((fileObj as FileHandleWrapper).vfsHandle, 0);
-            if (size === 0) {
-                size = vfs0.getFileSize(mappingFile.path);
-            }
+            file = fileSystem.duplicateHandle((fileObj as FileHandleWrapper).vfsHandle, 0);
+            if (size === 0) size = fileSystem.getFileSize(file.path);
         }
 
-        if (size === 0) {
-            size = 0x1000;
-        }
-
-        const mapping: FileMappingObject = {
-            kind: 'file_mapping',
-            size,
-            file: mappingFile,
-            protect: flProtect,
-        };
-
-        const handle = System.getInstance().resourceProvider.registerKernelObject(mapping);
-        if (!handle) {
-            System.getInstance().scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
-            return 0;
-        }
-        if (name) {
-            namedFileMappings.set(name, handle);
-        }
-        System.getInstance().scheduler.setLastError(0);
+        const mapping: FileMappingObject = { kind: 'file_mapping', size: size || 0x1000, file, protect, name };
+        const handle = resourceProvider.registerKernelObject(mapping);
+        if (name && handle) namedFileMappings.set(name, { handle, mapping });
+        scheduler.setLastError(handle ? 0 : ERROR_NO_SYSTEM_RESOURCES);
         return handle;
-    };
+    }
 
-    exports['CreateFileMappingW'] = (ctx, mem, args) => {
-        const hFile = args[0];
-        const flProtect = args[2] >>> 0;
-        const dwMaxSizeHigh = args[3] >>> 0;
-        const dwMaxSizeLow = args[4] >>> 0;
-        const lpName = args[5];
-
-        const name = lpName ? readStringW(mem, lpName) : '';
-        if (name) {
-            const existing = namedFileMappings.get(name);
-            if (existing !== undefined) {
-                System.getInstance().scheduler.setLastError(ERROR_ALREADY_EXISTS);
-                return existing;
-            }
-        }
-
-        let size = dwMaxSizeHigh * 0x100000000 + dwMaxSizeLow;
-        let mappingFile: VfsFileHandle | null = null;
-        const vfs0 = System.getInstance().fileSystem;
-
-        if ((hFile >>> 0) !== (INVALID_HANDLE_VALUE >>> 0) && hFile !== 0) {
-            const resourceProvider = System.getInstance().resourceProvider;
-            const fileObj = resourceProvider.getFileHandle(hFile);
-            if (!fileObj || isConsoleDeviceHandle(fileObj)) {
-                System.getInstance().scheduler.setLastError(ERROR_INVALID_HANDLE);
-                return 0;
-            }
-            mappingFile = vfs0.duplicateHandle((fileObj as FileHandleWrapper).vfsHandle, 0);
-            if (size === 0) {
-                size = vfs0.getFileSize(mappingFile.path);
-            }
-        }
-
-        if (size === 0) {
-            size = 0x1000;
-        }
-
-        const mapping: FileMappingObject = {
-            kind: 'file_mapping',
-            size,
-            file: mappingFile,
-            protect: flProtect,
-        };
-
-        const handle = System.getInstance().resourceProvider.registerKernelObject(mapping);
-        if (!handle) {
-            System.getInstance().scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
+    function openFileMapping(name: string): number {
+        const { resourceProvider, scheduler } = System.getInstance();
+        const existing = namedFileMappings.get(name);
+        if (!existing || !mappingIsLive(existing.mapping)) {
+            namedFileMappings.delete(name);
+            scheduler.setLastError(ERROR_FILE_NOT_FOUND);
             return 0;
         }
-        if (name) {
-            namedFileMappings.set(name, handle);
-        }
-        System.getInstance().scheduler.setLastError(0);
+        const handle = resourceProvider.registerKernelObject(existing.mapping);
+        if (!handle) scheduler.setLastError(ERROR_NO_SYSTEM_RESOURCES);
         return handle;
-    };
+    }
 
-    exports['OpenFileMappingA'] = (ctx, mem, args) => {
-        const lpName = args[2];
-        const name = lpName ? readStringA(mem, lpName) : '';
-        if (!name) {
-            System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
-            return 0;
-        }
-        const handle = namedFileMappings.get(name);
-        if (handle === undefined) {
-            System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
-            return 0;
-        }
-        return handle;
-    };
+    exports['CreateFileMappingA'] = (ctx, mem, args) => createFileMapping(args[5] ? readStringA(mem, args[5]) : '', args);
+    exports['CreateFileMappingW'] = (ctx, mem, args) => createFileMapping(args[5] ? readStringW(mem, args[5]) : '', args);
+    exports['OpenFileMappingA'] = (ctx, mem, args) => openFileMapping(args[2] ? readStringA(mem, args[2]) : '');
+    exports['OpenFileMappingW'] = (ctx, mem, args) => openFileMapping(args[2] ? readStringW(mem, args[2]) : '');
 
     exports['MapViewOfFile'] = async (ctx, mem, args) => {
         const hFileMappingObject = args[0];
@@ -1182,11 +1166,11 @@ const fileIoModule = (() => {
         // mapping protection and the view access request write (and it is not a
         // copy-on-write view, whose writes must NOT reach the file).
         const mappingWritable = (mapping.protect & PAGE_WRITE_MASK) !== 0;
-        const accessWrite = (dwDesiredAccess & (FILE_MAP_WRITE | FILE_MAP_ALL_ACCESS)) !== 0;
-        const isCopy = (dwDesiredAccess & FILE_MAP_COPY) !== 0 && !accessWrite;
+        const accessWrite = (dwDesiredAccess & FILE_MAP_WRITE) !== 0;
+        const isCopy = (dwDesiredAccess & FILE_MAP_COPY) !== 0 && (dwDesiredAccess & FILE_MAP_ALL_ACCESS) !== FILE_MAP_ALL_ACCESS;
         const writable = mapping.file !== null && mappingWritable && accessWrite && !isCopy;
 
-        fileMappingViews.set(base, { mappingHandle: hFileMappingObject, size, offset, file: mapping.file, writable });
+        fileMappingViews.set(base, { mapping, size, offset, access: dwDesiredAccess, writable });
         return base;
     };
 
@@ -1206,6 +1190,7 @@ const fileIoModule = (() => {
                 process.memory.free(lpBaseAddress);
             }
             fileMappingViews.delete(lpBaseAddress);
+            forgetUnusedMapping(view.mapping);
             return { value: 1, stackCleanup: 4 };
         })();
     };
@@ -2135,6 +2120,7 @@ const fileIoModule = (() => {
                         hypercallDataManager.forgetThreadSuspendCount(hObject);
                     }
                     resourceProvider.unregisterKernelObject(hObject);
+                    if (kernelObj?.kind === 'file_mapping') forgetUnusedMapping(kernelObj);
                     break;
                 }
                 default:
@@ -2471,10 +2457,11 @@ const fileIoModule = (() => {
         setFilePointerCallCounts.clear();
     };
 
-    return { exports, reset };
+    return { exports, reset, captureFileMappings, restoreFileMappings };
 })();
 
 export const exports: Record<string, ThunkImplementation> = fileIoModule.exports;
+export const { captureFileMappings, restoreFileMappings } = fileIoModule;
 
 export function resetFileIoState(): void {
     fileIoModule.reset();

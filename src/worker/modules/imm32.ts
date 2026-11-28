@@ -15,8 +15,10 @@ import { Mem } from "../core/memory/mem-accessor";
 import { System } from "../core/system";
 import { windows, registerWindowDestroyObserver, finalizeWindowDestroy } from "./user32/shared-state";
 import {
-    ImmContextTable, ImmLocalMemory, ImmWindowHost, INPUTCONTEXT, LHND,
+    ImmContextTable, IMM_CONTEXT_TABLE_FIELDS, type ImmContextTableState, ImmLocalMemory, ImmWindowHost, INPUTCONTEXT, LHND,
 } from "./imm32-context";
+import { savestateParticipants, savestatesEnabled, stateKeys, type FieldPolicy } from "../savestate/participant";
+import type { SaveValue } from "../savestate/value-codec";
 
 const TRUE = 1;
 const FALSE = 0;
@@ -80,6 +82,23 @@ const windowHost: ImmWindowHost = {
     },
 };
 
+export const IMM32_FIELDS = {
+    name: 'transient', exports: 'host', contexts: 'save', imeWindows: 'save', destroyObserverRegistered: 'host',
+} as const satisfies Record<string, FieldPolicy>;
+
+export interface Imm32State {
+    contexts: ImmContextTableState;
+    imeWindows: Array<[number, number]>;
+}
+
+export const IMM32_SCHEMA = {
+    module: IMM32_FIELDS,
+    table: IMM_CONTEXT_TABLE_FIELDS,
+    contextRow: ['himc', 'threadId', 'isDefault', 'hInputContext'],
+    tableState: stateKeys<ImmContextTableState>({ contexts: true, defaultByThread: true, associations: true, nextHimc: true }),
+    state: stateKeys<Imm32State>({ contexts: true, imeWindows: true }),
+};
+
 export class Imm32 implements IModule {
     name = "imm32";
     exports: Record<string, ThunkImplementation> = {};
@@ -88,7 +107,25 @@ export class Imm32 implements IModule {
     private imeWindows = new Map<number, number>();
     private destroyObserverRegistered = false;
 
+    captureSavestate(): Imm32State {
+        return { contexts: this.contexts.captureState(), imeWindows: [...this.imeWindows] };
+    }
+
+    restoreSavestate(s: Imm32State): void {
+        this.contexts.restoreState(s.contexts);
+        this.imeWindows = new Map(s.imeWindows);
+    }
+
+    registerSavestate(): () => void {
+        return savestateParticipants.add({
+            id: 'imm32', version: 1, order: 47, covers: ['imm32'], schema: IMM32_SCHEMA as unknown as SaveValue,
+            capture: () => this.captureSavestate() as unknown as SaveValue,
+            restore: (saved) => this.restoreSavestate(saved as unknown as Imm32State),
+        });
+    }
+
     initialize(_process: Process): void {
+        if (savestatesEnabled()) this.registerSavestate();
         if (!this.destroyObserverRegistered) {
             registerWindowDestroyObserver((hwnd) => this.windowDestroyed(hwnd));
             this.destroyObserverRegistered = true;

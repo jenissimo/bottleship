@@ -86,6 +86,17 @@ interface ImcRecord {
 const HIMC_BASE = 0x00011000;
 const HIMC_STRIDE = 4;
 
+export interface ImmContextTableState {
+    contexts: Array<[number, number, boolean, number]>;
+    defaultByThread: Array<[number, number]>;
+    associations: Array<[number, number]>;
+    nextHimc: number;
+}
+
+export const IMM_CONTEXT_TABLE_FIELDS = {
+    contexts: 'save', defaultByThread: 'save', associations: 'save', nextHimc: 'save', host: 'host',
+} as const;
+
 export class ImmContextTable {
     private contexts = new Map<number, ImcRecord>();
     private defaultByThread = new Map<number, number>();
@@ -100,6 +111,22 @@ export class ImmContextTable {
         this.defaultByThread.clear();
         this.associations.clear();
         this.nextHimc = HIMC_BASE;
+    }
+
+    captureState(): ImmContextTableState {
+        return {
+            contexts: [...this.contexts].map(([himc, r]) => [himc, r.threadId, r.isDefault, r.hInputContext]),
+            defaultByThread: [...this.defaultByThread],
+            associations: [...this.associations],
+            nextHimc: this.nextHimc,
+        };
+    }
+
+    restoreState(s: ImmContextTableState): void {
+        this.contexts = new Map(s.contexts.map(([himc, threadId, isDefault, hInputContext]) => [himc, { threadId, isDefault, hInputContext }]));
+        this.defaultByThread = new Map(s.defaultByThread);
+        this.associations = new Map(s.associations);
+        this.nextHimc = s.nextHimc;
     }
 
     isContext(himc: number): boolean {

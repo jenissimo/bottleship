@@ -13,11 +13,12 @@ import type { ResourceProviderState } from '../core/resources/system-resource-pr
 import type { MemoryManagerState } from '../core/process';
 import type { ThunkGeneratorState, ThunkStub } from '../core/thunking/thunk-generator';
 import { captureKernel32Memory, restoreKernel32Memory, type Kernel32MemoryState } from '../modules/kernel32/memory';
-import { pickSaved, savestateParticipants, stateKeys, type CaptureContext, type FieldPolicy } from './participant';
+import { pickSaved, savestateParticipants, schemaHash, stateKeys, type CaptureContext, type FieldPolicy } from './participant';
 import { CPU_FIELDS, captureCpu, restoreCpu, type V86Cpu } from './participants/cpu';
 import { MODULE_IMAGES_SCHEMA, moduleImagesHooks } from './participants/module-images';
 import { CaptureRefusal, objectCodecs } from './object-codecs';
 import { registerKernel32Participant } from '../modules/kernel32/savestate';
+import { captureFileMappings, restoreFileMappings, type FileMappingState } from '../modules/kernel32/file-io';
 import { registerUser32Participants } from '../modules/user32/savestate';
 import { registerGdi32Participants } from '../modules/gdi32/savestate';
 import type { SaveValue } from './value-codec';
@@ -166,10 +167,19 @@ const SCHEMAS = {
     cpu: CPU_FIELDS,
 } as const;
 
+interface SavedResources extends ResourceProviderState {
+    fileMappings: FileMappingState;
+}
+
 const schema = (v: unknown) => v as SaveValue;
 
 export function registerCoreParticipants(): void {
     for (const [module, reason] of Object.entries(STATELESS_MODULES)) savestateParticipants.stateless(module, reason);
+    savestateParticipants.add({
+        id: 'mscoree', version: 1, order: 75, covers: ['mscoree'], schema: null,
+        capture: () => null,
+        restore: () => {},
+    });
     registerKernelRecordCodecs();
     registerKernel32Participant();
     registerUser32Participants();
@@ -217,9 +227,31 @@ export function registerCoreParticipants(): void {
         restore: moduleImages.restore,
     });
     savestateParticipants.add({
-        id: 'resources', version: 1, order: 10, schema: schema(SCHEMAS.resources),
-        capture: (ctx) => save(System.getInstance().resourceProvider.captureState((o, w) => ctx.ref(o, w))),
-        restore: (s, ctx) => System.getInstance().resourceProvider.restoreState(as<ResourceProviderState>(s), r => ctx.object(r)),
+        id: 'resources', version: 2, order: 10,
+        schema: schema({
+            ...SCHEMAS.resources,
+            fileMappings: {
+                mapping: ['file', 'size', 'protect', 'name'],
+                file: ['path', 'source', 'access'],
+                names: ['handle', 'mappingRef'],
+                views: ['base', 'mappingRef', 'size', 'offset', 'access', 'writable'],
+            },
+        }),
+        migrations: {
+            1: {
+                schemaHash: schemaHash(schema(SCHEMAS.resources)),
+                migrate: s => save({ ...as<ResourceProviderState>(s), fileMappings: { names: [], views: [] } }),
+            },
+        },
+        capture: (ctx) => save({
+            ...System.getInstance().resourceProvider.captureState(ctx.ref),
+            fileMappings: captureFileMappings(ctx),
+        }),
+        restore: (s, ctx) => {
+            const state = as<SavedResources>(s);
+            System.getInstance().resourceProvider.restoreState(state, ctx.object);
+            restoreFileMappings(state.fileMappings, ctx);
+        },
     });
     savestateParticipants.add({
         id: 'hypercall-page', version: 2, order: 11, schema: schema(SCHEMAS.hypercallPage),

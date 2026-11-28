@@ -37,7 +37,6 @@ describe("stateless modules", () => {
     test("an open handle of a handle-backed module is refused by name", () => {
         registerCoreParticipants();
         const graph = newObjectGraph();
-        expect(() => graph.ref({ kind: "reg", key: "HKLM\\Software" }, "kernel 0x1004")).toThrow(/kernel 0x1004: no savestate codec for Object \(reg\)/);
         expect(() => graph.ref({ kind: "crypt_prov" }, "kernel 0x1008")).toThrow(/no savestate codec for Object \(crypt_prov\)/);
     });
 });
